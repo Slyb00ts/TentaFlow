@@ -8,6 +8,13 @@
 # =============================================================================
 
 [build]
+# Wspoldzielony katalog buildowy dla WSZYSTKICH crate'ow w repo. Bez tego
+# kazdy sub-crate (tentaflow/, tentaflow-core/, tentaflow-protocol/, ...)
+# ma wlasny `target/` z pelna kopia deps — ~230 GB lacznie. Z jednym
+# target_shared/ deps sa kompilowane raz i reuzywane. Sciezka relatywna,
+# resolvowana wzgledem katalogu zawierajacego `.cargo/` (czyli repo root).
+target-dir = "target_shared"
+
 # `jobs` celowo nieustawione — Cargo automatycznie wykrywa wszystkie logiczne
 # CPU (`std::thread::available_parallelism`). Maszyny zespolu maja rozne
 # liczby rdzeni (10/16/32/...), hardcode bil maszyny z >8 CPU. Override

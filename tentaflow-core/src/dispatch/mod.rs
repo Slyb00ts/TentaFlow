@@ -25,16 +25,23 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
+#[cfg(feature = "camera")]
+pub mod camera_admin;
 pub mod handlers;
+pub mod legal_admin;
 pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod recorder;
 pub mod resume_token;
+pub mod role_catalog;
 pub mod state;
+pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
 pub mod system_event_broadcast;
+pub mod ui_cbor_broadcast;
+pub mod ui_channel;
 
 pub use state::AppState;
 
@@ -53,10 +60,19 @@ pub struct HandlerContext {
     pub session: SessionAuth,
     /// Correlation_id dla tracing/spans.
     pub correlation_id: u64,
+    /// Per-WS-connection unique identifier. Used as a key in the UI session
+    /// registry so panel lifecycle state is scoped to the originating socket.
+    pub connection_id: u64,
     /// Connection-scoped resume secret (HMAC key dla resume token verify).
     pub resume_secret: Option<std::sync::Arc<Vec<u8>>>,
     /// Shared resources serwera (DB, Router, MeshPeerStore, ...).
     pub state: std::sync::Arc<state::AppState>,
+    /// F2 P1.b — per-request org snapshot. `None` for paths without a user
+    /// session (mesh handlers, anonymous endpoints, system-initiated calls);
+    /// handlers that need org scoping must check this is `Some` and reject
+    /// otherwise. Threaded in by the WS binary entrypoint after session
+    /// resolve; mesh / test handlers leave it `None`.
+    pub org_context: Option<crate::services::rbac::OrgContext>,
 }
 
 // =============================================================================
@@ -125,7 +141,7 @@ pub struct HandlerMeta {
     pub since_minor: u8,
     /// Minimalny tier autoryzacji (z `#[policy(...)]`).
     pub required_auth: SessionAuthKind,
-    /// Nazwa metryki Prometheus dla tego handlera.
+    /// Nazwa metryki dla tego handlera.
     pub metric_name: &'static str,
     /// Wskaznik do funkcji handlera. Zunifikowana async signatura — sync
     /// handlery sa owijane przez makro w `Box::pin(async move { ... })`.
@@ -273,7 +289,7 @@ pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody,
 ///   - ApiKeyCreateResponse: plaintext "shown only once" token
 ///   - SettingsUpdateRequest: potencjalnie is_secret=true entries
 fn is_sensitive_variant(body: &MessageBody) -> bool {
-    matches!(
+    if matches!(
         body,
         MessageBody::AuthLoginRequestBody(_)
             | MessageBody::AuthLoginResponseBody(_)
@@ -281,6 +297,33 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
             | MessageBody::SettingsUpdateRequestBody(_)
             | MessageBody::AddonConfigSetRequestBody(_)
             | MessageBody::AddonInstallRequestBody(_)
+    ) {
+        return true;
+    }
+    // CameraAdminBody:AddOnvifRequest carries plaintext ONVIF user+password.
+    if matches!(
+        body,
+        MessageBody::CameraAdminBody(tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(_))
+    ) {
+        return true;
+    }
+    // CameraAdminBody:FrameUrlResponse carries a signed `/frames/<ref>?token=...`
+    // URL whose query string includes a live HMAC token. With
+    // `TENTAFLOW_TRACE_WSS=1` an attacker reading trace logs could lift the
+    // token wire and replay the download within the (up to 300 s) TTL.
+    if matches!(
+        body,
+        MessageBody::CameraAdminBody(tentaflow_protocol::CameraAdminPayload::FrameUrlResponse(_))
+    ) {
+        return true;
+    }
+    // LegalAdminBody:GenerateResponse carries a fully-formed signed download
+    // URL whose query string includes a live HMAC token. With
+    // `TENTAFLOW_TRACE_WSS=1` an attacker reading trace logs could lift the
+    // token wire and replay the download within the 1 h TTL.
+    matches!(
+        body,
+        MessageBody::LegalAdminBody(tentaflow_protocol::LegalAdminPayload::GenerateResponse(_))
     )
 }
 
@@ -377,6 +420,35 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "ProfilingCollectorsStatusResponse"
             }
         },
+        MessageBody::CameraAdminBody(p) => match p {
+            tentaflow_protocol::CameraAdminPayload::DiscoverRequest(_) => "CameraDiscoverRequest",
+            tentaflow_protocol::CameraAdminPayload::DiscoverResponse(_) => "CameraDiscoverResponse",
+            tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(_) => "CameraAddOnvifRequest",
+            tentaflow_protocol::CameraAdminPayload::AddOnvifResponse(_) => "CameraAddOnvifResponse",
+            tentaflow_protocol::CameraAdminPayload::FrameUrlRequest(_) => "CameraFrameUrlRequest",
+            tentaflow_protocol::CameraAdminPayload::FrameUrlResponse(_) => "CameraFrameUrlResponse",
+        },
+        MessageBody::LegalAdminBody(p) => match p {
+            tentaflow_protocol::LegalAdminPayload::ListRequest(_) => "LegalDocumentsListRequest",
+            tentaflow_protocol::LegalAdminPayload::ListResponse(_) => "LegalDocumentsListResponse",
+            tentaflow_protocol::LegalAdminPayload::GenerateRequest(_) => {
+                "LegalDocumentGenerateRequest"
+            }
+            tentaflow_protocol::LegalAdminPayload::GenerateResponse(_) => {
+                "LegalDocumentGenerateResponse"
+            }
+            tentaflow_protocol::LegalAdminPayload::RevokeRequest(_) => "LegalDocumentRevokeRequest",
+            tentaflow_protocol::LegalAdminPayload::RevokeResponse(_) => {
+                "LegalDocumentRevokeResponse"
+            }
+        },
+        MessageBody::StreamBody(p) => match p {
+            tentaflow_protocol::StreamPayload::SubscribeRequest(_) => "StreamSubscribeRequest",
+            tentaflow_protocol::StreamPayload::SubscribeResponse(_) => "StreamSubscribeResponse",
+            tentaflow_protocol::StreamPayload::Frame(_) => "StreamFrame",
+            tentaflow_protocol::StreamPayload::CloseRequest(_) => "StreamCloseRequest",
+            tentaflow_protocol::StreamPayload::Closed(_) => "StreamClosed",
+        },
         MessageBody::SubscribeResumeRequest { .. } => "SubscribeResumeRequest",
         MessageBody::SubscribeResumeAck { .. } => "SubscribeResumeAck",
         MessageBody::SubscribeResumeOffer { .. } => "SubscribeResumeOffer",
@@ -391,6 +463,56 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::HubModelSearchRequest { .. } => "HubModelSearchRequest",
         MessageBody::HubModelSearchResponse { .. } => "HubModelSearchResponse",
         MessageBody::HubDownloadProgressBody(_) => "HubDownloadProgress",
+        MessageBody::SchedulerBody(p) => match p {
+            tentaflow_protocol::SchedulerPayload::JobsListRequest(_) => "SchedulerJobsListRequest",
+            tentaflow_protocol::SchedulerPayload::JobsListResponse(_) => {
+                "SchedulerJobsListResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::ActionsListRequest(_) => {
+                "SchedulerActionsListRequest"
+            }
+            tentaflow_protocol::SchedulerPayload::ActionsListResponse(_) => {
+                "SchedulerActionsListResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::RunsListRequest(_) => "SchedulerRunsListRequest",
+            tentaflow_protocol::SchedulerPayload::RunsListResponse(_) => {
+                "SchedulerRunsListResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::JobUpsertRequest(_) => {
+                "SchedulerJobUpsertRequest"
+            }
+            tentaflow_protocol::SchedulerPayload::JobUpsertResponse(_) => {
+                "SchedulerJobUpsertResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::JobDeleteRequest(_) => {
+                "SchedulerJobDeleteRequest"
+            }
+            tentaflow_protocol::SchedulerPayload::JobDeleteResponse(_) => {
+                "SchedulerJobDeleteResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::JobRunNowRequest(_) => {
+                "SchedulerJobRunNowRequest"
+            }
+            tentaflow_protocol::SchedulerPayload::JobRunNowResponse(_) => {
+                "SchedulerJobRunNowResponse"
+            }
+        },
+        MessageBody::SyncConflictBody(p) => match p {
+            tentaflow_protocol::SyncConflictPayload::ListRequest(_) => "SyncConflictsListRequest",
+            tentaflow_protocol::SyncConflictPayload::ListResponse(_) => "SyncConflictsListResponse",
+            tentaflow_protocol::SyncConflictPayload::ResolveRequest(_) => {
+                "SyncConflictResolveRequest"
+            }
+            tentaflow_protocol::SyncConflictPayload::ResolveResponse(_) => {
+                "SyncConflictResolveResponse"
+            }
+        },
+        MessageBody::SyncStorageBody(p) => match p {
+            tentaflow_protocol::SyncStoragePayload::ReportRequest(_) => "SyncStorageReportRequest",
+            tentaflow_protocol::SyncStoragePayload::ReportResponse(_) => {
+                "SyncStorageReportResponse"
+            }
+        },
         MessageBody::FlowListRequest => "FlowListRequest",
         MessageBody::FlowListResponse { .. } => "FlowListResponse",
         MessageBody::FlowDetailRequest { .. } => "FlowDetailRequest",
@@ -443,6 +565,16 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResPause(_) => "ServicePauseResponse",
             tentaflow_protocol::ServicePayload::ReqStart(_) => "ServiceStartRequest",
             tentaflow_protocol::ServicePayload::ResStart(_) => "ServiceStartResponse",
+            tentaflow_protocol::ServicePayload::ReqUpdate(_) => "ServiceConfigUpdateRequest",
+            tentaflow_protocol::ServicePayload::ResUpdate(_) => "ServiceConfigUpdateResponse",
+            tentaflow_protocol::ServicePayload::ReqVramHint(_) => "ServiceVramHintRequest",
+            tentaflow_protocol::ServicePayload::ResVramHint(_) => "ServiceVramHintResponse",
+            tentaflow_protocol::ServicePayload::ReqEnginePresets(_) => {
+                "ServiceEnginePresetsRequest"
+            }
+            tentaflow_protocol::ServicePayload::ResEnginePresets(_) => {
+                "ServiceEnginePresetsResponse"
+            }
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {
@@ -530,14 +662,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::RegistryListRequest => "RegistryListRequest",
         MessageBody::RegistryListResponse { .. } => "RegistryListResponse",
         MessageBody::AuditEventBody(_) => "AuditEvent",
-        MessageBody::ContainerListRequest => "ContainerListRequest",
-        MessageBody::ContainerListResponse { .. } => "ContainerListResponse",
-        MessageBody::ContainerStartRequest { .. } => "ContainerStartRequest",
-        MessageBody::ContainerStartResponse { .. } => "ContainerStartResponse",
-        MessageBody::ContainerStopRequest { .. } => "ContainerStopRequest",
-        MessageBody::ContainerStopResponse { .. } => "ContainerStopResponse",
-        MessageBody::ContainerLogStreamRequest { .. } => "ContainerLogStreamRequest",
-        MessageBody::ContainerLogChunkBody(_) => "ContainerLogChunk",
+        MessageBody::ContainerBody(p) => match p {
+            tentaflow_protocol::ContainerPayload::ListRequest => "ContainerListRequest",
+            tentaflow_protocol::ContainerPayload::ListResponse { .. } => "ContainerListResponse",
+            tentaflow_protocol::ContainerPayload::StartRequest { .. } => "ContainerStartRequest",
+            tentaflow_protocol::ContainerPayload::StartResponse { .. } => "ContainerStartResponse",
+            tentaflow_protocol::ContainerPayload::StopRequest { .. } => "ContainerStopRequest",
+            tentaflow_protocol::ContainerPayload::StopResponse { .. } => "ContainerStopResponse",
+            tentaflow_protocol::ContainerPayload::LogStreamRequest { .. } => {
+                "ContainerLogStreamRequest"
+            }
+            tentaflow_protocol::ContainerPayload::LogChunkBody(_) => "ContainerLogChunk",
+        },
         MessageBody::VoiceProfileListRequest => "VoiceProfileListRequest",
         MessageBody::VoiceProfileListResponse { .. } => "VoiceProfileListResponse",
         MessageBody::TtsRuleListRequest => "TtsRuleListRequest",
@@ -643,6 +779,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         // ServiceManifestDeploy przeniesione do DeploymentPayload::ReqStart/ResStart.
         MessageBody::AddonsListRequest => "AddonsListRequest",
         MessageBody::AddonsListResponseBody(_) => "AddonsListResponse",
+        MessageBody::AddonUiBody(p) => match p {
+            tentaflow_protocol::AddonUiPayload::ReqApplicationsList => {
+                "AddonApplicationsListRequest"
+            }
+            tentaflow_protocol::AddonUiPayload::ResApplicationsList { .. } => {
+                "AddonApplicationsListResponse"
+            }
+        },
         MessageBody::IamBody(p) => match p {
             tentaflow_protocol::IamPayload::ReqListUsers => "IamListUsersRequest",
             tentaflow_protocol::IamPayload::ResListUsers { .. } => "IamListUsersResponse",
@@ -754,6 +898,38 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AddonNetworkRulesSetResponseBody(_) => "AddonNetworkRulesSetResponse",
         MessageBody::AddonReloadRequestBody(_) => "AddonReloadRequest",
         MessageBody::AddonReloadResponseBody(_) => "AddonReloadResponse",
+        MessageBody::UiChannelCbor(_) => "UiChannelCbor",
+        MessageBody::RoleCatalogBody(p) => match p {
+            tentaflow_protocol::RoleCatalogPayload::ListRequest(_) => "RoleCatalogListRequest",
+            tentaflow_protocol::RoleCatalogPayload::ListResponse { .. } => {
+                "RoleCatalogListResponse"
+            }
+            tentaflow_protocol::RoleCatalogPayload::GetRequest { .. } => "RoleCatalogGetRequest",
+            tentaflow_protocol::RoleCatalogPayload::GetBySlugRequest { .. } => {
+                "RoleCatalogGetBySlugRequest"
+            }
+            tentaflow_protocol::RoleCatalogPayload::GetResponse { .. } => "RoleCatalogGetResponse",
+            tentaflow_protocol::RoleCatalogPayload::ListLocalesRequest => {
+                "RoleCatalogListLocalesRequest"
+            }
+            tentaflow_protocol::RoleCatalogPayload::ListLocalesResponse { .. } => {
+                "RoleCatalogListLocalesResponse"
+            }
+            tentaflow_protocol::RoleCatalogPayload::CreateRequest(_) => "RoleCatalogCreateRequest",
+            tentaflow_protocol::RoleCatalogPayload::CreateResponse(_) => {
+                "RoleCatalogCreateResponse"
+            }
+            tentaflow_protocol::RoleCatalogPayload::UpdateRequest(_) => "RoleCatalogUpdateRequest",
+            tentaflow_protocol::RoleCatalogPayload::UpdateResponse(_) => {
+                "RoleCatalogUpdateResponse"
+            }
+            tentaflow_protocol::RoleCatalogPayload::DeactivateRequest { .. } => {
+                "RoleCatalogDeactivateRequest"
+            }
+            tentaflow_protocol::RoleCatalogPayload::DeactivateResponse { .. } => {
+                "RoleCatalogDeactivateResponse"
+            }
+        },
         MessageBody::Error(_) => "Error",
     }
 }
@@ -862,8 +1038,10 @@ mod tests {
                 role: None,
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
         let body = MessageBody::Error(ProtocolError {
             code: ProtocolErrorCode::Internal,
@@ -875,6 +1053,301 @@ mod tests {
         match resp {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotImplemented),
             _ => panic!("expected error"),
+        }
+    }
+
+    fn sync_test_ctx(role: &str) -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0xFF, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                role: Some(role.to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state::AppState::for_test(),
+            org_context: None,
+        }
+    }
+
+    fn with_tmp_home<F: FnOnce()>(f: F) {
+        let _guard = crate::addon::fs_sandbox::test_home_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        f();
+        if let Some(p) = prev {
+            std::env::set_var("HOME", p);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    fn sync_conflict_capture(addon_id: &str) -> crate::sync::runtime::SqlWriteCapture {
+        crate::sync::runtime::SqlWriteCapture {
+            capture_id: format!("dispatch-conflict-{addon_id}"),
+            org_id: "org-default".to_string(),
+            addon_id: addon_id.to_string(),
+            table_name: "contacts".to_string(),
+            action: crate::sync::runtime::SqlWriteAction::Insert,
+            resource_type: "contacts".to_string(),
+            resource_id: "1".to_string(),
+            query: "INSERT INTO contacts (id, name) VALUES (?1, ?2)".to_string(),
+            params: vec![
+                serde_json::Value::from(1),
+                serde_json::Value::String("Ewa".to_string()),
+            ],
+            rows_affected: 1,
+            last_insert_id: 1,
+            actor_user_id: Some(1),
+            created_at_ms: crate::sync::runtime::now_ms(),
+        }
+    }
+
+    #[test]
+    fn sync_conflict_list_dispatch_returns_rows_for_admin() {
+        with_tmp_home(|| {
+            let addon_id = "dispatch-conflict-list-test";
+            let operation_id = crate::sync::ledger::OperationId::from_hash([0xA1; 32]);
+            crate::addon::storage_sql_exec::record_sync_conflict(
+                &sync_conflict_capture(addon_id),
+                operation_id,
+                "node-b",
+                &crate::addon::storage_sql_exec::StorageSqlError::SqlConstraint,
+            )
+            .expect("record conflict");
+
+            let ctx = sync_test_ctx("admin");
+            let body = MessageBody::SyncConflictBody(
+                tentaflow_protocol::SyncConflictPayload::ListRequest(
+                    tentaflow_protocol::SyncConflictsListRequest {
+                        org_id: "org-default".to_string(),
+                        addon_id: addon_id.to_string(),
+                        status: "open".to_string(),
+                        limit: 10,
+                    },
+                ),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
+
+            assert!(!is_err);
+            match resp {
+                MessageBody::SyncConflictBody(
+                    tentaflow_protocol::SyncConflictPayload::ListResponse(response),
+                ) => {
+                    assert_eq!(response.conflicts.len(), 1);
+                    assert_eq!(response.conflicts[0].operation_id, operation_id.to_hex());
+                }
+                _ => panic!("expected sync conflict list response"),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn sync_conflict_list_dispatch_rejects_non_admin() {
+        let ctx = sync_test_ctx("user");
+        let body =
+            MessageBody::SyncConflictBody(tentaflow_protocol::SyncConflictPayload::ListRequest(
+                tentaflow_protocol::SyncConflictsListRequest {
+                    org_id: "org-default".to_string(),
+                    addon_id: "contacts".to_string(),
+                    status: "open".to_string(),
+                    limit: 10,
+                },
+            ));
+
+        let (resp, is_err) = dispatch(&body, &ctx).await;
+
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::PolicyDenied),
+            _ => panic!("expected auth error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_conflict_resolve_dispatch_rejects_non_admin() {
+        let ctx = sync_test_ctx("user");
+        let body =
+            MessageBody::SyncConflictBody(tentaflow_protocol::SyncConflictPayload::ResolveRequest(
+                tentaflow_protocol::SyncConflictResolveRequest {
+                    org_id: "org-default".to_string(),
+                    addon_id: "contacts".to_string(),
+                    operation_id: crate::sync::ledger::OperationId::from_hash([0xC3; 32]).to_hex(),
+                    resolution: tentaflow_protocol::SyncConflictResolution::KeepLocal,
+                },
+            ));
+
+        let (resp, is_err) = dispatch(&body, &ctx).await;
+
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::PolicyDenied),
+            _ => panic!("expected auth error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_conflict_list_dispatch_rejects_invalid_scope_and_status() {
+        let ctx = sync_test_ctx("admin");
+        for (addon_id, status) in [("../contacts", "open"), ("contacts", "everything")] {
+            let body = MessageBody::SyncConflictBody(
+                tentaflow_protocol::SyncConflictPayload::ListRequest(
+                    tentaflow_protocol::SyncConflictsListRequest {
+                        org_id: "org-default".to_string(),
+                        addon_id: addon_id.to_string(),
+                        status: status.to_string(),
+                        limit: 10,
+                    },
+                ),
+            );
+            let (resp, is_err) = dispatch(&body, &ctx).await;
+            assert!(is_err);
+            match resp {
+                MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::BadRequest),
+                _ => panic!("expected bad request"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_conflict_resolve_dispatch_rejects_invalid_operation_id() {
+        let ctx = sync_test_ctx("admin");
+        let body =
+            MessageBody::SyncConflictBody(tentaflow_protocol::SyncConflictPayload::ResolveRequest(
+                tentaflow_protocol::SyncConflictResolveRequest {
+                    org_id: "org-default".to_string(),
+                    addon_id: "contacts".to_string(),
+                    operation_id: "not-hex".to_string(),
+                    resolution: tentaflow_protocol::SyncConflictResolution::AcceptRemote,
+                },
+            ));
+
+        let (resp, is_err) = dispatch(&body, &ctx).await;
+
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::BadRequest),
+            _ => panic!("expected bad request"),
+        }
+    }
+
+    #[test]
+    fn sync_conflict_resolve_dispatch_marks_conflict_for_admin() {
+        with_tmp_home(|| {
+            let addon_id = "dispatch-conflict-resolve-test";
+            let operation_id = crate::sync::ledger::OperationId::from_hash([0xB2; 32]);
+            let db_path = crate::paths::tentaflow_home().join("dispatch-sync-runtime.db");
+            let db = crate::db::init(&db_path).expect("test DB init");
+            let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[0xB2; 32]));
+            let security = std::sync::Arc::new(
+                crate::mesh::security::MeshSecurity::new(db, cipher).expect("mesh security"),
+            );
+            crate::sync::runtime::init(security.db.clone(), security).expect("sync runtime");
+            crate::addon::storage_sql_exec::record_sync_conflict(
+                &sync_conflict_capture(addon_id),
+                operation_id,
+                "node-b",
+                &crate::addon::storage_sql_exec::StorageSqlError::SqlConstraint,
+            )
+            .expect("record conflict");
+
+            let ctx = sync_test_ctx("admin");
+            let body = MessageBody::SyncConflictBody(
+                tentaflow_protocol::SyncConflictPayload::ResolveRequest(
+                    tentaflow_protocol::SyncConflictResolveRequest {
+                        org_id: "org-default".to_string(),
+                        addon_id: addon_id.to_string(),
+                        operation_id: operation_id.to_hex(),
+                        resolution: tentaflow_protocol::SyncConflictResolution::KeepLocal,
+                    },
+                ),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
+
+            assert!(!is_err);
+            match resp {
+                MessageBody::SyncConflictBody(
+                    tentaflow_protocol::SyncConflictPayload::ResolveResponse(response),
+                ) => {
+                    assert_eq!(response.operation_id, operation_id.to_hex());
+                    assert_eq!(response.status, "ignored");
+                    assert_eq!(response.resolution, "keep_local");
+                }
+                _ => panic!("expected sync conflict resolve response"),
+            }
+            let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+                "org-default",
+                addon_id,
+                Some("ignored"),
+                10,
+            )
+            .expect("resolved conflicts");
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].operation_id, operation_id.to_hex());
+        });
+    }
+
+    #[test]
+    fn sync_storage_report_dispatch_returns_report_for_admin() {
+        with_tmp_home(|| {
+            let home = crate::paths::tentaflow_home();
+            std::fs::create_dir_all(home.join("data")).expect("data dir");
+            std::fs::write(home.join("data/router.db"), vec![1u8; 9]).expect("router db");
+
+            let ctx = sync_test_ctx("admin");
+            let body = MessageBody::SyncStorageBody(
+                tentaflow_protocol::SyncStoragePayload::ReportRequest(
+                    tentaflow_protocol::SyncStorageReportRequest,
+                ),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
+
+            assert!(!is_err);
+            match resp {
+                MessageBody::SyncStorageBody(
+                    tentaflow_protocol::SyncStoragePayload::ReportResponse(response),
+                ) => {
+                    assert_eq!(response.sqlite_bytes, 9);
+                    assert_eq!(
+                        response.large_blob_block_bytes,
+                        crate::sync::storage_monitor::LARGE_BLOB_BLOCK_BYTES
+                    );
+                    assert!(response.paths.iter().any(|path| path.label == "sqlite"));
+                }
+                _ => panic!("expected sync storage report response"),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn sync_storage_report_dispatch_rejects_non_admin() {
+        let ctx = sync_test_ctx("user");
+        let body =
+            MessageBody::SyncStorageBody(tentaflow_protocol::SyncStoragePayload::ReportRequest(
+                tentaflow_protocol::SyncStorageReportRequest,
+            ));
+
+        let (resp, is_err) = dispatch(&body, &ctx).await;
+
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::PolicyDenied),
+            _ => panic!("expected auth error"),
         }
     }
 
@@ -959,8 +1432,10 @@ mod tests {
                 role: None,
             },
             correlation_id: 100,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
 
         // R-LIST — empty test DB → empty Vec, valid response.
@@ -988,8 +1463,10 @@ mod tests {
             &HandlerContext {
                 session: SessionAuth::Anonymous,
                 correlation_id: 1,
+                connection_id: 0,
                 resume_secret: None,
                 state: state::AppState::for_test(),
+                org_context: None,
             },
         )
         .await;
@@ -1029,8 +1506,10 @@ mod tests {
                 role: None,
             },
             correlation_id: 7,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
         assert!(!is_err);
@@ -1042,8 +1521,10 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 8,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
         assert!(is_err);
@@ -1058,8 +1539,10 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 9,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx).await;
         assert!(!is_err);
@@ -1110,8 +1593,10 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, is_err) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
@@ -1145,8 +1630,10 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 2,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, _) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
@@ -1173,8 +1660,10 @@ mod visibility_enforcement_tests {
                 role: Some("admin".to_string()),
             },
             correlation_id: 3,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, _) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
@@ -1198,8 +1687,10 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 4,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, is_err) = dispatch(
@@ -1228,8 +1719,10 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 5,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, is_err) = dispatch(
@@ -1262,8 +1755,10 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 6,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, is_err) = dispatch(

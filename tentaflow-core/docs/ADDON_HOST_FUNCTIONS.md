@@ -9,21 +9,157 @@ Kazda funkcja operuje na pamieci liniowej guest (WASM) przez wskazniki i dlugosc
 ## Konwencje ABI
 
 - Parametry tekstowe: `(ptr: i32, len: i32)` — wskaznik i dlugosc UTF-8 w pamieci guest
-- Bufor wyjsciowy: `(out_ptr: i32, out_capacity: i32)` — wskaznik i pojemnosc bufora
-- Zwracana wartosc `i32`: kod statusu (0 = sukces, <0 = blad)
+- Bufor wyjsciowy: `(out_ptr: i32, out_capacity: i32, out_len_ptr: i32)` — wskaznik, pojemnosc, oraz wskaznik na u32 LE z faktycznym rozmiarem
+- Zwracana wartosc `i32`: kod statusu (0 = sukces, !=0 = blad)
 - Zwracana wartosc `i64` (packed): `(status << 32) | data_length` — status w gornych 32 bitach, dlugosc danych w dolnych
+
+### Limity payloadu (`PayloadKind`)
+
+Kazda host function ktora przyjmuje payload od addona MUSI sprawdzic rozmiar przez `enforce_payload_size`. Przekroczenie → `ABI_ERR_PAYLOAD_TOO_LARGE` (21).
+
+| Kategoria | Max | Uzycie |
+|-----------|-----|--------|
+| `ServiceCall` | 8 MB | `service_call(alias, method, payload)` |
+| `SqlCombined` | 4 MB | `sql_exec/query` — query + params zlozone |
+| `VectorItem` | 1 MB | `vector_upsert` per item |
+| `UiRender` | 2 MB | `ui_render` — drzewo komponentow |
+| `Secret` | 64 KB | `secret_set/get` — wartosc |
+
+### out_cap retry pattern
+
+Kazda host function zwracajaca dane w buforze wyjsciowym uzywa ujednoliconej semantyki retry:
+
+1. Caller alokuje bufor o rozmiarze `out_cap`, przekazuje pointer + capacity + out_len_ptr.
+2. Host function probuje pisac:
+   - Jesli `actual_size <= out_cap` → zapisuje, `*out_len_ptr = actual_size`, returns `ABI_OK` (0).
+   - Jesli `actual_size > out_cap` → NIE pisze, `*out_len_ptr = actual_size` (wymagany rozmiar), returns `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` (6).
+3. Caller realokuje bufor do `actual_size` (z marginesem +10%) i powtarza wywolanie.
+4. Max retry: 1 (drugi `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` → addon bug, audit anomaly).
+
+Przyklad uzycia w SDK (Rust):
+
+```rust
+const INITIAL_CAP: usize = 4096;
+let mut buf = vec![0u8; INITIAL_CAP];
+let mut out_len: u32 = 0;
+let status = unsafe {
+    host_fn(..., buf.as_mut_ptr() as i32, buf.len() as i32, &mut out_len as *mut u32 as i32)
+};
+if status == ABI_ERR_OUTPUT_BUFFER_TOO_SMALL {
+    let need = (out_len as usize) + (out_len as usize / 10); // +10% margin
+    buf = vec![0u8; need];
+    let status2 = unsafe {
+        host_fn(..., buf.as_mut_ptr() as i32, buf.len() as i32, &mut out_len as *mut u32 as i32)
+    };
+    // Drugi blad = bug addona; audit_anomaly zostal juz zapisany przez host.
+    assert_eq!(status2, ABI_OK);
+}
+buf.truncate(out_len as usize);
+```
+
+### Domyslne timeouty per kategoria
+
+| Kategoria | Timeout |
+|-----------|---------|
+| `service_call` | 30 s |
+| `sql_*` (exec/query) | 30 s |
+| `vector_*` (upsert/search) | 5 s |
+| `camera_*` (probe/connect) | 15 s |
+| `recording_*` (save/get_url) | 60 s |
+
+Przekroczenie → `ABI_ERR_TIMEOUT` (4).
 
 ---
 
 ## Globalne kody bledow ABI
 
+Wartosci dodatnie (1..24) wprowadzone w F1a (M0.W2) sa kanoniczne dla nowych host functions (SQL, Alias, Camera, Streaming, Recording). Pre-F1a host functions (`storage_*`, `http_*`, `llm_*`, `ui_*`, `events_*`, `secret_*`) uzywaja starych stalych ujemnych (`ABI_ERR_PERMISSION = -1`, ...) — zachowanych dla wstecznej kompatybilnosci. Mapowanie jest jednoznaczne po znaku wartosci.
+
+| Kod | Stala (F1a) | Opis |
+|-----|-------------|------|
+| 0  | `ABI_OK` | Operacja zakonczona pomyslnie |
+| 1  | `ABI_ERR_PERMISSION` | Brak wymaganych uprawnien |
+| 2  | `ABI_ERR_NOT_FOUND` | Zasob nie znaleziony |
+| 3  | `ABI_ERR_NO_AVAILABLE_TARGET` | Brak dostepnego targetu dla aliasu |
+| 4  | `ABI_ERR_TIMEOUT` | Przekroczono limit czasu |
+| 5  | `ABI_ERR_OPERATION` | Ogolny blad operacji |
+| 6  | `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` | Bufor wyjsciowy za maly (out_len_ptr ma wymagany rozmiar) |
+| 7  | `ABI_ERR_CONFLICT` | Konflikt stanu (duplikat) |
+| 8  | `ABI_ERR_SQL_SYNTAX` | Bledna skladnia SQL |
+| 9  | `ABI_ERR_SQL_CONSTRAINT` | Naruszenie constraint SQL (UNIQUE/NOT NULL/FK/CHECK) |
+| 10 | `ABI_ERR_SQL_NO_RESULT` | Zapytanie SQL nie zwrocilo wyniku |
+| 11 | `ABI_ERR_QUOTA_EXCEEDED` | Przekroczono kwote zasobow |
+| 12 | `ABI_ERR_CAMERA_UNREACHABLE` | Kamera niedostepna |
+| 13 | `ABI_ERR_CAMERA_AUTH_FAILED` | Bledne dane uwierzytelniajace kamery |
+| 14 | `ABI_ERR_CAMERA_VENDOR_UNSUPPORTED` | Vendor kamery nieobslugiwany |
+| 15 | `ABI_ERR_STREAM_NOT_FOUND` | Strumien nie znaleziony |
+| 16 | `ABI_ERR_STREAM_CLOSED` | Strumien zamkniety |
+| 17 | `ABI_ERR_BACKPRESSURE` | Addon nie nadaza za strumieniem |
+| 18 | `ABI_ERR_RECORDING_NOT_FOUND` | Nagranie nie znalezione |
+| 19 | `ABI_ERR_RECORDING_PURGED` | Nagranie wyczyszczone (retention) |
+| 20 | `ABI_ERR_RECORDING_TIME_OUT_OF_RING` | Timestamp poza zakresem ring-buffera |
+| 21 | `ABI_ERR_PAYLOAD_TOO_LARGE` | Payload przekroczyl limit wielkosci |
+| 22 | `ABI_ERR_GATE_NOT_SATISFIED` | Gate niespelniony — operacja zablokowana |
+| 23 | `ABI_ERR_FRAME_TOKEN_INVALID` | PickupToken/FrameToken nieprawidlowy lub wygasly |
+| 24 | `ABI_ERR_FRAME_PURGED` | Frame zostal wyczyszczony |
+
+Stare kody pre-F1a (zachowane dla `storage_*`, `http_*`, `llm_*`, `ui_*`, `events_*`, `secret_*`):
+
 | Kod | Stala | Opis |
 |-----|-------|------|
-| 0 | `ABI_OK` | Operacja zakonczona sukcesem |
-| -1 | `ABI_ERR_PERMISSION` | Brak wymaganych uprawnien |
-| -2 | `ABI_ERR_OPERATION` | Blad operacji (ogolny) |
-| -3 | `ABI_ERR_NOT_FOUND` | Zasob nie znaleziony |
-| -4 | `ABI_ERR_TIMEOUT` | Przekroczono limit czasu |
+| -1 | `ABI_ERR_PERMISSION` (legacy) | Brak uprawnien |
+| -2 | `ABI_ERR_OPERATION` (legacy) | Blad operacji |
+| -3 | `ABI_ERR_TIMEOUT` (legacy) | Timeout |
+| -4 | `ABI_ERR_RATE_LIMIT` (legacy) | Rate limit |
+| -5 | `ABI_ERR_NOT_FOUND` (legacy) | Nie znaleziono |
+| -6 | `ABI_ERR_BUFFER_TOO_SMALL` (legacy) | Bufor za maly |
+
+---
+
+## Versioning ABI
+
+### Konwencja nazw
+
+Nowe host functions F1a uzywaja sufiksu `_v1` (np. `sql_exec_v1`, `alias_get_v1`, `camera_add_v1`). Sufiks otwiera droge do `_v2` przy lamiacych zmianach bez breaking caller'ow `_v1`.
+
+### Manifest
+
+Addon moze zadeklarowac wymagana wersje SDK rdzenia:
+
+```toml
+[addon]
+sdk_version = ">=0.2.0, <1.0"  # semver VersionReq
+```
+
+Pole jest opcjonalne — brak deklaracji = zakladamy kompatybilnosc.
+
+### Mechanizm rejekcji
+
+Rdzen eksportuje `CORE_SDK_VERSION = "0.2.0"` (stala kompilacji w `addon::sdk_version`). Przy instalacji `lifecycle::install` parsuje `manifest.sdk_version` jako `semver::VersionReq` i sprawdza dopasowanie do `CORE_SDK_VERSION`. Mismatch → install rolled back z `AbiError::Operation` (kod 5) i czytelnym komunikatem (`Addon 'X' wymaga SDK 'Y', rdzen ma 'Z'`).
+
+Bumpujemy `CORE_SDK_VERSION` przy:
+- usunieciu host function,
+- zmianie ABI signatury istniejacego `_v1`,
+- zmianie semantyki zwracanych kodow bledow.
+
+Dodanie nowej host function lub nowego pola manifestu nie wymaga bumpu (addony nie deklaruja czego nie potrzebuja).
+
+---
+
+## Audit log — risk_class
+
+Wpisy `audit_log` od F1a maja kolumne `risk_class` klasyfikujaca operacje wg RODO. Indeks partial `idx_audit_risk_class` (WHERE risk_class IN ('B','C')) umozliwia szybkie kwerendy zgodnosciowe.
+
+| Klasa | Kiedy uzyc |
+|-------|------------|
+| `A` | Operacje administracyjne / techniczne bez danych osobowych (start/stop, config) |
+| `B` | Operacje na danych osobowych zwyklych (RODO art. 6 — kontakty, identyfikatory) |
+| `C` | Dane wrazliwe / biometryczne / decyzje automatyczne (RODO art. 9, art. 22 — rozpoznanie twarzy, ADR) |
+| `unclassified` | Backward compat — wpisy sprzed F1a; domyslna wartosc kolumny |
+
+Preferowane API host-side: `audit_log_with_risk(state, action, resource_type, resource_id, risk_class, related_claim_id, request_id, result, error_message)`. Stara funkcja `audit_log(...)` deleguje z `RiskClass::Unclassified` — istniejacy kod nie wymaga zmian.
+
+`related_claim_id` (powiazany claim, F2) i `request_id` (korelacja wielu wpisow w obrebie jednego service_call) sa opcjonalne — przekazuj `None` gdy nie dotycza.
 
 ---
 
@@ -574,3 +710,1223 @@ stop_timeout_ms = 3000
 has_settings_panel = true
 has_dashboard_widget = true
 ```
+
+---
+
+## 10. Nowe API w F1a (planowane do implementacji)
+
+Sekcja informacyjna — pelna dokumentacja per API zostanie dodana wraz z
+implementacja w odpowiednich tygodniach planu F1a. Zarys w
+`notes/tentavision-plan.md` §6 (ABI kontrakty).
+
+| API | Funkcje | Tydzien |
+|-----|---------|---------|
+| **SQL** | `sql_exec_v1`, `sql_query_v1`, `sql_query_one_v1`, `sql_transaction_v1` | M0.W2 stub, M1.W5 pelne |
+| **Aliases (readonly)** | `alias_get_v1`, `alias_list_owned_v1` | M1.W5 |
+| **Camera** | `camera_add_v1`, `camera_list_v1`, `camera_get_v1`, `camera_snapshot_v1`, `camera_discover_v1`, `camera_test_connection_v1`, `camera_health_v1`, `camera_credentials_rotate_v1`, `camera_remove_v1`, `camera_update_v1` | M0.W2 stub, M2 pelne |
+| **Streaming** | `stream_subscribe_v1`, `stream_next_v1`, `stream_close_v1` | M0.W2 stub, M2 pelne |
+| **Recording** | `recording_save_segment_v1`, `recording_save_snapshot_v1`, `recording_get_url_v1`, `recording_stats_v1`, `frame_url_v1` | M0.W2 stub, M2 pelne (basic) |
+| **service_call (extended)** | `service_call_v1(alias, method, payload)` — istniejace `service_call` rozszerzone o parametr `method` | M0.W2 stub, M2 pelne |
+| **Vector** | `vector_upsert_v1`, `vector_search_v1`, `vector_delete_v1` | F1c P3 (see section 16) |
+| **Claims/Gates** | `claim_add_v1`, `claim_check_v1`, `claim_revoke_v1`, `gate_check_v1`, `gate_enforce_v1` | F2 |
+| **Flow** | `flow_invoke_v1`, `flow_status_v1`, `flow_list_v1`, `flow_get_v1` | F2 |
+| **Audit** | `audit_log_with_risk_v1`, `audit_query_v1`, `audit_export_v1`, `audit_verify_v1` | M0.W3 risk_class, F2 export |
+
+**Konwencja nazewnictwa:** wszystkie nowe host functions koncza sie na `_v1`
+(versioning ABI). Kolejne wersje (`_v2`, ...) bedzie wprowadzane bez usuwania
+starszych, dopoki istnieje addon korzystajacy ze starej wersji.
+
+**Kody bledow:** nowy enum `AbiError` z 24 kodami z `tentavision-plan.md` §6.2.Y
+zostanie dodany w M0.W2 (`src/addon/errors.rs`). Najwazniejsze nowe kody:
+`ABI_ERR_PAYLOAD_TOO_LARGE`, `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` (retry semantics
+z `*out_len_ptr` = required size), `ABI_ERR_GATE_NOT_SATISFIED`,
+`ABI_ERR_RATE_LIMITED`.
+
+**Status M0.W1 (manifest parser):** zaimplementowany. Dokumentacja sekcji
+manifestu: `docs/ADDON_MANIFEST.md`. Testy: `tests/addon_manifest_parsing.rs`.
+
+---
+
+## 11. SQL API (F1a M1.W4 — zaimplementowane)
+
+Per-addon SQLite. Kazdy addon dostaje wlasny plik bazy `~/.tentaflow/addons/<addon_id>/data.db`
+z WAL mode, `foreign_keys=ON`, `synchronous=NORMAL`, `busy_timeout=5s`. Izolacja
+przez FS sandbox (`addon/fs_sandbox.rs`) + walidacje `addon_id` regex
+`^[a-z0-9][a-z0-9-]{0,63}$`. DDL (CREATE/ALTER/DROP/VACUUM/PRAGMA itp.) jest
+zablokowane w runtime — schemat zmienia sie wylacznie przez migracje z bundle
+addona.
+
+### Wymagania manifestu
+
+Addon musi zadeklarowac:
+
+```toml
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"        # opcjonalnie, default "ansi"
+migrations_dir = "migrations" # opcjonalnie, default "migrations"
+encryption = "none"           # F1a: "at-rest" akceptowane ale nie wymuszone (F8: SQLCipher)
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt SQL"
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis SQL"
+risk = "medium"
+```
+
+Bez `[storage] sql = true` wszystkie host functions SQL zwracaja
+`AbiError::Permission` (1). Bez uprawnien `sql.read`/`sql.write` analogicznie.
+
+### Migracje
+
+Pliki `*.sql` w `<bundle>/<migrations_dir>/` z nazewnictwem `NNN_lowercase_name.sql`
+(>=3 cyfry numerujace + podkreslnik + nazwa). Aplikowane leksykograficznie przy
+`install_addon`. Kazda migracja runuje w transakcji per-addon SQLite
+(`execute_batch` w `BEGIN; ...; COMMIT;`); fail dowolnego statementu w pliku =
+rollback calej migracji.
+
+Idempotencja: tabela core DB `addon_migrations_applied` przechowuje
+`(addon_id, migration_name, migration_hash)`. Re-install z tym samym hash =
+skip. Hash mismatch (recznie zmodyfikowany plik po apply) = install fail
++ audit anomaly. Status `failed` umozliwia retry przy kolejnym install.
+
+Przyklad `migrations/001_init.sql`:
+
+```sql
+CREATE TABLE alarms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('info','warning','critical')),
+    note TEXT
+);
+CREATE INDEX idx_alarms_camera_ts ON alarms(camera_id, ts);
+```
+
+### DDL block w runtime
+
+Zapytania zaczynajace sie (po whitespace) od `CREATE`, `ALTER`, `DROP`,
+`TRUNCATE`, `REINDEX`, `VACUUM`, `ATTACH`, `DETACH`, `PRAGMA` sa odrzucane z
+`AbiError::Permission`. Cel: addony nie moga uciec sandboxowi schematu
+(np. dodajac kolumne pomijajaca aplikacja constraintu). Schemat zmienia sie
+wylacznie przez migrations, ktore sa wersjonowane przez hash.
+
+### SQL injection protection
+
+Wszystkie parametry sa bindowane przez `rusqlite::params_from_iter` — nigdy
+string concat. Wartosc `"'; DROP TABLE x;--"` jako parametr zostanie zapisana
+literalnie do TEXT kolumny, bez interpretacji jako SQL.
+
+### Limity i timeouts
+
+| Wlasciwosc | Wartosc |
+|------------|---------|
+| Payload combined (query + params) | 4 MB (`PayloadKind::SqlCombined`) |
+| Query timeout | 30 s (watchdog na `InterruptHandle::interrupt()`) |
+| Connection pool per addon | 5 polaczen (`r2d2`) |
+| Pool get timeout | 10 s |
+| SQLite `busy_timeout` | 5000 ms |
+
+### Encryption at-rest
+
+Deklaracja `encryption = "at-rest"` w manifescie jest akceptowana w F1a, ale
+NIE wymusza szyfrowania (SQLCipher integration planowane w F8). Runtime
+loguje warning przy install. Addon dziala normalnie — plik `data.db` jest
+plain SQLite.
+
+### sql_exec_v1
+
+DML (`INSERT`, `UPDATE`, `DELETE`). Uprawnienie: `sql.write`.
+
+ABI:
+
+```
+sql_exec_v1(
+    query_ptr: i32, query_len: i32,
+    params_json_ptr: i32, params_json_len: i32,
+    out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+) -> i32
+```
+
+Input `params_json` — JSON array (pusty `[]` = brak parametrow). Wartosci:
+
+| JSON | SQLite |
+|------|--------|
+| `null` | `NULL` |
+| `true`/`false` | `INTEGER 1/0` |
+| Integer | `INTEGER` |
+| Real (float) | `REAL` |
+| String | `TEXT` |
+| `{"$bytes": "<base64>"}` | `BLOB` |
+
+Output JSON: `{"rows_affected": <u64>, "last_insert_id": <i64>}`.
+
+Kody bledow: `0` OK, `1` Permission (brak `sql.write` / brak `[storage] sql=true` / DDL),
+`4` Timeout (>30s), `5` Operation (params parse fail), `8` SqlSyntax,
+`9` SqlConstraint (UNIQUE/FK/CHECK/NOT NULL), `21` PayloadTooLarge.
+
+### sql_query_v1
+
+`SELECT`, `WITH`, `EXPLAIN`. Uprawnienie: `sql.read`. Pisaca komenda
+zwraca `AbiError::Permission` z komunikatem audit "use sql_exec for writes".
+
+ABI identyczne jak `sql_exec_v1`. Output JSON:
+
+```json
+{
+  "columns": ["id", "ts", "severity"],
+  "rows": [
+    [1, 1715515200, "warning"],
+    [2, 1715515210, "info"]
+  ]
+}
+```
+
+Wartosci BLOB w wierszach zwracane jako `{"$bytes": "<base64>"}`.
+
+### sql_query_one_v1
+
+Jak `sql_query_v1`, ale zwraca pierwszy wiersz lub `null`. Output:
+`{"row": [<v1>, <v2>, ...]}` lub `{"row": null}`. Gdy wynik > 1 wiersz =
+audit warning, zwraca pierwszy.
+
+### sql_transaction_v1
+
+Atomic batch DML. Uprawnienie: `sql.write`.
+
+ABI:
+
+```
+sql_transaction_v1(
+    statements_json_ptr: i32, statements_json_len: i32,
+    out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+) -> i32
+```
+
+Input:
+
+```json
+{
+  "statements": [
+    {"query": "INSERT INTO alarms (camera_id, ts, severity) VALUES (?, ?, ?)",
+     "params": ["cam-1", 1715515200, "warning"]},
+    {"query": "INSERT INTO alarms (camera_id, ts, severity) VALUES (?, ?, ?)",
+     "params": ["cam-1", 1715515210, "info"]},
+    {"query": "UPDATE cameras SET last_alarm_ts = ? WHERE id = ?",
+     "params": [1715515210, "cam-1"]}
+  ]
+}
+```
+
+Wszystkie statementy w jednej transakcji. Fail dowolnego = rollback wszystkich.
+Output: `{"rows_affected_total": <i64>}`. DDL w ktoremkolwiek statemencie
+przed startem transakcji = `AbiError::Permission`.
+
+### Przyklad uzycia (Rust SDK)
+
+```rust
+use tentaflow_addon_sdk::prelude::*;
+
+fn save_alarm(camera_id: &str, ts: i64, severity: &str) -> Result<i64, i32> {
+    let res = sql_exec(
+        "INSERT INTO alarms (camera_id, ts, severity) VALUES (?, ?, ?)",
+        &[
+            SqlValue::String(camera_id.to_string()),
+            SqlValue::I64(ts),
+            SqlValue::String(severity.to_string()),
+        ],
+    )?;
+    Ok(res.last_insert_id)
+}
+
+fn recent_alarms(camera_id: &str, since: i64) -> Result<Vec<(i64, i64)>, i32> {
+    let rows = sql_query(
+        "SELECT id, ts FROM alarms WHERE camera_id = ? AND ts > ? ORDER BY ts DESC LIMIT 100",
+        &[
+            SqlValue::String(camera_id.to_string()),
+            SqlValue::I64(since),
+        ],
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| match (row.get(0), row.get(1)) {
+            (Some(SqlValue::I64(id)), Some(SqlValue::I64(ts))) => Some((*id, *ts)),
+            _ => None,
+        })
+        .collect())
+}
+
+fn batch_update(rows: &[(String, i64)]) -> Result<u64, i32> {
+    let stmts: Vec<(&str, &[SqlValue])> = rows
+        .iter()
+        .map(|(id, ts)| {
+            (
+                "UPDATE cameras SET last_seen = ? WHERE id = ?",
+                vec![SqlValue::I64(*ts), SqlValue::String(id.clone())].leak() as &[SqlValue],
+            )
+        })
+        .collect();
+    sql_transaction(&stmts)
+}
+```
+
+### Audit
+
+Kazde wywolanie SQL host function pisze do `audit_log` przez `audit_log_with_risk`:
+
+- `action` = `sql.exec` / `sql.query` / `sql.query_one` / `sql.transaction`
+- `resource_type` = `sql`
+- `resource_id` = pierwsze 16 znakow hex SHA256(query) (dla compliance bez ujawniania pelnej tresci)
+- `risk_class` = `A` (operacyjne)
+- `result` = `ok` / `denied` / `error`
+
+---
+
+## 12. Aliases (readonly)
+
+Readonly query metadanych aliasow AI w globalnej tabeli `model_aliases`.
+Addon **nie tworzy ani nie deaktywuje** aliasow przez ABI w runtime —
+zarzadzanie cyklem zycia aliasow nalezy do core (lifecycle hooks):
+
+- **install** → `install_manifest_aliases` czyta `[[alias]]` z manifestu i
+  zapisuje aliasy w `model_aliases` z `owner = addon:<addon_id>` plus rekordy
+  `model_alias_visibility` i `model_alias_consumers` na podstawie pol
+  `visibility` / `allowed_consumers`.
+- **uninstall** → `deactivate_aliases_owned_by_addon` ustawia `is_active=0`
+  na wszystkich aliasach z `owner_id = <addon_id>`. Wiersze pozostaja
+  (admin moze je trwale usunac z poziomu M16).
+- **upgrade** (F1b/F2) → diff manifestu starego vs nowego: nowe aliasy
+  dodawane, znikajace deaktywowane.
+
+Permission wymagana przez ponizsze host functions: `alias.read`
+(uprzednio nazywane `alias.manage`).
+
+### `alias_get_v1(alias_id_ptr, alias_id_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Zwraca metadane aliasu jako TOML. **Pola statystyczne**
+(`last_used_target`, `last_used_at`, `calls_24h`, `fallback_calls_24h`) sa
+stripowane gdy caller nie jest ownerem aliasu — chroni przed wyciekiem
+wzorcow uzycia miedzy addonami.
+
+| Parametr | Typ | Opis |
+|----------|-----|------|
+| `alias_id_ptr/len` | `i32` | Identyfikator aliasu (UTF-8) |
+| `out_ptr/out_cap/out_len_ptr` | `i32` | Bufor wyjsciowy z retry semantyka (sekcja "out_cap retry pattern") |
+
+**Output (TOML, AliasInfo):**
+
+```toml
+id = "teams-stt"
+display_name = "Teams meeting STT"
+owner = "addon:teams-bot"
+visibility = "restricted"
+current_target = "whisper-large-v3"
+fallback_targets = ["whisper-medium", "vosk-pl"]
+strategy = "first_available"
+is_active = true
+# nizsze pola tylko gdy caller == owner
+last_used_target = "whisper-large-v3"
+last_used_at = 1715515200
+calls_24h = 412
+fallback_calls_24h = 3
+```
+
+**Errors:**
+- `ABI_OK` (0) — sukces
+- `ABI_ERR_PERMISSION` (1) — brak `alias.read`
+- `ABI_ERR_NOT_FOUND` (2) — alias nie istnieje
+- `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` (6) — `out_cap` za maly (`*out_len_ptr` ma wymagany rozmiar)
+
+### `alias_list_owned_v1(out_ptr, out_cap, out_len_ptr) -> i32`
+
+Listuje wszystkie aliasy, ktorych ownerem jest wywolujacy addon. Wynik to
+TOML array `AliasInfo` (z pelnymi statystykami, bo zawsze owner).
+
+**Errors:**
+- `ABI_OK` (0)
+- `ABI_ERR_PERMISSION` (1) — brak `alias.read`
+- `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` (6)
+
+### SDK API (Rust)
+
+```rust
+use tentaflow_addon_sdk::prelude::*;
+
+pub fn alias_get(id: &str) -> Result<AliasInfo, AbiError>;
+pub fn alias_list_owned() -> Result<Vec<AliasInfo>, AbiError>;
+```
+
+### Przyklad — addon sprawdza w `on_tick` czy jego alias jest aktywny
+
+Admin moze w panelu M16 deaktywowac alias mimo ze addon jest zainstalowany.
+Addon powinien wykrywac taki stan i graceful-fallback:
+
+```rust
+fn on_tick(_ts: i64) -> i32 {
+    match alias_get("teams-stt") {
+        Ok(info) if info.is_active => {
+            // alias dostepny — normalna sciezka
+            run_stt_pipeline();
+        }
+        Ok(_) => {
+            log_warn("alias 'teams-stt' jest nieaktywny — pomijam tick STT");
+        }
+        Err(AbiError::NotFound) => {
+            // wariant defensywny: alias zostal usuniety przez admina (M16)
+            log_error("alias 'teams-stt' nie istnieje juz w core");
+        }
+        Err(e) => return e.into(),
+    }
+    ABI_OK
+}
+```
+
+## 13. Camera API (F1a M1.W6 — TentaVision)
+
+Camera ingest layer dla addonow video (TentaVision). Wszystkie host functions
+sa gated za cargo feature `camera`, ktore wciaga zalezosci GStreamer. Payload
+input/output to TOML (nie JSON).
+
+**Scope F1a:** wylacznie vendor `fake_file` (mp4 loop via GStreamer
+`filesrc`). RTSP, ONVIF discovery i rotacja credentialow przyjda w F1b/F1c —
+host functions sa zaimplementowane juz teraz jako noop zeby stabilizowac
+ABI dla SDK.
+
+**Uprawnienia (manifest `[[permission]].id`):**
+
+| Permission         | Risk | Funkcje                                                                     |
+|--------------------|------|-----------------------------------------------------------------------------|
+| `cameras.read`     | B    | `camera_list_v1`, `camera_get_v1`, `camera_health_v1`                       |
+| `cameras.write`    | A    | `camera_add_v1`, `camera_update_v1`, `camera_remove_v1`, `camera_discover_v1`, `camera_test_connection_v1`, `camera_credentials_rotate_v1` |
+| `cameras.snapshot` | A    | `camera_snapshot_v1`                                                        |
+
+**Ownership guard:** wszystkie operacje (read i write) sa zakreslone do
+kamer nalezacych do wywolujacego addona (`owner_addon_id = caller.addon_id`).
+Cudzy `camera_id` zwraca `NotFound` — nie `Permission` — zeby nie wyciekac
+przez side-channel istnienia kamer innych addonow.
+
+### Sygnatury ABI
+
+```text
+camera_add_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_list_v1(out_ptr, out_cap, out_len_ptr) -> i32
+camera_get_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_update_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_remove_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_snapshot_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_health_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_discover_v1(out_ptr, out_cap, out_len_ptr) -> i32
+camera_test_connection_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_credentials_rotate_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+```
+
+### Schematy TOML — `camera_add`
+
+Input:
+```toml
+display_name = "Front gate"
+vendor = "fake_file"            # F1a: tylko 'fake_file'
+url = "file:///abs/path/sample.mp4"
+target_fps = 30                 # 1..=60, default 30
+resolution_width = 1280         # opcjonalne
+resolution_height = 720         # opcjonalne
+retention_class = "C"           # A/B/C/Unclassified, default C
+profile = "default"             # default 'default'
+```
+
+Output:
+```toml
+camera_id = "cam_<uuid>"
+status = "starting"
+```
+
+Bledy: `CameraVendorUnsupported` (vendor poza whitelist), `Operation`
+(target_fps poza zakresem, pusty display_name, niewlasciwy retention_class,
+zly TOML), `Permission`, `Conflict` (kolizja na partial unique index —
+zazwyczaj wewnetrzny rollback rozwiazuje), `CameraUnreachable`
+(file_not_found / symlink na ścieżce).
+
+### Schematy TOML — `camera_list` / `camera_get`
+
+`camera_list` (bez wejscia) zwraca:
+```toml
+[[camera]]
+camera_id = "cam_xyz"
+display_name = "Front gate"
+vendor = "fake_file"
+url = "file:///abs/path"
+target_fps = 30
+resolution_width = 1280
+resolution_height = 720
+status = "online"
+status_message = ""
+fps_actual = 29.8
+last_frame_at = 1715789000
+retention_class = "C"
+profile = "default"
+```
+
+`camera_get { camera_id = "cam_xyz" }` zwraca pojedynczy `[camera]` ze
+struktury powyzej (bez wrappera tablicy).
+
+Runtime metryki (`status`, `fps_actual`, `last_frame_at`, `status_message`)
+pochodza z supervisora; gdy session nie zyje (np. po restarcie hosta),
+fallback na wartosci z DB.
+
+### Schematy TOML — `camera_update`
+
+```toml
+camera_id = "cam_xyz"
+# Wszystkie ponizsze pola opcjonalne — pomin pole zeby zostawic bez zmian.
+display_name = "Front gate v2"
+target_fps = 25
+resolution_width = 1920
+resolution_height = 1080
+retention_class = "B"
+profile = "high_quality"
+```
+
+`vendor` i `url` NIE mogą byc updateowane — zmiana wymaga `camera_remove` +
+`camera_add`. F1a: runtime config supervisora nie jest rebuiltowany —
+nowy target_fps wchodzi po remove+add. Bledy jak w `camera_add`.
+
+### Schematy TOML — `camera_remove`
+
+Input:
+```toml
+camera_id = "cam_xyz"
+```
+Output:
+```toml
+removed = true
+```
+Soft-delete (stamps `removed_at`). Re-add tego samego `camera_id` jest
+dozwolony (partial unique index na `camera_id WHERE removed_at IS NULL`).
+
+### Schematy TOML — `camera_snapshot`
+
+Input:
+```toml
+camera_id = "cam_xyz"
+```
+Output:
+```toml
+camera_id = "cam_xyz"
+width = 1280
+height = 720
+pixel_format = "rgb24"
+timestamp_unix_ms = 1715789000123
+data_b64 = "<base64 RGB24 bytes>"
+```
+
+F1a: inline base64. Limit `PayloadKind::ServiceCall` = 8 MB. 1280x720 RGB24
+(2.76 MB raw, ~3.7 MB base64) miesci sie; 1920x1080 (~8.3 MB base64)
+przekroczy limit → `PayloadTooLarge`. F1c wprowadzi `SnapshotRef` z M1.W7
+LRU frame storage.
+
+### Schematy TOML — `camera_health`
+
+Input:
+```toml
+camera_id = "cam_xyz"
+```
+Output:
+```toml
+camera_id = "cam_xyz"
+status = "online"        # offline/starting/online/error/stopping
+status_message = ""
+fps_actual = 29.8
+last_frame_at = 1715789000
+frames_total = 12345
+frames_dropped = 0
+```
+
+### Schematy TOML — `camera_discover`
+
+Brak inputu. F1a output:
+```toml
+discovered = []
+```
+F1b doda RTSP + ONVIF probe.
+
+### Schematy TOML — `camera_test_connection`
+
+Input:
+```toml
+vendor = "fake_file"
+url = "file:///path/file.mp4"
+```
+Output:
+```toml
+ok = true
+message = "fake_file path readable"
+```
+Albo `ok = false` z `message` opisujacym przyczyne (symlink, brak pliku,
+nieprawidlowy URL).
+
+### Schematy TOML — `camera_credentials_rotate`
+
+Input:
+```toml
+camera_id = "cam_xyz"
+new_credentials_b64 = "..."      # opcjonalne
+```
+F1a output (noop dla `fake_file`):
+```toml
+rotated = false
+reason = "f1a_noop_fake_file_has_no_credentials"
+```
+
+### Przyklad — addon dodaje kamere i co tick odswieża metryki
+
+```rust
+use tentaflow_addon_sdk::prelude::*;
+
+fn on_start() -> Result<(), AbiError> {
+    let spec = CameraAddSpec {
+        display_name: "Front gate".into(),
+        vendor: "fake_file".into(),
+        url: "file:///opt/tentaflow/samples/gate.mp4".into(),
+        target_fps: 25,
+        retention_class: "C".into(),
+        ..Default::default()
+    };
+    let added = camera_add(&spec)?;
+    store_set("front_gate_id", &added.camera_id).ok();
+    Ok(())
+}
+
+fn on_tick(_ts: i64) -> i32 {
+    let id = match store_get("front_gate_id").ok().flatten() {
+        Some(v) => v,
+        None => return AbiError::Ok.as_i32(),
+    };
+    if let Ok(h) = camera_health(&id) {
+        if h.frames_dropped > 0 {
+            log_warn(&format!("front_gate dropped {} frames", h.frames_dropped));
+        }
+    }
+    AbiError::Ok.as_i32()
+}
+```
+
+
+## 14. Streaming + Service-to-Core API (F1a M1.W7 — TentaVision)
+
+Wymaga `--features camera` w kompilacji core. Trzy host functions dla addona
+plus jeden Service-to-Core HTTP endpoint dla mikroserwisow AI.
+
+### Flow
+
+```
+camera_supervisor  →  FrameStorage LRU (frame_<uuid>)
+                  →  StreamingBus (per-camera bounded mpsc)
+                  →  stream_subscribe / stream_next        (addon, frame_ref + metadata)
+                  →  service_call(alias, {…, frame_ref})
+                       → core mints PickupToken (HMAC, TTL 30s, one-shot)
+                       → core injects pickup_token + request_id + service_id w payload
+                       → QUIC do service
+                  →  service: POST /core/frame/pickup
+                       + X-Pickup-Token: <wire>
+                       + X-Frame-Raw-Ref: frame_<uuid>
+                       + X-Service-Id: <service_id>
+                       + X-Request-Id: <uuid>
+                  →  core: verify HMAC + cross-check headers + remove from LRU
+                  →  response: bytes + X-Frame-Width/-Height/-Pixel-Format/-Timestamp-Ms/-Pts
+```
+
+### `stream_subscribe_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `streams.subscribe` |
+| Risk | B (read-only access do live frames) |
+| Input TOML | `target = "camera:<camera_id>"` + opcjonalnie `[filter] max_fps skip_frames` |
+| Output TOML | `stream_id = "stream_<uuid>"` |
+
+Ownership enforced — addon moze subscribe TYLKO do wlasnych kamer. Cross-addon
+subscribe zwraca `NotFound` (zapobiega enumeracji cudzych camera_id).
+
+### `stream_next_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `streams.subscribe` |
+| Risk | B |
+| Input TOML | `stream_id = "stream_<uuid>"` + `timeout_ms = <0..5000>` |
+| Output TOML | `type = "frame" \| "drop" \| "camera_offline" \| "timeout"` + pola zalezne |
+
+Frame bytes NIE sa inline w odpowiedzi — addon dostaje `frame_ref` + metadata.
+Zeby przekazac ramke do service uzyj `service_call_v1` z `frame_ref` w
+payloadzie (core wystawi `PickupToken` automatycznie).
+
+Warianty:
+
+```toml
+# Frame
+type = "frame"
+frame_ref = "frame_<uuid>"
+camera_id = "cam_<uuid>"
+width = 1280
+height = 720
+pixel_format = "rgb24"
+timestamp_unix_ms = 1715789000000
+
+# Drop (backpressure)
+type = "drop"
+count = 12
+
+# Kamera offline
+type = "camera_offline"
+reason = "removed"
+
+# Timeout — brak ramki w timeout_ms
+type = "timeout"
+```
+
+### `stream_close_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `streams.subscribe` |
+| Risk | B |
+| Input TOML | `stream_id = "stream_<uuid>"` |
+| Output TOML | `closed = true` |
+
+Drop slot → channel closes → kolejny `stream_next` z tym `stream_id` zwraca
+`StreamNotFound`.
+
+### PickupToken — security model
+
+```
+PickupToken wire = base64(json({raw_ref, service_id, request_id, expiry_unix_ms, one_shot})).base64(HMAC-SHA256(signing_key, payload_b64))
+```
+
+- **Signing key:** 32B random z `OsRng`, generowany przy starcie procesu.
+  Restart procesu invaliduje wszystkie outstanding tokeny (akceptowalne, TTL 30s).
+- **TTL:** 30s default (DEFAULT_TTL w `services/pickup_tokens/mod.rs`).
+- **One-shot:** `AtomicBool::compare_exchange(false, true)` — pierwszy
+  pickup wygrywa, drugi dostaje 403 `unauthorized` (replay detected).
+- **Cross-service:** payload zawiera `service_id`; pickup wymaga
+  `X-Service-Id == payload.service_id` — token wystawiony dla service A
+  zwroci 403 jezeli probowac uzyc dla service B.
+- **Constant-time HMAC verify** przez `subtle::ConstantTimeEq` — bez timing leaks.
+- **Inflight DashMap** sweep co 60s, retention 2× TTL.
+
+### Service-to-Core HTTP API
+
+`POST /core/frame/pickup` — bez JWT, bez Origin check (CSRF exempt). Service
+autoryzuje sie wylacznie przez token.
+
+| Header request | Opis |
+|----------------|------|
+| `X-Pickup-Token` | Wire token (payload_b64.signature_b64) |
+| `X-Frame-Raw-Ref` | `frame_<uuid>` — musi rownac sie `payload.raw_ref` |
+| `X-Service-Id` | Recipient service id — musi rownac sie `payload.service_id` |
+| `X-Request-Id` | UUID — musi rownac sie `payload.request_id` |
+
+| Status | Opis | `frame_pickup_log.result` |
+|--------|------|---------------------------|
+| 200 OK | Bajty RGB24 w body + metadata w headerach | `ok` |
+| 400 Bad Request | Brak/empty header | `token_invalid` |
+| 403 Forbidden | HMAC mismatch / malformed / unknown token | `token_invalid` |
+| 403 Forbidden | Replay (already consumed) / cross-service header mismatch | `unauthorized` |
+| 404 Not Found | Frame evicted z LRU przed pickup | `frame_purged` |
+| 410 Gone | Token wygasl | `token_expired` |
+
+Response headers przy 200:
+
+| Header | Wartosc |
+|--------|---------|
+| `Content-Type` | `application/octet-stream` |
+| `X-Frame-Width` | u32 |
+| `X-Frame-Height` | u32 |
+| `X-Frame-Pixel-Format` | `rgb24` (F1a only) |
+| `X-Frame-Timestamp-Ms` | u64 (Unix ms) |
+| `X-Frame-Pts` | u64 (GStreamer PTS, opcjonalny) |
+
+### SDK example (Rust addon)
+
+```rust
+use tentaflow_addon_sdk::{stream_subscribe, stream_next, stream_close, StreamNextMessage, service_request_call};
+
+fn process_camera(camera_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let stream_id = stream_subscribe(&format!("camera:{}", camera_id), Some(30))?;
+    loop {
+        match stream_next(&stream_id, 1000)? {
+            StreamNextMessage::Frame(meta) => {
+                let req = serde_json::json!({
+                    "frame_ref": meta.frame_ref,
+                    "task": "detect_persons",
+                });
+                let resp = service_request_call("yolo11m", &req.to_string())?;
+                // Core wstrzyknal pickup_token w payload; service uzyl go
+                // do POST /core/frame/pickup i dostal bajty z LRU.
+                log_info(&format!("yolo response: {}", resp));
+            }
+            StreamNextMessage::Drop { count } => log_warn(&format!("dropped {} frames", count)),
+            StreamNextMessage::CameraOffline { reason } => break,
+            StreamNextMessage::Timeout => continue,
+        }
+    }
+    stream_close(&stream_id).ok();
+    Ok(())
+}
+```
+
+## 15. Recording API + frame_url (F1a M1.W8 — TentaVision)
+
+7 host functions zarzadzaja trwalymi nagraniami (PNG snapshot, MP4 segment) plus
+multi-use signed URL-ami do raw frames z LRU. Wszystkie wywolania chronione sa
+parami `recording.read` / `recording.write`. Wymaga buildu core'a z
+`--features camera`; bez tego host functions nie sa zarejestrowane i guest
+otrzyma "missing import" przy instancjonowaniu.
+
+### Permission + risk map
+
+| Host function | Permission | Risk (audit) |
+|---|---|---|
+| `recording_save_snapshot_v1` | `recording.write` | A (z `retention_class` kamery) |
+| `recording_save_segment_v1` | `recording.write` | A |
+| `recording_get_url_v1` | `recording.read` | B |
+| `recording_get_stream_v1` | `recording.read` | B |
+| `recording_purge_v1` | `recording.write` | A |
+| `recording_stats_v1` | `recording.read` | B |
+| `frame_url_v1` | `recording.read` | B |
+
+`audit_log_with_risk` wpisuje klase ryzyka rownego `retention_class` rekordu
+(`A`/`B`/`C`/`Unclassified`) — niezalezna kopia jest zapisana w wierszu
+`recordings.retention_class`, wiec audit chain zachowuje sie nawet jesli
+kamera zostanie pozniej zmodyfikowana.
+
+### F1a limitations
+
+- Tylko snapshot PNG (RGB24 → `image::codecs::png`).
+- Segmenty MP4 przez GStreamer `x264enc tune=zerolatency` + `mp4mux` z
+  `file://` source (np. fakefile loop). RTSP live tap dochodzi w F1b.
+- Brak automatycznej retencji — wszystkie nagrania trzeba czyscic recznie przez
+  `recording_purge_v1`.
+- `recording_get_stream_v1` zwraca bajty inline (base64 w TOML) z hard-cap 8 MiB.
+  Dla wiekszych artefaktow trzeba uzyc `recording_get_url_v1` + HTTP handler
+  (Chunk D).
+
+### Signed URL flow
+
+```
+addon → recording_get_url_v1(ref, ttl_secs)
+        ↓
+HMAC-SHA256 over "recording:<ref>:<exp_ms>" using per-process recording key
+        ↓
+URL: /recordings/<ref>?token=<b64>&exp=<ms>&ref=<ref>
+        ↓
+HTTP GET → (Chunk D handler) verify HMAC + expiry, stream bytes from disk
+```
+
+`frame_url_v1` ma identyczna mechanike, ale:
+- inny scope w HMAC payload (`"frame:<ref>:<exp_ms>"`),
+- inny per-process key,
+- TTL `60..=600s` (vs `60..=3600s` recording).
+
+### 15.1 `recording_save_snapshot_v1` (write, risk A)
+
+**Input (TOML):**
+```toml
+camera_id = "cam_<uuid>"
+frame_ref = "frame_<uuid>"      # musi byc w LRU + nalezec do camera_id
+retention_class = "C"           # opcjonalne; default = cameras.retention_class
+```
+
+**Output (TOML):**
+```toml
+recording_ref = "snap_<uuid>"
+file_path = "/home/.../.tentaflow/recordings/<camera>/snapshots/snap_<uuid>.png"
+file_size_bytes = 12345
+hash_sha256 = "..."
+width = 1280
+height = 720
+created_at = 1715789000
+```
+
+**Logika:**
+1. ownership: `cameras WHERE camera_id=? AND owner_addon_id=AddonState.id`,
+2. `frame_storage().get(...)` — peek, brak remove,
+3. weryfikacja `frame.metadata.camera_id == camera_id` (defense-in-depth),
+4. `save_snapshot_rgb24(...)` → PNG na dysku,
+5. `INSERT INTO recordings` z `kind='snapshot'` + retention,
+6. `audit_log_with_risk(...)` z `risk = retention_class`.
+
+### 15.2 `recording_save_segment_v1` (write, risk A)
+
+**Input (TOML):**
+```toml
+camera_id = "cam_<uuid>"
+duration_secs = 5                             # 1..=60
+retention_class = "C"                         # opcjonalne
+```
+
+`source_url` jest **wyprowadzane host-side** z wiersza `cameras.url` dla
+`camera_id` przypisanego do wolajacego addona — addon nigdy nie podaje go
+sam, co eliminuje wektor czytania dowolnych plikow hosta przez segment.
+W F1a akceptujemy wylacznie `vendor='fake_file'`. Plik segmentu jest zawsze
+najpierw zapisywany do `<final>.mp4.tmp` i atomowo (`rename`) promowany do
+`<final>.mp4` dopiero po pomyslnej finalizacji `mp4mux` — niepelnych mp4
+nie ma na dysku.
+
+**Output:** identyczny `SavedRecordingOut` jak snapshot, z `duration_ms`
+zamiast `width/height`. Brak `pixel_format` (mp4 nie probujemy probowac w F1a).
+
+### 15.3 `recording_get_url_v1` (read, risk B)
+
+**Input:**
+```toml
+recording_ref = "snap_..."     # lub "clip_..."
+ttl_secs = 300                  # 60..=3600
+```
+
+**Output:**
+```toml
+url = "/recordings/snap_xxx?token=<b64>&exp=<ms>&ref=snap_xxx"
+expires_unix_ms = ...
+```
+
+### 15.4 `recording_get_stream_v1` (read, risk B)
+
+Zwraca bajty inline w polu `data_b64`. Calosc odpowiedzi TOML jest hard-capped
+8 MiB (`PayloadKind::ServiceCall`). Po uwzglednieniu rozszerzenia base64
+(`ceil(N/3)*4`) + ~256 B na nazwy pol i hash, praktyczny limit to ~6 MiB
+surowego pliku → ~8 MiB TOML odpowiedzi. Host odrzuca request **przed** odczytem
+pliku z dysku jesli oszacowany rozmiar odpowiedzi przekracza limit
+(`AbiError::PayloadTooLarge`, audit `error / payload_too_large`). Wieksze
+artefakty trzeba pobierac przez `recording_get_url_v1` + HTTP handler.
+Hash z DB jest dolaczany do odpowiedzi, zeby addon mogl zweryfikowac
+integralnosc po dekodzie.
+
+### 15.5 `recording_purge_v1` (write, risk A)
+
+Idempotent: usuwa plik na dysku (NotFound z systemu plikow nie jest bledem) +
+`UPDATE recordings SET purged_at = ?`. Powtorne wywolanie na tym samym ref
+zwraca `AbiError::NotFound` (wiersz juz nie jest aktywny).
+
+### 15.6 `recording_stats_v1` (read, risk B)
+
+**Input (opcjonalny):**
+```toml
+camera_id = "cam_<uuid>"        # opcjonalny filtr
+```
+
+**Output:**
+```toml
+[stats]
+total_snapshots = 12
+total_segments = 3
+total_size_bytes = 5123456
+
+[[per_camera]]
+camera_id = "cam_xxx"
+snapshots = 10
+segments = 2
+size_bytes = 4096000
+```
+
+### 15.7 `frame_url_v1` (read, risk B)
+
+**Input:**
+```toml
+frame_ref = "frame_<uuid>"
+ttl_secs = 120                  # 60..=600
+```
+
+**Output:**
+```toml
+url = "/frames/<frame_ref>?token=<b64>&exp=<ms>&ref=<frame_ref>"
+expires_unix_ms = ...
+```
+
+**Logika:** weryfikacja ze frame istnieje (peek przez `frame_storage.get`,
+brak remove), nastepnie weryfikacja ownership posrednio: `cameras WHERE
+camera_id = frame.metadata.camera_id AND owner_addon_id = AddonState.id`. URL
+jest multi-use az do `exp` — addon moze pobrac frame wiele razy w obrebie TTL.
+
+### SDK example (Rust addon)
+
+```rust
+use tentaflow_addon_sdk::{
+    recording_save_snapshot, recording_get_url, recording_stats,
+    recording_purge, frame_url, stream_subscribe, stream_next, StreamNextMessage,
+};
+
+fn capture_and_share(camera_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let stream_id = stream_subscribe(&format!("camera:{}", camera_id), Some(5))?;
+    if let StreamNextMessage::Frame(meta) = stream_next(&stream_id, 1000)? {
+        // 1. Wez signed URL na ramke (np. dla zewnetrznego service'u OCR).
+        let url = frame_url(&meta.frame_ref, 120)?;
+        log_info(&format!("frame_url: {} (exp={})", url.url, url.expires_unix_ms));
+
+        // 2. Zapisz snapshot do trwalej pamieci.
+        let saved = recording_save_snapshot(camera_id, &meta.frame_ref, None)?;
+        log_info(&format!("snapshot ref={} ({}B)", saved.recording_ref, saved.file_size_bytes));
+
+        // 3. Wystaw long-TTL URL na zapis.
+        let signed = recording_get_url(&saved.recording_ref, 600)?;
+        log_info(&format!("recording_url: {}", signed.url));
+
+        // 4. Stats + purge po skopiowaniu do storage.
+        let stats = recording_stats(Some(camera_id))?;
+        log_info(&format!("total snapshots={}", stats.total_snapshots));
+        recording_purge(&saved.recording_ref)?;
+    }
+    Ok(())
+}
+```
+
+## 16. Vector API (F1c P3 — TentaVision)
+
+Embedded HNSW per-addon per-namespace vector indexes backed by
+[`usearch`](https://github.com/unum-cloud/usearch) with mmap on-disk
+persistence. Default metric is cosine; `euclidean` and `dot` are
+available per-namespace via the manifest.
+
+Per-addon hard quotas in F1c (configurable in F2+):
+- 10 namespaces per addon
+- 1 000 000 vectors per addon (summed across all its namespaces)
+
+Required permissions:
+
+| Permission | Gates |
+|------------|-------|
+| `vector.read` | `vector_search_v1` |
+| `vector.write` | `vector_upsert_v1`, `vector_delete_v1` |
+
+Every namespace must be declared in the addon manifest under
+`[[vector_namespace]]` — dim + metric + optional gate are pinned at
+install time, addons cannot create ad-hoc namespaces at runtime.
+
+```toml
+[[vector_namespace]]
+name = "faces"
+dimensions = 512
+distance = "cosine"      # cosine | euclidean | dot
+data_class = "B"
+gate = "d4-historical"   # optional — when present, vector_search MUST
+                         # carry a non-empty gate_claim_id
+```
+
+### Wire format
+
+All three calls use TOML for input and output. Vector payloads
+(`vector_b64`, `query_b64`) are base64-encoded little-endian f32 bytes
+— a 512-dim vector encodes to ~2.7 KB, well within the `VectorItem`
+1 MiB payload limit.
+
+### `vector_upsert_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Input TOML:
+```toml
+namespace = "faces"
+ref_id = 17
+vector_b64 = "AAAAQAAAAAA..."
+```
+
+Output TOML:
+```toml
+namespace = "faces"
+ref_id = 17
+count = 12453            # total vectors in the namespace after upsert
+```
+
+Replaces the vector under `ref_id` if it already existed (usearch
+`multi=false` semantics, implemented as remove-then-add inside the
+backend). Persists synchronously to disk before returning. Risk
+class B; audited as `vector.upsert`.
+
+### `vector_search_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Input TOML:
+```toml
+namespace = "faces"
+query_b64 = "AAAAQAAAAAA..."
+k = 10
+gate_claim_id = "claim_abc123"   # required only if the namespace declares a gate
+```
+
+Output TOML:
+```toml
+namespace = "faces"
+
+[[hits]]
+ref_id = 17
+score = 0.0234
+
+[[hits]]
+ref_id = 42
+score = 0.0731
+```
+
+`k` is capped at 1000. `score` is the raw metric distance — lower means
+closer for cosine/euclidean; for `dot` it is `1 - dot product`. Risk
+class B; audited as `vector.search`. Returns `GateNotSatisfied` (code
+22) when the namespace declares a gate and the claim id is missing or
+empty (P3 enforces structural presence; P4 will validate the claim
+against `policy_claims`).
+
+### `vector_delete_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Input TOML:
+```toml
+namespace = "faces"
+ref_id = 17
+```
+
+Output TOML:
+```toml
+namespace = "faces"
+ref_id = 17
+removed = true           # false when the key did not exist
+count = 12452
+```
+
+Risk class B; audited as `vector.delete`.
+
+### SDK wrappers
+
+```rust
+use tentaflow_addon_sdk::prelude::*;
+
+// Upsert — returns the namespace count after the write.
+let embedding: [f32; 512] = compute_face_embedding(&frame);
+let count = vector_upsert("faces", 17, &embedding)?;
+
+// Search — gate_claim_id is None when the namespace declares no gate.
+let hits: Vec<VectorHit> = vector_search("faces", &embedding, 10, None)?;
+for h in &hits {
+    log_info(&format!("ref={} distance={:.4}", h.ref_id, h.score));
+}
+
+// Search a gated namespace.
+let hits = vector_search("faces_historical", &embedding, 10, Some(&claim_id))?;
+
+// Delete returns true when the key existed.
+let removed = vector_delete("faces", 17)?;
+```
+
+### Error codes
+
+| AbiError | Code | Meaning |
+|----------|------|---------|
+| `Permission` | 1 | Missing `vector.read` / `vector.write` |
+| `NotFound` | 2 | Namespace not declared in manifest, or `vector_delete`/`vector_search` against a namespace that has never been written |
+| `Operation` | 5 | Invalid payload, bad b64, dim mismatch, invalid namespace name, k=0 or k>1000 |
+| `OutputBufferTooSmall` | 6 | `out_cap` retry — `out_len_ptr` holds the required size |
+| `QuotaExceeded` | 11 | Per-addon namespace count > 10 or total vectors > 1 000 000 |
+| `PayloadTooLarge` | 21 | Input > 1 MiB or output > 1 MiB |
+| `GateNotSatisfied` | 22 | Namespace declares a gate; `gate_claim_id` missing or empty |
+
+
+## 17. Policy / Gate API (F1c P4 — TentaVision)
+
+Addon-facing API for verifying DPIA / FRIA / legal-grant / consent claims
+issued by an administrator. Used to gate D4 face re-identification and any
+vector namespace whose manifest declares `[[vector_namespace]].gate`.
+
+### 17.1 gate_check_v1
+
+```
+ABI: gate_check_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+Permission: policy.read
+Risk class: B (read-only inspection of regulated policy artifact)
+```
+
+Input TOML:
+```toml
+gate_id = "d4-historical"            # id of [[gate]] declared in manifest
+claim_id = "claim-dpia-faces-2026"   # the claim issued via `tentaflow-cli policy issue`
+resource_scope = "faces"             # optional — vector namespace / alias id
+```
+
+Output TOML:
+```toml
+valid = true
+claim_id = "claim-dpia-faces-2026"
+claim_type = "dpia"
+valid_until = "2030-01-01T00:00:00Z"
+[[signers]]
+role = "dpo"
+user = "alice"
+[[signers]]
+role = "supervisor"
+user = "bob"
+```
+
+When the claim fails validation:
+```toml
+valid = false
+claim_id = "claim-x"
+claim_type = ""
+valid_until = ""
+reason = "claim revoked: claim-x (reason: audit fail)"
+```
+
+Errors:
+- `AbiError::Permission` (1) — addon lacks `policy.read`.
+- `AbiError::NotFound` (2) — `gate_id` not declared in manifest.
+- `AbiError::Operation` (5) — malformed TOML input.
+
+### 17.2 Implicit enforcement in vector_search_v1
+
+When a `[[vector_namespace]]` declares a `gate`, `vector_search_v1`
+denies with `AbiError::GateNotSatisfied` (22) unless the addon passes
+`gate_claim_id = "<claim>"` AND the engine accepts it. Denial reason
+codes (in audit `details`):
+
+- `gate_claim_id_missing` — namespace gated but no claim passed.
+- `gate_not_declared_in_manifest` — manifest gate id missing (should
+  not happen post-install).
+- `claim_not_found` — claim id not in `policy_claims`.
+- `claim_revoked` — claim was revoked via `tentaflow-cli policy revoke`.
+- `claim_outside_validity` — `valid_from..valid_until` does not contain
+  current UTC time.
+- `claim_type_mismatch` — claim's `claim_type` does not match the gate's
+  required type.
+- `claim_scope_mismatch` — claim was narrowed to a different addon /
+  namespace.
+- `missing_required_signer` — no signer with a required role.
+
+### 17.3 SDK wrappers
+
+```rust
+let result = tentaflow_sdk::gate_check("d4-historical", "claim-dpia-faces-2026")?;
+if !result.valid {
+    return Err(format!("policy gate denied: {}",
+        result.reason.unwrap_or_default()));
+}
+// or with explicit scope:
+let result = tentaflow_sdk::gate_check_scoped(
+    "d4-historical", "claim-dpia-faces-2026", Some("faces"))?;
+```
+
+A `valid=false` return is NOT an `AbiError` — the addon explicitly
+asked for an inspection and may decide to surface the denial to the
+operator (e.g. as a UI toast) before retrying with a different claim.
+
+### 17.4 Audit
+
+Every call emits one audit row:
+- `action='policy.gate_check'`, risk class B, `related_claim_id=<claim_id>`.
+- `result='gate_ok'` on success, `result='gate_denied'` on policy
+  rejection. `details` carries the reason code listed in 17.2.
+- Pre-engine errors (missing permission, unknown gate id, payload
+  invalid) use `result='denied'` with reasons `missing_permission`,
+  `gate_not_declared_in_manifest`, `payload_invalid`, `toml_parse_error`.
+
+### 17.5 Issuance (admin only)
+
+Claims are issued via `tentaflow-cli policy issue` — there is no
+addon-side ABI for creating, revoking, or signing claims. See
+`docs/POLICY_CLAIMS.md` (forthcoming) or the F1c implementation note
+`notes/tentavision-f1c-implementation.md` Phase 4 for the full CLI
+surface.

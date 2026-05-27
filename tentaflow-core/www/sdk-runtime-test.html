@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+  Plik: sdk-runtime-test.html
+  Opis: Runner testów SDK-runtime (Krok 3.x). Ładuje moduły z `js/sdk-runtime/`
+  i raportuje wyniki w <pre>. Otwórz w przeglądarce z dashboardu lub przez
+  prosty serwer statyczny — moduły wymagają HTTP, nie file://.
+-->
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <title>TentaFlow SDK runtime — testy</title>
+  <style>
+    body { font: 13px/1.45 ui-monospace, monospace; padding: 16px; background: #111; color: #ddd; }
+    h1 { font-size: 16px; margin: 0 0 12px; }
+    pre[data-status="pass"] { color: #6ec97c; }
+    pre[data-status="fail"] { color: #f08080; }
+  </style>
+</head>
+<body>
+  <h1>TentaFlow SDK runtime — testy</h1>
+  <pre id="out">Ładuję testy…</pre>
+  <script type="module">
+    import { reportResults } from '/js/sdk-runtime/state-store.test.js';
+    reportResults(document.getElementById('out'));
+  </script>
+</body>
+</html>

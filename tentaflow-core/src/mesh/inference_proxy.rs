@@ -187,18 +187,24 @@ pub async fn dispatch_reverse_request(
                         hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
                         ..crate::services::runtime::context::ExecutionContext::default()
                     };
-                    let chat_response = match executor
-                        .execute_chat(chat_request, &mut exec_ctx)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return make_error_response(
-                                request_id,
-                                &format!("Blad chat completion: {}", e),
-                            );
-                        }
-                    };
+                    // EXEMPT-MESH-INBOUND (stage 3d v1.5): mesh reverse chat —
+                    // peer forwarduje request, my wykonujemy direct executor
+                    // żeby zachować ultra-low latency LAN budżet. Flow żyje
+                    // po stronie inicjatora (Node A), peer = remote backend
+                    // call. Plan v1.5: jeden z 3 dozwolonych wyjątków
+                    // (chat tutaj + STT routing/stt.rs:301 + embeddings
+                    // routing/embeddings.rs:222), wszystkie wywoływane
+                    // wyłącznie z mesh reverse path.
+                    let chat_response =
+                        match executor.execute_chat(chat_request, &mut exec_ctx).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return make_error_response(
+                                    request_id,
+                                    &format!("Blad chat completion: {}", e),
+                                );
+                            }
+                        };
                     let text = chat_response
                         .choices
                         .first()
@@ -208,8 +214,7 @@ pub async fn dispatch_reverse_request(
                             crate::api::openai::types::MessageContent::Parts(parts) => parts
                                 .iter()
                                 .filter_map(|p| {
-                                    if let crate::api::openai::types::ContentPart::Text { text } =
-                                        p
+                                    if let crate::api::openai::types::ContentPart::Text { text } = p
                                     {
                                         Some(text.as_str())
                                     } else {
@@ -365,9 +370,7 @@ fn build_chat_request(
                 ..Default::default()
             });
         } else {
-            return Err(
-                "CompletionPayload has neither messages nor prompt".to_string(),
-            );
+            return Err("CompletionPayload has neither messages nor prompt".to_string());
         }
     }
 
@@ -377,6 +380,7 @@ fn build_chat_request(
         temperature: payload.temperature,
         max_tokens: payload.max_tokens,
         stream: false,
+        stream_options: None,
         top_p: payload.top_p,
         frequency_penalty: None,
         presence_penalty: payload.presence_penalty,
@@ -397,7 +401,9 @@ pub async fn dispatch_reverse_stream_request(
     tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 ) {
     use futures::StreamExt;
-    use tentaflow_protocol::{ErrorInfo, ErrorType, ModelPayload, ModelStreamChunk, StreamChunkType};
+    use tentaflow_protocol::{
+        ErrorInfo, ErrorType, ModelPayload, ModelStreamChunk, StreamChunkType,
+    };
 
     let request_id = request.request_id.clone();
     let completion_payload = match &request.payload {
@@ -437,7 +443,10 @@ pub async fn dispatch_reverse_stream_request(
     };
     chat_request.stream = true;
 
-    let route_result = match router.route_chat_completion_stream(chat_request, None).await {
+    let route_result = match router
+        .route_chat_completion_stream(chat_request, None)
+        .await
+    {
         Ok(result) => result,
         Err(e) => {
             send_stream_chunk_bytes(

@@ -45,7 +45,7 @@ struct Args {
     #[arg(short = 'q', long = "quic-port")]
     quic_port: Option<u16>,
 
-    /// Sciezka do bazy SQLite (domyslnie <tentaflow_home>/data/router.db)
+    /// Sciezka do bazy SQLite (domyslnie <tentaflow_home>/data/tentaflow.db)
     #[arg(long = "db")]
     db_path: Option<PathBuf>,
 
@@ -221,6 +221,33 @@ async fn run_server(args: Args) -> Result<()> {
         "Mesh identity: {}",
         &local_node_id_str[..16.min(local_node_id_str.len())]
     );
+    match tentaflow_core::sync::runtime::init(db.clone(), mesh_security.clone()) {
+        Ok(_) => {
+            info!("Sync Ledger runtime initialized");
+            match tentaflow_core::addon::storage_sql_exec::drain_installed_sql_captures(&db, 1000) {
+                Ok(drained) => info!("Sync Ledger drained {} pending SQL captures", drained),
+                Err(e) => error!("Sync Ledger SQL capture drain failed: {}", e),
+            }
+            match tentaflow_core::sync::core_capture::drain_pending_core_captures(&db, 1000) {
+                Ok(drained) => info!("Sync Ledger drained {} pending core captures", drained),
+                Err(e) => error!("Sync Ledger core capture drain failed: {}", e),
+            }
+            match tentaflow_core::sync::kv_capture::drain_pending_kv_captures(&db, 1000) {
+                Ok(drained) => info!("Sync Ledger drained {} pending KV captures", drained),
+                Err(e) => error!("Sync Ledger KV capture drain failed: {}", e),
+            }
+            match tentaflow_core::sync::blob_capture::drain_pending_blob_captures(&db, 1000) {
+                Ok(drained) => info!("Sync Ledger drained {} pending blob captures", drained),
+                Err(e) => error!("Sync Ledger blob capture drain failed: {}", e),
+            }
+            match tentaflow_core::sync::runtime::apply_unapplied_inbox(1000) {
+                Ok(Some(applied)) => info!("Sync Ledger applied {} inbox operations", applied),
+                Ok(None) => {}
+                Err(e) => error!("Sync Ledger inbox apply failed: {}", e),
+            }
+        }
+        Err(e) => error!("Sync Ledger runtime init failed: {}", e),
+    }
 
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mut mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
@@ -292,25 +319,14 @@ async fn run_server(args: Args) -> Result<()> {
     let services_port_allocator: Option<Arc<tentaflow_core::services::ports::PortAllocator>> = {
         use std::collections::HashSet;
         use tentaflow_core::services::ports::PortAllocator;
-        use tentaflow_core::services_repo::services as services_v2_repo;
 
         let services_runtime_cfg = config.services_runtime.clone();
 
-        // Reserve ports already owned by alive services_v2 rows so the allocator
-        // never hands them to a parallel deploy.
-        let mut excluded: HashSet<u16> = HashSet::new();
-        if let Ok(conn) = db.lock() {
-            if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
-                for row in rows {
-                    if let Some(p) = row.runtime_port {
-                        excluded.insert(p);
-                    }
-                    if let Some(p) = row.sidecar_quic_port {
-                        excluded.insert(p);
-                    }
-                }
-            }
-        }
+        // Excluded set zostaje pusty — porty istniejących serwisów (z DB)
+        // sa pre-rezerwowane PONIZEJ przez `ports.reserve(p)` co dodaje je
+        // do `leased` (zwalniane przy stop/delete) zamiast do `excluded`
+        // (permanentne, blokuje takze wlasciciela portu przy respawn).
+        let excluded: HashSet<u16> = HashSet::new();
 
         match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
             Ok(allocator) => Some(Arc::new(allocator)),
@@ -324,6 +340,39 @@ async fn run_server(args: Args) -> Result<()> {
             }
         }
     };
+
+    // Pre-rezerwacja portów już zapisanych w DB (runtime_port każdego
+    // serwisu). Bez tego świeży `acquire()` w równoległym deploy mógł
+    // dostać port który należy do istniejącego serwisu (allocator nic o
+    // nim nie wie po restarcie procesu) → respawn pinned dostawał konflikt
+    // i wpadał w fallback z innym portem, czyli "magiczna" zmiana portu.
+    if let Some(port_allocator) = services_port_allocator.clone() {
+        match db.lock() {
+            Ok(conn) => {
+                match tentaflow_core::services_repo::services::list_all(&conn) {
+                    Ok(services) => {
+                        for svc in services {
+                            for port in [svc.runtime_port, svc.sidecar_quic_port]
+                                .into_iter()
+                                .flatten()
+                            {
+                                if let Err(e) = port_allocator.reserve(port) {
+                                    tracing::warn!(
+                                        service_id = svc.id,
+                                        port,
+                                        "boot port reserve skipped: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("boot port reserve: list_all failed: {}", e),
+                }
+            }
+            Err(e) => tracing::warn!("boot port reserve: db lock poisoned: {}", e),
+        }
+    }
 
     // Inicjalizacja routera (non-blocking)
     info!("Inicjalizacja routera...");
@@ -411,6 +460,31 @@ async fn run_server(args: Args) -> Result<()> {
     router
         .service_manager()
         .set_event_bus(addon_manager.event_bus().clone());
+
+    // Late-bind flow_runtime's ServiceManager + EventBus handles so operators
+    // (Predict, Sink event_publish) reach the same QUIC routing surface and
+    // bus the WASM host functions use.
+    {
+        let sched = tentaflow_core::flow_runtime::scheduler::FlowScheduler::global();
+        sched.set_service_manager(router.service_manager().clone());
+        sched.set_event_bus(addon_manager.event_bus().clone());
+    }
+    tentaflow_core::addon::event_publish::init_global(addon_manager.event_bus().clone());
+
+    addon_manager.clone().start_event_dispatcher();
+
+    // Wpiecie addon block resolverem do flow_engine — od tego momentu flow
+    // z node_type "addon.{id}.{block}" dostaje AddonNodeAdapter z resolvera
+    // zamiast bledu "no adapter for node".
+    if let Some(dispatcher) = router.flow_dispatcher() {
+        dispatcher.set_addon_resolver(addon_manager.clone());
+        tracing::info!("FlowDispatcher: addon block resolver wpiety");
+    }
+
+    // Auto-start wszystkich service-mode addonow ktore byly enabled przed
+    // reboot'em — bez tego service mode dzialalby tylko w sesji w ktorej
+    // admin explicit kliknal Start.
+    addon_manager.auto_start_services();
 
     // Mesh networking — iroh (LAN mDNS + DHT + relay), wspoldzielony pipeline z Core
     let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>> =
@@ -610,10 +684,24 @@ async fn run_server(args: Args) -> Result<()> {
         quic_mesh_for_server,
         local_node_id_for_server,
         mesh_security_for_server,
+        Some(addon_manager.clone()),
         mesh_relay_health_for_server,
         services_port_allocator.clone(),
         mesh_services_registry.clone(),
     )?;
+
+    // Boot-time camera ingest hydrate. Without this, `CameraIngestSupervisor`
+    // stays empty until SOMEONE opens TentaVision UI in a browser — kamera nie
+    // produkuje klatek, analiza Flow nie ma na czym pracować, status zostaje
+    // "starting" forever. Cameras are a core resource (not an addon resource),
+    // so they must come up at boot just like the dashboard server itself.
+    tokio::spawn(async {
+        if let Err(e) =
+            tentaflow_core::addon::host_functions::camera::ensure_supervisor_started().await
+        {
+            tracing::warn!("boot: camera supervisor hydrate failed: {e}");
+        }
+    });
 
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");
 
@@ -623,6 +711,11 @@ async fn run_server(args: Args) -> Result<()> {
     wait_for_shutdown_signal().await?;
 
     info!("Otrzymano sygnal shutdown, zamykanie routera...");
+    // Zamknij addon manager: anuluj service tick loops, drop dispatcher
+    // sender (rozwalenie cyklu referencyjnego Arc<AddonManager> w
+    // spawn_blocking task), drop running instances. Bez tego proces nie
+    // konczyl sie po SIGINT.
+    addon_manager.shutdown();
     // Zatrzymaj wszystkie supervised services (native python-bundle / native
     // binary / docker) zanim router shutdown zwolni RwLocki. Bez tego vLLM /
     // sglang subprocessy zostawaly zombie po Ctrl+C — trzymaly VRAM (~15 GiB
@@ -638,6 +731,11 @@ async fn run_server(args: Args) -> Result<()> {
         }
     }
     router.shutdown();
+
+    // Stop every active camera session (drains the F1a CameraIngestSupervisor
+    // singleton). GStreamer pipelines must terminate before the runtime
+    // shuts down, otherwise EOS messages race the tokio worker teardown.
+    tentaflow_core::addon::host_functions::camera::shutdown_camera_supervisor_global().await;
 
     // Graceful shutdown mesh — zamyka QUIC endpoint (zwalnia port UDP) i wyrejestruje mDNS
     if let Some(mesh) = _mesh_handles {

@@ -127,6 +127,15 @@ pub struct ServiceEntry {
     /// top-level keys, when materialising a legacy `ServiceBackend` for
     /// `BackendClient::new`. Numeric / object / array values are excluded.
     pub extra_config: HashMap<String, String>,
+    /// Krótki opis aktualnej fazy startu (np. "warming up — alive 30s,
+    /// waiting for /v1/models"). Aktualizowany przez supervisor heartbeat
+    /// w detached deploy task. GUI snapshot pokazuje obok statusu —
+    /// klient widzi PROGRES startu zamiast tylko "Starting" przez
+    /// minuty. NULL gdy serwis Running albo nie ma nic do raportowania.
+    pub progress_message: Option<String>,
+    /// Ostatni błąd zdrowia (failed health probe, pinned auto-start
+    /// failure). Przekazywany 1:1 z `services.health_last_err`.
+    pub health_last_err: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +354,15 @@ impl Supervisor {
 
     /// Iterates pinned services and re-launches every one that is stopped /
     /// failed and not paused. Used exclusively by `run_first_tick`.
+    ///
+    /// Non-blocking: każdy pinned service deploy::respawn idzie do osobnego
+    /// detached `tokio::spawn` task'a. `run_first_tick` (i tym samym
+    /// `main.rs::Wszystkie serwery uruchomione`) nie czeka na deploy
+    /// pythonowych bundli (vLLM ~140s, qwen-asr ~6s). Status w DB jest
+    /// `Starting` od razu po spawn'ie, GUI/snapshot zobaczy `Running` po
+    /// najbliższym health-check tick'u (default 2s). Przy fail status jest
+    /// `Failed` z error message — zgodnie z zamiarem "po porażce user
+    /// musi nacisnąć Start manualnie" (komentarz w `run_first_tick`).
     async fn auto_start_pinned(&self) -> Result<(), SupervisorError> {
         let db = self.db.clone();
         let pinned =
@@ -371,43 +389,110 @@ impl Supervisor {
                 continue;
             }
             tracing::info!(
-                "supervisor: auto-starting pinned service {} ({})",
+                "supervisor: auto-starting pinned service {} ({}) [detached]",
                 svc.id,
                 svc.engine_id
             );
             self.mark_status(svc.id, ServiceStatus::Starting, None)
                 .await;
-            match deploy::respawn(
-                &svc.engine_id,
-                svc.deploy_method,
-                &svc.config_json,
-                self.ports.clone(),
-            )
-            .await
-            {
-                Ok(handle) => {
-                    if let Err(e) = self.write_runtime(svc.id, &handle).await {
-                        tracing::warn!(
-                            "supervisor: write_runtime failed for pinned {} ({}): {}",
-                            svc.id,
-                            svc.engine_id,
-                            e
+
+            let svc_id = svc.id;
+            let engine_id = svc.engine_id.clone();
+            let deploy_method = svc.deploy_method;
+            let config_json = svc.config_json.clone();
+            let preserved_port = svc.runtime_port;
+            let db_for_task = self.db.clone();
+            let ports_for_task = self.ports.clone();
+
+            tokio::spawn(async move {
+                // Heartbeat progress: co 5s update progress_message
+                // ("warming up — alive Xs") zeby GUI snapshot pokazywal
+                // user'owi PROGRES startu (cold start vLLM ~3 min).
+                // tokio::select! z deploy::respawn() future i interval
+                // tick — pierwszy deploy result wins, interval jest
+                // anulowany.
+                update_progress_detached(&db_for_task, svc_id, Some("starting — bootstrap+spawn"))
+                    .await;
+                let respawn_fut = deploy::respawn(
+                    &engine_id,
+                    deploy_method,
+                    &config_json,
+                    ports_for_task,
+                    preserved_port,
+                );
+                tokio::pin!(respawn_fut);
+                let started = std::time::Instant::now();
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                tick.tick().await; // skip immediate first tick
+                let outcome: Result<deploy::RuntimeHandle, deploy::DeployError> = loop {
+                    tokio::select! {
+                        biased;
+                        res = &mut respawn_fut => break res,
+                        _ = tick.tick() => {
+                            let secs = started.elapsed().as_secs();
+                            update_progress_detached(
+                                &db_for_task,
+                                svc_id,
+                                Some(&format!("warming up — alive {}s, waiting for ready", secs)),
+                            )
+                            .await;
+                        }
+                    }
+                };
+                match outcome {
+                    Ok(handle) => {
+                        if let Err(e) = update_runtime_detached(&db_for_task, svc_id, &handle).await
+                        {
+                            tracing::warn!(
+                                "supervisor: write_runtime failed for pinned {} ({}): {}",
+                                svc_id,
+                                engine_id,
+                                e
+                            );
+                        }
+                        update_status_detached(&db_for_task, svc_id, ServiceStatus::Running, None)
+                            .await;
+                        update_progress_detached(&db_for_task, svc_id, None).await;
+                        tracing::info!(
+                            "supervisor: pinned service {} ({}) up after detached deploy ({}s)",
+                            svc_id,
+                            engine_id,
+                            started.elapsed().as_secs()
                         );
                     }
-                    self.mark_status(svc.id, ServiceStatus::Running, None).await;
-                }
-                Err(e) => {
-                    let msg = format!("pinned auto-start: {}", e);
-                    tracing::warn!(
-                        "supervisor: pinned auto-start failed for {} ({}): {}",
-                        svc.id,
-                        svc.engine_id,
-                        e
-                    );
-                    self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
+                    Err(e) => {
+                        let msg = format!("pinned auto-start: {}", e);
+                        tracing::warn!(
+                            "supervisor: pinned auto-start failed for {} ({}): {}",
+                            svc_id,
+                            engine_id,
+                            e
+                        );
+                        update_status_detached(
+                            &db_for_task,
+                            svc_id,
+                            ServiceStatus::Failed,
+                            Some(&msg),
+                        )
                         .await;
+                        // Wyczyść runtime_pid/runtime_port/endpoint_url po
+                        // failu — bez tego DB wlokła stary endpoint przez
+                        // restart, a `LiveHandlesCache` budował handle
+                        // wskazujacy na zwolniony port (zombie endpoint).
+                        clear_runtime_detached(&db_for_task, svc_id).await;
+                        // Progress message: pokazujemy ostatni stan +
+                        // ze padlo, zeby GUI mialo wskazowke (bezpiecznie
+                        // duplikuje error_message ale GUI moze inaczej
+                        // renderowac progress vs error).
+                        update_progress_detached(
+                            &db_for_task,
+                            svc_id,
+                            Some(&format!("failed after {}s", started.elapsed().as_secs())),
+                        )
+                        .await;
+                    }
                 }
-            }
+            });
         }
         Ok(())
     }
@@ -437,6 +522,16 @@ impl Supervisor {
                 // so we neither flip status nor count restart attempts. The user
                 // controls the runtime state directly through the pin/pause API.
                 if svc.paused {
+                    continue;
+                }
+                // Status=Starting znaczy ze detached deploy task wciaz pracuje
+                // (vLLM cold-start ~3 min). Endpoint_url jest NULL do momentu
+                // gdy `write_runtime` zapisze go po sukcesie deploy. Bez tego
+                // skipa health probe widzi NULL endpoint_url → Failed →
+                // run_loop wola deploy::respawn rownoczesnie z trwajacym
+                // deployem → dwie instancje walcza o ten sam port. Detached
+                // task sam ustawi status na Running albo Failed gdy skonczy.
+                if svc.status == ServiceStatus::Starting {
                     continue;
                 }
                 let health = self
@@ -584,6 +679,8 @@ impl Supervisor {
                     weight: meta.weight,
                     model_name_override: meta.model_name_override,
                     extra_config: meta.extra_config,
+                    progress_message: row.progress_message,
+                    health_last_err: row.health_last_err,
                 });
             }
 
@@ -647,6 +744,17 @@ impl Supervisor {
                 }
                 matches!(svc.transport.as_str(), "sidecar_quic" | "external_http")
             })
+            // Pomin handle build dla serwisow bez aktywnego runtime. HTTP
+            // transports (http_direct / external_http) wymagaja
+            // `endpoint_url` z DB; gdy NULL (serwis Stopped/Failed albo
+            // Starting przed pierwszym deploy_writeback), `build_handle`
+            // i tak by zwrocil "endpoint_url missing" co tickiem zalewa
+            // logi WARN. Embedded i SidecarQuic budujemy zawsze — embedded
+            // nie ma URLa, sidecar bierze port z DB.
+            .filter(|svc| match svc.transport.as_str() {
+                "http_direct" | "external_http" => svc.endpoint_url.is_some(),
+                _ => true,
+            })
             .map(|svc| ((svc.node_id.clone(), svc.id), svc))
             .collect();
 
@@ -677,10 +785,36 @@ impl Supervisor {
             }
         }
 
-        // (4) Insert handles for new pairs.
+        // (4) Insert / refresh handles. Bug N7.3: gdy serwis dostaje
+        // nowy port (np. po CUDA OOM crash + respawn na innym porcie z
+        // alokatora), DB endpoint_url zmienia sie ale live_handles
+        // trzymalo stary handle ze starym URL. Skutek: routing chat
+        // trafial na zwolniony port (zombie z poprzedniego attempta).
+        // Fix: porownaj endpoint signature; gdy rozni sie od desired,
+        // shutdown old + insert new.
         for ((node_id, service_id), svc) in desired.into_iter() {
-            if self.live_handles.get(&node_id, service_id).is_some() {
+            let existing_signature = self
+                .live_handles
+                .get(&node_id, service_id)
+                .map(|h| h.endpoint_signature());
+            let desired_signature = handle_endpoint_signature(&svc);
+            if existing_signature.as_deref() == Some(desired_signature.as_str()) {
                 continue;
+            }
+            // Endpoint mismatch (lub brak handle) → shutdown stary, build nowy.
+            if existing_signature.is_some() {
+                if let Some(old) = self.live_handles.remove(&node_id, service_id) {
+                    old.shutdown();
+                }
+                let mut tasks = self.reconnect_tasks.lock().await;
+                if let Some(task) = tasks.remove(&(node_id.clone(), service_id)) {
+                    task.abort();
+                }
+                tracing::info!(
+                    "supervisor: handle endpoint changed for service {} ({}) — rebuilding",
+                    service_id,
+                    svc.engine_id
+                );
             }
             let handle = match build_handle(&svc) {
                 Ok(h) => h,
@@ -844,6 +978,7 @@ impl Supervisor {
                     svc.deploy_method,
                     &svc.config_json,
                     self.ports.clone(),
+                    svc.runtime_port,
                 )
                 .await
                 {
@@ -867,6 +1002,10 @@ impl Supervisor {
                         let msg = format!("restart {}: {}", attempt, e);
                         self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
                             .await;
+                        // Defensywnie wyczysc runtime endpoint (jak w
+                        // detached pinned deploy) — DB nie ma wleko stary
+                        // URL przez restart tentaflow.
+                        clear_runtime_detached(&self.db, svc.id).await;
                         tracing::warn!(
                             "supervisor: respawn failed for service {} ({}): {}",
                             svc.id,
@@ -883,6 +1022,126 @@ impl Supervisor {
         let mut g = self.restart_state.lock().await;
         g.remove(&id);
     }
+}
+
+// ----- Detached pinned-deploy helpers ---------------------------------------
+//
+// Free fn'y dla detached `tokio::spawn` w `auto_start_pinned`. Logika
+// identyczna jak `Supervisor::write_runtime` / `mark_status` ale bez
+// `&self`, żeby spawn task mógł żyć po zwrocie z first_tick. Snapshot
+// rebuild dzieje się w run_loop tick (interval=2000ms domyślnie),
+// więc GUI zobaczy `Running`/`Failed` w max ~2s po deploy complete.
+
+async fn update_runtime_detached(
+    db: &DbPool,
+    id: i64,
+    runtime: &RuntimeHandle,
+) -> Result<(), SupervisorError> {
+    let db = db.clone();
+    let pid = runtime.pid;
+    let port = runtime.port;
+    let sidecar = runtime.sidecar_port;
+    let url = runtime.endpoint_url.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+        services_repo::update_runtime(&conn, id, pid, port, sidecar, url.as_deref())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
+    .map_err(|e| SupervisorError::Database(e.to_string()))
+}
+
+/// Aktualizuje progress_message przez `services_repo::update_progress_message`.
+/// `None` = wyczyść message (Running success / Failed cleanup). Erroram
+/// w spawn_blocking nie reagujemy — heartbeat to best-effort UX.
+/// Sygnatura endpointu dla `tentaflow_protocol::ServiceInfo` —
+/// odpowiednik `BackendHandle::endpoint_signature()`. Pozwala wykryć że
+/// serwis dostal nowy port (CUDA OOM crash + respawn z innym portem
+/// alokatora) i `live_handles` cached musi zostać przebudowany.
+fn handle_endpoint_signature(svc: &tentaflow_protocol::ServiceInfo) -> String {
+    match svc.transport.as_str() {
+        "http_direct" | "external_http" => {
+            format!("http:{}", svc.endpoint_url.as_deref().unwrap_or(""))
+        }
+        "sidecar_quic" => format!(
+            "quic:quic://127.0.0.1:{}",
+            svc.sidecar_quic_port.unwrap_or(0)
+        ),
+        "embedded" => {
+            let model = svc
+                .models
+                .first()
+                .map(|m| m.model_name.as_str())
+                .unwrap_or("");
+            format!("embedded:{}:{}", svc.engine_id, model)
+        }
+        other => format!("unknown:{}:{}", other, svc.engine_id),
+    }
+}
+
+/// Czyści `runtime_pid` i `endpoint_url` w `services` row. Wywoływane gdy
+/// deploy padł — bez tego DB wlokła stary endpoint z poprzedniego sukcesu
+/// przez restart tentaflow, a `LiveHandlesCache::build_handle` przy boot
+/// trafiał na ten URL i chat/embeddings/tts wysyłali request na zwolniony
+/// / zajęty przez zombie port.
+///
+/// `runtime_port` i `sidecar_quic_port` ZOSTAJĄ — port to permanentny
+/// atrybut serwisu na całe życie wpisu w `services`. Następny respawn
+/// musi wziąć dokładnie ten sam port (`acquire_or_specific`), żeby
+/// klient widzący `:5002` w GUI / DB nigdy nie trafił na inny port po
+/// crashu + retry.
+async fn clear_runtime_detached(db: &DbPool, id: i64) {
+    let db = db.clone();
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+        let n = conn.execute(
+            "UPDATE services SET runtime_pid = NULL, endpoint_url = NULL, \
+             updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "clear_runtime_detached: id={} not found",
+                id
+            ));
+        }
+        Ok(())
+    })
+    .await;
+}
+
+async fn update_progress_detached(db: &DbPool, id: i64, msg: Option<&str>) {
+    let db = db.clone();
+    let msg_owned = msg.map(|s| s.to_string());
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+        services_repo::update_progress_message(&conn, id, msg_owned.as_deref())?;
+        Ok(())
+    })
+    .await;
+}
+
+async fn update_status_detached(db: &DbPool, id: i64, status: ServiceStatus, err: Option<&str>) {
+    let db = db.clone();
+    let err_owned = err.map(|s| s.to_string());
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+        services_repo::update_status(&conn, id, status)?;
+        if let Some(msg) = err_owned {
+            services_repo::update_health(&conn, id, false, Some(&msg))?;
+        }
+        Ok(())
+    })
+    .await;
 }
 
 // ----- HTTP probe helper ----------------------------------------------------
@@ -1423,14 +1682,32 @@ mod tests {
 
         sup.auto_start_pinned().await.unwrap();
 
-        let final_status = {
-            let conn = db.lock().unwrap();
-            services_repo::get(&conn, id).unwrap().unwrap().status
-        };
+        // Detached deploy task pisze końcowy status async — test pollu z
+        // krótkim timeoutem żeby się dowiedzieć kiedy task dobiegnie.
+        // respawn() na bogus engine_id padnie szybko (zanim się dotknie
+        // Docker/python), więc 2s timeout z marżą wystarcza.
+        let final_status = poll_until_terminal(&db, id, Duration::from_secs(2)).await;
         // respawn() on an unknown engine flips the row to Failed; the key
         // assertion is that status moved away from Stopped — the pinned
         // path ran.
         assert_eq!(final_status, ServiceStatus::Failed);
+    }
+
+    async fn poll_until_terminal(db: &DbPool, id: i64, timeout: Duration) -> ServiceStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = {
+                let conn = db.lock().unwrap();
+                services_repo::get(&conn, id).unwrap().unwrap().status
+            };
+            if matches!(status, ServiceStatus::Running | ServiceStatus::Failed) {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
@@ -1654,6 +1931,7 @@ mod tests {
             endpoint_url: None,
             restart_count: 0,
             health_last_err: None,
+            progress_message: None,
             models: vec![tentaflow_protocol::ServiceModelEntry {
                 model_name: "qwen-tiny".into(),
                 display_name: None,

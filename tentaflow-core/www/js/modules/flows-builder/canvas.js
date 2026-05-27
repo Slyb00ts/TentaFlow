@@ -85,70 +85,87 @@ const TYPE_CATEGORY = {
 };
 
 // Zwraca listę portów wejściowych/wyjściowych dla nody. Priorytet: adapter
-// metadata z backendu (`template.input_ports`/`template.output_ports`), potem
-// legacy pola `inputs`/`outputs`, a na koncu heurystyki.
+// metadata z backendu (`template.input_ports`/`template.output_ports` plus
+// `input_port_types`/`output_port_types`), potem legacy pola
+// `inputs`/`outputs`, a na koncu heurystyki.
 // Adapter metadata jest autorytatywnym zrodlem — backend odrzuci krawedz z
 // nazwa portu spoza listy, wiec UI musi pokazywac dokladnie te porty.
+// Kazdy port ma `type` (string `text`/`audio`/`image`/`video`/`embedding`/
+// `other`/`json`/`any`) — uzywany do kolorowania i walidacji polaczenia
+// po stronie GUI (lustrzana R8: `any` na ktorejkolwiek stronie = wildcard).
 function portsForNode(node, template) {
   const isTrigger = node.type === 'trigger' || node.type === 'start';
   const isOutput = node.type === 'output' || node.type === 'end';
 
-  const readList = (raw) => {
+  const readList = (raw, types) => {
     if (!raw) return null;
-    if (Array.isArray(raw)) return raw.map((p) => (typeof p === 'string' ? { name: p } : p));
-    return null;
+    if (!Array.isArray(raw)) return null;
+    return raw.map((p, i) => {
+      const name = typeof p === 'string' ? p : p.name;
+      const type = (Array.isArray(types) && typeof types[i] === 'string') ? types[i] : 'any';
+      return { name, type };
+    });
   };
 
   let tplIn = null;
   let tplOut = null;
   if (template) {
-    // Adapter metadata (Rust registry → protocol); puste listy traktujemy jako
-    // "brak zarejestrowanego adaptera" — wtedy spadamy do heurystyki.
     if (Array.isArray(template.input_ports) && template.input_ports.length > 0) {
-      tplIn = readList(template.input_ports);
+      tplIn = readList(template.input_ports, template.input_port_types);
     }
     if (Array.isArray(template.output_ports) && template.output_ports.length > 0) {
-      tplOut = readList(template.output_ports);
+      tplOut = readList(template.output_ports, template.output_port_types);
     }
-    if (!tplIn) tplIn = readList(template.inputs);
-    if (!tplOut) tplOut = readList(template.outputs);
+    if (!tplIn) tplIn = readList(template.inputs, null);
+    if (!tplOut) tplOut = readList(template.outputs, null);
     if (!tplIn || !tplOut) {
       try {
         const schema = typeof template.params_schema === 'string'
           ? JSON.parse(template.params_schema)
           : template.params_schema;
         if (schema && schema.ports) {
-          if (!tplIn) tplIn = readList(schema.ports.inputs);
-          if (!tplOut) tplOut = readList(schema.ports.outputs);
+          if (!tplIn) tplIn = readList(schema.ports.inputs, null);
+          if (!tplOut) tplOut = readList(schema.ports.outputs, null);
         }
       } catch (_) {}
     }
   }
 
-  const inputs = tplIn || (isTrigger ? [] : [{ name: 'in' }]);
+  const inputs = tplIn || (isTrigger ? [] : [{ name: 'in', type: 'any' }]);
 
   let outputs;
   if (tplOut) {
     outputs = tplOut;
   } else if (node.type === 'condition') {
-    outputs = [{ name: 'true' }, { name: 'false' }];
+    outputs = [{ name: 'true', type: 'any' }, { name: 'false', type: 'any' }];
   } else if (node.type === 'switch' || node.type === 'router') {
     const cases = Array.isArray(node.config?.cases) ? node.config.cases : [];
     if (cases.length > 0) {
-      outputs = cases.map((c, i) => ({ name: typeof c === 'string' ? c : (c.name || `case_${i + 1}`) }));
-      outputs.push({ name: 'default' });
+      outputs = cases.map((c, i) => ({
+        name: typeof c === 'string' ? c : (c.name || `case_${i + 1}`),
+        type: 'any',
+      }));
+      outputs.push({ name: 'default', type: 'any' });
     } else {
-      outputs = [{ name: 'case_1' }, { name: 'case_2' }, { name: 'default' }];
+      outputs = [{ name: 'case_1', type: 'any' }, { name: 'case_2', type: 'any' }, { name: 'default', type: 'any' }];
     }
   } else if (isOutput) {
     outputs = [];
   } else {
-    // Domyslny port backendu to "full" — stary "out" byl odrzucany przez
-    // validate_flow_json_str (S4b).
-    outputs = [{ name: 'full' }];
+    outputs = [{ name: 'full', type: 'any' }];
   }
 
   return { inputs, outputs };
+}
+
+// Lustrzana walidacja R8 po stronie GUI: `any` na ktorejkolwiek stronie =
+// wildcard, inaczej wymaga dokladnego match'a typow. Uzywane przy probie
+// stworzenia krawedzi (drag-drop) — niedopasowane typy odrzucamy zanim
+// uzytkownik puscic na portcie input.
+function arePortTypesCompatible(fromType, toType) {
+  const a = (fromType || 'any').toLowerCase();
+  const b = (toType || 'any').toLowerCase();
+  return a === 'any' || b === 'any' || a === b;
 }
 
 export class FlowCanvas {
@@ -249,7 +266,16 @@ export class FlowCanvas {
       const y = typeof n.y === 'number' ? n.y : (typeof pos.y === 'number' ? pos.y : 0);
       return { ...n, x, y, config: n.config || {} };
     });
-    this.edges = (edges || []).map((e) => ({ ...e }));
+    // Krawedzie z backendu (flow_json w DB) nie maja `id` — to pole jest
+    // wewnetrznym uchwytem GUI dla selekcji + delete. Generujemy stable
+    // `e_<idx>_<from>_<to>_<from_port>_<to_port>` zeby ten sam graf po
+    // round-tripie (load → save → load) konsystentnie zaznaczal te same
+    // krawedzie. Dla nowych krawedzi `_onPointerUp` nadal generuje
+    // unikalne `e_<timestamp>` przy tworzeniu.
+    this.edges = (edges || []).map((e, idx) => {
+      const id = e.id || `e${idx}_${e.from_node || ''}-${e.to_node || ''}_${e.from_port || ''}-${e.to_port || ''}`;
+      return { ...e, id };
+    });
     this._normalizeNodeLabels();
     this._normalizeEdgePorts();
     this.selectedIds.clear();
@@ -283,6 +309,13 @@ export class FlowCanvas {
       }),
       edges: this.edges.map((e) => {
         const out = { ...e };
+        // `id` jest wewnetrznym uchwytem GUI generowanym przy load'zie z
+        // tupli (idx, from, to, ports). Backend FlowEdge ma `id: Option<String>`
+        // ale nasze syntetyczne klucze nie maja sensu w DB — czyscimy zeby
+        // round-trip do flow_json byl byte-identyczny ze zrodlem.
+        if (typeof out.id === 'string' && out.id.startsWith('e')) {
+          delete out.id;
+        }
         if (out.from_port === 'full') delete out.from_port;
         if (out.to_port === 'in') delete out.to_port;
         return out;
@@ -371,8 +404,31 @@ export class FlowCanvas {
         const inputNames = inputs.map((p) => p.name);
         const currentTo = edge.to_port || 'in';
         if (!inputNames.includes(currentTo)) {
-          if (inputNames.length === 1) edge.to_port = inputNames[0];
-          else if (inputNames.includes('in')) edge.to_port = 'in';
+          if (inputNames.length === 1) {
+            edge.to_port = inputNames[0];
+          } else if (inputNames.includes('in')) {
+            edge.to_port = 'in';
+          } else if (from) {
+            // Multi-port consumer (np. typed output node) bez `in` — auto-map
+            // po typie producenta. Bierzemy from_port type i znajdujemy
+            // input port konsumenta z tym samym typem. Bez tego legacy edge
+            // z `to_port="in"` (default) walil walidacje przy save.
+            const fromTpl = this.templates.get(from.type);
+            const { outputs: fromOutputs } = portsForNode(from, fromTpl);
+            const fromPortObj = fromOutputs.find((p) => p.name === edge.from_port);
+            const fromType = (fromPortObj?.type || 'any').toLowerCase();
+            const matched = inputs.find((p) => (p.type || 'any').toLowerCase() === fromType);
+            if (matched) {
+              edge.to_port = matched.name;
+            } else {
+              // Fallback: pierwszy input port. Walidacja serwera moze
+              // jeszcze odrzucic na typed mismatch, ale przynajmniej damy
+              // prawidlowa nazwe portu zeby user wiedzial gdzie kierowac.
+              edge.to_port = inputNames[0];
+            }
+          } else {
+            edge.to_port = inputNames[0];
+          }
         } else {
           edge.to_port = currentTo;
         }
@@ -600,6 +656,14 @@ export class FlowCanvas {
 
     const { inputs, outputs } = portsForNode(n, tmpl);
 
+    // Wysokosc nody musi pomiescic obie strony portow (in/out). Naszym
+    // pivotem jest strona z wieksza liczba portow. Header to PORT_HEADER_OFFSET
+    // (44px) + 14px stopka per port. Bez tego node ma sztywne CSS height i
+    // przy 6+ portach (trigger) ostatnie wystaja na zewnatrz dolnej krawedzi.
+    const portCount = Math.max(inputs.length, outputs.length, 1);
+    const minHeight = PORT_HEADER_OFFSET + portCount * PORT_STEP + 14;
+    div.style.minHeight = `${minHeight}px`;
+
     const inPortsHtml = inputs.map((p, i) => this._renderPortEl(n.id, p, i, 'in', inputs.length)).join('');
     const outPortsHtml = outputs.map((p, i) => this._renderPortEl(n.id, p, i, 'out', outputs.length)).join('');
 
@@ -621,18 +685,20 @@ export class FlowCanvas {
   _renderPortEl(nodeId, port, idx, side, total) {
     const top = PORT_HEADER_OFFSET + idx * PORT_STEP;
     const showLabel = total >= 2;
-    // Tooltip z opisem portu — stream/full/in maja tlumaczenia, reszta idzie
-    // surowa nazwa (np. "true"/"false" dla condition, "case_N" dla switch).
     const tooltipKey = port.name === 'stream' ? 'flows_builder.port_stream'
       : port.name === 'full' ? 'flows_builder.port_full'
       : port.name === 'in' ? 'flows_builder.port_in'
       : null;
-    const tooltip = tooltipKey ? I18n.t(tooltipKey) : port.name;
+    const portLabel = tooltipKey ? I18n.t(tooltipKey) : port.name;
+    const portType = (port.type || 'any').toLowerCase();
+    // Tooltip pokazuje nazwe portu + typ danych zeby uzytkownik widzial
+    // dlaczego port ma kolor X (np. "audio • Audio").
+    const tooltip = `${portLabel} • ${portType}`;
     const labelHtml = showLabel
       ? `<span class="fb-port-label">${escapeHtml(port.name)}</span>`
       : '';
-    const cls = side === 'in' ? 'fb-port fb-port-in' : 'fb-port fb-port-out';
-    return `<div class="${cls}" data-node-id="${escapeAttr(nodeId)}" data-port="${escapeAttr(port.name)}" data-port-kind="${escapeAttr(port.name)}" data-port-idx="${idx}" style="top:${top}px;" title="${escapeAttr(tooltip)}">${labelHtml}</div>`;
+    const cls = `fb-port fb-port-${side === 'in' ? 'in' : 'out'} fb-port-type-${portType}`;
+    return `<div class="${cls}" data-node-id="${escapeAttr(nodeId)}" data-port="${escapeAttr(port.name)}" data-port-kind="${escapeAttr(port.name)}" data-port-type="${escapeAttr(portType)}" data-port-idx="${idx}" style="top:${top}px;" title="${escapeAttr(tooltip)}">${labelHtml}</div>`;
   }
 
   _renderNodeSummary(n) {
@@ -702,18 +768,41 @@ export class FlowCanvas {
       p.setAttribute('class', 'fb-edge-path');
       p.setAttribute('d', d);
       p.dataset.edgeId = e.id;
-      if (this.selectedEdgeId === e.id) p.classList.add('selected');
+      const isSelected = this.selectedEdgeId === e.id;
+      if (isSelected) p.classList.add('selected');
       this.svg.appendChild(p);
-      // Animowana kropka przepływu
-      const dot = document.createElementNS(svgNs, 'circle');
-      dot.setAttribute('class', 'fb-edge-flow');
-      dot.setAttribute('r', '3');
-      const anim = document.createElementNS(svgNs, 'animateMotion');
-      anim.setAttribute('dur', '2.4s');
-      anim.setAttribute('repeatCount', 'indefinite');
-      anim.setAttribute('path', d);
-      dot.appendChild(anim);
-      this.svg.appendChild(dot);
+      // Animowane kropki na krawedziach byly niedeterministyczne — animacja
+      // SVG `animateMotion` zostawiala duchy podczas pan/zoom (svg.innerHTML
+      // = '' nie zawsze konczyl trwajace animacje natychmiast, browser
+      // trzymal ostatnia pozycje ducha jako wolny <circle>). Wizualnie
+      // edge'e maja juz cyan glow + selected red — kropki przeplywu byly
+      // ozdoba bez wartosci diagnostycznej, wycinamy.
+      // Przycisk delete (X) na srodku krawedzi gdy selected — kazda
+      // krawedz ma takze hover-interaktywny target przez .fb-edge-hit:hover
+      // w CSS, ale realny przycisk jest renderowany dopiero po selekcji
+      // (po pierwszym kliku w edge). Klik w X usuwa krawedz.
+      if (isSelected) {
+        const mid = this._bezierMidpoint(fp.x, fp.y, tp.x, tp.y);
+        const g = document.createElementNS(svgNs, 'g');
+        g.setAttribute('class', 'fb-edge-delete');
+        g.dataset.edgeId = e.id;
+        g.setAttribute('transform', `translate(${mid.x}, ${mid.y})`);
+        const bg = document.createElementNS(svgNs, 'circle');
+        bg.setAttribute('r', '11');
+        bg.setAttribute('class', 'fb-edge-delete-bg');
+        const x1 = document.createElementNS(svgNs, 'line');
+        x1.setAttribute('x1', '-4'); x1.setAttribute('y1', '-4');
+        x1.setAttribute('x2', '4'); x1.setAttribute('y2', '4');
+        x1.setAttribute('class', 'fb-edge-delete-stroke');
+        const x2 = document.createElementNS(svgNs, 'line');
+        x2.setAttribute('x1', '-4'); x2.setAttribute('y1', '4');
+        x2.setAttribute('x2', '4'); x2.setAttribute('y2', '-4');
+        x2.setAttribute('class', 'fb-edge-delete-stroke');
+        g.appendChild(bg);
+        g.appendChild(x1);
+        g.appendChild(x2);
+        this.svg.appendChild(g);
+      }
     }
     // Tymczasowa linia podczas łączenia
     if (this._connecting) {
@@ -730,6 +819,19 @@ export class FlowCanvas {
   _bezierPath(x1, y1, x2, y2) {
     const dx = Math.max(40, Math.abs(x2 - x1) * 0.5);
     return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+  }
+
+  /// Punkt na krzywej Beziera w t=0.5 — dla cubic z punktami kontrolnymi
+  /// `(P0, P1, P2, P3)` gdzie P1=(x1+dx,y1) i P2=(x2-dx,y2). Wzor cubic
+  /// Bezier dla t=0.5: B = (P0+3P1+3P2+P3)/8.
+  _bezierMidpoint(x1, y1, x2, y2) {
+    const dx = Math.max(40, Math.abs(x2 - x1) * 0.5);
+    const c1x = x1 + dx, c1y = y1;
+    const c2x = x2 - dx, c2y = y2;
+    return {
+      x: (x1 + 3 * c1x + 3 * c2x + x2) / 8,
+      y: (y1 + 3 * c1y + 3 * c2y + y2) / 8,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -812,7 +914,9 @@ export class FlowCanvas {
       return;
     }
 
-    // 1) Port out → start łączenia
+    // 1) Port out → start łączenia. setPointerCapture jest tu potrzebne
+    // bo pointermove musi miec gwarancje delivery do roota nawet gdy
+    // kursor wyjdzie poza canvas (drag-line do drugiego node'a).
     const portOut = ev.target.closest('.fb-port-out');
     if (portOut) {
       const nodeId = portOut.dataset.nodeId;
@@ -837,7 +941,18 @@ export class FlowCanvas {
     // 2) Port in → nic, obsłużony przy release łączenia
     if (ev.target.closest('.fb-port-in')) return;
 
-    // 3) Node → drag (ignoruj interaktywne elementy wewnątrz)
+    // 3) Klik w krawedz (SVG fb-edge-hit) — NIE rob panning, NIE rob
+    // setPointerCapture, NIE preventDefault. Zostawiamy przegladarce
+    // native dispatch zeby click event mial poprawny target = edge-hit
+    // (setPointerCapture przekierowywaloby click na roota).
+    if (ev.target.closest('.fb-edge-hit') || ev.target.closest('.fb-edge-delete')) {
+      return;
+    }
+
+    // 4) Node → drag (ignoruj interaktywne elementy wewnątrz). Brak
+    // setPointerCapture: pointermove/pointerup sa juz podpiete na window
+    // (linia 236-238), wiec drag dziala bez capture'a, a click na koniec
+    // ma poprawny ev.target.
     const nodeEl = ev.target.closest('.fb-node');
     if (nodeEl) {
       if (ev.target.closest('input, select, textarea, button, tf-button, [data-no-drag]')) return;
@@ -858,12 +973,13 @@ export class FlowCanvas {
         moved: false,
         pointerId: ev.pointerId,
       };
-      try { this.root.setPointerCapture(ev.pointerId); } catch (_) {}
+      // preventDefault tylko zeby zatrzymac native text selection na node
+      // labelach przy dlugim drag — NIE blokuje click bo standard W3C.
       ev.preventDefault();
       return;
     }
 
-    // 4) Pusty canvas → pan
+    // 5) Pusty canvas → pan. Bez setPointerCapture (jak w node-drag).
     this._panning = {
       startClientX: ev.clientX,
       startClientY: ev.clientY,
@@ -871,7 +987,6 @@ export class FlowCanvas {
       pointerId: ev.pointerId,
       moved: false,
     };
-    try { this.root.setPointerCapture(ev.pointerId); } catch (_) {}
     this.root.classList.add('panning');
     ev.preventDefault();
   }
@@ -983,6 +1098,23 @@ export class FlowCanvas {
             rejectMsg = I18n.t('flows_builder.invalid_port', { node_type: fromNode.type, port: fromPort });
           } else if (toInputs && !toInputs.includes(toPort)) {
             rejectMsg = I18n.t('flows_builder.invalid_port', { node_type: toNode.type, port: toPort });
+          } else {
+            // Walidacja typed (lustrzana R8 z backendu): port producenta i
+            // konsumenta musza miec kompatybilne typy. `any` na ktorejkolwiek
+            // stronie to wildcard. Bez tego user moglby polaczyc Audio do
+            // Text node'a a backend rzucilby blad dopiero przy save.
+            const fromIdx = fromOutputs ? fromOutputs.indexOf(fromPort) : -1;
+            const toIdx = toInputs ? toInputs.indexOf(toPort) : -1;
+            const fromType = (fromIdx >= 0 && Array.isArray(fromTpl?.output_port_types))
+              ? fromTpl.output_port_types[fromIdx] : 'any';
+            const toType = (toIdx >= 0 && Array.isArray(toTpl?.input_port_types))
+              ? toTpl.input_port_types[toIdx] : 'any';
+            if (!arePortTypesCompatible(fromType, toType)) {
+              rejectMsg = I18n.t('flows_builder.invalid_port_type', {
+                from_type: fromType,
+                to_type: toType,
+              }) || `Niekompatybilne typy: ${fromType} → ${toType}`;
+            }
           }
           if (rejectMsg) {
             this.opts.onInvalidConnection?.(rejectMsg);
@@ -1020,15 +1152,33 @@ export class FlowCanvas {
 
   _onClick(ev) {
     if (this._suppressNextClick) { this._suppressNextClick = false; return; }
-    const hit = ev.target.closest('.fb-edge-hit');
+    // Pobieramy realny element pod kursorem: ev.target moze byc rootem
+    // canvasa gdy SVG path z pointer-events: stroke nie zostaje primary
+    // target'em w niektorych przegladarkach (np. po zmianach DOM w
+    // _renderEdges). elementFromPoint jest authoritative dla kliku.
+    const hitTarget = document.elementFromPoint(ev.clientX, ev.clientY) || ev.target;
+
+    // Klik w X-przycisk na srodku selected edge'a → usun krawedz.
+    const deleteBtn = hitTarget.closest('.fb-edge-delete');
+    if (deleteBtn) {
+      const edgeId = deleteBtn.dataset.edgeId;
+      this.edges = this.edges.filter((e) => e.id !== edgeId);
+      this.selectedEdgeId = null;
+      this._pushHistory();
+      this._renderEdges();
+      this.onChange();
+      return;
+    }
+    const hit = hitTarget.closest('.fb-edge-hit');
     if (hit) {
       this.selectedIds.clear();
       this.selectedEdgeId = hit.dataset.edgeId;
       this._applySelectionClasses();
+      this._renderEdges();
       this.onSelect(null);
       return;
     }
-    const nodeEl = ev.target.closest('.fb-node');
+    const nodeEl = hitTarget.closest('.fb-node');
     if (nodeEl) {
       this.selectNode(nodeEl.dataset.nodeId, { additive: ev.shiftKey });
       return;

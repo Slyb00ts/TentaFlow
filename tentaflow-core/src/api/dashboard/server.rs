@@ -41,6 +41,7 @@ pub struct DashboardServer {
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
@@ -71,6 +72,7 @@ impl DashboardServer {
             local_node_id: Arc::from(""),
             mesh_security: None,
             permission_checker: None,
+            addon_manager: None,
             license: Arc::new(StaticLicenseChecker::free()),
             mesh_relay_health: None,
             port_allocator: None,
@@ -133,6 +135,15 @@ impl DashboardServer {
         self
     }
 
+    /// Ustawia AddonManager — udostepnia ui_panels cache dla Apps menu.
+    pub fn with_addon_manager(
+        mut self,
+        addon_manager: Option<Arc<crate::addon::AddonManager>>,
+    ) -> Self {
+        self.addon_manager = addon_manager;
+        self
+    }
+
     /// Uruchamia serwer HTTP - blokuje do zakonczenia
     pub async fn run(&self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.bind).await?;
@@ -149,10 +160,13 @@ impl DashboardServer {
         let local_node_id = self.local_node_id.clone();
         let mesh_security = self.mesh_security.clone();
         let permission_checker = self.permission_checker.clone();
+        let addon_manager = self.addon_manager.clone();
         let license = self.license.clone();
         let mesh_relay_health = self.mesh_relay_health.clone();
         let port_allocator = self.port_allocator.clone();
         let mesh_services_registry = self.mesh_services_registry.clone();
+
+        crate::scheduler::start(db.clone(), addon_manager.clone());
 
         // Wire up cross-node service action handlers (krok N3b). The mesh
         // command executor is created by `start_mesh_pipeline` long before
@@ -196,6 +210,7 @@ impl DashboardServer {
             let lni_clone = local_node_id.clone();
             let msec_clone = mesh_security.clone();
             let pc_clone = permission_checker.clone();
+            let am_clone = addon_manager.clone();
             let lic_clone = license.clone();
             let mrh_clone = mesh_relay_health.clone();
             let pa_clone = port_allocator.clone();
@@ -218,6 +233,7 @@ impl DashboardServer {
                     let lni = lni_clone.clone();
                     let msec = msec_clone.clone();
                     let pc = pc_clone.clone();
+                    let am = am_clone.clone();
                     let lic = lic_clone.clone();
                     let mrh = mrh_clone.clone();
                     let pa = pa_clone.clone();
@@ -225,8 +241,8 @@ impl DashboardServer {
                     let ra = remote_addr_str.clone();
                     async move {
                         handle_request(
-                            req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic,
-                            mrh, pa, ra, msr,
+                            req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, am,
+                            lic, mrh, pa, ra, msr,
                         )
                         .await
                     }
@@ -311,6 +327,270 @@ fn handle_result(result: anyhow::Result<(u16, String)>, error_status: u16) -> (u
     }
 }
 
+/// Reject any GET that smuggles a body onto an unauthenticated signed-URL
+/// endpoint. Returns a pre-built 413 response when the request carries a
+/// non-empty `Content-Length` or any `Transfer-Encoding` — preventing
+/// pre-HMAC memory exhaustion. The body is *never* read here; the caller
+/// should drop the request after this check so the connection terminates
+/// without slurping bytes off the socket.
+fn reject_unauth_get_body(
+    headers: &hyper::HeaderMap,
+) -> std::result::Result<(), Response<DashboardBody>> {
+    if headers.contains_key(hyper::header::TRANSFER_ENCODING) {
+        return Err(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header("Content-Type", "application/json")
+            .body(Either::Left(Full::new(Bytes::from_static(
+                b"{\"error\":\"body_not_allowed\"}",
+            ))))
+            .unwrap());
+    }
+    let cl = headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    match cl {
+        None | Some(0) => Ok(()),
+        Some(_) => Err(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header("Content-Type", "application/json")
+            .body(Either::Left(Full::new(Bytes::from_static(
+                b"{\"error\":\"body_not_allowed\"}",
+            ))))
+            .unwrap()),
+    }
+}
+
+/// Adds the always-on security headers we send back with every byte body
+/// served from the HMAC-only signed-URL endpoints (`/frames`, `/recordings`).
+/// `Cross-Origin-Resource-Policy: same-site` blocks cross-origin embedding
+/// (a hostile page cannot pull a frame into a `<canvas>`); `Cache-Control:
+/// private, no-store` keeps the bytes out of intermediate caches; the rest
+/// are the standard browser-side hardening trio.
+fn apply_signed_url_security_headers(
+    mut builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+    builder = builder
+        .header("Cross-Origin-Resource-Policy", "same-site")
+        .header("Referrer-Policy", "no-referrer")
+        .header("Cache-Control", "private, no-store")
+        .header("X-Content-Type-Options", "nosniff");
+    builder
+}
+
+/// F1b P3.C-3 — map a `PickupOutcome` to the HTTP response. Shared by the
+/// local fast path (`handle_pickup`) and the cross-node mesh-fallback path
+/// (`frame_proxy::fetch_from_peer`) so both routes apply the same security
+/// headers and emit the same body shape per status code.
+fn pickup_outcome_to_response(
+    outcome: crate::api::frame_pickup::PickupOutcome,
+) -> Response<DashboardBody> {
+    use crate::api::frame_pickup::{
+        PickupOutcome, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_PTS, HDR_FRAME_TS_MS,
+        HDR_FRAME_WIDTH,
+    };
+    let status = outcome.http_status();
+    match outcome {
+        PickupOutcome::Ok {
+            bytes,
+            width,
+            height,
+            pixel_format,
+            timestamp_unix_ms,
+            pts,
+        } => {
+            let mut builder = Response::builder()
+                .status(status)
+                .header("Content-Type", "application/octet-stream")
+                .header(HDR_FRAME_WIDTH, width.to_string())
+                .header(HDR_FRAME_HEIGHT, height.to_string())
+                .header(HDR_FRAME_PIXEL_FORMAT, pixel_format)
+                .header(HDR_FRAME_TS_MS, timestamp_unix_ms.to_string());
+            if let Some(p) = pts {
+                builder = builder.header(HDR_FRAME_PTS, p.to_string());
+            }
+            builder = apply_signed_url_security_headers(builder);
+            let body = Bytes::copy_from_slice(&bytes);
+            builder.body(Either::Left(Full::new(body))).unwrap()
+        }
+        PickupOutcome::BadHeaders(why) | PickupOutcome::HeaderMismatch(why) => {
+            let body = format!("{{\"error\":\"{}\"}}", why);
+            let builder = apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            );
+            builder
+                .body(Either::Left(Full::new(Bytes::from(body))))
+                .unwrap()
+        }
+        PickupOutcome::UpstreamUnavailable(reason) => {
+            let body = format!("{{\"error\":\"{}\"}}", reason);
+            let builder = apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .header("Retry-After", "5"),
+            );
+            builder
+                .body(Either::Left(Full::new(Bytes::from(body))))
+                .unwrap()
+        }
+        PickupOutcome::Replay => {
+            let builder = apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            );
+            builder
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"replay\"}",
+                ))))
+                .unwrap()
+        }
+        PickupOutcome::Unauthorized(_)
+        | PickupOutcome::FramePurged
+        | PickupOutcome::UpstreamNotFound => {
+            let builder = apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            );
+            builder
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"pickup_denied\"}",
+                ))))
+                .unwrap()
+        }
+    }
+}
+
+/// Collapse-audit map: per-IP timestamp of the LAST audit row emitted for a
+/// 429 denial, plus the count of denials inside the current window. We do
+/// not want to write one row per refused token, so we coalesce: at most one
+/// row per `AUDIT_429_WINDOW` per IP, carrying the in-window count.
+///
+/// Bounded by both an idle sweep (entries whose window has fully elapsed
+/// twice over are useless) and a hard cap (LRU-evict the oldest 25 % once
+/// `MAX_AUDIT_ENTRIES` is reached). Without these the map would grow
+/// unbounded under a flood of unique forged-token attackers.
+static RATE_LIMIT_AUDIT: std::sync::OnceLock<dashmap::DashMap<String, (std::time::Instant, u32)>> =
+    std::sync::OnceLock::new();
+const AUDIT_429_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const AUDIT_IDLE_EVICT_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_AUDIT_ENTRIES: usize = 10_000;
+
+fn rate_limit_audit_map() -> &'static dashmap::DashMap<String, (std::time::Instant, u32)> {
+    RATE_LIMIT_AUDIT.get_or_init(dashmap::DashMap::new)
+}
+
+/// Amortized cleanup: called from `build_rate_limit_response`. Cheap when the
+/// map is small (early-returns), aggressive once it crosses 1 000 entries.
+fn sweep_rate_limit_audit(now: std::time::Instant) {
+    let map = rate_limit_audit_map();
+    if map.len() < 1_000 {
+        return;
+    }
+    map.retain(|_, (last_seen, _)| {
+        now.saturating_duration_since(*last_seen) < AUDIT_IDLE_EVICT_AFTER
+    });
+    if map.len() >= MAX_AUDIT_ENTRIES {
+        let target = MAX_AUDIT_ENTRIES * 3 / 4;
+        let mut snapshot: Vec<(String, std::time::Instant)> =
+            map.iter().map(|e| (e.key().clone(), e.value().0)).collect();
+        snapshot.sort_by_key(|(_, ts)| *ts);
+        let drop_count = snapshot.len().saturating_sub(target);
+        for (key, _) in snapshot.into_iter().take(drop_count) {
+            map.remove(&key);
+        }
+    }
+}
+
+/// Build a 429 response and emit a collapsed-audit row if the per-IP window
+/// has elapsed. `retry_after_secs` is rounded up to whole seconds for the
+/// `Retry-After` header (HTTP requires integer seconds).
+fn build_rate_limit_response(
+    db: &DbPool,
+    ip: &str,
+    user_agent: Option<&str>,
+    endpoint: &str,
+    retry_after_secs: f64,
+    global: bool,
+) -> Response<DashboardBody> {
+    let retry_after = retry_after_secs.ceil().max(1.0) as u64;
+    let key = format!("{ip}|{endpoint}");
+    let now = std::time::Instant::now();
+    sweep_rate_limit_audit(now);
+    let mut entry = rate_limit_audit_map().entry(key).or_insert((now, 0));
+    let elapsed = now.saturating_duration_since(entry.0);
+    entry.1 = entry.1.saturating_add(1);
+    let should_emit = elapsed >= AUDIT_429_WINDOW || entry.0 == now;
+    if should_emit {
+        let denied_count = entry.1;
+        let details = serde_json::json!({
+            "endpoint": endpoint,
+            "denied_count": denied_count,
+            "window_secs": AUDIT_429_WINDOW.as_secs(),
+            "source_ip": ip,
+            "user_agent": user_agent.map(|s| s.chars().take(256).collect::<String>()).unwrap_or_default(),
+            "global": global,
+        })
+        .to_string();
+        if let Ok(conn) = db.lock() {
+            let _ = conn.execute(
+                "INSERT INTO audit_log \
+                    (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+                     result, error_message, severity, risk_class, details) \
+                 VALUES (datetime('now'), NULL, NULL, 'rate_limit_denied', \
+                         'http_endpoint', ?1, 'denied', NULL, 'warn', 'B', ?2)",
+                rusqlite::params![endpoint, details],
+            );
+        }
+        entry.0 = now;
+        entry.1 = 0;
+    }
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("Content-Type", "application/json")
+        .header("Retry-After", retry_after.to_string())
+        .body(Either::Left(Full::new(Bytes::from_static(
+            b"{\"error\":\"rate_limited\"}",
+        ))))
+        .unwrap()
+}
+
+/// Single helper that rate-limits the signed-URL endpoints. Returns Err with
+/// a pre-built 429 if the request must be refused.
+fn check_signed_url_rate_limit(
+    db: &DbPool,
+    ip: &str,
+    user_agent: Option<&str>,
+    endpoint: &str,
+) -> std::result::Result<(), Response<DashboardBody>> {
+    use crate::api::rate_limit::{rate_limiter, RateLimitResult};
+    match rate_limiter().check(ip) {
+        RateLimitResult::Allow => Ok(()),
+        RateLimitResult::IpLimit {
+            retry_after_secs, ..
+        } => Err(build_rate_limit_response(
+            db,
+            ip,
+            user_agent,
+            endpoint,
+            retry_after_secs,
+            false,
+        )),
+        RateLimitResult::GlobalLimit { retry_after_secs } => Err(build_rate_limit_response(
+            db,
+            ip,
+            user_agent,
+            endpoint,
+            retry_after_secs,
+            true,
+        )),
+    }
+}
+
 /// Wyciaga Bearer token z naglowka Authorization
 fn extract_bearer_token(req: &Request<Incoming>) -> Option<&str> {
     req.headers()
@@ -333,15 +613,29 @@ pub async fn handle_request(
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
-    _remote_addr: String,
+    remote_addr: String,
     mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> std::result::Result<Response<DashboardBody>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
+    // Use the raw socket peer for rate-limiting + audit. We deliberately do
+    // not honour `X-Forwarded-For` here: F1b core is meant to terminate the
+    // TLS connection itself, and a reverse-proxy deployment must explicitly
+    // opt in to XFF (not implemented in F1b — documented in the audit notes).
+    let client_ip: String = remote_addr
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(|c| c == '[' || c == ']').to_string())
+        .unwrap_or_else(|| remote_addr.clone());
+    let user_agent: Option<String> = req
+        .headers()
+        .get(hyper::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     // Wyciagnij i zwaliduj origin dla CORS
     let cors_origin: Option<String> = req
@@ -367,7 +661,8 @@ pub async fn handle_request(
     // Wyklucz endpointy publiczne (login, SSO callback) — nie maja Auth header
     let csrf_exempt = path == "/api/auth/login"
         || path.contains("/oauth/callback")
-        || path.contains("/sso/callback");
+        || path.contains("/sso/callback")
+        || path == "/core/frame/pickup";
     if !csrf_exempt && (method == Method::POST || method == Method::PUT || method == Method::DELETE)
     {
         let has_origin = req.headers().get("origin").is_some();
@@ -479,6 +774,18 @@ pub async fn handle_request(
                 .unwrap_or_default(),
         );
 
+        // Ensure a single shared SessionRegistry. If already initialized (e.g. by
+        // another code path), reuse the existing one. Both dispatch and host functions
+        // must see the same instance.
+        let shared_sessions = {
+            let fresh = Arc::new(crate::addon::ui_session::SessionRegistry::new());
+            crate::addon::ui_session::init_global_registry(fresh);
+            // Always read back from global — this is the authoritative instance.
+            crate::addon::ui_session::global_registry()
+                .expect("global_registry must be set after init")
+                .clone()
+        };
+
         // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
         let meeting_manager =
             crate::meeting::MeetingManager::new(db.clone(), Some(service_manager.clone()));
@@ -494,6 +801,7 @@ pub async fn handle_request(
             local_node_id: local_node_id.clone(),
             mesh_security: mesh_security.clone(),
             permission_checker: permission_checker.clone(),
+            addon_manager: addon_manager.clone(),
             license: license.clone(),
             meeting_manager,
             vnc_tunnels: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -501,6 +809,7 @@ pub async fn handle_request(
             port_allocator: port_allocator.clone(),
             mesh_services_registry: mesh_services_registry.clone(),
             live_handles: service_manager.live_handles.clone(),
+            ui_sessions: shared_sessions.clone(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
@@ -700,6 +1009,493 @@ pub async fn handle_request(
     }
 
     // Addon OAuth login — wymaga auth; obsluzony w bloku z JWT ponizej.
+
+    // Service-to-Core frame pickup — services authenticate via X-Pickup-Token
+    // (HMAC, scoped, one-shot) rather than JWT. Must be reachable WITHOUT the
+    // dashboard's auth gate. See `api::frame_pickup`.
+    if method == Method::POST && path == "/core/frame/pickup" {
+        use crate::api::frame_pickup::{
+            handle_pickup, log_outcome, verify_pickup_headers, PickupOutcome, PickupRequest,
+            HDR_FRAME_REF, HDR_PICKUP_TOKEN, HDR_REQUEST_ID, HDR_SERVICE_ID,
+        };
+        use crate::services::pickup_tokens::{PickupVerifyError, VerifySource};
+        // mTLS pinning gate: if the operator enabled `pickup_required`, the
+        // connecting peer MUST present a client cert whose SHA-256 fingerprint
+        // is on the allowlist. Default (single-node F1a/F1b) is `false`, in
+        // which case this check is a no-op and HMAC token auth stands alone.
+        let mtls_cfg = crate::api::mtls::pickup_mtls_config();
+        if mtls_cfg.pickup_required {
+            let peer_der = req
+                .extensions()
+                .get::<crate::api::mtls::ClientCertDer>()
+                .map(|c| c.0.clone());
+            let allowed = peer_der
+                .as_deref()
+                .map(|der| mtls_cfg.matches(der))
+                .unwrap_or(false);
+            if !allowed {
+                warn!(
+                    "/core/frame/pickup: mTLS pinning denied from {} (peer_cert_present={})",
+                    client_ip,
+                    peer_der.is_some()
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"mtls_required\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+        if let Err(resp) = check_signed_url_rate_limit(
+            &db,
+            &client_ip,
+            user_agent.as_deref(),
+            "/core/frame/pickup",
+        ) {
+            return Ok(resp);
+        }
+        let hdr = |name: &str| -> Option<String> {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        };
+        let token = hdr(HDR_PICKUP_TOKEN);
+        let frame_ref = hdr(HDR_FRAME_REF);
+        let service_id = hdr(HDR_SERVICE_ID);
+        let request_id = hdr(HDR_REQUEST_ID);
+        // Unauth endpoint — reject oversized bodies before reading them.
+        // Pickup handler ignores body entirely; 1 KiB is a safety margin.
+        const PICKUP_BODY_LIMIT: u64 = 1024;
+        let content_length: u64 = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if content_length > PICKUP_BODY_LIMIT {
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"payload_too_large\"}",
+                ))))
+                .unwrap());
+        }
+        let body = req.collect().await?.to_bytes();
+        if body.len() as u64 > PICKUP_BODY_LIMIT {
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"payload_too_large\"}",
+                ))))
+                .unwrap());
+        }
+
+        let pr = PickupRequest {
+            pickup_token: token.as_deref(),
+            frame_ref: frame_ref.as_deref(),
+            service_id: service_id.as_deref(),
+            request_id: request_id.as_deref(),
+        };
+        let issuer = crate::services::pickup_token_issuer();
+        let storage = crate::services::frame_storage();
+
+        // F1b P3.C-3 — split verify from consume so a Peer-source token can
+        // be routed through frame_proxy instead of touching the local LRU.
+        let verified = match verify_pickup_headers(&pr, issuer, &db) {
+            Ok(v) => v,
+            Err(outcome) => return Ok(pickup_outcome_to_response(outcome)),
+        };
+
+        let outcome = match &verified.source {
+            VerifySource::Local => handle_pickup(pr, issuer, storage, &db),
+            VerifySource::Peer(peer_node_id) => {
+                // B-side replay protection: the mesh-fallback issuing node
+                // owns the one-shot inflight contract, so we maintain a
+                // process-local "this wire was already proxied through me"
+                // map to stop double-spend on the verifying node.
+                if let Err(PickupVerifyError::AlreadyConsumed) =
+                    issuer.mesh_inflight_consume(&verified.token)
+                {
+                    return Ok(pickup_outcome_to_response(log_outcome(
+                        &db,
+                        &pr,
+                        PickupOutcome::Replay,
+                        Some(peer_node_id.clone()),
+                    )));
+                }
+                match quic_mesh.as_ref() {
+                    Some(iroh) => {
+                        let fetch = crate::services::frame_proxy::fetch_from_peer(
+                            iroh,
+                            peer_node_id,
+                            &verified.payload.raw_ref,
+                            crate::services::frame_proxy::DEFAULT_FETCH_TIMEOUT,
+                        )
+                        .await;
+                        match fetch {
+                            Ok((bytes, meta)) => {
+                                let pixel_format: &'static str = match meta.pixel_format.as_str() {
+                                    "rgb24" => "rgb24",
+                                    _ => "rgb24",
+                                };
+                                let outcome = PickupOutcome::Ok {
+                                    bytes: std::sync::Arc::<[u8]>::from(bytes.into_boxed_slice()),
+                                    width: meta.width,
+                                    height: meta.height,
+                                    pixel_format,
+                                    timestamp_unix_ms: meta.timestamp_unix_ms,
+                                    pts: None,
+                                };
+                                log_outcome(&db, &pr, outcome, Some(peer_node_id.clone()))
+                            }
+                            Err(crate::services::frame_proxy::FrameProxyError::NotFound(_)) => {
+                                log_outcome(
+                                    &db,
+                                    &pr,
+                                    PickupOutcome::UpstreamNotFound,
+                                    Some(peer_node_id.clone()),
+                                )
+                            }
+                            Err(crate::services::frame_proxy::FrameProxyError::Timeout(_)) => {
+                                log_outcome(
+                                    &db,
+                                    &pr,
+                                    PickupOutcome::UpstreamUnavailable("timeout"),
+                                    Some(peer_node_id.clone()),
+                                )
+                            }
+                            Err(crate::services::frame_proxy::FrameProxyError::Unavailable {
+                                ..
+                            }) => log_outcome(
+                                &db,
+                                &pr,
+                                PickupOutcome::UpstreamUnavailable("upstream_unavailable"),
+                                Some(peer_node_id.clone()),
+                            ),
+                            Err(_) => log_outcome(
+                                &db,
+                                &pr,
+                                PickupOutcome::UpstreamUnavailable("proxy_error"),
+                                Some(peer_node_id.clone()),
+                            ),
+                        }
+                    }
+                    None => log_outcome(
+                        &db,
+                        &pr,
+                        PickupOutcome::UpstreamUnavailable("mesh_unavailable"),
+                        Some(peer_node_id.clone()),
+                    ),
+                }
+            }
+        };
+
+        return Ok(pickup_outcome_to_response(outcome));
+    }
+
+    // GET /frames/<ref>?token=&exp=&ref= — addon-facing multi-use signed URL
+    // for raw RGB24 frames out of `services::frame_storage`. Authenticated by
+    // HMAC token only (no JWT, no cookies, no CSRF surface).
+    if method == Method::GET && path.starts_with("/frames/") && path.len() > "/frames/".len() {
+        use crate::api::frames::{
+            handle_frame_url, parse_query, FrameOutcome, RequestContext, HDR_FRAME_HEIGHT,
+            HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_PTS, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/frames")
+        {
+            return Ok(resp);
+        }
+        drop(req);
+        let path_ref = path.strip_prefix("/frames/").unwrap_or("");
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::frame_url_issuer();
+        let storage = crate::services::frame_storage();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_frame_url(path_ref, &q, issuer, storage, &db, ctx);
+        let status = outcome.http_status();
+        match outcome {
+            FrameOutcome::Ok {
+                bytes,
+                width,
+                height,
+                pixel_format,
+                timestamp_unix_ms,
+                pts,
+            } => {
+                // Frame storage holds raw RGB24. For browser `<img src>` we
+                // must re-encode to JPEG — `application/octet-stream` would
+                // fail to render and the dashboard would show a broken image.
+                // Quality 75 is a good MVP balance (~50-150 KB per 1080p
+                // frame). Later we will replace this snapshot polling with
+                // WebRTC (Krok 5) and the JPEG re-encode disappears.
+                let mut jpeg_buf: Vec<u8> = Vec::with_capacity(bytes.len() / 8);
+                let color = if pixel_format == "rgb24" {
+                    image::ExtendedColorType::Rgb8
+                } else {
+                    image::ExtendedColorType::Rgb8
+                };
+                use image::ImageEncoder;
+                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 75);
+                let encode_result = encoder.write_image(&bytes, width, height, color);
+                let (content_type, body_bytes) = match encode_result {
+                    Ok(()) => ("image/jpeg", jpeg_buf),
+                    Err(e) => {
+                        tracing::warn!(
+                            width,
+                            height,
+                            pixel_format,
+                            error = %e,
+                            "frames: JPEG encode failed, falling back to raw RGB"
+                        );
+                        ("application/octet-stream", bytes.to_vec())
+                    }
+                };
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header("Content-Type", content_type)
+                    .header(HDR_FRAME_WIDTH, width.to_string())
+                    .header(HDR_FRAME_HEIGHT, height.to_string())
+                    .header(HDR_FRAME_PIXEL_FORMAT, pixel_format)
+                    .header(HDR_FRAME_TS_MS, timestamp_unix_ms.to_string());
+                if let Some(p) = pts {
+                    builder = builder.header(HDR_FRAME_PTS, p.to_string());
+                }
+                builder = apply_signed_url_security_headers(builder);
+                let body = Bytes::from(body_bytes);
+                return Ok(builder.body(Either::Left(Full::new(body))).unwrap());
+            }
+            FrameOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            FrameOutcome::Denied(_) | FrameOutcome::NotFound => {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"frame_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
+    // GET /recordings/<ref>?token=&exp=&ref= — addon-facing signed URL for
+    // snapshot PNG / segment MP4. HMAC-only auth, exactly like /frames/.
+    // Wired under `feature = "camera"` because the recording subsystem
+    // (snapshot encoder + segment muxer + DB row helpers) is camera-gated.
+    #[cfg(feature = "camera")]
+    if method == Method::GET
+        && path.starts_with("/recordings/")
+        && path.len() > "/recordings/".len()
+    {
+        use crate::api::recording::{
+            handle_recording_url, parse_query, read_recording_file, RecordingFileOutcome,
+            RecordingOutcome, RequestContext,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/recordings")
+        {
+            return Ok(resp);
+        }
+        drop(req);
+        let path_ref = path.strip_prefix("/recordings/").unwrap_or("");
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::recording_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_recording_url(path_ref, &q, issuer, &db, ctx);
+        let auth_status = outcome.http_status();
+        match outcome {
+            RecordingOutcome::Ok {
+                content_type,
+                hash_sha256,
+                created_at,
+                file_size_bytes,
+                file_path,
+                retention_class,
+                owner_addon_id,
+            } => {
+                let file_outcome = read_recording_file(
+                    &db,
+                    path_ref,
+                    &file_path,
+                    &retention_class,
+                    &owner_addon_id,
+                    file_size_bytes,
+                    ctx,
+                )
+                .await;
+                let status = file_outcome.http_status();
+                return match file_outcome {
+                    RecordingFileOutcome::Ok { bytes } => Ok(apply_signed_url_security_headers(
+                        Response::builder()
+                            .status(status)
+                            .header("Content-Type", content_type)
+                            .header("X-Recording-Hash", hash_sha256)
+                            .header("X-Recording-Created-At", created_at.to_string()),
+                    )
+                    .body(Either::Left(Full::new(Bytes::from(bytes))))
+                    .unwrap()),
+                    _ => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Either::Left(Full::new(Bytes::from_static(
+                            b"{\"error\":\"recording_unavailable\"}",
+                        ))))
+                        .unwrap()),
+                };
+            }
+            RecordingOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(400)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            RecordingOutcome::Denied(_)
+            | RecordingOutcome::NotFound
+            | RecordingOutcome::InternalError(_) => {
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"recording_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
+    // GET /legal/<doc_id>?token=&exp=&org=&nonce= — HMAC-signed download of a
+    // RODO/GDPR PDF artifact. HMAC-only auth, same shape as `/recordings`
+    // plus `org` + `nonce` extra fields (the legal binding is per-tenant +
+    // unguessable). F2 P8.c.
+    if method == Method::GET && path.starts_with("/legal/") && path.len() > "/legal/".len() {
+        use crate::api::legal::{
+            handle_legal_url, parse_query, read_legal_file, LegalFileOutcome, LegalOutcome,
+            RequestContext,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/legal")
+        {
+            return Ok(resp);
+        }
+        drop(req);
+        let path_doc_id = path.strip_prefix("/legal/").unwrap_or("");
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::legal_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_legal_url(path_doc_id, &q, issuer, &db, ctx);
+        let auth_status = outcome.http_status();
+        match outcome {
+            LegalOutcome::Ok {
+                org_id,
+                pdf_path,
+                content_hash,
+                generated_at,
+            } => {
+                let file_outcome = read_legal_file(&db, path_doc_id, &org_id, &pdf_path, ctx).await;
+                let status = file_outcome.http_status();
+                return match file_outcome {
+                    LegalFileOutcome::Ok { bytes } => Ok(apply_signed_url_security_headers(
+                        Response::builder()
+                            .status(status)
+                            .header("Content-Type", "application/pdf")
+                            .header("X-Legal-Hash", content_hash)
+                            .header("X-Legal-Generated-At", generated_at.to_string()),
+                    )
+                    .body(Either::Left(Full::new(Bytes::from(bytes))))
+                    .unwrap()),
+                    _ => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Either::Left(Full::new(Bytes::from_static(
+                            b"{\"error\":\"legal_unavailable\"}",
+                        ))))
+                        .unwrap()),
+                };
+            }
+            LegalOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(400)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            LegalOutcome::Denied(_)
+            | LegalOutcome::Revoked
+            | LegalOutcome::NotFound
+            | LegalOutcome::InternalError(_) => {
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"legal_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
 
     // Pliki statyczne - sciezki poza /api/
     if method == Method::GET && !path.starts_with("/api/") {
@@ -1032,4 +1828,3 @@ fn extract_ws_user_session(
 
     Some((claims.user_id, role))
 }
-

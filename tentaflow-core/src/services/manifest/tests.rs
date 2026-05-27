@@ -1113,7 +1113,11 @@ mod capability_axes {
             );
         }
 
-        let inputs = [InputModality::Text, InputModality::Image, InputModality::Audio];
+        let inputs = [
+            InputModality::Text,
+            InputModality::Image,
+            InputModality::Audio,
+        ];
         for m in inputs {
             assert!(
                 VALID_INPUT_MODALITIES.contains(&m.as_wire_str()),

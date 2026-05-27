@@ -7,11 +7,262 @@ use super::models::*;
 use super::DbPool;
 use anyhow::Result;
 use rusqlite::OptionalExtension;
+use std::collections::BTreeMap;
 
 /// Pozyskuje polaczenie z puli (lock na Mutex)
 fn acquire(pool: &DbPool) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
     pool.lock()
         .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))
+}
+
+#[cfg(test)]
+mod core_sync_repository_tests {
+    use super::*;
+    use crate::sync::core_capture::load_core_write_capture;
+    use crate::sync::ledger::FieldValue;
+    use crate::sync::runtime::SqlWriteAction;
+    use std::path::Path;
+
+    fn setup_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("test db")
+    }
+
+    fn flow_params<'a>(
+        name: &'a str,
+        flow_json: &'a str,
+        actor_user_id: Option<i64>,
+    ) -> FlowParams<'a> {
+        FlowParams {
+            name,
+            description: Some("opis"),
+            is_default: false,
+            service_type: Some("chat"),
+            flow_json,
+            status: "active",
+            published_model_name: None,
+            actor_user_id,
+        }
+    }
+
+    fn capture_id_for_resource(db: &DbPool, resource_type: &str, resource_id: i64) -> String {
+        capture_id_for_resource_str(db, resource_type, &resource_id.to_string())
+    }
+
+    fn capture_id_for_resource_str(db: &DbPool, resource_type: &str, resource_id: &str) -> String {
+        let conn = db.lock().expect("db lock");
+        conn.query_row(
+            "SELECT capture_id FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = ?1 AND resource_id = ?2 \
+             ORDER BY created_at_ms DESC LIMIT 1",
+            rusqlite::params![resource_type, resource_id],
+            |row| row.get(0),
+        )
+        .expect("capture id")
+    }
+
+    fn capture_id_for_action(
+        db: &DbPool,
+        resource_type: &str,
+        resource_id: i64,
+        action: &str,
+    ) -> String {
+        let conn = db.lock().expect("db lock");
+        conn.query_row(
+            "SELECT capture_id FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = ?1 AND resource_id = ?2 AND action = ?3 \
+             ORDER BY created_at_ms DESC LIMIT 1",
+            rusqlite::params![resource_type, resource_id.to_string(), action],
+            |row| row.get(0),
+        )
+        .expect("capture id")
+    }
+
+    fn create_actor(db: &DbPool) -> i64 {
+        create_user_account(
+            db,
+            "flow-owner",
+            "hash",
+            "Flow Owner",
+            "flow-owner@example.com",
+        )
+        .expect("create actor")
+    }
+
+    #[test]
+    fn create_flow_records_binary_core_capture() {
+        let db = setup_db();
+        let actor_id = create_actor(&db);
+        let id = create_flow(
+            &db,
+            &flow_params("Flow A", r#"{"nodes":[]}"#, Some(actor_id)),
+        )
+        .expect("create flow");
+        let capture_id = capture_id_for_resource(&db, "core.flow", id);
+        let conn = db.lock().expect("db lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Insert);
+        assert_eq!(capture.actor_user_id, Some(actor_id));
+        assert_eq!(
+            capture.changed_fields.get("name"),
+            Some(&FieldValue::String("Flow A".to_string()))
+        );
+    }
+
+    #[test]
+    fn update_flow_with_snapshot_records_flow_and_version_captures() {
+        let db = setup_db();
+        let actor_id = create_actor(&db);
+        let id = create_flow(
+            &db,
+            &flow_params("Flow A", r#"{"nodes":[]}"#, Some(actor_id)),
+        )
+        .expect("create flow");
+        update_flow_with_snapshot(
+            &db,
+            id,
+            1,
+            &flow_params("Flow B", r#"{"nodes":[{"id":"n1"}]}"#, Some(actor_id)),
+            Some(&actor_id.to_string()),
+        )
+        .expect("update flow");
+        let conn = db.lock().expect("db lock");
+        let flow_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = 'core.flow' AND resource_id = ?1",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("flow capture count");
+        let version_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = 'core.flow_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version capture count");
+
+        assert_eq!(flow_count, 2);
+        assert_eq!(version_count, 1);
+    }
+
+    #[test]
+    fn create_user_account_records_capture_without_password_hash() {
+        let db = setup_db();
+        let user_id = create_user_account(
+            &db,
+            "sales-user",
+            "secret-hash",
+            "Sales User",
+            "sales@example.com",
+        )
+        .expect("create user");
+        let capture_id = capture_id_for_resource(&db, "core.user_account", user_id);
+        let conn = db.lock().expect("db lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Insert);
+        assert_eq!(
+            capture.changed_fields.get("username"),
+            Some(&FieldValue::String("sales-user".to_string()))
+        );
+        assert!(!capture.changed_fields.contains_key("password_hash"));
+    }
+
+    #[test]
+    fn password_update_records_only_redacted_capture() {
+        let db = setup_db();
+        let user_id = create_user_account(
+            &db,
+            "password-user",
+            "old-hash",
+            "Password User",
+            "password@example.com",
+        )
+        .expect("create user");
+        update_user_account_password(&db, user_id, "new-secret-hash").expect("update password");
+        let capture_id = capture_id_for_action(&db, "core.user_account", user_id, "update");
+        let conn = db.lock().expect("db lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Update);
+        assert_eq!(
+            capture.changed_fields.get("password_changed"),
+            Some(&FieldValue::Bool(true))
+        );
+        assert!(!capture.changed_fields.contains_key("password_hash"));
+    }
+
+    #[test]
+    fn group_membership_records_core_capture() {
+        let db = setup_db();
+        let user_id =
+            create_user_account(&db, "group-user", "hash", "Group User", "group@example.com")
+                .expect("create user");
+        let group_id = create_group(&db, "Sales", "CRM team").expect("create group");
+        add_user_to_group(&db, group_id, user_id).expect("add member");
+        let resource_id = group_member_resource_id(group_id, user_id);
+        let capture_id = capture_id_for_resource_str(&db, "core.group_member", &resource_id);
+        let conn = db.lock().expect("db lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Insert);
+        assert_eq!(
+            capture.changed_fields.get("group_id"),
+            Some(&FieldValue::I64(group_id))
+        );
+        assert_eq!(
+            capture.changed_fields.get("user_id"),
+            Some(&FieldValue::I64(user_id))
+        );
+    }
+
+    #[test]
+    fn sync_permission_epoch_changes_for_acl_and_role_not_password() {
+        let db = setup_db();
+        let user_id =
+            create_user_account(&db, "epoch-user", "hash", "Epoch User", "epoch@example.com")
+                .expect("create user");
+        let initial =
+            get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
+
+        update_user_account_password(&db, user_id, "new-hash").expect("password");
+        let after_password =
+            get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
+        assert_eq!(after_password, initial);
+
+        set_user_role(&db, user_id, "admin").expect("role");
+        let after_role =
+            get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
+        assert!(after_role > after_password);
+
+        upsert_sync_resource_acl(
+            &db,
+            crate::services::org::DEFAULT_ORG_ID,
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.flow",
+            "flow-epoch",
+            Some(user_id),
+            Some(user_id),
+            None,
+            None,
+            "assigned",
+        )
+        .expect("acl");
+        let after_acl =
+            get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
+        assert!(after_acl > after_role);
+    }
 }
 
 /// Mapowanie wiersza na DbPrompt
@@ -286,6 +537,47 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
         rusqlite::params![key, value],
     )?;
     Ok(())
+}
+
+fn sync_permission_epoch_key(org_id: &str) -> String {
+    format!("sync.permission_epoch:{org_id}")
+}
+
+fn bump_sync_permission_epoch_with_conn(conn: &rusqlite::Connection, org_id: &str) -> Result<u64> {
+    let key = sync_permission_epoch_key(org_id);
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, '1') \
+         ON CONFLICT(key) DO UPDATE SET \
+             value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), \
+             updated_at = datetime('now')",
+        rusqlite::params![key],
+    )?;
+    read_sync_permission_epoch_with_conn(conn, org_id)
+}
+
+fn read_sync_permission_epoch_with_conn(conn: &rusqlite::Connection, org_id: &str) -> Result<u64> {
+    let key = sync_permission_epoch_key(org_id);
+    let value = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "0".to_string());
+    value
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("Nieprawidlowa epoka permissions sync: {}", e))
+}
+
+pub fn bump_sync_permission_epoch(pool: &DbPool, org_id: &str) -> Result<u64> {
+    let conn = acquire(pool)?;
+    bump_sync_permission_epoch_with_conn(&conn, org_id)
+}
+
+pub fn get_sync_permission_epoch(pool: &DbPool, org_id: &str) -> Result<u64> {
+    let conn = acquire(pool)?;
+    read_sync_permission_epoch_with_conn(&conn, org_id)
 }
 
 /// Odczytuje setting z automatycznym deszyfrowaniem (jesli klucz jest wrazliwy)
@@ -609,16 +901,719 @@ pub fn get_model_alias(pool: &DbPool, id: i64) -> Result<Option<DbModelAlias>> {
     Ok(result)
 }
 
-pub fn resolve_model_alias(pool: &DbPool, alias: &str) -> Result<Option<DbModelAlias>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM model_aliases WHERE alias = ?1 AND is_active = 1",
-        MODEL_ALIAS_COLS
-    ))?;
-    let result = stmt
-        .query_row(rusqlite::params![alias], row_to_model_alias)
+/// Resolves an alias to its row. When `caller_addon_id = None` the call is
+/// a system bypass (legacy core paths like routing middleware, TTS router,
+/// teams-bot bootstrap) and the visibility/consumer gate is skipped. When
+/// `Some(addon_id)` is passed, the function enforces the F1a §6.6 v0.6.0
+/// permission gate:
+///   - owner addon resolving its own alias → always allow,
+///   - `visibility='public'` → allow,
+///   - `visibility='restricted'` with a non-revoked row in
+///     `model_alias_consumers(alias_id, consumer_addon_id)` → allow,
+///   - everything else (private, restricted without grant) → returns
+///     `AliasPermissionDenied` so the caller can surface a permission
+///     error and audit `alias_calls.result='permission_denied'`.
+///
+/// Missing alias still returns `Ok(None)` (the gate only triggers when the
+/// alias exists and is active).
+pub fn resolve_model_alias(
+    pool: &DbPool,
+    alias: &str,
+    caller_addon_id: Option<&str>,
+) -> Result<Option<DbModelAlias>> {
+    resolve_model_alias_for_addon(pool, alias, caller_addon_id, None, None)
+}
+
+/// Same as `resolve_model_alias` but carries `method` and `request_id` so
+/// the denial path can attach them to `alias_calls` / `audit_log`. Addon
+/// entrypoints (`llm_generate`, `service_request`) call this directly so
+/// `permission_denied` rows are linkable to the originating request.
+pub fn resolve_model_alias_for_addon(
+    pool: &DbPool,
+    alias: &str,
+    caller_addon_id: Option<&str>,
+    method: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<Option<DbModelAlias>> {
+    let mut conn = acquire(pool)?;
+
+    // All reads + the (optional) denial write run in one transaction so
+    // visibility / consumer / uses_alias state cannot mutate between the
+    // permission check and the audit row. The transaction is read-only on
+    // the success path (no writes performed) — SQLite still allows it.
+    let tx = conn.transaction()?;
+
+    let alias_row: Option<DbModelAlias> = {
+        let mut stmt = tx.prepare_cached(&format!(
+            "SELECT {} FROM model_aliases WHERE alias = ?1 AND is_active = 1",
+            MODEL_ALIAS_COLS
+        ))?;
+        stmt.query_row(rusqlite::params![alias], row_to_model_alias)
+            .optional()?
+    };
+    let Some(alias_row) = alias_row else {
+        tx.commit()?;
+        return Ok(None);
+    };
+
+    // System bypass — legacy core routing paths.
+    let Some(caller_id) = caller_addon_id else {
+        tx.commit()?;
+        return Ok(Some(alias_row));
+    };
+
+    // Owner addon always passes the gate.
+    let owner: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
+            rusqlite::params![alias_row.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .optional()?;
-    Ok(result)
+    if let Some((ref ot, ref oid)) = owner {
+        if ot == "addon" && oid.as_deref() == Some(caller_id) {
+            tx.commit()?;
+            return Ok(Some(alias_row));
+        }
+    }
+
+    // Visibility lookup. Absence of a row defaults to `private` (closed
+    // by default, F1a §6.6 v0.6.0).
+    let visibility: String = tx
+        .query_row(
+            "SELECT visibility FROM model_alias_visibility WHERE alias_id = ?1",
+            rusqlite::params![alias_row.id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "private".to_string());
+
+    // Non-owner caller always needs an `addon_uses_alias` row with status
+    // granted/auto_granted — this is the per-addon declaration gate. The
+    // visibility tier on top adds an extra constraint for `restricted`
+    // (must also be on the consumer whitelist) and short-circuits to deny
+    // for `private`.
+    let uses_alias_ok: bool = tx
+        .query_row(
+            "SELECT 1 FROM addon_uses_alias \
+             WHERE addon_id = ?1 AND alias_target_name = ?2 \
+               AND grant_status IN ('granted','auto_granted')",
+            rusqlite::params![caller_id, alias],
+            |row| row.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    let consumer_ok: bool = if visibility == "restricted" {
+        tx.query_row(
+            "SELECT 1 FROM model_alias_consumers \
+             WHERE alias_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![alias_row.id, caller_id],
+            |row| row.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false)
+    } else {
+        true
+    };
+
+    let reason: Option<&'static str> = match visibility.as_str() {
+        "private" => Some("private_not_owner"),
+        "restricted" => {
+            if !consumer_ok {
+                Some("restricted_no_consumer")
+            } else if !uses_alias_ok {
+                Some("restricted_no_uses")
+            } else {
+                None
+            }
+        }
+        "public" => {
+            if !uses_alias_ok {
+                Some("public_no_uses")
+            } else {
+                None
+            }
+        }
+        // Unknown visibility values shouldn't reach here (CHECK constraint
+        // on `model_alias_visibility.visibility`), but treat as deny.
+        _ => Some("private_not_owner"),
+    };
+
+    if let Some(reason) = reason {
+        record_alias_resolve_denied_within_tx(
+            &tx,
+            alias,
+            Some(alias_row.id),
+            caller_id,
+            method,
+            request_id,
+            reason,
+        )?;
+        tx.commit()?;
+        return Err(AliasPermissionDenied::new(alias, caller_id, reason).into());
+    }
+
+    tx.commit()?;
+    Ok(Some(alias_row))
+}
+
+/// Inserts an `alias_calls` row with `result='permission_denied'` and a
+/// matching `audit_log` row (risk_class='A', action='alias_resolve_denied').
+/// Pulled out so both helpers (the resolver and any future ABI shortcut
+/// that needs to record a denial) share the same audit shape.
+fn record_alias_resolve_denied_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_name: &str,
+    alias_id: Option<i64>,
+    caller_addon_id: &str,
+    method: Option<&str>,
+    request_id: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    // `alias_calls.alias_id` is `NOT NULL REFERENCES model_aliases(id)` so
+    // we can only emit a row when the alias exists. For the rare case
+    // where the alias is missing (e.g. consumer racing against an
+    // uninstall) we skip the alias_calls insert and rely on audit_log
+    // alone — both are written in the same tx so they stay consistent.
+    if let Some(alias_id) = alias_id {
+        tx.execute(
+            "INSERT INTO alias_calls \
+                (alias_id, alias_name, method, target_used, target_node_id, service_id, \
+                 caller_addon_id, caller_user_id, request_id, duration_ms, payload_bytes, \
+                 response_bytes, fallback_used, fallback_chain_position, result, error_code, ts) \
+             VALUES (?1, ?2, ?3, '', NULL, NULL, ?4, NULL, ?5, NULL, NULL, NULL, \
+                     0, NULL, 'permission_denied', ?6, strftime('%s','now'))",
+            rusqlite::params![
+                alias_id,
+                alias_name,
+                method,
+                caller_addon_id,
+                request_id,
+                reason
+            ],
+        )?;
+    }
+
+    let details = serde_json::json!({
+        "alias": alias_name,
+        "reason": reason,
+        "method": method,
+        "request_id": request_id,
+    })
+    .to_string();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id: None,
+        addon_id: Some(caller_addon_id),
+        instance_id: None,
+        action: "alias_resolve_denied",
+        resource: None,
+        resource_type: Some("model_alias"),
+        resource_id: Some(alias_name),
+        result: Some("denied"),
+        error_message: None,
+        details: Some(&details),
+        ip_address: None,
+        node_id: None,
+        severity: Some("warn"),
+        risk_class: "A",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&*tx, &hash_input)?;
+    tx.execute(
+        "INSERT INTO audit_log \
+            (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+             result, error_message, severity, risk_class, details, prev_hash, hash) \
+         VALUES (?1, NULL, ?2, 'alias_resolve_denied', \
+                 'model_alias', ?3, 'denied', NULL, 'warn', 'A', ?4, ?5, ?6)",
+        rusqlite::params![
+            timestamp,
+            caller_addon_id,
+            alias_name,
+            details,
+            prev_hash,
+            hash
+        ],
+    )?;
+    Ok(())
+}
+
+/// Error returned by `resolve_model_alias` when the addon-bound caller is
+/// not allowed to resolve a particular alias. Carries enough context for
+/// `service_call_v1` to log `alias_calls.result='permission_denied'` and
+/// return `ABI_ERR_PERMISSION` without rebuilding the lookup chain.
+#[derive(Debug, Clone)]
+pub struct AliasPermissionDenied {
+    pub alias: String,
+    pub caller_addon_id: String,
+    pub reason: &'static str,
+}
+
+impl AliasPermissionDenied {
+    fn new(alias: &str, caller: &str, reason: &'static str) -> Self {
+        Self {
+            alias: alias.to_string(),
+            caller_addon_id: caller.to_string(),
+            reason,
+        }
+    }
+}
+
+impl std::fmt::Display for AliasPermissionDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "addon '{}' is not allowed to resolve alias '{}': {}",
+            self.caller_addon_id, self.alias, self.reason
+        )
+    }
+}
+
+impl std::error::Error for AliasPermissionDenied {}
+
+// =============================================================================
+// F1a §6.6 v0.6.0 Chunk C — visibility / consumers / uses_alias / uses_model
+// =============================================================================
+
+/// Sets per-alias visibility row (upsert). `visibility` must be one of
+/// `private`/`restricted`/`public` — caller (manifest parser) already
+/// validates the value, so an invalid input here is treated as a bug and
+/// surfaces as a SQLite CHECK error.
+pub fn set_alias_visibility_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    visibility: &str,
+    updated_by_user_id: Option<i64>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO model_alias_visibility (alias_id, visibility, updated_at, updated_by_user_id) \
+         VALUES (?1, ?2, strftime('%s','now'), ?3) \
+         ON CONFLICT(alias_id) DO UPDATE SET \
+             visibility = excluded.visibility, \
+             updated_at = excluded.updated_at, \
+             updated_by_user_id = excluded.updated_by_user_id",
+        rusqlite::params![alias_id, visibility, updated_by_user_id],
+    )?;
+    Ok(())
+}
+
+/// Adds (or restores) a consumer grant for `restricted` aliases. UNIQUE
+/// `(alias_id, consumer_addon_id)` keeps the row stable across reinstalls;
+/// `revoked_at` is cleared so an admin-revoked grant can be re-granted by
+/// a reinstall only via this helper (the helper is the only writer).
+pub fn add_alias_consumer_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    consumer_addon_id: &str,
+    granted_by_user_id: Option<i64>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO model_alias_consumers \
+            (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
+         VALUES (?1, ?2, ?3, strftime('%s','now'), NULL) \
+         ON CONFLICT(alias_id, consumer_addon_id) DO UPDATE SET \
+             granted_by_user_id = COALESCE(model_alias_consumers.granted_by_user_id, excluded.granted_by_user_id), \
+             granted_at = CASE \
+                 WHEN model_alias_consumers.granted_by_user_id IS NOT NULL THEN model_alias_consumers.granted_at \
+                 ELSE excluded.granted_at \
+             END, \
+             revoked_at = CASE \
+                 WHEN model_alias_consumers.granted_by_user_id IS NOT NULL THEN model_alias_consumers.revoked_at \
+                 ELSE NULL \
+             END",
+        rusqlite::params![alias_id, consumer_addon_id, granted_by_user_id],
+    )?;
+    Ok(())
+}
+
+/// Revokes manifest-granted consumer rows for `alias_id` whose
+/// `consumer_addon_id` is not in `keep` and which were not manually granted
+/// by an admin (`granted_by_user_id IS NULL`). Returns the list of revoked
+/// consumer ids so callers can emit audit entries. Admin-granted rows
+/// (`granted_by_user_id IS NOT NULL`) are preserved across manifest changes
+/// — only the operator can revoke them via M16. The DELETE is hard (not
+/// `revoked_at = now()`) because the row was synthesized from the manifest
+/// in the first place and is regenerated on every install pass; keeping it
+/// as a revoked tombstone would silently re-grant on the next install once
+/// the consumer is re-added to `allowed_consumers`.
+pub fn revoke_obsolete_manifest_consumers_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    keep: &[String],
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT consumer_addon_id FROM model_alias_consumers \
+         WHERE alias_id = ?1 AND granted_by_user_id IS NULL AND revoked_at IS NULL",
+    )?;
+    let existing: Vec<String> = stmt
+        .query_map(rusqlite::params![alias_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let keep_set: std::collections::HashSet<&str> = keep.iter().map(|s| s.as_str()).collect();
+    let mut revoked: Vec<String> = Vec::new();
+    for consumer in existing {
+        if !keep_set.contains(consumer.as_str()) {
+            tx.execute(
+                "DELETE FROM model_alias_consumers \
+                 WHERE alias_id = ?1 AND consumer_addon_id = ?2 AND granted_by_user_id IS NULL",
+                rusqlite::params![alias_id, consumer],
+            )?;
+            revoked.push(consumer);
+        }
+    }
+    Ok(revoked)
+}
+
+/// Looks up the alias name → (alias_id, visibility) tuple inside an active
+/// transaction. Returns `Ok(None)` when the alias is absent (consumer
+/// declared `[[uses_alias]]` for an alias whose owner addon is not yet
+/// installed — row stays `pending` until reconciliation runs).
+pub fn lookup_alias_visibility_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+) -> Result<Option<(i64, String)>> {
+    let id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM model_aliases WHERE alias = ?1",
+            rusqlite::params![alias],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    let visibility: String = tx
+        .query_row(
+            "SELECT visibility FROM model_alias_visibility WHERE alias_id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "private".to_string());
+    Ok(Some((id, visibility)))
+}
+
+/// Returns whether `consumer_addon_id` has a non-revoked grant for
+/// `alias_id` in `model_alias_consumers`.
+pub fn has_alias_consumer_grant_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    consumer_addon_id: &str,
+) -> Result<bool> {
+    let row: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM model_alias_consumers \
+             WHERE alias_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![alias_id, consumer_addon_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(row.is_some())
+}
+
+/// Computes the grant_status for an `addon_uses_alias` row based on the
+/// current visibility / consumer-grant state. Owner addon is treated as
+/// always granted (`auto_granted`).
+pub fn compute_uses_alias_status_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+    consumer_addon_id: &str,
+) -> Result<&'static str> {
+    let Some((alias_id, visibility)) = lookup_alias_visibility_within_tx(tx, alias)? else {
+        return Ok("pending");
+    };
+    let owner_match: bool = tx
+        .query_row(
+            "SELECT 1 FROM model_alias_owners \
+             WHERE alias_id = ?1 AND owner_type = 'addon' AND owner_id = ?2",
+            rusqlite::params![alias_id, consumer_addon_id],
+            |r| r.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if owner_match {
+        return Ok("auto_granted");
+    }
+    Ok(match visibility.as_str() {
+        "public" => "auto_granted",
+        "restricted" => {
+            if has_alias_consumer_grant_within_tx(tx, alias_id, consumer_addon_id)? {
+                "granted"
+            } else {
+                "pending"
+            }
+        }
+        _ => "denied",
+    })
+}
+
+/// Inserts (or updates) a consumer-side `[[uses_alias]]` declaration into
+/// `addon_uses_alias`. The row's `grant_status` is computed by
+/// `compute_uses_alias_status_within_tx`. Subsequent reconciliation runs
+/// may flip the status when the owner addon installs the alias later.
+pub fn upsert_uses_alias_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    addon_id: &str,
+    alias_name: &str,
+    required: bool,
+    reason: &str,
+) -> Result<&'static str> {
+    let status = compute_uses_alias_status_within_tx(tx, alias_name, addon_id)?;
+    let decided_at: Option<i64> = if status == "pending" {
+        None
+    } else {
+        Some(now_unix())
+    };
+    tx.execute(
+        "INSERT INTO addon_uses_alias \
+            (addon_id, alias_target_name, required, reason, grant_status, \
+             grant_decided_at, grant_decided_by_user_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, strftime('%s','now')) \
+         ON CONFLICT(addon_id, alias_target_name) DO UPDATE SET \
+             required = excluded.required, \
+             reason = excluded.reason, \
+             grant_status = excluded.grant_status, \
+             grant_decided_at = excluded.grant_decided_at",
+        rusqlite::params![
+            addon_id,
+            alias_name,
+            required as i64,
+            reason,
+            status,
+            decided_at
+        ],
+    )?;
+    Ok(status)
+}
+
+/// Symmetric to `upsert_uses_alias_within_tx` for direct model access.
+/// Model visibility default is `restricted`, so unknown models keep the
+/// row `pending` (an admin must explicitly grant via `model_consumers`).
+pub fn upsert_uses_model_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    addon_id: &str,
+    model_id: &str,
+    required: bool,
+    reason: &str,
+) -> Result<&'static str> {
+    let visibility: String = tx
+        .query_row(
+            "SELECT visibility FROM model_visibility WHERE model_id = ?1",
+            rusqlite::params![model_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "restricted".to_string());
+    let granted: bool = tx
+        .query_row(
+            "SELECT 1 FROM model_consumers \
+             WHERE model_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![model_id, addon_id],
+            |r| r.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let status = if visibility == "public" {
+        "auto_granted"
+    } else if granted {
+        "granted"
+    } else {
+        "pending"
+    };
+    let decided_at: Option<i64> = if status == "pending" {
+        None
+    } else {
+        Some(now_unix())
+    };
+    tx.execute(
+        "INSERT INTO addon_uses_model \
+            (addon_id, model_target_name, required, reason, grant_status, \
+             grant_decided_at, grant_decided_by_user_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, strftime('%s','now')) \
+         ON CONFLICT(addon_id, model_target_name) DO UPDATE SET \
+             required = excluded.required, \
+             reason = excluded.reason, \
+             grant_status = excluded.grant_status, \
+             grant_decided_at = excluded.grant_decided_at",
+        rusqlite::params![
+            addon_id,
+            model_id,
+            required as i64,
+            reason,
+            status,
+            decided_at
+        ],
+    )?;
+    Ok(status)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Re-evaluates every `addon_uses_alias` row whose `alias_target_name =
+/// alias_name` and writes the new status. Called by the install path
+/// after a new alias / its visibility / its consumer list lands so that
+/// previously-`pending` consumers flip to `granted`/`auto_granted`/`denied`.
+///
+/// Returns the list of `(addon_id, before, after)` tuples for status
+/// transitions only (no-op when the status did not change). Caller writes
+/// one audit_log row per transition, risk_class=A, result='reconciled'.
+#[allow(clippy::type_complexity)]
+pub fn reconcile_uses_alias_for_alias_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_name: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = tx.prepare(
+        "SELECT addon_id, grant_status FROM addon_uses_alias WHERE alias_target_name = ?1",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(rusqlite::params![alias_name], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut transitions = Vec::new();
+    for (consumer, before) in rows {
+        let after = compute_uses_alias_status_within_tx(tx, alias_name, &consumer)?;
+        if after != before.as_str() {
+            let decided_at: Option<i64> = if after == "pending" {
+                None
+            } else {
+                Some(now_unix())
+            };
+            tx.execute(
+                "UPDATE addon_uses_alias \
+                    SET grant_status = ?1, grant_decided_at = ?2 \
+                  WHERE addon_id = ?3 AND alias_target_name = ?4",
+                rusqlite::params![after, decided_at, consumer, alias_name],
+            )?;
+            transitions.push((consumer, before, after.to_string()));
+        }
+    }
+    Ok(transitions)
+}
+
+/// Writes one risk-class-A audit row for a reconciliation transition. The
+/// row carries the addon_id (consumer), the affected alias, and a JSON
+/// details blob with `before`/`after` statuses. This is the audit trail
+/// for §6.2.Y compliance — any pending→granted/denied transition driven
+/// by an owner install must be traceable to the install event.
+pub fn audit_reconcile_uses_alias_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    consumer_addon_id: &str,
+    alias_name: &str,
+    before: &str,
+    after: &str,
+) -> Result<()> {
+    let details = serde_json::json!({
+        "alias": alias_name,
+        "before": before,
+        "after": after,
+    })
+    .to_string();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id: None,
+        addon_id: Some(consumer_addon_id),
+        instance_id: None,
+        action: "uses_alias.reconcile",
+        resource: None,
+        resource_type: Some("model_alias"),
+        resource_id: Some(alias_name),
+        result: Some("reconciled"),
+        error_message: None,
+        details: Some(&details),
+        ip_address: None,
+        node_id: None,
+        severity: Some("info"),
+        risk_class: "A",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&*tx, &hash_input)?;
+    tx.execute(
+        "INSERT INTO audit_log \
+            (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+             result, error_message, severity, risk_class, details, prev_hash, hash) \
+         VALUES (?1, NULL, ?2, 'uses_alias.reconcile', \
+                 'model_alias', ?3, 'reconciled', NULL, 'info', 'A', ?4, ?5, ?6)",
+        rusqlite::params![
+            timestamp,
+            consumer_addon_id,
+            alias_name,
+            details,
+            prev_hash,
+            hash
+        ],
+    )?;
+    Ok(())
+}
+
+/// Writes one risk-class-A audit row for a manifest-driven consumer revoke
+/// during install/reinstall. Triggered when a previously listed consumer is
+/// dropped from `allowed_consumers` and `revoke_obsolete_manifest_consumers_within_tx`
+/// removes the row. Pairs with `audit_reconcile_uses_alias_within_tx` so the
+/// pending→denied transition (computed afterwards by reconcile) has the
+/// upstream cause recorded in the same transaction.
+pub fn audit_consumer_revoked_by_manifest_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    owner_addon_id: &str,
+    alias_name: &str,
+    consumer_addon_id: &str,
+) -> Result<()> {
+    let details = serde_json::json!({
+        "alias": alias_name,
+        "consumer": consumer_addon_id,
+        "reason": "manifest_no_longer_lists_consumer",
+    })
+    .to_string();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id: None,
+        addon_id: Some(owner_addon_id),
+        instance_id: None,
+        action: "consumer_revoked_by_manifest_change",
+        resource: None,
+        resource_type: Some("model_alias"),
+        resource_id: Some(alias_name),
+        result: Some("revoked"),
+        error_message: None,
+        details: Some(&details),
+        ip_address: None,
+        node_id: None,
+        severity: Some("info"),
+        risk_class: "A",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&*tx, &hash_input)?;
+    tx.execute(
+        "INSERT INTO audit_log \
+            (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+             result, error_message, severity, risk_class, details, prev_hash, hash) \
+         VALUES (?1, NULL, ?2, 'consumer_revoked_by_manifest_change', \
+                 'model_alias', ?3, 'revoked', NULL, 'info', 'A', ?4, ?5, ?6)",
+        rusqlite::params![
+            timestamp,
+            owner_addon_id,
+            alias_name,
+            details,
+            prev_hash,
+            hash
+        ],
+    )?;
+    Ok(())
 }
 
 /// Raw insert into `model_aliases` — bypasses chain check, JSON validation,
@@ -854,21 +1849,137 @@ pub fn delete_model_alias(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Tworzy alias jesli nie istnieje, lub reaktywuje istniejacy (bez zmiany target_model).
-/// Uzywane przez cykl zycia addonow do automatycznego zarzadzania aliasami.
+/// Validates alias identifier: `^[a-z][a-z0-9-]{0,63}$`.
+/// Untrusted input (manifest may declare arbitrary alias id); reject early
+/// so the registry cannot grow names that break URL routing or SQL LIKE
+/// patterns elsewhere.
+pub fn validate_alias_id(alias: &str) -> Result<()> {
+    let bytes = alias.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 {
+        anyhow::bail!(
+            "invalid alias id '{}': must be 1..=64 chars, got {}",
+            alias.escape_debug(),
+            bytes.len()
+        );
+    }
+    if !(bytes[0].is_ascii_lowercase()) {
+        anyhow::bail!(
+            "invalid alias id '{}': must start with lowercase letter",
+            alias.escape_debug()
+        );
+    }
+    for &b in &bytes[1..] {
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            anyhow::bail!(
+                "invalid alias id '{}': only [a-z0-9-] allowed after first char",
+                alias.escape_debug()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Creates the alias if it does not exist, or reactivates an existing one
+/// without overwriting its `target_model`. Used by addon install/start to
+/// register aliases declared in the addon manifest, and by admin UI for
+/// manually managed aliases.
 ///
-/// Reaktywacja musi sprawdzic chain — istniejacy nieaktywny rekord moze
-/// wskazywac target ktory w miedzyczasie stal sie aliasem; wlaczenie
-/// `is_active = 1` bez kontroli stworzyloby chain. Caly check + write
-/// idzie pod jedna transakcja.
+/// Ownership is recorded in `model_alias_owners` inside the same
+/// transaction. `owner_type` must be `"addon"` or `"manual"`:
+/// - `addon` requires `owner_id` = addon id; reusing the same alias from
+///   another addon returns an error (cross-addon ownership conflict).
+/// - `manual` ignores `owner_id` (NULL is stored).
+///
+/// Reactivation re-runs the chain check — a parked row may target a name
+/// that became an alias in the meantime; flipping `is_active = 1` without
+/// the check would create a forbidden alias-of-alias chain.
+///
+/// Returns the alias row id.
 pub fn create_or_reactivate_model_alias(
     pool: &DbPool,
     alias: &str,
     default_target_model: &str,
     strategy: &str,
-) -> Result<()> {
+    owner_type: &str,
+    owner_id: Option<&str>,
+) -> Result<i64> {
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
+    let alias_id = create_or_reactivate_model_alias_within_tx(
+        &tx,
+        alias,
+        default_target_model,
+        strategy,
+        owner_type,
+        owner_id,
+    )?;
+    tx.commit()?;
+    Ok(alias_id)
+}
+
+/// Same as `create_or_reactivate_model_alias` but commits the alias in the
+/// requested `is_active` state inside a single transaction. Used by the
+/// addon install path for gated aliases: the router must never observe an
+/// in-between window where a `gate=...` alias is active. Both the create
+/// and the deactivate audit rows are written in one tx — on failure the
+/// alias does not appear at all.
+pub fn create_or_reactivate_model_alias_with_active(
+    pool: &DbPool,
+    alias: &str,
+    default_target_model: &str,
+    strategy: &str,
+    owner_type: &str,
+    owner_id: Option<&str>,
+    is_active: bool,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let alias_id = create_or_reactivate_model_alias_within_tx(
+        &tx,
+        alias,
+        default_target_model,
+        strategy,
+        owner_type,
+        owner_id,
+    )?;
+    if !is_active {
+        // Caller wants the alias parked (gated). Reuse the audited setter so
+        // the deactivate event is recorded with proper attribution.
+        let changed_by = if owner_type == "addon" {
+            owner_id
+        } else {
+            None
+        };
+        set_model_alias_active_audited_within_tx(&tx, alias, false, changed_by)?;
+    }
+    tx.commit()?;
+    Ok(alias_id)
+}
+
+/// Same logic as `create_or_reactivate_model_alias`, but the caller owns
+/// the transaction. Used by batch installers (addon manifest registration)
+/// that need every alias write — including the audit row — to roll back
+/// together on partial failure. `model_alias_changes` has no foreign key
+/// to `model_aliases` (audit trail is preserved across deletes), so the
+/// only reliable rollback is "tx never commits".
+pub fn create_or_reactivate_model_alias_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+    default_target_model: &str,
+    strategy: &str,
+    owner_type: &str,
+    owner_id: Option<&str>,
+) -> Result<i64> {
+    validate_alias_id(alias)?;
+    if owner_type != "addon" && owner_type != "manual" {
+        anyhow::bail!(
+            "invalid owner_type '{}': must be 'addon' or 'manual'",
+            owner_type
+        );
+    }
+    if owner_type == "addon" && owner_id.is_none() {
+        anyhow::bail!("owner_type='addon' requires owner_id (addon id)");
+    }
     let existing: Option<(i64, String, Option<String>)> = tx
         .query_row(
             "SELECT id, target_model, fallback_targets FROM model_aliases WHERE alias = ?1",
@@ -886,14 +1997,14 @@ pub fn create_or_reactivate_model_alias(
         if name.is_empty() {
             continue;
         }
-        if alias_is_active_within_tx(&tx, &name, action_id)? {
+        if alias_is_active_within_tx(tx, &name, action_id)? {
             anyhow::bail!(
                 "'{}' is itself an active alias; aliases of aliases are not supported",
                 name
             );
         }
     }
-    if alias_is_inbound_target_within_tx(&tx, alias, action_id)? {
+    if alias_is_inbound_target_within_tx(tx, alias, action_id)? {
         anyhow::bail!(
             "alias '{}' is already used as a target/fallback by another active alias; \
              registering or reactivating it would create a chain",
@@ -901,51 +2012,163 @@ pub fn create_or_reactivate_model_alias(
         );
     }
 
+    // Ownership guard — block silent take-over across owner_type boundaries.
+    // Cross-addon (addon→addon with different addon id) and manual↔addon
+    // transitions all require explicit admin action (M16 reassign), never
+    // a side effect of an install/reinstall.
+    if let Some(id) = action_id {
+        let existing_owner: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((ex_type, ex_owner_id)) = existing_owner {
+            if ex_type == "addon" && owner_type == "addon" && ex_owner_id.as_deref() != owner_id {
+                anyhow::bail!(
+                    "alias '{}' is already owned by addon '{}'; cannot reassign to '{}'",
+                    alias.escape_debug(),
+                    ex_owner_id.unwrap_or_default(),
+                    owner_id.unwrap_or_default()
+                );
+            }
+            if ex_type == "manual" && owner_type == "addon" {
+                anyhow::bail!(
+                    "alias '{}' is manually owned; addon '{}' cannot adopt it silently (use admin M16 to reassign)",
+                    alias.escape_debug(),
+                    owner_id.unwrap_or("?")
+                );
+            }
+            if ex_type == "addon" && owner_type == "manual" {
+                anyhow::bail!(
+                    "alias '{}' is owned by addon '{}'; manual ownership change requires admin M16",
+                    alias.escape_debug(),
+                    ex_owner_id.as_deref().unwrap_or("?")
+                );
+            }
+        }
+    }
+
+    let alias_id: i64;
+    let change_type: &str;
     if let Some(id) = action_id {
         tx.execute(
             "UPDATE model_aliases SET is_active = 1 WHERE id = ?1",
             rusqlite::params![id],
         )?;
+        alias_id = id;
+        change_type = "activate";
     } else {
         tx.execute(
             "INSERT INTO model_aliases (alias, target_model, is_active, strategy) VALUES (?1, ?2, 1, ?3)",
             rusqlite::params![alias, default_target_model, strategy],
         )?;
+        alias_id = tx.last_insert_rowid();
+        change_type = "create";
     }
+
+    // Owner row: INSERT new (created_at = now) or UPDATE existing in place,
+    // preserving the original `created_at` across reactivation. Cross-owner
+    // transitions are blocked above, so the update only changes within the
+    // same owner identity (idempotent reinstall).
+    let stored_owner_id: Option<&str> = if owner_type == "addon" {
+        owner_id
+    } else {
+        None
+    };
+    tx.execute(
+        "INSERT INTO model_alias_owners (alias_id, owner_type, owner_id, created_at) \
+         VALUES (?1, ?2, ?3, datetime('now')) \
+         ON CONFLICT(alias_id) DO UPDATE SET \
+             owner_type = excluded.owner_type, \
+             owner_id = excluded.owner_id",
+        rusqlite::params![alias_id, owner_type, stored_owner_id],
+    )?;
+
+    // Audit trail: one row per create/activate event.
+    let after_snapshot = serde_json::json!({
+        "alias": alias,
+        "target_model": default_target_model,
+        "is_active": true,
+        "owner_type": owner_type,
+        "owner_id": stored_owner_id,
+    })
+    .to_string();
+    let changed_by_addon = if owner_type == "addon" {
+        owner_id
+    } else {
+        None
+    };
+    tx.execute(
+        "INSERT INTO model_alias_changes \
+         (alias_id, alias_name, changed_by_addon_id, before_snapshot, after_snapshot, change_type, ts) \
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, strftime('%s','now'))",
+        rusqlite::params![alias_id, alias, changed_by_addon, after_snapshot, change_type],
+    )?;
+
+    Ok(alias_id)
+}
+
+/// Sets the `is_active` flag on an alias selected by name.
+///
+/// Reactivation (`is_active = true`) re-runs the same chain check as
+/// create/update — the row's target may have become an alias itself while
+/// the flag was off, so a naive flag flip could resurrect a chain.
+/// Deactivation is always safe; an inactive row does not route.
+pub fn set_model_alias_active(pool: &DbPool, alias: &str, is_active: bool) -> Result<()> {
+    set_model_alias_active_audited(pool, alias, is_active, None)
+}
+
+/// Same as `set_model_alias_active` but records `changed_by_addon_id` on
+/// the audit row. Used by the generic addon install/start/stop path so
+/// the audit trail attributes activate/deactivate events to the addon.
+pub fn set_model_alias_active_audited(
+    pool: &DbPool,
+    alias: &str,
+    is_active: bool,
+    changed_by_addon_id: Option<&str>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    set_model_alias_active_audited_within_tx(&tx, alias, is_active, changed_by_addon_id)?;
     tx.commit()?;
     Ok(())
 }
 
-/// Ustawia flage is_active aliasu po nazwie.
-///
-/// Reactivation (`is_active = true`) wymaga kontroli chainu po tych samych
-/// regulach co create/update — nie wystarczy przewinac flage skoro target
-/// rekordu mogl stac sie aliasem od czasu deaktywacji. Deactivation jest
-/// bezpieczna bezwarunkowo — nieaktywny rzad nie routuje.
-pub fn set_model_alias_active(pool: &DbPool, alias: &str, is_active: bool) -> Result<()> {
-    let conn = acquire(pool)?;
-    let tx = conn.unchecked_transaction()?;
+/// Same as `set_model_alias_active_audited`, but the caller owns the
+/// transaction. Used by the addon install path to keep the gated-alias
+/// deactivate inside the same tx as the create/reactivate above.
+pub fn set_model_alias_active_audited_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+    is_active: bool,
+    changed_by_addon_id: Option<&str>,
+) -> Result<()> {
+    let existing: Option<(i64, String, Option<String>, bool)> = tx
+        .query_row(
+            "SELECT id, target_model, fallback_targets, is_active FROM model_aliases WHERE alias = ?1",
+            rusqlite::params![alias],
+            |row| {
+                let active: i64 = row.get(3)?;
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, active != 0))
+            },
+        )
+        .optional()?;
     if is_active {
-        let existing: Option<(i64, String, Option<String>)> = tx
-            .query_row(
-                "SELECT id, target_model, fallback_targets FROM model_aliases WHERE alias = ?1",
-                rusqlite::params![alias],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        if let Some((id, target, fallbacks)) = existing {
-            for name in collect_chain_candidates(&target, fallbacks.as_deref())? {
+        if let Some((id, target, fallbacks, _)) = &existing {
+            for name in collect_chain_candidates(target, fallbacks.as_deref())? {
                 if name.is_empty() {
                     continue;
                 }
-                if alias_is_active_within_tx(&tx, &name, Some(id))? {
+                if alias_is_active_within_tx(tx, &name, Some(*id))? {
                     anyhow::bail!(
                         "'{}' is itself an active alias; aliases of aliases are not supported",
                         name
                     );
                 }
             }
-            if alias_is_inbound_target_within_tx(&tx, alias, Some(id))? {
+            if alias_is_inbound_target_within_tx(tx, alias, Some(*id))? {
                 anyhow::bail!(
                     "alias '{}' is already used as a target/fallback by another active alias; \
                      activating this row would create a chain",
@@ -958,7 +2181,34 @@ pub fn set_model_alias_active(pool: &DbPool, alias: &str, is_active: bool) -> Re
         "UPDATE model_aliases SET is_active = ?1 WHERE alias = ?2",
         rusqlite::params![is_active, alias],
     )?;
-    tx.commit()?;
+
+    // Audit only when the row actually exists and the flag transitions —
+    // double-deactivate stays idempotent without churn in the changes log.
+    if let Some((id, target, _, prev_active)) = existing {
+        if prev_active != is_active {
+            let before = serde_json::json!({ "is_active": prev_active }).to_string();
+            let after = serde_json::json!({
+                "alias": alias,
+                "target_model": target,
+                "is_active": is_active,
+            })
+            .to_string();
+            let change_type = if is_active { "activate" } else { "deactivate" };
+            tx.execute(
+                "INSERT INTO model_alias_changes \
+                 (alias_id, alias_name, changed_by_addon_id, before_snapshot, after_snapshot, change_type, ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'))",
+                rusqlite::params![
+                    id,
+                    alias,
+                    changed_by_addon_id,
+                    before,
+                    after,
+                    change_type
+                ],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1246,9 +2496,230 @@ pub fn get_flow_for_model(pool: &DbPool, model_name: &str) -> Result<Option<DbFl
     Ok(result)
 }
 
+fn field_string(value: &str) -> crate::sync::ledger::FieldValue {
+    crate::sync::ledger::FieldValue::String(value.to_string())
+}
+
+fn field_optional_string(value: Option<&str>) -> crate::sync::ledger::FieldValue {
+    value
+        .map(|v| crate::sync::ledger::FieldValue::String(v.to_string()))
+        .unwrap_or(crate::sync::ledger::FieldValue::Null)
+}
+
+fn field_optional_i64(value: Option<i64>) -> crate::sync::ledger::FieldValue {
+    value
+        .map(crate::sync::ledger::FieldValue::I64)
+        .unwrap_or(crate::sync::ledger::FieldValue::Null)
+}
+
+fn sync_resource_acl_core_id(addon_id: &str, resource_type: &str, resource_id: &str) -> String {
+    format!("{addon_id}\u{1f}{resource_type}\u{1f}{resource_id}")
+}
+
+fn sync_explicit_share_core_id(
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+) -> String {
+    format!("{addon_id}\u{1f}{resource_type}\u{1f}{resource_id}\u{1f}{subject_type}\u{1f}{subject_id}\u{1f}{action}")
+}
+
+fn node_user_assignment_core_id(node_id: &str, user_id: i64, assignment_mode: &str) -> String {
+    format!("{node_id}\u{1f}{user_id}\u{1f}{assignment_mode}")
+}
+
+fn sync_user_org_profile_core_id(org_id: &str, user_id: i64) -> String {
+    format!("{org_id}\u{1f}{user_id}")
+}
+
+fn flow_changed_fields(
+    params: &FlowParams<'_>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), field_string(params.name));
+    fields.insert(
+        "description".to_string(),
+        field_optional_string(params.description),
+    );
+    fields.insert(
+        "is_default".to_string(),
+        crate::sync::ledger::FieldValue::Bool(params.is_default),
+    );
+    fields.insert(
+        "service_type".to_string(),
+        field_optional_string(params.service_type),
+    );
+    fields.insert("flow_json".to_string(), field_string(params.flow_json));
+    fields.insert("status".to_string(), field_string(params.status));
+    fields.insert(
+        "published_model_name".to_string(),
+        field_optional_string(params.published_model_name),
+    );
+    fields
+}
+
+fn flow_version_changed_fields(
+    flow_id: i64,
+    version_num: i64,
+    flow_json: &str,
+    name: &str,
+    description: Option<&str>,
+    status: Option<&str>,
+    created_by: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "flow_id".to_string(),
+        crate::sync::ledger::FieldValue::I64(flow_id),
+    );
+    fields.insert(
+        "version_num".to_string(),
+        crate::sync::ledger::FieldValue::I64(version_num),
+    );
+    fields.insert("flow_json".to_string(), field_string(flow_json));
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert(
+        "description".to_string(),
+        field_optional_string(description),
+    );
+    fields.insert("status".to_string(), field_optional_string(status));
+    fields.insert("created_by".to_string(), field_optional_string(created_by));
+    fields
+}
+
+fn flow_binding_changed_fields(
+    flow_id: i64,
+    model_pattern: &str,
+    priority: i64,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "flow_id".to_string(),
+        crate::sync::ledger::FieldValue::I64(flow_id),
+    );
+    fields.insert("model_pattern".to_string(), field_string(model_pattern));
+    fields.insert(
+        "priority".to_string(),
+        crate::sync::ledger::FieldValue::I64(priority),
+    );
+    fields
+}
+
+fn record_core_capture_tx(
+    tx: &rusqlite::Transaction<'_>,
+    kind: crate::sync::core_registry::CoreSyncResourceKind,
+    resource_id: impl Into<String>,
+    action: crate::sync::runtime::SqlWriteAction,
+    changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
+    actor_user_id: Option<i64>,
+) -> Result<()> {
+    record_core_capture_for_org_tx(
+        tx,
+        kind,
+        crate::services::org::DEFAULT_ORG_ID,
+        resource_id,
+        action,
+        changed_fields,
+        actor_user_id,
+    )
+}
+
+fn record_core_capture_for_org_tx(
+    tx: &rusqlite::Transaction<'_>,
+    kind: crate::sync::core_registry::CoreSyncResourceKind,
+    org_id: &str,
+    resource_id: impl Into<String>,
+    action: crate::sync::runtime::SqlWriteAction,
+    changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
+    actor_user_id: Option<i64>,
+) -> Result<()> {
+    let capture = crate::sync::core_capture::CoreWriteCapture::new(
+        kind,
+        org_id,
+        resource_id,
+        action,
+        changed_fields,
+        actor_user_id,
+    );
+    crate::sync::core_capture::record_core_write_capture(tx, &capture)?;
+    Ok(())
+}
+
+fn user_account_changed_fields(
+    username: Option<&str>,
+    display_name: Option<&str>,
+    email: Option<&str>,
+    is_active: Option<bool>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    if let Some(value) = username {
+        fields.insert("username".to_string(), field_string(value));
+    }
+    if let Some(value) = display_name {
+        fields.insert("display_name".to_string(), field_string(value));
+    }
+    if let Some(value) = email {
+        fields.insert("email".to_string(), field_string(value));
+    }
+    if let Some(value) = is_active {
+        fields.insert(
+            "is_active".to_string(),
+            crate::sync::ledger::FieldValue::Bool(value),
+        );
+    }
+    fields
+}
+
+fn password_changed_fields() -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "password_changed".to_string(),
+        crate::sync::ledger::FieldValue::Bool(true),
+    );
+    fields
+}
+
+fn group_changed_fields(
+    name: Option<&str>,
+    description: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    if let Some(value) = name {
+        fields.insert("name".to_string(), field_string(value));
+    }
+    if let Some(value) = description {
+        fields.insert("description".to_string(), field_string(value));
+    }
+    fields
+}
+
+fn group_member_resource_id(group_id: i64, user_id: i64) -> String {
+    format!("{}:{}", group_id, user_id)
+}
+
+fn group_member_changed_fields(
+    group_id: i64,
+    user_id: i64,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "group_id".to_string(),
+        crate::sync::ledger::FieldValue::I64(group_id),
+    );
+    fields.insert(
+        "user_id".to_string(),
+        crate::sync::ledger::FieldValue::I64(user_id),
+    );
+    fields
+}
+
 pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO flows (name, description, is_default, service_type, flow_json, status, published_model_name) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
@@ -1261,7 +2732,17 @@ pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<i64> {
             params.published_model_name,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Flow,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        flow_changed_fields(params),
+        params.actor_user_id,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 pub fn update_flow(
@@ -1270,8 +2751,9 @@ pub fn update_flow(
     expected_version: i64,
     params: &FlowParams<'_>,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    let rows_affected = conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE flows \
          SET name = ?2, description = ?3, is_default = ?4, service_type = ?5, \
              flow_json = ?6, status = ?7, published_model_name = ?8, \
@@ -1292,12 +2774,35 @@ pub fn update_flow(
     if rows_affected == 0 {
         return Err(anyhow::anyhow!("CONFLICT"));
     }
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Flow,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Update,
+        flow_changed_fields(params),
+        params.actor_user_id,
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
 pub fn delete_flow(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute("DELETE FROM flows WHERE id = ?1", rusqlite::params![id])?;
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute("DELETE FROM flows WHERE id = ?1", rusqlite::params![id])?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::Flow,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1421,6 +2926,23 @@ pub fn update_flow_with_snapshot(
                 created_by,
             ],
         )?;
+        let flow_version_id = tx.last_insert_rowid();
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowVersion,
+            flow_version_id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            flow_version_changed_fields(
+                id,
+                next_ver,
+                &old_flow_json,
+                &old_name,
+                old_description.as_deref(),
+                old_status.as_deref(),
+                created_by,
+            ),
+            params.actor_user_id,
+        )?;
 
         // Prune — zostawiamy tylko FLOW_VERSIONS_KEEP najnowszych
         tx.execute(
@@ -1451,6 +2973,14 @@ pub fn update_flow_with_snapshot(
     if rows_affected == 0 {
         return Err(anyhow::anyhow!("CONFLICT"));
     }
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Flow,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Update,
+        flow_changed_fields(params),
+        params.actor_user_id,
+    )?;
 
     tx.commit()?;
     Ok(())
@@ -1499,12 +3029,23 @@ pub fn create_flow_model_binding(
     model_pattern: &str,
     priority: i64,
 ) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO flow_model_bindings (flow_id, model_pattern, priority) VALUES (?1, ?2, ?3)",
         rusqlite::params![flow_id, model_pattern, priority],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        flow_binding_changed_fields(flow_id, model_pattern, priority),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 pub fn update_flow_model_binding(
@@ -1514,27 +3055,53 @@ pub fn update_flow_model_binding(
     model_pattern: &str,
     priority: i64,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE flow_model_bindings SET flow_id = ?2, model_pattern = ?3, priority = ?4 WHERE id = ?1",
         rusqlite::params![id, flow_id, model_pattern, priority],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            flow_binding_changed_fields(flow_id, model_pattern, priority),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 pub fn delete_flow_model_binding(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "DELETE FROM flow_model_bindings WHERE id = ?1",
         rusqlite::params![id],
     )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 // --- Flow Node Templates ---
 
 const NODE_TEMPLATE_COLS: &str =
-    "id, node_type, category, label, description, default_config, icon";
+    "id, node_type, category, label, description, default_config, icon, params_schema";
 
 fn row_to_node_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowNodeTemplate> {
     Ok(DbFlowNodeTemplate {
@@ -1545,6 +3112,7 @@ fn row_to_node_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowNodeT
         description: row.get(4)?,
         default_config: row.get(5)?,
         icon: row.get(6)?,
+        params_schema: row.get(7)?,
     })
 }
 
@@ -2127,11 +3695,30 @@ pub fn set_user_role(pool: &DbPool, user_id: i64, role: &str) -> Result<()> {
         _ => anyhow::bail!("Nieprawidlowa rola: {}", role),
     };
     let is_admin = role == "admin";
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE user_accounts SET role = ?1, is_admin = ?2, updated_at = datetime('now') WHERE id = ?3",
         rusqlite::params![role, is_admin, user_id],
     )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("role".to_string(), field_string(role));
+        fields.insert(
+            "is_admin".to_string(),
+            crate::sync::ledger::FieldValue::Bool(is_admin),
+        );
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+            user_id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            fields,
+            None,
+        )?;
+        bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2144,13 +3731,24 @@ pub fn create_user_account(
     display_name: &str,
     email: &str,
 ) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO user_accounts (username, password_hash, display_name, email) \
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![username, password_hash, display_name, email],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        user_account_changed_fields(Some(username), Some(display_name), Some(email), Some(true)),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Pobiera uzytkownika po nazwie z tabeli user_accounts.
@@ -2194,11 +3792,23 @@ pub fn list_user_accounts(pool: &DbPool) -> Result<Vec<UserAccount>> {
 
 /// Aktualizuje hash hasla uzytkownika w tabeli user_accounts.
 pub fn update_user_account_password(pool: &DbPool, id: i64, new_password_hash: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE user_accounts SET password_hash = ?1, updated_at = datetime('now') WHERE id = ?2",
         rusqlite::params![new_password_hash, id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            password_changed_fields(),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2210,22 +3820,50 @@ pub fn update_user_account(
     email: &str,
     is_active: bool,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE user_accounts SET display_name = ?1, email = ?2, is_active = ?3, \
          updated_at = datetime('now') WHERE id = ?4",
         rusqlite::params![display_name, email, is_active, id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            user_account_changed_fields(None, Some(display_name), Some(email), Some(is_active)),
+            None,
+        )?;
+        bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 /// Usuwa uzytkownika z tabeli user_accounts (kaskadowo czlonkostwa w grupach).
 pub fn delete_user_account(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "DELETE FROM user_accounts WHERE id = ?1",
         rusqlite::params![id],
     )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+        bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2261,12 +3899,23 @@ pub fn verify_user_account_password(
 
 /// Tworzy nowa grupe uzytkownikow. Zwraca ID.
 pub fn create_group(pool: &DbPool, name: &str, description: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO user_groups (name, description) VALUES (?1, ?2)",
         rusqlite::params![name, description],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserGroup,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        group_changed_fields(Some(name), Some(description)),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Lista wszystkich grup uzytkownikow.
@@ -2289,21 +3938,45 @@ pub fn list_groups(pool: &DbPool) -> Result<Vec<UserGroup>> {
 
 /// Dodaje uzytkownika do grupy.
 pub fn add_user_to_group(pool: &DbPool, group_id: i64, user_id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?1, ?2)",
         rusqlite::params![group_id, user_id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::GroupMember,
+            group_member_resource_id(group_id, user_id),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            group_member_changed_fields(group_id, user_id),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 /// Usuwa uzytkownika z grupy.
 pub fn remove_user_from_group(pool: &DbPool, group_id: i64, user_id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "DELETE FROM group_members WHERE group_id = ?1 AND user_id = ?2",
         rusqlite::params![group_id, user_id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::GroupMember,
+            group_member_resource_id(group_id, user_id),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            group_member_changed_fields(group_id, user_id),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2331,11 +4004,23 @@ pub fn get_user_groups(pool: &DbPool, user_id: i64) -> Result<Vec<UserGroup>> {
 
 /// Aktualizuje nazwe i opis grupy.
 pub fn update_group(pool: &DbPool, id: i64, name: &str, description: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE user_groups SET name = ?1, description = ?2 WHERE id = ?3",
         rusqlite::params![name, description, id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserGroup,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            group_changed_fields(Some(name), Some(description)),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2376,11 +4061,25 @@ pub fn get_group_by_id(pool: &DbPool, id: i64) -> Result<Option<UserGroup>> {
 
 /// Usuwa grupe uzytkownikow (kaskadowo czlonkostwa).
 pub fn delete_group(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "DELETE FROM user_groups WHERE id = ?1",
         rusqlite::params![id],
     )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserGroup,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2508,10 +4207,31 @@ pub fn log_audit(
     node_id: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id,
+        addon_id,
+        instance_id: None,
+        action,
+        resource,
+        resource_type: None,
+        resource_id: None,
+        result: None,
+        error_message: None,
+        details,
+        ip_address,
+        node_id,
+        severity: Some("info"),
+        risk_class: "unclassified",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)?;
     conn.execute(
-        "INSERT INTO audit_log (user_id, addon_id, action, resource, details, ip_address, node_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![user_id, addon_id, action, resource, details, ip_address, node_id],
+        "INSERT INTO audit_log (timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, prev_hash, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, prev_hash, hash],
     )?;
     Ok(())
 }
@@ -2938,48 +4658,6 @@ pub fn delete_sso_provider(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Upsert SSO providera po nazwie (uzywany przez CRDT sync).
-pub fn upsert_sso_provider(
-    pool: &DbPool,
-    name: &str,
-    provider_type: &str,
-    client_id: &str,
-    client_secret_encrypted: &str,
-    discovery_url: &str,
-    enabled: bool,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO sso_providers (name, provider_type, client_id, client_secret_encrypted, \
-         discovery_url, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(name) DO UPDATE SET \
-         provider_type = excluded.provider_type, \
-         client_id = excluded.client_id, \
-         client_secret_encrypted = excluded.client_secret_encrypted, \
-         discovery_url = excluded.discovery_url, \
-         enabled = excluded.enabled",
-        rusqlite::params![
-            name,
-            provider_type,
-            client_id,
-            client_secret_encrypted,
-            discovery_url,
-            enabled
-        ],
-    )?;
-    Ok(())
-}
-
-/// Usuwa SSO providera po nazwie (uzywany przez CRDT sync).
-pub fn delete_sso_provider_by_name(pool: &DbPool, name: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "DELETE FROM sso_providers WHERE name = ?1",
-        rusqlite::params![name],
-    )?;
-    Ok(())
-}
-
 // =============================================================================
 // SSO Users — tworzenie i wyszukiwanie uzytkownikow SSO
 // =============================================================================
@@ -3041,320 +4719,6 @@ pub fn update_user_account_last_login(pool: &DbPool, id: i64) -> Result<()> {
     )?;
     Ok(())
 }
-
-// =============================================================================
-// CRDT Sync Helpers — upsert po nazwie (nie po ID)
-// =============================================================================
-
-/// Upsert uzytkownika po username (uzywany przez CRDT sync).
-pub fn upsert_user_account_by_username(
-    pool: &DbPool,
-    username: &str,
-    password_hash: &str,
-    display_name: &str,
-    email: &str,
-    is_active: bool,
-    is_admin: bool,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO user_accounts (username, password_hash, display_name, email, is_active, is_admin) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(username) DO UPDATE SET \
-         password_hash = excluded.password_hash, \
-         display_name = excluded.display_name, \
-         email = excluded.email, \
-         is_active = excluded.is_active, \
-         is_admin = excluded.is_admin, \
-         updated_at = datetime('now')",
-        rusqlite::params![username, password_hash, display_name, email, is_active, is_admin],
-    )?;
-    Ok(())
-}
-
-/// Usuwa uzytkownika po username (uzywany przez CRDT sync).
-pub fn delete_user_account_by_username(pool: &DbPool, username: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "DELETE FROM user_accounts WHERE username = ?1",
-        rusqlite::params![username],
-    )?;
-    Ok(())
-}
-
-/// Upsert grupy po nazwie (uzywany przez CRDT sync).
-pub fn upsert_group_by_name(pool: &DbPool, name: &str, description: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO user_groups (name, description) VALUES (?1, ?2) \
-         ON CONFLICT(name) DO UPDATE SET description = excluded.description",
-        rusqlite::params![name, description],
-    )?;
-    Ok(())
-}
-
-/// Usuwa grupe po nazwie (uzywany przez CRDT sync).
-pub fn delete_group_by_name(pool: &DbPool, name: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "DELETE FROM user_groups WHERE name = ?1",
-        rusqlite::params![name],
-    )?;
-    Ok(())
-}
-
-/// Dodaje uzytkownika do grupy po nazwach (uzywany przez CRDT sync).
-pub fn add_user_to_group_by_names(pool: &DbPool, group_name: &str, username: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO group_members (group_id, user_id) \
-         SELECT g.id, u.id FROM user_groups g, user_accounts u \
-         WHERE g.name = ?1 AND u.username = ?2",
-        rusqlite::params![group_name, username],
-    )?;
-    Ok(())
-}
-
-/// Usuwa uzytkownika z grupy po nazwach (uzywany przez CRDT sync).
-pub fn remove_user_from_group_by_names(
-    pool: &DbPool,
-    group_name: &str,
-    username: &str,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "DELETE FROM group_members WHERE group_id IN (SELECT id FROM user_groups WHERE name = ?1) \
-         AND user_id IN (SELECT id FROM user_accounts WHERE username = ?2)",
-        rusqlite::params![group_name, username],
-    )?;
-    Ok(())
-}
-
-/// Upsert uprawnienia per nazwy (uzywany przez CRDT sync).
-pub fn upsert_permission_by_names(
-    pool: &DbPool,
-    addon_id: &str,
-    subject_type: &str,
-    subject_name: &str,
-    permission_id: &str,
-    granted: bool,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    // Rozwiaz subject_name na subject_id
-    let subject_id: Option<i64> = match subject_type {
-        "user" => conn
-            .query_row(
-                "SELECT id FROM user_accounts WHERE username = ?1",
-                rusqlite::params![subject_name],
-                |row| row.get(0),
-            )
-            .optional()?,
-        "group" => conn
-            .query_row(
-                "SELECT id FROM user_groups WHERE name = ?1",
-                rusqlite::params![subject_name],
-                |row| row.get(0),
-            )
-            .optional()?,
-        _ => None,
-    };
-
-    if let Some(sid) = subject_id {
-        conn.execute(
-            "INSERT INTO addon_permissions (addon_id, subject_type, subject_id, permission_id, granted) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(addon_id, subject_type, subject_id, permission_id) \
-             DO UPDATE SET granted = excluded.granted",
-            rusqlite::params![addon_id, subject_type, sid, permission_id, granted as i32],
-        )?;
-    }
-    Ok(())
-}
-
-/// Usuwa uprawnienie per nazwy (uzywany przez CRDT sync).
-pub fn delete_permission_by_names(
-    pool: &DbPool,
-    addon_id: &str,
-    subject_type: &str,
-    subject_name: &str,
-    permission_id: &str,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let subject_id: Option<i64> = match subject_type {
-        "user" => conn
-            .query_row(
-                "SELECT id FROM user_accounts WHERE username = ?1",
-                rusqlite::params![subject_name],
-                |row| row.get(0),
-            )
-            .optional()?,
-        "group" => conn
-            .query_row(
-                "SELECT id FROM user_groups WHERE name = ?1",
-                rusqlite::params![subject_name],
-                |row| row.get(0),
-            )
-            .optional()?,
-        _ => None,
-    };
-
-    if let Some(sid) = subject_id {
-        conn.execute(
-            "DELETE FROM addon_permissions \
-             WHERE addon_id = ?1 AND subject_type = ?2 AND subject_id = ?3 AND permission_id = ?4",
-            rusqlite::params![addon_id, subject_type, sid, permission_id],
-        )?;
-    }
-    Ok(())
-}
-
-/// Upsert addon z synchronizacji CRDT (po addon_id).
-pub fn upsert_addon_sync(
-    pool: &DbPool,
-    addon_id: &str,
-    name: &str,
-    version: &str,
-    manifest_json: &str,
-    platforms: &str,
-    wasm_hash: &str,
-) -> Result<bool> {
-    let conn = acquire(pool)?;
-
-    // Sprawdz czy hash WASM sie zmienil — jesli tak, trzeba pobrac plik
-    let current_hash: Option<String> = conn
-        .query_row(
-            "SELECT manifest_json FROM addons WHERE addon_id = ?1",
-            rusqlite::params![addon_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-
-    // Sprawdz czy hash sie zmienil (uproszczone — porownujemy manifest_json ktory zawiera hash)
-    let wasm_changed = current_hash.as_deref() != Some(manifest_json);
-
-    conn.execute(
-        "INSERT INTO addons (addon_id, name, version, manifest_json, platforms) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(addon_id) DO UPDATE SET \
-         name = excluded.name, \
-         version = excluded.version, \
-         manifest_json = excluded.manifest_json, \
-         platforms = excluded.platforms, \
-         updated_at = datetime('now')",
-        rusqlite::params![addon_id, name, version, manifest_json, platforms],
-    )?;
-
-    // Zanotuj wasm_hash w ustawieniach addonu (do porownywania przy sync)
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value, updated_at) \
-         VALUES (?1, ?2, datetime('now'))",
-        rusqlite::params![format!("addon_wasm_hash:{addon_id}"), wasm_hash],
-    )?;
-
-    Ok(wasm_changed)
-}
-
-/// Upsert sekretu addonu per nazwy (uzywany przez CRDT sync).
-pub fn upsert_addon_secret_sync(
-    pool: &DbPool,
-    addon_id: &str,
-    username: Option<&str>,
-    key: &str,
-    encrypted_value: &str,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let user_id: Option<i64> = if let Some(uname) = username {
-        conn.query_row(
-            "SELECT id FROM user_accounts WHERE username = ?1",
-            rusqlite::params![uname],
-            |row| row.get(0),
-        )
-        .optional()?
-    } else {
-        None
-    };
-
-    conn.execute(
-        "INSERT INTO addon_secrets (addon_id, user_id, key, value_encrypted) \
-         VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT(addon_id, user_id, key) \
-         DO UPDATE SET value_encrypted = excluded.value_encrypted, updated_at = datetime('now')",
-        rusqlite::params![addon_id, user_id, key, encrypted_value],
-    )?;
-    Ok(())
-}
-
-/// Usuwa sekret addonu per nazwy (uzywany przez CRDT sync).
-pub fn delete_addon_secret_sync(
-    pool: &DbPool,
-    addon_id: &str,
-    username: Option<&str>,
-    key: &str,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let user_id: Option<i64> = if let Some(uname) = username {
-        conn.query_row(
-            "SELECT id FROM user_accounts WHERE username = ?1",
-            rusqlite::params![uname],
-            |row| row.get(0),
-        )
-        .optional()?
-    } else {
-        None
-    };
-
-    conn.execute(
-        "DELETE FROM addon_secrets WHERE addon_id = ?1 AND user_id IS ?2 AND key = ?3",
-        rusqlite::params![addon_id, user_id, key],
-    )?;
-    Ok(())
-}
-
-/// Upsert sync exclusion (uzywany przez CRDT sync).
-pub fn upsert_sync_exclusion(pool: &DbPool, group_name: &str, resource_type: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO sync_exclusions (group_id, resource_type) \
-         SELECT id, ?2 FROM user_groups WHERE name = ?1",
-        rusqlite::params![group_name, resource_type],
-    )?;
-    Ok(())
-}
-
-/// Usuwa sync exclusion (uzywany przez CRDT sync).
-pub fn delete_sync_exclusion(pool: &DbPool, group_name: &str, resource_type: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "DELETE FROM sync_exclusions WHERE group_id IN \
-         (SELECT id FROM user_groups WHERE name = ?1) AND resource_type = ?2",
-        rusqlite::params![group_name, resource_type],
-    )?;
-    Ok(())
-}
-
-/// Sprawdza czy dany resource_type jest wykluczony z synchronizacji
-/// dla jakiejkolwiek grupy lokalnego noda.
-pub fn is_sync_excluded(pool: &DbPool, resource_type: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sync_exclusions WHERE resource_type = ?1",
-        rusqlite::params![resource_type],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
-}
-
-/// Upsert konfiguracji addonu (uzywany przez CRDT sync).
-pub fn set_addon_config(pool: &DbPool, addon_id: &str, key: &str, value: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value, updated_at) \
-         VALUES (?1, ?2, datetime('now'))",
-        rusqlite::params![format!("addon_config:{addon_id}:{key}"), value],
-    )?;
-    Ok(())
-}
-
 /// Pobiera wszystkie ustawienia konfiguracji addonu jako HashMap
 pub fn get_addon_config_values(
     pool: &DbPool,
@@ -3467,6 +4831,1229 @@ pub fn get_trusted_node_public_key(pool: &DbPool, node_id: &str) -> Result<Optio
         )
         .optional()?;
     Ok(result)
+}
+
+// =============================================================================
+// Sync Identity Registry — node/device, user keys i przypisania
+// =============================================================================
+
+fn row_to_sync_node_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncNodeIdentity> {
+    Ok(SyncNodeIdentity {
+        node_id: row.get(0)?,
+        public_key: row.get(1)?,
+        public_key_type: row.get(2)?,
+        display_name: row.get(3)?,
+        node_kind: row.get(4)?,
+        trust_status: row.get(5)?,
+        owner_user_id: row.get(6)?,
+        sync_profile: row.get(7)?,
+        last_seen_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn row_to_user_identity_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserIdentityKey> {
+    Ok(UserIdentityKey {
+        key_id: row.get(0)?,
+        user_id: row.get(1)?,
+        key_type: row.get(2)?,
+        public_key: row.get(3)?,
+        purpose: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        revoked_at: row.get(7)?,
+    })
+}
+
+fn row_to_node_user_assignment(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeUserAssignment> {
+    Ok(NodeUserAssignment {
+        node_id: row.get(0)?,
+        user_id: row.get(1)?,
+        assignment_mode: row.get(2)?,
+        valid_from: row.get(3)?,
+        valid_until: row.get(4)?,
+        created_by: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn row_to_sync_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncPolicy> {
+    let resource_type: String = row.get(3)?;
+    let resource_id: String = row.get(4)?;
+    let mode: String = row.get(5)?;
+    let mode = SyncPolicyMode::parse(&mode).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            format!("invalid sync policy mode: {mode}").into(),
+        )
+    })?;
+    Ok(SyncPolicy {
+        policy_id: row.get(0)?,
+        org_id: row.get(1)?,
+        addon_id: row.get(2)?,
+        resource_type: (!resource_type.is_empty()).then_some(resource_type),
+        resource_id: (!resource_id.is_empty()).then_some(resource_id),
+        mode,
+        authority_node_id: row.get(6)?,
+        retention_days: row.get(7)?,
+        is_enabled: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+/// Rejestruje albo aktualizuje techniczna tozsamosc node/device.
+pub fn upsert_sync_node_identity(
+    pool: &DbPool,
+    node_id: &str,
+    public_key: &str,
+    public_key_type: &str,
+    display_name: &str,
+    node_kind: &str,
+    trust_status: &str,
+    owner_user_id: Option<i64>,
+    sync_profile: &str,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO sync_nodes \
+         (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(node_id) DO UPDATE SET \
+             public_key = excluded.public_key, \
+             public_key_type = excluded.public_key_type, \
+             display_name = excluded.display_name, \
+             node_kind = excluded.node_kind, \
+             trust_status = excluded.trust_status, \
+             owner_user_id = excluded.owner_user_id, \
+             sync_profile = excluded.sync_profile",
+        rusqlite::params![
+            node_id,
+            public_key,
+            public_key_type,
+            display_name,
+            node_kind,
+            trust_status,
+            owner_user_id,
+            sync_profile
+        ],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("public_key".to_string(), field_string(public_key));
+    fields.insert("public_key_type".to_string(), field_string(public_key_type));
+    fields.insert("display_name".to_string(), field_string(display_name));
+    fields.insert("node_kind".to_string(), field_string(node_kind));
+    fields.insert("trust_status".to_string(), field_string(trust_status));
+    fields.insert("owner_user_id".to_string(), field_optional_i64(owner_user_id));
+    fields.insert("sync_profile".to_string(), field_string(sync_profile));
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncNode,
+        node_id,
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        owner_user_id,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Pobiera techniczna tozsamosc node/device.
+pub fn get_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<Option<SyncNodeIdentity>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
+                owner_user_id, sync_profile, last_seen_at, created_at, updated_at \
+         FROM sync_nodes WHERE node_id = ?1",
+    )?;
+    let result = stmt
+        .query_row(rusqlite::params![node_id], row_to_sync_node_identity)
+        .optional()?;
+    Ok(result)
+}
+
+/// Aktualizuje czas ostatniej aktywnosci node/device.
+pub fn touch_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE sync_nodes \
+         SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE node_id = ?1",
+        rusqlite::params![node_id],
+    )?;
+    Ok(())
+}
+
+/// Dodaje albo odswieza kryptograficzny klucz uzytkownika.
+pub fn upsert_user_identity_key(
+    pool: &DbPool,
+    key_id: &str,
+    user_id: i64,
+    key_type: &str,
+    public_key: &str,
+    purpose: &str,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO user_identity_keys (key_id, user_id, key_type, public_key, purpose, status, revoked_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', NULL) \
+         ON CONFLICT(key_id) DO UPDATE SET \
+             user_id = excluded.user_id, \
+             key_type = excluded.key_type, \
+             public_key = excluded.public_key, \
+             purpose = excluded.purpose, \
+             status = 'active', \
+             revoked_at = NULL",
+        rusqlite::params![key_id, user_id, key_type, public_key, purpose],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("key_type".to_string(), field_string(key_type));
+    fields.insert("public_key".to_string(), field_string(public_key));
+    fields.insert("purpose".to_string(), field_string(purpose));
+    fields.insert("status".to_string(), field_string("active"));
+    fields.insert("revoked_at".to_string(), crate::sync::ledger::FieldValue::Null);
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserIdentityKey,
+        key_id,
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        Some(user_id),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Pobiera aktywne klucze kryptograficzne uzytkownika.
+pub fn list_active_user_identity_keys(pool: &DbPool, user_id: i64) -> Result<Vec<UserIdentityKey>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT key_id, user_id, key_type, public_key, purpose, status, created_at, revoked_at \
+         FROM user_identity_keys \
+         WHERE user_id = ?1 AND status = 'active' \
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![user_id], row_to_user_identity_key)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Revoke klucza uzytkownika bez usuwania historii.
+pub fn revoke_user_identity_key(pool: &DbPool, key_id: &str) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE user_identity_keys \
+         SET status = 'revoked', revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE key_id = ?1",
+        rusqlite::params![key_id],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("status".to_string(), field_string("revoked"));
+    fields.insert(
+        "revoked_at".to_string(),
+        field_string(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+    );
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserIdentityKey,
+        key_id,
+        crate::sync::runtime::SqlWriteAction::Update,
+        fields,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Przypisuje uzytkownika do node/device.
+pub fn assign_node_to_user(
+    pool: &DbPool,
+    node_id: &str,
+    user_id: i64,
+    assignment_mode: &str,
+    created_by: Option<i64>,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO node_user_assignments \
+         (node_id, user_id, assignment_mode, valid_until, created_by) \
+         VALUES (?1, ?2, ?3, NULL, ?4) \
+         ON CONFLICT(node_id, user_id, assignment_mode) DO UPDATE SET \
+             valid_until = NULL, \
+             created_by = excluded.created_by",
+        rusqlite::params![node_id, user_id, assignment_mode, created_by],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("node_id".to_string(), field_string(node_id));
+    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("assignment_mode".to_string(), field_string(assignment_mode));
+    fields.insert("created_by".to_string(), field_optional_i64(created_by));
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::NodeUserAssignment,
+        node_user_assignment_core_id(node_id, user_id, assignment_mode),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        created_by,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Konczy aktywne przypisanie uzytkownika do node/device.
+pub fn revoke_node_user_assignment(
+    pool: &DbPool,
+    node_id: &str,
+    user_id: i64,
+    assignment_mode: &str,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE node_user_assignments \
+         SET valid_until = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE node_id = ?1 AND user_id = ?2 AND assignment_mode = ?3 AND valid_until IS NULL",
+        rusqlite::params![node_id, user_id, assignment_mode],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("node_id".to_string(), field_string(node_id));
+    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("assignment_mode".to_string(), field_string(assignment_mode));
+    fields.insert(
+        "valid_until".to_string(),
+        field_string(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+    );
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::NodeUserAssignment,
+        node_user_assignment_core_id(node_id, user_id, assignment_mode),
+        crate::sync::runtime::SqlWriteAction::Update,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Lista aktywnych przypisan danego node/device.
+pub fn list_active_node_user_assignments(
+    pool: &DbPool,
+    node_id: &str,
+) -> Result<Vec<NodeUserAssignment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, user_id, assignment_mode, valid_from, valid_until, created_by, created_at \
+         FROM node_user_assignments \
+         WHERE node_id = ?1 AND valid_until IS NULL \
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![node_id], row_to_node_user_assignment)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Lista node/device aktywnie przypisanych do uzytkownika.
+pub fn list_sync_nodes_for_user(pool: &DbPool, user_id: i64) -> Result<Vec<SyncNodeIdentity>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT n.node_id, n.public_key, n.public_key_type, n.display_name, n.node_kind, \
+                n.trust_status, n.owner_user_id, n.sync_profile, n.last_seen_at, \
+                n.created_at, n.updated_at \
+         FROM sync_nodes n \
+         JOIN node_user_assignments a ON a.node_id = n.node_id \
+         WHERE a.user_id = ?1 AND a.valid_until IS NULL \
+         ORDER BY n.display_name, n.node_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![user_id], row_to_sync_node_identity)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+// =============================================================================
+// Sync Permission Engine — decyzje dostepu dla zasobow synchronizowanych
+// =============================================================================
+
+fn row_to_sync_resource_acl(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncResourceAcl> {
+    Ok(SyncResourceAcl {
+        org_id: row.get(0)?,
+        addon_id: row.get(1)?,
+        resource_type: row.get(2)?,
+        resource_id: row.get(3)?,
+        owner_user_id: row.get(4)?,
+        assigned_user_id: row.get(5)?,
+        department_id: row.get(6)?,
+        manager_user_id: row.get(7)?,
+        visibility_scope: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+/// Aktualizuje profil organizacyjny usera uzywany do effective permissions.
+pub fn upsert_sync_user_org_profile(
+    pool: &DbPool,
+    org_id: &str,
+    user_id: i64,
+    department_id: Option<&str>,
+    manager_user_id: Option<i64>,
+    is_department_manager: bool,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO sync_user_org_profiles \
+         (org_id, user_id, department_id, manager_user_id, is_department_manager) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(org_id, user_id) DO UPDATE SET \
+             department_id = excluded.department_id, \
+             manager_user_id = excluded.manager_user_id, \
+             is_department_manager = excluded.is_department_manager",
+        rusqlite::params![
+            org_id,
+            user_id,
+            department_id,
+            manager_user_id,
+            is_department_manager
+        ],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert(
+        "department_id".to_string(),
+        field_optional_string(department_id),
+    );
+    fields.insert(
+        "manager_user_id".to_string(),
+        field_optional_i64(manager_user_id),
+    );
+    fields.insert(
+        "is_department_manager".to_string(),
+        crate::sync::ledger::FieldValue::Bool(is_department_manager),
+    );
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncUserOrgProfile,
+        org_id,
+        sync_user_org_profile_core_id(org_id, user_id),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        Some(user_id),
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Aktualizuje metadata dostepu dla pojedynczego zasobu.
+pub fn upsert_sync_resource_acl(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    owner_user_id: Option<i64>,
+    assigned_user_id: Option<i64>,
+    department_id: Option<&str>,
+    manager_user_id: Option<i64>,
+    visibility_scope: &str,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO sync_resource_acl \
+         (org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, department_id, manager_user_id, visibility_scope) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(org_id, addon_id, resource_type, resource_id) DO UPDATE SET \
+             owner_user_id = excluded.owner_user_id, \
+             assigned_user_id = excluded.assigned_user_id, \
+             department_id = excluded.department_id, \
+             manager_user_id = excluded.manager_user_id, \
+             visibility_scope = excluded.visibility_scope",
+        rusqlite::params![
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            owner_user_id,
+            assigned_user_id,
+            department_id,
+            manager_user_id,
+            visibility_scope
+        ],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("owner_user_id".to_string(), field_optional_i64(owner_user_id));
+    fields.insert(
+        "assigned_user_id".to_string(),
+        field_optional_i64(assigned_user_id),
+    );
+    fields.insert(
+        "department_id".to_string(),
+        field_optional_string(department_id),
+    );
+    fields.insert(
+        "manager_user_id".to_string(),
+        field_optional_i64(manager_user_id),
+    );
+    fields.insert("visibility_scope".to_string(), field_string(visibility_scope));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncResourceAcl,
+        org_id,
+        sync_resource_acl_core_id(addon_id, resource_type, resource_id),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Pobiera metadata dostepu zasobu.
+pub fn get_sync_resource_acl(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<SyncResourceAcl>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, \
+                department_id, manager_user_id, visibility_scope, created_at, updated_at \
+         FROM sync_resource_acl \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4",
+    )?;
+    let acl = stmt
+        .query_row(
+            rusqlite::params![org_id, addon_id, resource_type, resource_id],
+            row_to_sync_resource_acl,
+        )
+        .optional()?;
+    Ok(acl)
+}
+
+/// Usuwa metadata dostepu zasobu.
+pub fn delete_sync_resource_acl(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM sync_resource_acl \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4",
+        rusqlite::params![org_id, addon_id, resource_type, resource_id],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncResourceAcl,
+        org_id,
+        sync_resource_acl_core_id(addon_id, resource_type, resource_id),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Przyznaje jawny dostep do zasobu userowi albo node.
+pub fn grant_sync_explicit_share(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+    granted_by: Option<i64>,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO sync_explicit_shares \
+         (org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action, granted_by, revoked_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL) \
+         ON CONFLICT(org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action) DO UPDATE SET \
+             granted_by = excluded.granted_by, \
+             granted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), \
+             revoked_at = NULL",
+        rusqlite::params![
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action,
+            granted_by
+        ],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("subject_type".to_string(), field_string(subject_type));
+    fields.insert("subject_id".to_string(), field_string(subject_id));
+    fields.insert("action".to_string(), field_string(action));
+    fields.insert("granted_by".to_string(), field_optional_i64(granted_by));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncExplicitShare,
+        org_id,
+        sync_explicit_share_core_id(
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action,
+        ),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        granted_by,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Cofa jawny dostep do zasobu.
+pub fn revoke_sync_explicit_share(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE sync_explicit_shares \
+         SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
+           AND subject_type = ?5 AND subject_id = ?6 AND action = ?7 AND revoked_at IS NULL",
+        rusqlite::params![
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action
+        ],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("subject_type".to_string(), field_string(subject_type));
+    fields.insert("subject_id".to_string(), field_string(subject_id));
+    fields.insert("action".to_string(), field_string(action));
+    fields.insert(
+        "revoked_at".to_string(),
+        field_string(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+    );
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncExplicitShare,
+        org_id,
+        sync_explicit_share_core_id(
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action,
+        ),
+        crate::sync::runtime::SqlWriteAction::Update,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Sprawdza effective access usera do zasobu.
+pub fn can_user_access_sync_resource(
+    pool: &DbPool,
+    user_id: i64,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    action: &str,
+) -> Result<SyncAccessDecision> {
+    let conn = acquire(pool)?;
+    can_user_access_sync_resource_with_conn(
+        &conn,
+        user_id,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        action,
+    )
+}
+
+fn can_user_access_sync_resource_with_conn(
+    conn: &rusqlite::Connection,
+    user_id: i64,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    action: &str,
+) -> Result<SyncAccessDecision> {
+    if is_user_org_admin_with_conn(conn, user_id, org_id)? {
+        return Ok(allow("admin"));
+    }
+
+    if has_explicit_share_with_conn(
+        conn,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        "user",
+        &user_id.to_string(),
+        action,
+    )? {
+        return Ok(allow("explicit_share"));
+    }
+
+    let acl = load_sync_resource_acl_with_conn(conn, org_id, addon_id, resource_type, resource_id)?;
+    let Some(acl) = acl else {
+        return Ok(deny("resource_acl_missing"));
+    };
+
+    if acl.owner_user_id == Some(user_id) {
+        return Ok(allow("owner"));
+    }
+    if acl.assigned_user_id == Some(user_id) {
+        return Ok(allow("assigned"));
+    }
+    if acl.manager_user_id == Some(user_id) {
+        return Ok(allow("manager"));
+    }
+    if acl.visibility_scope == "all" {
+        return Ok(allow("all"));
+    }
+    if acl.visibility_scope == "department"
+        && user_in_department_with_conn(conn, org_id, user_id, acl.department_id.as_deref())?
+    {
+        return Ok(allow("department"));
+    }
+    if acl.visibility_scope == "manager_subtree"
+        && user_manages_subject_with_conn(conn, org_id, user_id, acl.assigned_user_id)?
+    {
+        return Ok(allow("manager_subtree"));
+    }
+
+    Ok(deny("no_matching_rule"))
+}
+
+/// Sprawdza czy node moze dostac zasob w outbox/sync receive.
+pub fn can_node_receive_sync_resource(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<SyncAccessDecision> {
+    let conn = acquire(pool)?;
+    can_node_receive_sync_resource_with_conn(
+        &conn,
+        node_id,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+    )
+}
+
+/// Sprawdza czy node moze wykonac konkretna akcje na zasobie bez materializacji.
+pub fn can_node_access_sync_resource(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    action: &str,
+) -> Result<SyncAccessDecision> {
+    let conn = acquire(pool)?;
+    let node = load_sync_node_identity_with_conn(&conn, node_id)?;
+    let Some(node) = node else {
+        return Ok(deny("node_missing"));
+    };
+    if node.trust_status != "trusted" {
+        return Ok(deny("node_not_trusted"));
+    }
+    if has_explicit_share_with_conn(
+        &conn,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        "node",
+        node_id,
+        action,
+    )? {
+        return Ok(allow("explicit_share"));
+    }
+    Ok(deny("no_matching_rule"))
+}
+
+fn can_node_receive_sync_resource_with_conn(
+    conn: &rusqlite::Connection,
+    node_id: &str,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<SyncAccessDecision> {
+    let node = load_sync_node_identity_with_conn(conn, node_id)?;
+    let Some(node) = node else {
+        return Ok(deny("node_missing"));
+    };
+    if node.trust_status != "trusted" {
+        return Ok(deny("node_not_trusted"));
+    }
+    if node.sync_profile == "authority" {
+        return Ok(allow("authority_node"));
+    }
+    if has_explicit_share_with_conn(
+        conn,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        "node",
+        node_id,
+        "sync_receive",
+    )? {
+        return Ok(allow("explicit_node_share"));
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT user_id FROM node_user_assignments \
+         WHERE node_id = ?1 AND valid_until IS NULL",
+    )?;
+    let user_ids = stmt
+        .query_map(rusqlite::params![node_id], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for user_id in user_ids {
+        let decision = can_user_access_sync_resource_with_conn(
+            conn,
+            user_id,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            "sync_receive",
+        )?;
+        if decision.allowed {
+            return Ok(allow(&format!("assigned_user:{}", decision.reason)));
+        }
+    }
+
+    Ok(deny("no_assigned_user_access"))
+}
+
+fn load_sync_resource_acl_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<SyncResourceAcl>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, \
+                department_id, manager_user_id, visibility_scope, created_at, updated_at \
+         FROM sync_resource_acl \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4",
+    )?;
+    Ok(stmt
+        .query_row(
+            rusqlite::params![org_id, addon_id, resource_type, resource_id],
+            row_to_sync_resource_acl,
+        )
+        .optional()?)
+}
+
+fn load_sync_node_identity_with_conn(
+    conn: &rusqlite::Connection,
+    node_id: &str,
+) -> Result<Option<SyncNodeIdentity>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
+                owner_user_id, sync_profile, last_seen_at, created_at, updated_at \
+         FROM sync_nodes WHERE node_id = ?1",
+    )?;
+    Ok(stmt
+        .query_row(rusqlite::params![node_id], row_to_sync_node_identity)
+        .optional()?)
+}
+
+fn is_user_org_admin_with_conn(
+    conn: &rusqlite::Connection,
+    user_id: i64,
+    org_id: &str,
+) -> Result<bool> {
+    let is_admin = conn
+        .query_row(
+            "SELECT is_admin FROM user_accounts WHERE id = ?1 AND is_active = 1",
+            rusqlite::params![user_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if is_admin {
+        return Ok(true);
+    }
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) \
+         FROM org_memberships \
+         WHERE org_id = ?1 AND user_id = ?2 AND role_id = 'role-org-admin'",
+        rusqlite::params![org_id, user_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn has_explicit_share_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sync_explicit_shares \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
+           AND subject_type = ?5 AND subject_id = ?6 AND action = ?7 AND revoked_at IS NULL",
+        rusqlite::params![
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn user_in_department_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    user_id: i64,
+    department_id: Option<&str>,
+) -> Result<bool> {
+    let Some(department_id) = department_id else {
+        return Ok(false);
+    };
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sync_user_org_profiles \
+         WHERE org_id = ?1 AND user_id = ?2 AND department_id = ?3",
+        rusqlite::params![org_id, user_id, department_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn user_manages_subject_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    manager_user_id: i64,
+    subject_user_id: Option<i64>,
+) -> Result<bool> {
+    let Some(subject_user_id) = subject_user_id else {
+        return Ok(false);
+    };
+    if subject_user_id == manager_user_id {
+        return Ok(true);
+    }
+    let count: i64 = conn.query_row(
+        "WITH RECURSIVE subtree(user_id) AS ( \
+            SELECT user_id FROM sync_user_org_profiles WHERE org_id = ?1 AND manager_user_id = ?2 \
+            UNION ALL \
+            SELECT p.user_id FROM sync_user_org_profiles p JOIN subtree s ON p.manager_user_id = s.user_id \
+            WHERE p.org_id = ?1 \
+         ) \
+         SELECT COUNT(*) FROM subtree WHERE user_id = ?3",
+        rusqlite::params![org_id, manager_user_id, subject_user_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn allow(reason: &str) -> SyncAccessDecision {
+    SyncAccessDecision {
+        allowed: true,
+        reason: reason.to_string(),
+    }
+}
+
+fn deny(reason: &str) -> SyncAccessDecision {
+    SyncAccessDecision {
+        allowed: false,
+        reason: reason.to_string(),
+    }
+}
+
+// =============================================================================
+// Sync Policy — tryb synchronizacji i selekcja odbiorcow
+// =============================================================================
+
+/// Zapisuje polityke synchronizacji. Brak typu zasobu oznacza caly addon,
+/// a brak ID zasobu oznacza wszystkie zasoby danego typu.
+pub fn upsert_sync_policy(
+    pool: &DbPool,
+    policy_id: &str,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: Option<&str>,
+    resource_id: Option<&str>,
+    mode: &str,
+    authority_node_id: Option<&str>,
+    retention_days: Option<i64>,
+    is_enabled: bool,
+) -> Result<()> {
+    let mode = SyncPolicyMode::parse(mode)
+        .ok_or_else(|| anyhow::anyhow!("invalid sync policy mode: {mode}"))?;
+    let mut conn = acquire(pool)?;
+    let resource_type = resource_type.unwrap_or("");
+    let resource_id = resource_id.unwrap_or("");
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO sync_policies \
+         (policy_id, org_id, addon_id, resource_type, resource_id, mode, authority_node_id, retention_days, is_enabled) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(org_id, addon_id, resource_type, resource_id) DO UPDATE SET \
+             policy_id = excluded.policy_id, \
+             mode = excluded.mode, \
+             authority_node_id = excluded.authority_node_id, \
+             retention_days = excluded.retention_days, \
+             is_enabled = excluded.is_enabled",
+        rusqlite::params![
+            policy_id,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            mode.as_str(),
+            authority_node_id,
+            retention_days,
+            is_enabled
+        ],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("mode".to_string(), field_string(mode.as_str()));
+    fields.insert(
+        "authority_node_id".to_string(),
+        field_optional_string(authority_node_id),
+    );
+    fields.insert(
+        "retention_days".to_string(),
+        field_optional_i64(retention_days),
+    );
+    fields.insert(
+        "is_enabled".to_string(),
+        crate::sync::ledger::FieldValue::Bool(is_enabled),
+    );
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncPolicy,
+        org_id,
+        policy_id,
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Pobiera najbardziej szczegolna aktywna polityke dla zasobu.
+pub fn get_effective_sync_policy(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<SyncPolicy>> {
+    let conn = acquire(pool)?;
+    get_effective_sync_policy_with_conn(&conn, org_id, addon_id, resource_type, resource_id)
+}
+
+/// Wyznacza nody, do ktorych wolno wyslac operacje danego zasobu.
+pub fn list_sync_targets_for_resource(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Vec<SyncPolicyTarget>> {
+    let conn = acquire(pool)?;
+    let Some(policy) =
+        get_effective_sync_policy_with_conn(&conn, org_id, addon_id, resource_type, resource_id)?
+    else {
+        return Ok(Vec::new());
+    };
+    if !policy.is_enabled {
+        return Ok(Vec::new());
+    }
+
+    match policy.mode {
+        SyncPolicyMode::LocalOnly | SyncPolicyMode::Ephemeral => Ok(Vec::new()),
+        SyncPolicyMode::AuthorityReadthrough | SyncPolicyMode::AuthorityWrite => {
+            let Some(node_id) = policy.authority_node_id else {
+                return Ok(Vec::new());
+            };
+            if can_node_receive_sync_resource_with_conn(
+                &conn,
+                &node_id,
+                org_id,
+                addon_id,
+                resource_type,
+                resource_id,
+            )?
+            .allowed
+            {
+                Ok(vec![SyncPolicyTarget {
+                    node_id,
+                    reason: policy.mode.to_string(),
+                }])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        SyncPolicyMode::ReplicatedByPermission | SyncPolicyMode::Sharded => list_permission_filtered_sync_targets_with_conn(
+            &conn,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+        ),
+    }
+}
+
+fn get_effective_sync_policy_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<SyncPolicy>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT policy_id, org_id, addon_id, resource_type, resource_id, mode, authority_node_id, \
+                retention_days, is_enabled, created_at, updated_at \
+         FROM sync_policies \
+         WHERE org_id = ?1 \
+           AND addon_id = ?2 \
+           AND is_enabled = 1 \
+           AND (resource_type = ?3 OR resource_type = '') \
+           AND (resource_id = ?4 OR resource_id = '') \
+         ORDER BY \
+           CASE WHEN resource_id = ?4 THEN 2 WHEN resource_id = '' THEN 0 ELSE -1 END DESC, \
+           CASE WHEN resource_type = ?3 THEN 1 WHEN resource_type = '' THEN 0 ELSE -1 END DESC \
+         LIMIT 1",
+    )?;
+    Ok(stmt
+        .query_row(
+            rusqlite::params![org_id, addon_id, resource_type, resource_id],
+            row_to_sync_policy,
+        )
+        .optional()?)
+}
+
+fn list_permission_filtered_sync_targets_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Vec<SyncPolicyTarget>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id FROM sync_nodes \
+         WHERE trust_status = 'trusted' \
+           AND sync_profile IN ('standard','limited','authority','storage_only') \
+         ORDER BY node_id",
+    )?;
+    let node_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut targets = Vec::new();
+    for node_id in node_ids {
+        let decision = can_node_receive_sync_resource_with_conn(
+            conn,
+            &node_id,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+        )?;
+        if decision.allowed {
+            targets.push(SyncPolicyTarget {
+                node_id,
+                reason: decision.reason,
+            });
+        }
+    }
+    Ok(targets)
 }
 
 // =============================================================================
@@ -5481,8 +8068,12 @@ pub fn get_permission_catalog_risk(
     Ok(v)
 }
 
-/// Zapisuje wpis audytowy z wszystkimi polami (severity, resource_type, resource_id).
-/// Zamiast `log_audit`, ta funkcja wypelnia tez kolumny dodane przez migracje 20 i 39.
+/// Zapisuje wpis audytowy z wszystkimi polami (severity, resource_type, resource_id,
+/// risk_class, org_id, result). Zamiast `log_audit`, ta funkcja wypelnia tez kolumny
+/// dodane przez migracje 20, 39 oraz Merkle-chain (P4). Risk class follows the
+/// F1b convention (`A` = high / sensitive admin, `B` = medium, `C` = low / read,
+/// `unclassified` as fallback for legacy callers).
+#[allow(clippy::too_many_arguments)]
 pub fn log_audit_full(
     pool: &DbPool,
     user_id: Option<i64>,
@@ -5492,16 +8083,40 @@ pub fn log_audit_full(
     resource_id: Option<&str>,
     details: Option<&str>,
     severity: &str,
+    risk_class: &str,
+    result: Option<&str>,
+    org_id: Option<&str>,
     ip_address: Option<&str>,
     node_id: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id,
+        addon_id,
+        instance_id: None,
+        action,
+        resource: None,
+        resource_type,
+        resource_id,
+        result,
+        error_message: None,
+        details,
+        ip_address,
+        node_id,
+        severity: Some(severity),
+        risk_class,
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)?;
     conn.execute(
         "INSERT INTO audit_log \
-           (user_id, addon_id, action, resource_type, resource_id, details, severity, ip_address, node_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+           (timestamp, user_id, addon_id, action, resource_type, resource_id, result, details, severity, risk_class, org_id, ip_address, node_id, prev_hash, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
-            user_id, addon_id, action, resource_type, resource_id, details, severity, ip_address, node_id,
+            timestamp, user_id, addon_id, action, resource_type, resource_id, result, details, severity, risk_class, org_id, ip_address, node_id, prev_hash, hash,
         ],
     )?;
     Ok(())
@@ -6524,10 +9139,12 @@ pub fn get_addon_network_config(pool: &DbPool, addon_id: &str) -> Result<AddonNe
 /// Manifest-declared network rule row from `addon_network_rules`.
 #[derive(Debug, Clone)]
 pub struct AddonDeclaredNetworkRule {
+    pub rule_id: String,
     pub host: String,
     pub port: i32,
     pub protocol: String,
     pub required: bool,
+    pub approved: bool,
 }
 
 /// Loads manifest-declared network rules for an addon. Returns rows from
@@ -6539,20 +9156,51 @@ pub fn get_addon_declared_network_rules(
 ) -> Result<Vec<AddonDeclaredNetworkRule>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT host, port, protocol, required FROM addon_network_rules \
-         WHERE addon_id = ?1 ORDER BY host, port",
+        "SELECT rule_id, host, port, protocol, required, approved FROM addon_network_rules \
+         WHERE addon_id = ?1 ORDER BY host, port, rule_id",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![addon_id], |row| {
             Ok(AddonDeclaredNetworkRule {
-                host: row.get(0)?,
-                port: row.get(1)?,
-                protocol: row.get(2)?,
-                required: row.get::<_, i64>(3)? != 0,
+                rule_id: row.get(0)?,
+                host: row.get(1)?,
+                port: row.get(2)?,
+                protocol: row.get(3)?,
+                required: row.get::<_, i64>(4)? != 0,
+                approved: row.get::<_, i64>(5)? != 0,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Aktualizuje realne approvale regul manifestu na podstawie polityki admina.
+pub fn set_addon_network_rule_approvals(
+    pool: &DbPool,
+    addon_id: &str,
+    allowed_hosts: &[String],
+    blocked_hosts: &[String],
+    updated_by: Option<i64>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE addon_network_rules \
+         SET approved = 0, approved_by = NULL, approved_at = NULL \
+         WHERE addon_id = ?1",
+        rusqlite::params![addon_id],
+    )?;
+    for host in allowed_hosts {
+        if blocked_hosts.iter().any(|blocked| blocked == host) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE addon_network_rules \
+             SET approved = 1, approved_by = ?1, approved_at = datetime('now') \
+             WHERE addon_id = ?2 AND lower(host) = lower(?3)",
+            rusqlite::params![updated_by, addon_id, host],
+        )?;
+    }
+    Ok(())
 }
 
 /// Upsert konfiguracji regul sieciowych addona.
@@ -6726,7 +9374,7 @@ mod alias_resolve_tests {
         .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
-        let result = resolve_model_alias(&db, "gpt-4").expect("Blad zapytania");
+        let result = resolve_model_alias(&db, "gpt-4", None).expect("Blad zapytania");
 
         // Assert
         let alias = result.expect("Alias powinien istniec");
@@ -6747,7 +9395,7 @@ mod alias_resolve_tests {
         let db = create_test_db();
 
         // Act
-        let result = resolve_model_alias(&db, "nieistniejacy-alias").expect("Blad zapytania");
+        let result = resolve_model_alias(&db, "nieistniejacy-alias", None).expect("Blad zapytania");
 
         // Assert
         assert!(result.is_none());
@@ -6764,7 +9412,7 @@ mod alias_resolve_tests {
             .expect("Nie udalo sie zaktualizowac aliasu");
 
         // Act
-        let result = resolve_model_alias(&db, "stary-alias").expect("Blad zapytania");
+        let result = resolve_model_alias(&db, "stary-alias", None).expect("Blad zapytania");
 
         // Assert — nieaktywny alias nie powinien byc zwracany
         assert!(result.is_none());
@@ -6778,7 +9426,7 @@ mod alias_resolve_tests {
             .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
-        let result = resolve_model_alias(&db, "test-alias")
+        let result = resolve_model_alias(&db, "test-alias", None)
             .expect("Blad zapytania")
             .expect("Alias powinien istniec");
 
@@ -6794,7 +9442,7 @@ mod alias_resolve_tests {
             .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
-        let result = resolve_model_alias(&db, "simple")
+        let result = resolve_model_alias(&db, "simple", None)
             .expect("Blad zapytania")
             .expect("Alias powinien istniec");
 
@@ -6811,27 +9459,48 @@ mod alias_resolve_tests {
         let db = create_test_db();
 
         // Act 1 — tworzenie aliasow (symulacja instalacji teams-bot)
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
-            .expect("Utworzenie aliasu teams-stt powinno sie udac");
-        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available")
-            .expect("Utworzenie aliasu teams-tts powinno sie udac");
-        create_or_reactivate_model_alias(&db, "teams-summary", "", "first_available")
-            .expect("Utworzenie aliasu teams-summary powinno sie udac (pusty target)");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Utworzenie aliasu teams-stt powinno sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-tts",
+            "tts-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Utworzenie aliasu teams-tts powinno sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-summary",
+            "",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Utworzenie aliasu teams-summary powinno sie udac (pusty target)");
 
         // Assert 1 — aliasy istnieja i sa aktywne
-        let stt = resolve_model_alias(&db, "teams-stt").unwrap();
+        let stt = resolve_model_alias(&db, "teams-stt", None).unwrap();
         assert!(stt.is_some(), "Alias teams-stt powinien istniec");
         let stt = stt.unwrap();
         assert_eq!(stt.target_model, "whisper-1");
         assert!(stt.is_active);
 
-        let tts = resolve_model_alias(&db, "teams-tts").unwrap();
+        let tts = resolve_model_alias(&db, "teams-tts", None).unwrap();
         assert!(tts.is_some(), "Alias teams-tts powinien istniec");
         let tts = tts.unwrap();
         assert_eq!(tts.target_model, "tts-1");
         assert!(tts.is_active);
 
-        let summary = resolve_model_alias(&db, "teams-summary").unwrap();
+        let summary = resolve_model_alias(&db, "teams-summary", None).unwrap();
         assert!(summary.is_some(), "Alias teams-summary powinien istniec");
         let summary = summary.unwrap();
         assert_eq!(
@@ -6848,28 +9517,46 @@ mod alias_resolve_tests {
 
         // Assert 2 — resolve nie znajduje nieaktywnych aliasow
         assert!(
-            resolve_model_alias(&db, "teams-stt").unwrap().is_none(),
+            resolve_model_alias(&db, "teams-stt", None)
+                .unwrap()
+                .is_none(),
             "Nieaktywny alias teams-stt nie powinien byc rozwiazywany"
         );
         assert!(
-            resolve_model_alias(&db, "teams-tts").unwrap().is_none(),
+            resolve_model_alias(&db, "teams-tts", None)
+                .unwrap()
+                .is_none(),
             "Nieaktywny alias teams-tts nie powinien byc rozwiazywany"
         );
 
         // Act 3 — reaktywacja (symulacja ponownego uruchomienia)
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
-            .expect("Reaktywacja teams-stt powinna sie udac");
-        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available")
-            .expect("Reaktywacja teams-tts powinna sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Reaktywacja teams-stt powinna sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-tts",
+            "tts-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Reaktywacja teams-tts powinna sie udac");
 
         // Assert 3 — aliasy ponownie aktywne
-        let stt = resolve_model_alias(&db, "teams-stt")
+        let stt = resolve_model_alias(&db, "teams-stt", None)
             .unwrap()
             .expect("Alias teams-stt powinien byc reaktywowany");
         assert!(stt.is_active);
         assert_eq!(stt.target_model, "whisper-1");
 
-        let tts = resolve_model_alias(&db, "teams-tts")
+        let tts = resolve_model_alias(&db, "teams-tts", None)
             .unwrap()
             .expect("Alias teams-tts powinien byc reaktywowany");
         assert!(tts.is_active);
@@ -6883,11 +9570,20 @@ mod alias_resolve_tests {
         let db = create_test_db();
 
         // Tworzenie z domyslnym target_model
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
-            .expect("Utworzenie aliasu powinno sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Utworzenie aliasu powinno sie udac");
 
         // Uzytkownik zmienia target_model na inny
-        let alias = resolve_model_alias(&db, "teams-stt").unwrap().unwrap();
+        let alias = resolve_model_alias(&db, "teams-stt", None)
+            .unwrap()
+            .unwrap();
         update_model_alias_unchecked(
             &db,
             alias.id,
@@ -6903,11 +9599,18 @@ mod alias_resolve_tests {
         set_model_alias_active(&db, "teams-stt", false).unwrap();
 
         // Act — reaktywacja z domyslnym target_model
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
-            .expect("Reaktywacja powinna sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Reaktywacja powinna sie udac");
 
         // Assert — target_model ustawiony przez uzytkownika jest zachowany
-        let alias = resolve_model_alias(&db, "teams-stt")
+        let alias = resolve_model_alias(&db, "teams-stt", None)
             .unwrap()
             .expect("Alias powinien byc aktywny");
         assert_eq!(
@@ -6923,7 +9626,15 @@ mod alias_resolve_tests {
 
         // Arrange
         let db = create_test_db();
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available").unwrap();
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .unwrap();
         set_model_alias_active(&db, "teams-stt", false).unwrap();
 
         // Act — ponowna dezaktywacja
@@ -6931,6 +9642,504 @@ mod alias_resolve_tests {
 
         // Assert — brak bledu
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_alias_with_addon_owner_writes_to_owners_table() {
+        let db = create_test_db();
+        let alias_id = create_or_reactivate_model_alias(
+            &db,
+            "vendor-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("vendor-bot"),
+        )
+        .expect("create alias");
+
+        let conn = db.lock().unwrap();
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("owner row exists");
+        assert_eq!(row.0, "addon");
+        assert_eq!(row.1.as_deref(), Some("vendor-bot"));
+    }
+
+    #[test]
+    fn test_create_alias_with_manual_owner_writes_to_owners_table() {
+        let db = create_test_db();
+        let alias_id = create_or_reactivate_model_alias(
+            &db,
+            "ops-alias",
+            "model-a",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect("create alias");
+
+        let conn = db.lock().unwrap();
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("owner row exists");
+        assert_eq!(row.0, "manual");
+        assert_eq!(row.1, None);
+    }
+
+    #[test]
+    fn test_create_alias_conflict_when_owner_mismatch() {
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "shared-alias",
+            "model-x",
+            "first_available",
+            "addon",
+            Some("addon-a"),
+        )
+        .expect("addon-a registers alias");
+
+        let err = create_or_reactivate_model_alias(
+            &db,
+            "shared-alias",
+            "model-x",
+            "first_available",
+            "addon",
+            Some("addon-b"),
+        )
+        .expect_err("cross-addon take-over must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("addon-a"),
+            "error must name original owner, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_alias_id_validation_rejects_bad_input() {
+        let db = create_test_db();
+        for bad in &[
+            "",
+            "1starts-with-digit",
+            "UPPER",
+            "has space",
+            "has_underscore",
+        ] {
+            let err =
+                create_or_reactivate_model_alias(&db, bad, "", "first_available", "manual", None)
+                    .expect_err("validation must reject");
+            assert!(format!("{err}").contains("invalid alias id"));
+        }
+    }
+
+    #[test]
+    fn test_create_alias_writes_audit_row() {
+        let db = create_test_db();
+        let alias_id = create_or_reactivate_model_alias(
+            &db,
+            "auditable",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("addon-x"),
+        )
+        .expect("create alias");
+
+        let conn = db.lock().unwrap();
+        let (change_type, addon): (String, Option<String>) = conn
+            .query_row(
+                "SELECT change_type, changed_by_addon_id FROM model_alias_changes \
+                 WHERE alias_id = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("change row");
+        assert_eq!(change_type, "create");
+        assert_eq!(addon.as_deref(), Some("addon-x"));
+    }
+
+    #[test]
+    fn test_generic_alias_install_works_for_arbitrary_addon() {
+        // Simulates AddonManager.install_manifest_aliases loop for a
+        // hypothetical addon "vendor-x" declaring two aliases.
+        let db = create_test_db();
+        let id1 = create_or_reactivate_model_alias(
+            &db,
+            "vendor-x-alpha",
+            "model-alpha",
+            "first_available",
+            "addon",
+            Some("vendor-x"),
+        )
+        .unwrap();
+        let id2 = create_or_reactivate_model_alias(
+            &db,
+            "vendor-x-beta",
+            "",
+            "first_available",
+            "addon",
+            Some("vendor-x"),
+        )
+        .unwrap();
+        assert_ne!(id1, id2);
+
+        let conn = db.lock().unwrap();
+        let owned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM model_alias_owners WHERE owner_id = 'vendor-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owned, 2);
+    }
+
+    #[test]
+    fn test_uninstall_aliases_deactivate_keeps_owner_row() {
+        // Install (create) then deactivate (simulates uninstall path):
+        // the owner row must survive so future reinstall reactivates
+        // instead of taking ownership conflict.
+        let db = create_test_db();
+        let alias_id = create_or_reactivate_model_alias(
+            &db,
+            "persist-alias",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("persist-addon"),
+        )
+        .unwrap();
+        set_model_alias_active_audited(&db, "persist-alias", false, Some("persist-addon")).unwrap();
+
+        let conn = db.lock().unwrap();
+        let (active, owner): (i64, String) = conn
+            .query_row(
+                "SELECT m.is_active, o.owner_id FROM model_aliases m \
+                 JOIN model_alias_owners o ON o.alias_id = m.id WHERE m.id = ?1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active, 0, "alias deactivated");
+        assert_eq!(owner, "persist-addon", "owner row preserved");
+    }
+
+    #[test]
+    fn test_deactivate_writes_audit_row() {
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "deact-alias",
+            "model-a",
+            "first_available",
+            "manual",
+            None,
+        )
+        .unwrap();
+
+        set_model_alias_active_audited(&db, "deact-alias", false, Some("admin-tool"))
+            .expect("deactivate");
+
+        let conn = db.lock().unwrap();
+        let (ct, addon): (String, Option<String>) = conn
+            .query_row(
+                "SELECT change_type, changed_by_addon_id FROM model_alias_changes \
+                 WHERE alias_name = 'deact-alias' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("change row");
+        assert_eq!(ct, "deactivate");
+        assert_eq!(addon.as_deref(), Some("admin-tool"));
+    }
+
+    #[test]
+    fn test_reactivate_preserves_owner_created_at() {
+        // Reinstall (deactivate → create_or_reactivate) must keep the
+        // original `model_alias_owners.created_at`. Audit/tenure clocks
+        // downstream rely on this value as the first-seen timestamp.
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "persist-ts",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("persist-addon"),
+        )
+        .unwrap();
+
+        let original_created_at: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT created_at FROM model_alias_owners \
+                 WHERE alias_id = (SELECT id FROM model_aliases WHERE alias = 'persist-ts')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("owner row")
+        };
+
+        // Force a different `datetime('now')` by sleeping past the second
+        // boundary. SQLite resolution is 1s.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        set_model_alias_active_audited(&db, "persist-ts", false, Some("persist-addon")).unwrap();
+        create_or_reactivate_model_alias(
+            &db,
+            "persist-ts",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("persist-addon"),
+        )
+        .unwrap();
+
+        let after_created_at: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT created_at FROM model_alias_owners \
+                 WHERE alias_id = (SELECT id FROM model_aliases WHERE alias = 'persist-ts')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("owner row")
+        };
+        assert_eq!(
+            original_created_at, after_created_at,
+            "created_at must survive deactivate→reactivate"
+        );
+    }
+
+    #[test]
+    fn test_manual_alias_cannot_be_adopted_by_addon() {
+        // A manually-owned alias must not be silently re-owned by an addon
+        // through install. Adoption requires an explicit M16 admin action.
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "manual-first",
+            "model-a",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect("manual alias created");
+
+        let err = create_or_reactivate_model_alias(
+            &db,
+            "manual-first",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("evil-addon"),
+        )
+        .expect_err("addon adoption of manual alias must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("manually owned"),
+            "error must explain manual ownership, got: {msg}"
+        );
+        assert!(
+            msg.contains("evil-addon"),
+            "error must name the attempted owner, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_addon_alias_cannot_be_taken_manual() {
+        // Symmetric: addon→manual transition must also fail without M16.
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "addon-first",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("orig-addon"),
+        )
+        .expect("addon alias created");
+
+        let err = create_or_reactivate_model_alias(
+            &db,
+            "addon-first",
+            "model-a",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect_err("manual take-over of addon alias must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("manual ownership change requires admin M16"),
+            "error must name the M16 admin path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_alias_id_with_control_byte_in_error_message_escaped() {
+        // Raw control bytes in error messages can corrupt terminals and
+        // log aggregators. `escape_debug` renders them as `\0`, `\n`, etc.
+        let db = create_test_db();
+        let bad = "bad\0name";
+        let err = create_or_reactivate_model_alias(&db, bad, "", "first_available", "manual", None)
+            .expect_err("validation must reject control byte");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("\\u{0}") || msg.contains("\\0"),
+            "control byte must be escaped in error, got: {msg}"
+        );
+        assert!(
+            !msg.contains('\0'),
+            "raw NUL must not appear in error message"
+        );
+    }
+
+    #[test]
+    fn test_alias_id_length_64_chars_ok() {
+        let db = create_test_db();
+        let name = format!("a{}", "b".repeat(63)); // 64 chars total, all valid
+        assert_eq!(name.len(), 64);
+        create_or_reactivate_model_alias(&db, &name, "model-x", "first_available", "manual", None)
+            .expect("64-char alias must be accepted");
+    }
+
+    #[test]
+    fn test_alias_id_length_65_chars_err() {
+        let db = create_test_db();
+        let name = format!("a{}", "b".repeat(64)); // 65 chars total
+        assert_eq!(name.len(), 65);
+        let err = create_or_reactivate_model_alias(
+            &db,
+            &name,
+            "model-x",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect_err("65-char alias must be rejected");
+        assert!(format!("{err}").contains("invalid alias id"));
+    }
+
+    #[test]
+    fn test_alias_install_rollback_atomic() {
+        // Simulates `install_manifest_aliases`: batch register two aliases
+        // for a fresh addon, where the second registration fails. Dropping
+        // the tx must roll back BOTH the `model_aliases` insert from the
+        // first call AND every `model_alias_changes` audit row written by
+        // either call. Without the external-tx fix the audit rows for
+        // call #1 would survive (no FK on the audit table) and the next
+        // install would see a duplicate "create" event.
+        let db = create_test_db();
+
+        // Pre-seed an alias owned by `addon-a` so that addon-b's second
+        // alias registration triggers the cross-addon ownership conflict.
+        create_or_reactivate_model_alias(
+            &db,
+            "shared-name",
+            "model-x",
+            "first_available",
+            "addon",
+            Some("addon-a"),
+        )
+        .expect("addon-a seed");
+        let audit_before: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_alias_changes WHERE changed_by_addon_id = 'addon-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(audit_before, 0);
+
+        // Batch install for addon-b: alias-1 succeeds, alias-2 ('shared-name')
+        // conflicts → we drop the tx without commit.
+        {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction().expect("tx");
+            create_or_reactivate_model_alias_within_tx(
+                &tx,
+                "addon-b-first",
+                "model-y",
+                "first_available",
+                "addon",
+                Some("addon-b"),
+            )
+            .expect("first alias must register cleanly");
+
+            let err = create_or_reactivate_model_alias_within_tx(
+                &tx,
+                "shared-name",
+                "model-x",
+                "first_available",
+                "addon",
+                Some("addon-b"),
+            )
+            .expect_err("cross-addon conflict must surface inside tx");
+            assert!(format!("{err}").contains("addon-a"));
+            // tx dropped here without commit → rollback
+        }
+
+        // First alias must not exist (rollback).
+        let leftover_alias: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_aliases WHERE alias = 'addon-b-first'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            leftover_alias, 0,
+            "alias row from the partial batch must roll back"
+        );
+
+        // Audit must not have any addon-b rows — the create event for
+        // alias-1 was rolled back too. This is the critical invariant
+        // the external-tx fix protects.
+        let audit_after: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_alias_changes WHERE changed_by_addon_id = 'addon-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            audit_after, 0,
+            "audit rows from the partial batch must roll back (no FK on model_alias_changes)"
+        );
+    }
+
+    #[test]
+    fn test_alias_id_starts_with_dash_err() {
+        let db = create_test_db();
+        let err = create_or_reactivate_model_alias(
+            &db,
+            "-leading-dash",
+            "model-x",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect_err("leading dash must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must start with lowercase letter"),
+            "error must point to first-char rule, got: {msg}"
+        );
     }
 }
 
@@ -7947,6 +11156,9 @@ mod permission_and_oauth_tests {
             Some("audit-toggle"),
             Some(&details),
             "info",
+            "unclassified",
+            None,
+            None,
             None,
             Some("node-test"),
         )
@@ -9314,7 +12526,6 @@ mod meeting_summary_action_items_tests {
     }
 }
 
-
 // =============================================================================
 // Tests: settings → peer_persisted/peer_hints upgrade migration (PR5)
 // =============================================================================
@@ -9403,5 +12614,1807 @@ mod settings_to_peer_hints_migration_tests {
             .query_row("SELECT COUNT(*) FROM peer_hints", [], |r| r.get(0))
             .unwrap();
         assert_eq!(hints_after, 3, "second run must not create duplicate hints");
+    }
+}
+
+// =============================================================================
+// Camera ingest registry — F1a M1.W6 (TentaVision)
+// =============================================================================
+//
+// Per-addon view over the `cameras` table (migration v21). Ownership guard
+// (`owner_addon_id = ?`) is enforced in every query so a misbehaving addon
+// can never read or mutate another addon's cameras through the host ABI.
+
+/// Row materialized from `cameras` for the camera host functions. Mirrors
+/// the columns persisted by the supervisor sync. `credentials_encrypted`
+/// is populated for RTSP cameras whose connect string carries auth — the
+/// RTSP connector decrypts it on each pipeline build and overlays the
+/// resulting `user:pass` onto `url`.
+#[cfg(feature = "camera")]
+#[derive(Debug, Clone)]
+pub struct CameraRow {
+    pub id: i64,
+    pub camera_id: String,
+    pub owner_addon_id: String,
+    pub display_name: String,
+    pub vendor: String,
+    pub url: String,
+    pub profile: String,
+    pub target_fps: i64,
+    pub resolution_width: Option<i64>,
+    pub resolution_height: Option<i64>,
+    pub retention_class: String,
+    pub status: String,
+    pub status_message: Option<String>,
+    pub fps_actual: Option<f64>,
+    pub last_frame_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub credentials_encrypted: Option<Vec<u8>>,
+    pub onvif_url: Option<String>,
+    pub onvif_profile_token: Option<String>,
+    /// F2 P6.a — true iff the ONVIF discovery step found a non-empty
+    /// metadata configuration on the device. False (the column default) for
+    /// any non-ONVIF camera and for ONVIF cameras whose
+    /// `GetMetadataConfigurations` returned an empty list.
+    pub metadata_supported: bool,
+}
+
+/// Patch payload for `update_camera`. `None` means "do not touch this column".
+/// `vendor` and `url` are deliberately absent — F1a forbids in-place rebinding
+/// of the source (caller must remove + re-add to switch URL or vendor).
+#[cfg(feature = "camera")]
+#[derive(Debug, Default, Clone)]
+pub struct CameraPatch {
+    pub display_name: Option<String>,
+    pub target_fps: Option<i64>,
+    pub resolution_width: Option<Option<i64>>,
+    pub resolution_height: Option<Option<i64>>,
+    pub retention_class: Option<String>,
+    pub profile: Option<String>,
+}
+
+#[cfg(feature = "camera")]
+fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
+    Ok(CameraRow {
+        id: row.get(0)?,
+        camera_id: row.get(1)?,
+        owner_addon_id: row.get(2)?,
+        display_name: row.get(3)?,
+        vendor: row.get(4)?,
+        url: row.get(5)?,
+        profile: row.get(6)?,
+        target_fps: row.get(7)?,
+        resolution_width: row.get(8)?,
+        resolution_height: row.get(9)?,
+        retention_class: row.get(10)?,
+        status: row.get(11)?,
+        status_message: row.get(12)?,
+        fps_actual: row.get(13)?,
+        last_frame_at: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+        credentials_encrypted: row.get(17)?,
+        onvif_url: row.get(18)?,
+        onvif_profile_token: row.get(19)?,
+        metadata_supported: row.get::<_, i64>(20).map(|v| v != 0).unwrap_or(false),
+    })
+}
+
+#[cfg(feature = "camera")]
+const CAMERA_SELECT_COLS: &str =
+    "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
+     resolution_width, resolution_height, retention_class, status, status_message, \
+     fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
+     onvif_url, onvif_profile_token, metadata_supported";
+
+/// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
+/// is started separately; on supervisor failure the caller must
+/// `soft_delete_camera` (or use `delete_camera_hard` for symmetric rollback
+/// before the row is ever exposed). Initial `status` is `'starting'` because
+/// the supervisor `add_camera` path drives the session into Starting before
+/// returning success.
+#[cfg(feature = "camera")]
+#[allow(clippy::too_many_arguments)]
+pub fn insert_camera(
+    pool: &DbPool,
+    camera_id: &str,
+    owner_addon_id: &str,
+    display_name: &str,
+    vendor: &str,
+    url: &str,
+    target_fps: i64,
+    resolution_width: Option<i64>,
+    resolution_height: Option<i64>,
+    retention_class: &str,
+    profile: &str,
+    credentials_encrypted: Option<&[u8]>,
+    onvif_url: Option<&str>,
+    onvif_profile_token: Option<&str>,
+    org_id: Option<&str>,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    // Stamp the row with the addon's owning org so cross-tenant queries
+    // can never bleed cameras from one tenant into another.
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    conn.execute(
+        "INSERT INTO cameras \
+         (camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
+          resolution_width, resolution_height, retention_class, status, status_message, \
+          fps_actual, last_frame_at, credentials_encrypted, onvif_url, onvif_profile_token, \
+          created_at, updated_at, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?14, ?15)",
+        rusqlite::params![
+            camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps,
+            resolution_width, resolution_height, retention_class, credentials_encrypted,
+            onvif_url, onvif_profile_token, now, resolved_org,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Replace the `credentials_encrypted` blob for one camera (per-camera
+/// credentials rotation called by `camera_credentials_rotate_v1`). Ownership
+/// guard means a misbehaving addon cannot rotate another addon's camera.
+/// Passing `None` clears the field (e.g. after the operator removes auth).
+#[cfg(feature = "camera")]
+pub fn set_camera_credentials_encrypted(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    blob: Option<&[u8]>,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let n = conn.execute(
+        "UPDATE cameras SET credentials_encrypted = ?1, updated_at = ?2 \
+         WHERE owner_addon_id = ?3 AND camera_id = ?4 AND org_id = ?5 AND removed_at IS NULL",
+        rusqlite::params![blob, now, addon_id, camera_id, resolved_org],
+    )?;
+    Ok(n > 0)
+}
+
+/// Updates the URL (RTSP) and onvif_profile_token of a camera owned by
+/// `addon_id`. Used by the ONVIF credential rotation path which re-derives
+/// the stream URI from GetStreamUri whenever the password changes — the
+/// device-service URL itself is preserved (it sits in `onvif_url` and is
+/// not touched here). Returns true when a row was updated.
+#[cfg(feature = "camera")]
+pub fn set_camera_onvif_resolved(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    new_rtsp_url: &str,
+    profile_token: Option<&str>,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let n = conn.execute(
+        "UPDATE cameras SET url = ?1, onvif_profile_token = ?2, updated_at = ?3 \
+         WHERE owner_addon_id = ?4 AND camera_id = ?5 AND org_id = ?6 AND removed_at IS NULL",
+        rusqlite::params![
+            new_rtsp_url,
+            profile_token,
+            now,
+            addon_id,
+            camera_id,
+            resolved_org
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+/// F2 P6.a — flip the `metadata_supported` flag on a camera row. Returns
+/// `Ok(true)` if a row was updated, `Ok(false)` if no matching row existed
+/// (foreign owner / soft-deleted / wrong org). Used by the ONVIF discovery
+/// step (and tests) to mark cameras whose `GetMetadataConfigurations` call
+/// returned at least one configuration.
+#[cfg(feature = "camera")]
+pub fn set_camera_metadata_supported(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    supported: bool,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let flag = if supported { 1_i64 } else { 0_i64 };
+    let n = conn.execute(
+        "UPDATE cameras SET metadata_supported = ?1, updated_at = ?2 \
+         WHERE owner_addon_id = ?3 AND camera_id = ?4 AND org_id = ?5 AND removed_at IS NULL",
+        rusqlite::params![flag, now, addon_id, camera_id, resolved_org],
+    )?;
+    Ok(n > 0)
+}
+
+/// Returns `(rowid, blob)` for every camera that currently has an encrypted
+/// credentials blob. Used by the rotate-key CLI to walk and re-encrypt every
+/// row under a single transaction. Includes soft-deleted rows so historical
+/// secrets are also rotated (an attacker stealing the old master key should
+/// not be able to decrypt them either).
+#[cfg(feature = "camera")]
+pub fn list_all_camera_credentials_blobs(pool: &DbPool) -> Result<Vec<(i64, Vec<u8>)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, credentials_encrypted FROM cameras \
+         WHERE credentials_encrypted IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Bulk update of credentials blobs by rowid. Runs inside a single
+/// transaction so a partial rotation cannot leave the table half re-encrypted
+/// with the new master key and half with the old one.
+#[cfg(feature = "camera")]
+pub fn replace_camera_credentials_blobs(
+    pool: &DbPool,
+    updates: &[(i64, Vec<u8>)],
+) -> Result<usize> {
+    let mut conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let tx = conn.transaction()?;
+    let mut n = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE cameras SET credentials_encrypted = ?1, updated_at = ?2 WHERE id = ?3",
+        )?;
+        for (id, blob) in updates {
+            stmt.execute(rusqlite::params![blob, now, id])?;
+            n += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// Hard-delete a row by `camera_id` regardless of `removed_at`. Reserved for
+/// rollback of a failed `insert_camera` before any caller observed the row;
+/// normal removal flows through `soft_delete_camera` (preserves history and
+/// keeps the partial unique index honest).
+#[cfg(feature = "camera")]
+pub fn delete_camera_hard(pool: &DbPool, owner_addon_id: &str, camera_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM cameras WHERE camera_id = ?1 AND owner_addon_id = ?2",
+        rusqlite::params![camera_id, owner_addon_id],
+    )?;
+    Ok(())
+}
+
+/// Boot-time hydration helper: every active camera across all addons and
+/// orgs. Used by `CameraIngestSupervisor` on first `get_or_init_supervisor`
+/// to re-spawn sessions for cameras that survived the previous process
+/// lifecycle. There is no tenant filter — the supervisor is process-wide
+/// and the org boundary is enforced at the host-fn dispatch layer, not at
+/// the pipeline layer.
+#[cfg(feature = "camera")]
+pub fn list_all_active_cameras(pool: &DbPool) -> Result<Vec<CameraRow>> {
+    let conn = acquire(pool)?;
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras \
+         WHERE removed_at IS NULL ORDER BY camera_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], row_to_camera)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Returns every active camera (`removed_at IS NULL`) owned by `addon_id`,
+/// ordered by `camera_id` for stable output. When `org_id` is `Some`, the
+/// query further narrows to rows that belong to the calling tenant — the
+/// F2 P1.c multi-tenant isolation guarantee for the camera surface. A None
+/// org_id is treated as "unknown context" (system / boot starts) and falls
+/// back to the seed `org-default` row so backfilled cameras stay reachable.
+#[cfg(feature = "camera")]
+pub fn list_cameras_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    org_id: Option<&str>,
+) -> Result<Vec<CameraRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras \
+         WHERE owner_addon_id = ?1 AND org_id = ?2 AND removed_at IS NULL \
+         ORDER BY camera_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id, resolved_org], row_to_camera)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Org-scoped existence check used by the user-session frame_url dispatch
+/// (`camera_frame_url_v1`). Returns `Ok(true)` when an active (not removed)
+/// camera row matches BOTH `camera_id` AND `org_id`. A cross-org camera is
+/// reported as missing — the dispatch handler maps `Ok(false)` to
+/// `NotFound` so existence in another tenant is not leaked through error
+/// codes.
+#[cfg(feature = "camera")]
+pub fn camera_exists_in_org(pool: &DbPool, camera_id: &str, org_id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cameras \
+         WHERE camera_id = ?1 AND org_id = ?2 AND removed_at IS NULL",
+        rusqlite::params![camera_id, org_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Returns the active row identified by `camera_id` if owned by `addon_id`
+/// in the supplied org. Cross-org or cross-addon lookups return `Ok(None)`
+/// so the caller surfaces `NotFound` rather than `PermissionDenied` —
+/// avoiding a side-channel leak of camera ids that exist in another tenant.
+#[cfg(feature = "camera")]
+pub fn get_camera_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    org_id: Option<&str>,
+) -> Result<Option<CameraRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras \
+         WHERE owner_addon_id = ?1 AND camera_id = ?2 AND org_id = ?3 AND removed_at IS NULL"
+    );
+    let row = conn
+        .query_row(
+            &sql,
+            rusqlite::params![addon_id, camera_id, resolved_org],
+            row_to_camera,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Applies a partial update. Returns `Ok(false)` if no row matched
+/// `(addon_id, camera_id, removed_at IS NULL)` — the caller maps that to
+/// `AbiError::NotFound`. `Ok(true)` covers both real diffs and idempotent
+/// re-writes (updated_at always bumped).
+#[cfg(feature = "camera")]
+pub fn update_camera(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    patch: &CameraPatch,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    // Build SET clause dynamically. Avoid string concat of values — every
+    // user-supplied piece flows through bind parameters.
+    let mut sets: Vec<&'static str> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(v) = patch.display_name.as_ref() {
+        sets.push("display_name = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.target_fps {
+        sets.push("target_fps = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.resolution_width {
+        sets.push("resolution_width = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.resolution_height {
+        sets.push("resolution_height = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.retention_class.as_ref() {
+        sets.push("retention_class = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.profile.as_ref() {
+        sets.push("profile = ?");
+        params.push(Box::new(v.clone()));
+    }
+    sets.push("updated_at = ?");
+    params.push(Box::new(now));
+    params.push(Box::new(addon_id.to_string()));
+    params.push(Box::new(camera_id.to_string()));
+    params.push(Box::new(resolved_org.to_string()));
+    let sql = format!(
+        "UPDATE cameras SET {} WHERE owner_addon_id = ? AND camera_id = ? AND org_id = ? AND removed_at IS NULL",
+        sets.join(", ")
+    );
+    let bound: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let n = conn.execute(&sql, rusqlite::params_from_iter(bound.into_iter()))?;
+    Ok(n > 0)
+}
+
+/// Soft-deletes the active row by stamping `removed_at`. Returns `Ok(true)`
+/// when a row was matched, `Ok(false)` for "not found / not owned".
+#[cfg(feature = "camera")]
+pub fn soft_delete_camera(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let n = conn.execute(
+        "UPDATE cameras SET removed_at = ?1, updated_at = ?1 \
+         WHERE owner_addon_id = ?2 AND camera_id = ?3 AND org_id = ?4 AND removed_at IS NULL",
+        rusqlite::params![now, addon_id, camera_id, resolved_org],
+    )?;
+    Ok(n > 0)
+}
+
+// =============================================================================
+// Recording registry — F1a M1.W8 (TentaVision)
+// =============================================================================
+//
+// Per-addon view over the `recordings` table (migration v22). Ownership guard
+// (`owner_addon_id = ?`) is enforced in every query. Soft delete is driven by
+// `purged_at` — once stamped, the row hides from active selects but stays
+// present for audit lookups.
+
+#[cfg(feature = "camera")]
+#[derive(Debug, Clone)]
+pub struct RecordingRow {
+    pub id: i64,
+    pub recording_ref: String,
+    pub kind: String,
+    pub owner_addon_id: String,
+    pub camera_id: String,
+    pub file_path: String,
+    pub file_size_bytes: i64,
+    pub duration_ms: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub pixel_format: Option<String>,
+    pub hash_sha256: String,
+    pub retention_class: String,
+    pub created_at: i64,
+    pub purged_at: Option<i64>,
+}
+
+#[cfg(feature = "camera")]
+const RECORDING_SELECT_COLS: &str =
+    "id, ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, duration_ms, \
+     width, height, pixel_format, hash_sha256, retention_class, created_at, purged_at";
+
+#[cfg(feature = "camera")]
+fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
+    Ok(RecordingRow {
+        id: row.get(0)?,
+        recording_ref: row.get(1)?,
+        kind: row.get(2)?,
+        owner_addon_id: row.get(3)?,
+        camera_id: row.get(4)?,
+        file_path: row.get(5)?,
+        file_size_bytes: row.get(6)?,
+        duration_ms: row.get(7)?,
+        width: row.get(8)?,
+        height: row.get(9)?,
+        pixel_format: row.get(10)?,
+        hash_sha256: row.get(11)?,
+        retention_class: row.get(12)?,
+        created_at: row.get(13)?,
+        purged_at: row.get(14)?,
+    })
+}
+
+/// Per-camera breakdown row used by `recording_stats_for_addon`. One row per
+/// `camera_id` with both kinds collapsed.
+#[cfg(feature = "camera")]
+#[derive(Debug, Clone)]
+pub struct RecordingStatsPerCamera {
+    pub camera_id: String,
+    pub snapshots: u64,
+    pub segments: u64,
+    pub size_bytes: u64,
+}
+
+#[cfg(feature = "camera")]
+#[derive(Debug, Default, Clone)]
+pub struct RecordingStatsAggregate {
+    pub per_camera: Vec<RecordingStatsPerCamera>,
+    pub total_snapshots: u64,
+    pub total_segments: u64,
+    pub total_size_bytes: u64,
+}
+
+/// Insert a recording catalog row. The supplied `kind` must be `"snapshot"` or
+/// `"segment"` (the CHECK constraint enforces this at SQL level). Caller is
+/// responsible for placing the file on disk first; on a DB failure the caller
+/// must compensate by `purge_recording(file_path)` to avoid orphaned files.
+#[cfg(feature = "camera")]
+#[allow(clippy::too_many_arguments)]
+pub fn insert_recording(
+    pool: &DbPool,
+    recording_ref: &str,
+    kind: &str,
+    owner_addon_id: &str,
+    camera_id: &str,
+    file_path: &str,
+    file_size_bytes: i64,
+    duration_ms: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    pixel_format: Option<&str>,
+    hash_sha256: &str,
+    retention_class: &str,
+    org_id: Option<&str>,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    // Stamp recording rows with the addon's owning org so cross-tenant
+    // queries cannot bleed catalog entries between organizations.
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    conn.execute(
+        "INSERT INTO recordings \
+         (ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, \
+          duration_ms, width, height, pixel_format, hash_sha256, \
+          retention_class, created_at, purged_at, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14)",
+        rusqlite::params![
+            recording_ref,
+            kind,
+            owner_addon_id,
+            camera_id,
+            file_path,
+            file_size_bytes,
+            duration_ms,
+            width,
+            height,
+            pixel_format,
+            hash_sha256,
+            retention_class,
+            now,
+            resolved_org,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Returns an active (`purged_at IS NULL`) recording row when owned by
+/// `addon_id`. Cross-addon lookups return `Ok(None)` so the caller surfaces
+/// `NotFound` (no side-channel leak of foreign refs).
+#[cfg(feature = "camera")]
+pub fn get_recording_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    recording_ref: &str,
+    org_id: Option<&str>,
+) -> Result<Option<RecordingRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let sql = format!(
+        "SELECT {RECORDING_SELECT_COLS} FROM recordings \
+         WHERE owner_addon_id = ?1 AND ref = ?2 AND org_id = ?3 AND purged_at IS NULL"
+    );
+    let row = conn
+        .query_row(
+            &sql,
+            rusqlite::params![addon_id, recording_ref, resolved_org],
+            row_to_recording,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Look up an active recording row by `ref` alone, without scoping to an
+/// addon. Used by the HTTP handler that serves signed URLs: the HMAC token
+/// has already authenticated the caller, and the ref itself is the
+/// capability — there is no addon identity at the wire level. Cross-addon
+/// scoping is enforced at issuance time by `get_recording_for_addon`.
+#[cfg(feature = "camera")]
+pub fn get_recording_by_ref(pool: &DbPool, recording_ref: &str) -> Result<Option<RecordingRow>> {
+    let conn = acquire(pool)?;
+    let sql = format!(
+        "SELECT {RECORDING_SELECT_COLS} FROM recordings \
+         WHERE ref = ?1 AND purged_at IS NULL"
+    );
+    let row = conn
+        .query_row(&sql, rusqlite::params![recording_ref], row_to_recording)
+        .optional()?;
+    Ok(row)
+}
+
+/// Soft-deletes a recording by stamping `purged_at`. Returns `Ok(true)` when
+/// an active row was found and stamped, `Ok(false)` for "not found / not owned
+/// / already purged" (the host-function layer treats `false` as idempotent OK
+/// when the file is missing).
+#[cfg(feature = "camera")]
+pub fn soft_delete_recording(
+    pool: &DbPool,
+    addon_id: &str,
+    recording_ref: &str,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let n = conn.execute(
+        "UPDATE recordings SET purged_at = ?1 \
+         WHERE owner_addon_id = ?2 AND ref = ?3 AND org_id = ?4 AND purged_at IS NULL",
+        rusqlite::params![now, addon_id, recording_ref, resolved_org],
+    )?;
+    Ok(n > 0)
+}
+
+/// Aggregate stats for an addon's active recordings, optionally narrowed to a
+/// single camera. One row per camera with snapshots/segments collapsed via
+/// `SUM(CASE ...)`; `ORDER BY camera_id` so addon-visible output is stable.
+#[cfg(feature = "camera")]
+pub fn recording_stats_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: Option<&str>,
+    org_id: Option<&str>,
+) -> Result<RecordingStatsAggregate> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let mut out = RecordingStatsAggregate::default();
+    let base_select = "SELECT camera_id, \
+                       SUM(CASE WHEN kind = 'snapshot' THEN 1 ELSE 0 END) AS snapshots, \
+                       SUM(CASE WHEN kind = 'segment' THEN 1 ELSE 0 END) AS segments, \
+                       COALESCE(SUM(file_size_bytes), 0) AS size_bytes \
+                       FROM recordings";
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<RecordingStatsPerCamera> {
+        Ok(RecordingStatsPerCamera {
+            camera_id: r.get::<_, String>(0)?,
+            snapshots: r.get::<_, i64>(1)? as u64,
+            segments: r.get::<_, i64>(2)? as u64,
+            size_bytes: r.get::<_, i64>(3)? as u64,
+        })
+    };
+    let rows: Vec<RecordingStatsPerCamera> = if let Some(cam) = camera_id {
+        let sql = format!(
+            "{base_select} \
+             WHERE owner_addon_id = ?1 AND camera_id = ?2 AND org_id = ?3 AND purged_at IS NULL \
+             GROUP BY camera_id ORDER BY camera_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![addon_id, cam, resolved_org], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    } else {
+        let sql = format!(
+            "{base_select} \
+             WHERE owner_addon_id = ?1 AND org_id = ?2 AND purged_at IS NULL \
+             GROUP BY camera_id ORDER BY camera_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![addon_id, resolved_org], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for r in &rows {
+        out.total_snapshots += r.snapshots;
+        out.total_segments += r.segments;
+        out.total_size_bytes += r.size_bytes;
+    }
+    out.per_camera = rows;
+    Ok(out)
+}
+
+// =============================================================================
+// Trusted publishers (F1c P2, migration v26)
+// =============================================================================
+
+/// Row in `trusted_publishers`. `added_by_user` stays `None` for keys added
+/// via CLI before RBAC lands (F1c P7).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrustedPublisher {
+    pub key_b64: String,
+    pub label: String,
+    pub added_at: String,
+    pub added_by_user: Option<String>,
+    pub contact: Option<String>,
+}
+
+/// Inserts a publisher key into the trust store. Returns the row count
+/// (1 = new entry, 0 = duplicate ignored). Caller should validate the key
+/// format (44-char base64 → 32 raw bytes) before calling — repository does
+/// not re-validate to keep DB layer free of crypto concerns.
+pub fn insert_trusted_publisher(
+    pool: &DbPool,
+    key_b64: &str,
+    label: &str,
+    contact: Option<&str>,
+    added_by_user: Option<&str>,
+) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let added_at = chrono::Utc::now().to_rfc3339();
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO trusted_publishers (key_b64, label, added_at, added_by_user, contact) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![key_b64, label, added_at, added_by_user, contact],
+    )?;
+    Ok(n)
+}
+
+/// Lists all trusted publishers ordered by `label`.
+pub fn list_trusted_publishers(pool: &DbPool) -> Result<Vec<TrustedPublisher>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT key_b64, label, added_at, added_by_user, contact \
+         FROM trusted_publishers ORDER BY label ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(TrustedPublisher {
+                key_b64: r.get(0)?,
+                label: r.get(1)?,
+                added_at: r.get(2)?,
+                added_by_user: r.get(3)?,
+                contact: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Removes a publisher key from the trust store. Returns `true` if a row
+/// was deleted. Removing an already-trusted key does NOT retroactively
+/// uninstall addons signed by it — it only blocks future installs.
+pub fn remove_trusted_publisher(pool: &DbPool, key_b64: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "DELETE FROM trusted_publishers WHERE key_b64 = ?1",
+        rusqlite::params![key_b64],
+    )?;
+    Ok(n > 0)
+}
+
+/// Boolean shortcut used by the signature module during install verify.
+pub fn is_publisher_trusted(pool: &DbPool, key_b64: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM trusted_publishers WHERE key_b64 = ?1",
+        rusqlite::params![key_b64],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+#[cfg(test)]
+mod chunk_c_visibility_consumer_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn make_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("init test db")
+    }
+
+    fn seed_owned_alias(
+        pool: &DbPool,
+        alias_name: &str,
+        owner_addon: &str,
+        visibility: &str,
+        consumers: &[&str],
+    ) -> i64 {
+        let mut conn = pool.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let alias_id = create_or_reactivate_model_alias_within_tx(
+            &tx,
+            alias_name,
+            "service-target",
+            "first_available",
+            "addon",
+            Some(owner_addon),
+        )
+        .expect("create alias");
+        set_alias_visibility_within_tx(&tx, alias_id, visibility, None).expect("vis");
+        for c in consumers {
+            add_alias_consumer_within_tx(&tx, alias_id, c, None).expect("consumer");
+        }
+        tx.commit().expect("commit");
+        alias_id
+    }
+
+    #[test]
+    fn resolver_system_bypass_returns_alias_regardless_of_visibility() {
+        // None = system caller → no gate.
+        let db = make_db();
+        seed_owned_alias(&db, "private-alias", "addon-x", "private", &[]);
+        let row = resolve_model_alias(&db, "private-alias", None).expect("ok");
+        assert!(row.is_some(), "system bypass must always resolve");
+    }
+
+    #[test]
+    fn resolver_owner_addon_always_resolves_private_alias() {
+        let db = make_db();
+        seed_owned_alias(&db, "owner-only", "addon-owner", "private", &[]);
+        let row = resolve_model_alias(&db, "owner-only", Some("addon-owner"))
+            .expect("owner must pass private gate")
+            .expect("alias row");
+        assert_eq!(row.alias, "owner-only");
+    }
+
+    /// Seeds an `addon_uses_alias` row with the given grant_status. Tests
+    /// use this to model a consumer addon that has gone through the
+    /// install/reconcile flow against an already-existing alias.
+    fn seed_uses_alias(pool: &DbPool, addon_id: &str, alias_name: &str, grant_status: &str) {
+        let conn = pool.lock().expect("lock");
+        conn.execute(
+            "INSERT INTO addon_uses_alias \
+                (addon_id, alias_target_name, required, reason, grant_status, \
+                 grant_decided_at, grant_decided_by_user_id, created_at) \
+             VALUES (?1, ?2, 0, 'test', ?3, strftime('%s','now'), NULL, strftime('%s','now'))",
+            rusqlite::params![addon_id, alias_name, grant_status],
+        )
+        .expect("seed addon_uses_alias");
+    }
+
+    #[test]
+    fn resolver_blocks_other_addon_from_private_alias() {
+        let db = make_db();
+        seed_owned_alias(&db, "secret", "addon-owner", "private", &[]);
+        let err = resolve_model_alias(&db, "secret", Some("addon-other"))
+            .expect_err("private must reject foreign addon");
+        let denied = err
+            .downcast::<AliasPermissionDenied>()
+            .expect("AliasPermissionDenied");
+        assert_eq!(denied.reason, "private_not_owner");
+        assert_eq!(denied.alias, "secret");
+        assert_eq!(denied.caller_addon_id, "addon-other");
+    }
+
+    #[test]
+    fn resolver_public_alias_without_uses_alias_is_denied() {
+        // Issue #1: public visibility alone is not enough — non-owner needs
+        // an explicit addon_uses_alias declaration with granted/auto_granted.
+        let db = make_db();
+        seed_owned_alias(&db, "public-feed", "addon-owner", "public", &[]);
+        let err = resolve_model_alias(&db, "public-feed", Some("third-party"))
+            .expect_err("public without uses_alias must reject");
+        let denied = err.downcast::<AliasPermissionDenied>().expect("denied");
+        assert_eq!(denied.reason, "public_no_uses");
+    }
+
+    #[test]
+    fn resolver_public_alias_with_auto_granted_uses_alias_passes() {
+        let db = make_db();
+        seed_owned_alias(&db, "public-feed", "addon-owner", "public", &[]);
+        seed_uses_alias(&db, "third-party", "public-feed", "auto_granted");
+        let row = resolve_model_alias(&db, "public-feed", Some("third-party"))
+            .expect("public + auto_granted uses_alias must allow")
+            .expect("alias row");
+        assert_eq!(row.alias, "public-feed");
+    }
+
+    #[test]
+    fn resolver_restricted_alias_with_consumers_but_no_uses_alias_is_denied() {
+        // Issue #1: consumer whitelist alone is not enough — restricted
+        // still needs addon_uses_alias granted.
+        let db = make_db();
+        seed_owned_alias(
+            &db,
+            "shared-only",
+            "addon-owner",
+            "restricted",
+            &["addon-friend"],
+        );
+        let err = resolve_model_alias(&db, "shared-only", Some("addon-friend"))
+            .expect_err("whitelist alone is not enough");
+        let denied = err.downcast::<AliasPermissionDenied>().expect("denied");
+        assert_eq!(denied.reason, "restricted_no_uses");
+    }
+
+    #[test]
+    fn resolver_restricted_alias_with_uses_alias_but_no_consumer_is_denied() {
+        // Issue #1: addon_uses_alias granted alone is not enough — restricted
+        // still needs the consumer whitelist.
+        let db = make_db();
+        seed_owned_alias(
+            &db,
+            "shared-only",
+            "addon-owner",
+            "restricted",
+            &["other-addon"],
+        );
+        seed_uses_alias(&db, "addon-stranger", "shared-only", "granted");
+        let err = resolve_model_alias(&db, "shared-only", Some("addon-stranger"))
+            .expect_err("uses_alias alone is not enough");
+        let denied = err.downcast::<AliasPermissionDenied>().expect("denied");
+        assert_eq!(denied.reason, "restricted_no_consumer");
+    }
+
+    #[test]
+    fn resolver_restricted_alias_with_consumer_and_uses_alias_passes() {
+        let db = make_db();
+        seed_owned_alias(
+            &db,
+            "shared-only",
+            "addon-owner",
+            "restricted",
+            &["addon-friend"],
+        );
+        seed_uses_alias(&db, "addon-friend", "shared-only", "granted");
+        let row = resolve_model_alias(&db, "shared-only", Some("addon-friend"))
+            .expect("consumer + uses_alias must pass")
+            .expect("alias row");
+        assert_eq!(row.alias, "shared-only");
+    }
+
+    #[test]
+    fn resolver_denial_writes_alias_calls_and_audit_log() {
+        // Issue #3: every denial must leave a record. We use
+        // `resolve_model_alias_for_addon` so method/request_id are attached.
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "denied-feed", "addon-owner", "private", &[]);
+        let err = resolve_model_alias_for_addon(
+            &db,
+            "denied-feed",
+            Some("addon-bad"),
+            Some("chat.completion"),
+            Some("req-xyz"),
+        )
+        .expect_err("denial");
+        let _ = err.downcast::<AliasPermissionDenied>().expect("denied");
+
+        let conn = db.lock().expect("lock");
+        let (caller, method, request_id, result, error_code): (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT caller_addon_id, method, request_id, result, error_code \
+                 FROM alias_calls WHERE alias_id = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("alias_calls row");
+        assert_eq!(caller, "addon-bad");
+        assert_eq!(method.as_deref(), Some("chat.completion"));
+        assert_eq!(request_id.as_deref(), Some("req-xyz"));
+        assert_eq!(result, "permission_denied");
+        assert_eq!(error_code.as_deref(), Some("private_not_owner"));
+
+        let (risk, action, audit_result): (String, String, String) = conn
+            .query_row(
+                "SELECT risk_class, action, result FROM audit_log \
+                 WHERE action = 'alias_resolve_denied' AND resource_id = 'denied-feed' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("audit_log row");
+        assert_eq!(risk, "A");
+        assert_eq!(action, "alias_resolve_denied");
+        assert_eq!(audit_result, "denied");
+    }
+
+    #[test]
+    fn reinstall_drops_obsolete_manifest_consumers() {
+        // Issue #4: revoke_obsolete_manifest_consumers_within_tx must
+        // remove manifest-granted rows that vanished from `keep`, while
+        // preserving admin-granted (granted_by_user_id IS NOT NULL) rows.
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &["b", "c"]);
+        {
+            // Admin grant for "d" — must survive.
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO model_alias_consumers \
+                    (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
+                 VALUES (?1, 'd', 99, strftime('%s','now'), NULL)",
+                rusqlite::params![alias_id],
+            )
+            .unwrap();
+        }
+        let revoked = {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            let revoked =
+                revoke_obsolete_manifest_consumers_within_tx(&tx, alias_id, &["b".to_string()])
+                    .expect("revoke");
+            tx.commit().expect("commit");
+            revoked
+        };
+        assert_eq!(revoked, vec!["c".to_string()]);
+
+        let conn = db.lock().expect("lock");
+        let remaining: Vec<String> = conn
+            .prepare("SELECT consumer_addon_id FROM model_alias_consumers WHERE alias_id = ?1 ORDER BY consumer_addon_id")
+            .unwrap()
+            .query_map(rusqlite::params![alias_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["b".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn uses_alias_pending_when_owner_not_installed_yet() {
+        let db = make_db();
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let status = upsert_uses_alias_within_tx(
+            &tx,
+            "consumer-x",
+            "future-alias",
+            true,
+            "needed for analytics",
+        )
+        .expect("upsert");
+        assert_eq!(status, "pending");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn reconcile_flips_pending_to_auto_granted_on_public_install() {
+        // Consumer registers uses_alias before owner; then owner installs
+        // alias as `public`; reconciliation flips the row to auto_granted.
+        let db = make_db();
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            let status =
+                upsert_uses_alias_within_tx(&tx, "consumer-y", "later-alias", false, "telemetry")
+                    .expect("upsert pending");
+            assert_eq!(status, "pending");
+            tx.commit().expect("commit");
+        }
+
+        // Owner addon installs the alias with visibility=public.
+        seed_owned_alias(&db, "later-alias", "addon-owner", "public", &[]);
+
+        // Reconcile.
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            let transitions =
+                reconcile_uses_alias_for_alias_within_tx(&tx, "later-alias").expect("reconcile");
+            assert_eq!(transitions.len(), 1);
+            let (consumer, before, after) = &transitions[0];
+            assert_eq!(consumer, "consumer-y");
+            assert_eq!(before, "pending");
+            assert_eq!(after, "auto_granted");
+            audit_reconcile_uses_alias_within_tx(&tx, consumer, "later-alias", before, after)
+                .expect("audit");
+            tx.commit().expect("commit");
+        }
+
+        // Audit row exists with risk_class=A and result=reconciled.
+        let conn = db.lock().expect("lock");
+        let (risk, result): (String, String) = conn
+            .query_row(
+                "SELECT risk_class, result FROM audit_log \
+                  WHERE action = 'uses_alias.reconcile' \
+                    AND resource_id = 'later-alias' \
+                    AND addon_id = 'consumer-y'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("audit row present");
+        assert_eq!(risk, "A");
+        assert_eq!(result, "reconciled");
+    }
+
+    #[test]
+    fn reconcile_flips_pending_to_denied_on_private_install() {
+        let db = make_db();
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            upsert_uses_alias_within_tx(&tx, "consumer-z", "guarded", false, "ad-hoc")
+                .expect("upsert");
+            tx.commit().expect("commit");
+        }
+        seed_owned_alias(&db, "guarded", "addon-owner", "private", &[]);
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let transitions =
+            reconcile_uses_alias_for_alias_within_tx(&tx, "guarded").expect("reconcile");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].2, "denied");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn reconcile_restricted_grants_only_whitelisted_consumer() {
+        let db = make_db();
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            upsert_uses_alias_within_tx(&tx, "addon-friend", "shared", false, "ok").expect("a");
+            upsert_uses_alias_within_tx(&tx, "addon-stranger", "shared", false, "ok").expect("b");
+            tx.commit().expect("commit");
+        }
+        seed_owned_alias(
+            &db,
+            "shared",
+            "addon-owner",
+            "restricted",
+            &["addon-friend"],
+        );
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let transitions =
+            reconcile_uses_alias_for_alias_within_tx(&tx, "shared").expect("reconcile");
+        // Only the whitelisted consumer transitions (pending → granted);
+        // the stranger stays pending so the reconciler returns no row for it.
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].0, "addon-friend");
+        assert_eq!(transitions[0].2, "granted");
+        // And the stranger row is still pending in the DB.
+        let stranger_status: String = tx
+            .query_row(
+                "SELECT grant_status FROM addon_uses_alias \
+                  WHERE addon_id = 'addon-stranger' AND alias_target_name = 'shared'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("stranger row");
+        assert_eq!(stranger_status, "pending");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn uses_model_pending_for_unknown_model_default_restricted() {
+        let db = make_db();
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let status =
+            upsert_uses_model_within_tx(&tx, "addon-x", "yolo-v8", false, "vision pipeline")
+                .expect("upsert");
+        // No row in model_visibility → defaults to restricted, no consumer grant
+        // present → pending.
+        assert_eq!(status, "pending");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn uses_model_public_visibility_auto_grants() {
+        let db = make_db();
+        {
+            let mut conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO model_visibility (model_id, visibility, updated_at) \
+                 VALUES (?1, 'public', strftime('%s','now'))",
+                rusqlite::params!["llama-3"],
+            )
+            .expect("seed");
+        }
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let status =
+            upsert_uses_model_within_tx(&tx, "addon-x", "llama-3", false, "chat").expect("upsert");
+        assert_eq!(status, "auto_granted");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn migrations_chunk_c_are_idempotent() {
+        // Schema migrate runs at init(); a second call to `migrations::run`
+        // on the same connection must be a no-op (every Chunk C migration
+        // is keyed in `_migrations`).
+        let db = make_db();
+        let conn = db.lock().expect("lock");
+        crate::db::migrations::run(&conn).expect("second run must not error");
+        let (visibility, consumers, uses_alias, uses_model): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                    (SELECT COUNT(*) FROM _migrations WHERE name = 'model_alias_visibility'), \
+                    (SELECT COUNT(*) FROM _migrations WHERE name = 'model_alias_consumers'), \
+                    (SELECT COUNT(*) FROM _migrations WHERE name = 'addon_uses_alias'), \
+                    (SELECT COUNT(*) FROM _migrations WHERE name = 'addon_uses_model')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("counts");
+        assert_eq!(visibility, 1, "visibility migration applied exactly once");
+        assert_eq!(consumers, 1);
+        assert_eq!(uses_alias, 1);
+        assert_eq!(uses_model, 1);
+    }
+
+    /// Helper: returns (granted_by_user_id, granted_at, revoked_at) for a
+    /// consumer row, asserting the row exists.
+    fn consumer_row(
+        pool: &DbPool,
+        alias_id: i64,
+        consumer: &str,
+    ) -> (Option<i64>, i64, Option<i64>) {
+        let conn = pool.lock().expect("lock");
+        conn.query_row(
+            "SELECT granted_by_user_id, granted_at, revoked_at \
+             FROM model_alias_consumers \
+             WHERE alias_id = ?1 AND consumer_addon_id = ?2",
+            rusqlite::params![alias_id, consumer],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("consumer row exists")
+    }
+
+    #[test]
+    fn admin_grant_preserved_through_manifest_reinstall() {
+        // Admin manually grants consumer B; a subsequent manifest reinstall
+        // that re-asserts B in allowed_consumers must NOT demote the admin
+        // grant to a manifest grant (granted_by_user_id must stay 42).
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            // Simulate admin grant via the same helper, with explicit user id.
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", Some(42)).expect("admin grant");
+            tx.commit().expect("commit");
+        }
+        let (initial_user, initial_at, _) = consumer_row(&db, alias_id, "addon-b");
+        assert_eq!(initial_user, Some(42));
+
+        // Manifest reinstall path: granted_by_user_id = None for the same
+        // (alias_id, consumer) pair.
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
+                .expect("manifest reassert");
+            tx.commit().expect("commit");
+        }
+        let (user_after, at_after, revoked_after) = consumer_row(&db, alias_id, "addon-b");
+        assert_eq!(
+            user_after,
+            Some(42),
+            "admin grant must NOT be demoted to NULL by manifest reinstall"
+        );
+        assert_eq!(
+            at_after, initial_at,
+            "granted_at must preserve admin timestamp"
+        );
+        assert!(revoked_after.is_none(), "row stays active");
+
+        // Reinstall with B dropped from allowed_consumers must keep the
+        // admin row (revoke_obsolete only deletes granted_by_user_id IS NULL).
+        let revoked = {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            let revoked =
+                revoke_obsolete_manifest_consumers_within_tx(&tx, alias_id, &[]).expect("revoke");
+            tx.commit().expect("commit");
+            revoked
+        };
+        assert!(
+            revoked.is_empty(),
+            "admin-granted row must not be returned for revocation"
+        );
+        let (user_final, _, revoked_final) = consumer_row(&db, alias_id, "addon-b");
+        assert_eq!(user_final, Some(42));
+        assert!(revoked_final.is_none());
+    }
+
+    #[test]
+    fn manifest_reinstall_does_not_revive_admin_revoked() {
+        // Admin grants then revokes consumer B (granted_by_user_id=42,
+        // revoked_at NOT NULL). A manifest reinstall that re-asserts B in
+        // allowed_consumers must NOT clear revoked_at — admin revoke is final.
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
+        let original_revoked_at: i64 = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO model_alias_consumers \
+                    (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
+                 VALUES (?1, 'addon-b', 42, strftime('%s','now') - 100, strftime('%s','now'))",
+                rusqlite::params![alias_id],
+            )
+            .expect("seed admin-revoked");
+            conn.query_row(
+                "SELECT revoked_at FROM model_alias_consumers \
+                 WHERE alias_id = ?1 AND consumer_addon_id = 'addon-b'",
+                rusqlite::params![alias_id],
+                |r| r.get(0),
+            )
+            .expect("read revoked_at")
+        };
+
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
+                .expect("manifest reassert");
+            tx.commit().expect("commit");
+        }
+
+        let (user_after, _, revoked_after) = consumer_row(&db, alias_id, "addon-b");
+        assert_eq!(user_after, Some(42), "admin user id preserved");
+        assert_eq!(
+            revoked_after,
+            Some(original_revoked_at),
+            "admin revoke must not be cleared by manifest reinstall"
+        );
+    }
+
+    #[test]
+    fn manifest_granted_row_reactivates_after_revoke() {
+        // Pure manifest grant (granted_by_user_id IS NULL) that has been
+        // revoked must be reactivated by a subsequent manifest reinstall
+        // (revoked_at cleared).
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
+        // Initial manifest grant.
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None).expect("manifest grant");
+            tx.commit().expect("commit");
+        }
+        // Mark it revoked (simulates an out-of-band revoke path; the manifest
+        // grant has no admin user_id so reactivation should be allowed).
+        {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "UPDATE model_alias_consumers SET revoked_at = strftime('%s','now') \
+                 WHERE alias_id = ?1 AND consumer_addon_id = 'addon-b'",
+                rusqlite::params![alias_id],
+            )
+            .expect("mark revoked");
+        }
+        let (user_before, _, revoked_before) = consumer_row(&db, alias_id, "addon-b");
+        assert!(user_before.is_none());
+        assert!(revoked_before.is_some());
+
+        // Manifest reinstall must clear revoked_at.
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
+                .expect("manifest reassert");
+            tx.commit().expect("commit");
+        }
+        let (user_after, _, revoked_after) = consumer_row(&db, alias_id, "addon-b");
+        assert!(user_after.is_none(), "still a manifest grant");
+        assert!(
+            revoked_after.is_none(),
+            "manifest reinstall reactivates a manifest-revoked row"
+        );
+    }
+
+    #[test]
+    fn sync_identity_registry_maps_node_to_user() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('jan', 'hash', 'Jan', 'jan@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+
+        upsert_sync_node_identity(
+            &db,
+            "node-a",
+            "pub-a",
+            "ed25519",
+            "Laptop Jana",
+            "laptop",
+            "trusted",
+            Some(user_id),
+            "standard",
+        )
+        .expect("upsert node");
+        assign_node_to_user(&db, "node-a", user_id, "primary", Some(user_id)).expect("assign node");
+
+        let nodes = list_sync_nodes_for_user(&db, user_id).expect("list nodes");
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, "node-a");
+        assert_eq!(nodes[0].owner_user_id, Some(user_id));
+    }
+
+    #[test]
+    fn user_identity_key_revoke_removes_key_from_active_list() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('ewa', 'hash', 'Ewa', 'ewa@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+
+        upsert_user_identity_key(&db, "key-1", user_id, "ed25519", "pub-user", "sync")
+            .expect("insert key");
+        revoke_user_identity_key(&db, "key-1").expect("revoke key");
+
+        let keys = list_active_user_identity_keys(&db, user_id).expect("list keys");
+
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn sync_permission_allows_owner_and_denies_unrelated_user() {
+        let db = make_db();
+        let (owner_id, other_id) = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('owner', 'hash', 'Owner', 'owner@example.com')",
+                [],
+            )
+            .expect("insert owner");
+            let owner_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('other', 'hash', 'Other', 'other@example.com')",
+                [],
+            )
+            .expect("insert other");
+            (owner_id, conn.last_insert_rowid())
+        };
+        upsert_sync_resource_acl(
+            &db,
+            "org-default",
+            "contacts",
+            "person",
+            "person-1",
+            Some(owner_id),
+            None,
+            None,
+            None,
+            "own",
+        )
+        .expect("acl");
+
+        let owner = can_user_access_sync_resource(
+            &db,
+            owner_id,
+            "org-default",
+            "contacts",
+            "person",
+            "person-1",
+            "read",
+        )
+        .expect("owner access");
+        let other = can_user_access_sync_resource(
+            &db,
+            other_id,
+            "org-default",
+            "contacts",
+            "person",
+            "person-1",
+            "read",
+        )
+        .expect("other access");
+
+        assert!(owner.allowed);
+        assert!(!other.allowed);
+    }
+
+    #[test]
+    fn sync_permission_explicit_share_can_be_revoked() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('shared', 'hash', 'Shared', 'shared@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+        upsert_sync_resource_acl(
+            &db,
+            "org-default",
+            "contacts",
+            "company",
+            "company-1",
+            None,
+            None,
+            None,
+            None,
+            "explicit_share",
+        )
+        .expect("acl");
+        grant_sync_explicit_share(
+            &db,
+            "org-default",
+            "contacts",
+            "company",
+            "company-1",
+            "user",
+            &user_id.to_string(),
+            "read",
+            None,
+        )
+        .expect("share");
+        revoke_sync_explicit_share(
+            &db,
+            "org-default",
+            "contacts",
+            "company",
+            "company-1",
+            "user",
+            &user_id.to_string(),
+            "read",
+        )
+        .expect("revoke");
+
+        let decision = can_user_access_sync_resource(
+            &db,
+            user_id,
+            "org-default",
+            "contacts",
+            "company",
+            "company-1",
+            "read",
+        )
+        .expect("decision");
+
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn sync_permission_node_receives_resource_for_assigned_user() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('node-user', 'hash', 'Node User', 'node-user@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+        upsert_sync_node_identity(
+            &db,
+            "node-sync",
+            "pub-node",
+            "ed25519",
+            "Phone",
+            "phone",
+            "trusted",
+            Some(user_id),
+            "standard",
+        )
+        .expect("node");
+        assign_node_to_user(&db, "node-sync", user_id, "primary", None).expect("assign");
+        upsert_sync_resource_acl(
+            &db,
+            "org-default",
+            "contacts",
+            "person",
+            "person-2",
+            None,
+            Some(user_id),
+            None,
+            None,
+            "assigned",
+        )
+        .expect("acl");
+
+        let decision = can_node_receive_sync_resource(
+            &db,
+            "node-sync",
+            "org-default",
+            "contacts",
+            "person",
+            "person-2",
+        )
+        .expect("decision");
+
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn sync_permission_authority_node_can_receive_without_user_assignment() {
+        let db = make_db();
+        upsert_sync_node_identity(
+            &db,
+            "node-authority",
+            "pub-node",
+            "ed25519",
+            "Server",
+            "authority",
+            "trusted",
+            None,
+            "authority",
+        )
+        .expect("node");
+
+        let decision = can_node_receive_sync_resource(
+            &db,
+            "node-authority",
+            "org-default",
+            "contacts",
+            "person",
+            "person-3",
+        )
+        .expect("decision");
+
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn sync_policy_local_only_produces_no_targets() {
+        let db = make_db();
+        upsert_sync_policy(
+            &db,
+            "policy-local",
+            "org-default",
+            "contacts",
+            Some("person"),
+            None,
+            "local_only",
+            None,
+            None,
+            true,
+        )
+        .expect("policy");
+
+        let targets =
+            list_sync_targets_for_resource(&db, "org-default", "contacts", "person", "person-1")
+                .expect("targets");
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn sync_policy_replicated_by_permission_returns_allowed_node() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('sync-target', 'hash', 'Sync Target', 'sync-target@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+        upsert_sync_node_identity(
+            &db,
+            "node-target",
+            "pub-node",
+            "ed25519",
+            "Laptop",
+            "laptop",
+            "trusted",
+            Some(user_id),
+            "standard",
+        )
+        .expect("node");
+        assign_node_to_user(&db, "node-target", user_id, "primary", None).expect("assign");
+        upsert_sync_resource_acl(
+            &db,
+            "org-default",
+            "contacts",
+            "person",
+            "person-4",
+            None,
+            Some(user_id),
+            None,
+            None,
+            "assigned",
+        )
+        .expect("acl");
+        upsert_sync_policy(
+            &db,
+            "policy-repl",
+            "org-default",
+            "contacts",
+            Some("person"),
+            None,
+            "replicated_by_permission",
+            None,
+            None,
+            true,
+        )
+        .expect("policy");
+
+        let targets =
+            list_sync_targets_for_resource(&db, "org-default", "contacts", "person", "person-4")
+                .expect("targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].node_id, "node-target");
+    }
+
+    #[test]
+    fn sync_policy_resource_override_wins_over_type_policy() {
+        let db = make_db();
+        upsert_sync_policy(
+            &db,
+            "policy-type",
+            "org-default",
+            "contacts",
+            Some("person"),
+            None,
+            "replicated_by_permission",
+            None,
+            None,
+            true,
+        )
+        .expect("type policy");
+        upsert_sync_policy(
+            &db,
+            "policy-resource",
+            "org-default",
+            "contacts",
+            Some("person"),
+            Some("person-private"),
+            "local_only",
+            None,
+            None,
+            true,
+        )
+        .expect("resource policy");
+
+        let policy =
+            get_effective_sync_policy(&db, "org-default", "contacts", "person", "person-private")
+                .expect("policy")
+                .expect("effective policy");
+
+        assert_eq!(policy.policy_id, "policy-resource");
+        assert_eq!(policy.mode, SyncPolicyMode::LocalOnly);
+    }
+
+    #[test]
+    fn sync_policy_authority_write_targets_authority_node() {
+        let db = make_db();
+        upsert_sync_node_identity(
+            &db,
+            "node-authority-write",
+            "pub-node",
+            "ed25519",
+            "Authority",
+            "authority",
+            "trusted",
+            None,
+            "authority",
+        )
+        .expect("node");
+        upsert_sync_policy(
+            &db,
+            "policy-authority",
+            "org-default",
+            "contacts",
+            Some("activity"),
+            None,
+            "authority_write",
+            Some("node-authority-write"),
+            None,
+            true,
+        )
+        .expect("policy");
+
+        let targets = list_sync_targets_for_resource(
+            &db,
+            "org-default",
+            "contacts",
+            "activity",
+            "activity-1",
+        )
+        .expect("targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].node_id, "node-authority-write");
     }
 }

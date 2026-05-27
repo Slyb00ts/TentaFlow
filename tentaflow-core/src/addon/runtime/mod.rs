@@ -1,8 +1,14 @@
 // =============================================================================
-// Plik: addon/runtime.rs
-// Opis: Abstrakcja runtime WASM — wasmtime na Desktop/Router, wasmi na Mobile.
-//       Re-eksportuje typy i funkcje z odpowiedniego backendu.
+// File: addon/runtime/mod.rs
+// WASM runtime abstraction — wasmtime on Desktop/Router, wasmi on Mobile.
+// Re-exports types and functions from the active backend plus language adapters.
 // =============================================================================
+
+pub mod language_adapter;
+pub use language_adapter::{
+    adapter_for_runtime, DotnetAdapter, LanguageAdapter, PythonAdapter, RustAdapter,
+    KNOWN_RUNTIMES,
+};
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod runtime_wasmtime;

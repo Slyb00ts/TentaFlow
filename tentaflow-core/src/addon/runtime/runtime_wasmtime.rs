@@ -59,6 +59,22 @@ pub fn create_engine() -> Result<WasmEngine> {
     config.memory_reservation(DEFAULT_MEMORY_LIMIT_BYTES as u64);
     config.memory_reservation_for_growth(0);
 
+    // WASM stack — wasmtime default = 512 KB. Za malo dla addonow ktore
+    // buduja glebokie drzewa `serde_json::Value` (kazdy zagniezdzony Object
+    // dodaje stack frame). Zaobserwowane trap'y w TentaVision::on_start gdy
+    // pre-renderowane 11 paneli (kazdy z Card→Stack→Grid→Card→...).
+    //
+    // Wasmtime wymaga `max_wasm_stack <= async_stack_size`. Default
+    // async_stack_size = 2 MB, wiec ustawiamy oba: async = 8 MB (gosc rust
+    // dostaje pelen budget), max_wasm = 6 MB (zostawiamy 2 MB margines na
+    // ramki async runtime'u). Jesli kiedys addony beda potrzebowac wiecej,
+    // podbij oba symetrycznie.
+    // Wasmtime 44 validates max_wasm_stack <= async_stack_size on Engine
+    // creation. Both calls must succeed (panic if feature missing).
+    config.async_stack_size(16 * 1024 * 1024);
+    config.max_wasm_stack(4 * 1024 * 1024);
+    info!("stack config: async_stack=16MB, max_wasm_stack=4MB");
+
     let engine = WasmEngine::new(&config)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc silnika Wasmtime: {e}"))?;
 
@@ -89,20 +105,29 @@ pub fn compile_module(engine: &WasmEngine, wasm_bytes: &[u8]) -> Result<WasmModu
 // Tworzenie Store z limiterami
 // =============================================================================
 
-/// Tworzy nowy Store z limitem paliwa i limiterem pamieci
+/// Tworzy nowy Store z limitem paliwa i limiterem pamieci.
+/// Epoch deadline domyslnie `u64::MAX` — store nigdy nie wytrapuje przez
+/// global increment_epoch. Per-call (invoke_block, call_tick_static) ustawia
+/// unikalny N przed wywolaniem WASM i watchdog inkrementuje counter do tego
+/// konkretnego N. Po call deadline jest przywracany na u64::MAX, dzieki czemu
+/// dlugo zyjace instancje (start_addon → on_event handler) nie sa trapowane
+/// gdy inny addon ma odpalony watchdog.
 pub fn create_store(engine: &WasmEngine, state: AddonState) -> Result<WasmStore<AddonState>> {
     let mut store = WasmStore::new(engine, state);
 
-    // Ustaw poczatkowe paliwo — addon zuzywa paliwo z kazdej instrukcji WASM
     store
         .set_fuel(DEFAULT_FUEL_LIMIT)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie ustawic paliwa: {e}"))?;
 
-    // Ustaw epoch deadline — pozwala na przerywanie z innego watku
-    store.epoch_deadline_async_yield_and_update(1);
+    // UWAGA: set_epoch_deadline przyjmuje DELTA od current_epoch (wasmtime
+    // wewnetrznie robi `current_epoch + delta`). Wartosc u64::MAX powoduje
+    // overflow (panic). Uzywamy u64::MAX / 4 — bezpieczna delta ktora nigdy
+    // nie zostanie osiagnieta przez normalne incrementy, ale tez nie
+    // przepelnia gdy wasmtime dodaje do current_epoch.
+    store.set_epoch_deadline(u64::MAX / 4);
 
     info!(
-        "Store Wasmtime utworzony (fuel={}, memory_limit={}MB)",
+        "Store Wasmtime utworzony (fuel={}, memory_limit={}MB, epoch_delta=u64::MAX/4)",
         DEFAULT_FUEL_LIMIT,
         DEFAULT_MEMORY_LIMIT_BYTES / (1024 * 1024)
     );

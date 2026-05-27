@@ -281,6 +281,8 @@ mod tests {
             weight,
             model_name_override: None,
             extra_config: HashMap::new(),
+            progress_message: None,
+            health_last_err: None,
         }
     }
 
@@ -477,8 +479,7 @@ mod tests {
     #[test]
     fn ensure_local_embedded_rejects_non_embedded() {
         let mut svc = fixture_entry(Transport::HttpDirect, 100);
-        svc.extra_config
-            .insert("api_key".into(), "sk-test".into());
+        svc.extra_config.insert("api_key".into(), "sk-test".into());
         let backend = entry_to_service_backend(&svc).unwrap();
         let client = BackendClient::new(backend, None).expect("client");
         let h = BackendHandle::Http(Arc::new(client));
@@ -489,8 +490,7 @@ mod tests {
     #[test]
     fn resolve_http_client_returns_arc_for_http_handle() {
         let mut svc = fixture_entry(Transport::HttpDirect, 100);
-        svc.extra_config
-            .insert("api_key".into(), "sk-test".into());
+        svc.extra_config.insert("api_key".into(), "sk-test".into());
         let backend = entry_to_service_backend(&svc).unwrap();
         let client = BackendClient::new(backend, None).expect("client");
         let h = BackendHandle::Http(Arc::new(client));
@@ -515,9 +515,7 @@ mod tests {
             skip_tls_verify: true,
             direct_addrs: Vec::new(),
         };
-        let qh = Arc::new(crate::services::runtime::quic_handle::QuicServiceHandle::new(
-            qcfg,
-        ));
+        let qh = Arc::new(crate::services::runtime::quic_handle::QuicServiceHandle::new(qcfg));
         let h = BackendHandle::Quic(qh);
         match resolve_http_client(&h, "test") {
             Err(TransportClientError::UnsupportedTransport(_)) => {}
@@ -543,9 +541,7 @@ mod tests {
             skip_tls_verify: true,
             direct_addrs: Vec::new(),
         };
-        let qh = Arc::new(crate::services::runtime::quic_handle::QuicServiceHandle::new(
-            qcfg,
-        ));
+        let qh = Arc::new(crate::services::runtime::quic_handle::QuicServiceHandle::new(qcfg));
         let h = BackendHandle::Quic(qh);
         match resolve_quic_client(&h, "test-model").await {
             Err(TransportClientError::QuicNotConnected(ref m)) if m == "test-model" => {}

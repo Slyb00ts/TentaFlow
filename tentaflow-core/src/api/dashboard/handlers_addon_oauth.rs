@@ -80,6 +80,9 @@ fn audit(
         Some(resource_id),
         Some(&details),
         severity,
+        "unclassified",
+        None,
+        None,
         None,
         Some(node_id),
     ) {
@@ -881,8 +884,10 @@ mod tests {
                 role: Some("user".to_string()),
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: AppState::for_test(),
+            org_context: None,
         };
         let body =
             MessageBody::AddonOAuthTestConnectionRequestBody(AddonOAuthTestConnectionRequest {
@@ -907,8 +912,10 @@ mod tests {
                 role: Some("admin".to_string()),
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: AppState::for_test(),
+            org_context: None,
         };
         let body =
             MessageBody::AddonOAuthTestConnectionRequestBody(AddonOAuthTestConnectionRequest {

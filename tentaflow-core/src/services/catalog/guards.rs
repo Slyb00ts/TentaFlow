@@ -47,17 +47,22 @@ pub fn check_alias_collision(
         return Err(GuardError::Empty);
     }
 
-    let aliases = repository::list_model_aliases(pool)
-        .map_err(|_| GuardError::AliasVsAlias { name: trimmed.to_string() })?;
+    let aliases = repository::list_model_aliases(pool).map_err(|_| GuardError::AliasVsAlias {
+        name: trimmed.to_string(),
+    })?;
     if aliases
         .iter()
         .any(|a| a.alias == trimmed && Some(a.id) != excluding_alias_id)
     {
-        return Err(GuardError::AliasVsAlias { name: trimmed.to_string() });
+        return Err(GuardError::AliasVsAlias {
+            name: trimmed.to_string(),
+        });
     }
 
     if published_flow_name_exists(pool, trimmed)? {
-        return Err(GuardError::AliasVsFlow { name: trimmed.to_string() });
+        return Err(GuardError::AliasVsFlow {
+            name: trimmed.to_string(),
+        });
     }
     Ok(())
 }
@@ -75,16 +80,21 @@ pub fn check_flow_publish_collision(
         return Err(GuardError::Empty);
     }
 
-    let aliases = repository::list_model_aliases(pool)
-        .map_err(|_| GuardError::FlowVsAlias { name: trimmed.to_string() })?;
+    let aliases = repository::list_model_aliases(pool).map_err(|_| GuardError::FlowVsAlias {
+        name: trimmed.to_string(),
+    })?;
     if aliases.iter().any(|a| a.is_active && a.alias == trimmed) {
-        return Err(GuardError::FlowVsAlias { name: trimmed.to_string() });
+        return Err(GuardError::FlowVsAlias {
+            name: trimmed.to_string(),
+        });
     }
 
     let conflicting = published_flow_owner(pool, trimmed)?;
     if let Some(other_id) = conflicting {
         if Some(other_id) != excluding_flow_id {
-            return Err(GuardError::FlowVsFlow { name: trimmed.to_string() });
+            return Err(GuardError::FlowVsFlow {
+                name: trimmed.to_string(),
+            });
         }
     }
     Ok(())
@@ -101,14 +111,19 @@ pub fn check_service_deploy_collision(pool: &DbPool, model_name: &str) -> Result
         return Err(GuardError::Empty);
     }
 
-    let aliases = repository::list_model_aliases(pool)
-        .map_err(|_| GuardError::ServiceVsAlias { name: trimmed.to_string() })?;
+    let aliases = repository::list_model_aliases(pool).map_err(|_| GuardError::ServiceVsAlias {
+        name: trimmed.to_string(),
+    })?;
     if aliases.iter().any(|a| a.is_active && a.alias == trimmed) {
-        return Err(GuardError::ServiceVsAlias { name: trimmed.to_string() });
+        return Err(GuardError::ServiceVsAlias {
+            name: trimmed.to_string(),
+        });
     }
 
     if published_flow_name_exists(pool, trimmed)? {
-        return Err(GuardError::ServiceVsFlow { name: trimmed.to_string() });
+        return Err(GuardError::ServiceVsFlow {
+            name: trimmed.to_string(),
+        });
     }
     Ok(())
 }
@@ -132,9 +147,8 @@ fn published_flow_owner(pool: &DbPool, name: &str) -> Result<Option<i64>, GuardE
         let conn = pool
             .lock()
             .map_err(|_| anyhow::anyhow!("db pool lock poisoned"))?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1")?;
         let result: Option<i64> = stmt
             .query_row(rusqlite::params![name], |row| row.get(0))
             .ok();
@@ -181,7 +195,10 @@ mod tests {
     #[test]
     fn empty_name_is_rejected_everywhere() {
         let pool = fresh_db();
-        assert_eq!(check_alias_collision(&pool, "  ", None), Err(GuardError::Empty));
+        assert_eq!(
+            check_alias_collision(&pool, "  ", None),
+            Err(GuardError::Empty)
+        );
         assert_eq!(
             check_flow_publish_collision(&pool, "", None),
             Err(GuardError::Empty)

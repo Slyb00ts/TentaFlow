@@ -2,6 +2,12 @@
 # Artefakty kompilacji
 # =============================================================================
 target/
+target_shared/
+
+# Runtime data (SQLite, HMAC keys, container bundles, model cache).
+# Wczesniej trzymane w target/debug/ — `cargo clean` je wywalal. Teraz
+# osobny katalog `.runtime/` poza target/.
+/.runtime/
 obj/
 bin/
 *.o
@@ -11,6 +17,7 @@ bin/
 *.dll
 *.exe
 *.wasm
+plans/*
 
 # Swift Package Manager + xcodebuild (mlx-swift bridge build outputs)
 .build/
@@ -104,11 +111,20 @@ Cargo.lock
 !tentaflow-mobile/Cargo.lock
 !tentaflow-memory/Cargo.lock
 !tentaflow-containers/*/Cargo.lock
+# Cargo binary entry points are conventionally under `src/bin/` — the
+# generic `bin/` ignore above must not swallow them.
+!tentaflow-sdk-gen/src/bin/
+!tentaflow-sdk-gen/src/bin/**
 
 # =============================================================================
 # WASM build artefakty (addony kompilowane lokalnie)
 # =============================================================================
 tentaflow-core/addons/*/target/
+
+# =============================================================================
+# Test fixtures (regenerowane lokalnie przez ffmpeg — patrz README)
+# =============================================================================
+tentaflow-core/assets/test/sample_traffic.mp4
 
 # =============================================================================
 # Modele AI (duze pliki)
@@ -147,8 +163,6 @@ jailbreak-dataset/
 IMPLEMENTATION_PLAN.md
 CURRENT_API.md
 tests/e2e/node_modules/
-tests/e2e/package.json
-tests/e2e/package-lock.json
 tests/e2e/test-results/
 test-results/
 *.backup
@@ -156,3 +170,16 @@ test-results/
 notes/*.md.claude/
 
 .claude/
+
+# Python
+__pycache__/
+
+# Notatki robocze — nie wysylamy do remote
+notes/
+
+# Codex CLI session state — lokalne
+.context/
+
+# npm lockfiles — repo nie używa Node poza tests/e2e (Playwright)
+package-lock.json
+tests/e2e/package-lock.json

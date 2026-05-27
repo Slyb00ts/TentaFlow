@@ -1,0 +1,212 @@
+[addon]
+id = "eureka"
+name = "Eureka MF"
+version = "1.0.0"
+description = "Crawler publicznych informacji z systemu Eureka MF z lokalnym SQLite, wznowieniem zrzutu i narzedziami dla LLM."
+category = "legal"
+keywords = ["eureka", "mf", "podatki", "interpretacje", "crawler"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = "https://eureka.mf.gov.pl/"
+icon = "search"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "http.request"
+display_name = "Pobieranie danych z Eureka MF"
+description = "Wykonuje publiczne zapytania HTTP do eureka.mf.gov.pl."
+risk = "high"
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt indeksu Eureka"
+description = "Czyta pozycje i status synchronizacji z per-addon SQLite."
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis indeksu Eureka"
+description = "Zapisuje pozycje i checkpointy synchronizacji do per-addon SQLite."
+risk = "medium"
+
+[[network_rule]]
+id = "eureka-mf-https"
+protocol = "tcp"
+host = "eureka.mf.gov.pl"
+port = 443
+description = "Publiczne pobieranie informacji z systemu Eureka MF przez HTTPS."
+required = true
+
+[visibility]
+admin_only = true
+default_groups = []
+show_in_catalog = true
+
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+
+[resources]
+memory_mb = 128
+fuel_limit = 50000000
+storage_total_mb = 2048
+http_requests_per_minute = 120
+
+[lifecycle]
+background = false
+auto_start = false
+
+[[tool]]
+id = "search"
+display_name = "Szukaj w Eureka"
+description = "Wyszukuje w lokalnym indeksie pobranych informacji Eureka."
+keywords = ["eureka", "search", "podatki"]
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Fraza wyszukiwania."
+required = true
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Maksymalna liczba wynikow."
+required = false
+
+[[tool.parameter]]
+name = "offset"
+param_type = "number"
+description = "Offset wynikow."
+required = false
+
+[[tool]]
+id = "get_entry"
+display_name = "Pobierz wpis Eureka"
+description = "Pobiera lub odswieza pojedyncza informacje po identyfikatorze."
+keywords = ["eureka", "entry", "detail"]
+
+[[tool.parameter]]
+name = "id"
+param_type = "string"
+description = "Identyfikator informacji Eureka."
+required = true
+
+[[tool.parameter]]
+name = "refresh"
+param_type = "boolean"
+description = "Wymusza ponowne pobranie z Eureka."
+required = false
+
+[[tool]]
+id = "sync_new"
+display_name = "Synchronizuj nowe wpisy"
+description = "Skanuje nowe identyfikatory powyzej ostatniego pobranego wpisu i zapisuje znalezione pozycje."
+keywords = ["eureka", "sync", "daily"]
+
+[[tool.parameter]]
+name = "batch_size"
+param_type = "number"
+description = "Maksymalna liczba prob pobrania w jednym wywolaniu."
+required = false
+
+[[tool.parameter]]
+name = "max_consecutive_missing"
+param_type = "number"
+description = "Liczba kolejnych brakow konczaca dzienna synchronizacje."
+required = false
+
+[[tool.parameter]]
+name = "max_errors"
+param_type = "number"
+description = "Maksymalna liczba bledow HTTP/SQLite przerywajaca batch."
+required = false
+
+[[tool]]
+id = "full_dump"
+display_name = "Pelny zrzut Eureka"
+description = "Wykonuje wznawialny zrzut zakresu identyfikatorow Eureka w batchach."
+keywords = ["eureka", "dump", "crawl"]
+
+[[tool.parameter]]
+name = "start_id"
+param_type = "number"
+description = "Poczatkowy identyfikator dla zrzutu."
+required = false
+
+[[tool.parameter]]
+name = "end_id"
+param_type = "number"
+description = "Koncowy identyfikator dla zrzutu."
+required = false
+
+[[tool.parameter]]
+name = "batch_size"
+param_type = "number"
+description = "Maksymalna liczba identyfikatorow w jednym wywolaniu."
+required = false
+
+[[tool.parameter]]
+name = "direction"
+param_type = "string"
+description = "Kierunek skanu: asc albo desc."
+required = false
+
+[[tool.parameter]]
+name = "reset"
+param_type = "boolean"
+description = "Resetuje checkpoint pelnego zrzutu."
+required = false
+
+[[tool.parameter]]
+name = "max_errors"
+param_type = "number"
+description = "Maksymalna liczba bledow HTTP/SQLite przerywajaca batch."
+required = false
+
+[[tool]]
+id = "retry_failed"
+display_name = "Ponow bledy Eureka"
+description = "Ponawia pobranie wpisow, ktore wczesniej zakonczyly sie bledem."
+keywords = ["eureka", "retry", "errors"]
+
+[[tool.parameter]]
+name = "batch_size"
+param_type = "number"
+description = "Maksymalna liczba ponawianych identyfikatorow."
+required = false
+
+[[tool.parameter]]
+name = "max_errors"
+param_type = "number"
+description = "Maksymalna liczba bledow przerywajaca batch."
+required = false
+
+[[tool]]
+id = "recent"
+display_name = "Najnowsze wpisy Eureka"
+description = "Zwraca najnowsze wpisy z lokalnego indeksu Eureka."
+keywords = ["eureka", "recent", "latest"]
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Maksymalna liczba wynikow."
+required = false
+
+[[tool.parameter]]
+name = "offset"
+param_type = "number"
+description = "Offset wynikow."
+required = false
+
+[[tool]]
+id = "stats"
+display_name = "Statystyki Eureka"
+description = "Zwraca liczbe pobranych wpisow i checkpointy synchronizacji."
+keywords = ["eureka", "stats"]

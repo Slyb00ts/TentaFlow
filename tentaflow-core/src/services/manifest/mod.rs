@@ -11,9 +11,7 @@ mod types;
 mod validate;
 mod vocabulary;
 
-pub use vocabulary::{
-    VALID_INPUT_MODALITIES, VALID_OUTPUT_MODALITIES, VALID_SERVICE_SURFACES,
-};
+pub use vocabulary::{VALID_INPUT_MODALITIES, VALID_OUTPUT_MODALITIES, VALID_SERVICE_SURFACES};
 
 #[cfg(test)]
 mod tests;

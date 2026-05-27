@@ -595,7 +595,7 @@ mod tests {
         let pool = setup_pool();
 
         ensure_teams_bot_defaults(&pool).await.unwrap();
-        assert!(repository::resolve_model_alias(&pool, "teams-stt")
+        assert!(repository::resolve_model_alias(&pool, "teams-stt", None)
             .unwrap()
             .is_some());
 
@@ -609,13 +609,13 @@ mod tests {
                 .unwrap();
             assert_eq!(deleted, 1);
         }
-        assert!(repository::resolve_model_alias(&pool, "teams-stt")
+        assert!(repository::resolve_model_alias(&pool, "teams-stt", None)
             .unwrap()
             .is_none());
 
         ensure_teams_bot_defaults(&pool).await.unwrap();
 
-        let restored = repository::resolve_model_alias(&pool, "teams-stt")
+        let restored = repository::resolve_model_alias(&pool, "teams-stt", None)
             .unwrap()
             .expect("alias teams-stt powinien zostać odtworzony");
         assert_eq!(restored.strategy.as_deref(), Some("first_available"));

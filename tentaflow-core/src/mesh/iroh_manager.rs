@@ -4,12 +4,12 @@
 //       rozni sie transportem (iroh QUIC + relay + LAN mDNS + DHT pkarr) i
 //       brakiem warstwy AEAD (TLS 1.3 iroh wystarcza). Trzyma mape aktywnych
 //       polaczen po EndpointId, emituje zdarzenia do broadcast::Receiver.
-//       Message format na bidi streamie: [1 bajt discriminant][payload].
+//       Uni streamy mesh przenosza podpisane envelope UFP/2.
 // =============================================================================
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,19 +17,19 @@ use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use parking_lot::RwLock;
-use tokio::sync::{broadcast, mpsc, RwLock as AsyncRwLock};
+use tokio::sync::{RwLock as AsyncRwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::{
+    ALPN_API, ALPN_MESH, ALPN_PAIRING, IrohConfig, IrohEndpoint, IrohEndpointError,
     handler::IrohStreamError,
     pairing::{
-        endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
-        merge_contact_hints, PairingContactHints, PairingHandler,
+        PairingContactHints, PairingHandler, endpoint_addr_from_hints, hints_with_relay_fallback,
+        load_trusted_contact_hints, merge_contact_hints,
     },
-    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_MESH, ALPN_PAIRING,
 };
 
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
@@ -118,10 +118,6 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
-    CrdtDeltaReceived {
-        node_id: String,
-        data: Vec<u8>,
-    },
     PairingRequestReceived {
         peer_id: String,
         data: Vec<u8>,
@@ -146,14 +142,40 @@ pub enum IrohMeshEvent {
         node_id: String,
         keys: Vec<(String, String)>,
     },
+    /// F1b P3.B — peer pushed its HMAC issuer keys (pickup_token, frame_url,
+    /// recording_url). Payload carries raw 32-byte secrets + optional
+    /// previous-window key per scope; receiver must already trust the sender
+    /// (the dispatcher enforces this in `pipeline.rs`).
+    HmacKeysSyncReceived {
+        node_id: String,
+        payload: tentaflow_protocol::mesh::HmacKeysSyncPayload,
+    },
+    /// F1b P3.C-1 — trust-paired peer asked us for a frame whose `frame_url`
+    /// they hold. Server-side handling (lookup in local frame store, build
+    /// `FrameProxyResponsePayload`) is wired in P3.C-2.
+    FrameProxyRequestReceived {
+        from_node_id: String,
+        payload: tentaflow_protocol::mesh::FrameProxyRequestPayload,
+    },
+    /// F1b P3.C-1 — trust-paired peer replied to one of our outstanding
+    /// proxy requests. Client-side completion (pending-map lookup, oneshot
+    /// resolve) is wired in P3.C-2.
+    FrameProxyResponseReceived {
+        from_node_id: String,
+        payload: tentaflow_protocol::mesh::FrameProxyResponsePayload,
+    },
+    StorageProxyRequestReceived {
+        from_node_id: String,
+        payload: tentaflow_protocol::mesh::StorageProxyRequestPayload,
+    },
+    StorageProxyResponseReceived {
+        from_node_id: String,
+        payload: tentaflow_protocol::mesh::StorageProxyResponsePayload,
+    },
     NodeLeavingReceived {
         node_id: String,
     },
     ModelListUpdate {
-        node_id: String,
-        data: Vec<u8>,
-    },
-    ContainerListUpdate {
         node_id: String,
         data: Vec<u8>,
     },
@@ -184,22 +206,6 @@ pub enum IrohMeshEvent {
         request_id: String,
         payload: Vec<u8>,
     },
-    FullStateReceived {
-        node_id: String,
-        state: Vec<u8>,
-    },
-    KeyRotationReceived {
-        node_id: String,
-        ephemeral_public_key_hex: String,
-    },
-    KeyRotationResponseReceived {
-        node_id: String,
-        ephemeral_public_key_hex: String,
-    },
-    RelayFrameReceived {
-        from_node_id: String,
-        frame: tentaflow_protocol::mesh::MeshRelayFrame,
-    },
     /// Odkryty nowy peer przez mDNS/DHT — wypala zanim zaczniemy dial.
     /// Pipeline pisze do peer_store z source=discovered zeby UI widzial peera
     /// nawet gdy dial nie zdazyl wypalic.
@@ -225,6 +231,30 @@ pub enum IrohMeshEvent {
     },
     /// Push delta peera (`MESH_MSG_SERVICES_UPDATE`).
     ServicesUpdateReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncPushReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncAckReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncPullReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncPullResponseReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncSnapshotPullReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncSnapshotResponseReceived {
         from_node_id: String,
         data: Vec<u8>,
     },
@@ -934,68 +964,6 @@ impl IrohMeshManager {
     }
 
     /// Wysyla ramke `[disc][data]` na uni streamie do peera.
-    pub async fn send_to_peer(
-        &self,
-        target_node_id: &str,
-        discriminant: u8,
-        data: &[u8],
-    ) -> Result<()> {
-        let connection = self
-            .connections
-            .get(target_node_id)
-            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
-            .connection
-            .clone();
-
-        let mut send = connection
-            .open_uni()
-            .await
-            .map_err(|e| anyhow::anyhow!("open_uni: {e}"))?;
-        send.write_all(&[discriminant])
-            .await
-            .map_err(|e| anyhow::anyhow!("write discriminant: {e}"))?;
-        if !data.is_empty() {
-            send.write_all(data)
-                .await
-                .map_err(|e| anyhow::anyhow!("write payload: {e}"))?;
-        }
-        send.finish()
-            .map_err(|e| anyhow::anyhow!("finish uni: {e}"))?;
-        Ok(())
-    }
-
-    pub async fn broadcast_to_trusted(
-        &self,
-        discriminant: u8,
-        data: &[u8],
-        exclude: Option<&str>,
-    ) -> Vec<(String, Result<()>)> {
-        use futures::future::join_all;
-        let trusted = self.security.trusted_node_ids_snapshot();
-        // Jeden pass po DashMap: filtracja + build future. Brak posredniej Vec<String>.
-        // Klon String tylko dla peerow ktorzy przechodza filtr (trusted ∩ !exclude).
-        let mut futs = Vec::with_capacity(self.connections.len());
-        for entry in self.connections.iter() {
-            let id = entry.key();
-            if !trusted.contains(id) {
-                continue;
-            }
-            if let Some(e) = exclude {
-                if id.as_str() == e {
-                    continue;
-                }
-            }
-            let node_id = id.clone();
-            futs.push(async move {
-                let res = self.send_to_peer(&node_id, discriminant, data).await;
-                (node_id, res)
-            });
-        }
-        // PARALLEL: send_to_peer na kazdy cel rownolegle. 1000 peerow sekwencyjnie
-        // 2-5s (open_uni + write + finish); rownolegle max(rtt) + overhead, <50ms.
-        join_all(futs).await
-    }
-
     pub async fn connected_peers(&self) -> Vec<String> {
         self.connections.iter().map(|e| e.key().clone()).collect()
     }
@@ -1017,24 +985,143 @@ impl IrohMeshManager {
     }
 
     // =========================================================================
-    // Convenience wrappers — odpowiedniki metod QuicMeshManager. Kazdy deleguje
-    // do `send_to_peer` z odpowiednim discriminantem z `tentaflow_protocol::mesh`.
+    // Convenience wrappers — odpowiedniki metod QuicMeshManager. Kazdy
+    // wraca payload w podpisanej UFP/2 envelope przez `send_ufp2_to_peer`.
     // =========================================================================
 
     pub async fn send_heartbeat_data(&self, data: &[u8]) {
         use futures::future::join_all;
-        // Single pass po DashMap — brak intermediate Vec<String> (2000 heartbeatow/s
-        // × 1000 peerow = potencjalnie 2M alokacji/s w wersji z Vec posrednim).
+        // UFP/2 wire: the heartbeat body is the legacy rkyv-serialized
+        // MeshHeartbeat blob, wrapped in a signed UFP/2 envelope.
         let mut futs = Vec::with_capacity(self.connections.len());
         for entry in self.connections.iter() {
             let id = entry.key().clone();
             futs.push(async move {
-                let _ = self
-                    .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
-                    .await;
+                if let Err(e) = self
+                    .send_ufp2_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
+                    .await
+                {
+                    tracing::debug!(
+                        target: "mesh::ufp2",
+                        peer = %id,
+                        error = %e,
+                        "send_heartbeat_data: UFP/2 heartbeat send failed"
+                    );
+                }
             });
         }
         join_all(futs).await;
+    }
+
+    /// UFP/2 sender path: write the full envelope bytes to a fresh
+    /// uni-stream without any leading discriminator byte. The first byte
+    /// of `wire` is the CBOR map header — receivers detect UFP/2 vs
+    /// legacy by inspecting it (`mesh::ufp2::looks_like_ufp2_envelope_first_byte`).
+    async fn send_raw_envelope_to_peer(&self, target_node_id: &str, wire: &[u8]) -> Result<()> {
+        let connection = self
+            .connections
+            .get(target_node_id)
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
+            .connection
+            .clone();
+        let mut send = connection
+            .open_uni()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_uni: {e}"))?;
+        send.write_all(wire)
+            .await
+            .map_err(|e| anyhow::anyhow!("write ufp2 envelope: {e}"))?;
+        send.finish()
+            .map_err(|e| anyhow::anyhow!("finish ufp2 uni: {e}"))?;
+        Ok(())
+    }
+
+    /// Build a signed UFP/2 envelope around `data` for a single peer and
+    /// dispatch it on a fresh uni-stream. Used by every send wrapper that
+    /// has been migrated off the legacy `[disc][rkyv]` wire (4c2.x). The
+    /// destination peer's Ed25519 pubkey is derived from its iroh node id
+    /// (which IS the pubkey in iroh's identity model).
+    pub(crate) async fn send_ufp2_to_peer(
+        &self,
+        target_node_id: &str,
+        legacy_discriminator: u8,
+        data: &[u8],
+    ) -> Result<()> {
+        if !crate::mesh::ufp2::is_migrated_to_ufp2_discriminator(legacy_discriminator) {
+            return Err(anyhow::anyhow!(
+                "send_ufp2_to_peer: discriminator 0x{:02X} is not on the UFP/2 unicast allowlist (bi-stream types FORWARD_REQ/FORWARD_STREAM_REQ use their own protocol)",
+                legacy_discriminator
+            ));
+        }
+        let dest_pubkey = parse_iroh_node_id_to_pubkey(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "send_ufp2_to_peer: cannot parse iroh node id {} as Ed25519 pubkey",
+                target_node_id
+            )
+        })?;
+        let source_pubkey = self.security.verifying_key_bytes();
+        let epoch = self.current_policy_epoch();
+        let wire = crate::mesh::ufp2::build_signed_envelope_wire(
+            self.security.signing_key(),
+            source_pubkey,
+            dest_pubkey,
+            legacy_discriminator,
+            data.to_vec(),
+            epoch,
+        )
+        .map_err(|e| anyhow::anyhow!("send_ufp2_to_peer: envelope build failed: {e}"))?;
+        self.send_raw_envelope_to_peer(target_node_id, &wire).await
+    }
+
+    fn current_policy_epoch(&self) -> u32 {
+        crate::db::repository::get_sync_permission_epoch(
+            &self.security.db,
+            crate::services::org::DEFAULT_ORG_ID,
+        )
+        .map(|epoch| epoch.min(u32::MAX as u64) as u32)
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "mesh::ufp2",
+                error = %e,
+                "current_policy_epoch: failed to read sync permission epoch"
+            );
+            0
+        })
+    }
+
+    /// UFP/2 broadcast helper: build a per-peer signed envelope (each
+    /// envelope's `destination.id` must match the receiver's pubkey, so
+    /// broadcast cannot share one wire blob the way the legacy
+    /// `[disc][rkyv]` path could) and send to every trusted peer except
+    /// `exclude`. Returns per-peer results so callers can log failures.
+    pub(crate) async fn broadcast_ufp2_to_trusted(
+        &self,
+        legacy_discriminator: u8,
+        data: &[u8],
+        exclude: Option<&str>,
+    ) -> Vec<(String, Result<()>)> {
+        use futures::future::join_all;
+        let trusted = self.security.trusted_node_ids_snapshot();
+        let mut futs = Vec::with_capacity(self.connections.len());
+        for entry in self.connections.iter() {
+            let id = entry.key();
+            if !trusted.contains(id) {
+                continue;
+            }
+            if let Some(e) = exclude {
+                if id.as_str() == e {
+                    continue;
+                }
+            }
+            let node_id = id.clone();
+            futs.push(async move {
+                let res = self
+                    .send_ufp2_to_peer(&node_id, legacy_discriminator, data)
+                    .await;
+                (node_id, res)
+            });
+        }
+        join_all(futs).await
     }
 
     /// Broadcast listy modeli do wszystkich polaczonych peerow. Wywolywane
@@ -1046,7 +1133,7 @@ impl IrohMeshManager {
             let id = entry.key().clone();
             futs.push(async move {
                 let _ = self
-                    .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data)
+                    .send_ufp2_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data)
                     .await;
             });
         }
@@ -1054,19 +1141,19 @@ impl IrohMeshManager {
     }
 
     pub async fn send_node_info(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data)
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data)
             .await
     }
 
     pub async fn send_hello(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_HELLO, data)
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_HELLO, data)
             .await
     }
 
     /// Wysyla TopologyAnnounce do jednego zaufanego peera (unicast).
     /// Broadcast realizuje pipeline przez iteracje listy peerow.
     pub async fn send_topology_announce(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_TOPOLOGY_ANNOUNCE,
             data,
@@ -1075,7 +1162,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_known_peers(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_KNOWN_PEERS,
             data,
@@ -1084,7 +1171,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_pairing_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_PAIRING_REQUEST,
             data,
@@ -1093,7 +1180,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_pairing_confirm(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_PAIRING_CONFIRM,
             data,
@@ -1102,7 +1189,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_pairing_reject(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_PAIRING_REJECT,
             data,
@@ -1111,7 +1198,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_trust_revoked(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
             data,
@@ -1120,9 +1207,107 @@ impl IrohMeshManager {
     }
 
     pub async fn send_trusted_keys_sync(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
+            data,
+        )
+        .await
+    }
+
+    /// F1b P3.B — push this node's HMAC issuer keys to a trust-paired peer.
+    /// Caller is responsible for trust + cooldown gating; this is a thin
+    /// wrapper around `send_to_peer` with the right discriminant.
+    pub async fn send_hmac_keys_sync(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_HMAC_KEYS_SYNC,
+            data,
+        )
+        .await
+    }
+
+    pub async fn send_sync_push(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH, data)
+            .await
+    }
+
+    pub async fn send_sync_ack(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK, data)
+            .await
+    }
+
+    pub async fn send_sync_pull(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL, data)
+            .await
+    }
+
+    pub async fn send_sync_pull_response(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL_RESPONSE,
+            data,
+        )
+        .await
+    }
+
+    pub async fn send_sync_snapshot_pull(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_PULL,
+            data,
+        )
+        .await
+    }
+
+    pub async fn send_sync_snapshot_response(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
+            data,
+        )
+        .await
+    }
+
+    /// F1b P3.C-1 — send a frame proxy request to a trust-paired peer.
+    /// Caller is responsible for trust gating + correlating the
+    /// `request_id` with a pending response slot (P3.C-2 wires the slot
+    /// map). `data` is the rkyv-encoded `FrameProxyRequestPayload`.
+    pub async fn send_frame_proxy_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_FRAME_PROXY_REQUEST,
+            data,
+        )
+        .await
+    }
+
+    /// F1b P3.C-1 — send a frame proxy response to a trust-paired peer.
+    /// Caller (P3.C-2 server handler) builds the encoded
+    /// `FrameProxyResponsePayload` (Found / NotFound / Unavailable) and
+    /// pushes it back on the same trust link.
+    pub async fn send_frame_proxy_response(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_FRAME_PROXY_RESPONSE,
+            data,
+        )
+        .await
+    }
+
+    pub async fn send_storage_proxy_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_STORAGE_PROXY_REQUEST,
+            data,
+        )
+        .await
+    }
+
+    pub async fn send_storage_proxy_response(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_STORAGE_PROXY_RESPONSE,
             data,
         )
         .await
@@ -1131,25 +1316,19 @@ impl IrohMeshManager {
     pub async fn send_node_leaving(&self) {
         let data = vec![];
         let _ = self
-            .broadcast_to_trusted(tentaflow_protocol::mesh::MESH_MSG_NODE_LEAVING, &data, None)
+            .broadcast_ufp2_to_trusted(tentaflow_protocol::mesh::MESH_MSG_NODE_LEAVING, &data, None)
             .await;
     }
 
     pub async fn broadcast_node_info(&self, data: &[u8]) {
         let _ = self
-            .broadcast_to_trusted(tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data, None)
-            .await;
-    }
-
-    pub async fn broadcast_crdt_delta(&self, data: Vec<u8>) {
-        let _ = self
-            .broadcast_to_trusted(tentaflow_protocol::mesh::MESH_MSG_CRDT_DELTA, &data, None)
+            .broadcast_ufp2_to_trusted(tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data, None)
             .await;
     }
 
     pub async fn broadcast_alias_sync(&self, aliases_json: Vec<u8>) {
         let _ = self
-            .broadcast_to_trusted(
+            .broadcast_ufp2_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_ALIAS_SYNC,
                 &aliases_json,
                 None,
@@ -1368,12 +1547,20 @@ impl IrohMeshManager {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_waiters.insert(command_id.clone(), tx);
 
-        self.send_to_peer(
-            target_node_id,
-            tentaflow_protocol::mesh::MESH_MSG_COMMAND,
-            &data,
-        )
-        .await?;
+        // If the send fails the waiter would otherwise leak until the
+        // explicit removals below in the timeout/drop arms — but those
+        // only run after the `?` returns. Clear the waiter on send error.
+        if let Err(e) = self
+            .send_ufp2_to_peer(
+                target_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_COMMAND,
+                &data,
+            )
+            .await
+        {
+            self.command_waiters.remove(&command_id);
+            return Err(e);
+        }
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(resp)) => Ok(resp),
@@ -1461,7 +1648,7 @@ impl IrohMeshManager {
                 };
                 if let Ok(bytes) = serde_json::to_vec(&resp) {
                     let _ = self
-                        .send_to_peer(
+                        .send_ufp2_to_peer(
                             from_node_id,
                             tentaflow_protocol::mesh::MESH_MSG_COMMAND_RESPONSE,
                             &bytes,
@@ -1482,7 +1669,7 @@ impl IrohMeshManager {
         match serde_json::to_vec(&resp_envelope) {
             Ok(bytes) => {
                 if let Err(e) = self
-                    .send_to_peer(
+                    .send_ufp2_to_peer(
                         from_node_id,
                         tentaflow_protocol::mesh::MESH_MSG_COMMAND_RESPONSE,
                         &bytes,
@@ -1523,43 +1710,6 @@ impl IrohMeshManager {
                     .await;
             }
         }
-    }
-
-    pub async fn send_key_rotation(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
-            target_node_id,
-            tentaflow_protocol::mesh::MESH_MSG_KEY_ROTATION,
-            data,
-        )
-        .await
-    }
-
-    pub async fn send_key_rotation_response(
-        &self,
-        target_node_id: &str,
-        data: &[u8],
-    ) -> Result<()> {
-        self.send_to_peer(
-            target_node_id,
-            tentaflow_protocol::mesh::MESH_MSG_KEY_ROTATION_RESPONSE,
-            data,
-        )
-        .await
-    }
-
-    /// Wysyla relay frame (multi-hop) do nastepnego noda w trasie.
-    pub async fn send_relay_frame(&self, next_hop_id: &str, frame_bytes: &[u8]) -> Result<()> {
-        self.send_to_peer(
-            next_hop_id,
-            tentaflow_protocol::mesh::MESH_MSG_RELAY_FRAME,
-            frame_bytes,
-        )
-        .await
-    }
-
-    /// Wysyla payload przez relay do docelowego peera (wybiera pierwszy hop z config).
-    pub async fn send_via_relay(&self, via_node_id: &str, frame_bytes: &[u8]) -> Result<()> {
-        self.send_relay_frame(via_node_id, frame_bytes).await
     }
 }
 
@@ -1718,23 +1868,56 @@ impl IrohMeshManagerRef {
         remote_hex: String,
         mut recv: iroh::endpoint::RecvStream,
     ) -> Result<(), IrohStreamError> {
-        let mut disc = [0u8; 1];
-        recv.read_exact(&mut disc)
+        let mut first = [0u8; 1];
+        recv.read_exact(&mut first)
             .await
             .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
         // iroh RecvStream.read_to_end bierze limit bajtow, zwraca Vec<u8>.
-        let payload = recv
+        let tail = recv
             .read_to_end(MAX_MSG_BYTES)
             .await
             .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
-        if payload.len() > MAX_MSG_BYTES {
-            return Err(IrohStreamError::FrameTooLarge(payload.len()));
+        if tail.len() > MAX_MSG_BYTES {
+            return Err(IrohStreamError::FrameTooLarge(tail.len()));
         }
+
+        // UFP/2 receive: every unicast mesh frame is a signed UFP/2
+        // envelope. `classify_inbound` reassembles the bytes, decodes
+        // CBOR, runs the structural validator, verifies the Ed25519
+        // signature, and binds envelope.source.id / destination.id to the
+        // transport peer / local node so a trusted peer cannot relay or
+        // replay another node's envelope. The legacy discriminator is
+        // recovered from envelope.kind so the existing event dispatch
+        // below routes by `frame_type` unchanged.
+        let local_pubkey = self.security.verifying_key_bytes();
+        let peer_pubkey_opt = parse_iroh_node_id_to_pubkey(&remote_hex);
+        let (frame_type, payload) = if let Some(peer_pubkey) = peer_pubkey_opt {
+            match crate::mesh::ufp2::classify_inbound(first[0], tail, peer_pubkey, local_pubkey) {
+                Ok(crate::mesh::ufp2::InboundMeshFrame::Ufp2(decoded)) => {
+                    (decoded.legacy_discriminator, decoded.body)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mesh::ufp2",
+                        peer = %remote_hex,
+                        error = %e,
+                        "handle_mesh_uni: UFP/2 dispatch rejected incoming frame"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            tracing::warn!(
+                target: "mesh::ufp2",
+                peer = %remote_hex,
+                "handle_mesh_uni: cannot parse iroh node id as Ed25519 pubkey, dropping frame"
+            );
+            return Ok(());
+        };
 
         // Pre-trust whitelist: untrusted peers may only send pairing handshake
         // frames. Every other mesh frame is dropped before any application
         // state (peer_store, registry, command executor, ...) is touched.
-        let frame_type = disc[0];
         let trusted_now = self.security.is_trusted(&remote_hex);
         tracing::debug!(
             target: "mesh::gate",
@@ -1768,7 +1951,7 @@ impl IrohMeshManagerRef {
         }
 
         use tentaflow_protocol::mesh::*;
-        let event = match disc[0] {
+        let event = match frame_type {
             x if x == MESH_MSG_HEARTBEAT => IrohMeshEvent::HeartbeatReceived {
                 node_id: remote_hex,
                 heartbeat: payload,
@@ -1787,10 +1970,6 @@ impl IrohMeshManagerRef {
             },
             x if x == MESH_MSG_KNOWN_PEERS => IrohMeshEvent::KnownPeersReceived {
                 from_node_id: remote_hex,
-                data: payload,
-            },
-            x if x == MESH_MSG_CRDT_DELTA => IrohMeshEvent::CrdtDeltaReceived {
-                node_id: remote_hex,
                 data: payload,
             },
             x if x == MESH_MSG_PAIRING_REQUEST => IrohMeshEvent::PairingRequestReceived {
@@ -1833,6 +2012,106 @@ impl IrohMeshManagerRef {
                     }
                 }
             }
+            x if x == MESH_MSG_HMAC_KEYS_SYNC => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::HmacKeysSyncPayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::HmacKeysSyncReceived {
+                        node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode HmacKeysSync: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_FRAME_PROXY_REQUEST => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::FrameProxyRequestPayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::FrameProxyRequestReceived {
+                        from_node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode FrameProxyRequest: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_FRAME_PROXY_RESPONSE => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::FrameProxyResponsePayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::FrameProxyResponseReceived {
+                        from_node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode FrameProxyResponse: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_STORAGE_PROXY_REQUEST => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::StorageProxyRequestPayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::StorageProxyRequestReceived {
+                        from_node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode StorageProxyRequest: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_STORAGE_PROXY_RESPONSE => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::StorageProxyResponsePayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::StorageProxyResponseReceived {
+                        from_node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode StorageProxyResponse: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
             x if x == MESH_MSG_TRUST_REVOKED => {
                 // payload: JSON { revoked_node_id }
                 let revoked: String = serde_json::from_slice::<serde_json::Value>(&payload)
@@ -1850,10 +2129,6 @@ impl IrohMeshManagerRef {
             }
             x if x == MESH_MSG_NODE_LEAVING => IrohMeshEvent::NodeLeavingReceived {
                 node_id: remote_hex,
-            },
-            x if x == MESH_MSG_CONTAINER_LIST => IrohMeshEvent::ContainerListUpdate {
-                node_id: remote_hex,
-                data: payload,
             },
             x if x == MESH_MSG_COMMAND => IrohMeshEvent::MeshCommandReceived {
                 from_node_id: remote_hex,
@@ -1889,6 +2164,32 @@ impl IrohMeshManagerRef {
                 from_node_id: remote_hex,
                 data: payload,
             },
+            x if x == MESH_MSG_SYNC_PUSH => IrohMeshEvent::SyncPushReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_ACK => IrohMeshEvent::SyncAckReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_PULL => IrohMeshEvent::SyncPullReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_PULL_RESPONSE => IrohMeshEvent::SyncPullResponseReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_SNAPSHOT_PULL => IrohMeshEvent::SyncSnapshotPullReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_SNAPSHOT_RESPONSE => {
+                IrohMeshEvent::SyncSnapshotResponseReceived {
+                    from_node_id: remote_hex,
+                    data: payload,
+                }
+            }
             other => {
                 warn!(
                     peer = %remote_hex,
@@ -1939,6 +2240,20 @@ async fn handler_accept_connection(handler: &PairingHandler, connection: Connect
         .await
         .map_err(|e| anyhow::anyhow!("pairing accept: {e:?}"))?;
     Ok(())
+}
+
+/// Parse an iroh node id (hex-encoded 32-byte Ed25519 public key) into the
+/// raw byte form required by `NodeAddress::node` and UFP/2 signature scope.
+/// Returns `None` on any decoding failure so callers can log + skip
+/// without falling over.
+fn parse_iroh_node_id_to_pubkey(node_id_hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(node_id_hex).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
 }
 
 fn build_secret_key_from_security(security: &MeshSecurity) -> Result<iroh::SecretKey> {

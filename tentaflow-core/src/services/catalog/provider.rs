@@ -218,10 +218,7 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
             let mut svc_inputs: HashSet<InputModality> = HashSet::new();
             let mut svc_outputs: HashSet<OutputModality> = HashSet::new();
             if let Some(m) = manifest {
-                let preset = m
-                    .model_presets
-                    .iter()
-                    .find(|p| p.id == model.model_name);
+                let preset = m.model_presets.iter().find(|p| p.id == model.model_name);
                 for s in m.engine.effective_service_surfaces(preset) {
                     if let Some(v) = ServiceSurface::from_wire_str(&s) {
                         svc_surfaces.insert(v);
@@ -335,10 +332,7 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
 /// This makes alias inheritance (D.17) actually work for audio/image flows
 /// — without the inference an alias targeting an audio chat flow would be
 /// advertised as text-only and the resolver would reject audio requests.
-fn build_flow_entries(
-    pool: &DbPool,
-    taken_ids: &HashSet<String>,
-) -> Result<Vec<CatalogEntry>> {
+fn build_flow_entries(pool: &DbPool, taken_ids: &HashSet<String>) -> Result<Vec<CatalogEntry>> {
     let flows = repository::list_flows(pool, 0, i64::MAX)?;
     let mut entries = Vec::new();
     for flow in flows {
@@ -414,6 +408,7 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "trigger",
     "output",
     "condition",
+    "combine",
     "pii_filter",
     "tts_clean",
     "session_context",
@@ -539,14 +534,11 @@ fn build_alias_entries(
         // the alias name and target keeps the wire output honest about
         // what was hidden.
         if taken_ids.contains(&alias.alias) {
-            shadow_markers
-                .entry(alias.alias.clone())
-                .or_insert(CatalogDiagnostic::RemoteShadowed {
-                    local_owner: format!(
-                        "local alias '{}' targeting '{}'",
-                        alias.alias, target
-                    ),
-                });
+            shadow_markers.entry(alias.alias.clone()).or_insert(
+                CatalogDiagnostic::RemoteShadowed {
+                    local_owner: format!("local alias '{}' targeting '{}'", alias.alias, target),
+                },
+            );
             continue;
         }
 
@@ -820,6 +812,7 @@ mod tests {
                 endpoint_url: None,
                 restart_count: 0,
                 health_last_err: None,
+                progress_message: None,
                 models: vec![ServiceModelEntry {
                     // Same name as the seeded alias above.
                     model_name: "test-alias".into(),
@@ -891,6 +884,7 @@ mod tests {
                 endpoint_url: None,
                 restart_count: 0,
                 health_last_err: None,
+                progress_message: None,
                 models: vec![ServiceModelEntry {
                     model_name: "whisper-base".into(),
                     display_name: None,
@@ -947,6 +941,7 @@ mod tests {
             endpoint_url: None,
             restart_count: 0,
             health_last_err: None,
+            progress_message: None,
             models: vec![ServiceModelEntry {
                 model_name: "shared".into(),
                 display_name: None,
@@ -1141,8 +1136,10 @@ mod tests {
             .copied()
             .collect();
 
-        let unhandled: Vec<&String> =
-            seeded.iter().filter(|t| !known.contains(t.as_str())).collect();
+        let unhandled: Vec<&String> = seeded
+            .iter()
+            .filter(|t| !known.contains(t.as_str()))
+            .collect();
         assert!(
             unhandled.is_empty(),
             "node types in flow_node_templates not handled by infer_flow_modalities: {:?}\n\
@@ -1156,7 +1153,10 @@ mod tests {
     fn infer_flow_modalities_returns_empty_for_garbage_json() {
         assert_eq!(infer_flow_modalities("not-json"), (vec![], vec![]));
         assert_eq!(infer_flow_modalities("{}"), (vec![], vec![]));
-        assert_eq!(infer_flow_modalities(r#"{"nodes":"oops"}"#), (vec![], vec![]));
+        assert_eq!(
+            infer_flow_modalities(r#"{"nodes":"oops"}"#),
+            (vec![], vec![])
+        );
     }
 
     #[test]

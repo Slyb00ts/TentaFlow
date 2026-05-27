@@ -56,6 +56,8 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             resource_kind: None,
             requires_model: None,
             gpu_supported: None,
+            // dgx_spark: brak ograniczen Spark dla testowego silnika
+            dgx_spark: None,
             default_port: 0,
             api: ApiKind::OpenaiCompatible,
             version: "0.0.1".into(),
@@ -83,6 +85,10 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
+            // speculator_*: brak speculative decoding w tescie
+            speculator_repo: None,
+            speculator_method: None,
+            speculator_num_tokens: None,
         }],
         parameters: vec![],
         docker_source_hash: String::new(),
@@ -108,6 +114,8 @@ fn fake_service_info(id: i64, node_id: &str, model_name: &str) -> ServiceInfo {
         endpoint_url: None,
         restart_count: 0,
         health_last_err: None,
+        // progress_message: brak raportu fazy startu w tescie
+        progress_message: None,
         models: vec![ServiceModelEntry {
             model_name: model_name.into(),
             display_name: None,
@@ -118,6 +126,8 @@ fn fake_service_info(id: i64, node_id: &str, model_name: &str) -> ServiceInfo {
         }],
         created_at: String::new(),
         updated_at: String::new(),
+        // request_time_parameters: domyslna pusta mapa parametrow
+        request_time_parameters: Default::default(),
     }
 }
 

@@ -201,6 +201,21 @@ export function browserSignHex(data) {
 }
 
 /**
+ * Decode a CBOR-encoded Component into a JS object suitable for ComponentRenderer.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {any}
+ */
+export function decodeComponentCbor(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeComponentCbor(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * Decode + bytecheck (NIGDY `access_unchecked`) pelnego envelope'u z WSS input.
  * Zwraca strukturalny widok; body wciaz zakodowany (lazy decode przez
  * `decodeMessageBody`).
@@ -235,6 +250,51 @@ export function decodeMessageBody(bytes) {
 }
 
 /**
+ * Decode CBOR-encoded Vec<PatchOp> into JS array of { path, op, ... }.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {any}
+ */
+export function decodePatchOpsCbor(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodePatchOpsCbor(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * Decode CBOR-encoded Vec<StateEntry> into JS array of { path, value }.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {any}
+ */
+export function decodeStateEntriesCbor(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeStateEntriesCbor(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * Decode UI channel CBOR payload into a JS-friendly object.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {any}
+ */
+export function decodeUiPayload(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeUiPayload(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * MessageBody::AddonAdminOnlySetRequest { addon_id, admin_only }.
  * @param {string} addon_id
  * @param {boolean} admin_only
@@ -250,6 +310,21 @@ export function encodeAddonAdminOnlySetRequest(addon_id, admin_only) {
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
+}
+
+/**
+ * MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji widocznych
+ * w glownym menu launcher. Frontend buduje liste ikon w app menu.
+ * @returns {Uint8Array}
+ */
+export function encodeAddonApplicationsListRequest() {
+    const ret = wasm.encodeAddonApplicationsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
 }
 
 /**
@@ -1011,6 +1086,75 @@ export function encodeBrowserCaptureRequest(session_id, kind, full_page) {
     const ptr0 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeBrowserCaptureRequest(session_id, ptr0, len0, full_page);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CameraAdminBody(AddOnvifRequest) — bind a discovered ONVIF
+ * device as a managed camera session. Credentials travel over the TLS
+ * admin transport and are AES-GCM-sealed server-side before persistence.
+ * @param {string} display_name
+ * @param {string} device_service_url
+ * @param {string} username
+ * @param {string} password
+ * @param {string | null} [profile_token]
+ * @param {number | null} [target_fps]
+ * @returns {Uint8Array}
+ */
+export function encodeCameraAddOnvifRequest(display_name, device_service_url, username, password, profile_token, target_fps) {
+    const ptr0 = passStringToWasm0(display_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(device_service_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(profile_token) ? 0 : passStringToWasm0(profile_token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCameraAddOnvifRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, isLikeNone(target_fps) ? Number.MAX_SAFE_INTEGER : (target_fps) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
+ * MessageBody::CameraAdminBody(DiscoverRequest) — kick off ONVIF WS-Discovery
+ * against the local network; the response carries the discovered devices.
+ * @returns {Uint8Array}
+ */
+export function encodeCameraDiscoverRequest() {
+    const ret = wasm.encodeCameraDiscoverRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * MessageBody::CameraAdminBody(FrameUrlRequest) — live-preview tile URL
+ * for `<tf-live-camera-tile>`. The handler gates on `camera.read`,
+ * enforces UUID v4 camera_id validation, a per-user rate limit, and a
+ * 5..=300 s dispatch TTL band before minting against the global frame
+ * signed-URL issuer.
+ * @param {string} camera_id
+ * @param {number} ttl_secs
+ * @returns {Uint8Array}
+ */
+export function encodeCameraFrameUrlRequest(camera_id, ttl_secs) {
+    const ptr0 = passStringToWasm0(camera_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCameraFrameUrlRequest(ptr0, len0, ttl_secs);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -1878,6 +2022,60 @@ export function encodeIamUpdateUserRequest(user_id, display_name, email, is_acti
     var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v4;
+}
+
+/**
+ * MessageBody::LegalAdminBody(GenerateRequest) — render and persist a new
+ * RODO/GDPR PDF. `variant` must be one of `short` | `standard` | `full`
+ * (server-side validation via `RodoVariant::from_str`).
+ * @param {string} variant
+ * @returns {Uint8Array}
+ */
+export function encodeLegalDocumentGenerateRequest(variant) {
+    const ptr0 = passStringToWasm0(variant, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeLegalDocumentGenerateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::LegalAdminBody(RevokeRequest) — soft-delete a previously
+ * generated legal document. The PDF stays on disk; the row gets a
+ * `revoked_at` stamp and is excluded from default list views.
+ * @param {string} doc_id
+ * @returns {Uint8Array}
+ */
+export function encodeLegalDocumentRevokeRequest(doc_id) {
+    const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeLegalDocumentRevokeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::LegalAdminBody(ListRequest) — fetch the legal documents
+ * catalogue. `include_revoked = false` matches the default dashboard view.
+ * @param {boolean} include_revoked
+ * @returns {Uint8Array}
+ */
+export function encodeLegalDocumentsListRequest(include_revoked) {
+    const ret = wasm.encodeLegalDocumentsListRequest(include_revoked);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
 }
 
 /**
@@ -3029,6 +3227,240 @@ export function encodeRegistryListRequest() {
 }
 
 /**
+ * MessageBody::RoleCatalogBody(CreateRequest) — payload jako JSON object
+ * odpowiadajacy `RoleCatalogCreateRequest`. Translations sa parami
+ * `[code, value]`; brak ikony / color_hint w obiekcie = None.
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogCreateRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogCreateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(DeactivateRequest { id }).
+ * @param {string} id
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogDeactivateRequest(id) {
+    const ptr0 = passStringToWasm0(id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogDeactivateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(GetBySlugRequest { slug }).
+ * @param {string} slug
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogGetBySlugRequest(slug) {
+    const ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogGetBySlugRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(GetRequest { id }).
+ * @param {string} id
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogGetRequest(id) {
+    const ptr0 = passStringToWasm0(id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(ListLocalesRequest) — unit variant.
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogListLocalesRequest() {
+    const ret = wasm.encodeRoleCatalogListLocalesRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(ListRequest) — filter jako JSON object.
+ * Wszystkie pola filter opcjonalne; pusty `{}` zwraca pelna liste.
+ * @param {string} filter_json
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogListRequest(filter_json) {
+    const ptr0 = passStringToWasm0(filter_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(UpdateRequest) — patch update.
+ * `Option<Option<String>>` w JSON: brak pola = nie ruszaj, `null` = wyzeruj,
+ * string = ustaw. Vec<(String, String)> jako lista par `[["pl","..."], ...]`.
+ * Serde nie potrafi rozroznic "missing" od "null" dla `Option<Option<T>>`,
+ * wiec parsujemy ręcznie z `serde_json::Value`.
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogUpdateRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogUpdateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeSchedulerActionsListRequest() {
+    const ret = wasm.encodeSchedulerActionsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} job_id
+ * @returns {Uint8Array}
+ */
+export function encodeSchedulerJobDeleteRequest(job_id) {
+    const ptr0 = passStringToWasm0(job_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSchedulerJobDeleteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} job_id
+ * @returns {Uint8Array}
+ */
+export function encodeSchedulerJobRunNowRequest(job_id) {
+    const ptr0 = passStringToWasm0(job_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSchedulerJobRunNowRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} job_json
+ * @returns {Uint8Array}
+ */
+export function encodeSchedulerJobUpsertRequest(job_json) {
+    const ptr0 = passStringToWasm0(job_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSchedulerJobUpsertRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeSchedulerJobsListRequest() {
+    const ret = wasm.encodeSchedulerJobsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} job_id
+ * @param {number} limit
+ * @returns {Uint8Array}
+ */
+export function encodeSchedulerRunsListRequest(job_id, limit) {
+    const ptr0 = passStringToWasm0(job_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSchedulerRunsListRequest(ptr0, len0, limit);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ServiceBody(ServicePayload::ReqUpdate) — edycja serwisu po
+ * deploy (Edit modal). 13 pól opcjonalnych; klient sam decyduje co jest
+ * `Some(_)`. Payload przyjmujemy jako JSON string żeby nie trzymać 13
+ * argumentów wasm-bindgen.
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeServiceConfigUpdateRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceConfigUpdateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::ServiceBody(ServicePayload::ReqDelete) — stop + delete the row
  * (cascades to `model_registry`).
  * @param {number} service_id
@@ -3039,6 +3471,25 @@ export function encodeServiceDeleteRequest(service_id, node_id) {
     var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeServiceDeleteRequest(service_id, ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ServiceBody(ServicePayload::ReqEnginePresets) — lista
+ * presetów modelu z manifestu silnika (single source of truth z
+ * `tentaflow-containers/<cat>/_services/<engine>.toml`).
+ * @param {string} engine_id
+ * @returns {Uint8Array}
+ */
+export function encodeServiceEnginePresetsRequest(engine_id) {
+    const ptr0 = passStringToWasm0(engine_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceEnginePresetsRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -3149,6 +3600,26 @@ export function encodeServiceStartRequest(service_id, node_id) {
     var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeServiceStartRequest(service_id, ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ServiceBody(ServicePayload::ReqVramHint) — snapshot VRAM
+ * per GPU + lista zewnętrznych procesów (sunshine, chrome itp.).
+ * @param {number | null} [gpu_index]
+ * @param {string | null} [node_id]
+ * @param {number | null} [exclude_service_id]
+ * @returns {Uint8Array}
+ */
+export function encodeServiceVramHintRequest(gpu_index, node_id, exclude_service_id) {
+    var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceVramHintRequest(isLikeNone(gpu_index) ? Number.MAX_SAFE_INTEGER : (gpu_index) >>> 0, ptr0, len0, !isLikeNone(exclude_service_id), isLikeNone(exclude_service_id) ? 0 : exclude_service_id);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -3279,6 +3750,45 @@ export function encodeSsoProvidersListRequest() {
 }
 
 /**
+ * MessageBody::StreamBody(CloseRequest) — release a live subscription early
+ * (e.g. UI tile navigates away). Reuses the original correlation id; the
+ * server cancels the streaming task and emits a final Closed frame.
+ * @param {string} stream_id
+ * @returns {Uint8Array}
+ */
+export function encodeStreamCloseRequest(stream_id) {
+    const ptr0 = passStringToWasm0(stream_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeStreamCloseRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::StreamBody(SubscribeRequest) — subscribe this connection to a
+ * hub-registered stream. The server first answers with a SubscribeResponse
+ * (mime + has_init_segment), then pushes a sequence of Frame chunks on the
+ * same correlation id, terminating with a single Closed payload.
+ * @param {string} stream_id
+ * @returns {Uint8Array}
+ */
+export function encodeStreamSubscribeRequest(stream_id) {
+    const ptr0 = passStringToWasm0(stream_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeStreamSubscribeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::SubscribeResumeRequest { resume_token }.
  * Klient po reconnect przekazuje token z poprzedniej SubscribeResumeOffer.
  * @param {Uint8Array} resume_token
@@ -3294,6 +3804,67 @@ export function encodeSubscribeResumeRequest(resume_token) {
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
+}
+
+/**
+ * @param {string} org_id
+ * @param {string} addon_id
+ * @param {string} operation_id
+ * @param {string} resolution
+ * @returns {Uint8Array}
+ */
+export function encodeSyncConflictResolveRequest(org_id, addon_id, operation_id, resolution) {
+    const ptr0 = passStringToWasm0(org_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(operation_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(resolution, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSyncConflictResolveRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * @param {string} org_id
+ * @param {string} addon_id
+ * @param {string} status
+ * @param {number} limit
+ * @returns {Uint8Array}
+ */
+export function encodeSyncConflictsListRequest(org_id, addon_id, status, limit) {
+    const ptr0 = passStringToWasm0(org_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(status, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSyncConflictsListRequest(ptr0, len0, ptr1, len1, ptr2, len2, limit);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeSyncStorageReportRequest() {
+    const ret = wasm.encodeSyncStorageReportRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
 }
 
 /**
@@ -3391,6 +3962,99 @@ export function encodeTtsRuleListRequest() {
     var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v1;
+}
+
+/**
+ * Encode Action into MessageBody::UiChannelCbor frame.
+ * @param {string} addon_id
+ * @param {string} panel_id
+ * @param {bigint} panel_epoch
+ * @param {string} action_id
+ * @param {string} params_json
+ * @returns {Uint8Array}
+ */
+export function encodeUiAction(addon_id, panel_id, panel_epoch, action_id, params_json) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(action_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeUiAction(ptr0, len0, ptr1, len1, panel_epoch, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * Wraps raw CBOR bytes in `MessageBody::UiChannelCbor` for binary WS transport.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {Uint8Array}
+ */
+export function encodeUiChannelCbor(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeUiChannelCbor(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Encode PanelClose into MessageBody::UiChannelCbor frame.
+ * @param {string} addon_id
+ * @param {string} panel_id
+ * @param {bigint} panel_epoch
+ * @returns {Uint8Array}
+ */
+export function encodeUiPanelClose(addon_id, panel_id, panel_epoch) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeUiPanelClose(ptr0, len0, ptr1, len1, panel_epoch);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * Encode PanelOpen into MessageBody::UiChannelCbor frame.
+ * @param {string} addon_id
+ * @param {string} panel_id
+ * @param {string} locale
+ * @param {string} theme
+ * @param {number} viewport_width
+ * @param {number} viewport_height
+ * @returns {Uint8Array}
+ */
+export function encodeUiPanelOpen(addon_id, panel_id, locale, theme, viewport_width, viewport_height) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(locale, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(theme, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeUiPanelOpen(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, viewport_width, viewport_height);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
 }
 
 /**

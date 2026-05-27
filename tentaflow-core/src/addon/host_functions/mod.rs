@@ -5,17 +5,34 @@
 //       do audit trail i operuje na liniowej pamieci WASM.
 // =============================================================================
 
+pub mod abi_helpers;
+pub mod aliases;
+#[cfg(feature = "camera")]
+pub mod camera;
+#[cfg(feature = "camera")]
+pub mod camera_metadata;
 pub mod events;
+pub mod flow;
+pub mod gate;
 pub mod http;
 pub mod llm;
 pub mod log;
 pub mod network;
 pub mod oauth;
+#[cfg(feature = "camera")]
+pub mod recording;
 pub mod secrets;
 pub mod service;
+pub mod services;
+pub mod sql;
 pub mod storage;
+pub mod sync_acl;
+#[cfg(feature = "camera")]
+pub mod streaming;
 pub mod ui;
 pub mod user;
+#[cfg(feature = "vector")]
+pub mod vector;
 
 use anyhow::Result;
 
@@ -86,6 +103,38 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         .func_wrap("tentaflow", "storage_list", storage::storage_list)
         .map_err(|e| anyhow::anyhow!("Rejestracja storage_list: {e}"))?;
 
+    linker
+        .func_wrap(
+            "tentaflow",
+            "sync_acl_upsert_v1",
+            sync_acl::sync_acl_upsert_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja sync_acl_upsert_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "sync_acl_delete_v1",
+            sync_acl::sync_acl_delete_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja sync_acl_delete_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "sync_share_grant_v1",
+            sync_acl::sync_share_grant_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja sync_share_grant_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "sync_share_revoke_v1",
+            sync_acl::sync_share_revoke_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja sync_share_revoke_v1: {e}"))?;
+
     // --- HTTP API ---
     linker
         .func_wrap("tentaflow", "http_request", http::http_request)
@@ -102,8 +151,8 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
 
     // --- UI API ---
     linker
-        .func_wrap("tentaflow", "ui_render", ui::ui_render)
-        .map_err(|e| anyhow::anyhow!("Rejestracja ui_render: {e}"))?;
+        .func_wrap("tentaflow", "ui_render_cbor", ui::ui_render_cbor)
+        .map_err(|e| anyhow::anyhow!("Rejestracja ui_render_cbor: {e}"))?;
 
     linker
         .func_wrap("tentaflow", "ui_notify", ui::ui_notify)
@@ -171,10 +220,214 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         .func_wrap("tentaflow", "service_request", service::service_request)
         .map_err(|e| anyhow::anyhow!("Rejestracja service_request: {e}"))?;
 
+    // --- Services catalog read-only (F2 P2.a — M16 v2 dropdown + node res) ---
+    linker
+        .func_wrap("tentaflow", "service_list_v1", services::service_list_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja service_list_v1: {e}"))?;
+    linker
+        .func_wrap(
+            "tentaflow",
+            "node_resources_get_v1",
+            services::node_resources_get_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja node_resources_get_v1: {e}"))?;
+
     // --- OAuth API ---
     linker
         .func_wrap("tentaflow", "oauth_get_token", oauth::oauth_get_token)
         .map_err(|e| anyhow::anyhow!("Rejestracja oauth_get_token: {e}"))?;
+
+    // --- SQL API (F1a M1.W4 — per-addon SQLite z migracjami) ---
+    linker
+        .func_wrap("tentaflow", "sql_exec_v1", sql::sql_exec_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja sql_exec_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "sql_query_v1", sql::sql_query_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja sql_query_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "sql_query_one_v1", sql::sql_query_one_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja sql_query_one_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "sql_transaction_v1", sql::sql_transaction_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja sql_transaction_v1: {e}"))?;
+
+    // --- Policy/Gate API (F1c P4 — DPIA/FRIA claim engine) ---
+    linker
+        .func_wrap("tentaflow", "gate_check_v1", gate::gate_check_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja gate_check_v1: {e}"))?;
+
+    // --- Flow API (F1c P5 — DAG flow runtime: invoke/status/cancel) ---
+    linker
+        .func_wrap("tentaflow", "flow_invoke_v1", flow::flow_invoke_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja flow_invoke_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "flow_status_v1", flow::flow_status_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja flow_status_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "flow_cancel_v1", flow::flow_cancel_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja flow_cancel_v1: {e}"))?;
+
+    // --- Vector API (F1c P3 — embedded usearch HNSW + mmap) ---
+    #[cfg(feature = "vector")]
+    {
+        linker
+            .func_wrap("tentaflow", "vector_upsert_v1", vector::vector_upsert_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja vector_upsert_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "vector_search_v1", vector::vector_search_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja vector_search_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "vector_delete_v1", vector::vector_delete_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja vector_delete_v1: {e}"))?;
+    }
+
+    // --- Alias API (F1a M1.W5 — readonly: alias_get / alias_list_owned) ---
+    linker
+        .func_wrap("tentaflow", "alias_get_v1", aliases::alias_get_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja alias_get_v1: {e}"))?;
+    linker
+        .func_wrap(
+            "tentaflow",
+            "alias_list_owned_v1",
+            aliases::alias_list_owned_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja alias_list_owned_v1: {e}"))?;
+
+    // --- Camera API (F1a M1.W6 — TentaVision camera ingest) ---
+    #[cfg(feature = "camera")]
+    {
+        linker
+            .func_wrap("tentaflow", "camera_add_v1", camera::camera_add_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_add_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_list_v1", camera::camera_list_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_list_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_get_v1", camera::camera_get_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_get_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_update_v1", camera::camera_update_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_update_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_remove_v1", camera::camera_remove_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_remove_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_snapshot_v1",
+                camera::camera_snapshot_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_snapshot_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_health_v1", camera::camera_health_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_health_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_discover_v1",
+                camera::camera_discover_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_discover_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_test_connection_v1",
+                camera::camera_test_connection_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_test_connection_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_credentials_rotate_v1",
+                camera::camera_credentials_rotate_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_credentials_rotate_v1: {e}"))?;
+
+        // --- Streaming API (F1a M1.W7 — TentaVision frame bus + PickupToken) ---
+        linker
+            .func_wrap(
+                "tentaflow",
+                "stream_subscribe_v1",
+                streaming::stream_subscribe_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja stream_subscribe_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "stream_next_v1", streaming::stream_next_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja stream_next_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "stream_close_v1", streaming::stream_close_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja stream_close_v1: {e}"))?;
+
+        // --- Recording API (F1a M1.W8 — TentaVision recording manager + frame_url) ---
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_save_snapshot_v1",
+                recording::recording_save_snapshot_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_save_snapshot_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_save_segment_v1",
+                recording::recording_save_segment_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_save_segment_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_get_url_v1",
+                recording::recording_get_url_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_get_url_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_get_stream_v1",
+                recording::recording_get_stream_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_get_stream_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_purge_v1",
+                recording::recording_purge_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_purge_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_stats_v1",
+                recording::recording_stats_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_stats_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "frame_url_v1", recording::frame_url_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja frame_url_v1: {e}"))?;
+
+        // --- ONVIF analytics metadata (F2 P6.b) ---
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_metadata_subscribe_v1",
+                camera_metadata::camera_metadata_subscribe_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_metadata_subscribe_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_metadata_unsubscribe_v1",
+                camera_metadata::camera_metadata_unsubscribe_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_metadata_unsubscribe_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_metadata_poll_v1",
+                camera_metadata::camera_metadata_poll_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_metadata_poll_v1: {e}"))?;
+    }
 
     Ok(())
 }
@@ -275,7 +528,9 @@ pub fn get_memory(caller: &mut WasmCaller<'_, AddonState>) -> Option<WasmMemory>
     caller.get_export("memory")?.into_memory()
 }
 
-/// Loguje operacje do audit log w DB
+/// Loguje operacje do audit log w DB (backward-compat — deleguje do
+/// `audit_log_with_risk` z RiskClass::Unclassified). Uzywane przez host
+/// functions sprzed F1a (storage, http, llm, ui, events, secrets, ...).
 pub fn audit_log(
     state: &AddonState,
     action: &str,
@@ -284,15 +539,95 @@ pub fn audit_log(
     result: &str,
     error_message: Option<&str>,
 ) {
+    audit_log_with_risk(
+        state,
+        action,
+        resource_type,
+        resource_id,
+        crate::audit::RiskClass::Unclassified,
+        None,
+        None,
+        result,
+        error_message,
+    );
+}
+
+/// Loguje operacje do audit log z pelnym kontekstem F1a:
+/// - `risk_class` — klasyfikacja RODO wpisu (A/B/C/unclassified).
+/// - `related_claim_id` — powiazany claim (gate evaluation, F2).
+/// - `request_id` — korelacja wielu wpisow w obrebie jednego wywolania.
+///
+/// Wpisy klasy B/C maja indeks partial w DB — szybkie kwerendy zgodnosciowe.
+#[allow(clippy::too_many_arguments)]
+pub fn audit_log_with_risk(
+    state: &AddonState,
+    action: &str,
+    resource_type: Option<&str>,
+    resource_id: Option<&str>,
+    risk_class: crate::audit::RiskClass,
+    related_claim_id: Option<&str>,
+    request_id: Option<&str>,
+    result: &str,
+    error_message: Option<&str>,
+) {
     let action_hash = fnv1a_hash(action);
     if let Ok(conn) = state.db.lock() {
+        // F1b P4 (DoD-15) — extend each row with a Merkle hash linked to the
+        // previous row's hash. The shared `DbPool` Mutex serializes us against
+        // every other writer, so the SELECT(latest hash) + INSERT pair is
+        // atomic without an explicit transaction. Pre-bind the timestamp the
+        // same way SQLite's `datetime('now')` default would render it
+        // ("YYYY-MM-DD HH:MM:SS" UTC) so the hash input matches the value
+        // the verifier reads back from the row.
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let risk_class_db = risk_class.as_db_str();
+        let hash_input = crate::audit::chain::AuditRowHashInput {
+            user_id: state.user_id,
+            addon_id: Some(state.addon_id.as_str()),
+            instance_id: Some(state.instance_id.as_str()),
+            action,
+            resource: None,
+            resource_type,
+            resource_id,
+            result: Some(result),
+            error_message,
+            details: None,
+            ip_address: None,
+            node_id: None,
+            severity: Some("info"),
+            risk_class: risk_class_db,
+            related_claim_id,
+            request_id,
+            timestamp: &timestamp,
+        };
+        let (prev_hash_blob, hash_blob) =
+            match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("audit chain: compute_chain_for_insert failed: {e}");
+                    return;
+                }
+            };
+
+        // F2 P1.b — `org_id` is written to the row but NOT folded into the
+        // chain hash. Extending `AuditRowHashInput` would invalidate every
+        // pre-F2 chained row on disk; a column-only addition keeps the
+        // verifier compatible with historical rows. Fallback to
+        // `org-default` for system / boot starts that have no org context.
+        let org_for_row = state
+            .org_id
+            .as_deref()
+            .unwrap_or(crate::services::org::DEFAULT_ORG_ID);
         let _ = conn.execute(
-            "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash, org_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 state.user_id, &state.addon_id, &state.instance_id,
                 action, resource_type, resource_id,
-                result, error_message, action_hash
+                result, error_message, action_hash,
+                risk_class_db, related_claim_id, request_id,
+                timestamp, prev_hash_blob, hash_blob,
+                org_for_row
             ],
         );
     }

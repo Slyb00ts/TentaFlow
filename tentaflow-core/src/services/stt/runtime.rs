@@ -83,10 +83,7 @@ impl SttRuntime {
     /// Transkrypcja pliku audio. Pusty `request.file` jest tu twardo
     /// odrzucany — to lustro guard'u w `routing/stt.rs` (R6.P3) zeby
     /// blad sygnalizowal sie jak najwczesniej.
-    pub async fn transcribe(
-        &self,
-        request: TranscriptionRequest,
-    ) -> Result<TranscriptionResponse> {
+    pub async fn transcribe(&self, request: TranscriptionRequest) -> Result<TranscriptionResponse> {
         if request.file.is_empty() {
             return Err(CoreError::InvalidRequest {
                 message: "transcription file is empty (0 bytes)".to_string(),
@@ -118,10 +115,12 @@ impl SttRuntime {
 
         let result = {
             let mgr = self.default_local.read().await;
-            let engine = mgr.active_engine().ok_or_else(|| CoreError::InternalError {
-                message: "no STT engine loaded".to_string(),
-                source: None,
-            })?;
+            let engine = mgr
+                .active_engine()
+                .ok_or_else(|| CoreError::InternalError {
+                    message: "no STT engine loaded".to_string(),
+                    source: None,
+                })?;
             engine
                 .transcribe(params)
                 .await
@@ -228,14 +227,13 @@ impl SttRuntime {
             }
         };
         if let Some(client) = backend_kind {
-            return client
-                .audio_transcription(request)
-                .await
-                .map_err(|e| CoreError::InternalError {
+            return client.audio_transcription(request).await.map_err(|e| {
+                CoreError::InternalError {
                     message: format!("audio_transcription HTTP backend: {}", e),
                     source: None,
                 }
-                .into());
+                .into()
+            });
         }
         // Local fallback (embedded whisper przez default_local).
         self.transcribe(request).await
@@ -341,8 +339,7 @@ mod tests {
             }]),
         };
         let json = serde_json::to_string(&resp).expect("serialize");
-        let parsed: TranscriptionResponse =
-            serde_json::from_str(&json).expect("round-trip");
+        let parsed: TranscriptionResponse = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(parsed.text, "ahoj");
         assert_eq!(parsed.speakers.as_ref().map(|s| s.len()), Some(1));
         assert_eq!(

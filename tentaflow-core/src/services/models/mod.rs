@@ -134,7 +134,10 @@ mod tests {
         )
         .expect_err("fallback that is itself an alias must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("smart-chat"), "error must name the offender, got: {msg}");
+        assert!(
+            msg.contains("smart-chat"),
+            "error must name the offender, got: {msg}"
+        );
     }
 
     /// R6.P1: an inbound chain — `child → real-model` already exists
@@ -189,15 +192,12 @@ mod tests {
     /// check on the stored target/fallbacks before flipping the flag.
     #[test]
     fn reactivation_rejects_chain_introduced_after_deactivation() {
-        use crate::db::repository::{
-            create_model_alias_with_chain_check, set_model_alias_active,
-        };
+        use crate::db::repository::{create_model_alias_with_chain_check, set_model_alias_active};
 
         let db = fresh_db();
         // 1. Create alias `child → real-model`, then deactivate it.
-        let child_id =
-            create_model_alias_with_chain_check(&db, "child", "real-model", None, None)
-                .expect("child alias create");
+        let child_id = create_model_alias_with_chain_check(&db, "child", "real-model", None, None)
+            .expect("child alias create");
         set_model_alias_active(&db, "child", false).expect("deactivate child");
 
         // 2. While `child` is parked, register a new active alias under
@@ -210,7 +210,10 @@ mod tests {
         let err = set_model_alias_active(&db, "child", true)
             .expect_err("reactivation must detect the chain");
         let msg = format!("{err}");
-        assert!(msg.contains("real-model"), "error must name target, got: {msg}");
+        assert!(
+            msg.contains("real-model"),
+            "error must name target, got: {msg}"
+        );
         // Avoid an unused-binding warning on child_id while still asserting
         // we created the row we then tried to reactivate.
         let _ = child_id;
@@ -224,11 +227,13 @@ mod tests {
         create_alias(&db, "primary-alias", "qwen-base", None, None).unwrap();
         let id = create_alias(&db, "raw-alias", "raw-target", None, None).unwrap();
 
-        let err =
-            update_alias(&db, id, "raw-alias", "primary-alias", true, None, None)
-                .expect_err("update must reject pointing at another alias");
+        let err = update_alias(&db, id, "raw-alias", "primary-alias", true, None, None)
+            .expect_err("update must reject pointing at another alias");
         let msg = format!("{err}");
-        assert!(msg.contains("primary-alias"), "error must name target, got: {msg}");
+        assert!(
+            msg.contains("primary-alias"),
+            "error must name target, got: {msg}"
+        );
     }
 }
 

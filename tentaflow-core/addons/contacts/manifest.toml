@@ -1,0 +1,303 @@
+[addon]
+id = "contacts"
+name = "Contacts"
+version = "0.1.0"
+description = "Centralna baza firm, osob, zatrudnien i relacji dla CRM, Calendar, Billing, Activity i narzedzi AI."
+category = "crm"
+keywords = ["contacts", "crm", "firmy", "osoby", "relacje", "nip"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = "https://tentaflow.local/addons/contacts"
+icon = "users"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt kontaktow"
+description = "Czyta firmy, osoby, zatrudnienia, tagi i relacje z bazy Contacts."
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis kontaktow"
+description = "Tworzy i aktualizuje firmy, osoby, zatrudnienia i relacje w bazie Contacts."
+risk = "medium"
+
+[[permission]]
+id = "http.request"
+display_name = "Wyszukiwanie firm online"
+description = "Pobiera aktualne dane firm z oficjalnego Wykazu VAT Ministerstwa Finansow."
+risk = "high"
+
+[[permission]]
+id = "llm"
+display_name = "Analiza AI kontaktow"
+description = "Uzywa lokalnego LLM do ekstrakcji kontaktow i rekomendacji relacyjnych."
+risk = "medium"
+
+[[permission]]
+id = "ui"
+display_name = "Interfejs Contacts"
+description = "Renderuje pelne widoki aplikacji Contacts w launcherze TentaFlow."
+risk = "low"
+
+[[network_rule]]
+id = "mf-vat-whitelist-https"
+protocol = "tcp"
+host = "wl-api.mf.gov.pl"
+port = 443
+description = "Publiczne wyszukiwanie firm po NIP/REGON w Wykazie VAT MF."
+required = true
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[application]
+entry_panel = "main"
+title = "Contacts"
+icon = "users"
+description = "Firmy, osoby, relacje i mapy kont dla CRM."
+sort_order = 20
+
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+
+[resources]
+memory_mb = 128
+fuel_limit = 50000000
+storage_total_mb = 512
+http_requests_per_minute = 60
+
+[lifecycle]
+background = false
+auto_start = false
+
+[[tool]]
+id = "search_contacts"
+display_name = "Szukaj kontaktow"
+description = "Wyszukuje firmy i osoby po nazwie, NIP, REGON, emailu, stanowisku lub tagach."
+keywords = ["contacts", "search", "firma", "osoba"]
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Fraza wyszukiwania."
+required = false
+
+[[tool.parameter]]
+name = "kind"
+param_type = "string"
+description = "Opcjonalnie: company albo person."
+required = false
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Maksymalna liczba wynikow."
+required = false
+
+[[tool]]
+id = "get_company"
+display_name = "Pobierz firme"
+description = "Pobiera szczegoly firmy wraz z osobami kontaktowymi i relacjami grupy."
+keywords = ["contacts", "company", "firma"]
+
+[[tool.parameter]]
+name = "company_id"
+param_type = "string"
+description = "Identyfikator firmy."
+required = true
+
+[[tool]]
+id = "get_person"
+display_name = "Pobierz osobe"
+description = "Pobiera szczegoly osoby wraz z obecnym zatrudnieniem i relacjami."
+keywords = ["contacts", "person", "osoba"]
+
+[[tool.parameter]]
+name = "person_id"
+param_type = "string"
+description = "Identyfikator osoby."
+required = true
+
+[[tool]]
+id = "create_company"
+display_name = "Utworz firme"
+description = "Tworzy firme recznie albo po lookup online po NIP/REGON."
+keywords = ["contacts", "company", "create", "nip"]
+
+[[tool.parameter]]
+name = "name"
+param_type = "string"
+description = "Nazwa firmy."
+required = false
+
+[[tool.parameter]]
+name = "nip"
+param_type = "string"
+description = "NIP firmy. Gdy online_lookup=true, dane sa pobierane z MF."
+required = false
+
+[[tool.parameter]]
+name = "regon"
+param_type = "string"
+description = "REGON firmy."
+required = false
+
+[[tool.parameter]]
+name = "online_lookup"
+param_type = "boolean"
+description = "Czy pobrac dane online z MF przed zapisem."
+required = false
+
+[[tool]]
+id = "create_person"
+display_name = "Utworz osobe"
+description = "Tworzy osobe i opcjonalnie przypina ja do firmy."
+keywords = ["contacts", "person", "create"]
+
+[[tool.parameter]]
+name = "first_name"
+param_type = "string"
+description = "Imie."
+required = false
+
+[[tool.parameter]]
+name = "last_name"
+param_type = "string"
+description = "Nazwisko."
+required = false
+
+[[tool.parameter]]
+name = "full_name"
+param_type = "string"
+description = "Pelne imie i nazwisko, gdy nie podano osobnych pol."
+required = false
+
+[[tool.parameter]]
+name = "email"
+param_type = "string"
+description = "Glowny email."
+required = false
+
+[[tool.parameter]]
+name = "company_id"
+param_type = "string"
+description = "Firma obecnego zatrudnienia."
+required = false
+
+[[tool.parameter]]
+name = "position_title"
+param_type = "string"
+description = "Stanowisko w firmie."
+required = false
+
+[[tool]]
+id = "attach_person_to_company"
+display_name = "Przypnij osobe do firmy"
+description = "Dodaje lub odswieza zatrudnienie osoby w firmie."
+keywords = ["contacts", "employment", "relationship"]
+
+[[tool.parameter]]
+name = "person_id"
+param_type = "string"
+description = "Identyfikator osoby."
+required = true
+
+[[tool.parameter]]
+name = "company_id"
+param_type = "string"
+description = "Identyfikator firmy."
+required = true
+
+[[tool.parameter]]
+name = "position_title"
+param_type = "string"
+description = "Stanowisko."
+required = false
+
+[[tool]]
+id = "list_persons_in_company"
+display_name = "Osoby w firmie"
+description = "Zwraca osoby przypisane do firmy."
+keywords = ["contacts", "company", "persons"]
+
+[[tool.parameter]]
+name = "company_id"
+param_type = "string"
+description = "Identyfikator firmy."
+required = true
+
+[[tool.parameter]]
+name = "current_only"
+param_type = "boolean"
+description = "Czy zwrocic tylko biezace zatrudnienia."
+required = false
+
+[[tool]]
+id = "get_relationship_map"
+display_name = "Mapa relacji"
+description = "Zwraca graf osob i relacji dla firmy albo osoby."
+keywords = ["contacts", "relations", "map"]
+
+[[tool.parameter]]
+name = "company_id"
+param_type = "string"
+description = "Identyfikator firmy."
+required = false
+
+[[tool.parameter]]
+name = "person_id"
+param_type = "string"
+description = "Identyfikator osoby."
+required = false
+
+[[tool]]
+id = "lookup_company_online"
+display_name = "Firma online po NIP/REGON"
+description = "Pobiera aktualne dane firmy z oficjalnego Wykazu VAT MF bez cache."
+keywords = ["contacts", "company", "lookup", "nip", "regon"]
+
+[[tool.parameter]]
+name = "nip"
+param_type = "string"
+description = "NIP firmy."
+required = false
+
+[[tool.parameter]]
+name = "regon"
+param_type = "string"
+description = "REGON firmy."
+required = false
+
+[[tool]]
+id = "extract_from_text"
+display_name = "Wyciagnij kontakty z tekstu"
+description = "Uzywa LLM do przygotowania propozycji firm, osob i relacji z maila, notatki lub transkrypcji. Nie zapisuje bez potwierdzenia."
+keywords = ["contacts", "ai", "extract"]
+
+[[tool.parameter]]
+name = "text"
+param_type = "string"
+description = "Tekst zrodlowy."
+required = true
+
+[[tool]]
+id = "compute_person_insights"
+display_name = "Wnioski AI o osobie"
+description = "Generuje krotkie wnioski o osobie na podstawie danych Contacts. Bez danych Activity/CRM wynik jest ograniczony."
+keywords = ["contacts", "ai", "insights"]
+
+[[tool.parameter]]
+name = "person_id"
+param_type = "string"
+description = "Identyfikator osoby."
+required = true
