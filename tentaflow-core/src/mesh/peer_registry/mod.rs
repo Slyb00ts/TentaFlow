@@ -87,7 +87,7 @@ impl PeerRegistry {
     /// current entry under a short read lock; callers must already hold an
     /// arc. Returns `None` when `pubkey` is unknown — peer_persisted.pubkey
     /// is NOT NULL, so we skip the UpsertEntry op until pairing/hello fills
-    /// it in. Hints are persisted independently via `UpsertHints`.
+    /// it in.
     fn snapshot_for_persist(g: &PeerEntry) -> Option<PeerPersistSnapshot> {
         let pubkey = g.pubkey.as_ref()?;
         let last_seen_ms = g
@@ -148,14 +148,9 @@ impl PeerRegistry {
 
     /// Persist a freshly-mutated entry. Versions are derived from the bumping
     /// counter on the entry, monotonically increasing per peer. Skips the
-    /// UpsertEntry op when pubkey is missing (snapshot returns None) but
-    /// still emits hints since peer_hints has no FK constraint requiring
-    /// pubkey on the parent — wait, it does (FK on node_id). The hint
-    /// upsert is therefore also gated until at least one UpsertEntry has
-    /// landed. We emit hints unconditionally because the writer applies
-    /// entries first within a flush; if no entry exists, the hint insert
-    /// will FK-fail and be dropped, which is the desired conservative
-    /// behavior for not-yet-known pubkeys.
+    /// UpsertEntry op when pubkey is missing (snapshot returns None). Hints
+    /// are emitted only with a persistable parent row because peer_hints is
+    /// FK-bound to peer_persisted.
     fn persist_entry(&self, g: &mut PeerEntry, persist_hints: bool) {
         if self.persist_tx.get().is_none() {
             return;
@@ -167,18 +162,24 @@ impl PeerRegistry {
                 snapshot: snap,
                 version: g.persisted_version,
             });
+            if persist_hints {
+                let hints = Self::hints_for_persist(g);
+                self.schedule_persist(PersistOp::UpsertHints {
+                    node_id: g.node_id,
+                    hints,
+                });
+            }
         } else {
             tracing::debug!(
                 node_id = %hex::encode(g.node_id),
                 "peer_registry: skipping UpsertEntry — pubkey not yet known"
             );
-        }
-        if persist_hints {
-            let hints = Self::hints_for_persist(g);
-            self.schedule_persist(PersistOp::UpsertHints {
-                node_id: g.node_id,
-                hints,
-            });
+            if persist_hints {
+                tracing::debug!(
+                    node_id = %hex::encode(g.node_id),
+                    "peer_registry: skipping UpsertHints — parent row not persistable yet"
+                );
+            }
         }
     }
 
@@ -235,22 +236,7 @@ impl PeerRegistry {
             return PeerOutcome::Changed { delta };
         }
         let mut entry = PeerEntry::new_discovered(id, hints, now);
-        // First persist: write entry + hints under one logical commit. The
-        // UpsertEntry is only emitted once we know the pubkey; hints flow
-        // independently and will be reconciled on the next flush after
-        // pubkey arrives via set_pubkey.
-        if self.persist_tx.get().is_some() {
-            entry.persisted_version = entry.persisted_version.saturating_add(1);
-            if let Some(snap) = Self::snapshot_for_persist(&entry) {
-                self.schedule_persist(PersistOp::UpsertEntry {
-                    node_id: id,
-                    snapshot: snap,
-                    version: entry.persisted_version,
-                });
-            }
-            let hints = Self::hints_for_persist(&entry);
-            self.schedule_persist(PersistOp::UpsertHints { node_id: id, hints });
-        }
+        self.persist_entry(&mut entry, true);
         w.insert(id, Arc::new(RwLock::new(entry)));
         drop(w);
         let delta = PeerDelta::Discovered { node_id: id };
