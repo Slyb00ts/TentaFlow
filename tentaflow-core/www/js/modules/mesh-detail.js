@@ -86,6 +86,11 @@ const MeshDetailScreen = {
       activeBanner = null;
       bannerNodeId = null;
     }
+    if (recPill) {
+      try { recPill.unmount(); } catch (_e) { /* ignore */ }
+      recPill = null;
+      recPillNodeId = null;
+    }
     const root = document.getElementById('main');
     if (root) {
       if (backHandler) root.removeEventListener('click', backHandler);

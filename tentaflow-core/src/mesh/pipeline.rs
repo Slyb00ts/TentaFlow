@@ -1765,7 +1765,7 @@ fn spawn_quic_event_handler(
                     from_node_id,
                     command,
                 }) => {
-                    info!(from = %from_node_id, "Otrzymano MeshCommand — przekazuje do executora");
+                    debug!(from = %from_node_id, "Otrzymano MeshCommand — przekazuje do executora");
                     qm_events
                         .handle_command_received(&from_node_id, &command)
                         .await;
