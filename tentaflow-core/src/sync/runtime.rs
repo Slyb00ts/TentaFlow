@@ -22,7 +22,9 @@ use crate::sync::ledger::{
     OperationQuery, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
     SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
 };
-use crate::sync::snapshot::{verify_snapshot_signature, SnapshotManager, SnapshotPackageStore};
+use crate::sync::snapshot::{
+    verify_snapshot_signature, SnapshotBuildRequest, SnapshotManager, SnapshotPackageStore,
+};
 use tentaflow_protocol::mesh::{
     MeshSyncAckPayload, MeshSyncOperationWire, MeshSyncPullPayload, MeshSyncPullResponsePayload,
     MeshSyncPushPayload, MeshSyncSnapshotPullPayload, MeshSyncSnapshotResponsePayload,
@@ -281,6 +283,16 @@ pub fn handle_snapshot_response_payload(
     runtime
         .handle_snapshot_response_payload(source_node_id, payload)
         .map(Some)
+}
+
+pub fn build_sql_snapshot_package(
+    partition_id: &str,
+    up_to_sequence: Option<u64>,
+) -> LedgerResult<Option<SyncSnapshot>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    runtime.build_sql_snapshot_package(partition_id, up_to_sequence)
 }
 
 pub fn apply_unapplied_inbox(limit: usize) -> LedgerResult<Option<usize>> {
@@ -595,6 +607,9 @@ impl SyncRuntime {
             to_sequence: None,
             limit: Some(payload.limit as usize),
         })?;
+        for operation in &operations {
+            self.ensure_peer_target_allowed(operation, source_node_id)?;
+        }
         if self.pull_needs_snapshot(&partition_id, payload.from_sequence, &operations)? {
             let snapshot = self
                 .ledger
@@ -607,6 +622,7 @@ impl SyncRuntime {
                 })?;
             return self
                 .build_snapshot_response_from_snapshot(
+                    source_node_id,
                     payload.partition_id,
                     snapshot,
                     true,
@@ -669,6 +685,7 @@ impl SyncRuntime {
             self.ledger
                 .get_snapshot(partition_id.clone(), payload.up_to_sequence, snapshot_id)?;
         self.build_snapshot_response_from_snapshot(
+            source_node_id,
             payload.partition_id,
             snapshot,
             payload.include_tail,
@@ -704,6 +721,7 @@ impl SyncRuntime {
 
     fn build_snapshot_response_from_snapshot(
         &self,
+        target_node_id: &str,
         partition_id: String,
         snapshot: SyncSnapshot,
         include_tail: bool,
@@ -712,14 +730,21 @@ impl SyncRuntime {
         verify_snapshot_signature(&snapshot)?;
         let store = SnapshotPackageStore::new(SnapshotPackageStore::default_root());
         let blob_bytes = store.get_sql_package(&snapshot)?;
+        let blob = crate::sync::snapshot::decode_snapshot_sql_blob(&blob_bytes)?;
+        for operation in &blob.operations {
+            self.ensure_peer_target_allowed(operation, target_node_id)?;
+        }
         let operations_after_snapshot = if include_tail && tail_limit > 0 {
-            self.ledger
-                .get_operations(OperationQuery {
-                    partition_id: snapshot.partition_id.clone(),
-                    from_sequence: Some(snapshot.up_to_sequence.saturating_add(1)),
-                    to_sequence: None,
-                    limit: Some(tail_limit as usize),
-                })?
+            let operations = self.ledger.get_operations(OperationQuery {
+                partition_id: snapshot.partition_id.clone(),
+                from_sequence: Some(snapshot.up_to_sequence.saturating_add(1)),
+                to_sequence: None,
+                limit: Some(tail_limit as usize),
+            })?;
+            for operation in &operations {
+                self.ensure_peer_target_allowed(operation, target_node_id)?;
+            }
+            operations
                 .iter()
                 .map(operation_to_wire)
                 .collect::<LedgerResult<Vec<_>>>()?
@@ -735,6 +760,26 @@ impl SyncRuntime {
             blob_bytes,
             operations_after_snapshot,
         })
+    }
+
+    fn build_sql_snapshot_package(
+        &self,
+        partition_id: &str,
+        up_to_sequence: Option<u64>,
+    ) -> LedgerResult<Option<SyncSnapshot>> {
+        let package_store = SnapshotPackageStore::new(SnapshotPackageStore::default_root());
+        let partition_id = PartitionId::new(partition_id.to_string())?;
+        Ok(SnapshotManager::new(self.ledger.as_ref())
+            .build_sql_package_and_persist(
+                SnapshotBuildRequest {
+                    partition_id,
+                    up_to_sequence,
+                    created_at_ms: now_ms(),
+                },
+                &self.signer,
+                &package_store,
+            )?
+            .map(|result| result.snapshot))
     }
 
     fn build_snapshot_pull_payload(
@@ -1140,6 +1185,14 @@ impl SyncRuntime {
     }
 
     fn ensure_local_target_allowed(&self, operation: &SyncOperation) -> LedgerResult<()> {
+        self.ensure_peer_target_allowed(operation, &self.local_node_id)
+    }
+
+    fn ensure_peer_target_allowed(
+        &self,
+        operation: &SyncOperation,
+        target_node_id: &str,
+    ) -> LedgerResult<()> {
         let targets = repository::list_sync_targets_for_resource(
             &self.db,
             &operation.body.org_id,
@@ -1150,12 +1203,12 @@ impl SyncRuntime {
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         let allowed = targets
             .iter()
-            .any(|target| target.node_id == self.local_node_id);
+            .any(|target| target.node_id == target_node_id);
         if allowed {
             Ok(())
         } else {
             Err(SyncLedgerError::Runtime(format!(
-                "local node is not a sync target for {}/{}/{}",
+                "node {target_node_id} is not a sync target for {}/{}/{}",
                 operation.body.addon_id, operation.body.resource_type, operation.body.resource_id
             )))
         }
