@@ -5165,6 +5165,21 @@ fn sync_conflict_limit(limit: u32) -> usize {
     }
 }
 
+fn validate_sync_conflict_scope(org_id: &str, addon_id: &str) -> Result<(), ProtocolError> {
+    crate::addon::fs_sandbox::validate_addon_id(org_id)
+        .map_err(|_| ProtocolError::bad_request("invalid org_id"))?;
+    crate::addon::fs_sandbox::validate_addon_id(addon_id)
+        .map_err(|_| ProtocolError::bad_request("invalid addon_id"))?;
+    Ok(())
+}
+
+fn validate_sync_conflict_status(status: &str) -> Result<(), ProtocolError> {
+    match status {
+        "open" | "resolved" | "ignored" | "superseded" => Ok(()),
+        _ => Err(ProtocolError::bad_request("invalid conflict status")),
+    }
+}
+
 fn sync_conflict_row_to_wire(
     row: crate::addon::storage_sql_exec::SyncConflictRow,
 ) -> tentaflow_protocol::SyncConflictRow {
@@ -5230,6 +5245,8 @@ pub fn sync_conflict_dispatch(
             } else {
                 request.status.as_str()
             };
+            validate_sync_conflict_scope(org_id, &request.addon_id)?;
+            validate_sync_conflict_status(status)?;
             let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
                 org_id,
                 &request.addon_id,
@@ -5251,6 +5268,7 @@ pub fn sync_conflict_dispatch(
             } else {
                 request.org_id.as_str()
             };
+            validate_sync_conflict_scope(org_id, &request.addon_id)?;
             let operation_id = crate::sync::ledger::OperationId::from_hex(&request.operation_id)
                 .map_err(|_| ProtocolError::bad_request("invalid operation_id"))?;
             let resolution = sync_conflict_resolution_to_storage(&request.resolution);

@@ -1227,6 +1227,16 @@ impl IrohMeshManager {
         .await
     }
 
+    pub async fn send_sync_push(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH, data)
+            .await
+    }
+
+    pub async fn send_sync_ack(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK, data)
+            .await
+    }
+
     /// F1b P3.C-1 — send a frame proxy request to a trust-paired peer.
     /// Caller is responsible for trust gating + correlating the
     /// `request_id` with a pending response slot (P3.C-2 wires the slot

@@ -181,6 +181,18 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         Ok(entries)
     }
 
+    fn list_outbox_for_operation(&self, op_id: OperationId) -> LedgerResult<Vec<OutboxEntry>> {
+        let mut entries = Vec::new();
+        for item in self.outbox.iter() {
+            let (_, value) = item.into_inner()?;
+            let entry: OutboxEntry = decode(value.as_ref())?;
+            if entry.op_id == op_id {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
     fn put_verified_in_inbox(
         &self,
         source: PeerId,

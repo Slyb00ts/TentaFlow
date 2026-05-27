@@ -449,6 +449,7 @@ pub trait SyncLedgerStore: Send + Sync {
         target: SyncTarget,
         limit: usize,
     ) -> LedgerResult<Vec<OutboxEntry>>;
+    fn list_outbox_for_operation(&self, op_id: OperationId) -> LedgerResult<Vec<OutboxEntry>>;
     fn put_verified_in_inbox(
         &self,
         source: PeerId,
