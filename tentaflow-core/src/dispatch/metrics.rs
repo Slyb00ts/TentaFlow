@@ -2,7 +2,7 @@
 // Plik: dispatch/metrics.rs
 // Opis: Per-handler metryki dla WSS dispatch. Liczy wywolania, bledy, lacznie
 //       czas trwania w mikrosekundach. Eksponowane przez snapshot() do
-//       Prometheus exporter (api_dashboard / /metrics endpoint).
+//       wewnetrznej telemetrii runtime.
 //       Wywolywane przez dispatch::dispatch() automatycznie — handlery nie
 //       musza nic robic. #[observed] proc-macro tylko ustanawia marker; logika
 //       liczenia zyje tutaj.
@@ -93,7 +93,6 @@ pub fn record(variant_name: &'static str, duration_us: u64, is_error: bool) {
     m.record(duration_us, is_error);
 }
 
-/// Snapshot wszystkich metryk dla Prometheus eksportera.
 /// Zwraca posortowane Vec dla determinizmu.
 pub fn snapshot_all() -> Vec<(&'static str, VariantMetricsSnapshot)> {
     let guard = registry().read();
@@ -162,52 +161,6 @@ impl Drop for Timer {
 }
 
 // =============================================================================
-// Prometheus text format render
-// =============================================================================
-
-/// Zwraca metryki w formacie Prometheus text exposition (HELP + TYPE + samples).
-/// Pasuje do /metrics endpoint w api_dashboard.
-pub fn render_prometheus() -> String {
-    let mut out = String::new();
-    let snap = snapshot_all();
-
-    out.push_str(
-        "# HELP tentaflow_ws_handler_calls_total Total dispatch calls per MessageBody variant.\n",
-    );
-    out.push_str("# TYPE tentaflow_ws_handler_calls_total counter\n");
-    for (name, s) in &snap {
-        out.push_str(&format!(
-            "tentaflow_ws_handler_calls_total{{variant=\"{}\"}} {}\n",
-            name, s.calls_total
-        ));
-    }
-
-    out.push_str(
-        "# HELP tentaflow_ws_handler_errors_total Total dispatch errors per MessageBody variant.\n",
-    );
-    out.push_str("# TYPE tentaflow_ws_handler_errors_total counter\n");
-    for (name, s) in &snap {
-        out.push_str(&format!(
-            "tentaflow_ws_handler_errors_total{{variant=\"{}\"}} {}\n",
-            name, s.errors_total
-        ));
-    }
-
-    out.push_str(
-        "# HELP tentaflow_ws_handler_duration_us_avg Average handler duration in microseconds.\n",
-    );
-    out.push_str("# TYPE tentaflow_ws_handler_duration_us_avg gauge\n");
-    for (name, s) in &snap {
-        out.push_str(&format!(
-            "tentaflow_ws_handler_duration_us_avg{{variant=\"{}\"}} {}\n",
-            name, s.avg_duration_us
-        ));
-    }
-
-    out
-}
-
-// =============================================================================
 // Testy
 // =============================================================================
 
@@ -261,14 +214,4 @@ mod tests {
         assert_eq!(s.errors_total, 1);
     }
 
-    #[test]
-    fn render_prometheus_includes_all_three_metric_families() {
-        let variant = "TestPrometheusRender";
-        record(variant, 1000, false);
-        let text = render_prometheus();
-        assert!(text.contains("tentaflow_ws_handler_calls_total"));
-        assert!(text.contains("tentaflow_ws_handler_errors_total"));
-        assert!(text.contains("tentaflow_ws_handler_duration_us_avg"));
-        assert!(text.contains(variant));
-    }
 }

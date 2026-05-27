@@ -2506,6 +2506,35 @@ fn field_optional_string(value: Option<&str>) -> crate::sync::ledger::FieldValue
         .unwrap_or(crate::sync::ledger::FieldValue::Null)
 }
 
+fn field_optional_i64(value: Option<i64>) -> crate::sync::ledger::FieldValue {
+    value
+        .map(crate::sync::ledger::FieldValue::I64)
+        .unwrap_or(crate::sync::ledger::FieldValue::Null)
+}
+
+fn sync_resource_acl_core_id(addon_id: &str, resource_type: &str, resource_id: &str) -> String {
+    format!("{addon_id}\u{1f}{resource_type}\u{1f}{resource_id}")
+}
+
+fn sync_explicit_share_core_id(
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+) -> String {
+    format!("{addon_id}\u{1f}{resource_type}\u{1f}{resource_id}\u{1f}{subject_type}\u{1f}{subject_id}\u{1f}{action}")
+}
+
+fn node_user_assignment_core_id(node_id: &str, user_id: i64, assignment_mode: &str) -> String {
+    format!("{node_id}\u{1f}{user_id}\u{1f}{assignment_mode}")
+}
+
+fn sync_user_org_profile_core_id(org_id: &str, user_id: i64) -> String {
+    format!("{org_id}\u{1f}{user_id}")
+}
+
 fn flow_changed_fields(
     params: &FlowParams<'_>,
 ) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
@@ -2587,9 +2616,29 @@ fn record_core_capture_tx(
     changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
     actor_user_id: Option<i64>,
 ) -> Result<()> {
-    let capture = crate::sync::core_capture::CoreWriteCapture::new(
+    record_core_capture_for_org_tx(
+        tx,
         kind,
         crate::services::org::DEFAULT_ORG_ID,
+        resource_id,
+        action,
+        changed_fields,
+        actor_user_id,
+    )
+}
+
+fn record_core_capture_for_org_tx(
+    tx: &rusqlite::Transaction<'_>,
+    kind: crate::sync::core_registry::CoreSyncResourceKind,
+    org_id: &str,
+    resource_id: impl Into<String>,
+    action: crate::sync::runtime::SqlWriteAction,
+    changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
+    actor_user_id: Option<i64>,
+) -> Result<()> {
+    let capture = crate::sync::core_capture::CoreWriteCapture::new(
+        kind,
+        org_id,
         resource_id,
         action,
         changed_fields,
@@ -4832,13 +4881,21 @@ fn row_to_node_user_assignment(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node
 fn row_to_sync_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncPolicy> {
     let resource_type: String = row.get(3)?;
     let resource_id: String = row.get(4)?;
+    let mode: String = row.get(5)?;
+    let mode = SyncPolicyMode::parse(&mode).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            format!("invalid sync policy mode: {mode}").into(),
+        )
+    })?;
     Ok(SyncPolicy {
         policy_id: row.get(0)?,
         org_id: row.get(1)?,
         addon_id: row.get(2)?,
         resource_type: (!resource_type.is_empty()).then_some(resource_type),
         resource_id: (!resource_id.is_empty()).then_some(resource_id),
-        mode: row.get(5)?,
+        mode,
         authority_node_id: row.get(6)?,
         retention_days: row.get(7)?,
         is_enabled: row.get(8)?,
@@ -4859,8 +4916,9 @@ pub fn upsert_sync_node_identity(
     owner_user_id: Option<i64>,
     sync_profile: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO sync_nodes \
          (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
@@ -4883,7 +4941,24 @@ pub fn upsert_sync_node_identity(
             sync_profile
         ],
     )?;
-    bump_sync_permission_epoch_with_conn(&conn, crate::services::org::DEFAULT_ORG_ID)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("public_key".to_string(), field_string(public_key));
+    fields.insert("public_key_type".to_string(), field_string(public_key_type));
+    fields.insert("display_name".to_string(), field_string(display_name));
+    fields.insert("node_kind".to_string(), field_string(node_kind));
+    fields.insert("trust_status".to_string(), field_string(trust_status));
+    fields.insert("owner_user_id".to_string(), field_optional_i64(owner_user_id));
+    fields.insert("sync_profile".to_string(), field_string(sync_profile));
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncNode,
+        node_id,
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        owner_user_id,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -4922,8 +4997,9 @@ pub fn upsert_user_identity_key(
     public_key: &str,
     purpose: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO user_identity_keys (key_id, user_id, key_type, public_key, purpose, status, revoked_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'active', NULL) \
          ON CONFLICT(key_id) DO UPDATE SET \
@@ -4935,6 +5011,22 @@ pub fn upsert_user_identity_key(
              revoked_at = NULL",
         rusqlite::params![key_id, user_id, key_type, public_key, purpose],
     )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("key_type".to_string(), field_string(key_type));
+    fields.insert("public_key".to_string(), field_string(public_key));
+    fields.insert("purpose".to_string(), field_string(purpose));
+    fields.insert("status".to_string(), field_string("active"));
+    fields.insert("revoked_at".to_string(), crate::sync::ledger::FieldValue::Null);
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserIdentityKey,
+        key_id,
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        Some(user_id),
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -4955,13 +5047,29 @@ pub fn list_active_user_identity_keys(pool: &DbPool, user_id: i64) -> Result<Vec
 
 /// Revoke klucza uzytkownika bez usuwania historii.
 pub fn revoke_user_identity_key(pool: &DbPool, key_id: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE user_identity_keys \
          SET status = 'revoked', revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
          WHERE key_id = ?1",
         rusqlite::params![key_id],
     )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("status".to_string(), field_string("revoked"));
+    fields.insert(
+        "revoked_at".to_string(),
+        field_string(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+    );
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserIdentityKey,
+        key_id,
+        crate::sync::runtime::SqlWriteAction::Update,
+        fields,
+        None,
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -4973,8 +5081,9 @@ pub fn assign_node_to_user(
     assignment_mode: &str,
     created_by: Option<i64>,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO node_user_assignments \
          (node_id, user_id, assignment_mode, valid_until, created_by) \
          VALUES (?1, ?2, ?3, NULL, ?4) \
@@ -4983,7 +5092,21 @@ pub fn assign_node_to_user(
              created_by = excluded.created_by",
         rusqlite::params![node_id, user_id, assignment_mode, created_by],
     )?;
-    bump_sync_permission_epoch_with_conn(&conn, crate::services::org::DEFAULT_ORG_ID)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("node_id".to_string(), field_string(node_id));
+    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("assignment_mode".to_string(), field_string(assignment_mode));
+    fields.insert("created_by".to_string(), field_optional_i64(created_by));
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::NodeUserAssignment,
+        node_user_assignment_core_id(node_id, user_id, assignment_mode),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        created_by,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -4994,14 +5117,32 @@ pub fn revoke_node_user_assignment(
     user_id: i64,
     assignment_mode: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE node_user_assignments \
          SET valid_until = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
          WHERE node_id = ?1 AND user_id = ?2 AND assignment_mode = ?3 AND valid_until IS NULL",
         rusqlite::params![node_id, user_id, assignment_mode],
     )?;
-    bump_sync_permission_epoch_with_conn(&conn, crate::services::org::DEFAULT_ORG_ID)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("node_id".to_string(), field_string(node_id));
+    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("assignment_mode".to_string(), field_string(assignment_mode));
+    fields.insert(
+        "valid_until".to_string(),
+        field_string(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+    );
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::NodeUserAssignment,
+        node_user_assignment_core_id(node_id, user_id, assignment_mode),
+        crate::sync::runtime::SqlWriteAction::Update,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -5070,8 +5211,9 @@ pub fn upsert_sync_user_org_profile(
     manager_user_id: Option<i64>,
     is_department_manager: bool,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO sync_user_org_profiles \
          (org_id, user_id, department_id, manager_user_id, is_department_manager) \
          VALUES (?1, ?2, ?3, ?4, ?5) \
@@ -5087,7 +5229,32 @@ pub fn upsert_sync_user_org_profile(
             is_department_manager
         ],
     )?;
-    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert(
+        "department_id".to_string(),
+        field_optional_string(department_id),
+    );
+    fields.insert(
+        "manager_user_id".to_string(),
+        field_optional_i64(manager_user_id),
+    );
+    fields.insert(
+        "is_department_manager".to_string(),
+        crate::sync::ledger::FieldValue::Bool(is_department_manager),
+    );
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncUserOrgProfile,
+        org_id,
+        sync_user_org_profile_core_id(org_id, user_id),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        Some(user_id),
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -5104,8 +5271,9 @@ pub fn upsert_sync_resource_acl(
     manager_user_id: Option<i64>,
     visibility_scope: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO sync_resource_acl \
          (org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, department_id, manager_user_id, visibility_scope) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
@@ -5127,7 +5295,36 @@ pub fn upsert_sync_resource_acl(
             visibility_scope
         ],
     )?;
-    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("owner_user_id".to_string(), field_optional_i64(owner_user_id));
+    fields.insert(
+        "assigned_user_id".to_string(),
+        field_optional_i64(assigned_user_id),
+    );
+    fields.insert(
+        "department_id".to_string(),
+        field_optional_string(department_id),
+    );
+    fields.insert(
+        "manager_user_id".to_string(),
+        field_optional_i64(manager_user_id),
+    );
+    fields.insert("visibility_scope".to_string(), field_string(visibility_scope));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncResourceAcl,
+        org_id,
+        sync_resource_acl_core_id(addon_id, resource_type, resource_id),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -5155,6 +5352,40 @@ pub fn get_sync_resource_acl(
     Ok(acl)
 }
 
+/// Usuwa metadata dostepu zasobu.
+pub fn delete_sync_resource_acl(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM sync_resource_acl \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4",
+        rusqlite::params![org_id, addon_id, resource_type, resource_id],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncResourceAcl,
+        org_id,
+        sync_resource_acl_core_id(addon_id, resource_type, resource_id),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Przyznaje jawny dostep do zasobu userowi albo node.
 pub fn grant_sync_explicit_share(
     pool: &DbPool,
@@ -5167,8 +5398,9 @@ pub fn grant_sync_explicit_share(
     action: &str,
     granted_by: Option<i64>,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO sync_explicit_shares \
          (org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action, granted_by, revoked_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL) \
@@ -5187,7 +5419,33 @@ pub fn grant_sync_explicit_share(
             granted_by
         ],
     )?;
-    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("subject_type".to_string(), field_string(subject_type));
+    fields.insert("subject_id".to_string(), field_string(subject_id));
+    fields.insert("action".to_string(), field_string(action));
+    fields.insert("granted_by".to_string(), field_optional_i64(granted_by));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncExplicitShare,
+        org_id,
+        sync_explicit_share_core_id(
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action,
+        ),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        granted_by,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -5202,8 +5460,9 @@ pub fn revoke_sync_explicit_share(
     subject_id: &str,
     action: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE sync_explicit_shares \
          SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
          WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
@@ -5218,7 +5477,36 @@ pub fn revoke_sync_explicit_share(
             action
         ],
     )?;
-    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("subject_type".to_string(), field_string(subject_type));
+    fields.insert("subject_id".to_string(), field_string(subject_id));
+    fields.insert("action".to_string(), field_string(action));
+    fields.insert(
+        "revoked_at".to_string(),
+        field_string(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+    );
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncExplicitShare,
+        org_id,
+        sync_explicit_share_core_id(
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action,
+        ),
+        crate::sync::runtime::SqlWriteAction::Update,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -5319,6 +5607,39 @@ pub fn can_node_receive_sync_resource(
         resource_type,
         resource_id,
     )
+}
+
+/// Sprawdza czy node moze wykonac konkretna akcje na zasobie bez materializacji.
+pub fn can_node_access_sync_resource(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    action: &str,
+) -> Result<SyncAccessDecision> {
+    let conn = acquire(pool)?;
+    let node = load_sync_node_identity_with_conn(&conn, node_id)?;
+    let Some(node) = node else {
+        return Ok(deny("node_missing"));
+    };
+    if node.trust_status != "trusted" {
+        return Ok(deny("node_not_trusted"));
+    }
+    if has_explicit_share_with_conn(
+        &conn,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        "node",
+        node_id,
+        action,
+    )? {
+        return Ok(allow("explicit_share"));
+    }
+    Ok(deny("no_matching_rule"))
 }
 
 fn can_node_receive_sync_resource_with_conn(
@@ -5544,10 +5865,13 @@ pub fn upsert_sync_policy(
     retention_days: Option<i64>,
     is_enabled: bool,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
+    let mode = SyncPolicyMode::parse(mode)
+        .ok_or_else(|| anyhow::anyhow!("invalid sync policy mode: {mode}"))?;
+    let mut conn = acquire(pool)?;
     let resource_type = resource_type.unwrap_or("");
     let resource_id = resource_id.unwrap_or("");
-    conn.execute(
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO sync_policies \
          (policy_id, org_id, addon_id, resource_type, resource_id, mode, authority_node_id, retention_days, is_enabled) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
@@ -5563,13 +5887,41 @@ pub fn upsert_sync_policy(
             addon_id,
             resource_type,
             resource_id,
-            mode,
+            mode.as_str(),
             authority_node_id,
             retention_days,
             is_enabled
         ],
     )?;
-    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("mode".to_string(), field_string(mode.as_str()));
+    fields.insert(
+        "authority_node_id".to_string(),
+        field_optional_string(authority_node_id),
+    );
+    fields.insert(
+        "retention_days".to_string(),
+        field_optional_i64(retention_days),
+    );
+    fields.insert(
+        "is_enabled".to_string(),
+        crate::sync::ledger::FieldValue::Bool(is_enabled),
+    );
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncPolicy,
+        org_id,
+        policy_id,
+        crate::sync::runtime::SqlWriteAction::Insert,
+        fields,
+        None,
+    )?;
+    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -5603,9 +5955,9 @@ pub fn list_sync_targets_for_resource(
         return Ok(Vec::new());
     }
 
-    match policy.mode.as_str() {
-        "local_only" | "ephemeral" => Ok(Vec::new()),
-        "authority_readthrough" | "authority_write" => {
+    match policy.mode {
+        SyncPolicyMode::LocalOnly | SyncPolicyMode::Ephemeral => Ok(Vec::new()),
+        SyncPolicyMode::AuthorityReadthrough | SyncPolicyMode::AuthorityWrite => {
             let Some(node_id) = policy.authority_node_id else {
                 return Ok(Vec::new());
             };
@@ -5621,20 +5973,19 @@ pub fn list_sync_targets_for_resource(
             {
                 Ok(vec![SyncPolicyTarget {
                     node_id,
-                    reason: policy.mode,
+                    reason: policy.mode.to_string(),
                 }])
             } else {
                 Ok(Vec::new())
             }
         }
-        "replicated_by_permission" | "sharded" => list_permission_filtered_sync_targets_with_conn(
+        SyncPolicyMode::ReplicatedByPermission | SyncPolicyMode::Sharded => list_permission_filtered_sync_targets_with_conn(
             &conn,
             org_id,
             addon_id,
             resource_type,
             resource_id,
         ),
-        _ => Ok(Vec::new()),
     }
 }
 
@@ -14022,7 +14373,7 @@ mod chunk_c_visibility_consumer_tests {
                 .expect("effective policy");
 
         assert_eq!(policy.policy_id, "policy-resource");
-        assert_eq!(policy.mode, "local_only");
+        assert_eq!(policy.mode, SyncPolicyMode::LocalOnly);
     }
 
     #[test]

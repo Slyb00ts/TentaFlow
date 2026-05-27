@@ -644,6 +644,10 @@ pub const MESH_MSG_COMMAND: u8 = 0x30;
 pub const MESH_MSG_COMMAND_RESPONSE: u8 = 0x31;
 pub const MESH_MSG_DEPLOY_PROGRESS: u8 = 0x32;
 pub const MESH_MSG_LOG_CHUNK: u8 = 0x33;
+/// Online authority storage request for central-only addon data.
+pub const MESH_MSG_STORAGE_PROXY_REQUEST: u8 = 0x34;
+/// Online authority storage response for central-only addon data.
+pub const MESH_MSG_STORAGE_PROXY_RESPONSE: u8 = 0x35;
 pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
 pub const MESH_MSG_FORWARD_STREAM_REQ: u8 = 0x38;
 pub const MESH_MSG_ALIAS_SYNC: u8 = 0x39;
@@ -1032,6 +1036,127 @@ pub struct MeshSyncSnapshotResponsePayload {
     pub snapshot_bytes: Vec<u8>,
     pub blob_bytes: Vec<u8>,
     pub operations_after_snapshot: Vec<MeshSyncOperationWire>,
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub enum StorageValueWire {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub enum StorageProxyRequestKind {
+    SqlExec {
+        query: String,
+        params: Vec<StorageValueWire>,
+    },
+    SqlQuery {
+        query: String,
+        params: Vec<StorageValueWire>,
+        one: bool,
+        limit: Option<u32>,
+    },
+    KvGet {
+        instance_id: String,
+        key: String,
+    },
+    KvSet {
+        instance_id: String,
+        key: String,
+        value: Vec<u8>,
+    },
+    KvDelete {
+        instance_id: String,
+        key: String,
+    },
+    KvList {
+        instance_id: String,
+        prefix: Option<String>,
+    },
+    BlobGetChunk {
+        sha256: String,
+        offset: u64,
+        length: u32,
+    },
+    BlobPutChunk {
+        blob_id: String,
+        sha256: String,
+        mime: String,
+        size_bytes: u64,
+        chunk_index: u32,
+        chunk_count: u32,
+        chunk_sha256: String,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct StorageProxyRequestPayload {
+    pub request_id: String,
+    pub from_node_id: String,
+    pub org_id: String,
+    pub addon_id: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub actor_user_id: Option<i64>,
+    pub kind: StorageProxyRequestKind,
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub enum StorageProxyResponseKind {
+    SqlExec {
+        rows_affected: u64,
+        last_insert_id: i64,
+    },
+    SqlRows {
+        columns: Vec<String>,
+        rows: Vec<Vec<StorageValueWire>>,
+    },
+    SqlOne {
+        row: Option<Vec<StorageValueWire>>,
+    },
+    KvValue {
+        value: Option<Vec<u8>>,
+    },
+    KvWrite {
+        rows_affected: u64,
+    },
+    KvKeys {
+        keys: Vec<String>,
+    },
+    BlobChunk {
+        sha256: String,
+        mime: String,
+        size_bytes: u64,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    BlobWrite {
+        blob_id: String,
+        sha256: String,
+        complete: bool,
+        received_chunks: u32,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct StorageProxyResponsePayload {
+    pub request_id: String,
+    pub from_node_id: String,
+    pub kind: StorageProxyResponseKind,
 }
 
 // =============================================================================

@@ -225,9 +225,6 @@ pub async fn handle_request(
         // Lista dostepnych modeli
         ("GET", "/v1/models") => handle_models_list(router).await,
 
-        // Prometheus metrics
-        ("GET", "/metrics") => handle_metrics(router).await,
-
         // 404 Not Found
         _ => {
             warn!("Nieznany endpoint: {} {}", method, path);
@@ -1271,78 +1268,6 @@ async fn handle_models_list(
     Ok(json_response(StatusCode::OK, body))
 }
 
-// =============================================================================
-// PROMETHEUS METRICS HANDLER
-// =============================================================================
-// Zwraca metryki w formacie Prometheus
-
-async fn handle_metrics(
-    router: Arc<Router>,
-) -> std::result::Result<
-    Response<
-        StreamBody<
-            Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>,
-        >,
-    >,
-    hyper::Error,
-> {
-    let metrics = router.get_metrics();
-
-    // Format Prometheus text format
-    let mut output = String::new();
-    output.push_str("# HELP tentaflow_router_info Router information\n");
-    output.push_str("# TYPE tentaflow_router_info gauge\n");
-    output.push_str("tentaflow_router_info{version=\"0.1.0\"} 1\n\n");
-
-    // Backend health metrics
-    output.push_str(
-        "# HELP tentaflow_ai_backend_healthy Backend health status (1=healthy, 0=unhealthy)\n",
-    );
-    output.push_str("# TYPE tentaflow_ai_backend_healthy gauge\n");
-    for (model_name, backend_metrics) in &metrics.backends {
-        for (backend_idx, backend_metric) in backend_metrics.iter().enumerate() {
-            let health_value = if backend_metric.is_healthy { 1 } else { 0 };
-            output.push_str(&format!(
-                "tentaflow_ai_backend_healthy{{model=\"{}\",backend=\"{}\"}} {}\n",
-                model_name, backend_idx, health_value
-            ));
-        }
-    }
-    output.push_str("\n");
-
-    // Request counters
-    output.push_str("# HELP tentaflow_ai_requests_total Total number of requests\n");
-    output.push_str("# TYPE tentaflow_ai_requests_total counter\n");
-    output.push_str(&format!(
-        "tentaflow_ai_requests_total{{}} {}\n\n",
-        metrics.total_requests
-    ));
-
-    // Active connections
-    output
-        .push_str("# HELP tentaflow_ai_active_connections Current number of active connections\n");
-    output.push_str("# TYPE tentaflow_ai_active_connections gauge\n");
-    output.push_str(&format!(
-        "tentaflow_ai_active_connections{{}} {}\n\n",
-        metrics.active_connections
-    ));
-
-    // WSS handler metrics (per MessageBody variant). Lazy-init w
-    // dispatch::metrics gdy ktorykolwiek handler bedzie wywolany.
-    output.push_str(&crate::dispatch::metrics::render_prometheus());
-
-    let body = hyper::body::Bytes::from(output);
-    let stream = futures::stream::once(async move { Ok(Frame::data(body)) });
-    let boxed_stream: Pin<
-        Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
-    > = Box::pin(stream);
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/plain; version=0.0.4")
-        .body(StreamBody::new(boxed_stream))
-        .unwrap())
-}
 
 /// Sprawdza czy request ma wlaczony debug routing (header lub query param)
 fn is_debug_route_openai(headers: &hyper::header::HeaderMap, uri: &hyper::Uri) -> bool {

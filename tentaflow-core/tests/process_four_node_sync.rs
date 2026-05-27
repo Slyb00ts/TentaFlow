@@ -24,6 +24,9 @@ use tentaflow_core::sync::core_registry::{
 };
 use tentaflow_core::sync::ledger::{FieldValue, OperationId};
 use tentaflow_core::sync::runtime::{MeshSyncPullResult, SqlWriteAction, SqlWriteCapture};
+use tentaflow_protocol::mesh::{
+    StorageProxyRequestKind, StorageProxyRequestPayload, StorageValueWire,
+};
 
 const FLOW_ID: &str = "92001";
 const SUITE_ORG_ID: &str = "org-process";
@@ -321,18 +324,124 @@ fn process_four_node_permission_gating_blocks_unshared_target() {
 }
 
 #[test]
+fn process_four_node_central_only_clients_do_not_materialize_sql() {
+    if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("process e2e root");
+    let mut authority = ChildNode::spawn("authority", root.path().join("authority"));
+    let mut replicated = ChildNode::spawn("replicated", root.path().join("replicated"));
+    let mut central_a = ChildNode::spawn("central-a", root.path().join("central-a"));
+    let mut central_b = ChildNode::spawn("central-b", root.path().join("central-b"));
+
+    connect_nodes(&mut authority, &mut replicated);
+    connect_nodes(&mut authority, &mut central_a);
+    connect_nodes(&mut authority, &mut central_b);
+
+    let seed_source_args = [&replicated, &central_a, &central_b]
+        .iter()
+        .map(|receiver| format!("{} {}", receiver.node_id, receiver.public_key))
+        .collect::<Vec<_>>()
+        .join(" ");
+    authority.command(&format!("SEED_SQL_SOURCE 3 1 {}", seed_source_args));
+    replicated.command("SEED_SQL_RECEIVER");
+    central_a.command("SEED_SQL_RECEIVER");
+    central_b.command("SEED_SQL_RECEIVER");
+
+    let sql_op = parse_record_flow_op_id(&authority.command("RECORD_SQL_INSERT central-source"));
+    let snapshot_line = authority.command("BUILD_SQL_SNAPSHOT 1");
+    let snapshot = parse_snapshot_line(&snapshot_line);
+
+    authority.command(&format!("ASSERT_NO_PAYLOAD {}", central_a.node_id));
+    authority.command(&format!("ASSERT_NO_PAYLOAD {}", central_b.node_id));
+    authority.command(&format!("ASSERT_REPAIR_DENIED {}", central_a.node_id));
+    authority.command(&format!("ASSERT_REPAIR_DENIED {}", central_b.node_id));
+    authority.command(&format!(
+        "ASSERT_SNAPSHOT_DENIED {} {} {}",
+        central_a.node_id, snapshot.0, snapshot.1
+    ));
+    authority.command(&format!(
+        "ASSERT_SNAPSHOT_DENIED {} {} {}",
+        central_b.node_id, snapshot.0, snapshot.1
+    ));
+
+    authority.command(&format!("PUSH {}", replicated.node_id));
+    authority.command(&format!("WAIT_ACKS {} 1", sql_op));
+    replicated.command("WAIT_SQL_NAME central-source");
+    central_a.command("ASSERT_NO_SQL");
+    central_b.command("ASSERT_NO_SQL");
+}
+
+#[test]
+fn process_four_node_central_only_clients_read_and_write_through_authority() {
+    if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("process e2e root");
+    let mut authority = ChildNode::spawn("authority", root.path().join("authority"));
+    let mut replicated = ChildNode::spawn("replicated", root.path().join("replicated"));
+    let mut central_a = ChildNode::spawn("central-a", root.path().join("central-a"));
+    let mut central_b = ChildNode::spawn("central-b", root.path().join("central-b"));
+
+    connect_nodes(&mut authority, &mut replicated);
+    connect_nodes(&mut authority, &mut central_a);
+    connect_nodes(&mut authority, &mut central_b);
+
+    let seed_source_args = [&replicated, &central_a, &central_b]
+        .iter()
+        .map(|receiver| format!("{} {}", receiver.node_id, receiver.public_key))
+        .collect::<Vec<_>>()
+        .join(" ");
+    authority.command(&format!("SEED_SQL_SOURCE 3 1 {}", seed_source_args));
+    replicated.command("SEED_SQL_RECEIVER");
+    central_a.command(&format!(
+        "SEED_SQL_CENTRAL_CLIENT {} {}",
+        authority.node_id, authority.public_key
+    ));
+    central_b.command(&format!(
+        "SEED_SQL_CENTRAL_CLIENT {} {}",
+        authority.node_id, authority.public_key
+    ));
+
+    authority.command("LOCAL_SQL_INSERT central-source");
+    central_a.command(&format!(
+        "REMOTE_SQL_QUERY {} central-source",
+        authority.node_id
+    ));
+    central_a.command(&format!(
+        "REMOTE_SQL_EXEC {} central-write-a",
+        authority.node_id
+    ));
+    authority.command("WAIT_SQL_NAME central-write-a");
+    central_b.command(&format!(
+        "REMOTE_SQL_QUERY {} central-write-a",
+        authority.node_id
+    ));
+
+    let sql_op = parse_record_flow_op_id(&authority.command("RECORD_SQL_INSERT replicated-copy"));
+    authority.command(&format!("PUSH {}", replicated.node_id));
+    authority.command(&format!("WAIT_ACKS {} 1", sql_op));
+    replicated.command("WAIT_SQL_NAME replicated-copy");
+    central_a.command("ASSERT_NO_SQL");
+    central_b.command("ASSERT_NO_SQL");
+}
+
+#[test]
 fn process_four_node_core_suite_materializes_after_restart() {
     if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
         return;
     }
 
     let root = tempfile::tempdir().expect("process e2e root");
+    let source_home = root.path().join("source");
     let receiver_homes = [
         root.path().join("receiver-a"),
         root.path().join("receiver-b"),
         root.path().join("receiver-c"),
     ];
-    let mut source = ChildNode::spawn("source", root.path().join("source"));
+    let mut source = ChildNode::spawn("source", source_home.clone());
     let mut receivers = vec![
         ChildNode::spawn("receiver-a", receiver_homes[0].clone()),
         ChildNode::spawn("receiver-b", receiver_homes[1].clone()),
@@ -369,6 +478,9 @@ fn process_four_node_core_suite_materializes_after_restart() {
     }
 
     drop(receivers);
+    drop(source);
+
+    let mut source = ChildNode::spawn("source-restart", source_home);
     let mut receivers = vec![
         ChildNode::spawn("receiver-a-restart", receiver_homes[0].clone()),
         ChildNode::spawn("receiver-b-restart", receiver_homes[1].clone()),
@@ -376,6 +488,9 @@ fn process_four_node_core_suite_materializes_after_restart() {
     ];
     for receiver in &mut receivers {
         receiver.command("WAIT_CORE_SUITE");
+    }
+    for op_id in &op_ids {
+        source.command(&format!("ASSERT_NO_PENDING {}", op_id));
     }
 }
 
@@ -549,6 +664,8 @@ async fn child_main() {
     let _mesh_task = mesh.start();
     let mut events = mesh.subscribe();
     let mesh_for_events = mesh.clone();
+    let db_for_events = db.clone();
+    let local_node_id_for_events = local_node_id.clone();
     tokio::spawn(async move {
         loop {
             match events.recv().await {
@@ -685,6 +802,23 @@ async fn child_main() {
                         .await
                         .expect("send snapshot ack");
                 }
+                Ok(IrohMeshEvent::StorageProxyRequestReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    tentaflow_core::services::storage_proxy::handle_request(
+                        mesh_for_events.as_ref().clone(),
+                        db_for_events.clone(),
+                        local_node_id_for_events.clone(),
+                        from_node_id,
+                        payload,
+                    )
+                    .await;
+                }
+                Ok(IrohMeshEvent::StorageProxyResponseReceived { payload, .. }) => {
+                    tentaflow_core::services::storage_proxy::storage_proxy_client()
+                        .handle_response(payload);
+                }
                 Ok(IrohMeshEvent::PeerConnected { .. }) => {}
                 Ok(_) => {}
                 Err(_) => break,
@@ -753,6 +887,20 @@ async fn handle_child_command(
             seed_sql_receiver(db, local_node_id, &security.public_key_hex())?;
             Ok("SEED_SQL_RECEIVER".to_string())
         }
+        [
+            "SEED_SQL_CENTRAL_CLIENT",
+            authority_node_id,
+            authority_public_key,
+        ] => {
+            seed_sql_central_client(
+                db,
+                local_node_id,
+                &security.public_key_hex(),
+                authority_node_id,
+                authority_public_key,
+            )?;
+            Ok("SEED_SQL_CENTRAL_CLIENT".to_string())
+        }
         ["SEED_SOURCE", count, rest @ ..] => {
             let count = count.parse::<usize>()?;
             anyhow::ensure!(rest.len() == count * 2, "target tuple count mismatch");
@@ -770,7 +918,13 @@ async fn handle_child_command(
             let allowed_count = allowed_count.parse::<usize>()?;
             anyhow::ensure!(rest.len() == count * 2, "target tuple count mismatch");
             anyhow::ensure!(allowed_count <= count, "allowed target count mismatch");
-            seed_sql_source(db, rest, allowed_count)?;
+            seed_sql_source(
+                db,
+                local_node_id,
+                &security.public_key_hex(),
+                rest,
+                allowed_count,
+            )?;
             Ok("SEED_SQL_SOURCE".to_string())
         }
         ["SEED_SOURCE_ALLOWED", count, allowed_count, rest @ ..] => {
@@ -825,6 +979,14 @@ async fn handle_child_command(
         ["LOCAL_SQL_INSERT", name] => {
             local_sql_insert(name)?;
             Ok("LOCAL_SQL_INSERT".to_string())
+        }
+        ["REMOTE_SQL_QUERY", authority_node_id, expected_name] => {
+            remote_sql_query(mesh, local_node_id, authority_node_id, expected_name).await?;
+            Ok("REMOTE_SQL_QUERY".to_string())
+        }
+        ["REMOTE_SQL_EXEC", authority_node_id, name] => {
+            remote_sql_exec(mesh, local_node_id, authority_node_id, name).await?;
+            Ok("REMOTE_SQL_EXEC".to_string())
         }
         ["BUILD_SQL_SNAPSHOT", sequence] => {
             let sequence = sequence.parse::<u64>()?;
@@ -886,6 +1048,10 @@ async fn handle_child_command(
         ["WAIT_SQL_NAME", name] => {
             wait_for_sql_name(name).await?;
             Ok("WAIT_SQL_NAME".to_string())
+        }
+        ["ASSERT_NO_SQL"] => {
+            assert_no_sql().await?;
+            Ok("ASSERT_NO_SQL".to_string())
         }
         ["WAIT_SQL_CONFLICT"] => {
             wait_for_sql_conflict().await?;
@@ -1099,6 +1265,52 @@ fn seed_sql_receiver(
     Ok(())
 }
 
+fn seed_sql_central_client(
+    db: &tentaflow_core::db::DbPool,
+    local_node_id: &str,
+    local_public_key: &str,
+    authority_node_id: &str,
+    authority_public_key: &str,
+) -> anyhow::Result<()> {
+    repository::upsert_sync_node_identity(
+        db,
+        local_node_id,
+        local_public_key,
+        "ed25519",
+        "Process SQL Central Client",
+        "desktop",
+        "trusted",
+        None,
+        "standard",
+    )?;
+    repository::upsert_sync_node_identity(
+        db,
+        authority_node_id,
+        authority_public_key,
+        "ed25519",
+        "Process SQL Authority",
+        "server",
+        "trusted",
+        None,
+        "authority",
+    )?;
+    repository::upsert_sync_policy(
+        db,
+        "process-sql-central-client",
+        "org-default",
+        SNAPSHOT_ADDON_ID,
+        Some("person"),
+        None,
+        "replicated_by_permission",
+        Some(authority_node_id),
+        None,
+        true,
+    )?;
+    open_sql_table()?;
+    reset_sql_table()?;
+    Ok(())
+}
+
 fn seed_source(db: &tentaflow_core::db::DbPool, targets: &[&str]) -> anyhow::Result<()> {
     seed_source_with_allowed_targets(db, targets, targets.len() / 2)
 }
@@ -1140,9 +1352,22 @@ fn seed_source_core_suite(db: &tentaflow_core::db::DbPool, targets: &[&str]) -> 
 
 fn seed_sql_source(
     db: &tentaflow_core::db::DbPool,
+    local_node_id: &str,
+    local_public_key: &str,
     targets: &[&str],
     allowed_count: usize,
 ) -> anyhow::Result<()> {
+    repository::upsert_sync_node_identity(
+        db,
+        local_node_id,
+        local_public_key,
+        "ed25519",
+        "Process SQL Authority",
+        "server",
+        "trusted",
+        None,
+        "authority",
+    )?;
     repository::upsert_sync_policy(
         db,
         "process-sql-source",
@@ -1151,7 +1376,7 @@ fn seed_sql_source(
         Some("person"),
         None,
         "replicated_by_permission",
-        None,
+        Some(local_node_id),
         None,
         true,
     )?;
@@ -1181,10 +1406,32 @@ fn seed_sql_source(
                 "sync_receive",
                 Some(1),
             )?;
+        } else {
+            grant_storage_proxy_target(db, node_id)?;
         }
     }
     open_sql_table()?;
     reset_sql_table()?;
+    Ok(())
+}
+
+fn grant_storage_proxy_target(
+    db: &tentaflow_core::db::DbPool,
+    node_id: &str,
+) -> anyhow::Result<()> {
+    for action in ["read", "write"] {
+        repository::grant_sync_explicit_share(
+            db,
+            "org-default",
+            SNAPSHOT_ADDON_ID,
+            "person",
+            "person-1",
+            "node",
+            node_id,
+            action,
+            Some(1),
+        )?;
+    }
     Ok(())
 }
 
@@ -1598,6 +1845,82 @@ fn local_sql_insert(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn remote_sql_query(
+    mesh: &IrohMeshManager,
+    local_node_id: &str,
+    authority_node_id: &str,
+    expected_name: &str,
+) -> anyhow::Result<()> {
+    let request = StorageProxyRequestPayload {
+        request_id: String::new(),
+        from_node_id: local_node_id.to_string(),
+        org_id: "org-default".to_string(),
+        addon_id: SNAPSHOT_ADDON_ID.to_string(),
+        resource_type: "person".to_string(),
+        resource_id: "person-1".to_string(),
+        actor_user_id: Some(7),
+        kind: StorageProxyRequestKind::SqlQuery {
+            query: "SELECT name FROM contacts WHERE id = ?1".to_string(),
+            params: vec![StorageValueWire::I64(1)],
+            one: true,
+            limit: Some(1),
+        },
+    };
+    let response = tentaflow_core::services::storage_proxy::remote_sql_query(
+        mesh,
+        authority_node_id,
+        request,
+        Duration::from_secs(10),
+    )
+    .await?;
+    let actual = response
+        .get("row")
+        .and_then(|row| row.as_array())
+        .and_then(|row| row.first())
+        .and_then(|value| value.as_str());
+    anyhow::ensure!(
+        actual == Some(expected_name),
+        "remote sql query returned {actual:?}, expected {expected_name}"
+    );
+    Ok(())
+}
+
+async fn remote_sql_exec(
+    mesh: &IrohMeshManager,
+    local_node_id: &str,
+    authority_node_id: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    let request = StorageProxyRequestPayload {
+        request_id: String::new(),
+        from_node_id: local_node_id.to_string(),
+        org_id: "org-default".to_string(),
+        addon_id: SNAPSHOT_ADDON_ID.to_string(),
+        resource_type: "person".to_string(),
+        resource_id: "person-1".to_string(),
+        actor_user_id: Some(7),
+        kind: StorageProxyRequestKind::SqlExec {
+            query: "UPDATE contacts SET name = ?1 WHERE id = ?2".to_string(),
+            params: vec![
+                StorageValueWire::Text(name.to_string()),
+                StorageValueWire::I64(1),
+            ],
+        },
+    };
+    let (rows_affected, _) = tentaflow_core::services::storage_proxy::remote_sql_exec(
+        mesh,
+        authority_node_id,
+        request,
+        Duration::from_secs(10),
+    )
+    .await?;
+    anyhow::ensure!(
+        rows_affected == 1,
+        "remote sql exec affected {rows_affected} rows"
+    );
+    Ok(())
+}
+
 async fn wait_for_flow(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
     wait_for_flow_name(db, "Process Four Node Flow").await
 }
@@ -1651,6 +1974,27 @@ async fn wait_for_sql_name(expected: &str) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("sql name not materialized: expected {expected}")
+}
+
+async fn assert_no_sql() -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        open_sql_table()?;
+        let pool =
+            tentaflow_core::addon::storage_sql::open_addon_db("org-default", SNAPSHOT_ADDON_ID)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let count = {
+            let conn = pool.get().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            conn.query_row("SELECT COUNT(*) FROM contacts", [], |row| {
+                row.get::<_, i64>(0)
+            })?
+        };
+        if count > 0 {
+            anyhow::bail!("sql unexpectedly materialized: {count} row(s)");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
 }
 
 async fn wait_for_sql_conflict() -> anyhow::Result<()> {

@@ -7,7 +7,7 @@
 // =============================================================================
 
 use tentaflow_protocol::mesh as legacy;
-use tentaflow_sdk_spec::protocol::frame::channel::{channels, Channel, Kind};
+use tentaflow_sdk_spec::protocol::frame::channel::{Channel, Kind, channels};
 
 /// Convert a legacy MESH_MSG_* u8 discriminator into the matching UFP/2
 /// `Kind` value. Mesh-channel kinds keep `low_byte == legacy discriminator`;
@@ -122,6 +122,8 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_HMAC_KEYS_SYNC
             | legacy::MESH_MSG_FRAME_PROXY_REQUEST
             | legacy::MESH_MSG_FRAME_PROXY_RESPONSE
+            | legacy::MESH_MSG_STORAGE_PROXY_REQUEST
+            | legacy::MESH_MSG_STORAGE_PROXY_RESPONSE
             | legacy::MESH_MSG_SYNC_PUSH
             | legacy::MESH_MSG_SYNC_ACK
             | legacy::MESH_MSG_SYNC_PULL
@@ -167,6 +169,8 @@ pub mod kinds {
     pub const HMAC_KEYS_SYNC: Kind = Kind(legacy::MESH_MSG_HMAC_KEYS_SYNC as u16);
     pub const FRAME_PROXY_REQUEST: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_REQUEST as u16);
     pub const FRAME_PROXY_RESPONSE: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_RESPONSE as u16);
+    pub const STORAGE_PROXY_REQUEST: Kind = Kind(legacy::MESH_MSG_STORAGE_PROXY_REQUEST as u16);
+    pub const STORAGE_PROXY_RESPONSE: Kind = Kind(legacy::MESH_MSG_STORAGE_PROXY_RESPONSE as u16);
     pub const SYNC_PUSH: Kind = super::sync_kinds::PUSH;
     pub const SYNC_ACK: Kind = super::sync_kinds::ACK;
     pub const SYNC_PULL: Kind = super::sync_kinds::PULL;
@@ -210,12 +214,13 @@ mod tests {
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_FORWARD_STREAM_REQ as u16)).is_none());
         // Holes in the 0x10..=0x4C range — not even legacy.
         assert!(legacy_from_kind(Kind(0x0017)).is_none());
-        assert!(legacy_from_kind(Kind(0x0034)).is_none());
+        assert!(legacy_from_kind(Kind(0x0036)).is_none());
     }
 
     #[test]
     fn migrated_discriminator_allowlist_matches_chunks() {
-        // 4c2.1 + 4c2.2 + 4c2.3 + 4c2.4 + 4c2.5 + 4c2.6b = 31 migrated
+        // 4c2.1 + 4c2.2 + 4c2.3 + 4c2.4 + 4c2.5 + 4c2.6b plus
+        // storage proxy types are migrated.
         // types. When a new 4c2.x chunk lands, add its types here AND to
         // `is_migrated_to_ufp2_discriminator`.
         let migrated = [
@@ -236,6 +241,8 @@ mod tests {
             legacy::MESH_MSG_HMAC_KEYS_SYNC,
             legacy::MESH_MSG_FRAME_PROXY_REQUEST,
             legacy::MESH_MSG_FRAME_PROXY_RESPONSE,
+            legacy::MESH_MSG_STORAGE_PROXY_REQUEST,
+            legacy::MESH_MSG_STORAGE_PROXY_RESPONSE,
             legacy::MESH_MSG_SYNC_PUSH,
             legacy::MESH_MSG_SYNC_ACK,
             legacy::MESH_MSG_SYNC_PULL,
@@ -296,6 +303,8 @@ mod tests {
             kinds::COMMAND_RESPONSE,
             kinds::DEPLOY_PROGRESS,
             kinds::LOG_CHUNK,
+            kinds::STORAGE_PROXY_REQUEST,
+            kinds::STORAGE_PROXY_RESPONSE,
         ] {
             assert!(
                 k.0 >= 0x0010 && k.0 <= 0x004C,

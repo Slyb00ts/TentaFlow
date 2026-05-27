@@ -8,8 +8,8 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,19 +17,19 @@ use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use parking_lot::RwLock;
-use tokio::sync::{broadcast, mpsc, RwLock as AsyncRwLock};
+use tokio::sync::{RwLock as AsyncRwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::{
+    ALPN_API, ALPN_MESH, ALPN_PAIRING, IrohConfig, IrohEndpoint, IrohEndpointError,
     handler::IrohStreamError,
     pairing::{
-        endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
-        merge_contact_hints, PairingContactHints, PairingHandler,
+        PairingContactHints, PairingHandler, endpoint_addr_from_hints, hints_with_relay_fallback,
+        load_trusted_contact_hints, merge_contact_hints,
     },
-    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_MESH, ALPN_PAIRING,
 };
 
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
@@ -163,6 +163,14 @@ pub enum IrohMeshEvent {
     FrameProxyResponseReceived {
         from_node_id: String,
         payload: tentaflow_protocol::mesh::FrameProxyResponsePayload,
+    },
+    StorageProxyRequestReceived {
+        from_node_id: String,
+        payload: tentaflow_protocol::mesh::StorageProxyRequestPayload,
+    },
+    StorageProxyResponseReceived {
+        from_node_id: String,
+        payload: tentaflow_protocol::mesh::StorageProxyResponsePayload,
     },
     NodeLeavingReceived {
         node_id: String,
@@ -990,11 +998,7 @@ impl IrohMeshManager {
             let id = entry.key().clone();
             futs.push(async move {
                 if let Err(e) = self
-                    .send_ufp2_to_peer(
-                        &id,
-                        tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT,
-                        data,
-                    )
+                    .send_ufp2_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
                     .await
                 {
                     tracing::debug!(
@@ -1013,11 +1017,7 @@ impl IrohMeshManager {
     /// uni-stream without any leading discriminator byte. The first byte
     /// of `wire` is the CBOR map header — receivers detect UFP/2 vs
     /// legacy by inspecting it (`mesh::ufp2::looks_like_ufp2_envelope_first_byte`).
-    async fn send_raw_envelope_to_peer(
-        &self,
-        target_node_id: &str,
-        wire: &[u8],
-    ) -> Result<()> {
+    async fn send_raw_envelope_to_peer(&self, target_node_id: &str, wire: &[u8]) -> Result<()> {
         let connection = self
             .connections
             .get(target_node_id)
@@ -1290,6 +1290,24 @@ impl IrohMeshManager {
         self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_FRAME_PROXY_RESPONSE,
+            data,
+        )
+        .await
+    }
+
+    pub async fn send_storage_proxy_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_STORAGE_PROXY_REQUEST,
+            data,
+        )
+        .await
+    }
+
+    pub async fn send_storage_proxy_response(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_STORAGE_PROXY_RESPONSE,
             data,
         )
         .await
@@ -1693,7 +1711,6 @@ impl IrohMeshManager {
             }
         }
     }
-
 }
 
 /// Kopia referencji uzywana w spawned tasks — bez `Arc<Self>` aby unikac cyklu.
@@ -1875,12 +1892,7 @@ impl IrohMeshManagerRef {
         let local_pubkey = self.security.verifying_key_bytes();
         let peer_pubkey_opt = parse_iroh_node_id_to_pubkey(&remote_hex);
         let (frame_type, payload) = if let Some(peer_pubkey) = peer_pubkey_opt {
-            match crate::mesh::ufp2::classify_inbound(
-                first[0],
-                tail,
-                peer_pubkey,
-                local_pubkey,
-            ) {
+            match crate::mesh::ufp2::classify_inbound(first[0], tail, peer_pubkey, local_pubkey) {
                 Ok(crate::mesh::ufp2::InboundMeshFrame::Ufp2(decoded)) => {
                     (decoded.legacy_discriminator, decoded.body)
                 }
@@ -2054,6 +2066,46 @@ impl IrohMeshManagerRef {
                         warn!(
                             peer = %remote_hex,
                             "iroh_mesh: failed to decode FrameProxyResponse: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_STORAGE_PROXY_REQUEST => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::StorageProxyRequestPayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::StorageProxyRequestReceived {
+                        from_node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode StorageProxyRequest: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_STORAGE_PROXY_RESPONSE => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::StorageProxyResponsePayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::StorageProxyResponseReceived {
+                        from_node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode StorageProxyResponse: {}",
                             e
                         );
                         return Ok(());

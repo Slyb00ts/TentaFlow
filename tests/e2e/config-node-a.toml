@@ -46,8 +46,6 @@ circuit_breaker_threshold = 5
 circuit_breaker_timeout_ms = 60000
 
 [monitoring]
-prometheus_enabled = false
-prometheus_bind = "0.0.0.0:19091"
 health_check_enabled = false
 health_check_bind = "0.0.0.0:19881"
 health_check_path = "/health"

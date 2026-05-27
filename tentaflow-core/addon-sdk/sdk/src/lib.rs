@@ -154,6 +154,14 @@ extern "C" {
     /// Zapis do klucz-wartosc storage
     fn storage_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i32;
 
+    fn sync_acl_upsert_v1(payload_ptr: i32, payload_len: i32) -> i32;
+
+    fn sync_acl_delete_v1(payload_ptr: i32, payload_len: i32) -> i32;
+
+    fn sync_share_grant_v1(payload_ptr: i32, payload_len: i32) -> i32;
+
+    fn sync_share_revoke_v1(payload_ptr: i32, payload_len: i32) -> i32;
+
     /// Wykonanie requestu HTTP
     /// ABI: (req_ptr, req_len, out_ptr, out_cap, out_len_ptr) -> i32
     fn http_request(req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
@@ -531,6 +539,18 @@ fn call_host_kv_set(
     Ok(())
 }
 
+fn call_host_binary_status(
+    host_fn: unsafe extern "C" fn(i32, i32) -> i32,
+    payload: &[u8],
+) -> Result<(), AbiError> {
+    let rc = unsafe { host_fn(payload.as_ptr() as i32, payload.len() as i32) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(AbiError::from_i32(rc))
+    }
+}
+
 /// Wywoluje host function ktora przyjmuje klucz i zwraca wartosc do bufora.
 /// ABI 5-param: (key_ptr, key_len, out_ptr, out_cap, out_len_ptr) -> i32
 /// Host zapisuje dane do out_ptr i dlugosc do out_len_ptr (4 bajty LE).
@@ -665,6 +685,56 @@ pub fn store_get(key: &str) -> Result<Option<String>, String> {
 /// Wymaga uprawnienia "storage" z access_level "rw".
 pub fn store_set(key: &str, value: &str) -> Result<(), String> {
     call_host_kv_set(storage_set, key, value)
+}
+
+// =============================================================================
+// Wysokopoziomowe wrappery — Sync ACL
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncAclUpsert {
+    pub resource_type: String,
+    pub resource_id: String,
+    pub owner_user_id: Option<i64>,
+    pub assigned_user_id: Option<i64>,
+    pub department_id: Option<String>,
+    pub manager_user_id: Option<i64>,
+    pub visibility_scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncAclDelete {
+    pub resource_type: String,
+    pub resource_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncShare {
+    pub resource_type: String,
+    pub resource_id: String,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub action: String,
+}
+
+pub fn sync_acl_upsert(request: &SyncAclUpsert) -> Result<(), AbiError> {
+    let payload = encode_cbor(request)?;
+    call_host_binary_status(sync_acl_upsert_v1, &payload)
+}
+
+pub fn sync_acl_delete(request: &SyncAclDelete) -> Result<(), AbiError> {
+    let payload = encode_cbor(request)?;
+    call_host_binary_status(sync_acl_delete_v1, &payload)
+}
+
+pub fn sync_share_grant(request: &SyncShare) -> Result<(), AbiError> {
+    let payload = encode_cbor(request)?;
+    call_host_binary_status(sync_share_grant_v1, &payload)
+}
+
+pub fn sync_share_revoke(request: &SyncShare) -> Result<(), AbiError> {
+    let payload = encode_cbor(request)?;
+    call_host_binary_status(sync_share_revoke_v1, &payload)
 }
 
 // =============================================================================
@@ -824,23 +894,20 @@ pub fn render_panel_typed(panel_id: &str, tree: &ui::PanelTree) -> Result<(), St
     ui_render_raw(panel_id, &ui_json)
 }
 
-/// Renders an addon UI panel by shipping a MessagePack-encoded `PanelTree`
+/// Renders an addon UI panel by shipping a CBOR-encoded `PanelTree`
 /// directly across the addon↔host ABI. No JSON anywhere on the addon side.
 ///
 /// On the host side this drops the `parse_and_validate_panel_tree(&str)`
-/// JSON parser entirely — the host calls `rmp_serde::from_slice` once and
+/// JSON parser entirely — the host decodes CBOR once and
 /// goes straight into `validate_panel_tree`. End-to-end this is several
 /// times faster than [`render_panel_typed`] for non-trivial trees and the
 /// wire payload is ~2-3× smaller (no whitespace, no quoting, integer-
-/// tagged field names). MessagePack was picked over postcard/bincode
-/// because `UiComponent` uses `#[serde(untagged)]`, which only self-
-/// describing formats can decode. See `notes/addon-ui-perf-plan.md` §2 P3.
+/// tagged field names). See `notes/addon-ui-perf-plan.md` §2 P3.
 ///
 /// Requires the `ui` permission in the addon manifest. Frontend wire
 /// format is unchanged (host still serves panels as JSON via `panel_get`).
 pub fn render_panel_binary(panel_id: &str, tree: &ui::PanelTree) -> Result<(), String> {
-    let encoded = rmp_serde::to_vec_named(tree)
-        .map_err(|e| format!("Blad serializacji msgpack panelu UI: {}", e))?;
+    let encoded = encode_cbor(tree).map_err(|e| format!("Blad serializacji CBOR panelu UI: {e}"))?;
     let pid = panel_id.as_bytes();
     let result = unsafe {
         ui_render_binary(
@@ -852,6 +919,12 @@ pub fn render_panel_binary(panel_id: &str, tree: &ui::PanelTree) -> Result<(), S
         return Err(format!("Blad renderowania panelu UI (binary): {}", result));
     }
     Ok(())
+}
+
+fn encode_cbor<T: Serialize>(value: &T) -> Result<Vec<u8>, AbiError> {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(value, &mut bytes).map_err(|_| AbiError::Operation)?;
+    Ok(bytes)
 }
 
 /// Internal: ship a pre-serialized panel JSON across the ABI boundary.

@@ -31,7 +31,7 @@ use crate::services::runtime::quic_handle::ServiceManager;
 
 /// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler
 pub fn is_openai_path(path: &str) -> bool {
-    path.starts_with("/v1/") || path == "/health" || path == "/ready" || path == "/metrics"
+    path.starts_with("/v1/") || path == "/health" || path == "/ready"
 }
 
 /// Uruchamia zunifikowany serwer HTTPS obslugujacy OpenAI API + Dashboard

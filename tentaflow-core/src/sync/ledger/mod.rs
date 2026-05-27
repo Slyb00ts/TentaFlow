@@ -8,7 +8,7 @@ mod types;
 mod validation;
 
 pub use fjall_store::FjallSyncLedgerStore;
-pub(crate) use types::hash_canonical;
+pub(crate) use types::{decode, encode, hash_canonical};
 pub use types::{
     ActionType, AppendResult, CompactionPolicy, FieldValue, HybridLogicalTimestamp, InboxEntry,
     LedgerResult, NewSyncOperation, OperationId, OperationQuery, OutboxEntry, PartitionHead,

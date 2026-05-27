@@ -218,11 +218,11 @@ fn rusqlite_decode_error(message: String) -> rusqlite::Error {
 }
 
 fn encode_changed_fields(fields: &BTreeMap<String, FieldValue>) -> Result<Vec<u8>> {
-    Ok(rmp_serde::to_vec_named(fields)?)
+    crate::sync::ledger::encode(fields).map_err(Into::into)
 }
 
 fn decode_changed_fields(bytes: &[u8]) -> Result<BTreeMap<String, FieldValue>> {
-    Ok(rmp_serde::from_slice(bytes)?)
+    crate::sync::ledger::decode(bytes).map_err(Into::into)
 }
 
 fn stable_capture_id(

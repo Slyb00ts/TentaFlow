@@ -781,7 +781,7 @@ fn snapshot_signing_bytes(payload: &SnapshotSignaturePayload<'_>) -> LedgerResul
 }
 
 fn encode_snapshot_sql_blob(blob: &SnapshotSqlBlobPackage) -> LedgerResult<Vec<u8>> {
-    let payload = rmp_serde::to_vec_named(blob)?;
+    let payload = crate::sync::ledger::encode(blob)?;
     let mut bytes = SNAPSHOT_SQL_BLOB_DOMAIN.to_vec();
     bytes.extend_from_slice(&payload);
     Ok(bytes)
@@ -793,7 +793,7 @@ pub(crate) fn decode_snapshot_sql_blob(bytes: &[u8]) -> LedgerResult<SnapshotSql
             "snapshot sql blob has invalid domain".to_string(),
         ));
     };
-    Ok(rmp_serde::from_slice(payload)?)
+    crate::sync::ledger::decode(payload)
 }
 
 fn snapshot_blob_hash(bytes: &[u8]) -> [u8; 32] {

@@ -20,7 +20,7 @@ struct Inner {
 
 impl PortAllocator {
     /// Builds a fresh allocator. `range` is inclusive on both ends; `excluded`
-    /// is a set of ports the caller wants to reserve (e.g. dashboard, prometheus).
+    /// is a set of ports the caller wants to reserve (e.g. dashboard).
     pub fn new(range: (u16, u16), excluded: HashSet<u16>) -> Result<Self> {
         let (lo, hi) = range;
         if lo == 0 || hi == 0 || lo > hi {
@@ -122,7 +122,7 @@ impl PortAllocator {
             .map_err(|e| anyhow!("port allocator mutex poisoned: {}", e))?;
         if inner.excluded.contains(&port) {
             return Err(anyhow!(
-                "port {port} jest na excluded list (zarezerwowany dla dashboard / prometheus)"
+                "port {port} jest na excluded list (zarezerwowany dla dashboard)"
             ));
         }
         // `leased` to znacznik "ten port nalezy do JAKIEGOS serwisu" —

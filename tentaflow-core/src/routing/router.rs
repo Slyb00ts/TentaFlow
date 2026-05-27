@@ -434,6 +434,10 @@ impl Router {
         *self.mesh_manager.write() = Some(manager);
     }
 
+    pub fn mesh_manager(&self) -> Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>> {
+        self.mesh_manager.read().clone()
+    }
+
     /// Wires the supervisor's services snapshot into the router. Called once
     /// from `main.rs` after `Supervisor::new` returns. The router consults the
     /// snapshot as a fallback when legacy resolution misses a model — Phase 8

@@ -327,11 +327,10 @@ mod tests {
     }
 
     #[test]
-    fn panel_tree_msgpack_round_trip_preserves_untagged_variants() {
+    fn panel_tree_cbor_round_trip_preserves_untagged_variants() {
         // `UiComponent` is `#[serde(untagged)]`. postcard + bincode both
         // reject untagged enums (they need `deserialize_any`, which only
-        // self-describing formats provide). MessagePack via `rmp-serde`
-        // with named fields (`to_vec_named`) round-trips correctly and
+        // self-describing formats provide). CBOR round-trips correctly and
         // still produces a payload meaningfully smaller than JSON.
         let tree = PanelTree {
             root: vec![
@@ -357,15 +356,17 @@ mod tests {
             navigation: None,
         };
 
-        let bytes = rmp_serde::to_vec_named(&tree).expect("msgpack encode");
-        let decoded: PanelTree = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&tree, &mut bytes).expect("cbor encode");
+        let decoded: PanelTree =
+            ciborium::de::from_reader(std::io::Cursor::new(&bytes)).expect("cbor decode");
         assert_eq!(tree, decoded);
 
         // Payload is meaningfully smaller than JSON for the same content.
         let json = serde_json::to_string(&tree).expect("json encode");
         assert!(
             bytes.len() < json.len(),
-            "msgpack payload {} should be < json {}",
+            "cbor payload {} should be < json {}",
             bytes.len(),
             json.len()
         );

@@ -141,7 +141,7 @@ pub struct HandlerMeta {
     pub since_minor: u8,
     /// Minimalny tier autoryzacji (z `#[policy(...)]`).
     pub required_auth: SessionAuthKind,
-    /// Nazwa metryki Prometheus dla tego handlera.
+    /// Nazwa metryki dla tego handlera.
     pub metric_name: &'static str,
     /// Wskaznik do funkcji handlera. Zunifikowana async signatura — sync
     /// handlery sa owijane przez makro w `Box::pin(async move { ... })`.
