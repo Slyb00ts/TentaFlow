@@ -19,7 +19,7 @@ use tentaflow_core::mesh::security::MeshSecurity;
 use tentaflow_core::sync::core_capture::CoreWriteCapture;
 use tentaflow_core::sync::core_registry::{CORE_SYNC_ADDON_ID, CoreSyncResourceKind};
 use tentaflow_core::sync::ledger::{FieldValue, OperationId};
-use tentaflow_core::sync::runtime::SqlWriteAction;
+use tentaflow_core::sync::runtime::{MeshSyncPullResult, SqlWriteAction};
 
 const FLOW_ID: &str = "92001";
 
@@ -259,6 +259,53 @@ fn process_four_node_offline_receiver_catches_up_after_source_restart() {
     receiver_c.command("WAIT_FLOW");
 }
 
+#[test]
+fn process_four_node_permission_gating_blocks_unshared_target() {
+    if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("process e2e root");
+    let mut source = ChildNode::spawn("source", root.path().join("source"));
+    let mut receiver_a = ChildNode::spawn("receiver-a", root.path().join("receiver-a"));
+    let mut receiver_b = ChildNode::spawn("receiver-b", root.path().join("receiver-b"));
+    let mut receiver_c = ChildNode::spawn("receiver-c", root.path().join("receiver-c"));
+
+    connect_nodes(&mut source, &mut receiver_a);
+    connect_nodes(&mut source, &mut receiver_b);
+    connect_nodes(&mut source, &mut receiver_c);
+
+    let seed_source_args = [&receiver_a, &receiver_b, &receiver_c]
+        .iter()
+        .map(|receiver| format!("{} {}", receiver.node_id, receiver.public_key))
+        .collect::<Vec<_>>()
+        .join(" ");
+    source.command(&format!("SEED_SOURCE_ALLOWED 3 2 {}", seed_source_args));
+    receiver_a.command("SEED_RECEIVER");
+    receiver_b.command("SEED_RECEIVER");
+    receiver_c.command("SEED_RECEIVER");
+
+    let op_line = source.command("RECORD_FLOW");
+    let op_id = parse_record_flow_op_id(&op_line);
+    source.command(&format!("ASSERT_NO_PAYLOAD {}", receiver_c.node_id));
+    source.command(&format!("PUSH {}", receiver_a.node_id));
+    source.command(&format!("PUSH {}", receiver_b.node_id));
+    source.command(&format!("WAIT_ACKS {} 2", op_id));
+    receiver_a.command("WAIT_FLOW");
+    receiver_b.command("WAIT_FLOW");
+    receiver_c.command("ASSERT_NO_FLOW");
+
+    source.command(&format!("GRANT_SOURCE_TARGET {}", receiver_c.node_id));
+    let op_line = source.command("RECORD_FLOW");
+    let op_id = parse_record_flow_op_id(&op_line);
+    source.command(&format!("PUSH {}", receiver_a.node_id));
+    source.command(&format!("PUSH {}", receiver_b.node_id));
+    source.command(&format!("PUSH {}", receiver_c.node_id));
+    receiver_c.command(&format!("SEND_REPAIR {}", source.node_id));
+    source.command(&format!("WAIT_ACKS {} 3", op_id));
+    receiver_c.command("WAIT_FLOW");
+}
+
 fn connect_nodes(source: &mut ChildNode, receiver: &mut ChildNode) {
     source.command(&format!(
         "TRUST {} {}",
@@ -315,19 +362,20 @@ async fn child_main() {
                         rkyv::rancor::Error,
                     >(&data)
                     .expect("decode sync push");
-                    let Some(ack) =
-                        tentaflow_core::sync::runtime::handle_push_payload(&from_node_id, payload)
-                            .expect("handle push")
-                    else {
-                        continue;
-                    };
-                    let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-                        .map(|bytes| bytes.to_vec())
-                        .expect("encode ack");
-                    mesh_for_events
-                        .send_sync_ack(&from_node_id, &ack_bytes)
-                        .await
-                        .expect("send ack");
+                    match tentaflow_core::sync::runtime::handle_push_payload(&from_node_id, payload)
+                    {
+                        Ok(Some(ack)) => {
+                            let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+                                .map(|bytes| bytes.to_vec())
+                                .expect("encode ack");
+                            mesh_for_events
+                                .send_sync_ack(&from_node_id, &ack_bytes)
+                                .await
+                                .expect("send ack");
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!("TF4 child sync push error: {error}"),
+                    }
                 }
                 Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data }) => {
                     let payload = rkyv::from_bytes::<
@@ -337,6 +385,50 @@ async fn child_main() {
                     .expect("decode sync ack");
                     tentaflow_core::sync::runtime::handle_ack_payload(&from_node_id, payload)
                         .expect("handle ack");
+                }
+                Ok(IrohMeshEvent::SyncPullReceived { from_node_id, data }) => {
+                    let payload = rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncPullPayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    .expect("decode sync pull");
+                    let Some(result) =
+                        tentaflow_core::sync::runtime::handle_pull_payload(&from_node_id, payload)
+                            .expect("handle pull")
+                    else {
+                        continue;
+                    };
+                    let MeshSyncPullResult::Operations(response) = result else {
+                        continue;
+                    };
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response)
+                        .map(|bytes| bytes.to_vec())
+                        .expect("encode pull response");
+                    mesh_for_events
+                        .send_sync_pull_response(&from_node_id, &bytes)
+                        .await
+                        .expect("send pull response");
+                }
+                Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data }) => {
+                    let payload = rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    .expect("decode sync pull response");
+                    let Some(ack) = tentaflow_core::sync::runtime::handle_pull_response_payload(
+                        &from_node_id,
+                        payload,
+                    )
+                    .expect("handle pull response") else {
+                        continue;
+                    };
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+                        .map(|bytes| bytes.to_vec())
+                        .expect("encode pull ack");
+                    mesh_for_events
+                        .send_sync_ack(&from_node_id, &bytes)
+                        .await
+                        .expect("send pull ack");
                 }
                 Ok(IrohMeshEvent::PeerConnected { .. }) => {}
                 Ok(_) => {}
@@ -404,10 +496,29 @@ async fn handle_child_command(
             seed_source(db, rest)?;
             Ok("SEED_SOURCE".to_string())
         }
+        ["SEED_SOURCE_ALLOWED", count, allowed_count, rest @ ..] => {
+            let count = count.parse::<usize>()?;
+            let allowed_count = allowed_count.parse::<usize>()?;
+            anyhow::ensure!(rest.len() == count * 2, "target tuple count mismatch");
+            anyhow::ensure!(allowed_count <= count, "allowed target count mismatch");
+            seed_source_with_allowed_targets(db, rest, allowed_count)?;
+            Ok("SEED_SOURCE_ALLOWED".to_string())
+        }
+        ["GRANT_SOURCE_TARGET", node_id] => {
+            grant_source_target(db, node_id)?;
+            Ok("GRANT_SOURCE_TARGET".to_string())
+        }
         ["RECORD_FLOW"] => {
             let result = tentaflow_core::sync::runtime::record_core_capture(core_flow_capture())?
                 .expect("runtime initialized");
             Ok(format!("RECORD_FLOW {}", result.op_id.to_hex()))
+        }
+        ["ASSERT_NO_PAYLOAD", target] => {
+            anyhow::ensure!(
+                tentaflow_core::sync::runtime::build_push_payload_for_target(target, 32)?.is_none(),
+                "unexpected push payload for {target}"
+            );
+            Ok("ASSERT_NO_PAYLOAD".to_string())
         }
         ["PUSH", target] => {
             let payload = tentaflow_core::sync::runtime::build_push_payload_for_target(target, 32)?
@@ -418,9 +529,17 @@ async fn handle_child_command(
             mesh.send_sync_push(target, &bytes).await?;
             Ok("PUSH".to_string())
         }
+        ["SEND_REPAIR", peer] => {
+            send_repair_pull(mesh, peer).await?;
+            Ok("SEND_REPAIR".to_string())
+        }
         ["WAIT_FLOW"] => {
             wait_for_flow(db).await?;
             Ok("WAIT_FLOW".to_string())
+        }
+        ["ASSERT_NO_FLOW"] => {
+            assert_no_flow(db).await?;
+            Ok("ASSERT_NO_FLOW".to_string())
         }
         ["WAIT_ACKS", op_id, count] => {
             wait_for_acks(op_id, count.parse()?).await?;
@@ -443,6 +562,26 @@ async fn wait_connected(mesh: &IrohMeshManager, node_id: &str) -> anyhow::Result
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     anyhow::bail!("mesh peer not connected: {node_id}")
+}
+
+async fn send_repair_pull(mesh: &IrohMeshManager, peer: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let payloads =
+            tentaflow_core::sync::runtime::build_repair_pull_payloads_for_peer(peer, 16, 256)?;
+        if payloads.is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        for payload in payloads {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                .map(|bytes| bytes.to_vec())
+                .expect("encode repair pull");
+            mesh.send_sync_pull(peer, &bytes).await?;
+        }
+        return Ok(());
+    }
+    anyhow::bail!("repair pull not queued for {peer}")
 }
 
 fn seed_receiver(
@@ -477,6 +616,14 @@ fn seed_receiver(
 }
 
 fn seed_source(db: &tentaflow_core::db::DbPool, targets: &[&str]) -> anyhow::Result<()> {
+    seed_source_with_allowed_targets(db, targets, targets.len() / 2)
+}
+
+fn seed_source_with_allowed_targets(
+    db: &tentaflow_core::db::DbPool,
+    targets: &[&str],
+    allowed_count: usize,
+) -> anyhow::Result<()> {
     repository::upsert_sync_policy(
         db,
         "process-e2e-source-core-flow",
@@ -503,18 +650,25 @@ fn seed_source(db: &tentaflow_core::db::DbPool, targets: &[&str]) -> anyhow::Res
             None,
             "standard",
         )?;
-        repository::grant_sync_explicit_share(
-            db,
-            "org-default",
-            CORE_SYNC_ADDON_ID,
-            "core.flow",
-            FLOW_ID,
-            "node",
-            node_id,
-            "sync_receive",
-            Some(1),
-        )?;
+        if idx < allowed_count {
+            grant_source_target(db, node_id)?;
+        }
     }
+    Ok(())
+}
+
+fn grant_source_target(db: &tentaflow_core::db::DbPool, node_id: &str) -> anyhow::Result<()> {
+    repository::grant_sync_explicit_share(
+        db,
+        "org-default",
+        CORE_SYNC_ADDON_ID,
+        "core.flow",
+        FLOW_ID,
+        "node",
+        node_id,
+        "sync_receive",
+        Some(1),
+    )?;
     Ok(())
 }
 
@@ -554,6 +708,17 @@ async fn wait_for_flow(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("flow not materialized")
+}
+
+async fn assert_no_flow(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if let Some(flow) = repository::get_flow(db, FLOW_ID.parse()?)? {
+            anyhow::bail!("flow unexpectedly materialized: {}", flow.name);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
 }
 
 async fn wait_for_acks(op_id: &str, expected: usize) -> anyhow::Result<()> {
