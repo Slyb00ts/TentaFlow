@@ -382,7 +382,7 @@ pub async fn initiate_pairing(
             ));
         }
     } else {
-        info!(target_node = %remote_hints.node_id, "Parowanie: wysylam PairingRequest przez ALPN_PAIRING");
+        info!(target_node = %remote_hints.node_id, "Parowanie: wysylam FirstContact przez ALPN_PAIRING");
         match initiate_pairing_over_iroh(
             qm.endpoint(),
             &remote_hints,

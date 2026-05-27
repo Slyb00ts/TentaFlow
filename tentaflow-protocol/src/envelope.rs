@@ -29,7 +29,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///     (QUIC z TLS 1.3 + relay fallback + LAN mDNS + DHT pkarr discovery).
 ///   - MeshPeerSummary.endpoint pole porzucone — iroh rozwiazuje adres po
 ///     EndpointId (wczesniej NodeId).
-///   - ALPN zmienione na `tentaflow-mesh/v1`, `tentaflow-pairing/v1`,
+///   - ALPN zmienione na `tentaflow-mesh/v1`, `tentaflow-pairing/v2`,
 ///     `tentaflow-api/v1`.
 ///   - Custom AEAD/replay/rotation usunieta z `mesh/security.rs` — bezpieczenstwo
 ///     transportu zapewnia iroh TLS. Zostaje Ed25519 identity, trusted_keys,

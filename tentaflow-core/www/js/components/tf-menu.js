@@ -15,9 +15,24 @@
 import { adoptControlsInto } from './shared-styles.js';
 import { Sfx } from '/js/lib/sfx.js';
 
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function safeIconName(value) {
+  const text = String(value || '').trim();
+  return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
+}
+
 class TfMenuItem extends HTMLElement {
   static get observedAttributes() {
-    return ['icon', 'danger', 'action'];
+    return ['icon', 'danger', 'action', 'disabled', 'shortcut'];
   }
 
   constructor() {
@@ -37,7 +52,7 @@ class TfMenuItem extends HTMLElement {
   }
 
   _build() {
-    this._label = this.innerHTML;
+    this._label = this.textContent;
     this.innerHTML = '';
     // w Shadow DOM rodzica — tu budujemy w light DOM itemu,
     // rodzic przeniesie go do shadow slot gdy otwiera
@@ -51,16 +66,28 @@ class TfMenuItem extends HTMLElement {
   }
 
   _update() {
-    const icon = this.getAttribute('icon');
+    const icon = safeIconName(this.getAttribute('icon'));
+    const shortcut = this.getAttribute('shortcut');
     const danger = this.hasAttribute('danger');
+    const disabled = this.hasAttribute('disabled');
     this._btn.classList.toggle('danger', danger);
+    this._btn.classList.toggle('disabled', disabled);
+    this._btn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
     const iconHtml = icon
       ? `<svg width="14" height="14" aria-hidden="true"><use href="#i-${icon}"/></svg>`
       : '';
-    this._btn.innerHTML = `${iconHtml}<span>${this._label}</span>`;
+    const shortcutHtml = shortcut
+      ? `<span class="tf-menu-item-shortcut">${escapeHtml(shortcut)}</span>`
+      : '';
+    this._btn.innerHTML = `${iconHtml}<span>${escapeHtml(this._label)}</span>${shortcutHtml}`;
   }
 
-  _onClick() {
+  _onClick(e) {
+    if (this.hasAttribute('disabled')) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     const action = this.getAttribute('action') || '';
     this.dispatchEvent(new CustomEvent('tf-menu-select', {
       bubbles: true,

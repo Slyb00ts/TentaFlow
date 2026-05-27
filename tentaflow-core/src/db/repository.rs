@@ -12162,8 +12162,8 @@ pub fn delete_peer_persisted(pool: &DbPool, node_id: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-/// One-shot upgrade path: copy `trusted_nodes` rows + decode `settings` keys
-/// `trusted_contact:<hex>` (JSON value) into peer_persisted + peer_hints.
+/// One-shot upgrade path: copy `trusted_nodes` rows + decode legacy `settings`
+/// contact hint rows into peer_persisted + peer_hints.
 /// After the copy, settings rows for `trusted_contact:%` and `pending_contact:%`
 /// are deleted. Returns the number of peer_persisted rows produced.
 ///
@@ -12234,10 +12234,8 @@ pub fn migrate_settings_trusted_contacts_to_peer_hints(pool: &DbPool) -> Result<
         }
     }
 
-    // Step 2: parse settings `trusted_contact:<hex>` rows (JSON
-    // PairingContactHints) and emit peer_hints rows. Same JSON shape used by
-    // pairing.rs / sanitize_trusted_contacts.
-    let mut settings_rows: Vec<(String, String)> = Vec::new();
+    // Step 2: parse legacy settings contact rows and emit peer_hints rows.
+    let mut settings_rows: Vec<(String, String, i64)> = Vec::new();
     {
         let mut stmt = tx.prepare(
             "SELECT key, value FROM settings WHERE key LIKE 'trusted_contact:%' ESCAPE '\\'",
@@ -12248,28 +12246,42 @@ pub fn migrate_settings_trusted_contacts_to_peer_hints(pool: &DbPool) -> Result<
             Ok((key, value))
         })?;
         for r in it {
-            settings_rows.push(r?);
+            let (key, value) = r?;
+            settings_rows.push((key, value, TRUST_TRUSTED));
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT key, value FROM settings WHERE key LIKE 'pending_contact:%' ESCAPE '\\'",
+        )?;
+        let it = stmt.query_map([], |row| {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            Ok((key, value))
+        })?;
+        for r in it {
+            let (key, value) = r?;
+            settings_rows.push((key, value, TRUST_PENDING_PAIRING));
         }
     }
 
     {
-        // Ensure a peer_persisted row exists before inserting hints (FK).
         let mut ensure_peer = tx.prepare_cached(
             "INSERT OR IGNORE INTO peer_persisted \
                 (node_id, pubkey, trust_state, hostname, platform, role, \
                  last_seen_ms, persisted_ver, updated_at_ms) \
-             VALUES (?1, X'', ?2, NULL, NULL, ?3, 0, 0, ?4)",
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0, 0, ?6)",
         )?;
         let mut ins_hint = tx.prepare_cached(
             "INSERT OR IGNORE INTO peer_hints (node_id, hint_kind, payload, last_ok_ms, fail_count) \
              VALUES (?1, ?2, ?3, NULL, 0)",
         )?;
 
-        for (key, value) in &settings_rows {
-            let hex_part = match key.strip_prefix("trusted_contact:") {
-                Some(s) => s,
-                None => continue,
-            };
+        for (key, value, trust_state) in &settings_rows {
+            let hex_part = key
+                .strip_prefix("trusted_contact:")
+                .or_else(|| key.strip_prefix("pending_contact:"));
+            let Some(hex_part) = hex_part else { continue };
             let mut node_id = [0u8; 32];
             if hex::decode_to_slice(hex_part, &mut node_id).is_err() {
                 continue;
@@ -12278,12 +12290,23 @@ pub fn migrate_settings_trusted_contacts_to_peer_hints(pool: &DbPool) -> Result<
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            ensure_peer.execute(rusqlite::params![
+            let pubkey = parsed
+                .get("public_key_hex")
+                .and_then(|v| v.as_str())
+                .and_then(|s| hex::decode(s).ok())
+                .unwrap_or_default();
+            let hostname = parsed.get("hostname").and_then(|v| v.as_str());
+            let n = ensure_peer.execute(rusqlite::params![
                 node_id.as_slice(),
-                TRUST_TRUSTED,
+                pubkey,
+                trust_state,
+                hostname,
                 ROLE_NODE,
                 now_ms,
             ])?;
+            if n > 0 {
+                created += 1;
+            }
 
             if let Some(addrs) = parsed.get("addresses").and_then(|v| v.as_array()) {
                 for a in addrs {
@@ -12319,8 +12342,7 @@ pub fn migrate_settings_trusted_contacts_to_peer_hints(pool: &DbPool) -> Result<
         }
     }
 
-    // Step 3: purge settings rows that have been migrated. pending_contact:* is
-    // an ephemeral pairing artifact; not migrated, just dropped.
+    // Step 3: purge legacy settings rows that have been migrated.
     tx.execute(
         "DELETE FROM settings WHERE key LIKE 'trusted_contact:%' ESCAPE '\\'",
         [],
@@ -12614,6 +12636,47 @@ mod settings_to_peer_hints_migration_tests {
             .query_row("SELECT COUNT(*) FROM peer_hints", [], |r| r.get(0))
             .unwrap();
         assert_eq!(hints_after, 3, "second run must not create duplicate hints");
+    }
+
+    #[test]
+    fn migration_pending_contacts_to_peer_hints_preserves_pending_state() {
+        let db = fresh_db();
+        let node_hex = "dcba4321".repeat(8);
+        let public_key_hex = format!("{}{}", node_hex, "11".repeat(32));
+        let value = format!(
+            r#"{{"node_id":"{}","public_key_hex":"{}","hostname":"pending-peer","addresses":["127.0.0.1:7788"],"relay_url":"https://relay.pending.example.com"}}"#,
+            node_hex, public_key_hex
+        );
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("pending_contact:{}", node_hex), value],
+            )
+            .unwrap();
+        }
+
+        let _ = migrate_settings_trusted_contacts_to_peer_hints(&db).unwrap();
+
+        let conn = db.lock().unwrap();
+        let trust_state: i64 = conn
+            .query_row("SELECT trust_state FROM peer_persisted", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(trust_state, TRUST_PENDING_PAIRING);
+
+        let hints_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peer_hints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hints_count, 3);
+
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key LIKE 'pending_contact:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
     }
 }
 

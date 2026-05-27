@@ -4,6 +4,20 @@
 // auto-scroll on selection) and a FLIP-based active indicator.
 // =============================================================================
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeIconName(value) {
+  const text = String(value || '').trim();
+  return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
+}
+
 class TfTab extends HTMLElement {
   static get observedAttributes() {
     return ['count', 'icon', 'disabled'];
@@ -25,7 +39,7 @@ class TfTab extends HTMLElement {
   }
 
   _build() {
-    const label = this.innerHTML;
+    const label = this.textContent;
     this.innerHTML = '';
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -39,15 +53,15 @@ class TfTab extends HTMLElement {
   }
 
   _update() {
-    const icon = this.getAttribute('icon');
+    const icon = safeIconName(this.getAttribute('icon'));
     const count = this.getAttribute('count');
     const iconHtml = icon
       ? `<svg width="12" height="12" aria-hidden="true"><use href="#i-${icon}"/></svg>`
       : '';
     const countHtml = count
-      ? `<span class="tf-tab-count">${count}</span>`
+      ? `<span class="tf-tab-count">${escapeHtml(count)}</span>`
       : '';
-    this._btn.innerHTML = `${iconHtml}<span class="tf-tab-label">${this._btn._label}</span>${countHtml}`;
+    this._btn.innerHTML = `${iconHtml}<span class="tf-tab-label">${escapeHtml(this._btn._label)}</span>${countHtml}`;
     this._btn.dataset.tabId = this.id || '';
     if (this.hasAttribute('disabled')) this._btn.setAttribute('disabled', '');
     else this._btn.removeAttribute('disabled');

@@ -4,6 +4,8 @@
 //       aktualizuje sidebar active state.
 // =============================================================================
 
+import { escapeHtml } from '/js/utils.js';
+
 const screens = new Map();
 let currentId = null;
 let currentScreen = null;
@@ -53,7 +55,7 @@ export const Router = {
         await screen.show(params || {});
       } catch (e) {
         console.error(`[router] show ${id} failed`, e);
-        content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${e.message}</pre></div>`;
+        content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${escapeHtml(e.message)}</pre></div>`;
       }
       return;
     }
@@ -66,7 +68,7 @@ export const Router = {
       if (screen.mount) await screen.mount(params || {});
     } catch (e) {
       console.error(`[router] render ${id} failed`, e);
-      content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${e.message}</pre></div>`;
+      content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${escapeHtml(e.message)}</pre></div>`;
     }
   },
 
