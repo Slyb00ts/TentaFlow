@@ -107,11 +107,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             protobuf-compiler cmake build-essential pkg-config \
-            libssl-dev git curl ca-certificates
+            libglib2.0-dev libssl-dev git curl ca-certificates
 
       - name: Install base tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf cmake
+        run: brew install protobuf cmake glib pkg-config
 
       - name: Verify Xcode (macOS — wymagane przez build.rs do zbudowania
               libMLXBridge.dylib z Metal shaderami przez xcodebuild)
