@@ -1172,6 +1172,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_conflict_resolve_dispatch_rejects_non_admin() {
+        let ctx = sync_test_ctx("user");
+        let body =
+            MessageBody::SyncConflictBody(tentaflow_protocol::SyncConflictPayload::ResolveRequest(
+                tentaflow_protocol::SyncConflictResolveRequest {
+                    org_id: "org-default".to_string(),
+                    addon_id: "contacts".to_string(),
+                    operation_id: crate::sync::ledger::OperationId::from_hash([0xC3; 32]).to_hex(),
+                    resolution: tentaflow_protocol::SyncConflictResolution::KeepLocal,
+                },
+            ));
+
+        let (resp, is_err) = dispatch(&body, &ctx).await;
+
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::PolicyDenied),
+            _ => panic!("expected auth error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_conflict_list_dispatch_rejects_invalid_scope_and_status() {
+        let ctx = sync_test_ctx("admin");
+        for (addon_id, status) in [("../contacts", "open"), ("contacts", "everything")] {
+            let body = MessageBody::SyncConflictBody(
+                tentaflow_protocol::SyncConflictPayload::ListRequest(
+                    tentaflow_protocol::SyncConflictsListRequest {
+                        org_id: "org-default".to_string(),
+                        addon_id: addon_id.to_string(),
+                        status: status.to_string(),
+                        limit: 10,
+                    },
+                ),
+            );
+            let (resp, is_err) = dispatch(&body, &ctx).await;
+            assert!(is_err);
+            match resp {
+                MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::BadRequest),
+                _ => panic!("expected bad request"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sync_conflict_resolve_dispatch_rejects_invalid_operation_id() {
         let ctx = sync_test_ctx("admin");
         let body =
@@ -1191,6 +1236,66 @@ mod tests {
             MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::BadRequest),
             _ => panic!("expected bad request"),
         }
+    }
+
+    #[test]
+    fn sync_conflict_resolve_dispatch_marks_conflict_for_admin() {
+        with_tmp_home(|| {
+            let addon_id = "dispatch-conflict-resolve-test";
+            let operation_id = crate::sync::ledger::OperationId::from_hash([0xB2; 32]);
+            let db_path = crate::paths::tentaflow_home().join("dispatch-sync-runtime.db");
+            let db = crate::db::init(&db_path).expect("test DB init");
+            let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[0xB2; 32]));
+            let security = std::sync::Arc::new(
+                crate::mesh::security::MeshSecurity::new(db, cipher).expect("mesh security"),
+            );
+            crate::sync::runtime::init(security.db.clone(), security).expect("sync runtime");
+            crate::addon::storage_sql_exec::record_sync_conflict(
+                &sync_conflict_capture(addon_id),
+                operation_id,
+                "node-b",
+                &crate::addon::storage_sql_exec::StorageSqlError::SqlConstraint,
+            )
+            .expect("record conflict");
+
+            let ctx = sync_test_ctx("admin");
+            let body = MessageBody::SyncConflictBody(
+                tentaflow_protocol::SyncConflictPayload::ResolveRequest(
+                    tentaflow_protocol::SyncConflictResolveRequest {
+                        org_id: "org-default".to_string(),
+                        addon_id: addon_id.to_string(),
+                        operation_id: operation_id.to_hex(),
+                        resolution: tentaflow_protocol::SyncConflictResolution::KeepLocal,
+                    },
+                ),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
+
+            assert!(!is_err);
+            match resp {
+                MessageBody::SyncConflictBody(
+                    tentaflow_protocol::SyncConflictPayload::ResolveResponse(response),
+                ) => {
+                    assert_eq!(response.operation_id, operation_id.to_hex());
+                    assert_eq!(response.status, "ignored");
+                    assert_eq!(response.resolution, "keep_local");
+                }
+                _ => panic!("expected sync conflict resolve response"),
+            }
+            let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+                "org-default",
+                addon_id,
+                Some("ignored"),
+                10,
+            )
+            .expect("resolved conflicts");
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].operation_id, operation_id.to_hex());
+        });
     }
 
     #[test]
