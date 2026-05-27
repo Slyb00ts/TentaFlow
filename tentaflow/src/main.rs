@@ -602,6 +602,20 @@ async fn run_server(args: Args) -> Result<()> {
                             },
                         )).await;
 
+                        if let Some(port_allocator) = services_port_allocator.clone() {
+                            if let Some(executor) = mesh_mgr.command_executor().await {
+                                executor
+                                    .set_service_action_context(
+                                        tentaflow_core::mesh::command_executor::ServiceActionContext {
+                                            db: db.clone(),
+                                            port_allocator,
+                                            iroh: mesh_mgr.clone(),
+                                        },
+                                    )
+                                    .await;
+                            }
+                        }
+
                         // Obsluga przychodzacych alias sync od zdalnych nodow
                         let router_for_alias = router.clone();
                         let mut alias_rx = mesh_mgr.subscribe();
