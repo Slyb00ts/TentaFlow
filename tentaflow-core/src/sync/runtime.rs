@@ -565,8 +565,14 @@ impl SyncRuntime {
         }
         let target = SyncTarget::new(source_node_id.to_string())?;
         for op_id in payload.operation_ids {
-            self.ledger
-                .mark_acknowledged(target.clone(), operation_id_from_wire(&op_id)?)?;
+            match self
+                .ledger
+                .mark_acknowledged(target.clone(), operation_id_from_wire(&op_id)?)
+            {
+                Ok(()) => {}
+                Err(SyncLedgerError::OutboxEntryNotFound { .. }) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
