@@ -44,6 +44,87 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // 2. Walidacja
     validate_manifest(&manifest)?;
 
+    // Sprawdzenie kompatybilnosci SDK addona z rdzeniem (F1a §6.2.Y).
+    // None → kompatybilny (addon nie deklaruje wymagan); Some(req) → musi
+    // matchowac CORE_SDK_VERSION.
+    if let Err(e) = crate::addon::sdk_version::check_compatibility(manifest.sdk_version.as_deref())
+    {
+        bail!("Addon '{}': {}", manifest.addon_id, e);
+    }
+
+    // 2b. F1c P2 — verify Ed25519 signatures of [[ui_component]] bundles
+    // against [publisher] key in the trust store. Failure aborts install
+    // before any DB row is written. The manifest validator already rejected
+    // "ui_components without publisher" combinations, so an Some(publisher)
+    // implies every ui_component must verify.
+    if let Some(publisher) = manifest.publisher.as_ref() {
+        for component in &manifest.ui_components {
+            let bundle_path =
+                match crate::util::path_safety::safe_resolve(addon_dir, &component.src) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let pk_short = crate::addon::signature::truncate_pk_for_audit(
+                            &publisher.ed25519_public_key,
+                        );
+                        let _ = crate::db::repository::log_audit(
+                            db,
+                            None,
+                            Some(&manifest.addon_id),
+                            "addon.ui_signature_verify",
+                            Some(component.id.as_str()),
+                            Some(&format!(
+                                "denied: unsafe bundle path; publisher_pk={pk_short}"
+                            )),
+                            None,
+                            None,
+                        );
+                        bail!(
+                            "ui_component '{}' src '{}' rejected: {}",
+                            component.id,
+                            component.src,
+                            e
+                        );
+                    }
+                };
+            if let Err(e) = crate::addon::signature::verify_ui_component_bundle(
+                &bundle_path,
+                &publisher.ed25519_public_key,
+                &component.signature,
+                db,
+            ) {
+                let pk_short =
+                    crate::addon::signature::truncate_pk_for_audit(&publisher.ed25519_public_key);
+                let _ = crate::db::repository::log_audit(
+                    db,
+                    None,
+                    Some(&manifest.addon_id),
+                    "addon.ui_signature_verify",
+                    Some(component.id.as_str()),
+                    Some(&format!("denied: {e}; publisher_pk={pk_short}")),
+                    None,
+                    None,
+                );
+                bail!(
+                    "ui_component '{}': signature verify failed ({})",
+                    component.id,
+                    e
+                );
+            }
+            let pk_short =
+                crate::addon::signature::truncate_pk_for_audit(&publisher.ed25519_public_key);
+            let _ = crate::db::repository::log_audit(
+                db,
+                None,
+                Some(&manifest.addon_id),
+                "addon.ui_signature_verify",
+                Some(component.id.as_str()),
+                Some(&format!("ok: publisher_pk={pk_short}")),
+                None,
+                None,
+            );
+        }
+    }
+
     // 3. Odczytaj plik WASM
     let wasm_path = addon_dir.join(&manifest.wasm_file);
 
@@ -65,6 +146,14 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
 
     let wasm_bytes = std::fs::read(&wasm_path)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac pliku WASM: {e}"))?;
+
+    // F1c P5 — compile every declared [[flow_template]] before touching the
+    // DB. A flow.json that fails schema, edge, or cycle validation aborts
+    // install with a precise diagnostic rather than landing a half-installed
+    // addon whose templates silently no-op at runtime. Registry insertion
+    // happens after the DB COMMIT so a later failure does not leave a flow
+    // visible to invokers for an addon that is not actually installed.
+    let compiled_flows = compile_flow_templates(&manifest, addon_dir)?;
 
     let platforms_json =
         serde_json::to_string(&manifest.platforms).unwrap_or_else(|_| "[\"all\"]".to_string());
@@ -165,8 +254,8 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
         .ok();
     }
 
-    // Zapisz reguly sieciowe z manifestu (TCP/UDP + HTTP domains)
-    // Reguly required=true sa domyslnie approved (addon jawnie ich potrzebuje)
+    // Zapisz reguly sieciowe z manifestu (TCP/UDP + HTTP domains).
+    // Deklaracja nie jest zgoda admina; kazda nowa regula startuje jako blocked.
     for rule in &manifest.network_rules {
         conn.execute(
             "INSERT OR IGNORE INTO addon_network_rules \
@@ -180,7 +269,7 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
                 rule.port,
                 rule.description.as_deref().unwrap_or(""),
                 rule.required as i32,
-                if rule.required { 1 } else { 0 }
+                0
             ],
         )
         .ok();
@@ -191,6 +280,26 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
 
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &manifest)?;
+
+    // F1a §6.5 M1.W4: jezeli addon deklaruje [storage] sql=true — utworz
+    // per-addon SQLite (przez fs_sandbox::addon_data_dir) i zaaplikuj migracje.
+    // Bez deklaracji storage.sql nic sie nie dzieje — backward compat z istniejacymi
+    // addonami (test-app, teams-bot).
+    if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
+        apply_addon_sql_migrations(&manifest, addon_dir, db)?;
+    }
+
+    // F1c P5 — publish compiled flows as the final install step. Done after
+    // every fallible side-effect (DB tx, metadata sync, per-addon SQL migrate)
+    // so an error path never leaves orphaned registry entries pointing at an
+    // addon row that did not finish landing. Compilation already happened
+    // pre-tx; registration itself is infallible.
+    {
+        let registry = crate::flow_runtime::registry::global();
+        for flow in compiled_flows {
+            registry.register(&manifest.addon_id, flow);
+        }
+    }
 
     info!(
         "Addon '{}' v{} installed ({} WASM bytes, {} permissions, {} tools, {} network rules)",
@@ -203,6 +312,82 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     );
 
     Ok(manifest)
+}
+
+pub fn ensure_sql_storage(addon_dir: &Path, db: &DbPool) -> Result<()> {
+    let manifest_path = addon_dir.join("manifest.toml");
+    if !manifest_path.exists() {
+        bail!("Brak pliku manifest.toml w {:?}", addon_dir);
+    }
+    let manifest_content = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac manifest.toml: {e}"))?;
+    let manifest = parse_manifest_toml(&manifest_content)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie sparsowac manifest.toml: {e}"))?;
+    validate_manifest(&manifest)?;
+    if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
+        apply_addon_sql_migrations(&manifest, addon_dir, db)?;
+    }
+    Ok(())
+}
+
+/// Otwiera per-addon SQLite i aplikuje migracje z `<bundle>/<migrations_dir>/`.
+/// Wywolywane tylko gdy `manifest.storage.sql == true`. Migration fail =
+/// install fail z rollbackiem: czyscimy zarejestrowanego addona z core DB
+/// oraz purgujemy pool, zeby kolejna proba install nie kolidowala.
+fn apply_addon_sql_migrations(
+    manifest: &AddonManifest,
+    addon_dir: &Path,
+    db: &DbPool,
+) -> Result<()> {
+    let storage = manifest.storage.as_ref().expect("checked by caller");
+    let migrations_dir = storage.migrations_dir.as_str();
+
+    if storage.encryption == "at-rest" {
+        // F1a: deklaracja akceptowana, ale SQLCipher integracja przyjdzie w F8.
+        tracing::warn!(
+            "addon '{}': [storage].encryption='at-rest' — F1a nie wymusza szyfrowania (planowane F8 SQLCipher)",
+            manifest.addon_id
+        );
+    }
+
+    // F2 P1.b — install runs under `org-default` during P1.b. Per-tenant
+    // install (lifecycle::install_for_org) lands in P1.c together with the
+    // CLI surface; until then every install is owned by `org-default`,
+    // matching the v32 backfill for `addons.org_id`.
+    let org_id = crate::services::org::DEFAULT_ORG_ID;
+    match crate::addon::migrations::apply_migrations(
+        &manifest.addon_id,
+        &manifest.version,
+        migrations_dir,
+        addon_dir,
+        db,
+        org_id,
+    ) {
+        Ok(n) => {
+            info!(
+                "addon '{}': SQL storage gotowy ({} migracji zaaplikowanych w tej sesji)",
+                manifest.addon_id, n
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Rollback rejestracji addonu — usuwamy go z DB i zamykamy pool,
+            // zeby kolejny install_addon nie trafil na "addon juz istnieje".
+            tracing::error!(
+                "addon '{}': migracje SQL FAILED ({}) — rollback install",
+                manifest.addon_id,
+                e.as_i32()
+            );
+            crate::addon::storage_sql::close_addon_db(org_id, &manifest.addon_id);
+            // Usun z DB (best-effort, install i tak juz failuje).
+            let _ = uninstall(&manifest.addon_id, db);
+            bail!(
+                "addon '{}': blad migracji SQL (kod {})",
+                manifest.addon_id,
+                e.as_i32()
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -314,6 +499,9 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
         "addon_resource_limits",
         "addon_config",
         "addon_network_rules",
+        // Bez tego ponowny install innej wersji o tej samej nazwie pliku
+        // migracji ale roznym hashu trafia na "hash mismatch" guard.
+        "addon_migrations_applied",
     ];
 
     for table in &tables {
@@ -333,9 +521,128 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
 
     conn.execute("COMMIT", [])?;
 
+    // F1a §6.5 M1.W4: zamknij per-addon SQLite pool. Plik data.db pozostaje
+    // na dysku (user moze chciec backup) — czyszczenie tylko manualne.
+    // F2 P1.b — uninstall is single-tenant in P1.b (org-default). Per-org
+    // uninstall lands with the CLI in P1.c.
+    crate::addon::storage_sql::close_addon_db(crate::services::org::DEFAULT_ORG_ID, addon_id);
+
+    // F1c P5 — drop any compiled flows this addon registered so a later
+    // invoke against a stale id reports "not found" instead of executing a
+    // template owned by an addon that no longer exists.
+    crate::flow_runtime::registry::global().unregister_addon(addon_id);
+
     info!("Addon '{}' odinstalowany", addon_id);
 
     Ok(())
+}
+
+// =============================================================================
+// F2 P1.b — boot-time migration of pre-F2 addon dirs to per-org layout
+// =============================================================================
+
+/// Move every legacy `<home>/.tentaflow/addons/<addon_id>/` directory into the
+/// new per-org layout `<home>/.tentaflow/orgs/org-default/addons/<addon_id>/`.
+/// Called from the boot path AFTER `db::migrations::run` so the DB v32
+/// backfill has already promoted every row to `org-default`.
+///
+/// Idempotent: a second invocation finds the legacy root already absent (or
+/// empty) and returns 0. Returns the number of addon dirs that were moved
+/// successfully. IO failures on individual entries are logged and skipped —
+/// the boot does not abort on a single stuck dir (e.g. open file handle on
+/// Windows). Missing legacy root → returns Ok(0).
+pub fn migrate_addon_dirs_to_org_default(home: &std::path::Path) -> std::io::Result<usize> {
+    let legacy_root = home.join(".tentaflow").join("addons");
+    if !legacy_root.exists() {
+        return Ok(0);
+    }
+    let target_root = home
+        .join(".tentaflow")
+        .join("orgs")
+        .join(crate::services::org::DEFAULT_ORG_ID)
+        .join("addons");
+    std::fs::create_dir_all(&target_root)?;
+
+    let mut moved = 0usize;
+    for entry in std::fs::read_dir(&legacy_root)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("migrate_addon_dirs: read_dir entry skipped: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // `symlink_metadata` does NOT follow links — a symlinked addon dir
+        // (operator's manual customisation, e.g. linking into a dev tree)
+        // must not be silently moved or dereferenced. Warn and skip so the
+        // operator can reconcile by hand; following the link would corrupt
+        // both the legacy path and whatever it pointed at.
+        let lstat = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "migrate_addon_dirs: symlink_metadata('{}') failed: {} — skipping",
+                    name,
+                    e
+                );
+                continue;
+            }
+        };
+        if lstat.file_type().is_symlink() {
+            tracing::warn!(
+                "migrate_addon_dirs: '{}' is a symlink — skipping (manual move required)",
+                name
+            );
+            continue;
+        }
+        // Skip non-directory entries (stray files from manual operator
+        // intervention should not block the migration).
+        if !lstat.is_dir() {
+            continue;
+        }
+        let dest = target_root.join(&name);
+        if dest.exists() {
+            // Target already populated — refuse to continue. A collision
+            // means the operator has a second copy of the same addon under
+            // the per-org root; silently leaving the legacy dir in place
+            // would hide the inconsistency until a later boot fails. Stop
+            // the migration so a human reconciles before the daemon comes
+            // up.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "migrate_addon_dirs: '{}' exists at both legacy and per-org paths",
+                    name
+                ),
+            ));
+        }
+        match std::fs::rename(&path, &dest) {
+            Ok(_) => {
+                moved += 1;
+                tracing::info!("migrate_addon_dirs: '{}' moved to per-org layout", name);
+            }
+            Err(e) => {
+                // `rename` across filesystem boundaries fails with EXDEV on
+                // Linux. The legacy root and target are siblings under the
+                // same `.tentaflow` tree so this should not happen, but log
+                // and continue rather than abort the entire boot.
+                tracing::warn!(
+                    "migrate_addon_dirs: rename '{}' failed: {} — manual move required",
+                    name,
+                    e
+                );
+            }
+        }
+    }
+
+    // Try to drop the now-empty legacy root. Failure is non-fatal.
+    let _ = std::fs::remove_dir(&legacy_root);
+    Ok(moved)
 }
 
 // =============================================================================
@@ -387,6 +694,12 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
         bail!("Brak pliku WASM: {:?}", wasm_path);
     }
 
+    // F1c P5 — compile the new flow templates BEFORE touching the DB. Any
+    // compile error (cycle, schema, missing file) aborts the upgrade with the
+    // old registry entries intact. Registry swap happens at the bottom, after
+    // every fallible step.
+    let new_compiled_flows = compile_flow_templates(&new_manifest, new_dir)?;
+
     // Size is captured from the WASM file on disk; metadata() avoids reading
     // the module contents twice (install() does a full read for validation,
     // upgrade() trusts the lifecycle path traversal check above).
@@ -402,17 +715,22 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     let license = new_manifest.license.as_deref().unwrap_or("");
     let show_in_catalog = new_manifest.show_in_catalog.unwrap_or(true) as i64;
 
-    let conn = db.lock().unwrap();
-    conn.execute("BEGIN TRANSACTION", [])?;
-
-    // Pobierz stara wersje
-    let old_version: String = conn
-        .query_row(
+    let old_version: String = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
             "SELECT version FROM addons WHERE addon_id = ?1",
             rusqlite::params![addon_id],
             |row| row.get(0),
         )
-        .map_err(|e| anyhow::anyhow!("Addon nie znaleziony: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Addon nie znaleziony: {e}"))?
+    };
+
+    if matches!(new_manifest.storage.as_ref(), Some(s) if s.sql) {
+        apply_addon_sql_migrations(&new_manifest, new_dir, db)?;
+    }
+
+    let conn = db.lock().unwrap();
+    conn.execute("BEGIN TRANSACTION", [])?;
 
     info!(
         "Upgrade addonu '{}': {} -> {}",
@@ -481,6 +799,14 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
 
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &new_manifest)?;
+
+    // F1c P5 — atomically swap compiled flows: drop every previous-version
+    // entry for this addon and publish the new set under a single write lock,
+    // so no concurrent flow_invoke_v1 ever observes a partial publish (no
+    // not-found-then-found window). In-flight invocations holding an Arc to
+    // the old CompiledFlow keep running against the old graph until they
+    // finish.
+    crate::flow_runtime::registry::global().replace_addon_flows(addon_id, new_compiled_flows);
 
     info!(
         "Addon '{}' zaktualizowany do v{}",
@@ -693,6 +1019,15 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         .get("runtime")
         .and_then(|v| v.as_str())
         .map(String::from);
+    if let Some(ref rt) = runtime {
+        if !crate::addon::runtime::KNOWN_RUNTIMES.contains(&rt.as_str()) {
+            anyhow::bail!(
+                "unknown addon runtime '{}', expected one of: {}",
+                rt,
+                crate::addon::runtime::KNOWN_RUNTIMES.join(", ")
+            );
+        }
+    }
     let license = addon
         .get("license")
         .and_then(|v| v.as_str())
@@ -933,6 +1268,105 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         })
         .unwrap_or_default();
 
+    let service = top.get("service").and_then(|v| v.as_table()).map(|svc| {
+        crate::addon::AddonServiceSection {
+            enabled: svc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            tick_interval_ms: svc
+                .get("tick_interval_ms")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64),
+            tick_fuel_budget: svc
+                .get("tick_fuel_budget")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64),
+            tick_timeout_ms: svc
+                .get("tick_timeout_ms")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64),
+        }
+    });
+
+    let application = match top.get("application") {
+        None => None,
+        Some(v) => {
+            let tbl = v
+                .as_table()
+                .ok_or_else(|| anyhow::anyhow!("[application] must be a TOML table"))?;
+            let entry_panel = tbl
+                .get("entry_panel")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow::anyhow!("[application] missing entry_panel (string)"))?
+                .to_string();
+            let title = tbl
+                .get("title")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow::anyhow!("[application] missing title (string)"))?
+                .to_string();
+            let icon = tbl
+                .get("icon")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow::anyhow!("[application] missing icon (string)"))?
+                .to_string();
+            let description = tbl
+                .get("description")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let sort_order = match tbl.get("sort_order") {
+                None => 100,
+                Some(toml::Value::Integer(n)) => {
+                    if !(i32::MIN as i64..=i32::MAX as i64).contains(n) {
+                        bail!("application.sort_order {n} outside i32 range");
+                    }
+                    *n as i32
+                }
+                Some(other) => bail!(
+                    "application.sort_order must be integer (got {})",
+                    other.type_str()
+                ),
+            };
+            let section = crate::addon::AddonApplicationSection {
+                entry_panel,
+                title,
+                icon,
+                description,
+                sort_order,
+            };
+            section.validate()?;
+            Some(section)
+        }
+    };
+
+    let sdk_version = addon
+        .get("sdk_version")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let storage = parse_storage_section(top.get("storage"))?;
+    let aliases = parse_aliases(top.get("alias"))?;
+    let gates = parse_gates(top.get("gate"))?;
+    let vector_namespaces = parse_vector_namespaces(top.get("vector_namespace"))?;
+    let flow_templates = parse_flow_templates(top.get("flow_template"))?;
+    let ui_components = parse_ui_components(top.get("ui_component"))?;
+    let gpu = parse_gpu_section(top.get("gpu"));
+    let uses_aliases = parse_uses_aliases(top.get("uses_alias"))?;
+    let uses_models = parse_uses_models(top.get("uses_model"))?;
+    let publisher = parse_publisher_section(top.get("publisher"))?;
+    let runtime_overrides = parse_runtime_section(top.get("runtime"))?;
+
+    crate::addon::manifest::validate_manifest_extensions(
+        storage.as_ref(),
+        &aliases,
+        &gates,
+        &vector_namespaces,
+        &flow_templates,
+        &ui_components,
+        sdk_version.as_deref(),
+        &uses_aliases,
+        &uses_models,
+        publisher.as_ref(),
+    )?;
+
     let resources = top.get("resources").map(|res| ResourceRequirements {
         storage_total_mb: res
             .get("storage_total_mb")
@@ -988,6 +1422,514 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         oauth_provider,
         license,
         show_in_catalog,
+        service,
+        application,
+        storage,
+        aliases,
+        gates,
+        vector_namespaces,
+        flow_templates,
+        ui_components,
+        gpu,
+        sdk_version,
+        uses_aliases,
+        uses_models,
+        publisher,
+        runtime_overrides,
+    })
+}
+
+/// Parses the optional top-level `[runtime]` TOML table into a
+/// `RuntimeSection`. Distinct from the `addon.runtime` scalar (which names
+/// the wasm engine — `"wasmtime"` / `"wasmi"`). Strict on field types: a
+/// non-integer `max_concurrency` or `rate_limit_per_min` is a hard parse
+/// error rather than a silent default, so a manifest typo cannot mask a
+/// regression in addon tuning.
+fn parse_runtime_section(
+    val: Option<&toml::Value>,
+) -> Result<Option<crate::addon::manifest::RuntimeSection>> {
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    let t = v
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[runtime] must be a TOML table"))?;
+    let max_concurrency = match t.get("max_concurrency") {
+        Some(toml::Value::Integer(n)) => {
+            if *n < 0 {
+                bail!("runtime.max_concurrency must be >= 0 (got {n})");
+            }
+            // Treat 0 as "no override" — the default cap stays in force.
+            if *n == 0 {
+                None
+            } else {
+                Some(*n as u32)
+            }
+        }
+        Some(other) => bail!(
+            "runtime.max_concurrency must be an integer (got {})",
+            other.type_str()
+        ),
+        None => None,
+    };
+    let rate_limit_per_min = match t.get("rate_limit_per_min") {
+        Some(toml::Value::Integer(n)) => {
+            if *n < 0 {
+                bail!("runtime.rate_limit_per_min must be >= 0 (got {n})");
+            }
+            if *n == 0 {
+                None
+            } else {
+                Some(*n as u32)
+            }
+        }
+        Some(other) => bail!(
+            "runtime.rate_limit_per_min must be an integer (got {})",
+            other.type_str()
+        ),
+        None => None,
+    };
+    Ok(Some(crate::addon::manifest::RuntimeSection {
+        max_concurrency,
+        rate_limit_per_min,
+    }))
+}
+
+/// Parses optional `[publisher]` table. Strict on field types — `label` and
+/// `ed25519_public_key` must be strings when present.
+fn parse_publisher_section(
+    val: Option<&toml::Value>,
+) -> Result<Option<crate::addon::manifest::PublisherInfo>> {
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    let tbl = v
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[publisher] must be a table"))?;
+    let ed25519_public_key = tbl
+        .get("ed25519_public_key")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("[publisher] missing ed25519_public_key (string)"))?
+        .to_string();
+    let label = tbl
+        .get("label")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("[publisher] missing label (string)"))?
+        .to_string();
+    let contact = tbl
+        .get("contact")
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    Ok(Some(crate::addon::manifest::PublisherInfo {
+        ed25519_public_key,
+        label,
+        contact,
+    }))
+}
+
+// Parsery sekcji rozszerzonych (F1a). Trzymamy je w lifecycle.rs zeby utrzymac
+// jeden punkt wejscia parsowania (parse_manifest_toml) i nie dublowac iteracji
+// po toml::Value w manifest.rs.
+
+fn parse_storage_section(
+    val: Option<&toml::Value>,
+) -> Result<Option<crate::addon::manifest::StorageConfig>> {
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    let tbl = v
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[storage] must be a table"))?;
+    let cfg = crate::addon::manifest::StorageConfig {
+        kv: tbl.get("kv").and_then(|v| v.as_bool()).unwrap_or(true),
+        sql: tbl.get("sql").and_then(|v| v.as_bool()).unwrap_or(false),
+        sql_backends: tbl
+            .get("sql_backends")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        sql_dialect: tbl
+            .get("sql_dialect")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ansi")
+            .to_string(),
+        migrations_dir: tbl
+            .get("migrations_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("migrations")
+            .to_string(),
+        encryption: tbl
+            .get("encryption")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+            .to_string(),
+    };
+    Ok(Some(cfg))
+}
+
+fn parse_aliases(val: Option<&toml::Value>) -> Result<Vec<crate::addon::manifest::AliasSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[alias]][{idx}] missing 'id'"))?
+            .to_string();
+        let display_name = item
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let methods = item
+            .get("methods")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let suggested_default = item
+            .get("suggested_default")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let gate = item.get("gate").and_then(|v| v.as_str()).map(String::from);
+        let visibility = match item.get("visibility").and_then(|v| v.as_str()) {
+            Some(s) => crate::addon::manifest::AliasVisibility::parse(s)?,
+            None => crate::addon::manifest::AliasVisibility::Private,
+        };
+        let allowed_consumers = item
+            .get("allowed_consumers")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(crate::addon::manifest::AliasSpec {
+            id,
+            display_name,
+            methods,
+            suggested_default,
+            gate,
+            visibility,
+            allowed_consumers,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_uses_aliases(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::UsesAliasSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[uses_alias]][{idx}] missing 'id'"))?
+            .to_string();
+        let required = item
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reason = item
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(crate::addon::manifest::UsesAliasSpec {
+            id,
+            required,
+            reason,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_uses_models(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::UsesModelSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[uses_model]][{idx}] missing 'id'"))?
+            .to_string();
+        let required = item
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reason = item
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(crate::addon::manifest::UsesModelSpec {
+            id,
+            required,
+            reason,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_gates(val: Option<&toml::Value>) -> Result<Vec<crate::addon::manifest::GateSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[gate]][{idx}] missing 'id'"))?
+            .to_string();
+        let display_name = item
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let required_claims = item
+            .get("required_claims")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(parse_claim_requirement)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        out.push(crate::addon::manifest::GateSpec {
+            id,
+            display_name,
+            required_claims,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_claim_requirement(val: &toml::Value) -> Result<crate::addon::manifest::ClaimRequirement> {
+    let claim_type = val
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("claim requirement missing 'type'"))?
+        .to_string();
+    Ok(crate::addon::manifest::ClaimRequirement {
+        claim_type,
+        subject: val
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        scope: val.get("scope").and_then(|v| v.as_str()).map(String::from),
+        status: val.get("status").and_then(|v| v.as_str()).map(String::from),
+        value: val.get("value").and_then(|v| v.as_str()).map(String::from),
+        oneof: val
+            .get("oneof")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        valid: val.get("valid").and_then(|v| v.as_bool()),
+        has_expiry: val.get("has_expiry").and_then(|v| v.as_bool()),
+    })
+}
+
+fn parse_vector_namespaces(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::VectorNamespaceSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'name'"))?
+            .to_string();
+        let dimensions = item
+            .get("dimensions")
+            .and_then(|v| v.as_integer())
+            .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'dimensions'"))?
+            as u32;
+        let distance = item
+            .get("distance")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'distance'"))?
+            .to_string();
+        let data_class = item
+            .get("data_class")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'data_class'"))?
+            .to_string();
+        let gate = item.get("gate").and_then(|v| v.as_str()).map(String::from);
+        out.push(crate::addon::manifest::VectorNamespaceSpec {
+            name,
+            dimensions,
+            distance,
+            data_class,
+            gate,
+        });
+    }
+    Ok(out)
+}
+
+/// F1c P5 — load + compile every `[[flow_template]].path` against the
+/// addon bundle directory. Returns the compiled flows on success; on
+/// failure aborts install with a precise per-template error.
+fn compile_flow_templates(
+    manifest: &AddonManifest,
+    addon_dir: &Path,
+) -> Result<Vec<std::sync::Arc<crate::flow_runtime::types::CompiledFlow>>> {
+    let mut out = Vec::with_capacity(manifest.flow_templates.len());
+    for template in &manifest.flow_templates {
+        let compiled = crate::flow_runtime::parser::load_from_addon_dir(addon_dir, &template.path)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "flow_template '{}' (path '{}'): compile failed: {}",
+                    template.id,
+                    template.path,
+                    e
+                )
+            })?;
+        if compiled.def.id != template.id {
+            bail!(
+                "flow_template '{}': manifest id does not match flow.json id '{}'",
+                template.id,
+                compiled.def.id
+            );
+        }
+        out.push(std::sync::Arc::new(compiled));
+    }
+    Ok(out)
+}
+
+fn parse_flow_templates(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::FlowTemplateSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[flow_template]][{idx}] missing 'id'"))?
+            .to_string();
+        let display_name = item
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let path = item
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[flow_template]][{idx}] missing 'path'"))?
+            .to_string();
+        let description = item
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(crate::addon::manifest::FlowTemplateSpec {
+            id,
+            display_name,
+            path,
+            description,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_ui_components(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::UiComponentSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[ui_component]][{idx}] missing 'id'"))?
+            .to_string();
+        let display_name = item
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let slot = item
+            .get("slot")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[ui_component]][{idx}] missing 'slot'"))?
+            .to_string();
+        let src = item
+            .get("src")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[ui_component]][{idx}] missing 'src'"))?
+            .to_string();
+        let signature = item
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[ui_component]][{idx}] missing 'signature'"))?
+            .to_string();
+        let risk = item
+            .get("risk")
+            .and_then(|v| v.as_str())
+            .unwrap_or("low")
+            .to_string();
+        let host_permissions = item
+            .get("host_permissions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.push(crate::addon::manifest::UiComponentSpec {
+            id,
+            display_name,
+            slot,
+            src,
+            signature,
+            risk,
+            host_permissions,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_gpu_section(val: Option<&toml::Value>) -> Option<crate::addon::manifest::GpuInfo> {
+    let tbl = val?.as_table()?;
+    Some(crate::addon::manifest::GpuInfo {
+        recommended_vram_mb: tbl
+            .get("recommended_vram_mb")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32),
+        notes: tbl.get("notes").and_then(|v| v.as_str()).map(String::from),
     })
 }
 
@@ -1155,6 +2097,196 @@ mod tests {
     }
 
     #[test]
+    fn parses_service_section_with_tick_interval_and_fuel() {
+        let toml = r#"
+[addon]
+id = "cam-watcher"
+name = "Camera Watcher"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[service]
+enabled = true
+tick_interval_ms = 500
+tick_fuel_budget = 20000000
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        let svc = m.service.expect("[service] sekcja wczytana");
+        assert!(svc.enabled);
+        assert_eq!(svc.tick_interval_ms, Some(500));
+        assert_eq!(svc.tick_fuel_budget, Some(20_000_000));
+    }
+
+    #[test]
+    fn application_section_parses_with_all_fields() {
+        let toml = r#"
+[addon]
+id = "tentavision"
+name = "TentaVision"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "main"
+title = "TentaVision"
+icon = "video"
+description = "Live camera surveillance"
+sort_order = 10
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        let app = m.application.expect("[application] parsed");
+        assert_eq!(app.entry_panel, "main");
+        assert_eq!(app.title, "TentaVision");
+        assert_eq!(app.icon, "video");
+        assert_eq!(app.description, "Live camera surveillance");
+        assert_eq!(app.sort_order, 10);
+    }
+
+    #[test]
+    fn application_section_uses_defaults_when_optional_fields_omitted() {
+        let toml = r#"
+[addon]
+id = "addon-x"
+name = "X"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "panel_a"
+title = "X"
+icon = "camera"
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        let app = m.application.expect("parsed");
+        assert_eq!(app.description, "");
+        assert_eq!(app.sort_order, 100);
+    }
+
+    #[test]
+    fn application_section_absent_yields_none() {
+        let toml = r#"
+[addon]
+id = "no-app"
+name = "No App"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        assert!(m.application.is_none());
+    }
+
+    #[test]
+    fn application_rejects_invalid_entry_panel() {
+        let toml = r#"
+[addon]
+id = "bad"
+name = "Bad"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "Main Panel!"
+title = "Bad"
+icon = "video"
+"#;
+        let err = parse_manifest_toml(toml).expect_err("must reject");
+        assert!(
+            err.to_string().contains("entry_panel"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn application_rejects_empty_title() {
+        let toml = r#"
+[addon]
+id = "bad"
+name = "Bad"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "main"
+title = ""
+icon = "video"
+"#;
+        let err = parse_manifest_toml(toml).expect_err("must reject");
+        assert!(err.to_string().contains("title"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn application_rejects_invalid_icon() {
+        let toml = r#"
+[addon]
+id = "bad"
+name = "Bad"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "main"
+title = "OK"
+icon = "Video Cam!"
+"#;
+        let err = parse_manifest_toml(toml).expect_err("must reject");
+        assert!(err.to_string().contains("icon"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn application_rejects_sort_order_out_of_range() {
+        let toml = r#"
+[addon]
+id = "bad"
+name = "Bad"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "main"
+title = "OK"
+icon = "video"
+sort_order = 999999
+"#;
+        let err = parse_manifest_toml(toml).expect_err("must reject");
+        assert!(
+            err.to_string().contains("sort_order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_service_section_yields_none() {
+        let toml = r#"
+[addon]
+id = "no-service"
+name = "No Service"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        assert!(m.service.is_none());
+    }
+
+    #[test]
+    fn service_section_defaults_enabled_true_when_omitted() {
+        let toml = r#"
+[addon]
+id = "default-enabled"
+name = "Default Enabled"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[service]
+tick_interval_ms = 1000
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        let svc = m.service.expect("[service] sekcja wczytana");
+        assert!(svc.enabled, "enabled default to true when section present");
+        assert_eq!(svc.tick_interval_ms, Some(1000));
+        assert!(svc.tick_fuel_budget.is_none());
+    }
+
+    #[test]
     fn test_lifecycle_install_persists_wasm_size_and_ui_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let addon_dir = tmp.path();
@@ -1192,5 +2324,186 @@ runtime = "wasmtime"
         assert_eq!(row.runtime, "wasmtime");
         assert_eq!(row.category, "communication");
         assert_eq!(row.wasm_size_bytes, wasm.len() as i64);
+    }
+
+    fn write_trusted_publisher(db: &crate::db::DbPool, key_b64: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO trusted_publishers (key_b64, label, added_at) VALUES (?1, 'test', '2026-01-01T00:00:00Z')",
+            rusqlite::params![key_b64],
+        )
+        .unwrap();
+    }
+
+    fn pub_pk_b64() -> (ed25519_dalek::SigningKey, String) {
+        use base64::Engine;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pk_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        (sk, pk_b64)
+    }
+
+    fn install_with_bad_src(component_src: &str) -> anyhow::Error {
+        use base64::Engine;
+        let tmp = tempfile::tempdir().unwrap();
+        let addon_dir = tmp.path();
+        let (_sk, pk_b64) = pub_pk_b64();
+        let sig_b64 = format!(
+            "ed25519:{}",
+            base64::engine::general_purpose::STANDARD.encode([0u8; 64])
+        );
+
+        let manifest = format!(
+            r#"
+[addon]
+id = "path-traversal-test"
+name = "PT Test"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[publisher]
+label = "Test Publisher"
+ed25519_public_key = "{pk_b64}"
+
+[[ui_component]]
+id = "evil"
+src = "{component_src}"
+signature = "{sig_b64}"
+slot = "sidebar"
+"#
+        );
+        std::fs::write(addon_dir.join("manifest.toml"), manifest).unwrap();
+        let mut f = std::fs::File::create(addon_dir.join("addon.wasm")).unwrap();
+        f.write_all(&minimal_wasm_bytes()).unwrap();
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        write_trusted_publisher(&db, &pk_b64);
+        install(addon_dir, &db).unwrap_err()
+    }
+
+    #[test]
+    fn install_rejects_dotdot_in_component_src() {
+        let err = install_with_bad_src("../../etc/passwd");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rejected") && msg.contains(".."),
+            "expected rejection mentioning '..', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_rejects_absolute_component_src() {
+        let err = install_with_bad_src("/etc/passwd");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rejected") && msg.contains("absolute"),
+            "expected absolute-path rejection, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlink_component_src() {
+        use base64::Engine;
+        let tmp = tempfile::tempdir().unwrap();
+        let addon_dir = tmp.path();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.html");
+        std::fs::write(&target, b"<html>secret</html>").unwrap();
+        std::os::unix::fs::symlink(&target, addon_dir.join("link.html")).unwrap();
+
+        let (_sk, pk_b64) = pub_pk_b64();
+        let manifest = format!(
+            r#"
+[addon]
+id = "symlink-test"
+name = "Sym Test"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[publisher]
+label = "Test Publisher"
+ed25519_public_key = "{pk_b64}"
+
+[[ui_component]]
+id = "linked"
+src = "link.html"
+signature = "ed25519:{}"
+slot = "sidebar"
+"#,
+            base64::engine::general_purpose::STANDARD.encode([0u8; 64])
+        );
+        std::fs::write(addon_dir.join("manifest.toml"), manifest).unwrap();
+        let mut f = std::fs::File::create(addon_dir.join("addon.wasm")).unwrap();
+        f.write_all(&minimal_wasm_bytes()).unwrap();
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        write_trusted_publisher(&db, &pk_b64);
+        let err = install(addon_dir, &db).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rejected"),
+            "expected symlink rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn migrate_addon_dirs_skips_symlink_entry() {
+        // A symlink under the legacy root must NOT be moved (would leave the
+        // target dangling or corrupt the operator's manual customisation).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let legacy_root = home.join(".tentaflow").join("addons");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+
+        // Real dir → migrates.
+        let real = legacy_root.join("real-addon");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("manifest.toml"), "id=\"real\"").unwrap();
+
+        // Symlink → skipped. Use `symlink_dir` on Windows, `symlink` on Unix.
+        let link_target = tmp.path().join("external-tree");
+        std::fs::create_dir(&link_target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&link_target, legacy_root.join("linked-addon")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&link_target, legacy_root.join("linked-addon")).unwrap();
+
+        let moved = migrate_addon_dirs_to_org_default(home).expect("migrate ok");
+        assert_eq!(moved, 1, "only the real dir should migrate");
+
+        let target_root = home
+            .join(".tentaflow")
+            .join("orgs")
+            .join(crate::services::org::DEFAULT_ORG_ID)
+            .join("addons");
+        assert!(target_root.join("real-addon").exists());
+        assert!(!target_root.join("linked-addon").exists());
+        // The symlink stays at the legacy path for the operator to reconcile.
+        assert!(legacy_root.join("linked-addon").exists());
+    }
+
+    #[test]
+    fn migrate_addon_dirs_errors_on_collision() {
+        // A pre-existing entry at the per-org target must abort migration so
+        // the operator sees the inconsistency at boot.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let legacy_root = home.join(".tentaflow").join("addons");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        let target_root = home
+            .join(".tentaflow")
+            .join("orgs")
+            .join(crate::services::org::DEFAULT_ORG_ID)
+            .join("addons");
+        std::fs::create_dir_all(&target_root).unwrap();
+
+        // Same name on both sides → collision.
+        std::fs::create_dir(legacy_root.join("dup")).unwrap();
+        std::fs::create_dir(target_root.join("dup")).unwrap();
+
+        let err = migrate_addon_dirs_to_org_default(home).expect_err("must err");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(format!("{err}").contains("dup"));
     }
 }

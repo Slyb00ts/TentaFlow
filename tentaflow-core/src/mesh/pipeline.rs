@@ -16,12 +16,12 @@ use crate::config::MeshConfig;
 use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, NodeInfo};
-use crate::mesh::relay_health::{spawn_relay_health_monitor, RelayHealth};
+use crate::mesh::relay_health::{RelayHealth, spawn_relay_health_monitor};
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::load_relay_url;
 use crate::net::iroh::pairing::{
-    load_trusted_contact_hints, merge_contact_hints, store_trusted_contact_hints,
-    PairingContactHints,
+    PairingContactHints, load_trusted_contact_hints, merge_contact_hints,
+    store_trusted_contact_hints,
 };
 use crate::routing::live_metrics;
 use parking_lot::RwLock as PlRwLock;
@@ -135,8 +135,8 @@ pub async fn start_mesh_pipeline(
     // + iroh relay wystarczaja do discovery peerow. Na desktop respektujemy
     // `mesh.dht_enabled` z config.toml (default true) — uzytkownicy z ISP
     // blokujacym BitTorrent UDP moga wylaczyc i nie zalewac logow timeout-ami.
-    let enable_dht = cfg!(not(any(target_os = "ios", target_os = "android")))
-        && mesh_config.dht_enabled;
+    let enable_dht =
+        cfg!(not(any(target_os = "ios", target_os = "android"))) && mesh_config.dht_enabled;
     let relay_url = load_relay_url(db_pool.as_ref(), Some(mesh_config));
 
     // Wyczysc stare wpisy `trusted_contact:*` z martwym relay URL zanim
@@ -198,6 +198,17 @@ pub async fn start_mesh_pipeline(
     match IrohMeshManager::new(iroh_cfg, security_for_mesh).await {
         Ok(quic_mesh) => {
             let local_node_id = quic_mesh.node_id();
+
+            // F2 P5 — register the mesh broadcast-on-rotate hook so the
+            // on-disk key watcher in `services::mod` can push the rotated
+            // HMAC keys to every trust-paired peer without waiting for the
+            // next `PeerConnected`. Idempotent: a second mesh boot in the
+            // same process keeps the first handle.
+            crate::services::mesh_keys::register_broadcast_hook(
+                local_node_id.clone(),
+                quic_mesh.clone(),
+            );
+
             let local_node_info = node_info_collector::collect_node_info(&local_node_id);
             upsert_local_peer(
                 mesh_peer_store,
@@ -338,6 +349,7 @@ pub async fn start_mesh_pipeline(
                 db_pool.clone(),
             );
             spawn_pairing_cleanup(mesh_security.clone());
+            spawn_sync_repair_scheduler(quic_mesh.clone(), mesh_security.clone());
 
             info!("Mesh networking uruchomiony (iroh transport)");
 
@@ -571,7 +583,7 @@ async fn handle_peer_connected(
                         rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
                     {
                         let _ = qm_events
-                            .send_to_peer(
+                            .send_ufp2_to_peer(
                                 &node_id,
                                 tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
                                 &data,
@@ -581,6 +593,16 @@ async fn handle_peer_connected(
                 }
 
                 last_sync_sent.insert(node_id.clone(), std::time::Instant::now());
+            }
+
+            // F1b P3.B — push our HMAC issuer keys (pickup_token, frame_url,
+            // recording_url) so the peer can verify tokens we mint. Only sent
+            // to already-trusted peers; the receiver enforces the same gate.
+            let advertise = crate::services::mesh_keys::sync::build_local_advertise(&local_node_id);
+            if let Some(bytes) = crate::services::mesh_keys::sync::encode_advertise(&advertise) {
+                if let Err(e) = qm_events.send_hmac_keys_sync(&node_id, &bytes).await {
+                    warn!("Blad wysylania HmacKeysSync do {}: {}", node_id, e);
+                }
             }
         }
 
@@ -593,7 +615,7 @@ async fn handle_peer_connected(
         };
         if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&pull) {
             if let Err(e) = qm_events
-                .send_to_peer(
+                .send_ufp2_to_peer(
                     &node_id,
                     tentaflow_protocol::mesh::MESH_MSG_SERVICES_GET,
                     &bytes,
@@ -602,6 +624,31 @@ async fn handle_peer_connected(
             {
                 debug!(peer = %node_id, "MeshServicesGet send failed: {}", e);
             }
+        }
+
+        match crate::sync::runtime::build_push_payload_for_target(&node_id, 128) {
+            Ok(Some(payload)) => {
+                let op_count = payload.operations.len();
+                match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                    Ok(bytes) => {
+                        if let Err(e) = qm_events
+                            .send_ufp2_to_peer(
+                                &node_id,
+                                tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
+                                &bytes,
+                            )
+                            .await
+                        {
+                            debug!(peer = %node_id, "SyncPush send failed: {}", e);
+                        } else {
+                            debug!(peer = %node_id, op_count, "SyncPush sent on connect");
+                        }
+                    }
+                    Err(e) => warn!(peer = %node_id, "SyncPush encode error: {}", e),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!(peer = %node_id, "SyncPush build failed: {}", e),
         }
     } else {
         debug!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
@@ -710,6 +757,11 @@ async fn handle_peer_disconnected(
     peer_store.set_status(&node_id, "disconnected");
     peer_store.clear_heartbeat(&node_id);
     info!(peer_id = %node_id, "QUIC peer rozlaczony");
+
+    // F1b P3.B — disconnected peer's HMAC keys are no longer trustworthy
+    // for verifying new tokens; drop them from the pool. They will be
+    // re-acquired on the next reconnect's advertise.
+    crate::services::mesh_keys::sync::forget_peer(&node_id);
 
     let hostname = peer_store.get_hostname(&node_id).unwrap_or_default();
     crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
@@ -1324,7 +1376,9 @@ fn spawn_quic_event_handler(
                                     "PairingRequest szczegoly"
                                 );
                                 if from_node_id == local_node_id {
-                                    warn!("Odrzucono PairingRequest od samego siebie (from_node_id == local_node_id)");
+                                    warn!(
+                                        "Odrzucono PairingRequest od samego siebie (from_node_id == local_node_id)"
+                                    );
                                     continue;
                                 }
                                 let pin = val.pin.as_str();
@@ -1334,7 +1388,10 @@ fn spawn_quic_event_handler(
                                 {
                                     warn!("Blad zapisu PairingRequest od {}: {}", peer_id, e);
                                 } else {
-                                    info!("PairingRequest od {} zapisany — oczekuje na potwierdzenie PIN", from_node_id);
+                                    info!(
+                                        "PairingRequest od {} zapisany — oczekuje na potwierdzenie PIN",
+                                        from_node_id
+                                    );
                                     // Auto-confirm jesli PIN pochodzi z naszego QR invite —
                                     // user na drugim nodzie juz zeskanowal kod i jego intent
                                     // jest jednoznaczny. Zadna dodatkowa akcja po stronie
@@ -1500,7 +1557,7 @@ fn spawn_quic_event_handler(
                                                 .map(|v| v.to_vec())
                                                 .unwrap_or_default();
                                         // Broadcast do wszystkich trusted — pomija nowo sparowanego (juz dostal wyzej)
-                                        let results = qm_events.broadcast_to_trusted(
+                                        let results = qm_events.broadcast_ufp2_to_trusted(
                                             tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
                                             &broadcast_data,
                                             Some(&target_node_id),
@@ -1565,6 +1622,9 @@ fn spawn_quic_event_handler(
                             let all_trusted = sec.get_all_trusted_keys();
                             for (trusted_id, _) in &all_trusted {
                                 let _ = sec.unpair(trusted_id);
+                                // F1b P3.B — drop the peer's mirrored HMAC keys
+                                // so their tokens stop verifying immediately.
+                                crate::services::mesh_keys::sync::forget_peer(trusted_id);
                             }
                             info!(
                                 "Odlaczony z mesh przez {} — usunieto {} kluczy",
@@ -1593,6 +1653,7 @@ fn spawn_quic_event_handler(
                         // Przypadek 2: ktos inny zostal odlaczony — usun TYLKO jego klucz
                         if sender_trusted && sec.is_trusted(&revoked_node_id) {
                             let _ = sec.unpair(&revoked_node_id);
+                            crate::services::mesh_keys::sync::forget_peer(&revoked_node_id);
                             info!(
                                 "Usunieto {} z mesh (propagacja od {})",
                                 revoked_node_id, node_id
@@ -1628,11 +1689,6 @@ fn spawn_quic_event_handler(
 
                     info!("Node {} opuszcza mesh (graceful leave)", node_id);
                     qm_events.disconnect_peer(&node_id).await;
-                }
-                Ok(IrohMeshEvent::KeyRotationReceived { .. })
-                | Ok(IrohMeshEvent::KeyRotationResponseReceived { .. }) => {
-                    // Rotacja kluczy jest obsluzona przez iroh TLS per-connection —
-                    // legacy zdarzenia od starych peerow sa ignorowane.
                 }
                 Ok(IrohMeshEvent::TrustedKeysSyncReceived { node_id, keys }) => {
                     // Akceptuj sync TYLKO od trusted peera
@@ -1679,59 +1735,30 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(IrohMeshEvent::RelayFrameReceived {
-                    from_node_id: _,
-                    frame,
-                }) => {
-                    // Sprawdz TTL
-                    if frame.ttl == 0 {
-                        warn!(source = %frame.source_node_id, dest = %frame.destination_node_id, "Relay frame TTL wyczerpany — odrzucam");
+                Ok(IrohMeshEvent::HmacKeysSyncReceived { node_id, payload }) => {
+                    // SECURITY: HMAC keys sync MUST be post-trust. Reject from
+                    // untrusted peers — otherwise an attacker could inject fake
+                    // HMAC keys into our verify pool and mint tokens we would
+                    // accept. The `is_trusted` check below is a load-bearing
+                    // security boundary; the `mesh_key_sync_integration`
+                    // contract test (`receive_handler_has_is_trusted_gate`)
+                    // greps this file to prove the gate did not regress.
+                    let sender_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&node_id),
+                        None => false,
+                    };
+                    if !sender_trusted {
+                        warn!("Odrzucono HmacKeysSync od niezaufanego noda {}", node_id);
                         continue;
                     }
-
-                    // Czy ja jestem odbiorca koncowym?
-                    if frame.destination_node_id == local_node_id {
-                        // iroh TLS zapewnia end-to-end encryption na polaczeniu —
-                        // payload jest juz odszyfrowany przy odbiorze streamu.
+                    let accepted =
+                        crate::services::mesh_keys::sync::ingest_advertise(&node_id, payload);
+                    if accepted > 0 {
                         info!(
-                            source = %frame.source_node_id,
-                            disc = frame.discriminant,
-                            hops = 5u8.saturating_sub(frame.ttl) + 1,
-                            "Otrzymano relay frame (multi-hop)"
+                            from = %node_id,
+                            scopes = accepted,
+                            "HmacKeysSync przyjety — peer keys zalezone do verify pool"
                         );
-                    } else {
-                        // Forward do next-hop
-                        let mut forwarded_frame = frame;
-                        forwarded_frame.ttl -= 1;
-
-                        if let Some(route) =
-                            peer_store.get_route(&forwarded_frame.destination_node_id)
-                        {
-                            let frame_bytes =
-                                rkyv::to_bytes::<rkyv::rancor::Error>(&forwarded_frame)
-                                    .map(|v| v.to_vec())
-                                    .unwrap_or_default();
-                            if let Err(e) = qm_events
-                                .send_relay_frame(&route.next_hop, &frame_bytes)
-                                .await
-                            {
-                                warn!(
-                                    dest = %forwarded_frame.destination_node_id,
-                                    next_hop = %route.next_hop,
-                                    "Blad forwarding relay frame: {}", e
-                                );
-                            } else {
-                                debug!(
-                                    source = %forwarded_frame.source_node_id,
-                                    dest = %forwarded_frame.destination_node_id,
-                                    next_hop = %route.next_hop,
-                                    ttl = forwarded_frame.ttl,
-                                    "Relay frame forwarded"
-                                );
-                            }
-                        } else {
-                            warn!(dest = %forwarded_frame.destination_node_id, "Brak route — nie moge forwardowac relay frame");
-                        }
                     }
                 }
                 Ok(IrohMeshEvent::MeshCommandReceived {
@@ -1747,28 +1774,6 @@ fn spawn_quic_event_handler(
                     qm_events
                         .handle_command_response_received(&from_node_id, &data)
                         .await;
-                }
-                Ok(IrohMeshEvent::CrdtDeltaReceived { node_id, .. }) => {
-                    // Safety net — przetwarzaj CRDT delta TYLKO od trusted peerow
-                    let is_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&node_id),
-                        None => false, // Zero trust — bez MeshSecurity nie przetwarzaj danych
-                    };
-                    if !is_trusted {
-                        debug!(peer_id = %node_id, "Pomijam CrdtDelta od niezaufanego peera (safety net)");
-                    }
-                    // Dalsze przetwarzanie CRDT delta (jesli bedzie potrzebne) — tu placeholder
-                }
-                Ok(IrohMeshEvent::FullStateReceived { node_id, .. }) => {
-                    // Safety net — przetwarzaj FullState TYLKO od trusted peerow
-                    let is_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&node_id),
-                        None => false, // Zero trust — bez MeshSecurity nie przetwarzaj danych
-                    };
-                    if !is_trusted {
-                        debug!(peer_id = %node_id, "Pomijam FullState od niezaufanego peera (safety net)");
-                    }
-                    // Dalsze przetwarzanie FullState (jesli bedzie potrzebne) — tu placeholder
                 }
                 Ok(IrohMeshEvent::ModelListUpdate { node_id, data }) => {
                     // ModelsSync — nadpisuje liste modeli danego peera.
@@ -1858,7 +1863,7 @@ fn spawn_quic_event_handler(
                             }
                         };
                         if let Err(e) = qm
-                            .send_to_peer(
+                            .send_ufp2_to_peer(
                                 &peer,
                                 tentaflow_protocol::mesh::MESH_MSG_SERVICES_GET_RESPONSE,
                                 &bytes,
@@ -1948,6 +1953,393 @@ fn spawn_quic_event_handler(
                             warn!(peer = %from_node_id, "MeshServicesUpdate decode error: {}", e);
                         }
                     }
+                }
+                Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "SyncPush od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncPushPayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            match crate::sync::runtime::handle_push_payload(&from_node_id, payload)
+                            {
+                                Ok(Some(ack)) => {
+                                    match rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+                                        .map(|v| v.to_vec())
+                                    {
+                                        Ok(bytes) => {
+                                            if let Err(e) = qm_events
+                                                .send_ufp2_to_peer(
+                                                    &from_node_id,
+                                                    tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                                                    &bytes,
+                                                )
+                                                .await
+                                            {
+                                                warn!(peer = %from_node_id, "SyncAck send failed: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(peer = %from_node_id, "SyncAck encode error: {}", e)
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!(peer = %from_node_id, "SyncPush handle failed: {}", e)
+                                }
+                            }
+                        }
+                        Err(e) => warn!(peer = %from_node_id, "SyncPush decode error: {}", e),
+                    }
+                }
+                Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "SyncAck od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncAckPayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            if let Err(e) =
+                                crate::sync::runtime::handle_ack_payload(&from_node_id, payload)
+                            {
+                                warn!(peer = %from_node_id, "SyncAck handle failed: {}", e);
+                            }
+                        }
+                        Err(e) => warn!(peer = %from_node_id, "SyncAck decode error: {}", e),
+                    }
+                }
+                Ok(IrohMeshEvent::SyncPullReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "SyncPull od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncPullPayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            match crate::sync::runtime::handle_pull_payload(&from_node_id, payload)
+                            {
+                                Ok(Some(crate::sync::runtime::MeshSyncPullResult::Operations(
+                                    response,
+                                ))) => {
+                                    match rkyv::to_bytes::<rkyv::rancor::Error>(&response)
+                                    .map(|v| v.to_vec())
+                                {
+                                    Ok(bytes) => {
+                                        if let Err(e) = qm_events
+                                            .send_ufp2_to_peer(
+                                                &from_node_id,
+                                                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL_RESPONSE,
+                                                &bytes,
+                                            )
+                                            .await
+                                        {
+                                            warn!(peer = %from_node_id, "SyncPullResponse send failed: {}", e);
+                                        }
+                                    }
+                                    Err(e) => warn!(peer = %from_node_id, "SyncPullResponse encode error: {}", e),
+                                }
+                                }
+                                Ok(Some(crate::sync::runtime::MeshSyncPullResult::Snapshot(
+                                    response,
+                                ))) => {
+                                    match rkyv::to_bytes::<rkyv::rancor::Error>(&response)
+                                        .map(|v| v.to_vec())
+                                    {
+                                        Ok(bytes) => {
+                                            if let Err(e) = qm_events
+                                                .send_ufp2_to_peer(
+                                                    &from_node_id,
+                                                    tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
+                                                    &bytes,
+                                                )
+                                                .await
+                                            {
+                                                warn!(peer = %from_node_id, "SyncSnapshotResponse send failed: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(peer = %from_node_id, "SyncSnapshotResponse encode error: {}", e)
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!(peer = %from_node_id, "SyncPull handle failed: {}", e)
+                                }
+                            }
+                        }
+                        Err(e) => warn!(peer = %from_node_id, "SyncPull decode error: {}", e),
+                    }
+                }
+                Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "SyncPullResponse od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => match crate::sync::runtime::handle_pull_response_payload(
+                            &from_node_id,
+                            payload,
+                        ) {
+                            Ok(Some(ack)) => {
+                                match rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+                                    .map(|v| v.to_vec())
+                                {
+                                    Ok(bytes) => {
+                                        if let Err(e) = qm_events
+                                            .send_ufp2_to_peer(
+                                                &from_node_id,
+                                                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                                                &bytes,
+                                            )
+                                            .await
+                                        {
+                                            warn!(peer = %from_node_id, "SyncAck send failed: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(peer = %from_node_id, "SyncAck encode error: {}", e)
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                warn!(peer = %from_node_id, "SyncPullResponse handle failed: {}", e)
+                            }
+                        },
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "SyncPullResponse decode error: {}", e)
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::SyncSnapshotPullReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "SyncSnapshotPull od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncSnapshotPullPayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            match crate::sync::runtime::handle_snapshot_pull_payload(
+                                &from_node_id,
+                                payload,
+                            ) {
+                                Ok(Some(response)) => {
+                                    match rkyv::to_bytes::<rkyv::rancor::Error>(&response)
+                                        .map(|v| v.to_vec())
+                                    {
+                                        Ok(bytes) => {
+                                            if let Err(e) = qm_events
+                                                .send_ufp2_to_peer(
+                                                    &from_node_id,
+                                                    tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
+                                                    &bytes,
+                                                )
+                                                .await
+                                            {
+                                                warn!(peer = %from_node_id, "SyncSnapshotResponse send failed: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(peer = %from_node_id, "SyncSnapshotResponse encode error: {}", e)
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!(peer = %from_node_id, "SyncSnapshotPull handle failed: {}", e)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "SyncSnapshotPull decode error: {}", e)
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::SyncSnapshotResponseReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "SyncSnapshotResponse od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            match crate::sync::runtime::handle_snapshot_response_payload(
+                                &from_node_id,
+                                payload,
+                            ) {
+                                Ok(Some(ack)) => {
+                                    match rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+                                        .map(|v| v.to_vec())
+                                    {
+                                        Ok(bytes) => {
+                                            if let Err(e) = qm_events
+                                                .send_ufp2_to_peer(
+                                                    &from_node_id,
+                                                    tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                                                    &bytes,
+                                                )
+                                                .await
+                                            {
+                                                warn!(peer = %from_node_id, "SyncAck send failed: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(peer = %from_node_id, "SyncAck encode error: {}", e)
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!(peer = %from_node_id, "SyncSnapshotResponse handle failed: {}", e)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "SyncSnapshotResponse decode error: {}", e)
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::FrameProxyRequestReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    // Trust gate — only peers we have completed pairing
+                    // with may pull frame bytes out of our LRU. Mirrors
+                    // the gate applied to ServicesAnnounce / KeysSync.
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(
+                            peer = %from_node_id,
+                            raw_ref = %payload.raw_ref,
+                            request_id = %payload.request_id,
+                            "FrameProxyRequest from untrusted peer — dropped"
+                        );
+                        continue;
+                    }
+                    let iroh = qm_events.clone();
+                    tokio::spawn(crate::services::frame_proxy::handle_request(
+                        iroh,
+                        from_node_id,
+                        payload,
+                    ));
+                }
+                Ok(IrohMeshEvent::FrameProxyResponseReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(
+                            peer = %from_node_id,
+                            "FrameProxyResponse from untrusted peer — dropped"
+                        );
+                        continue;
+                    }
+                    crate::services::frame_proxy::frame_proxy_client().handle_response(payload);
+                }
+                Ok(IrohMeshEvent::StorageProxyRequestReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(
+                            peer = %from_node_id,
+                            request_id = %payload.request_id,
+                            "StorageProxyRequest from untrusted peer — dropped"
+                        );
+                        continue;
+                    }
+                    let Some(db) = db_pool.clone() else {
+                        debug!(
+                            peer = %from_node_id,
+                            request_id = %payload.request_id,
+                            "StorageProxyRequest without DB — dropped"
+                        );
+                        continue;
+                    };
+                    let iroh = qm_events.clone();
+                    let local_node_id = local_node_id.clone();
+                    tokio::spawn(crate::services::storage_proxy::handle_request(
+                        iroh,
+                        db,
+                        local_node_id,
+                        from_node_id,
+                        payload,
+                    ));
+                }
+                Ok(IrohMeshEvent::StorageProxyResponseReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(
+                            peer = %from_node_id,
+                            "StorageProxyResponse from untrusted peer — dropped"
+                        );
+                        continue;
+                    }
+                    crate::services::storage_proxy::storage_proxy_client().handle_response(payload);
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -2103,7 +2495,7 @@ fn spawn_heartbeat_sender(
                                     };
                                 if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                                     let _ = quic_mesh
-                                        .broadcast_to_trusted(
+                                        .broadcast_ufp2_to_trusted(
                                             tentaflow_protocol::mesh::MESH_MSG_SERVICES_ANNOUNCE,
                                             &bytes,
                                             None,
@@ -2309,4 +2701,91 @@ fn spawn_pairing_cleanup(mesh_security: Arc<MeshSecurity>) {
             }
         }
     });
+}
+
+fn spawn_sync_repair_scheduler(qm: Arc<IrohMeshManager>, mesh_security: Arc<MeshSecurity>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            run_sync_repair_scheduler_tick_with(
+                qm.as_ref(),
+                mesh_security.as_ref(),
+                |peer_id| crate::sync::runtime::build_push_payload_for_target(peer_id, 128),
+                |peer_id| {
+                    crate::sync::runtime::build_repair_pull_payloads_for_peer(peer_id, 16, 256)
+                },
+            )
+            .await;
+        }
+    });
+}
+
+pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>(
+    qm: &IrohMeshManager,
+    mesh_security: &MeshSecurity,
+    mut build_push: BuildPush,
+    mut build_repairs: BuildRepairs,
+) where
+    BuildPush: FnMut(
+        &str,
+    ) -> crate::sync::ledger::LedgerResult<
+        Option<tentaflow_protocol::mesh::MeshSyncPushPayload>,
+    >,
+    BuildRepairs: FnMut(
+        &str,
+    ) -> crate::sync::ledger::LedgerResult<
+        Vec<tentaflow_protocol::mesh::MeshSyncPullPayload>,
+    >,
+{
+    let peers = qm.connected_peers().await;
+    for peer_id in peers {
+        if !mesh_security.is_trusted(&peer_id) {
+            continue;
+        }
+        match build_push(&peer_id) {
+            Ok(Some(payload)) => {
+                match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                    Ok(bytes) => {
+                        if let Err(e) = qm
+                            .send_ufp2_to_peer(
+                                &peer_id,
+                                tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
+                                &bytes,
+                            )
+                            .await
+                        {
+                            debug!(peer = %peer_id, "SyncPush retry send failed: {}", e);
+                        }
+                    }
+                    Err(e) => warn!(peer = %peer_id, "SyncPush retry encode error: {}", e),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!(peer = %peer_id, "SyncPush retry build failed: {}", e),
+        }
+
+        match build_repairs(&peer_id) {
+            Ok(payloads) => {
+                for payload in payloads {
+                    match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                        Ok(bytes) => {
+                            if let Err(e) = qm
+                                .send_ufp2_to_peer(
+                                    &peer_id,
+                                    tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL,
+                                    &bytes,
+                                )
+                                .await
+                            {
+                                debug!(peer = %peer_id, "SyncPull repair send failed: {}", e);
+                            }
+                        }
+                        Err(e) => warn!(peer = %peer_id, "SyncPull repair encode error: {}", e),
+                    }
+                }
+            }
+            Err(e) => warn!(peer = %peer_id, "SyncPull repair build failed: {}", e),
+        }
+    }
 }

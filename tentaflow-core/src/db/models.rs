@@ -161,6 +161,14 @@ pub struct DbFlowNodeTemplate {
     pub description: Option<String>,
     pub default_config: String,
     pub icon: Option<String>,
+    /// JSON-Schema-like opis pol konfiguracyjnych. NULL → GUI nie renderuje
+    /// formy (pusty config tab). Niech-NULL JSON object z polami:
+    /// `properties: { <key>: { type, title, description, default, enum?,
+    /// minimum?, maximum?, format?, dynamic_enum? } }`, `required: []`,
+    /// `order: [...]`. `dynamic_enum: { source: "models", category: "stt"
+    /// | "tts" | "llm" | "embeddings" }` mowi GUI zeby wczytac liste
+    /// modeli z runtime registry zamiast statycznego enum.
+    pub params_schema: Option<String>,
 }
 
 /// Regula filtrowania danych osobowych (PII)
@@ -276,6 +284,7 @@ pub struct FlowParams<'a> {
     /// `Some` advertises it as a model (validated against alias / flow
     /// collisions in the handler before this struct is built).
     pub published_model_name: Option<&'a str>,
+    pub actor_user_id: Option<i64>,
 }
 
 /// Parametry tworzenia/aktualizacji szablonu wezla flow
@@ -514,6 +523,162 @@ pub struct PendingPairing {
     pub pin_code: String,
     pub direction: String,
     pub expires_at: String,
+}
+
+/// Techniczna tozsamosc node/device uzywana przez Sync Ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNodeIdentity {
+    pub node_id: String,
+    pub public_key: String,
+    pub public_key_type: String,
+    pub display_name: String,
+    pub node_kind: String,
+    pub trust_status: String,
+    pub owner_user_id: Option<i64>,
+    pub sync_profile: String,
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Kryptograficzny klucz uzytkownika, niezalezny od klucza node/device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserIdentityKey {
+    pub key_id: String,
+    pub user_id: i64,
+    pub key_type: String,
+    pub public_key: String,
+    pub purpose: String,
+    pub status: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+/// Relacja okreslajaca, ktorzy uzytkownicy moga korzystac z danego noda.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeUserAssignment {
+    pub node_id: String,
+    pub user_id: i64,
+    pub assignment_mode: String,
+    pub valid_from: String,
+    pub valid_until: Option<String>,
+    pub created_by: Option<i64>,
+    pub created_at: String,
+}
+
+/// Profil organizacyjny usera uzywany przez Permission Engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncUserOrgProfile {
+    pub org_id: String,
+    pub user_id: i64,
+    pub department_id: Option<String>,
+    pub manager_user_id: Option<i64>,
+    pub is_department_manager: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Metadata dostepu do zasobu synchronizowanego przez Sync Ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncResourceAcl {
+    pub org_id: String,
+    pub addon_id: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub owner_user_id: Option<i64>,
+    pub assigned_user_id: Option<i64>,
+    pub department_id: Option<String>,
+    pub manager_user_id: Option<i64>,
+    pub visibility_scope: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Wynik decyzji Permission Engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncAccessDecision {
+    pub allowed: bool,
+    pub reason: String,
+}
+
+/// Konfiguracja trybu synchronizacji dla addonu/typu zasobu/zasobu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPolicyMode {
+    LocalOnly,
+    ReplicatedByPermission,
+    AuthorityReadthrough,
+    AuthorityWrite,
+    Sharded,
+    Ephemeral,
+}
+
+impl SyncPolicyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local_only",
+            Self::ReplicatedByPermission => "replicated_by_permission",
+            Self::AuthorityReadthrough => "authority_readthrough",
+            Self::AuthorityWrite => "authority_write",
+            Self::Sharded => "sharded",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "local_only" => Some(Self::LocalOnly),
+            "replicated_by_permission" => Some(Self::ReplicatedByPermission),
+            "authority_readthrough" => Some(Self::AuthorityReadthrough),
+            "authority_write" => Some(Self::AuthorityWrite),
+            "sharded" => Some(Self::Sharded),
+            "ephemeral" => Some(Self::Ephemeral),
+            _ => None,
+        }
+    }
+
+    pub fn is_authority_backed(self) -> bool {
+        matches!(
+            self,
+            Self::AuthorityReadthrough
+                | Self::AuthorityWrite
+                | Self::ReplicatedByPermission
+                | Self::Sharded
+        )
+    }
+
+    pub fn materializes_by_permission(self) -> bool {
+        matches!(self, Self::ReplicatedByPermission | Self::Sharded)
+    }
+}
+
+impl std::fmt::Display for SyncPolicyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Konfiguracja trybu synchronizacji dla addonu/typu zasobu/zasobu.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncPolicy {
+    pub policy_id: String,
+    pub org_id: String,
+    pub addon_id: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub mode: SyncPolicyMode,
+    pub authority_node_id: Option<String>,
+    pub retention_days: Option<i64>,
+    pub is_enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Odbiorca wybrany przez Sync Policy i Permission Engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncPolicyTarget {
+    pub node_id: String,
+    pub reason: String,
 }
 
 /// Filtry do przeszukiwania logu audytowego

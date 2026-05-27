@@ -10,7 +10,7 @@
 
 class TfInput extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern'];
+    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows'];
   }
 
   constructor() {
@@ -85,7 +85,7 @@ class TfInput extends HTMLElement {
     const wrap = document.createElement('div');
     wrap.className = 'tf-input-wrap';
 
-    const input = document.createElement('input');
+    const input = document.createElement(this.hasAttribute('multiline') ? 'textarea' : 'input');
     input.className = 'tf-input';
     input.addEventListener('input', this._onInput);
     input.addEventListener('change', this._onChange);
@@ -94,6 +94,14 @@ class TfInput extends HTMLElement {
 
     const iconEl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     iconEl.classList.add('tf-input-icon');
+    iconEl.setAttribute('width', '16');
+    iconEl.setAttribute('height', '16');
+    iconEl.setAttribute('fill', 'none');
+    iconEl.setAttribute('stroke', 'currentColor');
+    iconEl.setAttribute('stroke-width', '2');
+    iconEl.setAttribute('stroke-linecap', 'round');
+    iconEl.setAttribute('stroke-linejoin', 'round');
+    iconEl.setAttribute('aria-hidden', 'true');
     const useEl = document.createElementNS('http://www.w3.org/2000/svg', 'use');
     iconEl.appendChild(useEl);
 
@@ -140,8 +148,11 @@ class TfInput extends HTMLElement {
 
     this._input.placeholder = placeholder;
     if (document.activeElement !== this._input) this._input.value = value;
-    this._input.type = type;
+    if (this._input.tagName !== 'TEXTAREA') this._input.type = type;
     this._input.disabled = disabled;
+    if (this._input.tagName === 'TEXTAREA') {
+      this._input.rows = Number(this.getAttribute('rows') || 4);
+    }
 
     // pass-through natywnych atrybutow do wewnetrznego <input>
     const autocomplete = this.getAttribute('autocomplete');

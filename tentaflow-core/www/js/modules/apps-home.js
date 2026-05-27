@@ -37,6 +37,71 @@ function renderTile(t) {
     </div>`;
 }
 
+// Whitelista ikon — synchronizowana z ADDON_ICON_WHITELIST w app.js.
+// Nieznana lub nieprawidlowa ikona => 'apps'. Walidacja chroni przed XSS:
+// raw input z manifestu addona NIE moze trafic do sprite() niesprawdzona.
+const ICON_WHITELIST = new Set([
+  'alert', 'apps', 'arrow', 'arrow-out', 'audit', 'ban', 'bar-chart', 'bolt',
+  'brain', 'branch', 'catalog', 'chart-line', 'chat', 'check', 'chevron-down',
+  'chevron-left', 'chevron-right', 'chip', 'clock', 'clock-glance', 'close',
+  'cloud', 'cluster', 'code', 'collapse', 'copy', 'core', 'cpu', 'cylinder',
+  'dashboard', 'database', 'desktop', 'docker', 'download', 'edit',
+  'external-link', 'eye', 'file-text', 'filter', 'flow', 'folder', 'globe',
+  'globe-grid', 'gpu', 'grid-rows', 'grip', 'home', 'home-simple', 'host',
+  'iface-lan', 'iface-loop', 'iface-tb', 'iface-virt', 'iface-vpn',
+  'iface-wifi', 'image', 'info', 'key', 'line-chart', 'list', 'lock', 'logout',
+  'management', 'max', 'meeting', 'message', 'mic', 'min', 'model', 'models',
+  'network', 'network-svg', 'os', 'paperclip', 'pause', 'pi', 'pin', 'play',
+  'plus', 'prompt', 'puzzle', 'question', 'rag-db', 'ram', 'record',
+  'record-dot', 'refresh', 'registry', 'rotate', 'rules', 'search', 'send',
+  'services', 'settings', 'share', 'shield', 'sparkle', 'speaker',
+  'speaker-alt', 'star', 'stop', 'transform', 'trash', 'trend', 'unlock',
+  'user', 'users', 'volume', 'workflow-app', 'x', 'zap',
+]);
+
+function resolveIcon(raw) {
+  const t = String(raw ?? '').trim();
+  const id = t.startsWith('i-') ? t.slice(2) : t;
+  if (id && ICON_WHITELIST.has(id)) return id;
+  return 'apps';
+}
+
+// Dynamic tile dla zainstalowanego addonu z `[application]` w manifescie.
+// Click -> Router.navigate('addon-app', { addonId, panelId }).
+function renderAddonTile(app) {
+  const addonId = app.addonId ?? app.addon_id ?? '';
+  const panelId = app.entryPanel ?? app.entry_panel ?? '';
+  const title = escapeHtml(app.title ?? addonId);
+  const desc = escapeHtml(app.description ?? addonId);
+  const iconId = resolveIcon(app.icon);
+  const enabled = app.enabled !== false;
+  const disabledBadge = enabled
+    ? ''
+    : `<span class="badge-soon">${escapeHtml(I18n.t('addon.disabled') || 'disabled')}</span>`;
+  const cls = `app-tile addon-app-tile${enabled ? '' : ' coming-soon'}`;
+  return `
+    <div class="${cls}"
+         data-addon-id="${escapeHtml(addonId)}"
+         data-panel-id="${escapeHtml(panelId)}"
+         data-enabled="${enabled ? '1' : '0'}">
+      ${disabledBadge}
+      <div class="app-icon">${sprite(iconId)}</div>
+      <div class="app-name">${title}</div>
+      <div class="app-desc">${desc}</div>
+    </div>`;
+}
+
+function sortAddonApps(apps) {
+  return apps.slice().sort((a, b) => {
+    const sa = Number(a.sortOrder ?? a.sort_order ?? 0);
+    const sb = Number(b.sortOrder ?? b.sort_order ?? 0);
+    if (sa !== sb) return sa - sb;
+    const ta = String(a.title ?? a.addonId ?? a.addon_id ?? '').toLowerCase();
+    const tb = String(b.title ?? b.addonId ?? b.addon_id ?? '').toLowerCase();
+    return ta.localeCompare(tb);
+  });
+}
+
 const AppsHomeScreen = {
   render() {
     return `
@@ -60,8 +125,33 @@ const AppsHomeScreen = {
     }
 
     const grid = byId('apps-grid');
+
+    // Dolacz dynamiczne kafelki addon applications. Bledem nie zabijamy
+    // calego widoku — kafelki built-in zostaja widoczne.
+    try {
+      const apps = await ApiBinary.list('addonApplicationsListRequest', {
+        arrayKey: 'applications',
+      });
+      if (Array.isArray(apps) && apps.length > 0) {
+        const html = sortAddonApps(apps).map(renderAddonTile).join('');
+        grid.insertAdjacentHTML('beforeend', html);
+      }
+    } catch (e) {
+      console.warn('[apps-home] addon applications fetch failed:', e?.message ?? e);
+    }
+
     grid.querySelectorAll('.app-tile').forEach((el) => {
       el.addEventListener('click', () => {
+        // Addon app tile — drill-down do renderera UI v2.
+        if (el.classList.contains('addon-app-tile')) {
+          if (el.dataset.enabled === '0') return;
+          const addonId = el.dataset.addonId;
+          const panelId = el.dataset.panelId;
+          if (addonId && panelId) {
+            Router.navigate('addon-app', { addonId, panelId });
+          }
+          return;
+        }
         // Soon tiles still navigate — the target screen explains the status
         // honestly instead of faking a feature.
         const route = el.dataset.route;

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>TF Minimal Test</title>
+<link rel="stylesheet" href="/css/controls.css">
+<style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}html,body{overflow-y:auto!important;height:auto!important}body{background:#050818;color:#e8ebf5;font-family:system-ui;padding:40px;line-height:1.5}pre{font-size:13px;line-height:1.8}.ok{color:#22c55e}.err{color:#ef4444}</style>
+</head>
+<body>
+<h2>Minimal Component Test</h2>
+<pre id="log">Starting...\n</pre>
+<div id="pg" style="display:none"></div>
+<script type="module">
+const L = document.getElementById('log');
+const P = document.getElementById('pg');
+function log(msg) { L.textContent += msg + '\n'; }
+
+const files = [
+  'tf-button', 'tf-chip', 'tf-input', 'tf-textarea', 'tf-searchbox',
+  'tf-select', 'tf-toggle', 'tf-tabs', 'tf-segmented', 'tf-table',
+  'tf-menu', 'tf-window', 'tf-screen', 'tf-pin-input',
+  'tf-stat-card', 'tf-section-card', 'tf-alert', 'tf-progress-bar',
+  'tf-badge', 'tf-avatar', 'tf-breadcrumb', 'tf-empty-state',
+  'tf-list', 'tf-timeline', 'tf-filter-chips', 'tf-stage',
+  'tf-status-pill', 'tf-divider', 'tf-spinner', 'tf-contrib-tag',
+  'tf-radio', 'tf-checkbox', 'tf-slider', 'tf-toast',
+  'tf-alarm-card', 'tf-key-value', 'tf-detail-header',
+];
+
+for (const name of files) {
+  log('Loading ' + name + '...');
+  try {
+    await import('/js/components/' + name + '.js');
+    log('  OK: imported');
+  } catch(e) {
+    log('  ERR import: ' + e.message);
+    continue;
+  }
+  try {
+    const el = document.createElement(name);
+    P.appendChild(el);
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    P.innerHTML = '';
+    log('  OK: rendered');
+  } catch(e) {
+    log('  ERR render: ' + e.message);
+    P.innerHTML = '';
+  }
+}
+
+log('\n=== ALL DONE ===');
+</script>
+</body>
+</html>

@@ -12,7 +12,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{debug, warn};
 
 // =============================================================================
 // Event — typ eventu w systemie
@@ -68,6 +69,13 @@ pub struct EventBus {
     published_count: AtomicU64,
     /// Licznik dostarczonych eventow
     delivered_count: AtomicU64,
+    /// Sender kanalu dispatchera — kazdy `publish()` wpada na ten kanal,
+    /// `AddonManager` drenuje go w dedykowanym blocking watku i woluje
+    /// `handle_event`. RwLock<Option> (nie OnceLock!) bo shutdown musi
+    /// mochic dropowac sender — inaczej blocking_recv wisi wiecznie i
+    /// proces nie konczy sie po SIGINT (cykl referencyjny przez
+    /// Arc<AddonManager> trzymany w spawn_blocking task).
+    dispatch_tx: RwLock<Option<UnboundedSender<Event>>>,
 }
 
 impl EventBus {
@@ -79,7 +87,32 @@ impl EventBus {
             subscription_counter: AtomicU64::new(1),
             published_count: AtomicU64::new(0),
             delivered_count: AtomicU64::new(0),
+            dispatch_tx: RwLock::new(None),
         }
+    }
+
+    /// Podpina sender kanalu dispatchera — moze byc wywolany tylko raz przez
+    /// `AddonManager` przy inicjalizacji. Kolejne wywolania sa ignorowane.
+    pub fn set_dispatch_sender(&self, tx: UnboundedSender<Event>) {
+        let mut slot = self.dispatch_tx.write();
+        if slot.is_some() {
+            warn!("EventBus: dispatcher sender juz ustawiony, ignoruje");
+            return;
+        }
+        *slot = Some(tx);
+    }
+
+    /// Zamyka kanal dispatchera — dropuje sender, dispatcher loop dostaje
+    /// `None` z `blocking_recv` i wychodzi. Wolane z `AddonManager::shutdown`
+    /// zeby graceful shutdown faktycznie sie zakonczyl (bez tego blocking
+    /// thread wisi wiecznie przez cykl referencyjny Arc<AddonManager>).
+    pub fn close_dispatcher(&self) {
+        *self.dispatch_tx.write() = None;
+    }
+
+    /// Bumpuje licznik dostarczonych eventow (wolane przez dispatcher po handle_event).
+    pub fn record_delivery(&self, count: u64) {
+        self.delivered_count.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Subskrybuje typ eventu. Zwraca subscription_id.
@@ -101,8 +134,11 @@ impl EventBus {
         subscription_id
     }
 
-    /// Publikuje event — dodaje do ring buffer.
-    /// Dostarczenie do addonow WASM odbywa sie przez AddonManager::handle_event().
+    /// Publikuje event — dodaje do ring buffer i wysyla na kanal dispatchera.
+    /// Dispatcher (w `AddonManager::start_event_dispatcher`) drenuje kanal i
+    /// dostarcza event do subskrybentow przez `handle_event`. Jesli dispatcher
+    /// nie jest jeszcze podpiety (np. testy event_bus w izolacji), event ladu-
+    /// je tylko w ring bufferze.
     pub fn publish(&self, event: Event) {
         self.published_count.fetch_add(1, Ordering::Relaxed);
 
@@ -111,7 +147,19 @@ impl EventBus {
             event.event_type, event.source_addon
         );
 
-        // Dodaj do ring buffer
+        // Wyslij na kanal dispatchera (jesli skonfigurowany).
+        // Klon eventu zostaje pozniej dolozony do ring buffera dla historii.
+        // Drop guard `tx` szybko — nie trzymamy locka podczas send.
+        let tx = self.dispatch_tx.read().clone();
+        if let Some(tx) = tx {
+            if let Err(e) = tx.send(event.clone()) {
+                warn!(
+                    "EventBus: dispatcher kanal zamkniety, event '{}' upuszczony: {}",
+                    event.event_type, e
+                );
+            }
+        }
+
         self.event_history.write().push(event);
     }
 
@@ -475,6 +523,71 @@ mod tests {
         // Nie matchuje innego prefixu
         let subs = bus.get_subscribers("addon.started");
         assert_eq!(subs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn publish_pushes_event_to_dispatcher_channel() {
+        // Po `set_dispatch_sender` kazdy publish musi pojawic sie na kanale —
+        // to gwarancja ze AddonManager dispatcher faktycznie dostaje eventy.
+        let bus = EventBus::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bus.set_dispatch_sender(tx);
+
+        bus.publish(Event {
+            event_type: "test.evt".to_string(),
+            source_addon: Some("addon-a".to_string()),
+            source_user: None,
+            payload: serde_json::json!({"v": 42}),
+            timestamp: chrono::Utc::now(),
+        });
+
+        let delivered = rx.recv().await.expect("event powinien dotrzec na kanal");
+        assert_eq!(delivered.event_type, "test.evt");
+        assert_eq!(delivered.payload["v"], 42);
+        assert_eq!(delivered.source_addon.as_deref(), Some("addon-a"));
+
+        // Event powinien byc tez w ring bufferze.
+        let recent = bus.recent_events(1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].event_type, "test.evt");
+    }
+
+    #[test]
+    fn publish_without_dispatcher_only_lands_in_ring_buffer() {
+        // Brak podpiętego sendera nie moze wywalic publish — event powinien
+        // wyladowac w ring bufferze, a licznik published byc zwiekszony.
+        let bus = EventBus::new();
+        bus.publish(Event {
+            event_type: "test.evt".to_string(),
+            source_addon: None,
+            source_user: None,
+            payload: serde_json::Value::Null,
+            timestamp: chrono::Utc::now(),
+        });
+
+        assert_eq!(bus.stats().published_count, 1);
+        assert_eq!(bus.recent_events(1).len(), 1);
+    }
+
+    #[test]
+    fn second_set_dispatch_sender_is_ignored() {
+        let bus = EventBus::new();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        bus.set_dispatch_sender(tx1);
+        bus.set_dispatch_sender(tx2);
+
+        bus.publish(Event {
+            event_type: "test.evt".to_string(),
+            source_addon: None,
+            source_user: None,
+            payload: serde_json::Value::Null,
+            timestamp: chrono::Utc::now(),
+        });
+
+        // Drugi sender pozostal odpiety — recv musi zwrocic Empty,
+        // bo event poszedl do pierwszego (porzuconego) kanalu.
+        assert!(rx2.try_recv().is_err());
     }
 
     #[test]

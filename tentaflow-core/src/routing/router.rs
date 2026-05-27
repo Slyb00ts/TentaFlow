@@ -9,7 +9,6 @@ use crate::config::RouterConfig;
 use crate::db::DbPool;
 use crate::error::Result;
 use crate::flow_engine::dispatcher::FlowDispatcher;
-use crate::middleware::ResponseMiddleware;
 use crate::services::runtime::quic_handle::ServiceManager;
 
 use std::collections::HashMap;
@@ -30,9 +29,6 @@ use tracing::info;
 pub struct Router {
     /// Service Manager - zarzadza wszystkimi serwisami asynchronicznie
     pub(crate) service_manager: Arc<ServiceManager>,
-
-    /// Response middleware dla filtrowania PII
-    pub(crate) response_middleware: Arc<ResponseMiddleware>,
 
     /// Flow Engine dispatcher - opcjonalny, aktywny gdy DB jest dostepna
     pub(crate) flow_dispatcher: Option<Arc<FlowDispatcher>>,
@@ -76,16 +72,13 @@ pub struct Router {
     /// Clone, a RwLock samo przez się nie jest Clone — Arc dzieli ten sam
     /// slot miedzy klonami zeby executor wspolny dla wszystkich call sites.
     pub(crate) executor: Arc<
-        parking_lot::RwLock<
-            Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
-        >,
+        parking_lot::RwLock<Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>>,
     >,
 
     /// R2d (Codex M1): SttRuntime wpiety przez `Router::start` po
     /// `Arc::new(router)` zeby trzymal `Weak<Router>` (anty-cykl).
     /// `None` w testach DB-less.
-    pub(crate) stt_runtime:
-        Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>,
+    pub(crate) stt_runtime: Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>,
 }
 
 /// Wynik identyfikacji mowcy z poziomem pewnosci.
@@ -179,78 +172,6 @@ pub struct SttWithDiarization {
     pub speakers: Vec<DiarizedSpeaker>,
 }
 
-/// Metryki czasowe dla pojedynczego requestu.
-/// Zbiera czasy kazdego etapu przetwarzania do wyswietlenia w logach.
-#[derive(Debug, Clone, Default)]
-pub struct RequestMetrics {
-    /// Czas rozpoczecia requestu
-    pub start_time: Option<std::time::Instant>,
-    /// STT (Speech-to-Text)
-    pub stt_ms: Option<u64>,
-    /// Speaker identification
-    pub speaker_id_ms: Option<u64>,
-    /// Person context lookup
-    pub person_context_ms: Option<u64>,
-    /// Main LLM inference (bielik-11b)
-    pub llm_inference_ms: Option<u64>,
-    /// TTS (Text-to-Speech) - jesli wlaczone
-    pub tts_ms: Option<u64>,
-    /// Nazwa modelu glownego
-    pub model_name: Option<String>,
-}
-
-impl RequestMetrics {
-    pub fn new() -> Self {
-        Self {
-            start_time: Some(std::time::Instant::now()),
-            ..Default::default()
-        }
-    }
-
-    /// Zwraca calkowity czas od rozpoczecia
-    pub fn total_ms(&self) -> u64 {
-        self.start_time
-            .map(|t| t.elapsed().as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    /// Formatuje tabelke z czasami do logowania
-    pub fn format_table(&self) -> String {
-        let mut lines = Vec::new();
-        lines.push(format!("┌─────────────────────────────────────┐"));
-        lines.push(format!(
-            "│ REQUEST TIMING {:>20} │",
-            self.model_name.as_deref().unwrap_or("-")
-        ));
-        lines.push(format!("├─────────────────────────────────────┤"));
-
-        if let Some(ms) = self.stt_ms {
-            lines.push(format!("│ STT              {:>10} ms     │", ms));
-        }
-        if let Some(ms) = self.speaker_id_ms {
-            lines.push(format!("│ Speaker ID       {:>10} ms     │", ms));
-        }
-        if let Some(ms) = self.person_context_ms {
-            lines.push(format!("│ Person Context   {:>10} ms     │", ms));
-        }
-        if let Some(ms) = self.llm_inference_ms {
-            lines.push(format!("│ LLM Inference    {:>10} ms     │", ms));
-        }
-        if let Some(ms) = self.tts_ms {
-            lines.push(format!("│ TTS              {:>10} ms     │", ms));
-        }
-
-        lines.push(format!("├─────────────────────────────────────┤"));
-        lines.push(format!(
-            "│ TOTAL            {:>10} ms     │",
-            self.total_ms()
-        ));
-        lines.push(format!("└─────────────────────────────────────┘"));
-
-        lines.join("\n")
-    }
-}
-
 /// Metryki pojedynczego backendu
 #[derive(Debug, Clone)]
 pub struct BackendMetric {
@@ -287,12 +208,7 @@ impl Router {
         // byl ustawiony PRZED uruchomieniem petli (inaczej meeting-bot nie dostanie listenera).
         // service_manager.spawn_connection_tasks();
 
-        // === KROK 3: INICJALIZUJ RESPONSE MIDDLEWARE ===
-        let response_middleware = Arc::new(ResponseMiddleware::new(
-            config.middleware.response_filtering_enabled,
-        ));
-
-        // === KROK 4: INICJALIZUJ FLOW DISPATCHER ===
+        // === KROK 3: INICJALIZUJ FLOW DISPATCHER ===
         // R2a: Adapter LLM potrzebuje executor'a, ktory powstaje DOPIERO po
         // FlowDispatcher (cykl: executor->dispatcher->adapter->executor).
         // Tworzymy pusty slot teraz; Router::new wpisze executor po
@@ -309,13 +225,41 @@ impl Router {
             parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>,
         > = Arc::new(parking_lot::RwLock::new(None));
         let db_clone = db.clone();
+        // Etap 2: BlobStore default = FileBlobStore w `<TENTAFLOW_HOME>/blobs`.
+        // Override `TENTAFLOW_BLOB_STORE=memory` dla testów / lokalnych dev
+        // sesji bez persystencji audio.
+        let blobs: Arc<dyn crate::flow_engine::blob_store::BlobStore> =
+            match std::env::var("TENTAFLOW_BLOB_STORE").as_deref() {
+                Ok("memory") => Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new()),
+                _ => {
+                    let root = std::env::var("TENTAFLOW_HOME")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| {
+                            dirs::home_dir()
+                                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                .join(".tentaflow")
+                        })
+                        .join("blobs");
+                    if let Err(e) = std::fs::create_dir_all(&root) {
+                        tracing::warn!("FileBlobStore init {}: {e}", root.display());
+                    }
+                    match db_clone.as_ref() {
+                        Some(db_for_blob_sync) => {
+                            Arc::new(crate::flow_engine::blob_store::FileBlobStore::with_sync(
+                                root,
+                                db_for_blob_sync.clone(),
+                            ))
+                        }
+                        None => Arc::new(crate::flow_engine::blob_store::FileBlobStore::new(root)),
+                    }
+                }
+            };
         let flow_dispatcher = db.map(|pool| {
             Arc::new(FlowDispatcher::new(
                 pool,
                 service_manager.clone(),
-                config.clone(),
                 executor_slot.clone(),
-                stt_runtime_slot.clone(),
+                blobs.clone(),
             ))
         });
 
@@ -331,7 +275,6 @@ impl Router {
 
         let router = Self {
             service_manager: service_manager.clone(),
-            response_middleware,
             flow_dispatcher: flow_dispatcher.clone(),
             db: db_clone,
             mesh_manager: Arc::new(parking_lot::RwLock::new(None)),
@@ -370,7 +313,6 @@ impl Router {
                 local_inference.clone(),
                 router.stt_runtime.clone(),
                 router.mesh_manager.clone(),
-                Vec::new(),
             ));
             *executor_slot.write() = Some(executor);
         }
@@ -478,7 +420,6 @@ impl Router {
             .await
     }
 
-
     /// Pobierz status wszystkich serwisow (do diagnostyki/health check)
     pub async fn get_service_status(&self) -> std::collections::HashMap<String, String> {
         self.service_manager.get_service_status().await
@@ -491,6 +432,10 @@ impl Router {
     /// Ustawia mesh manager (wywolane po inicjalizacji mesh pipeline)
     pub fn set_mesh_manager(&self, manager: Arc<crate::mesh::iroh_manager::IrohMeshManager>) {
         *self.mesh_manager.write() = Some(manager);
+    }
+
+    pub fn mesh_manager(&self) -> Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>> {
+        self.mesh_manager.read().clone()
     }
 
     /// Wires the supervisor's services snapshot into the router. Called once

@@ -196,6 +196,17 @@ pub async fn handle_request(
         // Audio TTS
         ("POST", "/v1/audio/speech") => handle_audio_tts(req, router).await,
 
+        // Audio TTS streaming (TentaFlow-specific, NIE OpenAI-compatible)
+        ("POST", "/v1/audio/speech/stream") => handle_audio_tts_stream(req, router).await,
+
+        // Audio flow streaming (Krok 5 — request leci przez flow_engine
+        // streaming, audio chunki z `EnvelopeDelta::Audio`. Dla flow z
+        // `tts_stream_bridge` audio leci per zdanie; dla blocking flow
+        // wychodzi single chunk z całością bytes z BlobStore).
+        ("POST", "/v1/audio/speech/flow-stream") => {
+            handle_audio_speech_flow_stream(req, router).await
+        }
+
         // Audio STT (Whisper)
         ("POST", "/v1/audio/transcriptions") => handle_audio_transcriptions(req, router).await,
 
@@ -213,9 +224,6 @@ pub async fn handle_request(
 
         // Lista dostepnych modeli
         ("GET", "/v1/models") => handle_models_list(router).await,
-
-        // Prometheus metrics
-        ("GET", "/metrics") => handle_metrics(router).await,
 
         // 404 Not Found
         _ => {
@@ -248,6 +256,10 @@ async fn handle_chat_completions(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    // Etap 2: trailers opt-in. Klient z `X-Want-Trailers: true` dostaje
+    // dodatkowe `X-Tentaflow-{Latency-Ms,*Tokens,Finish-Reason}` headery
+    // wyciągnięte z `RouteMetadata` po blocking response.
+    let want_trailers = wants_trailers(req.headers());
     let user_ctx = req
         .extensions()
         .get::<crate::auth::acl::UserContext>()
@@ -345,19 +357,12 @@ async fn handle_chat_completions(
             }
             Err(e) => {
                 error!("Blad routing (streaming): {}", e);
-                Ok(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    e.to_string(),
-                ))
+                Ok(core_error_to_response(&e))
             }
         }
     } else {
         // === NON-STREAMING MODE: JSON ===
-        match router
-            .route_chat_completion(request, user_ctx)
-            .await
-        {
+        match router.route_chat_completion(request, user_ctx).await {
             Ok(route_result) => {
                 let body = serde_json::to_vec(&route_result.response).unwrap();
                 let mut resp = json_response(StatusCode::OK, body);
@@ -370,6 +375,9 @@ async fn handle_chat_completions(
                                 .unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
                         );
                     }
+                }
+                if want_trailers {
+                    emit_trailer_headers(resp.headers_mut(), &route_result.metadata);
                 }
                 Ok(resp)
             }
@@ -420,6 +428,7 @@ async fn handle_audio_tts(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let want_trailers = wants_trailers(req.headers());
     let user_ctx = req
         .extensions()
         .get::<crate::auth::acl::UserContext>()
@@ -526,17 +535,336 @@ async fn handle_audio_tts(
                     );
                 }
             }
+            if want_trailers {
+                emit_trailer_headers(resp.headers_mut(), &route_result.metadata);
+            }
             Ok(resp)
         }
         Err(e) => {
             error!("TTS error: {}", e);
-            Ok(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("TTS synthesis failed: {}", e),
-            ))
+            Ok(core_error_to_response(&e))
         }
     }
+}
+
+/// Etap 3c: TentaFlow-specific (NIE OpenAI-compatible) endpoint streaming
+/// TTS. Klient POST'uje tę samą strukturę co `/v1/audio/speech`
+/// (`TTSRequest` JSON), dostaje `text/event-stream` z audio chunks:
+/// `data: { audio_chunk: "<base64>", mime, sample_rate, finish_reason }\n\n`.
+/// Stream kończy `data: [DONE]\n\n`. Cancel propaguje przez
+/// `CancelOnDropStream` — klient disconnect zatrzymuje emisję
+/// kolejnych chunków (limit: backend blocking syntezę i tak skończy
+/// przed cancel — full backend abort wraca z native streaming).
+async fn handle_audio_tts_stream(
+    req: Request<Incoming>,
+    router: Arc<Router>,
+) -> std::result::Result<
+    Response<
+        StreamBody<
+            std::pin::Pin<
+                Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
+            >,
+        >,
+    >,
+    hyper::Error,
+> {
+    let user_ctx = req
+        .extensions()
+        .get::<crate::auth::acl::UserContext>()
+        .cloned();
+
+    let body_bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("Nie udalo sie odczytac body: {}", e),
+            ));
+        }
+    };
+    let api_request: crate::api::openai::types::TTSRequest =
+        match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("invalid JSON: {}", e),
+                ));
+            }
+        };
+
+    let dispatcher = match router.flow_dispatcher.as_ref() {
+        Some(d) => d.clone(),
+        None => {
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "flow dispatcher not wired".to_string(),
+            ));
+        }
+    };
+
+    // Etap 3c CRITICAL fix: model-level ACL gate przed dispatchem.
+    // Mirror /v1/audio/speech sciezka (routing/tts.rs:41).
+    if let Some(ref u) = user_ctx {
+        if let Some(ref db) = router.db {
+            if !crate::auth::acl::check_access_safe(
+                db,
+                "model",
+                &api_request.model,
+                u.user_id,
+                &u.role,
+            ) {
+                tracing::warn!(
+                    user_id = u.user_id,
+                    model = %api_request.model,
+                    "ACL denied TTS stream model"
+                );
+                return Ok(error_response(
+                    StatusCode::NOT_FOUND,
+                    "model_not_found",
+                    format!("model '{}' not found", api_request.model),
+                ));
+            }
+        }
+    }
+
+    if api_request.input.is_empty() {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "TTSRequest.input must not be empty".to_string(),
+        ));
+    }
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let req_dto = crate::flow_engine::dispatchers::TtsRequest {
+        model: api_request.model.clone(),
+        text: api_request.input.clone(),
+        voice: Some(api_request.voice.clone()),
+        format: api_request.response_format.clone(),
+        language: api_request.language.clone(),
+        speed: api_request.speed,
+        user_id: user_ctx.as_ref().map(|u| u.user_id),
+        user_role: user_ctx.as_ref().map(|u| u.role.clone()),
+        cancel_token: cancel.clone(),
+    };
+
+    let chunk_stream = match dispatcher.tts().stream_synthesize(req_dto).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Map common error types to typed HTTP status. Default Internal
+            // pokrywa nieznane błędy backendu.
+            // Mapowanie typowane na podstawie podstringów wytwarzanych
+            // przez TtsDispatcherImpl/runtime. "not wired" → backend nie
+            // gotowy; "not found" / "unknown model" → 404; "empty text"
+            // / "no candidate" / "capability" → 400; reszta → 500.
+            let msg = e.to_string();
+            let lower = msg.to_ascii_lowercase();
+            let (status, code) = if lower.contains("not wired") {
+                (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+            } else if lower.contains("not found") || lower.contains("unknown model") {
+                (StatusCode::NOT_FOUND, "model_not_found")
+            } else if lower.contains("empty text")
+                || lower.contains("no candidate")
+                || lower.contains("capability")
+            {
+                (StatusCode::BAD_REQUEST, "invalid_request")
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, "backend_error")
+            };
+            error!("TTS stream init: {}", e);
+            return Ok(error_response(status, code, msg));
+        }
+    };
+
+    use base64::Engine;
+    use futures::StreamExt;
+    let sse_chunks = chunk_stream.flat_map(|res| {
+        let frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> = match res {
+            Ok(chunk) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk.bytes_delta);
+                let json = serde_json::json!({
+                    "audio_chunk": b64,
+                    "mime": chunk.mime,
+                    "sample_rate": chunk.sample_rate,
+                    "finish_reason": chunk
+                        .finish_reason
+                        .and_then(|f| f.as_openai_str().map(|s| s.to_string())),
+                });
+                let line = format!("data: {}\n\n", json);
+                vec![Ok(Frame::data(Bytes::from(line)))]
+            }
+            Err(e) => {
+                let json = serde_json::json!({ "error": format!("{e}") });
+                let line = format!("data: {}\n\n", json);
+                vec![Ok(Frame::data(Bytes::from(line)))]
+            }
+        };
+        futures::stream::iter(frames)
+    });
+    let done = futures::stream::once(async {
+        Ok::<_, std::io::Error>(Frame::data(Bytes::from("data: [DONE]\n\n")))
+    });
+    let combined = sse_chunks.chain(done);
+
+    // CancelOnDropStream: hyper drop body → cancel.cancel() → take_while
+    // w `stream_synthesize` widzi cancelled, EOF.
+    let wrapped = crate::flow_engine::cancel_on_drop::CancelOnDropStream::new(combined, cancel);
+
+    let body: std::pin::Pin<
+        Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
+    > = Box::pin(wrapped);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(StreamBody::new(body))
+        .unwrap())
+}
+
+/// Handler dla `POST /v1/audio/speech/flow-stream` (Krok 5).
+///
+/// Klient POST'uje strukturę `TTSRequest` (taką samą jak `/v1/audio/speech`),
+/// dostaje `text/event-stream` z bazą64-zakodowanymi audio chunkami emitowanymi
+/// bezpośrednio z flow_engine streaming chain'a:
+///
+/// - User-defined flow z `tts_stream_bridge` → audio per-zdanie (LLM tokeny
+///   buforowane do sentence boundary, każde zdanie osobny TTS synthesize).
+/// - User-defined blocking flow z `FlowValue::Audio` na output → single
+///   chunk z całością bytes (`wrap_blocking_as_stream` fetchuje BlobStore
+///   przed emitem).
+/// - Synthetic TTS (gdy admin nie skonfigurował user-defined) → blocking
+///   path → single chunk.
+///
+/// Cancel propaguje przez `CancelOnDropStream` — hyper drop body → token
+/// cancel → executor finalizer EOF.
+async fn handle_audio_speech_flow_stream(
+    req: Request<Incoming>,
+    router: Arc<Router>,
+) -> std::result::Result<
+    Response<
+        StreamBody<
+            std::pin::Pin<
+                Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
+            >,
+        >,
+    >,
+    hyper::Error,
+> {
+    let user_ctx = req
+        .extensions()
+        .get::<crate::auth::acl::UserContext>()
+        .cloned();
+
+    let body_bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("Nie udalo sie odczytac body: {}", e),
+            ));
+        }
+    };
+    let api_request: crate::api::openai::types::TTSRequest =
+        match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("invalid JSON: {}", e),
+                ));
+            }
+        };
+
+    let dispatcher = match router.flow_dispatcher.as_ref() {
+        Some(d) => d.clone(),
+        None => {
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "flow dispatcher not wired".to_string(),
+            ));
+        }
+    };
+
+    if let Some(ref u) = user_ctx {
+        if let Some(ref db) = router.db {
+            if !crate::auth::acl::check_access_safe(
+                db,
+                "model",
+                &api_request.model,
+                u.user_id,
+                &u.role,
+            ) {
+                tracing::warn!(
+                    user_id = u.user_id,
+                    model = %api_request.model,
+                    "ACL denied flow audio stream model"
+                );
+                return Ok(error_response(
+                    StatusCode::NOT_FOUND,
+                    "model_not_found",
+                    format!("model '{}' not found", api_request.model),
+                ));
+            }
+        }
+    }
+
+    if api_request.input.is_empty() {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "TTSRequest.input must not be empty".to_string(),
+        ));
+    }
+
+    let (initial, mut meta) = crate::services::runtime::executor::tts_request_to_initial_envelope(
+        &api_request,
+        user_ctx.clone(),
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    meta.cancel_token = cancel.clone();
+
+    let stream_exec = match dispatcher
+        .try_dispatch_streaming(&api_request.model, "tts", initial, meta)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = e.to_string();
+            let core_err = crate::routing::dispatch_error_to_core(e, &api_request.model);
+            let (status, code) = match &core_err {
+                crate::error::CoreError::ModelNotFound { .. } => {
+                    (StatusCode::NOT_FOUND, "model_not_found")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "backend_error"),
+            };
+            error!("audio flow-stream init: {}", msg);
+            return Ok(error_response(status, code, msg));
+        }
+    };
+
+    let body_chunks = crate::routing::audio_stream::envelope_stream_to_audio_chunks(stream_exec);
+    let wrapped = crate::flow_engine::cancel_on_drop::CancelOnDropStream::new(body_chunks, cancel);
+
+    let body: std::pin::Pin<
+        Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
+    > = Box::pin(wrapped);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(StreamBody::new(body))
+        .unwrap())
 }
 
 /// Handler dla /v1/audio/transcriptions (Speech-to-Text, Whisper)
@@ -557,6 +885,7 @@ async fn handle_audio_transcriptions(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let want_trailers = wants_trailers(req.headers());
     let user_ctx = req
         .extensions()
         .get::<crate::auth::acl::UserContext>()
@@ -777,15 +1106,14 @@ async fn handle_audio_transcriptions(
                     );
                 }
             }
+            if want_trailers {
+                emit_trailer_headers(resp.headers_mut(), &route_result.metadata);
+            }
             Ok(resp)
         }
         Err(e) => {
             error!("Blad routingu audio transcription: {}", e);
-            Ok(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "backend_error",
-                format!("Blad przetwarzania audio: {}", e),
-            ))
+            Ok(core_error_to_response(&e))
         }
     }
 }
@@ -805,6 +1133,7 @@ async fn handle_embeddings(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let want_trailers = wants_trailers(req.headers());
     let user_ctx = req
         .extensions()
         .get::<crate::auth::acl::UserContext>()
@@ -846,6 +1175,9 @@ async fn handle_embeddings(
                         "X-TentaFlow-Route".parse().unwrap(),
                     );
                 }
+            }
+            if want_trailers {
+                emit_trailer_headers(resp.headers_mut(), &route_result.metadata);
             }
             Ok(resp)
         }
@@ -936,78 +1268,6 @@ async fn handle_models_list(
     Ok(json_response(StatusCode::OK, body))
 }
 
-// =============================================================================
-// PROMETHEUS METRICS HANDLER
-// =============================================================================
-// Zwraca metryki w formacie Prometheus
-
-async fn handle_metrics(
-    router: Arc<Router>,
-) -> std::result::Result<
-    Response<
-        StreamBody<
-            Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>,
-        >,
-    >,
-    hyper::Error,
-> {
-    let metrics = router.get_metrics();
-
-    // Format Prometheus text format
-    let mut output = String::new();
-    output.push_str("# HELP tentaflow_router_info Router information\n");
-    output.push_str("# TYPE tentaflow_router_info gauge\n");
-    output.push_str("tentaflow_router_info{version=\"0.1.0\"} 1\n\n");
-
-    // Backend health metrics
-    output.push_str(
-        "# HELP tentaflow_ai_backend_healthy Backend health status (1=healthy, 0=unhealthy)\n",
-    );
-    output.push_str("# TYPE tentaflow_ai_backend_healthy gauge\n");
-    for (model_name, backend_metrics) in &metrics.backends {
-        for (backend_idx, backend_metric) in backend_metrics.iter().enumerate() {
-            let health_value = if backend_metric.is_healthy { 1 } else { 0 };
-            output.push_str(&format!(
-                "tentaflow_ai_backend_healthy{{model=\"{}\",backend=\"{}\"}} {}\n",
-                model_name, backend_idx, health_value
-            ));
-        }
-    }
-    output.push_str("\n");
-
-    // Request counters
-    output.push_str("# HELP tentaflow_ai_requests_total Total number of requests\n");
-    output.push_str("# TYPE tentaflow_ai_requests_total counter\n");
-    output.push_str(&format!(
-        "tentaflow_ai_requests_total{{}} {}\n\n",
-        metrics.total_requests
-    ));
-
-    // Active connections
-    output
-        .push_str("# HELP tentaflow_ai_active_connections Current number of active connections\n");
-    output.push_str("# TYPE tentaflow_ai_active_connections gauge\n");
-    output.push_str(&format!(
-        "tentaflow_ai_active_connections{{}} {}\n\n",
-        metrics.active_connections
-    ));
-
-    // WSS handler metrics (per MessageBody variant). Lazy-init w
-    // dispatch::metrics gdy ktorykolwiek handler bedzie wywolany.
-    output.push_str(&crate::dispatch::metrics::render_prometheus());
-
-    let body = hyper::body::Bytes::from(output);
-    let stream = futures::stream::once(async move { Ok(Frame::data(body)) });
-    let boxed_stream: Pin<
-        Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
-    > = Box::pin(stream);
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/plain; version=0.0.4")
-        .body(StreamBody::new(boxed_stream))
-        .unwrap())
-}
 
 /// Sprawdza czy request ma wlaczony debug routing (header lub query param)
 fn is_debug_route_openai(headers: &hyper::header::HeaderMap, uri: &hyper::Uri) -> bool {
@@ -1017,4 +1277,44 @@ fn is_debug_route_openai(headers: &hyper::header::HeaderMap, uri: &hyper::Uri) -
         .map_or(false, |v| v == "true");
     let has_query = uri.query().map_or(false, |q| q.contains("debug=route"));
     has_header || has_query
+}
+
+/// Etap 2: czy klient prosi o trailery (`X-Want-Trailers: true`)? Streaming
+/// SSE ignoruje to dziś (HTTP/2 trailers wraca w stage 3) — używane tylko
+/// dla blocking response (chat / embeddings non-stream).
+fn wants_trailers(headers: &hyper::header::HeaderMap) -> bool {
+    headers
+        .get("x-want-trailers")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Emituje `X-Tentaflow-*` trailer-friendly headery z `RouteMetadata` na
+/// response. Używane tylko gdy `wants_trailers(req)` zwróci true.
+fn emit_trailer_headers(
+    headers: &mut hyper::header::HeaderMap,
+    metadata: &crate::routing::RouteMetadata,
+) {
+    if let Some(latency) = metadata.latency_ms {
+        if let Ok(v) = (latency as u64).to_string().parse() {
+            headers.insert("x-tentaflow-latency-ms", v);
+        }
+    }
+    if let Some(usage) = metadata.usage.as_ref() {
+        if let Ok(v) = usage.prompt_tokens.to_string().parse() {
+            headers.insert("x-tentaflow-prompt-tokens", v);
+        }
+        if let Ok(v) = usage.completion_tokens.to_string().parse() {
+            headers.insert("x-tentaflow-completion-tokens", v);
+        }
+        if let Ok(v) = usage.total_tokens.to_string().parse() {
+            headers.insert("x-tentaflow-total-tokens", v);
+        }
+    }
+    if let Some(fr) = metadata.finish_reason.as_deref() {
+        if let Ok(v) = fr.parse() {
+            headers.insert("x-tentaflow-finish-reason", v);
+        }
+    }
 }

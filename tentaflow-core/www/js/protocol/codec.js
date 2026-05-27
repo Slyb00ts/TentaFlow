@@ -695,6 +695,64 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Camera admin (F2 P7.a-bis) — ONVIF wizard
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::CameraAdminBody(DiscoverRequest) — start ONVIF WS-Discovery. */
+  cameraDiscoverRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCameraDiscoverRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::CameraAdminBody(AddOnvifRequest) — bind a discovered ONVIF
+   * device as a managed camera session.
+   * payload: { displayName, deviceServiceUrl, username, password,
+   *            profileToken?, targetFps? }
+   */
+  cameraAddOnvifRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCameraAddOnvifRequest(
+      payload.displayName,
+      payload.deviceServiceUrl,
+      payload.username,
+      payload.password,
+      payload.profileToken ?? null,
+      payload.targetFps != null ? Number(payload.targetFps) : null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::CameraAdminBody(FrameUrlRequest) — live-preview tile URL.
+   * payload: { cameraId, ttlSecs }
+   */
+  cameraFrameUrlRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCameraFrameUrlRequest(
+      payload.cameraId,
+      Number(payload.ttlSecs),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Hub
   // -------------------------------------------------------------------------
 
@@ -976,6 +1034,41 @@ export const encode = {
       BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
+    );
+  },
+
+  /**
+   * MessageBody::ServiceBody(ServicePayload::ReqUpdate) — edycja serwisu
+   * po deploy. Payload to JSON-encoded ServiceUpdateRequest (13 pól
+   * opcjonalnych — łatwiej tak niż 13 args wasm-bindgen).
+   */
+  serviceConfigUpdateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceConfigUpdateRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqVramHint) */
+  serviceVramHintRequest(correlationId, { gpuIndex, nodeId, excludeServiceId } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceVramHintRequest(
+      gpuIndex == null ? undefined : Number(gpuIndex),
+      nodeId ?? undefined,
+      excludeServiceId == null ? undefined : Number(excludeServiceId),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqEnginePresets) */
+  serviceEnginePresetsRequest(correlationId, { engineId } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceEnginePresetsRequest(String(engineId || ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
     );
   },
 
@@ -1703,6 +1796,20 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji addonow
+   *  do glownego menu launcher. Frontend buduje liste ikon. */
+  addonApplicationsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonApplicationsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+
   /** MessageBody::UsersListRequest (unit, Admin) — lista uzytkownikow. */
   usersListRequest(correlationId, sequence = 1) {
     assertReady();
@@ -1732,6 +1839,120 @@ export const encode = {
       Number(payload.offset ?? 0),
       Number(payload.limit ?? 100) >>> 0,
     );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerJobsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerJobsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerActionsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerActionsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerRunsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerRunsListRequest(
+      String(payload.jobId ?? payload.job_id ?? ''),
+      Number(payload.limit ?? 20) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerJobUpsertRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerJobUpsertRequest(
+      typeof payload.jobJson === 'string' ? payload.jobJson : JSON.stringify(payload.job ?? payload),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerJobDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerJobDeleteRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerJobRunNowRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerJobRunNowRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  syncConflictsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSyncConflictsListRequest(
+      String(payload.orgId ?? payload.org_id ?? 'org-default'),
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.status ?? 'open'),
+      Number(payload.limit ?? 100) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  syncConflictResolveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSyncConflictResolveRequest(
+      String(payload.orgId ?? payload.org_id ?? 'org-default'),
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.operationId ?? payload.operation_id ?? ''),
+      String(payload.resolution ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  syncStorageReportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSyncStorageReportRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2441,6 +2662,230 @@ export const encode = {
     );
   },
 
+  // ---- Legal documents (RODO/GDPR admin, F2-P8.d M10) -------------------
+
+  /**
+   * MessageBody::LegalAdminBody(ListRequest) — admin list of generated RODO
+   * documents. `includeRevoked=false` hides soft-deleted rows.
+   */
+  legalDocumentsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeLegalDocumentsListRequest(Boolean(payload.includeRevoked));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::LegalAdminBody(GenerateRequest) — render and persist a new
+   * RODO PDF. `variant` must be one of `short` | `standard` | `full`.
+   */
+  legalDocumentGenerateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeLegalDocumentGenerateRequest(String(payload.variant ?? 'standard'));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::LegalAdminBody(RevokeRequest) — soft-delete a legal document
+   * by its UUID.
+   */
+  legalDocumentRevokeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeLegalDocumentRevokeRequest(String(payload.docId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::StreamBody(SubscribeRequest) — subskrypcja strumienia
+   *  zarejestrowanego w StreamHub (Chunk B). Server odpowiada
+   *  SubscribeResponse + sekwencja Frame chunkow + Closed na tym samym
+   *  correlation_id. Payload: { streamId }. */
+  streamSubscribeRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
+    const body = _wasm.encodeStreamSubscribeRequest(streamId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::StreamBody(CloseRequest) — wczesna rezygnacja z aktywnej
+   *  subskrypcji. Wysylane na tym samym correlation_id co oryginalny
+   *  SubscribeRequest. Payload: { streamId }. */
+  streamCloseRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
+    const body = _wasm.encodeStreamCloseRequest(streamId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // ---------------------------------------------------------------------------
+  // RoleCatalogBody — katalog ról biznesowych (admin). Payload przekazywany do
+  // WASM jako JSON string aby wesprzec Vec<(String,String)> + Option<Option<_>>
+  // bez serde-wasm-bindgen w tym crate'cie.
+  // ---------------------------------------------------------------------------
+
+  /** MessageBody::RoleCatalogBody(ListRequest). Payload: { kind?, isActive?, search?, limit?, offset? }. */
+  roleCatalogListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const filter = {
+      kind: payload?.kind ?? null,
+      is_active: payload?.isActive ?? payload?.is_active ?? null,
+      search: payload?.search ?? null,
+      limit: payload?.limit ?? null,
+      offset: payload?.offset ?? null,
+    };
+    const body = _wasm.encodeRoleCatalogListRequest(JSON.stringify(filter));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(GetRequest). Payload: { id }. */
+  roleCatalogGetRequest(correlationId, { id }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRoleCatalogGetRequest(String(id));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(GetBySlugRequest). Payload: { slug }. */
+  roleCatalogGetBySlugRequest(correlationId, { slug }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRoleCatalogGetBySlugRequest(String(slug));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(ListLocalesRequest) — unit. */
+  roleCatalogListLocalesRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRoleCatalogListLocalesRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(CreateRequest). Payload (camelCase z UI) jest
+   *  remapowany na snake_case zgodny z DTO `RoleCatalogCreateRequest`. */
+  roleCatalogCreateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const req = {
+      slug: String(payload?.slug ?? ''),
+      kind: String(payload?.kind ?? ''),
+      name_translations: payload?.nameTranslations ?? payload?.name_translations ?? [],
+      description_translations:
+        payload?.descriptionTranslations ?? payload?.description_translations ?? [],
+      icon: payload?.icon ?? null,
+      color_hint: payload?.colorHint ?? payload?.color_hint ?? null,
+      is_manager: !!(payload?.isManager ?? payload?.is_manager ?? false),
+      default_visibility_scope: String(
+        payload?.defaultVisibilityScope ?? payload?.default_visibility_scope ?? 'assigned',
+      ),
+    };
+    const body = _wasm.encodeRoleCatalogCreateRequest(JSON.stringify(req));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(UpdateRequest) — patch.
+   *  Pola w `payload` mogą być nieobecne (nie ruszaj), `null` (wyczysc) lub
+   *  konkretną wartością. icon/colorHint mapowane na Option<Option<String>>. */
+  roleCatalogUpdateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const req = { id: String(payload?.id ?? '') };
+    if (Object.prototype.hasOwnProperty.call(payload, 'kind') && payload.kind !== undefined) {
+      req.kind = payload.kind === null ? null : String(payload.kind);
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(payload, 'nameTranslations')
+      && payload.nameTranslations !== undefined
+    ) {
+      req.name_translations = payload.nameTranslations;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(payload, 'descriptionTranslations')
+      && payload.descriptionTranslations !== undefined
+    ) {
+      req.description_translations = payload.descriptionTranslations;
+    }
+    // icon: Option<Option<String>> — w JSON: brak pola = None, null = Some(None) (clear),
+    // string = Some(Some(value)).
+    if (Object.prototype.hasOwnProperty.call(payload, 'icon') && payload.icon !== undefined) {
+      req.icon = payload.icon === null ? null : String(payload.icon);
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, 'colorHint') && payload.colorHint !== undefined) {
+      req.color_hint = payload.colorHint === null ? null : String(payload.colorHint);
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, 'isManager') && payload.isManager !== undefined) {
+      req.is_manager = !!payload.isManager;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(payload, 'defaultVisibilityScope')
+      && payload.defaultVisibilityScope !== undefined
+    ) {
+      req.default_visibility_scope = String(payload.defaultVisibilityScope);
+    }
+    const body = _wasm.encodeRoleCatalogUpdateRequest(JSON.stringify(req));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(DeactivateRequest). Payload: { id }. */
+  roleCatalogDeactivateRequest(correlationId, { id }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRoleCatalogDeactivateRequest(String(id));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
 };
 
 // =============================================================================
@@ -2487,6 +2932,23 @@ export function validateFrame(bytes) {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/**
+ * Konwersja kluczy camelCase → snake_case dla JSON-encoded payload'ów
+ * które backend parsuje przez serde (struktury z snake_case fields).
+ * Zachowuje wartości bez zmian, mapuje tylko klucze pierwszego poziomu
+ * obiektu (rekursja niepotrzebna dla naszych payloadów które są płaskie).
+ */
+function camelToSnakePayload(obj) {
+  if (obj == null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(camelToSnakePayload);
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const sk = k.replace(/[A-Z]/g, (c) => '_' + c.toLowerCase());
+    out[sk] = camelToSnakePayload(v);
+  }
+  return out;
+}
 
 function assertReady() {
   if (!_wasm) {

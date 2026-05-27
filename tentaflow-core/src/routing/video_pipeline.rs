@@ -178,7 +178,7 @@ struct InferAttrs {
 /// Rozwiązuje alias do nazwy serwisu (czyli klucza w `vision::registry`).
 /// Zwraca `Ok(None)` gdy alias pusty/brak — caller traktuje to jako "skip".
 fn resolve_vision_alias(pool: &DbPool, alias: &'static str) -> anyhow::Result<Option<String>> {
-    match crate::db::repository::resolve_model_alias(pool, alias)? {
+    match crate::db::repository::resolve_model_alias(pool, alias, None)? {
         Some(a) if !a.target_model.trim().is_empty() => Ok(Some(a.target_model)),
         _ => {
             if !alias_warn_throttled(alias) {

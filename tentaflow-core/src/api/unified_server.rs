@@ -26,12 +26,12 @@ use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::mesh::security::MeshSecurity;
 use crate::metrics::RouterMetrics;
-use crate::services::runtime::quic_handle::ServiceManager;
 use crate::routing::Router;
+use crate::services::runtime::quic_handle::ServiceManager;
 
 /// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler
 pub fn is_openai_path(path: &str) -> bool {
-    path.starts_with("/v1/") || path == "/health" || path == "/ready" || path == "/metrics"
+    path.starts_with("/v1/") || path == "/health" || path == "/ready"
 }
 
 /// Uruchamia zunifikowany serwer HTTPS obslugujacy OpenAI API + Dashboard
@@ -54,10 +54,14 @@ pub fn start_unified_server(
     quic_mesh: Option<Arc<IrohMeshManager>>,
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
     mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Result<()> {
+    let permission_checker = addon_manager
+        .as_ref()
+        .map(|m| m.permission_checker().clone());
     start_unified_server_with_permissions(
         config,
         db,
@@ -67,7 +71,8 @@ pub fn start_unified_server(
         quic_mesh,
         local_node_id,
         mesh_security,
-        None,
+        permission_checker,
+        addon_manager,
         mesh_relay_health,
         port_allocator,
         mesh_services_registry,
@@ -85,6 +90,7 @@ pub fn start_unified_server_with_permissions(
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
     mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
@@ -138,9 +144,24 @@ pub fn start_unified_server_with_permissions(
     let local_node_id = local_node_id.clone();
     let mesh_security = mesh_security.clone();
     let permission_checker = permission_checker.clone();
+    let addon_manager = addon_manager.clone();
     let mesh_relay_health = mesh_relay_health.clone();
     let port_allocator = port_allocator.clone();
     let mesh_services_registry = mesh_services_registry.clone();
+
+    // Initialise the process-wide pickup mTLS profile from the loaded config.
+    // The verifier wired into rustls below offers client auth iff this profile
+    // says pickup is required; the HTTP layer enforces fingerprint pinning.
+    let pickup_mtls = config
+        .server
+        .mtls
+        .clone()
+        .map(|c| {
+            crate::api::mtls::PickupMtlsConfig::new(c.pickup_required, c.client_cert_fingerprints)
+        })
+        .unwrap_or_default();
+    let mtls_offers_client_auth = pickup_mtls.requests_client_cert();
+    crate::api::mtls::set_pickup_mtls_config(pickup_mtls);
 
     // Wbudowane certyfikaty TLS z katalogu certs/ repozytorium
     let tls_acceptor = {
@@ -152,10 +173,24 @@ pub fn start_unified_server_with_permissions(
         let key = crate::api::tls_pem::parse_key_pem(key_pem)
             .expect("Nie udalo sie sparsowac wbudowanego klucza");
 
-        let mut tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .expect("Nie udalo sie skonfigurowac TLS");
+        // TLS 1.3 only — F1b is HTTPS-native, no legacy clients to support.
+        // Pinning the version here also pins AEAD-only cipher suites and
+        // forward-secret key exchange (X25519 / P-256), eliminating the need
+        // for an explicit cipher allowlist.
+        let builder =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13]);
+
+        let mut tls_config = if mtls_offers_client_auth {
+            builder
+                .with_client_cert_verifier(crate::api::mtls::AnyClientCertVerifier::new())
+                .with_single_cert(certs, key)
+                .expect("Nie udalo sie skonfigurowac TLS (mTLS)")
+        } else {
+            builder
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .expect("Nie udalo sie skonfigurowac TLS")
+        };
 
         tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
@@ -164,6 +199,7 @@ pub fn start_unified_server_with_permissions(
 
     // OAuth pending-state TTL purge: run once at startup, then hourly.
     crate::addon::oauth_cleanup::start_oauth_cleanup_task(db.clone());
+    crate::scheduler::start(db.clone(), addon_manager.clone());
 
     info!("Inicjalizacja unified HTTPS server na {}...", bind_addr);
 
@@ -273,6 +309,7 @@ pub fn start_unified_server_with_permissions(
                 let lni = local_node_id.clone();
                 let msec = mesh_security.clone();
                 let pc = permission_checker.clone();
+                let am = addon_manager.clone();
                 let mrh = mesh_relay_health.clone();
                 let pa = port_allocator.clone();
                 let msr = mesh_services_registry.clone();
@@ -289,11 +326,28 @@ pub fn start_unified_server_with_permissions(
                             return;
                         }
                     };
+                    // Snapshot peer (client) certificate DER bytes, if the
+                    // client offered one during the handshake. Forwarded into
+                    // request extensions so /core/frame/pickup can pin the
+                    // SHA-256 fingerprint at the HTTP layer.
+                    let client_cert_der: Option<Vec<u8>> = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|chain| chain.first().map(|c| c.as_ref().to_vec()));
                     let io = TokioIo::new(tls_stream);
 
                     // VULN-035: Przekaz remote_addr do handle_request
                     let remote_addr_str = remote_addr.to_string();
-                    let service = service_fn(move |req: Request<Incoming>| {
+                    let client_cert_der = client_cert_der.clone();
+                    let service = service_fn(move |mut req: Request<Incoming>| {
+                        // Wstrzykuj peer cert DER do extensions — handlery
+                        // (np. /core/frame/pickup) wyciagaja go przez
+                        // `req.extensions().get::<ClientCertDer>()`.
+                        if let Some(der) = client_cert_der.clone() {
+                            req.extensions_mut()
+                                .insert(crate::api::mtls::ClientCertDer(der));
+                        }
                         let router = router.clone();
                         let db = db.clone();
                         let metrics = metrics.clone();
@@ -305,6 +359,7 @@ pub fn start_unified_server_with_permissions(
                         let lni = lni.clone();
                         let msec = msec.clone();
                         let pc = pc.clone();
+                        let am = am.clone();
                         let mrh = mrh.clone();
                         let pa = pa.clone();
                         let msr = msr.clone();
@@ -381,33 +436,38 @@ pub fn start_unified_server_with_permissions(
                                 // Wstrzykuje UserContext do request extensions zeby
                                 // openai::server::handle_request mogl uzyc go w
                                 // route_*_for_user wariantach.
-                                let mut req = req;
                                 if let Some(uc) = owner_user_ctx {
                                     req.extensions_mut().insert(uc);
                                 }
                                 let resp =
                                     crate::api::openai::server::handle_request(req, router).await?;
-                                let resp = resp.map(|body| {
+                                let mut resp = resp.map(|body| {
                                     UnsyncBoxBody::new(body.map_err(
                                         |e| -> Box<dyn std::error::Error + Send + Sync> {
                                             Box::new(e)
                                         },
                                     ))
                                 });
+                                crate::api::mtls::apply_universal_security_headers(
+                                    resp.headers_mut(),
+                                );
                                 Ok::<_, hyper::Error>(resp)
                             } else {
                                 let resp = crate::api::dashboard::server::handle_request(
                                     req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec,
-                                    pc, lic, mrh, pa, ra, msr,
+                                    pc, am, lic, mrh, pa, ra, msr,
                                 )
                                 .await?;
-                                let resp = resp.map(|body| {
+                                let mut resp = resp.map(|body| {
                                     UnsyncBoxBody::new(body.map_err(
                                         |e| -> Box<dyn std::error::Error + Send + Sync> {
                                             e.into()
                                         },
                                     ))
                                 });
+                                crate::api::mtls::apply_universal_security_headers(
+                                    resp.headers_mut(),
+                                );
                                 Ok::<_, hyper::Error>(resp)
                             }
                         }

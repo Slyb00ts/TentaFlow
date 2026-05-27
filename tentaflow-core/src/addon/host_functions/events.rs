@@ -13,6 +13,7 @@ use super::{
     ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
 };
 use crate::addon::event_bus::EventSubscriber;
+use crate::addon::runtime;
 
 // =============================================================================
 // event_subscribe — subskrypcja eventu
@@ -71,11 +72,21 @@ pub fn event_subscribe(
         addon_id, event_type
     );
 
-    // Zarejestruj subskrypcje w event bus
+    // Resolve event export name from the addon's manifest runtime
+    let rt_id = caller
+        .data()
+        .manifest
+        .runtime
+        .as_deref()
+        .unwrap_or("wasmtime");
+    let event_export = runtime::adapter_for_runtime(rt_id)
+        .map(|a| a.export_on_event().to_string())
+        .unwrap_or_else(|| "on_event".to_string());
+
     let subscriber = EventSubscriber {
         addon_id: addon_id.clone(),
         instance_id: instance_id.clone(),
-        callback_name: "on_event".to_string(),
+        callback_name: event_export,
     };
 
     let subscription_id = caller.data().event_bus.subscribe(&event_type, subscriber);
@@ -148,48 +159,39 @@ pub fn event_publish(
         serde_json::Value::Null
     };
 
-    // Sprawdz uprawnienie events (rw — publikacja wymaga write)
-    if !check_permission(caller.data(), "events", Some(&event_type)) {
-        audit_log(
-            caller.data(),
-            "event.publish",
-            Some("events"),
-            Some(&event_type),
-            "denied",
-            None,
-        );
-        return ABI_ERR_PERMISSION;
-    }
-
-    let addon_id = caller.data().addon_id.clone();
-    let user_id = caller.data().user_id;
+    let state = caller.data();
+    let req_caller = crate::services::service_call::CallerContext {
+        addon_id: state.addon_id.clone(),
+        user_id: state.user_id,
+        instance_id: Some(state.instance_id.clone()),
+        is_system_call: state.is_system_call,
+        org_id: state.org_id.clone(),
+    };
+    let bus = state.event_bus.clone();
+    let db = state.db.clone();
+    let checker = state.permission_checker.clone();
+    let permissions = state.permissions.clone();
 
     info!(
         "event_publish: addon='{}', event_type='{}'",
-        addon_id, event_type
+        req_caller.addon_id, event_type
     );
 
-    // Opublikuj event
-    let event = crate::addon::event_bus::Event {
-        event_type: event_type.clone(),
-        source_addon: Some(addon_id.clone()),
-        source_user: user_id,
+    match crate::addon::event_publish::publish_event(
+        &bus,
+        &db,
+        &req_caller,
+        Some(&checker),
+        &permissions,
+        &event_type,
         payload,
-        timestamp: chrono::Utc::now(),
-    };
-
-    caller.data().event_bus.publish(event);
-
-    audit_log(
-        caller.data(),
-        "event.publish",
-        Some("events"),
-        Some(&event_type),
-        "ok",
-        None,
-    );
-
-    ABI_OK
+    ) {
+        Ok(()) => ABI_OK,
+        Err(crate::addon::event_publish::EventPublishError::Permission { .. }) => {
+            ABI_ERR_PERMISSION
+        }
+        Err(_) => ABI_ERR_OPERATION,
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +212,7 @@ mod tests {
             addon_id: "events-test-addon".to_string(),
             instance_id: "t".to_string(),
             user_id: None,
+            org_id: None,
             db: db.clone(),
             permissions,
             event_bus: Arc::new(EventBus::new()),
@@ -225,6 +228,7 @@ mod tests {
                 crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
             ),
             router: None,
+            ui_panels: None,
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
         }

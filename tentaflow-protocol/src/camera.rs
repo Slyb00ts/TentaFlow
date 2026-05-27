@@ -1,0 +1,308 @@
+// =============================================================================
+// File: camera.rs
+// Purpose: Admin-side binary protocol for camera discovery + add (F2 P7.a).
+//          Packed into a single `CameraAdminPayload` inner enum so the whole
+//          camera-wizard surface burns one `MessageBody` discriminant slot
+//          (rkyv 0.8 caps `MessageBody` at 256 variants — see profiling.rs
+//          / vision.rs for the same pack pattern).
+// =============================================================================
+
+use rkyv::{Archive, Deserialize, Serialize};
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
+
+/// One device returned by ONVIF WS-Discovery. Mirrors the host-fn
+/// `DiscoveredCameraOut` shape so the dashboard wizard and addons share
+/// the same field set; the wire-level type lives in this crate so the
+/// `tentaflow-core` crate can be built without dragging the dashboard
+/// schema into the addon ABI.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct DiscoveredCameraInfo {
+    /// Source IP of the ProbeMatch UDP packet (the camera's NIC address).
+    pub address: String,
+    /// ONVIF device-service URLs advertised by the camera, e.g.
+    /// `http://192.168.1.50/onvif/device_service`. Usually one entry.
+    pub xaddrs: Vec<String>,
+    /// ONVIF type tokens, e.g. `dn:NetworkVideoTransmitter`.
+    pub types: Vec<String>,
+    /// Best-effort manufacturer extracted from scopes (empty if absent).
+    pub manufacturer: String,
+    /// Best-effort model extracted from scopes (empty if absent).
+    pub model: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraDiscoverRequest {}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraDiscoverResponse {
+    pub discovered: Vec<DiscoveredCameraInfo>,
+}
+
+/// Request to add a discovered ONVIF camera as a managed session. The
+/// dashboard never re-uses `camera_add_v1` (host-fn / addon-scoped); this
+/// admin RPC carries the operator's user-session credentials and binds the
+/// resulting row to the org from `ctx.org_context`.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraAddOnvifRequest {
+    /// Human-readable label shown in the UI.
+    pub display_name: String,
+    /// ONVIF device-service URL (e.g. `http://192.168.1.50/onvif/device_service`).
+    pub device_service_url: String,
+    /// Plaintext ONVIF username. Travels over the TLS-protected admin
+    /// transport (WT/WS); the server encrypts it via `credentials_cipher`
+    /// before persisting and never returns it to the client.
+    pub username: String,
+    /// Plaintext ONVIF password — same handling rules as `username`.
+    pub password: String,
+    /// Profile token to bind, or `None` to pick the first profile returned
+    /// by `GetProfiles`.
+    pub profile_token: Option<String>,
+    /// Target capture FPS (1..=60). When `None`, the server picks a sensible
+    /// default (15 fps to match the host-fn surface).
+    pub target_fps: Option<u32>,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraAddOnvifResponse {
+    pub camera_id: String,
+    /// RTSP URI derived from `GetStreamUri` against the chosen profile.
+    pub rtsp_url: String,
+    /// Profile token actually bound (echoes the request when set, otherwise
+    /// the first profile that the device advertised).
+    pub profile_token: String,
+}
+
+/// Live-preview frame URL request — the dashboard `<tf-live-camera-tile>`
+/// custom element calls this directly so the panel does not round-trip
+/// through the addon WASM `__tentaflow.frame_url__` action. The handler
+/// authenticates as the user session, gates on `camera.read`, validates the
+/// camera id (UUID v4), enforces a per-user rate limit, and mints a signed
+/// `/frames/<ref>?token=...` URL against the latest frame stored for that
+/// camera in the in-memory LRU.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraFrameUrlRequest {
+    /// Camera id (UUID v4 textual form, 36 chars). Strict validation in the
+    /// handler — non-UUID values fail with BadRequest before any DB hit.
+    pub camera_id: String,
+    /// Requested TTL in seconds. Dispatch contract: 5..=300. Out-of-range
+    /// values yield BadRequest; the response `expires_at_ms` echoes the
+    /// actually-minted expiry.
+    pub ttl_secs: u32,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraFrameUrlResponse {
+    /// Same-origin signed URL (`/frames/<ref>?token=&exp=&ref=`).
+    pub signed_url: String,
+    /// Absolute expiry as Unix milliseconds. Mirrors the host-fn
+    /// `UrlOut.expires_unix_ms` shape so dashboard + addon paths stay
+    /// schema-compatible.
+    pub expires_at_ms: i64,
+}
+
+/// Inner-enum pack — keeps every admin camera RPC in a single
+/// `MessageBody::CameraAdminBody` slot (rkyv 256-variant budget). Matches the
+/// `ProfilingPayload` / `VisionInferPayload` pattern.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub enum CameraAdminPayload {
+    DiscoverRequest(CameraDiscoverRequest),
+    DiscoverResponse(CameraDiscoverResponse),
+    AddOnvifRequest(CameraAddOnvifRequest),
+    AddOnvifResponse(CameraAddOnvifResponse),
+    FrameUrlRequest(CameraFrameUrlRequest),
+    FrameUrlResponse(CameraFrameUrlResponse),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! round_trip {
+        ($ty:ty, $value:expr) => {{
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&$value).expect("encode");
+            rkyv::from_bytes::<$ty, rkyv::rancor::Error>(&bytes).expect("decode")
+        }};
+    }
+
+    #[test]
+    fn discover_request_round_trip() {
+        let v = CameraAdminPayload::DiscoverRequest(CameraDiscoverRequest {});
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn discover_response_round_trip() {
+        let v = CameraAdminPayload::DiscoverResponse(CameraDiscoverResponse {
+            discovered: vec![DiscoveredCameraInfo {
+                address: "192.168.1.50".into(),
+                xaddrs: vec!["http://192.168.1.50/onvif/device_service".into()],
+                types: vec!["dn:NetworkVideoTransmitter".into()],
+                manufacturer: "ACME".into(),
+                model: "Cam-9000".into(),
+            }],
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn add_onvif_request_round_trip() {
+        let v = CameraAdminPayload::AddOnvifRequest(CameraAddOnvifRequest {
+            display_name: "Front Door".into(),
+            device_service_url: "http://192.168.1.50/onvif/device_service".into(),
+            username: "admin".into(),
+            password: "hunter2".into(),
+            profile_token: Some("MainProfile".into()),
+            target_fps: Some(15),
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn add_onvif_response_round_trip() {
+        let v = CameraAdminPayload::AddOnvifResponse(CameraAddOnvifResponse {
+            camera_id: "cam_abc".into(),
+            rtsp_url: "rtsp://192.168.1.50:554/onvif/profile1/media.smp".into(),
+            profile_token: "MainProfile".into(),
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    // F2 P7.a-bis: ensure the CameraAdminPayload survives a round trip when
+    // wrapped in `MessageBody::CameraAdminBody`. The browser-side WASM glue
+    // (tentaflow-protocol-wasm) emits frames at this outer layer, so wire
+    // compatibility must hold for the full envelope body.
+    #[test]
+    fn camera_admin_body_discover_request_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::DiscoverRequest(
+            CameraDiscoverRequest {},
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn camera_admin_body_add_onvif_request_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifRequest(
+            CameraAddOnvifRequest {
+                display_name: "Lobby".into(),
+                device_service_url: "http://10.0.0.7/onvif/device_service".into(),
+                username: "viewer".into(),
+                password: "s3cret".into(),
+                profile_token: None,
+                target_fps: Some(10),
+            },
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn camera_admin_body_discover_response_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::DiscoverResponse(
+            CameraDiscoverResponse {
+                discovered: vec![
+                    DiscoveredCameraInfo {
+                        address: "10.0.0.21".into(),
+                        xaddrs: vec!["http://10.0.0.21/onvif/device_service".into()],
+                        types: vec!["dn:NetworkVideoTransmitter".into()],
+                        manufacturer: "Hikvision".into(),
+                        model: "DS-2CD".into(),
+                    },
+                    DiscoveredCameraInfo {
+                        address: "10.0.0.22".into(),
+                        xaddrs: vec![],
+                        types: vec![],
+                        manufacturer: String::new(),
+                        model: String::new(),
+                    },
+                ],
+            },
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn frame_url_request_round_trip() {
+        let v = CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
+            camera_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            ttl_secs: 30,
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn frame_url_response_round_trip() {
+        let v = CameraAdminPayload::FrameUrlResponse(CameraFrameUrlResponse {
+            signed_url: "/frames/frame_550e8400-e29b-41d4-a716-446655440000?token=ABCD&exp=1700000000000&ref=frame_xyz"
+                .into(),
+            expires_at_ms: 1_700_000_000_000,
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn camera_admin_body_frame_url_request_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
+            CameraFrameUrlRequest {
+                camera_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                ttl_secs: 30,
+            },
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn camera_admin_body_frame_url_response_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlResponse(
+            CameraFrameUrlResponse {
+                signed_url: "/frames/frame_x?token=A&exp=1&ref=frame_x".into(),
+                expires_at_ms: 1,
+            },
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn camera_admin_body_add_onvif_response_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifResponse(
+            CameraAddOnvifResponse {
+                camera_id: "cam_xyz".into(),
+                rtsp_url: "rtsp://10.0.0.21:554/Streaming/Channels/101".into(),
+                profile_token: "Profile_1".into(),
+            },
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+}

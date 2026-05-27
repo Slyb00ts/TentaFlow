@@ -45,7 +45,7 @@ pub struct NodeConfig {
     /// Load balancing (health checks, circuit breaker)
     pub load_balancing: LoadBalancingConfig,
 
-    /// Monitoring (Prometheus, health checks)
+    /// Monitoring (health checks)
     #[serde(default)]
     pub monitoring: MonitoringConfig,
 
@@ -261,6 +261,25 @@ pub struct ServerConfig {
     /// Format logow (json lub pretty)
     #[serde(default = "default_log_format")]
     pub log_format: String,
+
+    /// Opcjonalna konfiguracja mTLS pinning dla Service-to-Core endpointu
+    /// `/core/frame/pickup`. Domyslnie wylaczona (F1a/F1b compat) — production
+    /// deploy powinien wlaczyc `pickup_required = true` i wpisac fingerprinty.
+    #[serde(default)]
+    pub mtls: Option<MtlsConfig>,
+}
+
+/// Pinning client certificates for HTTP REST tier endpoints. SHA-256
+/// fingerprints of DER leaf certs (lower-case hex, with or without colons).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct MtlsConfig {
+    /// Gdy `true`, rustls request client cert na handshake'u i `/core/frame/pickup`
+    /// odrzuca polaczenia bez pasujacego fingerprintu.
+    #[serde(default)]
+    pub pickup_required: bool,
+    /// Lista SHA-256 fingerprintow dozwolonych client certow.
+    #[serde(default)]
+    pub client_cert_fingerprints: Vec<String>,
 }
 
 // =============================================================================
@@ -340,17 +359,11 @@ pub struct QuicProtocolConfig {
 // Middleware i rate limiting
 // =============================================================================
 
-/// Konfiguracja middleware
+/// Konfiguracja middleware. Po Krok 6 zostaje tylko rate-limit + audit
+/// — request/response filtering przeszło do flow_engine (`pii_filter`
+/// node), nie ma już osobnych knobów.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MiddlewareConfig {
-    /// Czy request middleware jest wlaczony (Faza 0: false = noop)
-    #[serde(default)]
-    pub request_validation_enabled: bool,
-
-    /// Czy response middleware jest wlaczony (Faza 0: false = noop)
-    #[serde(default)]
-    pub response_filtering_enabled: bool,
-
     /// Czy rate limiting jest wlaczony
     #[serde(default = "default_true")]
     pub rate_limiting_enabled: bool,
@@ -542,14 +555,6 @@ pub enum LlmModelCategory {
 /// Konfiguracja monitoringu
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MonitoringConfig {
-    /// Czy Prometheus metrics sa wlaczone
-    #[serde(default = "default_true")]
-    pub prometheus_enabled: bool,
-
-    /// Adres dla Prometheus endpoint
-    #[serde(default = "default_prometheus_bind")]
-    pub prometheus_bind: String,
-
     /// Czy health check endpoint jest wlaczony
     #[serde(default = "default_true")]
     pub health_check_enabled: bool,
@@ -673,10 +678,6 @@ fn default_circuit_breaker_timeout() -> u64 {
 
 fn default_weight() -> u32 {
     1
-}
-
-fn default_prometheus_bind() -> String {
-    "0.0.0.0:9090".to_string()
 }
 
 fn default_health_bind() -> String {
@@ -828,8 +829,6 @@ impl NodeConfig {
 impl Default for MiddlewareConfig {
     fn default() -> Self {
         Self {
-            request_validation_enabled: false,
-            response_filtering_enabled: false,
             rate_limiting_enabled: true,
             audit_logging_enabled: true,
         }
@@ -871,6 +870,7 @@ impl Default for NodeConfig {
                 cpu_affinity: true,
                 log_level: "info".to_string(),
                 log_format: "json".to_string(),
+                mtls: None,
             },
             protocols: ProtocolsConfig {
                 openai_api: ProtocolConfig {
@@ -921,8 +921,6 @@ impl Default for NodeConfig {
 impl Default for MonitoringConfig {
     fn default() -> Self {
         Self {
-            prometheus_enabled: true,
-            prometheus_bind: default_prometheus_bind(),
             health_check_enabled: true,
             health_check_bind: default_health_bind(),
             health_check_path: default_health_path(),

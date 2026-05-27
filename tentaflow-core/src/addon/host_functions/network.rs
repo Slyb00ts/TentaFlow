@@ -929,6 +929,7 @@ mod tests {
             addon_id: "net-test-addon".to_string(),
             instance_id: "test-instance".to_string(),
             user_id: None,
+            org_id: None,
             db,
             permissions,
             event_bus,
@@ -944,6 +945,7 @@ mod tests {
                 crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
             ),
             router: None,
+            ui_panels: None,
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
         }

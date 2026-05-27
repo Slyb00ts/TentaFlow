@@ -29,7 +29,6 @@ use crate::flow_engine::dispatcher::FlowDispatcher;
 use crate::services::catalog::{CatalogProvider, InputModality, OutputModality, ServiceSurface};
 use crate::services::handles_cache::BackendHandle;
 use crate::services::runtime::context::ExecutionContext;
-use crate::services::runtime::middleware::StreamMiddlewareFactory;
 use crate::services::runtime::resolver::{AliasResolver, ResolveError, ResolveRequest};
 use crate::services::runtime::strategy::{rank, StrategyState};
 use crate::services::runtime::target::ResolvedExecutionTarget;
@@ -37,8 +36,7 @@ use crate::services::runtime::target::ResolvedExecutionTarget;
 /// Strumien chunkow zwracany przez `stream_chat`. Boxed `Pin<Box<dyn Stream>>`
 /// zeby caller mog go zapakowac w SSE bez wiedzy o konkretnym typie strumienia
 /// (kazdy backend transport produkuje inny typ wewnetrznie).
-pub type ExecutorChunkStream =
-    Pin<Box<dyn Stream<Item = CoreResult<ChatCompletionChunk>> + Send>>;
+pub type ExecutorChunkStream = Pin<Box<dyn Stream<Item = CoreResult<ChatCompletionChunk>> + Send>>;
 
 /// Errors visible to the caller. Every variant maps onto a user-facing
 /// outcome — `model_capability_unsupported` from the resolver, transport
@@ -95,9 +93,7 @@ impl ExecutorError {
     fn aborts_fallback_chain(&self) -> bool {
         matches!(
             self,
-            Self::FlowDispatcherUnavailable
-                | Self::SttRuntimeUnavailable
-                | Self::SttBackend(_)
+            Self::FlowDispatcherUnavailable | Self::SttRuntimeUnavailable | Self::SttBackend(_)
         )
     }
 }
@@ -125,10 +121,7 @@ pub struct ModelRuntimeExecutor {
     /// `None` for DB-less / no-mesh routers; the dispatcher returns
     /// `TransportPendingCutover` so the caller can pick the next
     /// candidate or take the legacy fallback.
-    mesh_manager: Arc<
-        parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>,
-    >,
-    middleware: Vec<Arc<dyn StreamMiddlewareFactory>>,
+    mesh_manager: Arc<parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>>,
     /// Per-alias round-robin state keyed by alias name. `DashMap` so we
     /// can mutate per-key without serialising the whole map.
     strategy_state: Arc<dashmap::DashMap<String, Arc<StrategyState>>>,
@@ -144,7 +137,6 @@ impl ModelRuntimeExecutor {
         mesh_manager: Arc<
             parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>,
         >,
-        middleware: Vec<Arc<dyn StreamMiddlewareFactory>>,
     ) -> Self {
         Self {
             catalog,
@@ -153,7 +145,6 @@ impl ModelRuntimeExecutor {
             local_inference,
             stt_runtime,
             mesh_manager,
-            middleware,
             strategy_state: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -191,7 +182,10 @@ impl ModelRuntimeExecutor {
         for target in ranked {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self.dispatch_chat_blocking(&target, request.clone(), ctx).await {
+            match self
+                .dispatch_chat_blocking(&target, request.clone(), ctx)
+                .await
+            {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
@@ -272,7 +266,10 @@ impl ModelRuntimeExecutor {
         for target in ranked {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self.dispatch_chat_stream(&target, request.clone(), ctx).await {
+            match self
+                .dispatch_chat_stream(&target, request.clone(), ctx)
+                .await
+            {
                 Ok(stream) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
@@ -395,30 +392,33 @@ impl ModelRuntimeExecutor {
                         async move {
                             match chunk_result {
                                 Ok(stream_chunk) => match stream_chunk.chunk {
-                                    StreamChunkType::TextDelta(text) => Some(Ok(ChatCompletionChunk {
-                                        id: chat_id,
-                                        object: "chat.completion.chunk".to_string(),
-                                        created,
-                                        model,
-                                        choices: vec![ChunkChoice {
-                                            index: 0,
-                                            delta: Delta {
-                                                role: None,
-                                                content: Some(text),
-                                                reasoning_content: None,
-                                                tool_calls: None,
-                                            },
-                                            finish_reason: None,
-                                            logprobs: None,
-                                        }],
-                                        system_fingerprint: None,
-                                        audio: None,
-                                        detected_intent: None,
-                                        detected_tools: None,
-                                        transcribed_text: None,
-                                        speaker_id: None,
-                                        speaker_name: None,
-                                    })),
+                                    StreamChunkType::TextDelta(text) => {
+                                        Some(Ok(ChatCompletionChunk {
+                                            id: chat_id,
+                                            object: "chat.completion.chunk".to_string(),
+                                            created,
+                                            model,
+                                            choices: vec![ChunkChoice {
+                                                index: 0,
+                                                delta: Delta {
+                                                    role: None,
+                                                    content: Some(text),
+                                                    reasoning_content: None,
+                                                    tool_calls: None,
+                                                },
+                                                finish_reason: None,
+                                                logprobs: None,
+                                            }],
+                                            system_fingerprint: None,
+                                            audio: None,
+                                            detected_intent: None,
+                                            detected_tools: None,
+                                            transcribed_text: None,
+                                            speaker_id: None,
+                                            speaker_name: None,
+                                            usage: None,
+                                        }))
+                                    }
                                     StreamChunkType::ReasoningDelta(reasoning) => {
                                         Some(Ok(ChatCompletionChunk {
                                             id: chat_id,
@@ -443,9 +443,19 @@ impl ModelRuntimeExecutor {
                                             transcribed_text: None,
                                             speaker_id: None,
                                             speaker_name: None,
+                                            usage: None,
                                         }))
                                     }
-                                    StreamChunkType::Done { final_metrics: _ } => {
+                                    StreamChunkType::Done { final_metrics } => {
+                                        // Etap 3a: stempluj `usage` na finish chunk gdy
+                                        // backend zaraportował token rollup w
+                                        // `DetailedMetrics::Completion`. Routing layer
+                                        // (apply_include_usage_split) decyduje czy
+                                        // przepuścić to pole na wire (gdy klient
+                                        // poprosił `stream_options.include_usage=true`)
+                                        // czy stripować je back-compat default.
+                                        let usage =
+                                            extract_completion_usage(final_metrics.as_ref());
                                         Some(Ok(ChatCompletionChunk {
                                             id: chat_id,
                                             object: "chat.completion.chunk".to_string(),
@@ -469,6 +479,7 @@ impl ModelRuntimeExecutor {
                                             transcribed_text: None,
                                             speaker_id: None,
                                             speaker_name: None,
+                                            usage,
                                         }))
                                     }
                                     _ => None,
@@ -490,9 +501,10 @@ impl ModelRuntimeExecutor {
                 ctx.enter_hop().map_err(|e| {
                     ExecutorError::Internal(format!("mesh forward stream hop limit: {}", e))
                 })?;
-                let mesh = self.mesh_manager.read().clone().ok_or_else(|| {
-                    ExecutorError::TransportPendingCutover("mesh_forward_stream")
-                })?;
+                let mesh =
+                    self.mesh_manager.read().clone().ok_or_else(|| {
+                        ExecutorError::TransportPendingCutover("mesh_forward_stream")
+                    })?;
                 let protocol_messages =
                     crate::routing::openai_messages_to_protocol(&request.messages);
                 let request_id = uuid::Uuid::new_v4().to_string();
@@ -531,42 +543,36 @@ impl ModelRuntimeExecutor {
                     .forward_stream_request(node_id, &request_id, payload)
                     .await
                     .map_err(|e| {
-                        ExecutorError::Internal(format!(
-                            "mesh forward stream request: {}",
-                            e
-                        ))
+                        ExecutorError::Internal(format!("mesh forward stream request: {}", e))
                     })?;
                 let backend_url = format!("mesh://{}", node_id);
                 let protocol_stream = frame_stream.map(move |frame_result| {
-                    let frame = frame_result.map_err(|e| {
-                        crate::error::CoreError::NetworkError {
+                    let frame =
+                        frame_result.map_err(|e| crate::error::CoreError::NetworkError {
                             message: format!("mesh stream read: {}", e),
                             source: e,
-                        }
-                    })?;
-                    let archived = rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(
-                        &frame,
-                    )
-                    .map_err(|e| crate::error::CoreError::BackendError {
-                        backend_url: backend_url.clone(),
-                        message: format!("mesh stream access ModelStreamChunk: {}", e),
-                        source: None,
-                    })?;
+                        })?;
+                    let archived =
+                        rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(&frame)
+                            .map_err(|e| crate::error::CoreError::BackendError {
+                                backend_url: backend_url.clone(),
+                                message: format!("mesh stream access ModelStreamChunk: {}", e),
+                                source: None,
+                            })?;
                     rkyv::deserialize::<ModelStreamChunk, rkyv::rancor::Error>(archived).map_err(
                         |e| crate::error::CoreError::BackendError {
                             backend_url: backend_url.clone(),
-                            message: format!(
-                                "mesh stream deserialize ModelStreamChunk: {}",
-                                e
-                            ),
+                            message: format!("mesh stream deserialize ModelStreamChunk: {}", e),
                             source: None,
                         },
                     )
                 });
-                Ok(crate::routing::stream_helpers::quic_stream_to_openai_chunks(
-                    protocol_stream,
-                    target_model,
-                ))
+                Ok(
+                    crate::routing::stream_helpers::quic_stream_to_openai_chunks(
+                        protocol_stream,
+                        target_model,
+                    ),
+                )
             }
             ResolvedExecutionTarget::Flow { .. } => {
                 Err(ExecutorError::TransportPendingCutover("flow_stream"))
@@ -602,7 +608,11 @@ impl ModelRuntimeExecutor {
         // Required modality slice — slot-allocate to keep the lifetime
         // bound to the request. Empty when only text in / text out.
         let inputs: &'a [InputModality] = match (needs_audio, needs_image) {
-            (true, true) => &[InputModality::Audio, InputModality::Image, InputModality::Text],
+            (true, true) => &[
+                InputModality::Audio,
+                InputModality::Image,
+                InputModality::Text,
+            ],
             (true, false) => &[InputModality::Audio, InputModality::Text],
             (false, true) => &[InputModality::Image, InputModality::Text],
             (false, false) => &[],
@@ -667,9 +677,7 @@ impl ModelRuntimeExecutor {
                     .chat_completion(request)
                     .await
                     .map_err(|e| ExecutorError::Internal(e.to_string())),
-                BackendHandle::Quic(handle) => {
-                    Self::dispatch_chat_quic(handle, request).await
-                }
+                BackendHandle::Quic(handle) => Self::dispatch_chat_quic(handle, request).await,
             },
             ResolvedExecutionTarget::MeshForward {
                 node_id,
@@ -701,9 +709,7 @@ impl ModelRuntimeExecutor {
                     metadata: None,
                     session_id: None,
                 };
-                let response = self
-                    .forward_via_mesh(node_id, model_request, ctx)
-                    .await?;
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
                 match response.result {
                     ModelResult::Completion(completion) => Ok(ChatCompletionResponse {
                         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -758,15 +764,14 @@ impl ModelRuntimeExecutor {
             }
             ResolvedExecutionTarget::Flow {
                 flow_id,
-                published_name,
+                published_name: _,
             } => {
                 let dispatcher = self
                     .flow_dispatcher
                     .as_ref()
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
-                ctx.enter_flow(*flow_id).map_err(|e| {
-                    ExecutorError::Internal(format!("flow recursion limit: {}", e))
-                })?;
+                ctx.enter_flow(*flow_id)
+                    .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
 
                 // Pair `enter_flow` with `leave_flow` on every exit path
                 // — a dispatcher failure must not leave the recursion
@@ -782,21 +787,22 @@ impl ModelRuntimeExecutor {
                 // that is not the one this branch picked.
                 let dispatch_result = {
                     let user = ctx.user.clone();
-                    let flow_ctx = crate::routing::build_flow_context_for_user(
-                        &request, false, user,
-                    );
-                    dispatcher.dispatch_by_flow_id(*flow_id, flow_ctx).await
+                    let blobs = dispatcher.blobs();
+                    let (initial, meta) =
+                        crate::routing::build_initial_envelope_for_user(&request, user, &blobs)
+                            .await
+                            .map_err(|e| ExecutorError::Internal(format!("envelope seed: {e}")))?;
+                    dispatcher
+                        .dispatch_by_flow_id(*flow_id, initial, meta)
+                        .await
                 };
                 ctx.leave_flow();
 
-                let result = dispatch_result
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?
-                    .ok_or_else(|| ExecutorError::FlowEmptyResult {
-                        model: published_name.clone(),
-                    })?;
+                let outcome =
+                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
 
-                Ok(crate::routing::chat::flow_result_to_chat_response(
-                    result,
+                Ok(crate::routing::chat::flow_outcome_to_chat_response(
+                    outcome,
                     &request.model,
                 ))
             }
@@ -818,13 +824,14 @@ impl ModelRuntimeExecutor {
     ) -> Result<tentaflow_protocol::ModelResponse, ExecutorError> {
         use tentaflow_protocol::*;
 
-        ctx.enter_hop().map_err(|e| {
-            ExecutorError::Internal(format!("mesh forward hop limit: {}", e))
-        })?;
+        ctx.enter_hop()
+            .map_err(|e| ExecutorError::Internal(format!("mesh forward hop limit: {}", e)))?;
 
-        let mesh = self.mesh_manager.read().clone().ok_or_else(|| {
-            ExecutorError::TransportPendingCutover("mesh_forward")
-        })?;
+        let mesh = self
+            .mesh_manager
+            .read()
+            .clone()
+            .ok_or_else(|| ExecutorError::TransportPendingCutover("mesh_forward"))?;
 
         // Codex R3b.7 H1 (defense in depth): re-verify trust on the
         // executor side too. Underlying transport already checks but a
@@ -852,20 +859,16 @@ impl ModelRuntimeExecutor {
 
         let request_id = model_request.request_id.clone();
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
-            .map_err(|e| {
-                ExecutorError::Internal(format!("mesh forward serialize: {}", e))
-            })?
+            .map_err(|e| ExecutorError::Internal(format!("mesh forward serialize: {}", e)))?
             .into_vec();
         let response_bytes = mesh
             .forward_request(target_node_id, &request_id, payload)
             .await
             .map_err(|e| ExecutorError::Internal(format!("mesh forward request: {}", e)))?;
-        let archived = rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(
-            &response_bytes,
-        )
-        .map_err(|e| {
-            ExecutorError::Internal(format!("mesh forward access ModelResponse: {}", e))
-        })?;
+        let archived = rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(&response_bytes)
+            .map_err(|e| {
+                ExecutorError::Internal(format!("mesh forward access ModelResponse: {}", e))
+            })?;
         rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived).map_err(|e| {
             ExecutorError::Internal(format!("mesh forward deserialize ModelResponse: {}", e))
         })
@@ -875,8 +878,8 @@ impl ModelRuntimeExecutor {
     /// `TransportPendingCutover`; teraz buduje `ModelRequest::Completion`,
     /// wysyla przez `Arc<QuicClient>` z handle'u, mapuje response na
     /// `ChatCompletionResponse`. Logika lustro `chat.rs::route_to_quic_llm`
-    /// bez aplikacji `response_middleware` — to robi caller (api handler /
-    /// chat.rs) zeby executor pozostal middleware-agnostic.
+    /// — PII cleaning idzie przez flow_engine `pii_filter` node, executor
+    /// pozostaje agnostic.
     async fn dispatch_chat_quic(
         handle: &Arc<crate::services::runtime::quic_handle::QuicServiceHandle>,
         request: ChatCompletionRequest,
@@ -891,8 +894,7 @@ impl ModelRuntimeExecutor {
             ))
         })?;
 
-        let protocol_messages =
-            crate::routing::openai_messages_to_protocol(&request.messages);
+        let protocol_messages = crate::routing::openai_messages_to_protocol(&request.messages);
         let request_id = uuid::Uuid::new_v4().to_string();
         let model_request = ModelRequest {
             request_id: request_id.clone(),
@@ -971,14 +973,6 @@ impl ModelRuntimeExecutor {
                 "QUIC LLM returned unexpected result type".to_string(),
             )),
         }
-    }
-
-    /// Public accessor for the configured middleware factory list. The
-    /// streaming entry points walk this list and call `start_session`
-    /// per request to materialise an isolated stack — never share the
-    /// returned `Vec` itself across streams.
-    pub fn middleware_factories(&self) -> &[Arc<dyn StreamMiddlewareFactory>] {
-        &self.middleware
     }
 
     // =========================================================================
@@ -1185,9 +1179,7 @@ impl ModelRuntimeExecutor {
                     metadata: None,
                     session_id: None,
                 };
-                let response = self
-                    .forward_via_mesh(node_id, model_request, ctx)
-                    .await?;
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
                 match response.result {
                     ModelResult::Embeddings(result) => {
                         // Codex R3b.7 M2: cardinality guard. Peer that
@@ -1234,7 +1226,7 @@ impl ModelRuntimeExecutor {
             }
             ResolvedExecutionTarget::Flow {
                 flow_id,
-                published_name,
+                published_name: _,
             } => {
                 // Catalog can advertise embedding-surface flows
                 // (`EmbeddingsNodeAdapter` is registered) so this branch must
@@ -1247,27 +1239,24 @@ impl ModelRuntimeExecutor {
                     .flow_dispatcher
                     .as_ref()
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
-                ctx.enter_flow(*flow_id).map_err(|e| {
-                    ExecutorError::Internal(format!("flow recursion limit: {}", e))
-                })?;
+                ctx.enter_flow(*flow_id)
+                    .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
                 // Codex R3b.1 round 2 H1: propagate user → flow ACL gate.
                 // Without this `dispatch_by_flow_id` sees `user_id = None`
                 // and skips the per-flow ACL check.
-                let flow_ctx = embeddings_request_to_flow_ctx(&request, ctx.user.clone());
+                let (initial, meta) =
+                    embeddings_request_to_initial_envelope(&request, ctx.user.clone());
                 let dispatch_result = dispatcher
-                    .dispatch_by_flow_id(*flow_id, flow_ctx)
+                    .dispatch_by_flow_id(*flow_id, initial, meta)
                     .await;
                 ctx.leave_flow();
-                let result = dispatch_result
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?
-                    .ok_or_else(|| ExecutorError::FlowEmptyResult {
-                        model: published_name.clone(),
-                    })?;
+                let outcome =
+                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
                 let expected_count = match &request.input {
                     EmbeddingInput::Single(_) => 1,
                     EmbeddingInput::Multiple(texts) => texts.len(),
                 };
-                flow_result_to_embedding_response(result, &request, expected_count)
+                flow_outcome_to_embedding_response(outcome, &request, expected_count)
             }
         }
     }
@@ -1400,8 +1389,8 @@ impl ModelRuntimeExecutor {
                     let model_name_owned = model_name.clone();
                     let text = request.input.clone();
                     let speed = request.speed.unwrap_or(1.0);
-                    let res = tokio::task::spawn_blocking(
-                        move || -> anyhow::Result<(Vec<f32>, u32)> {
+                    let res =
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, u32)> {
                             let mgr = crate::tts::shared_tts_manager();
                             let guard = mgr.blocking_read();
                             // Some embedded engines (apple-tts) honour
@@ -1419,11 +1408,10 @@ impl ModelRuntimeExecutor {
                                 },
                             )?;
                             Ok((out.samples, out.sample_rate))
-                        },
-                    )
-                    .await
-                    .map_err(|e| ExecutorError::Internal(format!("embedded TTS join: {e}")))?
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                        })
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("embedded TTS join: {e}")))?
+                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
                     let (samples, sr) = res;
                     Ok(TtsExecutionResult {
                         bytes: samples_to_wav_pcm16(&samples, sr),
@@ -1448,7 +1436,10 @@ impl ModelRuntimeExecutor {
                             handle.config.name
                         ))
                     })?;
-                    let format = request.response_format.clone().unwrap_or_else(|| "wav".into());
+                    let format = request
+                        .response_format
+                        .clone()
+                        .unwrap_or_else(|| "wav".into());
                     let speed = request.speed.unwrap_or(1.0);
                     let model_request = ModelRequest {
                         request_id: uuid::Uuid::new_v4().to_string(),
@@ -1494,7 +1485,10 @@ impl ModelRuntimeExecutor {
                 model_name,
                 ..
             } => {
-                let format = request.response_format.clone().unwrap_or_else(|| "wav".into());
+                let format = request
+                    .response_format
+                    .clone()
+                    .unwrap_or_else(|| "wav".into());
                 let model_request = ModelRequest {
                     request_id: uuid::Uuid::new_v4().to_string(),
                     payload: ModelPayload::Audio(AudioPayload {
@@ -1511,14 +1505,10 @@ impl ModelRuntimeExecutor {
                     metadata: None,
                     session_id: None,
                 };
-                let response = self
-                    .forward_via_mesh(node_id, model_request, ctx)
-                    .await?;
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
                 match response.result {
                     ModelResult::Audio(audio_result) => match audio_result.data {
-                        AudioResultData::Audio(bytes) => {
-                            Ok(TtsExecutionResult { bytes, format })
-                        }
+                        AudioResultData::Audio(bytes) => Ok(TtsExecutionResult { bytes, format }),
                         _ => Err(ExecutorError::Internal(
                             "mesh TTS returned non-audio result".into(),
                         )),
@@ -1532,9 +1522,22 @@ impl ModelRuntimeExecutor {
                     )),
                 }
             }
-            ResolvedExecutionTarget::Flow { .. } => Err(ExecutorError::Internal(
-                "TTS via flow not supported yet".into(),
-            )),
+            ResolvedExecutionTarget::Flow { flow_id, .. } => {
+                let dispatcher = self
+                    .flow_dispatcher
+                    .as_ref()
+                    .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
+                ctx.enter_flow(*flow_id)
+                    .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {e}")))?;
+                let (initial, meta) = tts_request_to_initial_envelope(&request, ctx.user.clone());
+                let dispatch_result = dispatcher
+                    .dispatch_by_flow_id(*flow_id, initial, meta)
+                    .await;
+                ctx.leave_flow();
+                let outcome =
+                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                flow_outcome_to_tts_result(outcome, dispatcher.blobs()).await
+            }
         }
     }
 
@@ -1562,9 +1565,11 @@ impl ModelRuntimeExecutor {
         request: TranscriptionRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<TranscriptionResponse, ExecutorError> {
-        let runtime = self.stt_runtime.read().clone().ok_or_else(|| {
-            ExecutorError::SttRuntimeUnavailable
-        })?;
+        let runtime = self
+            .stt_runtime
+            .read()
+            .clone()
+            .ok_or_else(|| ExecutorError::SttRuntimeUnavailable)?;
 
         // Pusty model = bezposredni fallback do default local whisper
         // (handler `/v1/audio/transcriptions` bez `model` field — legacy
@@ -1581,7 +1586,9 @@ impl ModelRuntimeExecutor {
         let outcome = match self.resolver.resolve(&req, &snapshot, ctx) {
             Ok(o) => o,
             Err(crate::services::runtime::resolver::ResolveError::UnknownModel(_))
-            | Err(crate::services::runtime::resolver::ResolveError::CapabilityUnsupported { .. }) => {
+            | Err(crate::services::runtime::resolver::ResolveError::CapabilityUnsupported {
+                ..
+            }) => {
                 // Legacy single-node bez catalog STT entries: client wysyla
                 // `model="whisper-1"` (default), katalog nie ma takiego
                 // wpisu — fallback do default local whisper zamiast hard
@@ -1684,118 +1691,319 @@ fn samples_to_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-/// Build a `FlowContext` for an embeddings request. Propagates `user_id` /
-/// `user_role` from the executor context so the dispatcher's per-flow ACL
-/// fires identically to chat dispatch.
-fn embeddings_request_to_flow_ctx(
+/// Buduje seed envelope + per-request meta dla embeddings flow path.
+/// Dla `EmbeddingInput::Multiple` payload zostaje pierwszym tekstem
+/// (single-input fallback dla legacy adapterów), a pełna lista trafia do
+/// `envelope.meta["embeddings_inputs"]` jako JSON array. EmbeddingsNodeAdapter
+/// preferuje meta gdy istnieje (multi-input batch), w przeciwnym wypadku
+/// używa payload (single).
+pub(crate) fn embeddings_request_to_initial_envelope(
     request: &EmbeddingRequest,
     user: Option<crate::auth::acl::UserContext>,
-) -> crate::flow_engine::types::FlowContext {
-    let input_text = match &request.input {
-        EmbeddingInput::Single(text) => text.clone(),
-        EmbeddingInput::Multiple(texts) => texts.join("\n"),
-    };
-    let mut ctx = crate::flow_engine::types::FlowContext {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        model: request.model.clone(),
-        input: input_text,
-        stream: false,
-        service_type: "embeddings".to_string(),
-        original_request: serde_json::to_value(request).ok(),
-        ..Default::default()
-    };
-    if let Some(u) = user {
-        ctx.user_id = Some(u.user_id);
-        ctx.user_role = Some(u.role);
+) -> (
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+) {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let mut env = FlowEnvelope::empty();
+    match &request.input {
+        EmbeddingInput::Single(text) => {
+            env.payload = FlowValue::Text(text.clone());
+        }
+        EmbeddingInput::Multiple(texts) => {
+            // Pierwszy tekst zostaje na payload jako fallback dla adapterów
+            // które zostały na single-input contract; pełna lista w meta.
+            env.payload = FlowValue::Text(texts.first().cloned().unwrap_or_default());
+            env.meta.insert(
+                "embeddings_inputs".into(),
+                serde_json::Value::Array(
+                    texts
+                        .iter()
+                        .map(|t| serde_json::Value::String(t.clone()))
+                        .collect(),
+                ),
+            );
+        }
     }
-    ctx
+    env.meta.insert(
+        "embeddings_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    if let Some(d) = request.dimensions {
+        env.meta
+            .insert("dimensions".into(), serde_json::Value::Number(d.into()));
+    }
+    if let Some(fmt) = &request.encoding_format {
+        env.meta.insert(
+            "encoding_format".into(),
+            serde_json::Value::String(fmt.clone()),
+        );
+    }
+
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    (env, meta)
 }
 
-/// Convert a flow's terminal output into an `EmbeddingResponse`. Flow author
-/// is expected to surface either `Vec<f32>` (single input) or `Vec<Vec<f32>>`
-/// (batched) under the `embedding`/`embeddings` key. Cardinality is checked
-/// against `expected_count` so a batched request that comes back with one
-/// vector is rejected — silent collapse would let a flow misconfig hide
-/// behind an OK response.
-fn flow_result_to_embedding_response(
-    result: crate::flow_engine::types::FlowExecutionResult,
+/// Buduje seed envelope + meta dla TTS-as-flow path. `voice` / `format` /
+/// `language` lądują w `envelope.meta`, `TtsNodeAdapter::pick_optional_str`
+/// czyta je z fallback `node.config -> envelope.meta`. Operator może
+/// override'ować przez node config; brak override = użyj wartości z requestu.
+pub(crate) fn tts_request_to_initial_envelope(
+    request: &TTSRequest,
+    user: Option<crate::auth::acl::UserContext>,
+) -> (
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+) {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let mut env = FlowEnvelope::empty();
+    env.payload = FlowValue::Text(request.input.clone());
+    env.meta.insert(
+        "tts_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    env.meta.insert(
+        "voice".into(),
+        serde_json::Value::String(request.voice.clone()),
+    );
+    if let Some(fmt) = &request.response_format {
+        env.meta
+            .insert("format".into(), serde_json::Value::String(fmt.clone()));
+    }
+    if let Some(lang) = &request.language {
+        env.meta
+            .insert("language".into(), serde_json::Value::String(lang.clone()));
+    }
+    if let Some(spd) = request.speed {
+        if let Some(num) = serde_json::Number::from_f64(spd as f64) {
+            env.meta
+                .insert("speed".into(), serde_json::Value::Number(num));
+        }
+    }
+
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    (env, meta)
+}
+
+/// Konwertuje FlowExecutionOutcome (z TTS-as-flow) na `TtsExecutionResult`.
+/// Output flow musi mieć `payload = FlowValue::Audio { blob_ref, mime, .. }`;
+/// w przeciwnym wypadku zwracamy Internal — runtime check ostatniej deski
+/// ratunku, bo R8 walidacja sama nie wymusza Audio-on-output (`output` adapter
+/// ma `input_port_type = Any`).
+pub(crate) async fn flow_outcome_to_tts_result(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+    blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> Result<TtsExecutionResult, ExecutorError> {
+    use crate::flow_engine::envelope::FlowValue;
+    match outcome.final_envelope.payload {
+        FlowValue::Audio { blob_ref, mime, .. } => {
+            let bytes = blobs
+                .get(&blob_ref)
+                .await
+                .map_err(|e| ExecutorError::Internal(format!("tts flow blob read: {e}")))?;
+            let format = tts_mime_to_format(&mime)?;
+            Ok(TtsExecutionResult { bytes, format })
+        }
+        other => Err(ExecutorError::Internal(format!(
+            "tts flow returned non-Audio payload kind: {}",
+            other.kind()
+        ))),
+    }
+}
+
+fn tts_mime_to_format(mime: &str) -> Result<String, ExecutorError> {
+    let format = match mime {
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/opus" => "opus",
+        "audio/aac" => "aac",
+        "audio/flac" => "flac",
+        "audio/ogg" => "ogg",
+        other => {
+            return Err(ExecutorError::Internal(format!(
+                "tts flow output mime '{other}' nie ma mapowania format — \
+                 dodaj entry w tts_mime_to_format albo popraw flow"
+            )));
+        }
+    };
+    Ok(format.to_string())
+}
+
+/// Konwertuje FlowExecutionOutcome na EmbeddingResponse z walidacją
+/// cardinality (batch flow z jednym wektorem dla wielu inputów to misconfig).
+pub(crate) fn flow_outcome_to_embedding_response(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
     request: &EmbeddingRequest,
     expected_count: usize,
 ) -> Result<EmbeddingResponse, ExecutorError> {
-    let extract = |v: &serde_json::Value| -> Option<Vec<Vec<f32>>> {
-        // Try [[f32]] first, then [f32] wrapped in a single batch. Reject
-        // any non-finite floats — NaN/Inf vectors break downstream cosine
-        // similarity and other consumers without a clear error.
-        let parse_finite = |n: &serde_json::Value| -> Option<f32> {
-            let f = n.as_f64()? as f32;
-            if f.is_finite() {
-                Some(f)
-            } else {
-                None
-            }
-        };
-        if let Some(arr) = v.as_array() {
-            if arr.iter().all(|x| x.is_array()) {
-                let mut out = Vec::with_capacity(arr.len());
-                for row in arr {
-                    let inner = row.as_array()?;
-                    let mut floats = Vec::with_capacity(inner.len());
-                    for n in inner {
-                        floats.push(parse_finite(n)?);
-                    }
-                    out.push(floats);
-                }
-                return Some(out);
-            }
-            if arr.iter().all(|x| x.is_number()) {
-                let mut floats = Vec::with_capacity(arr.len());
-                for n in arr {
-                    floats.push(parse_finite(n)?);
-                }
-                return Some(vec![floats]);
-            }
-        }
-        None
-    };
-    let embeddings = result
-        .output
-        .get("embedding")
-        .and_then(extract)
-        .or_else(|| result.output.get("embeddings").and_then(extract))
-        .ok_or_else(|| {
-            ExecutorError::Internal(
-                "flow output missing `embedding`/`embeddings` field with vector payload".into(),
-            )
-        })?;
-
-    if embeddings.len() != expected_count {
+    let response =
+        crate::flow_engine::converter::flow_outcome_to_embedding_response(&outcome, &request.model)
+            .map_err(|e| ExecutorError::Internal(format!("{e}")))?;
+    if response.data.len() != expected_count {
         return Err(ExecutorError::Internal(format!(
             "flow returned {} embedding(s) for {} input(s) — cardinality mismatch",
-            embeddings.len(),
+            response.data.len(),
             expected_count
         )));
     }
+    Ok(response)
+}
 
-    let data = embeddings
-        .into_iter()
-        .enumerate()
-        .map(|(idx, embedding)| EmbeddingData {
-            object: "embedding".to_string(),
-            index: idx as u32,
-            embedding,
-        })
-        .collect();
-    let prompt_tokens = result.prompt_tokens.max(0) as u32;
-    let total_tokens = result.total_tokens.max(prompt_tokens as i64) as u32;
-    Ok(EmbeddingResponse {
-        object: "list".to_string(),
-        data,
-        model: request.model.clone(),
-        usage: EmbeddingUsage {
-            prompt_tokens,
-            total_tokens,
-        },
+/// Stage 3d-0b-4: buduje seed envelope + meta dla STT-as-flow path.
+/// Audio bytes lądują w BlobStore (sentinel BlobRef zostaje na payload),
+/// adapter STT pobiera bytes z `ctx.blobs.get(&blob_ref)` w execute().
+/// Pola `language` / `prompt` / `temperature` lądują w `envelope.meta` —
+/// adapter może je czytać z fallback `node.config -> envelope.meta`.
+pub(crate) async fn stt_request_to_initial_envelope(
+    request: &TranscriptionRequest,
+    user: Option<crate::auth::acl::UserContext>,
+    blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> anyhow::Result<(
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+)> {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let mime = mime_for_filename(&request.filename);
+    let bytes_vec = request.file.to_vec();
+    let blob_ref = blobs
+        .put(bytes_vec, &mime)
+        .await
+        .map_err(|e| anyhow::anyhow!("STT blob put: {e}"))?;
+    let mut env = FlowEnvelope::empty();
+    env.payload = FlowValue::Audio {
+        blob_ref,
+        mime,
+        sample_rate: None,
+    };
+    env.meta.insert(
+        "stt_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    if let Some(lang) = &request.language {
+        env.meta
+            .insert("language".into(), serde_json::Value::String(lang.clone()));
+    }
+    if let Some(prompt) = &request.prompt {
+        env.meta
+            .insert("prompt".into(), serde_json::Value::String(prompt.clone()));
+    }
+    if let Some(temp) = request.temperature {
+        if let Some(num) = serde_json::Number::from_f64(temp as f64) {
+            env.meta
+                .insert("temperature".into(), serde_json::Value::Number(num));
+        }
+    }
+    if let Some(fmt) = &request.response_format {
+        env.meta.insert(
+            "response_format".into(),
+            serde_json::Value::String(fmt.clone()),
+        );
+    }
+
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    Ok((env, meta))
+}
+
+fn mime_for_filename(filename: &str) -> String {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "wav" => "audio/wav".to_string(),
+        "mp3" => "audio/mpeg".to_string(),
+        "ogg" => "audio/ogg".to_string(),
+        "flac" => "audio/flac".to_string(),
+        "webm" => "audio/webm".to_string(),
+        "m4a" | "mp4" => "audio/mp4".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+/// Stage 3d-0b-4: konwertuje FlowExecutionOutcome na TranscriptionResponse.
+/// STT flow output to FlowValue::Text (transcript) z verbose polami w
+/// envelope.meta (segments / duration / speakers / detected_language) —
+/// SttNodeAdapter zapisuje je gdy backend zwrócił verbose_json.
+pub(crate) fn flow_outcome_to_stt_response(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+) -> Result<TranscriptionResponse, ExecutorError> {
+    use crate::flow_engine::envelope::FlowValue;
+    let envelope = outcome.final_envelope;
+    let text = match envelope.payload {
+        FlowValue::Text(t) => t,
+        FlowValue::Empty => String::new(),
+        other => {
+            return Err(ExecutorError::Internal(format!(
+                "stt flow returned non-Text payload kind: {}",
+                other.kind()
+            )));
+        }
+    };
+    let language = envelope
+        .meta
+        .get("detected_language")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let duration = envelope
+        .meta
+        .get("duration")
+        .and_then(|v| v.as_f64())
+        .map(|n| n as f32);
+    let segments = envelope
+        .meta
+        .get("segments")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let speakers = envelope
+        .meta
+        .get("speakers")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    Ok(TranscriptionResponse {
+        text,
+        task: None,
+        language,
+        duration,
+        segments,
+        speakers,
     })
+}
+
+/// Etap 3a: extract token usage z `ModelMetrics.detailed` gdy backend dostarczył
+/// `DetailedMetrics::Completion`. Inny wariant (np. Embeddings dla embeddings
+/// stream'a) lub brak `final_metrics` zwraca `None` — chunk wtedy bez `usage`,
+/// klient z `include_usage=true` widzi brak (warn'em wpisany w
+/// `apply_include_usage_split`).
+fn extract_completion_usage(
+    metrics: Option<&tentaflow_protocol::ModelMetrics>,
+) -> Option<crate::api::openai::types::Usage> {
+    use tentaflow_protocol::DetailedMetrics;
+    match metrics?.detailed.as_ref()? {
+        DetailedMetrics::Completion {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => Some(crate::api::openai::types::Usage {
+            prompt_tokens: *prompt_tokens,
+            completion_tokens: *completion_tokens,
+            total_tokens: *total_tokens,
+        }),
+        _ => None,
+    }
 }
 
 fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {
@@ -1832,21 +2040,14 @@ mod tests {
         // Codex R3b.5+6 M2: SttRuntimeUnavailable is the **only** STT
         // failure where the caller may try the legacy path.
         assert!(ExecutorError::SttRuntimeUnavailable.aborts_fallback_chain());
-        assert!(
-            !ExecutorError::AllCandidatesFailed {
-                target_kind: "x",
-                attempts: 1,
-                last_error: "y".into(),
-            }
-            .aborts_fallback_chain()
-        );
-        assert!(
-            !ExecutorError::Internal("z".into()).aborts_fallback_chain()
-        );
-        assert!(
-            !ExecutorError::FlowEmptyResult { model: "m".into() }
-                .aborts_fallback_chain()
-        );
+        assert!(!ExecutorError::AllCandidatesFailed {
+            target_kind: "x",
+            attempts: 1,
+            last_error: "y".into(),
+        }
+        .aborts_fallback_chain());
+        assert!(!ExecutorError::Internal("z".into()).aborts_fallback_chain());
+        assert!(!ExecutorError::FlowEmptyResult { model: "m".into() }.aborts_fallback_chain());
     }
 
     // R3b.1: `dispatch_embeddings_blocking` per-target tests. Branches without
@@ -1872,11 +2073,9 @@ mod tests {
             handles,
             "local-node".to_string(),
         ));
-        let local_inference = Arc::new(
-            crate::inference::local::LocalInferenceHandler::new(
-                crate::inference::shared_inference_manager(),
-            ),
-        );
+        let local_inference = Arc::new(crate::inference::local::LocalInferenceHandler::new(
+            crate::inference::shared_inference_manager(),
+        ));
         let stt_slot = Arc::new(parking_lot::RwLock::new(None));
         let mesh_slot = Arc::new(parking_lot::RwLock::new(None));
         ModelRuntimeExecutor::new(
@@ -1886,7 +2085,6 @@ mod tests {
             local_inference,
             stt_slot,
             mesh_slot,
-            Vec::new(),
         )
     }
 
@@ -1898,7 +2096,8 @@ mod tests {
     #[tokio::test]
     async fn embeddings_embedded_routes_through_local_inference() {
         let exec = dummy_executor();
-        let target = ResolvedExecutionTarget::Local { service_id: 1,
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 1,
             model_name: "qwen-emb".into(),
             handle: BackendHandle::Embedded {
                 model_name: "qwen-emb".into(),
@@ -1951,67 +2150,65 @@ mod tests {
         assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
     }
 
-    /// `flow_result_to_embedding_response` accepts both shapes the catalog
-    /// promises a flow can emit: a single `[f32]` (one input, single vector)
-    /// and a `[[f32]]` batch.
-    fn flow_result(output: serde_json::Value) -> crate::flow_engine::types::FlowExecutionResult {
-        crate::flow_engine::types::FlowExecutionResult {
-            status: "ok".into(),
-            output,
-            execution_log: vec![],
+    fn outcome_with_payload(
+        payload: crate::flow_engine::envelope::FlowValue,
+    ) -> crate::flow_engine::envelope::FlowExecutionOutcome {
+        let mut env = crate::flow_engine::envelope::FlowEnvelope::empty();
+        env.payload = payload;
+        crate::flow_engine::envelope::FlowExecutionOutcome {
+            final_envelope: env,
+            trace: vec![],
+            usage: crate::flow_engine::envelope::TokenUsage::default(),
+            finish_reason: crate::flow_engine::envelope::FinishReason::Stop,
             total_latency_ms: 0,
-            total_tokens: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            error: None,
         }
     }
 
     fn batch_request(model: &str, count: usize) -> EmbeddingRequest {
         EmbeddingRequest {
             model: model.to_string(),
-            input: EmbeddingInput::Multiple(
-                (0..count).map(|i| format!("text-{i}")).collect(),
-            ),
+            input: EmbeddingInput::Multiple((0..count).map(|i| format!("text-{i}")).collect()),
             encoding_format: None,
             dimensions: None,
             user: None,
         }
     }
 
+    /// Single-vector outcome trafia do `data[0]` z `index=0`.
     #[test]
-    fn flow_result_extracts_single_embedding_for_single_input() {
+    fn flow_outcome_extracts_single_embedding_for_single_input() {
         let request = make_request("any");
-        let single = flow_result(serde_json::json!({ "embedding": [0.1, 0.2, 0.3] }));
-        let resp = flow_result_to_embedding_response(single, &request, 1).expect("single ok");
+        let outcome =
+            outcome_with_payload(crate::flow_engine::envelope::FlowValue::Embedding(vec![
+                0.1, 0.2, 0.3,
+            ]));
+        let resp = flow_outcome_to_embedding_response(outcome, &request, 1).expect("single ok");
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].embedding.len(), 3);
     }
 
+    /// Batch JSON `{ "embeddings": [[..],[..]] }` mapuje na `data[]` z
+    /// `index` 0..n.
     #[test]
-    fn flow_result_extracts_batched_embeddings_for_batched_input() {
+    fn flow_outcome_extracts_batched_embeddings_for_batched_input() {
         let request = batch_request("any", 2);
-        let batched = flow_result(serde_json::json!({ "embeddings": [[0.1], [0.2]] }));
-        let resp = flow_result_to_embedding_response(batched, &request, 2).expect("batched ok");
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Json(
+            serde_json::json!({ "embeddings": [[0.1], [0.2]] }),
+        ));
+        let resp = flow_outcome_to_embedding_response(outcome, &request, 2).expect("batched ok");
         assert_eq!(resp.data.len(), 2);
     }
 
+    /// Cardinality mismatch (1 wektor dla 3 inputów) zwraca Internal — silent
+    /// collapse byłby ukrytym misconfigiem flow.
     #[test]
-    fn flow_result_missing_field_returns_internal() {
-        let request = make_request("any");
-        let bad = flow_result(serde_json::json!({ "text": "no vectors here" }));
-        let err = flow_result_to_embedding_response(bad, &request, 1)
-            .expect_err("missing embedding field should reject");
-        assert!(matches!(err, ExecutorError::Internal(_)));
-    }
-
-    /// Codex R3b.1 round 2 M3: a batched request that comes back with a
-    /// single vector must be rejected — silent collapse would let a flow
-    /// misconfig hide behind an OK response.
-    #[test]
-    fn flow_result_cardinality_mismatch_returns_internal() {
+    fn flow_outcome_cardinality_mismatch_returns_internal() {
         let request = batch_request("any", 3);
-        let single_result = flow_result(serde_json::json!({ "embeddings": [[0.1]] }));
-        let err = flow_result_to_embedding_response(single_result, &request, 3)
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Json(
+            serde_json::json!({ "embeddings": [[0.1]] }),
+        ));
+        let err = flow_outcome_to_embedding_response(outcome, &request, 3)
             .expect_err("1 embedding for 3 inputs must reject");
         assert!(matches!(err, ExecutorError::Internal(_)));
     }
@@ -2046,8 +2243,11 @@ mod tests {
         ));
     }
 
+    /// Etap 2: TTS-as-flow path działa, ale dummy_executor nie ma
+    /// FlowDispatcher (Router::new go tworzy). Bez dispatchera dostajemy
+    /// `FlowDispatcherUnavailable`, nie `Internal('not supported')`.
     #[tokio::test]
-    async fn tts_flow_returns_internal() {
+    async fn tts_flow_without_dispatcher_returns_typed_error() {
         let exec = dummy_executor();
         let target = ResolvedExecutionTarget::Flow {
             flow_id: 1,
@@ -2057,11 +2257,8 @@ mod tests {
         let err = exec
             .dispatch_tts_blocking(&target, make_tts_request("any"), &mut ctx)
             .await
-            .expect_err("flow branch should not handle TTS");
-        match err {
-            ExecutorError::Internal(msg) => assert!(msg.to_lowercase().contains("flow")),
-            other => panic!("expected Internal, got {other:?}"),
-        }
+            .expect_err("flow without dispatcher should be a typed error");
+        assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
     }
 
     /// Codex R3b.5+6 L4: direct test for `execute_stt` when no SttRuntime
@@ -2113,15 +2310,13 @@ mod tests {
     /// NaN / Inf in embedding payload break downstream cosine similarity
     /// silently — reject at parse time so the operator sees a clear error.
     #[test]
-    fn flow_result_rejects_non_finite_floats() {
+    fn flow_outcome_rejects_non_numeric_batch_entries() {
         let request = make_request("any");
-        let bad = flow_result(serde_json::json!({ "embedding": [0.1, "NaN", 0.3] }));
-        // String "NaN" doesn't parse as number → extract returns None →
-        // missing-field error path. The finite check covers numeric NaN/Inf
-        // emitted by serde_json::Number with non-finite f64.
-        let err = flow_result_to_embedding_response(bad, &request, 1)
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Json(
+            serde_json::json!({ "embeddings": [[0.1, "NaN", 0.3]] }),
+        ));
+        let err = flow_outcome_to_embedding_response(outcome, &request, 1)
             .expect_err("non-numeric entry rejects");
         assert!(matches!(err, ExecutorError::Internal(_)));
     }
 }
-

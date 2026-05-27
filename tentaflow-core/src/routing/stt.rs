@@ -12,11 +12,13 @@ use crate::routing::router::Router;
 use tracing::{debug, error};
 
 impl Router {
-    /// Routuje audio transcription request do odpowiedniego backendu.
-    ///
-    /// Probuje QUIC STT (preferowany), potem fallback na HTTP backend.
-    /// Obsluguje zarowno prosty tekst jak i verbose_json z segmentami.
-    /// Wariant z user context — ACL gate przed wywolaniem backendu.
+    /// Routuje audio transcription request przez flow_engine (stage 3d
+    /// Universal Flow Gateway). Synthetic flow `trigger → stt(model) →
+    /// output` aktywuje się gdy admin nie skonfigurował user-defined flow.
+    /// Backend dispatch (embedded whisper.cpp / MLX, HTTP, QUIC) idzie
+    /// przez SttDispatcherImpl → executor.execute_stt. verbose_json
+    /// (segments/duration/speakers) propagowany przez envelope.meta.
+    /// Wariant z user context — ACL gate przed dispatch.
     pub async fn route_audio_transcription_for_user(
         &self,
         request: TranscriptionRequest,
@@ -39,61 +41,80 @@ impl Router {
                 }
             }
         }
-        // Delegate through the executor — single dispatch surface for all
-        // four routes (chat / embeddings / tts / stt). `execute_stt` is a
-        // thin wrapper over `SttRuntime` (D.3 single owner) so this path
-        // ends up in the same place as the legacy `Router.stt_runtime()`
-        // delegation; routing through the executor keeps the
-        // `routing/*` -> `services/runtime` -> backend layering uniform.
-        let executor_snapshot = self.executor.read().clone();
-        if let Some(executor) = executor_snapshot {
-            use crate::services::runtime::context::ExecutionContext;
-            use crate::services::runtime::executor::ExecutorError;
-            let mut exec_ctx = ExecutionContext {
-                user: user.clone(),
-                ..ExecutionContext::default()
-            };
-            match executor.execute_stt(request.clone(), &mut exec_ctx).await {
-                Ok(response) => {
-                    return Ok(crate::routing::RouteResult {
-                        response,
-                        metadata: crate::routing::RouteMetadata {
-                            served_by_node: hostname::get()
-                                .map(|h| h.to_string_lossy().to_string())
-                                .unwrap_or_else(|_| "unknown".to_string()),
-                            backend_type: "executor".to_string(),
-                            strategy_used: "executor".to_string(),
-                            fallbacks_tried: 0,
-                            hop_count: 0,
-                            latency_ms: None,
-                        },
-                    });
-                }
-                Err(ExecutorError::SttRuntimeUnavailable) => {
-                    // Codex R3b.5+6 H1: fall back ONLY for executor-not-ready;
-                    // real STT errors must surface so we don't re-dispatch
-                    // the same expensive transcription.
-                    tracing::debug!(
-                        "STT runtime not wired in executor, falling back to legacy route_audio_transcription"
-                    );
-                }
-                Err(ExecutorError::SttBackend(msg)) => {
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!("STT backend error: {}", msg),
-                        source: None,
+        // Stage 3d Universal Flow Gateway: STT path zawsze przez
+        // FlowDispatcher. Synthetic flow `trigger → stt(model) → output`
+        // aktywuje się gdy admin nie skonfigurował user-defined flow.
+        // Direct executor.execute_stt fallback wycięty w 3d-0b-final.
+        if let Some(ref dispatcher) = self.flow_dispatcher {
+            match crate::services::runtime::executor::stt_request_to_initial_envelope(
+                &request,
+                user.clone(),
+                dispatcher.blobs(),
+            )
+            .await
+            {
+                Ok((initial, meta)) => {
+                    match dispatcher
+                        .try_dispatch(&request.model, "stt", initial, meta)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            let response =
+                                crate::services::runtime::executor::flow_outcome_to_stt_response(
+                                    outcome,
+                                )
+                                .map_err(|e| {
+                                    crate::error::CoreError::InternalError {
+                                        message: format!("stt flow result: {e}"),
+                                        source: None,
+                                    }
+                                })?;
+                            return Ok(crate::routing::RouteResult {
+                                response,
+                                metadata: crate::routing::RouteMetadata {
+                                    served_by_node: hostname::get()
+                                        .map(|h| h.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| "unknown".to_string()),
+                                    backend_type: "flow_engine".to_string(),
+                                    strategy_used: "flow_dispatch".to_string(),
+                                    fallbacks_tried: 0,
+                                    hop_count: 0,
+                                    latency_ms: None,
+                                    usage: None,
+                                    finish_reason: None,
+                                },
+                            });
+                        }
+                        Err(e) => {
+                            return Err(
+                                crate::routing::dispatch_error_to_core(e, &request.model).into()
+                            );
+                        }
                     }
-                    .into());
                 }
-                Err(other) => {
+                Err(e) => {
+                    // Stage 3d-0b-final: envelope build error (np. blob put
+                    // failed) → 500. Brak fallback do executor direct.
                     return Err(crate::error::CoreError::InternalError {
-                        message: format!("executor.execute_stt: {}", other),
+                        message: format!("stt envelope build: {e}"),
                         source: None,
                     }
                     .into());
                 }
             }
         }
-        self.route_audio_transcription(request).await
+
+        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
+        // Direct executor.execute_stt fallback wycięty.
+        Err(crate::error::CoreError::InternalError {
+            message: format!(
+                "flow_dispatcher not wired for stt model '{}' — DB-less router \
+                 nie wspiera Universal Flow Gateway",
+                request.model
+            ),
+            source: None,
+        }
+        .into())
     }
 
     pub async fn route_audio_transcription(
@@ -120,7 +141,6 @@ impl Router {
         let _ = request;
         Err(crate::error::CoreError::AllBackendsUnavailable { model_name }.into())
     }
-
 
     /// Routuje audio request przez protocol-native interface.
     ///
@@ -155,7 +175,9 @@ impl Router {
                     language: language.clone(),
                 };
 
-                match self.synthesize_speech(&tts_request).await {
+                // route_audio_via_protocol jest wywoływane przez reverse-mesh
+                // path bez user context (internal caller, ACL fail-open).
+                match self.synthesize_speech(&tts_request, None).await {
                     Ok(tts_result) => {
                         let audio_bytes = tts_result.response.bytes;
                         let response = ModelResponse {
@@ -231,11 +253,14 @@ impl Router {
                     options: crate::api::openai::types::SttRequestOptions::default(),
                 };
 
-                // Codex R3b.5+6 M3: protocol-native STT goes through the
-                // same executor entry point as `/v1/audio/transcriptions`
-                // so the resolver / SttRuntime contract is uniform across
-                // mesh reverse and HTTP. `route_audio_transcription` is
-                // still hit as fallback for DB-less / executor-not-ready.
+                // EXEMPT-MESH-INBOUND (stage 3d v1.5): protocol-native STT
+                // dociera tu z `route_audio_via_protocol` — mesh peer
+                // forwarduje AudioOperation rkyv przez QUIC. Plan v1.5:
+                // mesh inbound = remote backend call (analogiczny do
+                // HTTP/QUIC service), flow żyje po stronie inicjatora,
+                // peer wykonuje direct executor żeby zachować ultra-low
+                // latency LAN budżet (1-5ms baseline). Jeden z 3 dozwolonych
+                // wyjątków (mesh chat + STT tutaj + embeddings via_quic).
                 let executor_snapshot = self.executor.read().clone();
                 let stt_dispatch = match executor_snapshot {
                     Some(executor) => {
@@ -254,6 +279,8 @@ impl Router {
                                     fallbacks_tried: 0,
                                     hop_count: 0,
                                     latency_ms: None,
+                                    usage: None,
+                                    finish_reason: None,
                                 },
                             }),
                             Err(ExecutorError::SttRuntimeUnavailable) => {

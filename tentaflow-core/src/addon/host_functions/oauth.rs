@@ -444,6 +444,7 @@ mod tests {
             addon_id: addon_id.to_string(),
             instance_id: "inst-1".to_string(),
             user_id,
+            org_id: None,
             db,
             permissions,
             event_bus: Arc::new(EventBus::new()),
@@ -456,6 +457,7 @@ mod tests {
             manifest: Arc::new(AddonManifest::default()),
             memory_limit: 64 * 1024 * 1024,
             router: None,
+            ui_panels: None,
             oauth_refresh_guard: Arc::new(
                 crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
             ),

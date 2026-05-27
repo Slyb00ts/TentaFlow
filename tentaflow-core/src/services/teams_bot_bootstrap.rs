@@ -55,7 +55,14 @@ fn ensure_alias(pool: &DbPool, alias: &str) -> Result<()> {
     // `create_or_reactivate_model_alias` robi atomicznie: jak istnieje (active
     // lub inactive) → reactivate (z chain-checkiem); inaczej → INSERT.
     // `target_model` zostaje pusty — zostanie uzupelniony recznie w UI.
-    repository::create_or_reactivate_model_alias(pool, alias, "", "first_available")?;
+    repository::create_or_reactivate_model_alias(
+        pool,
+        alias,
+        "",
+        "first_available",
+        "addon",
+        Some("teams-bot"),
+    )?;
     Ok(())
 }
 
@@ -107,6 +114,7 @@ fn ensure_teams_flow(pool: &DbPool) -> Result<()> {
         flow_json: &flow_json,
         status: "active",
         published_model_name: None,
+        actor_user_id: None,
     };
     repository::create_flow(pool, &params)?;
     Ok(())
@@ -151,7 +159,7 @@ mod tests {
         ensure_teams_bot_defaults(&pool).await.unwrap();
 
         for alias in TEAMS_ALIASES {
-            let row = repository::resolve_model_alias(&pool, alias)
+            let row = repository::resolve_model_alias(&pool, alias, None)
                 .unwrap()
                 .unwrap_or_else(|| panic!("alias {alias} not created"));
             assert_eq!(row.target_model, "");
@@ -195,7 +203,7 @@ mod tests {
 
         // Każdy alias pojawia się dokładnie raz (resolve zwraca is_active=1).
         for alias in TEAMS_ALIASES {
-            let row = repository::resolve_model_alias(&pool, alias).unwrap();
+            let row = repository::resolve_model_alias(&pool, alias, None).unwrap();
             assert!(row.is_some(), "alias {alias} disappeared");
         }
     }
@@ -216,7 +224,7 @@ mod tests {
 
         ensure_teams_bot_defaults(&pool).await.unwrap();
 
-        let row = repository::resolve_model_alias(&pool, "teams-summarization")
+        let row = repository::resolve_model_alias(&pool, "teams-summarization", None)
             .unwrap()
             .unwrap();
         assert_eq!(

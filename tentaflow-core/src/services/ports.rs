@@ -20,7 +20,7 @@ struct Inner {
 
 impl PortAllocator {
     /// Builds a fresh allocator. `range` is inclusive on both ends; `excluded`
-    /// is a set of ports the caller wants to reserve (e.g. dashboard, prometheus).
+    /// is a set of ports the caller wants to reserve (e.g. dashboard).
     pub fn new(range: (u16, u16), excluded: HashSet<u16>) -> Result<Self> {
         let (lo, hi) = range;
         if lo == 0 || hi == 0 || lo > hi {
@@ -88,6 +88,68 @@ impl PortAllocator {
             }
         }
         Ok(out)
+    }
+
+    /// Bierze KONKRETNY port jeśli wolny — używane przy respawn istniejącego
+    /// serwisu, żeby zachować port który admin już widzi w GUI / DB.
+    /// Port = atrybut serwisu, raz przyznany zostaje na całe życie wpisu w
+    /// `services`. Bez tego allocator dawał kolejny port z cursora przy
+    /// każdym respawn (5000 → 5001 → 5002 …) i `LiveHandlesCache` wskazywał
+    /// na zwolnione porty.
+    ///
+    /// `preferred=None` → fallback na zwykły `acquire()` (świeży deploy bez
+    /// zaalokowanego portu w DB). `Some(p)` z `p` poza zakresem `range`
+    /// też idzie na fallback (np. legacy serwis zapisany przed zmianą
+    /// `port_range` w configu).
+    ///
+    /// Bind probe: gdy port w zakresie ale aktualnie zajęty przez OBCY
+    /// proces (sunshine, chrome, zombie z poprzedniej sesji), zwracamy
+    /// `Err` żeby caller widział konflikt — nie próbujemy "po cichu"
+    /// zmienić portu, bo to ten klasa bug.
+    pub fn acquire_or_specific(&self, preferred: Option<u16>) -> Result<u16> {
+        let Some(port) = preferred else {
+            return self.acquire();
+        };
+        let (lo, hi) = self.range;
+        if port < lo || port > hi {
+            // Port poza pulą — admin musi przebudować serwis przy zmienionym
+            // zakresie. Fallback na świeży acquire jako pragmatyczny ratunek.
+            return self.acquire();
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow!("port allocator mutex poisoned: {}", e))?;
+        if inner.excluded.contains(&port) {
+            return Err(anyhow!(
+                "port {port} jest na excluded list (zarezerwowany dla dashboard)"
+            ));
+        }
+        // `leased` to znacznik "ten port nalezy do JAKIEGOS serwisu" —
+        // boot pre-rezerwuje runtime_port kazdego wpisu, deploy() znaczy
+        // przy alokacji. Respawn istniejacego serwisu prosi o swoj wlasny
+        // port (preserved_port) ktory JUZ jest w leased. Idempotent OK,
+        // realny konflikt z innym procesem wykryje is_port_free.
+        if !is_port_free(port) {
+            return Err(anyhow!(
+                "port {port} zajety przez inny proces — sprawdz `ss -tln` (nasz wlasny stary respawn? zombie?)"
+            ));
+        }
+        inner.leased.insert(port);
+        Ok(port)
+    }
+
+    /// Pre-rezerwuj port który już jest zapisany w DB jako `runtime_port`
+    /// któregoś serwisu. Wywoływane przy boot tentaflow PRZED `auto_start_pinned`,
+    /// żeby kolejne `acquire()` (świeże deployy w tej samej sesji) nie
+    /// zaproponowały portu już przypisanego do istniejącego serwisu.
+    pub fn reserve(&self, port: u16) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow!("port allocator mutex poisoned: {}", e))?;
+        inner.leased.insert(port);
+        Ok(())
     }
 
     /// Releases a previously acquired port so future calls may hand it out

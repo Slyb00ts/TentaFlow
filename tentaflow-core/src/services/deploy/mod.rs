@@ -377,6 +377,7 @@ pub async fn respawn(
     deploy_method: DeployMethod,
     config_json: &str,
     ports: Arc<PortAllocator>,
+    preserved_port: Option<u16>,
 ) -> DeployResult<RuntimeHandle> {
     let manifest = crate::services::manifest::registry()
         .by_id(engine_id)
@@ -387,6 +388,16 @@ pub async fn respawn(
                 engine_id
             ))
         })?;
+
+    // Pre-kill: jeśli na preserved_port siedzi nasz wlasny stary proces
+    // (zombie po crash, OR run_loop respawnuje serwis ktory wciaz dziala
+    // bo health probe zwrocil Failed na chwile), strategy.prepare()
+    // probowalby zabindowac port i dostal "port zajety". Probujemy
+    // znalezc PID slychający na tym porcie i go zabic. Bez tego
+    // respawn pinned services walil sie nieskonczenie.
+    if let Some(port) = preserved_port {
+        kill_listener_on_port(port).await;
+    }
 
     let user_config: serde_json::Value = if config_json.is_empty() {
         serde_json::Value::Object(serde_json::Map::new())
@@ -399,23 +410,28 @@ pub async fn respawn(
         DeployMethod::NativeEmbedded => {
             Box::new(embedded::EmbeddedDeploy::new(manifest, user_config, None))
         }
-        DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new(
+        DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new_with_port(
             manifest,
             user_config,
             ports.clone(),
             None,
+            preserved_port,
         )),
-        DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new(
+        DeployMethod::NativePythonBundle => {
+            Box::new(python_bundle::PythonBundleDeploy::new_with_port(
+                manifest,
+                user_config,
+                ports.clone(),
+                None,
+                preserved_port,
+            ))
+        }
+        DeployMethod::Docker => Box::new(docker::DockerDeploy::new_with_port(
             manifest,
             user_config,
             ports.clone(),
             None,
-        )),
-        DeployMethod::Docker => Box::new(docker::DockerDeploy::new(
-            manifest,
-            user_config,
-            ports.clone(),
-            None,
+            preserved_port,
         )),
         DeployMethod::External => {
             return Err(DeployError::Manifest(
@@ -495,16 +511,67 @@ pub async fn stop(
         }
     }
 
-    // Always release whichever ports the row claims; PortAllocator is idempotent
-    // on unknown ports.
-    if let Some(p) = svc.runtime_port {
-        let _ = ports.release(p);
-    }
-    if let Some(p) = svc.sidecar_quic_port {
-        let _ = ports.release(p);
-    }
+    // NIE zwalniamy portow przy stop(). Port to permanentny atrybut serwisu
+    // — przyznany przy `deploy()`, zwalniany dopiero przy delete (gdy row
+    // znika z DB). Restart / pause / crash zostawia port w `leased`,
+    // zeby kolejny respawn dostal dokladnie ten sam port przez
+    // `acquire_or_specific(svc.runtime_port)`.
+    let _ = ports;
 
     Ok(())
+}
+
+/// Znajduje PID nasłuchujacy na danym porcie (TCP, 127.0.0.1) i wysyla
+/// SIGTERM, po 1.5s SIGKILL. Uzywane przed respawn — gdy stary proces
+/// serwisu zyje na preserved_port (zombie po crash tentaflow albo
+/// run_loop respawn na zywym serwisie), strategy.prepare() dostalby
+/// "port zajety". No-op gdy nikt nie nasluchuje.
+async fn kill_listener_on_port(port: u16) {
+    let pid_opt = tokio::task::spawn_blocking(move || find_listener_pid(port))
+        .await
+        .ok()
+        .flatten();
+    let Some(pid) = pid_opt else {
+        return;
+    };
+    tracing::info!(
+        "respawn: killing leftover process pid={} on port {}",
+        pid,
+        port
+    );
+    let _ = crate::deploy::process_ctl::terminate(pid);
+    // Krotki grace na zwolnienie portu w jadrze (TCP_LISTEN -> CLOSED).
+    for _ in 0..20 {
+        if is_listener_gone(port) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn find_listener_pid(port: u16) -> Option<u32> {
+    let out = std::process::Command::new("ss")
+        .args(["-Hlntp", &format!("sport = :{}", port)])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(start) = line.find("pid=") {
+            let rest = &line[start + 4..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if let Ok(pid) = rest[..end].parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+fn is_listener_gone(port: u16) -> bool {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
 // ----- DB helpers -----------------------------------------------------------
@@ -591,12 +658,24 @@ pub struct SmartProbeConfig {
     /// `log_sink` so the dashboard sees progress.
     pub status_report_interval: std::time::Duration,
     pub log_sink: Option<LogSink>,
+    /// Opcjonalny hard ceiling czasu warmupu. `None` = no timeout (default
+    /// zachowanie — duze modele 70B+ moga ladowac 10-30 min). Operator
+    /// moze ustawic explicit deadline (np. dla CI/CD) — po przekroczeniu
+    /// probe zwraca `ProcessExited(None)`, caller robi rollback.
+    ///
+    /// W produkcji preferujemy `None` zeby nie zabijac legitnych dlugich
+    /// loadow. User widzi PROGRES przez `progress_message` heartbeat w
+    /// supervisor i moze recznie anulowac deploy w GUI gdy uzna ze cos
+    /// wisi (np. CUDA OOM gdzie parent uvicorn pozostaje alive ale nie
+    /// odpowiada na readiness).
+    pub max_wait: Option<std::time::Duration>,
 }
 
-/// Smart liveness+readiness probe with no hard timeout. Loops until one of:
+/// Smart liveness+readiness probe. Loops until one of:
 ///
 /// * a readiness URL answers 2xx → `Ready`;
-/// * `is_alive_check` reports the process gone → `ProcessExited`.
+/// * `is_alive_check` reports the process gone → `ProcessExited`;
+/// * `max_wait` upłynął (gdy ustawiony) → `ProcessExited(None)`.
 ///
 /// `is_alive_check` is an async closure returning `Some(exit_code)` when
 /// the supervised process has exited (None inside Some means "exited but
@@ -627,6 +706,18 @@ where
     };
 
     loop {
+        if let Some(deadline) = cfg.max_wait {
+            if started.elapsed() >= deadline {
+                if let Some(sink) = &cfg.log_sink {
+                    sink.info(&format!(
+                        "[health] timeout after {}s — engine alive but not ready (likely crashed worker / CUDA OOM); failing deploy",
+                        started.elapsed().as_secs()
+                    ));
+                }
+                return SmartProbeOutcome::ProcessExited(None);
+            }
+        }
+
         if let Some(exit) = is_alive_check().await {
             return SmartProbeOutcome::ProcessExited(exit);
         }
@@ -842,6 +933,7 @@ mod apply_parameters_deploy_tests {
             requires_model: Some(true),
             gpu_supported: None,
             default_port: 8000,
+            dgx_spark: None,
             api: ApiKind::OpenaiCompatible,
             version: "0.1.0".into(),
             service_surfaces: None,
@@ -899,8 +991,7 @@ mod apply_parameters_deploy_tests {
     #[test]
     fn empty_parameters_returns_empty_application() {
         let m = manifest_with_params(vec![]);
-        let (app, req) =
-            apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
+        let (app, req) = apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
         assert!(app.env.is_empty());
         assert!(req.ollama_options.is_empty());
     }
@@ -913,8 +1004,7 @@ mod apply_parameters_deploy_tests {
             0.9,
         )]);
         let user_config = json!({ "parameters": { "gpu_memory_utilization": 0.6 } });
-        let (app, _) =
-            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap();
+        let (app, _) = apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap();
         assert_eq!(app.env.get("GPU_MEMORY_UTILIZATION").unwrap(), "0.6");
     }
 
@@ -925,8 +1015,7 @@ mod apply_parameters_deploy_tests {
             "GPU_MEMORY_UTILIZATION",
             0.9,
         )]);
-        let (app, _) =
-            apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
+        let (app, _) = apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
         assert_eq!(app.env.get("GPU_MEMORY_UTILIZATION").unwrap(), "0.9");
     }
 
@@ -938,8 +1027,7 @@ mod apply_parameters_deploy_tests {
             0.9,
         )]);
         let user_config = json!({ "parameters": { "gpu_memory_utilization": 2.0 } });
-        let err =
-            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
+        let err = apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
         assert!(matches!(err, ParameterError::OutOfRange { .. }));
     }
 
@@ -951,8 +1039,7 @@ mod apply_parameters_deploy_tests {
             0.9,
         )]);
         let user_config = json!({ "parameters": { "gpu_memory_utilization": "not a float" } });
-        let err =
-            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
+        let err = apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
         assert!(matches!(err, ParameterError::TypeMismatch { .. }));
     }
 
@@ -1053,7 +1140,10 @@ mod apply_parameters_deploy_tests {
         let (app, req) =
             apply_parameters_deploy(&m, &user_config, DeployTarget::NativeEmbedded).unwrap();
         assert_eq!(app.whisper.get("default_beam_size").unwrap(), &json!(8));
-        assert_eq!(req.whisper_overridable.get("default_beam_size").unwrap(), &json!(8));
+        assert_eq!(
+            req.whisper_overridable.get("default_beam_size").unwrap(),
+            &json!(8)
+        );
     }
 
     #[test]
@@ -1087,8 +1177,7 @@ mod apply_parameters_deploy_tests {
         });
 
         let user_config = json!({ "parameters": { "context_size": 16384 } });
-        let (app, req) =
-            apply_parameters_deploy(&m, &user_config, DeployTarget::External).unwrap();
+        let (app, req) = apply_parameters_deploy(&m, &user_config, DeployTarget::External).unwrap();
         assert!(app.env.is_empty());
         assert_eq!(req.ollama_options.get("num_ctx").unwrap(), &json!(16384));
     }
@@ -1107,9 +1196,10 @@ pub fn merge_config_json(
     if !value.is_object() {
         value = serde_json::Value::Object(serde_json::Map::new());
     }
-    let to_value_map = |m: &HashMap<String, serde_json::Value>| -> serde_json::Map<String, serde_json::Value> {
-        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
+    let to_value_map =
+        |m: &HashMap<String, serde_json::Value>| -> serde_json::Map<String, serde_json::Value> {
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
     let rtp = serde_json::json!({
         "ollama_options": to_value_map(&request_time.ollama_options),
         "python_request": to_value_map(&request_time.python_request),
@@ -1167,7 +1257,6 @@ pub(crate) fn auto_gpu_memory_utilization() -> Option<f64> {
     let rounded = (ratio * 100.0).floor() / 100.0;
     Some(rounded)
 }
-
 
 /// Wynik aplikacji typed schemy parametrów dla konkretnego deployu.
 /// **Deploy-time** wartości — konsumowane raz przy spawnie procesu albo
@@ -1230,10 +1319,7 @@ pub enum ParameterError {
         options: Vec<String>,
     },
     #[error("parameter '{key}' has no binding for deploy target {target:?}")]
-    NoBindingForTarget {
-        key: String,
-        target: DeployTarget,
-    },
+    NoBindingForTarget { key: String, target: DeployTarget },
 }
 
 /// Aplikuje typed schemę parametrów z manifestu do `user_config.parameters`
@@ -1265,9 +1351,7 @@ pub fn apply_parameters_deploy(
     let mut app = ParameterApplication::default();
     let mut req = RequestTimeParameters::default();
 
-    let user_params = user_config
-        .get("parameters")
-        .and_then(|v| v.as_object());
+    let user_params = user_config.get("parameters").and_then(|v| v.as_object());
 
     for p in &manifest.parameters {
         let value = user_params
@@ -1512,6 +1596,7 @@ mod tests {
                 requires_model: None,
                 gpu_supported: None,
                 default_port: 8000,
+                dgx_spark: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0.0.1".into(),
                 service_surfaces: None,
@@ -1574,6 +1659,7 @@ mod tests {
             readiness_urls: vec![format!("{}/v1/models", server.uri())],
             status_report_interval: Duration::from_secs(60),
             log_sink: None,
+            max_wait: None,
         };
         let alive = AtomicBool::new(true);
         let outcome = smart_health_probe(cfg, || async {
@@ -1596,11 +1682,33 @@ mod tests {
             readiness_urls: vec!["http://127.0.0.1:1/health".to_string()],
             status_report_interval: Duration::from_secs(60),
             log_sink: None,
+            max_wait: None,
         };
         let outcome = smart_health_probe(cfg, || async { Some(Some(137)) }).await;
         match outcome {
             SmartProbeOutcome::ProcessExited(Some(137)) => {}
             other => panic!("expected ProcessExited(137), got {:?}", other),
+        }
+    }
+
+    /// Process zywy ale readiness URL nieosiagalny → po max_wait probe
+    /// kończy z ProcessExited(None). Bez tego deploy::respawn wisial w
+    /// nieskonczonosc gdy parent uvicorn alive ale child engine core
+    /// crashowal (CUDA OOM).
+    #[tokio::test]
+    async fn smart_probe_times_out_when_alive_but_never_ready() {
+        use std::time::Duration;
+
+        let cfg = SmartProbeConfig {
+            readiness_urls: vec!["http://127.0.0.1:1/health".to_string()],
+            status_report_interval: Duration::from_secs(60),
+            log_sink: None,
+            max_wait: Some(Duration::from_millis(800)),
+        };
+        let outcome = smart_health_probe(cfg, || async { None }).await;
+        match outcome {
+            SmartProbeOutcome::ProcessExited(None) => {}
+            other => panic!("expected ProcessExited(None) on timeout, got {:?}", other),
         }
     }
 
@@ -1653,7 +1761,7 @@ mod tests {
         let conn = db.lock().unwrap();
         let (status, error_text): (String, Option<String>) = conn
             .query_row(
-                "SELECT status, error_text FROM deployments WHERE engine_id = 'emb-collide'",
+                "SELECT status, error_message FROM deployments WHERE engine_id = 'emb-collide'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1734,6 +1842,7 @@ mod tests {
             DeployMethod::NativeEmbedded,
             "{}",
             ports.clone(),
+            None,
         )
         .await
         .unwrap_err();
@@ -1776,7 +1885,7 @@ mod tests {
         let conn = db.lock().unwrap();
         let (status, err): (String, Option<String>) = conn
             .query_row(
-                "SELECT status, error_text FROM deployments WHERE engine_id = 'bin-err' ORDER BY id DESC LIMIT 1",
+                "SELECT status, error_message FROM deployments WHERE engine_id = 'bin-err' ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )

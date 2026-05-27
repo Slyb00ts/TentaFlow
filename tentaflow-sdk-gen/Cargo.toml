@@ -1,0 +1,31 @@
+[package]
+name = "tentaflow-sdk-gen"
+version = "0.1.0"
+edition = "2021"
+description = "TentaFlow codegen — emits catalog-manifest/v1.cbor and generated SDK code (Rust / C# / Python targets) from the tentaflow-sdk-spec registry."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "tentaflow_sdk_gen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tentaflow-sdk-gen-emit-manifest"
+path = "src/bin/emit_manifest.rs"
+
+[[bin]]
+name = "tentaflow-sdk-gen-self-test"
+path = "src/bin/self_test.rs"
+
+[[bin]]
+name = "tentaflow-sdk-gen-csharp"
+path = "src/bin/gen_csharp.rs"
+
+[[bin]]
+name = "tentaflow-sdk-gen-python"
+path = "src/bin/gen_python.rs"
+
+[dependencies]
+minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive", "std"] }
+tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }

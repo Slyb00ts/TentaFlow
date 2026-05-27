@@ -51,6 +51,9 @@ fn audit(ctx: &HandlerContext, action: &str, note_id: Option<i64>) {
         resource_id.as_deref(),
         Some(&details),
         "info",
+        "unclassified",
+        None,
+        None,
         None,
         Some(node_id),
     ) {

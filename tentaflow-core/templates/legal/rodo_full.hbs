@@ -1,0 +1,135 @@
+KLAUZULA INFORMACYJNA RODO — WERSJA ROZSZERZONA
+
+Dokument sporządzono zgodnie z art. 13 i art. 14 rozporządzenia Parlamentu
+Europejskiego i Rady (UE) 2016/679 z dnia 27 kwietnia 2016 r. (RODO) oraz
+przepisami krajowymi w zakresie ochrony danych osobowych. Wersja rozszerzona
+obejmuje dodatkowo informacje o inspektorze ochrony danych, transferach do
+państw trzecich, ocenie skutków dla ochrony danych (DPIA) oraz szczegółowych
+okresach retencji per kategoria danych.
+
+Data wystawienia: {{generation.date}}
+
+1. ADMINISTRATOR DANYCH OSOBOWYCH
+
+Administratorem Twoich danych osobowych jest:
+{{org.name}}
+Adres siedziby: {{org.address}}
+Adres kontaktowy: {{org.email}}
+
+{{#if org.dpo_email}}
+2. INSPEKTOR OCHRONY DANYCH (IOD / DPO)
+
+Administrator wyznaczył inspektora ochrony danych, z którym można się
+kontaktować we wszystkich sprawach dotyczących przetwarzania danych osobowych
+oraz korzystania z praw związanych z przetwarzaniem.
+
+Kontakt z inspektorem ochrony danych: {{org.dpo_email}}
+{{/if}}
+
+3. CELE I PODSTAWY PRAWNE PRZETWARZANIA
+
+Administrator przetwarza dane osobowe pozyskane za pośrednictwem systemu
+monitoringu wizyjnego oraz powiązanych systemów analizy obrazu w następujących
+celach:
+
+a) zapewnienie bezpieczeństwa osób oraz ochrona mienia — podstawa: art. 6
+   ust. 1 lit. f RODO (prawnie uzasadniony interes administratora);
+b) wykrywanie i wyjaśnianie zdarzeń mających znamiona naruszenia prawa lub
+   regulaminów wewnętrznych — podstawa: art. 6 ust. 1 lit. c i f RODO;
+c) ewentualne ustalenie, dochodzenie lub obrona roszczeń — podstawa: art. 6
+   ust. 1 lit. f RODO;
+d) realizacja obowiązków wynikających z przepisów prawa, w tym przepisów
+   dotyczących ochrony obiektów i osób — podstawa: art. 6 ust. 1 lit. c RODO.
+
+4. KATEGORIE PRZETWARZANYCH DANYCH
+
+W ramach systemu administrator przetwarza następujące kategorie danych
+osobowych:
+
+{{#each data_categories}}- {{this}}
+{{/each}}
+
+Dane biometryczne w rozumieniu art. 4 pkt 14 RODO przetwarzane są wyłącznie w
+zakresie, w jakim jest to niezbędne do realizacji celów wskazanych w punkcie 3
+oraz po przeprowadzeniu oceny skutków dla ochrony danych (DPIA, art. 35 RODO).
+
+5. SZCZEGÓŁOWE OKRESY PRZECHOWYWANIA
+
+Administrator stosuje zróżnicowane okresy retencji dostosowane do kategorii
+przetwarzanych danych:
+
+- pojedyncze klatki obrazu (frame storage, bufor LRU): {{retention.frames_days}}
+  dni od rejestracji;
+- nagrania wideo (recordings, sekwencje obrazu): {{retention.recordings_days}}
+  dni od rejestracji;
+- metadane zdarzeń (timestamp, identyfikator strumienia, klasa detekcji):
+  do {{retention.recordings_days}} dni od rejestracji, powiązane z odpowiednim
+  fragmentem nagrania wideo;
+- dane przetwarzane w związku z postępowaniem wyjaśniającym lub roszczeniami:
+  do czasu prawomocnego zakończenia postępowania oraz upływu właściwego okresu
+  przedawnienia.
+
+6. ODBIORCY DANYCH
+
+Odbiorcami danych mogą być wyłącznie podmioty uprawnione na podstawie
+przepisów prawa oraz starannie wybrani podmioty współpracujące na podstawie
+umów powierzenia przetwarzania (art. 28 RODO):
+
+{{#each recipients}}- {{name}} — {{purpose}}
+{{/each}}
+
+7. TRANSFERY DO PAŃSTW TRZECICH
+
+Administrator co do zasady nie przekazuje danych osobowych poza Europejski
+Obszar Gospodarczy (EOG). W przypadku gdy konkretna usługa przetwarzania
+danych wymaga transferu do państwa trzeciego, transfer odbywa się wyłącznie
+na podstawie standardowych klauzul umownych zatwierdzonych przez Komisję
+Europejską (art. 46 ust. 2 lit. c RODO) lub innego instrumentu prawnego
+spełniającego wymagania rozdziału V RODO. Lista takich transferów oraz
+zastosowanych zabezpieczeń jest dostępna na żądanie u administratora.
+
+8. OCENA SKUTKÓW DLA OCHRONY DANYCH (DPIA)
+
+Z uwagi na charakter, zakres i cel przetwarzania (systematyczny monitoring
+miejsc dostępnych publicznie oraz zautomatyzowane przetwarzanie obrazu)
+administrator przeprowadził ocenę skutków dla ochrony danych zgodnie z
+art. 35 RODO. Dokumentacja DPIA jest aktualizowana przy każdej istotnej
+zmianie systemu, w szczególności przy zmianie kategorii danych, celów
+przetwarzania lub zakresu odbiorców. Podsumowanie DPIA udostępniane jest
+osobom, których dane dotyczą, na żądanie skierowane na adres kontaktowy
+administratora.
+
+9. TWOJE PRAWA
+
+W związku z przetwarzaniem danych osobowych przysługują Ci prawa:
+
+a) dostępu do danych oraz uzyskania ich kopii (art. 15 RODO);
+b) sprostowania danych (art. 16 RODO);
+c) usunięcia danych, w zakresie dopuszczalnym przez prawo (art. 17 RODO);
+d) ograniczenia przetwarzania (art. 18 RODO);
+e) przenoszenia danych (art. 20 RODO);
+f) sprzeciwu wobec przetwarzania opartego na prawnie uzasadnionym interesie
+   (art. 21 RODO);
+g) wniesienia skargi do Prezesa Urzędu Ochrony Danych Osobowych (ul. Stawki 2,
+   00-193 Warszawa).
+
+10. ZAUTOMATYZOWANE PODEJMOWANIE DECYZJI
+
+System może stosować algorytmy automatycznego rozpoznawania obrazu (detekcja
+osób, detekcja zdarzeń). Decyzje wywołujące skutki prawne lub w podobny sposób
+istotnie wpływające na osobę nie są podejmowane wyłącznie w sposób
+zautomatyzowany — każda taka decyzja podlega weryfikacji przez upoważnionego
+pracownika administratora (art. 22 ust. 2 lit. b RODO).
+
+11. DOBROWOLNOŚĆ PODANIA DANYCH
+
+Wejście na teren objęty monitoringiem oznacza zarejestrowanie wizerunku osoby.
+Podanie danych nie jest wymogiem ustawowym ani umownym; brak zgody na
+rejestrację oznacza brak możliwości przebywania na terenie monitorowanym.
+
+12. KONTAKT
+
+W każdej sprawie dotyczącej przetwarzania danych osobowych można kontaktować
+się z administratorem pod adresem: {{org.email}}{{#if org.dpo_email}}, a
+w sprawach związanych z ochroną danych również bezpośrednio z inspektorem
+ochrony danych pod adresem: {{org.dpo_email}}{{/if}}.

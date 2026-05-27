@@ -500,11 +500,31 @@ function engineId(engine) {
 }
 
 function ensureAudioConfigDefaults(conv) {
-  if (!conv.audioConfig.sttEngine && engineCache.stt.length) {
-    conv.audioConfig.sttEngine = engineId(engineCache.stt[0]);
+  // Wybiera deployed (stt|tts) engine zgodny z aktualnie zapisanym
+  // sttEngine/ttsEngine, fallback na pierwszy z engineCache. Wartosci sa
+  // walidowane wzgledem rzeczywistego registry — sztywne defaulty
+  // 'whisper-1' / 'tts-1' (OpenAI compat) z newConversation() ZAWSZE
+  // zamieniamy na real model_name, bo backend route_audio_transcription
+  // /_speech rezolwuje przez `services_repo` i nie zna tych aliasow.
+  const pickEngine = (kind) => {
+    const cache = engineCache[kind];
+    if (!cache.length) return null;
+    const wanted = kind === 'stt' ? conv.audioConfig.sttEngine : conv.audioConfig.ttsEngine;
+    if (wanted) {
+      const found = cache.find((e) => engineId(e) === wanted);
+      if (found) return found;
+    }
+    return cache[0];
+  };
+  const stt = pickEngine('stt');
+  if (stt) {
+    conv.audioConfig.sttEngine = engineId(stt);
+    conv.audioConfig.sttModel = stt.model_name || stt.id || conv.audioConfig.sttModel;
   }
-  if (!conv.audioConfig.ttsEngine && engineCache.tts.length) {
-    conv.audioConfig.ttsEngine = engineId(engineCache.tts[0]);
+  const tts = pickEngine('tts');
+  if (tts) {
+    conv.audioConfig.ttsEngine = engineId(tts);
+    conv.audioConfig.ttsModel = tts.model_name || tts.id || conv.audioConfig.ttsModel;
   }
 }
 
@@ -621,8 +641,15 @@ function openEnginePicker(kind) {
     const btn = e.target.closest('button[data-engine-id]');
     if (!btn) return;
     const id = btn.dataset.engineId;
-    if (kind === 'stt') conv.audioConfig.sttEngine = id;
-    else conv.audioConfig.ttsEngine = id;
+    const cache = engineCache[kind] || [];
+    const picked = cache.find((e) => engineId(e) === id);
+    if (kind === 'stt') {
+      conv.audioConfig.sttEngine = id;
+      if (picked) conv.audioConfig.sttModel = picked.model_name || picked.id || conv.audioConfig.sttModel;
+    } else {
+      conv.audioConfig.ttsEngine = id;
+      if (picked) conv.audioConfig.ttsModel = picked.model_name || picked.id || conv.audioConfig.ttsModel;
+    }
     saveConversations();
     updateEngineLabels();
     closeMenu();
@@ -868,6 +895,10 @@ async function startAudioPipeline() {
   if (audioPipeline) return;
   const conv = activeConv();
   if (!conv || conv.mode !== 'audio' || !faceHandle) return;
+  // Re-validate audioConfig wzgledem aktualnego registry. Bez tego stary
+  // wpis z localStorage z `sttModel: 'whisper-1'` (defaultem z
+  // newConversation()) lecial do API i routing nie znajdowal serwisu.
+  ensureAudioConfigDefaults(conv);
   // Jezyk transkrypcji bierzemy z aktywnego I18n — w Etapie 1 conv.audioConfig
   // mial sztywne 'pl', ale uzytkownik moze rozmawiac w innym jezyku.
   const lang = (I18n.getLanguage && I18n.getLanguage()) || conv.audioConfig.language || 'pl';

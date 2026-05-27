@@ -1809,6 +1809,25 @@ fn spawn_engine(
         .open(&log_path)
         .with_context(|| format!("open engine log {}", log_path.display()))?;
 
+    // setsid() przed exec: child staje sie liderem nowej sesji + process
+    // group. Wszystkie subprocess'y ktore vLLM uvicorn parent spawn'uje
+    // (EngineCore workers, multiproc DP) dziedziczą tę grupę. Bez tego
+    // SIGTERM na parent zostawiał zombie engine cores trzymajace GPU
+    // memory (9GB+ na 0.5B model przez fragmentacje). Stop_all_supervised
+    // zabija teraz `kill(-pid)` (negative = group), co dotyka wszystkich.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     let mut child = if log.is_some() {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.spawn().with_context(|| format!("spawn {:?}", exe))?
@@ -2188,7 +2207,9 @@ mod tests {
 
     #[test]
     fn substitute_ternary_all_truthy_aliases() {
-        for alias in ["1", "true", "True", "TRUE", "yes", "YES", "on", "ON", "enabled", "Enabled"] {
+        for alias in [
+            "1", "true", "True", "TRUE", "yes", "YES", "on", "ON", "enabled", "Enabled",
+        ] {
             let mut env = HashMap::new();
             env.insert("FLAG".to_string(), alias.to_string());
             let s = substitute_vars("${FLAG?yes:no}", &env, Path::new("/tmp/b"));
@@ -2198,7 +2219,9 @@ mod tests {
 
     #[test]
     fn substitute_ternary_falsy_aliases() {
-        for alias in ["0", "false", "False", "no", "NO", "off", "disabled", "", "garbage"] {
+        for alias in [
+            "0", "false", "False", "no", "NO", "off", "disabled", "", "garbage",
+        ] {
             let mut env = HashMap::new();
             env.insert("FLAG".to_string(), alias.to_string());
             let s = substitute_vars("${FLAG?yes:no}", &env, Path::new("/tmp/b"));
