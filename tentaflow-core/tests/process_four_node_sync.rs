@@ -13,15 +13,26 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use rusqlite::OptionalExtension;
 use tentaflow_core::db::repository;
 use tentaflow_core::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use tentaflow_core::mesh::security::MeshSecurity;
 use tentaflow_core::sync::core_capture::CoreWriteCapture;
-use tentaflow_core::sync::core_registry::{CORE_SYNC_ADDON_ID, CoreSyncResourceKind};
+use tentaflow_core::sync::core_registry::{
+    CORE_SYNC_ADDON_ID, CoreSyncResourceKind, descriptor_for_kind,
+};
 use tentaflow_core::sync::ledger::{FieldValue, OperationId};
 use tentaflow_core::sync::runtime::{MeshSyncPullResult, SqlWriteAction};
 
 const FLOW_ID: &str = "92001";
+const SUITE_ORG_ID: &str = "org-process";
+const SUITE_USER_ID: &str = "20101";
+const SUITE_GROUP_ID: &str = "20102";
+const SUITE_FLOW_ID: &str = "20103";
+const SUITE_BINDING_ID: &str = "20104";
+const SUITE_FLOW_VERSION_ID: &str = "20105";
+const SUITE_ROLE_ID: &str = "process-sync-role";
+const SUITE_MODEL_PATTERN: &str = "process-sync-model";
 
 struct ChildNode {
     child: Child,
@@ -306,6 +317,65 @@ fn process_four_node_permission_gating_blocks_unshared_target() {
     receiver_c.command("WAIT_FLOW");
 }
 
+#[test]
+fn process_four_node_core_suite_materializes_after_restart() {
+    if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("process e2e root");
+    let receiver_homes = [
+        root.path().join("receiver-a"),
+        root.path().join("receiver-b"),
+        root.path().join("receiver-c"),
+    ];
+    let mut source = ChildNode::spawn("source", root.path().join("source"));
+    let mut receivers = vec![
+        ChildNode::spawn("receiver-a", receiver_homes[0].clone()),
+        ChildNode::spawn("receiver-b", receiver_homes[1].clone()),
+        ChildNode::spawn("receiver-c", receiver_homes[2].clone()),
+    ];
+
+    for receiver in &mut receivers {
+        connect_nodes(&mut source, receiver);
+    }
+
+    let seed_source_args = receivers
+        .iter()
+        .map(|receiver| format!("{} {}", receiver.node_id, receiver.public_key))
+        .collect::<Vec<_>>()
+        .join(" ");
+    source.command(&format!(
+        "SEED_SOURCE_CORE_SUITE {} {}",
+        receivers.len(),
+        seed_source_args
+    ));
+    for receiver in &mut receivers {
+        receiver.command("SEED_RECEIVER_CORE_SUITE");
+    }
+
+    let op_ids = parse_record_core_suite_op_ids(&source.command("RECORD_CORE_SUITE"));
+    for receiver in &mut receivers {
+        source.command(&format!("PUSH {}", receiver.node_id));
+    }
+    for op_id in &op_ids {
+        source.command(&format!("WAIT_ACKS {} {}", op_id, receivers.len()));
+    }
+    for receiver in &mut receivers {
+        receiver.command("WAIT_CORE_SUITE");
+    }
+
+    drop(receivers);
+    let mut receivers = vec![
+        ChildNode::spawn("receiver-a-restart", receiver_homes[0].clone()),
+        ChildNode::spawn("receiver-b-restart", receiver_homes[1].clone()),
+        ChildNode::spawn("receiver-c-restart", receiver_homes[2].clone()),
+    ];
+    for receiver in &mut receivers {
+        receiver.command("WAIT_CORE_SUITE");
+    }
+}
+
 fn connect_nodes(source: &mut ChildNode, receiver: &mut ChildNode) {
     source.command(&format!(
         "TRUST {} {}",
@@ -321,6 +391,13 @@ fn parse_record_flow_op_id(line: &str) -> String {
         .nth(3)
         .expect("record flow op id")
         .to_string()
+}
+
+fn parse_record_core_suite_op_ids(line: &str) -> Vec<String> {
+    line.split_whitespace()
+        .skip(3)
+        .map(ToString::to_string)
+        .collect()
 }
 
 async fn child_main() {
@@ -490,11 +567,21 @@ async fn handle_child_command(
             seed_receiver(db, local_node_id, &security.public_key_hex())?;
             Ok("SEED_RECEIVER".to_string())
         }
+        ["SEED_RECEIVER_CORE_SUITE"] => {
+            seed_receiver_core_suite(db, local_node_id, &security.public_key_hex())?;
+            Ok("SEED_RECEIVER_CORE_SUITE".to_string())
+        }
         ["SEED_SOURCE", count, rest @ ..] => {
             let count = count.parse::<usize>()?;
             anyhow::ensure!(rest.len() == count * 2, "target tuple count mismatch");
             seed_source(db, rest)?;
             Ok("SEED_SOURCE".to_string())
+        }
+        ["SEED_SOURCE_CORE_SUITE", count, rest @ ..] => {
+            let count = count.parse::<usize>()?;
+            anyhow::ensure!(rest.len() == count * 2, "target tuple count mismatch");
+            seed_source_core_suite(db, rest)?;
+            Ok("SEED_SOURCE_CORE_SUITE".to_string())
         }
         ["SEED_SOURCE_ALLOWED", count, allowed_count, rest @ ..] => {
             let count = count.parse::<usize>()?;
@@ -512,6 +599,14 @@ async fn handle_child_command(
             let result = tentaflow_core::sync::runtime::record_core_capture(core_flow_capture())?
                 .expect("runtime initialized");
             Ok(format!("RECORD_FLOW {}", result.op_id.to_hex()))
+        }
+        ["RECORD_CORE_SUITE"] => {
+            let op_ids = record_core_suite()?
+                .into_iter()
+                .map(|op_id| op_id.to_hex())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(format!("RECORD_CORE_SUITE {op_ids}"))
         }
         ["ASSERT_NO_PAYLOAD", target] => {
             anyhow::ensure!(
@@ -536,6 +631,10 @@ async fn handle_child_command(
         ["WAIT_FLOW"] => {
             wait_for_flow(db).await?;
             Ok("WAIT_FLOW".to_string())
+        }
+        ["WAIT_CORE_SUITE"] => {
+            wait_for_core_suite(db).await?;
+            Ok("WAIT_CORE_SUITE".to_string())
         }
         ["ASSERT_NO_FLOW"] => {
             assert_no_flow(db).await?;
@@ -615,8 +714,77 @@ fn seed_receiver(
     Ok(())
 }
 
+fn seed_receiver_core_suite(
+    db: &tentaflow_core::db::DbPool,
+    local_node_id: &str,
+    public_key: &str,
+) -> anyhow::Result<()> {
+    repository::upsert_sync_node_identity(
+        db,
+        local_node_id,
+        public_key,
+        "ed25519",
+        "Process E2E Receiver",
+        "authority",
+        "trusted",
+        None,
+        "authority",
+    )?;
+    for kind in core_suite_kinds() {
+        let descriptor = descriptor_for_kind(kind);
+        repository::upsert_sync_policy(
+            db,
+            &format!("process-e2e-receiver-{}", descriptor.resource_type),
+            "org-default",
+            CORE_SYNC_ADDON_ID,
+            Some(descriptor.resource_type),
+            None,
+            "authority_write",
+            Some(local_node_id),
+            None,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
 fn seed_source(db: &tentaflow_core::db::DbPool, targets: &[&str]) -> anyhow::Result<()> {
     seed_source_with_allowed_targets(db, targets, targets.len() / 2)
+}
+
+fn seed_source_core_suite(db: &tentaflow_core::db::DbPool, targets: &[&str]) -> anyhow::Result<()> {
+    for kind in core_suite_kinds() {
+        let descriptor = descriptor_for_kind(kind);
+        repository::upsert_sync_policy(
+            db,
+            &format!("process-e2e-source-{}", descriptor.resource_type),
+            "org-default",
+            CORE_SYNC_ADDON_ID,
+            Some(descriptor.resource_type),
+            None,
+            "replicated_by_permission",
+            None,
+            None,
+            true,
+        )?;
+    }
+    for (idx, pair) in targets.chunks_exact(2).enumerate() {
+        let node_id = pair[0];
+        let public_key = pair[1];
+        repository::upsert_sync_node_identity(
+            db,
+            node_id,
+            public_key,
+            "ed25519",
+            &format!("Process E2E Receiver {idx}"),
+            "server",
+            "trusted",
+            None,
+            "standard",
+        )?;
+        grant_core_suite_target(db, node_id)?;
+    }
+    Ok(())
 }
 
 fn seed_source_with_allowed_targets(
@@ -672,6 +840,52 @@ fn grant_source_target(db: &tentaflow_core::db::DbPool, node_id: &str) -> anyhow
     Ok(())
 }
 
+fn grant_core_suite_target(db: &tentaflow_core::db::DbPool, node_id: &str) -> anyhow::Result<()> {
+    for (kind, resource_id) in core_suite_resources() {
+        let descriptor = descriptor_for_kind(kind);
+        repository::grant_sync_explicit_share(
+            db,
+            "org-default",
+            CORE_SYNC_ADDON_ID,
+            descriptor.resource_type,
+            resource_id,
+            "node",
+            node_id,
+            "sync_receive",
+            Some(1),
+        )?;
+    }
+    Ok(())
+}
+
+fn core_suite_kinds() -> [CoreSyncResourceKind; 9] {
+    [
+        CoreSyncResourceKind::Organization,
+        CoreSyncResourceKind::UserAccount,
+        CoreSyncResourceKind::UserGroup,
+        CoreSyncResourceKind::GroupMember,
+        CoreSyncResourceKind::Role,
+        CoreSyncResourceKind::OrgMembership,
+        CoreSyncResourceKind::Flow,
+        CoreSyncResourceKind::FlowVersion,
+        CoreSyncResourceKind::FlowModelBinding,
+    ]
+}
+
+fn core_suite_resources() -> [(CoreSyncResourceKind, &'static str); 9] {
+    [
+        (CoreSyncResourceKind::Organization, SUITE_ORG_ID),
+        (CoreSyncResourceKind::UserAccount, SUITE_USER_ID),
+        (CoreSyncResourceKind::UserGroup, SUITE_GROUP_ID),
+        (CoreSyncResourceKind::GroupMember, "20102:20101"),
+        (CoreSyncResourceKind::Role, SUITE_ROLE_ID),
+        (CoreSyncResourceKind::OrgMembership, "org-default:20101"),
+        (CoreSyncResourceKind::Flow, SUITE_FLOW_ID),
+        (CoreSyncResourceKind::FlowVersion, SUITE_FLOW_VERSION_ID),
+        (CoreSyncResourceKind::FlowModelBinding, SUITE_BINDING_ID),
+    ]
+}
+
 fn core_flow_capture() -> CoreWriteCapture {
     let mut fields = BTreeMap::new();
     fields.insert(
@@ -697,6 +911,222 @@ fn core_flow_capture() -> CoreWriteCapture {
     )
 }
 
+fn record_core_suite() -> anyhow::Result<Vec<OperationId>> {
+    let captures = core_suite_captures();
+    let mut op_ids = Vec::with_capacity(captures.len());
+    for capture in captures {
+        let result = tentaflow_core::sync::runtime::record_core_capture(capture)?
+            .expect("runtime initialized");
+        op_ids.push(result.op_id);
+    }
+    Ok(op_ids)
+}
+
+fn core_suite_captures() -> Vec<CoreWriteCapture> {
+    let mut captures = Vec::new();
+
+    let mut organization = BTreeMap::new();
+    organization.insert(
+        "name".to_string(),
+        FieldValue::String("Process Sync Org".to_string()),
+    );
+    organization.insert(
+        "slug".to_string(),
+        FieldValue::String("process-sync-org".to_string()),
+    );
+    organization.insert(
+        "status".to_string(),
+        FieldValue::String("active".to_string()),
+    );
+    captures.push(core_capture_for(
+        CoreSyncResourceKind::Organization,
+        SUITE_ORG_ID,
+        organization,
+    ));
+
+    let mut role = BTreeMap::new();
+    role.insert(
+        "name".to_string(),
+        FieldValue::String("Process Sync Role".to_string()),
+    );
+    role.insert(
+        "permissions_json".to_string(),
+        FieldValue::String(r#"["contacts.read","flows.write"]"#.to_string()),
+    );
+    captures.push(core_capture_for(
+        CoreSyncResourceKind::Role,
+        SUITE_ROLE_ID,
+        role,
+    ));
+
+    let mut user = BTreeMap::new();
+    user.insert(
+        "username".to_string(),
+        FieldValue::String("process-sync-user".to_string()),
+    );
+    user.insert(
+        "display_name".to_string(),
+        FieldValue::String("Process Sync User".to_string()),
+    );
+    user.insert(
+        "email".to_string(),
+        FieldValue::String("process-sync@example.test".to_string()),
+    );
+    user.insert("is_active".to_string(), FieldValue::Bool(true));
+    user.insert("is_admin".to_string(), FieldValue::Bool(false));
+    user.insert("role".to_string(), FieldValue::String("user".to_string()));
+    captures.push(core_capture_for(
+        CoreSyncResourceKind::UserAccount,
+        SUITE_USER_ID,
+        user,
+    ));
+
+    let mut group = BTreeMap::new();
+    group.insert(
+        "name".to_string(),
+        FieldValue::String("Process Sync Group".to_string()),
+    );
+    group.insert(
+        "description".to_string(),
+        FieldValue::String("Four-node synchronized group".to_string()),
+    );
+    captures.push(core_capture_for(
+        CoreSyncResourceKind::UserGroup,
+        SUITE_GROUP_ID,
+        group,
+    ));
+
+    let mut group_member = BTreeMap::new();
+    group_member.insert("group_id".to_string(), FieldValue::I64(20102));
+    group_member.insert("user_id".to_string(), FieldValue::I64(20101));
+    captures.push(core_capture_for(
+        CoreSyncResourceKind::GroupMember,
+        "20102:20101",
+        group_member,
+    ));
+
+    let mut membership = BTreeMap::new();
+    membership.insert(
+        "org_id".to_string(),
+        FieldValue::String("org-default".to_string()),
+    );
+    membership.insert(
+        "user_id".to_string(),
+        FieldValue::String(SUITE_USER_ID.to_string()),
+    );
+    membership.insert(
+        "role_id".to_string(),
+        FieldValue::String(SUITE_ROLE_ID.to_string()),
+    );
+    membership.insert(
+        "granted_by".to_string(),
+        FieldValue::String("process-e2e".to_string()),
+    );
+    captures.push(core_capture_for(
+        CoreSyncResourceKind::OrgMembership,
+        "org-default:20101",
+        membership,
+    ));
+
+    captures.push(core_suite_flow_capture());
+
+    let mut version = BTreeMap::new();
+    version.insert("flow_id".to_string(), FieldValue::I64(20103));
+    version.insert("version_num".to_string(), FieldValue::I64(1));
+    version.insert(
+        "flow_json".to_string(),
+        FieldValue::String(r#"{"nodes":[{"id":"trigger"}]}"#.to_string()),
+    );
+    version.insert(
+        "name".to_string(),
+        FieldValue::String("Process Suite Flow v1".to_string()),
+    );
+    version.insert(
+        "description".to_string(),
+        FieldValue::String("Version synchronized by process test".to_string()),
+    );
+    version.insert(
+        "status".to_string(),
+        FieldValue::String("published".to_string()),
+    );
+    version.insert(
+        "created_by".to_string(),
+        FieldValue::String("process-e2e".to_string()),
+    );
+    captures.push(core_capture_for(
+        CoreSyncResourceKind::FlowVersion,
+        SUITE_FLOW_VERSION_ID,
+        version,
+    ));
+
+    let mut binding = BTreeMap::new();
+    binding.insert("flow_id".to_string(), FieldValue::I64(20103));
+    binding.insert(
+        "model_pattern".to_string(),
+        FieldValue::String(SUITE_MODEL_PATTERN.to_string()),
+    );
+    binding.insert("priority".to_string(), FieldValue::I64(10));
+    captures.push(core_capture_for(
+        CoreSyncResourceKind::FlowModelBinding,
+        SUITE_BINDING_ID,
+        binding,
+    ));
+
+    captures
+}
+
+fn core_capture_for(
+    kind: CoreSyncResourceKind,
+    resource_id: &str,
+    fields: BTreeMap<String, FieldValue>,
+) -> CoreWriteCapture {
+    CoreWriteCapture::new(
+        kind,
+        "org-default",
+        resource_id,
+        SqlWriteAction::Insert,
+        fields,
+        Some(1),
+    )
+}
+
+fn core_suite_flow_capture() -> CoreWriteCapture {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "name".to_string(),
+        FieldValue::String("Process Suite Flow".to_string()),
+    );
+    fields.insert(
+        "description".to_string(),
+        FieldValue::String("Flow synchronized in the four-process suite".to_string()),
+    );
+    fields.insert("is_default".to_string(), FieldValue::Bool(false));
+    fields.insert(
+        "service_type".to_string(),
+        FieldValue::String("chat".to_string()),
+    );
+    fields.insert(
+        "flow_json".to_string(),
+        FieldValue::String(r#"{"nodes":[{"id":"trigger"}]}"#.to_string()),
+    );
+    fields.insert(
+        "status".to_string(),
+        FieldValue::String("active".to_string()),
+    );
+    fields.insert(
+        "published_model_name".to_string(),
+        FieldValue::String("process-suite-model".to_string()),
+    );
+    CoreWriteCapture::new(
+        CoreSyncResourceKind::Flow,
+        "org-default",
+        SUITE_FLOW_ID,
+        SqlWriteAction::Insert,
+        fields,
+        Some(1),
+    )
+}
+
 async fn wait_for_flow(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -708,6 +1138,101 @@ async fn wait_for_flow(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("flow not materialized")
+}
+
+async fn wait_for_core_suite(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut status = String::new();
+    while Instant::now() < deadline {
+        status = core_suite_status(db)?;
+        if status == "complete" {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("core suite not materialized: {status}")
+}
+
+fn core_suite_status(db: &tentaflow_core::db::DbPool) -> anyhow::Result<String> {
+    let conn = db
+        .lock()
+        .map_err(|error| anyhow::anyhow!("db lock failed: {error}"))?;
+    let org_name = conn
+        .query_row(
+            "SELECT name FROM organizations WHERE org_id = ?1",
+            rusqlite::params![SUITE_ORG_ID],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let username = conn
+        .query_row(
+            "SELECT username FROM user_accounts WHERE id = ?1",
+            rusqlite::params![SUITE_USER_ID.parse::<i64>()?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let group_name = conn
+        .query_row(
+            "SELECT name FROM user_groups WHERE id = ?1",
+            rusqlite::params![SUITE_GROUP_ID.parse::<i64>()?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let group_count = conn.query_row(
+        "SELECT COUNT(*) FROM group_members WHERE group_id = ?1 AND user_id = ?2",
+        rusqlite::params![20102_i64, 20101_i64],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let role_name = conn
+        .query_row(
+            "SELECT name FROM roles WHERE role_id = ?1",
+            rusqlite::params![SUITE_ROLE_ID],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let membership_count = conn.query_row(
+        "SELECT COUNT(*) FROM org_memberships WHERE org_id = ?1 AND user_id = ?2 AND role_id = ?3",
+        rusqlite::params!["org-default", SUITE_USER_ID, SUITE_ROLE_ID],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let flow_name = conn
+        .query_row(
+            "SELECT name FROM flows WHERE id = ?1",
+            rusqlite::params![SUITE_FLOW_ID.parse::<i64>()?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let version_name = conn
+        .query_row(
+            "SELECT name FROM flow_versions WHERE id = ?1",
+            rusqlite::params![SUITE_FLOW_VERSION_ID.parse::<i64>()?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let binding_pattern = conn
+        .query_row(
+            "SELECT model_pattern FROM flow_model_bindings WHERE id = ?1",
+            rusqlite::params![SUITE_BINDING_ID.parse::<i64>()?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if org_name.as_deref() == Some("Process Sync Org")
+        && username.as_deref() == Some("process-sync-user")
+        && group_name.as_deref() == Some("Process Sync Group")
+        && group_count == 1
+        && role_name.as_deref() == Some("Process Sync Role")
+        && membership_count == 1
+        && flow_name.as_deref() == Some("Process Suite Flow")
+        && version_name.as_deref() == Some("Process Suite Flow v1")
+        && binding_pattern.as_deref() == Some(SUITE_MODEL_PATTERN)
+    {
+        return Ok("complete".to_string());
+    }
+    Ok(format!(
+        "org={org_name:?} user={username:?} group={group_name:?} group_count={group_count} \
+         role={role_name:?} membership_count={membership_count} flow={flow_name:?} \
+         version={version_name:?} binding={binding_pattern:?}"
+    ))
 }
 
 async fn assert_no_flow(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {

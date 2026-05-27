@@ -1688,20 +1688,38 @@ enum BlobApplyOutcome {
     Pending,
 }
 
-fn blob_apply_priority(operation: &SyncOperation) -> u8 {
+fn inbox_apply_priority(operation: &SyncOperation) -> u8 {
     if operation.body.resource_type != "core.blob" {
-        return 1;
+        return core_apply_priority(operation);
     }
     match operation.body.table_name.as_str() {
         "blob_store_chunks" => 0,
-        "blob_store" => 2,
-        _ => 1,
+        "blob_store" => 10,
+        _ => 20,
+    }
+}
+
+fn core_apply_priority(operation: &SyncOperation) -> u8 {
+    if operation.body.addon_id != crate::sync::core_registry::CORE_SYNC_ADDON_ID {
+        return 20;
+    }
+    match operation.body.table_name.as_str() {
+        "organizations" => 1,
+        "roles" => 2,
+        "user_accounts" => 3,
+        "user_groups" => 4,
+        "group_members" => 5,
+        "org_memberships" => 6,
+        "flows" => 7,
+        "flow_versions" => 8,
+        "flow_model_bindings" => 9,
+        _ => 20,
     }
 }
 
 fn inbox_apply_order(entry: &InboxEntry) -> (u8, &str, u64) {
     (
-        blob_apply_priority(&entry.operation),
+        inbox_apply_priority(&entry.operation),
         entry.operation.body.partition_id.as_str(),
         entry.operation.body.partition_sequence,
     )
