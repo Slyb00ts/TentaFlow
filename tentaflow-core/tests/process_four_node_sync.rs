@@ -14,6 +14,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rusqlite::OptionalExtension;
+use serde_json::Value as JsonValue;
 use tentaflow_core::db::repository;
 use tentaflow_core::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use tentaflow_core::mesh::security::MeshSecurity;
@@ -22,7 +23,7 @@ use tentaflow_core::sync::core_registry::{
     CORE_SYNC_ADDON_ID, CoreSyncResourceKind, descriptor_for_kind,
 };
 use tentaflow_core::sync::ledger::{FieldValue, OperationId};
-use tentaflow_core::sync::runtime::{MeshSyncPullResult, SqlWriteAction};
+use tentaflow_core::sync::runtime::{MeshSyncPullResult, SqlWriteAction, SqlWriteCapture};
 
 const FLOW_ID: &str = "92001";
 const SUITE_ORG_ID: &str = "org-process";
@@ -33,6 +34,8 @@ const SUITE_BINDING_ID: &str = "20104";
 const SUITE_FLOW_VERSION_ID: &str = "20105";
 const SUITE_ROLE_ID: &str = "process-sync-role";
 const SUITE_MODEL_PATTERN: &str = "process-sync-model";
+const SNAPSHOT_ADDON_ID: &str = "process-snapshot-addon";
+const SNAPSHOT_PARTITION: &str = "addon/process-snapshot-addon/person/person-1";
 
 struct ChildNode {
     child: Child,
@@ -376,6 +379,109 @@ fn process_four_node_core_suite_materializes_after_restart() {
     }
 }
 
+#[test]
+fn process_four_node_snapshot_tail_respects_acl() {
+    if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("process e2e root");
+    let mut source = ChildNode::spawn("source", root.path().join("source"));
+    let mut receiver_a = ChildNode::spawn("receiver-a", root.path().join("receiver-a"));
+    let mut receiver_b = ChildNode::spawn("receiver-b", root.path().join("receiver-b"));
+    let mut receiver_denied = ChildNode::spawn("receiver-denied", root.path().join("receiver-c"));
+
+    connect_nodes(&mut source, &mut receiver_a);
+    connect_nodes(&mut source, &mut receiver_b);
+    connect_nodes(&mut source, &mut receiver_denied);
+
+    let seed_source_args = [&receiver_a, &receiver_b, &receiver_denied]
+        .iter()
+        .map(|receiver| format!("{} {}", receiver.node_id, receiver.public_key))
+        .collect::<Vec<_>>()
+        .join(" ");
+    source.command(&format!("SEED_SQL_SOURCE 3 2 {}", seed_source_args));
+    receiver_a.command("SEED_SQL_RECEIVER");
+    receiver_b.command("SEED_SQL_RECEIVER");
+    receiver_denied.command("SEED_SQL_RECEIVER");
+
+    source.command("RECORD_SQL_INSERT snap-base");
+    let snapshot_line = source.command("BUILD_SQL_SNAPSHOT 1");
+    let snapshot = parse_snapshot_line(&snapshot_line);
+    let update_op = parse_record_flow_op_id(&source.command("RECORD_SQL_UPDATE snap-tail"));
+
+    source.command(&format!("ASSERT_REPAIR_DENIED {}", receiver_denied.node_id));
+    source.command(&format!(
+        "ASSERT_SNAPSHOT_DENIED {} {} {}",
+        receiver_denied.node_id, snapshot.0, snapshot.1
+    ));
+    receiver_a.command(&format!(
+        "SEND_SNAPSHOT {} {} {}",
+        source.node_id, snapshot.0, snapshot.1
+    ));
+    receiver_b.command(&format!(
+        "SEND_SNAPSHOT {} {} {}",
+        source.node_id, snapshot.0, snapshot.1
+    ));
+    receiver_a.command("WAIT_SQL_NAME snap-tail");
+    receiver_b.command("WAIT_SQL_NAME snap-tail");
+    source.command(&format!("WAIT_ACKS {} 2", update_op));
+}
+
+#[test]
+fn process_four_node_conflict_and_repeated_fanout() {
+    if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("process e2e root");
+    let mut source = ChildNode::spawn("source", root.path().join("source"));
+    let mut receiver_a = ChildNode::spawn("receiver-a", root.path().join("receiver-a"));
+    let mut receiver_b = ChildNode::spawn("receiver-b", root.path().join("receiver-b"));
+    let mut receiver_c = ChildNode::spawn("receiver-c", root.path().join("receiver-c"));
+
+    connect_nodes(&mut source, &mut receiver_a);
+    connect_nodes(&mut source, &mut receiver_b);
+    connect_nodes(&mut source, &mut receiver_c);
+
+    let seed_source_args = [&receiver_a, &receiver_b, &receiver_c]
+        .iter()
+        .map(|receiver| format!("{} {}", receiver.node_id, receiver.public_key))
+        .collect::<Vec<_>>()
+        .join(" ");
+    source.command(&format!("SEED_SQL_SOURCE 3 3 {}", seed_source_args));
+    receiver_a.command("SEED_SQL_RECEIVER");
+    receiver_b.command("SEED_SQL_RECEIVER");
+    receiver_c.command("SEED_SQL_RECEIVER");
+    receiver_a.command("LOCAL_SQL_INSERT local-conflict");
+
+    let sql_op = parse_record_flow_op_id(&source.command("RECORD_SQL_INSERT remote-conflict"));
+    for receiver in [&receiver_a, &receiver_b, &receiver_c] {
+        source.command(&format!("PUSH {}", receiver.node_id));
+    }
+    source.command(&format!("WAIT_ACKS {} 3", sql_op));
+    receiver_a.command("WAIT_SQL_CONFLICT");
+    receiver_b.command("WAIT_SQL_NAME remote-conflict");
+    receiver_c.command("WAIT_SQL_NAME remote-conflict");
+
+    source.command(&format!("SEED_SOURCE 3 {}", seed_source_args));
+    receiver_a.command("SEED_RECEIVER");
+    receiver_b.command("SEED_RECEIVER");
+    receiver_c.command("SEED_RECEIVER");
+    let mut last_op = String::new();
+    for idx in 0..8 {
+        last_op =
+            parse_record_flow_op_id(&source.command(&format!("RECORD_FLOW_ID 92001 flow-{idx}")));
+        for receiver in [&receiver_a, &receiver_b, &receiver_c] {
+            source.command(&format!("PUSH {}", receiver.node_id));
+        }
+    }
+    source.command(&format!("WAIT_ACKS {} 3", last_op));
+    receiver_a.command("WAIT_FLOW_NAME flow-7");
+    receiver_b.command("WAIT_FLOW_NAME flow-7");
+    receiver_c.command("WAIT_FLOW_NAME flow-7");
+}
+
 fn connect_nodes(source: &mut ChildNode, receiver: &mut ChildNode) {
     source.command(&format!(
         "TRUST {} {}",
@@ -400,11 +506,24 @@ fn parse_record_core_suite_op_ids(line: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_snapshot_line(line: &str) -> (u64, String) {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    (
+        parts
+            .get(3)
+            .expect("snapshot sequence")
+            .parse()
+            .expect("snapshot sequence number"),
+        parts.get(4).expect("snapshot id").to_string(),
+    )
+}
+
 async fn child_main() {
     let home = PathBuf::from(std::env::var("TENTAFLOW_PROCESS_E2E_HOME").expect("child home env"));
     std::fs::create_dir_all(home.join("data")).expect("home data");
     unsafe {
         std::env::set_var("TENTAFLOW_HOME", &home);
+        std::env::set_var("HOME", &home);
     }
 
     let db = tentaflow_core::db::init(&home.join("data").join("tentaflow.db")).expect("db");
@@ -475,16 +594,29 @@ async fn child_main() {
                     else {
                         continue;
                     };
-                    let MeshSyncPullResult::Operations(response) = result else {
-                        continue;
-                    };
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response)
-                        .map(|bytes| bytes.to_vec())
-                        .expect("encode pull response");
-                    mesh_for_events
-                        .send_sync_pull_response(&from_node_id, &bytes)
-                        .await
-                        .expect("send pull response");
+                    match result {
+                        MeshSyncPullResult::Operations(response) => {
+                            mesh_for_events
+                                .send_sync_pull_response(
+                                    &from_node_id,
+                                    &rkyv::to_bytes::<rkyv::rancor::Error>(&response)
+                                        .map(|bytes| bytes.to_vec())
+                                        .expect("encode pull response"),
+                                )
+                                .await
+                        }
+                        MeshSyncPullResult::Snapshot(response) => {
+                            mesh_for_events
+                                .send_sync_snapshot_response(
+                                    &from_node_id,
+                                    &rkyv::to_bytes::<rkyv::rancor::Error>(&response)
+                                        .map(|bytes| bytes.to_vec())
+                                        .expect("encode snapshot response"),
+                                )
+                                .await
+                        }
+                    }
+                    .expect("send pull result");
                 }
                 Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data }) => {
                     let payload = rkyv::from_bytes::<
@@ -501,11 +633,57 @@ async fn child_main() {
                     };
                     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
                         .map(|bytes| bytes.to_vec())
-                        .expect("encode pull ack");
+                        .expect("encode ack");
                     mesh_for_events
                         .send_sync_ack(&from_node_id, &bytes)
                         .await
                         .expect("send pull ack");
+                }
+                Ok(IrohMeshEvent::SyncSnapshotPullReceived { from_node_id, data }) => {
+                    let payload = rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncSnapshotPullPayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    .expect("decode sync snapshot pull");
+                    let Some(response) =
+                        tentaflow_core::sync::runtime::handle_snapshot_pull_payload(
+                            &from_node_id,
+                            payload,
+                        )
+                        .expect("handle snapshot pull")
+                    else {
+                        continue;
+                    };
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response)
+                        .map(|bytes| bytes.to_vec())
+                        .expect("encode snapshot response");
+                    mesh_for_events
+                        .send_sync_snapshot_response(&from_node_id, &bytes)
+                        .await
+                        .expect("send snapshot response");
+                }
+                Ok(IrohMeshEvent::SyncSnapshotResponseReceived { from_node_id, data }) => {
+                    let payload = rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    .expect("decode sync snapshot response");
+                    let Some(ack) =
+                        tentaflow_core::sync::runtime::handle_snapshot_response_payload(
+                            &from_node_id,
+                            payload,
+                        )
+                        .expect("handle snapshot response")
+                    else {
+                        continue;
+                    };
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+                        .map(|bytes| bytes.to_vec())
+                        .expect("encode snapshot ack");
+                    mesh_for_events
+                        .send_sync_ack(&from_node_id, &bytes)
+                        .await
+                        .expect("send snapshot ack");
                 }
                 Ok(IrohMeshEvent::PeerConnected { .. }) => {}
                 Ok(_) => {}
@@ -571,6 +749,10 @@ async fn handle_child_command(
             seed_receiver_core_suite(db, local_node_id, &security.public_key_hex())?;
             Ok("SEED_RECEIVER_CORE_SUITE".to_string())
         }
+        ["SEED_SQL_RECEIVER"] => {
+            seed_sql_receiver(db, local_node_id, &security.public_key_hex())?;
+            Ok("SEED_SQL_RECEIVER".to_string())
+        }
         ["SEED_SOURCE", count, rest @ ..] => {
             let count = count.parse::<usize>()?;
             anyhow::ensure!(rest.len() == count * 2, "target tuple count mismatch");
@@ -582,6 +764,14 @@ async fn handle_child_command(
             anyhow::ensure!(rest.len() == count * 2, "target tuple count mismatch");
             seed_source_core_suite(db, rest)?;
             Ok("SEED_SOURCE_CORE_SUITE".to_string())
+        }
+        ["SEED_SQL_SOURCE", count, allowed_count, rest @ ..] => {
+            let count = count.parse::<usize>()?;
+            let allowed_count = allowed_count.parse::<usize>()?;
+            anyhow::ensure!(rest.len() == count * 2, "target tuple count mismatch");
+            anyhow::ensure!(allowed_count <= count, "allowed target count mismatch");
+            seed_sql_source(db, rest, allowed_count)?;
+            Ok("SEED_SQL_SOURCE".to_string())
         }
         ["SEED_SOURCE_ALLOWED", count, allowed_count, rest @ ..] => {
             let count = count.parse::<usize>()?;
@@ -600,6 +790,14 @@ async fn handle_child_command(
                 .expect("runtime initialized");
             Ok(format!("RECORD_FLOW {}", result.op_id.to_hex()))
         }
+        ["RECORD_FLOW_ID", resource_id, name] => {
+            let result = tentaflow_core::sync::runtime::record_core_capture(core_flow_capture_id(
+                resource_id,
+                name,
+            ))?
+            .expect("runtime initialized");
+            Ok(format!("RECORD_FLOW_ID {}", result.op_id.to_hex()))
+        }
         ["RECORD_CORE_SUITE"] => {
             let op_ids = record_core_suite()?
                 .into_iter()
@@ -607,6 +805,39 @@ async fn handle_child_command(
                 .collect::<Vec<_>>()
                 .join(" ");
             Ok(format!("RECORD_CORE_SUITE {op_ids}"))
+        }
+        ["RECORD_SQL_INSERT", name] => {
+            let result = tentaflow_core::sync::runtime::record_sql_capture(sql_capture(
+                SqlWriteAction::Insert,
+                name,
+            ))?
+            .expect("runtime initialized");
+            Ok(format!("RECORD_SQL_INSERT {}", result.op_id.to_hex()))
+        }
+        ["RECORD_SQL_UPDATE", name] => {
+            let result = tentaflow_core::sync::runtime::record_sql_capture(sql_capture(
+                SqlWriteAction::Update,
+                name,
+            ))?
+            .expect("runtime initialized");
+            Ok(format!("RECORD_SQL_UPDATE {}", result.op_id.to_hex()))
+        }
+        ["LOCAL_SQL_INSERT", name] => {
+            local_sql_insert(name)?;
+            Ok("LOCAL_SQL_INSERT".to_string())
+        }
+        ["BUILD_SQL_SNAPSHOT", sequence] => {
+            let sequence = sequence.parse::<u64>()?;
+            let snapshot = tentaflow_core::sync::runtime::build_sql_snapshot_package(
+                SNAPSHOT_PARTITION,
+                Some(sequence),
+            )?
+            .expect("snapshot built");
+            Ok(format!(
+                "BUILD_SQL_SNAPSHOT {} {}",
+                snapshot.up_to_sequence,
+                snapshot.snapshot_id.as_str()
+            ))
         }
         ["ASSERT_NO_PAYLOAD", target] => {
             anyhow::ensure!(
@@ -628,13 +859,37 @@ async fn handle_child_command(
             send_repair_pull(mesh, peer).await?;
             Ok("SEND_REPAIR".to_string())
         }
+        ["SEND_SNAPSHOT", peer, sequence, snapshot_id] => {
+            send_snapshot_pull(mesh, peer, sequence.parse()?, snapshot_id).await?;
+            Ok("SEND_SNAPSHOT".to_string())
+        }
+        ["ASSERT_REPAIR_DENIED", peer] => {
+            assert_repair_denied(peer)?;
+            Ok("ASSERT_REPAIR_DENIED".to_string())
+        }
+        ["ASSERT_SNAPSHOT_DENIED", peer, sequence, snapshot_id] => {
+            assert_snapshot_denied(peer, sequence.parse()?, snapshot_id)?;
+            Ok("ASSERT_SNAPSHOT_DENIED".to_string())
+        }
         ["WAIT_FLOW"] => {
             wait_for_flow(db).await?;
             Ok("WAIT_FLOW".to_string())
         }
+        ["WAIT_FLOW_NAME", name] => {
+            wait_for_flow_name(db, name).await?;
+            Ok("WAIT_FLOW_NAME".to_string())
+        }
         ["WAIT_CORE_SUITE"] => {
             wait_for_core_suite(db).await?;
             Ok("WAIT_CORE_SUITE".to_string())
+        }
+        ["WAIT_SQL_NAME", name] => {
+            wait_for_sql_name(name).await?;
+            Ok("WAIT_SQL_NAME".to_string())
+        }
+        ["WAIT_SQL_CONFLICT"] => {
+            wait_for_sql_conflict().await?;
+            Ok("WAIT_SQL_CONFLICT".to_string())
         }
         ["ASSERT_NO_FLOW"] => {
             assert_no_flow(db).await?;
@@ -681,6 +936,69 @@ async fn send_repair_pull(mesh: &IrohMeshManager, peer: &str) -> anyhow::Result<
         return Ok(());
     }
     anyhow::bail!("repair pull not queued for {peer}")
+}
+
+async fn send_snapshot_pull(
+    mesh: &IrohMeshManager,
+    peer: &str,
+    up_to_sequence: u64,
+    snapshot_id: &str,
+) -> anyhow::Result<()> {
+    let payload = tentaflow_core::sync::runtime::build_snapshot_pull_payload(
+        SNAPSHOT_PARTITION,
+        up_to_sequence,
+        snapshot_id,
+        true,
+        64,
+    )?
+    .expect("runtime initialized");
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+        .map(|bytes| bytes.to_vec())
+        .expect("encode snapshot pull");
+    mesh.send_sync_snapshot_pull(peer, &bytes).await?;
+    Ok(())
+}
+
+fn assert_repair_denied(peer: &str) -> anyhow::Result<()> {
+    let payload = tentaflow_protocol::mesh::MeshSyncPullPayload {
+        from_node_id: peer.to_string(),
+        partition_id: SNAPSHOT_PARTITION.to_string(),
+        from_sequence: 1,
+        limit: 64,
+    };
+    let error = match tentaflow_core::sync::runtime::handle_pull_payload(peer, payload) {
+        Ok(_) => anyhow::bail!("repair pull must be denied"),
+        Err(error) => error,
+    };
+    anyhow::ensure!(
+        error.to_string().contains("is not a sync target"),
+        "unexpected repair denial: {error}"
+    );
+    Ok(())
+}
+
+fn assert_snapshot_denied(
+    peer: &str,
+    up_to_sequence: u64,
+    snapshot_id: &str,
+) -> anyhow::Result<()> {
+    let payload = tentaflow_protocol::mesh::MeshSyncSnapshotPullPayload {
+        from_node_id: peer.to_string(),
+        partition_id: SNAPSHOT_PARTITION.to_string(),
+        up_to_sequence,
+        snapshot_id: snapshot_id.to_string(),
+        include_tail: true,
+        tail_limit: 64,
+    };
+    let error = match tentaflow_core::sync::runtime::handle_snapshot_pull_payload(peer, payload) {
+        Ok(_) => anyhow::bail!("snapshot pull must be denied"),
+        Err(error) => error,
+    };
+    anyhow::ensure!(
+        error.to_string().contains("is not a sync target"),
+        "unexpected snapshot denial: {error}"
+    );
+    Ok(())
 }
 
 fn seed_receiver(
@@ -748,6 +1066,39 @@ fn seed_receiver_core_suite(
     Ok(())
 }
 
+fn seed_sql_receiver(
+    db: &tentaflow_core::db::DbPool,
+    local_node_id: &str,
+    public_key: &str,
+) -> anyhow::Result<()> {
+    repository::upsert_sync_node_identity(
+        db,
+        local_node_id,
+        public_key,
+        "ed25519",
+        "Process SQL Receiver",
+        "authority",
+        "trusted",
+        None,
+        "authority",
+    )?;
+    repository::upsert_sync_policy(
+        db,
+        "process-sql-receiver",
+        "org-default",
+        SNAPSHOT_ADDON_ID,
+        Some("person"),
+        None,
+        "authority_write",
+        Some(local_node_id),
+        None,
+        true,
+    )?;
+    open_sql_table()?;
+    reset_sql_table()?;
+    Ok(())
+}
+
 fn seed_source(db: &tentaflow_core::db::DbPool, targets: &[&str]) -> anyhow::Result<()> {
     seed_source_with_allowed_targets(db, targets, targets.len() / 2)
 }
@@ -784,6 +1135,56 @@ fn seed_source_core_suite(db: &tentaflow_core::db::DbPool, targets: &[&str]) -> 
         )?;
         grant_core_suite_target(db, node_id)?;
     }
+    Ok(())
+}
+
+fn seed_sql_source(
+    db: &tentaflow_core::db::DbPool,
+    targets: &[&str],
+    allowed_count: usize,
+) -> anyhow::Result<()> {
+    repository::upsert_sync_policy(
+        db,
+        "process-sql-source",
+        "org-default",
+        SNAPSHOT_ADDON_ID,
+        Some("person"),
+        None,
+        "replicated_by_permission",
+        None,
+        None,
+        true,
+    )?;
+    for (idx, pair) in targets.chunks_exact(2).enumerate() {
+        let node_id = pair[0];
+        let public_key = pair[1];
+        repository::upsert_sync_node_identity(
+            db,
+            node_id,
+            public_key,
+            "ed25519",
+            &format!("Process SQL Receiver {idx}"),
+            "server",
+            "trusted",
+            None,
+            "standard",
+        )?;
+        if idx < allowed_count {
+            repository::grant_sync_explicit_share(
+                db,
+                "org-default",
+                SNAPSHOT_ADDON_ID,
+                "person",
+                "person-1",
+                "node",
+                node_id,
+                "sync_receive",
+                Some(1),
+            )?;
+        }
+    }
+    open_sql_table()?;
+    reset_sql_table()?;
     Ok(())
 }
 
@@ -887,11 +1288,12 @@ fn core_suite_resources() -> [(CoreSyncResourceKind, &'static str); 9] {
 }
 
 fn core_flow_capture() -> CoreWriteCapture {
+    core_flow_capture_id(FLOW_ID, "Process Four Node Flow")
+}
+
+fn core_flow_capture_id(resource_id: &str, name: &str) -> CoreWriteCapture {
     let mut fields = BTreeMap::new();
-    fields.insert(
-        "name".to_string(),
-        FieldValue::String("Process Four Node Flow".to_string()),
-    );
+    fields.insert("name".to_string(), FieldValue::String(name.to_string()));
     fields.insert("is_default".to_string(), FieldValue::Bool(false));
     fields.insert(
         "flow_json".to_string(),
@@ -904,7 +1306,7 @@ fn core_flow_capture() -> CoreWriteCapture {
     CoreWriteCapture::new(
         CoreSyncResourceKind::Flow,
         "org-default",
-        FLOW_ID,
+        resource_id,
         SqlWriteAction::Insert,
         fields,
         Some(1),
@@ -1127,17 +1529,93 @@ fn core_suite_flow_capture() -> CoreWriteCapture {
     )
 }
 
+fn open_sql_table() -> anyhow::Result<()> {
+    let pool = tentaflow_core::addon::storage_sql::open_addon_db("org-default", SNAPSHOT_ADDON_ID)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let conn = pool.get().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn reset_sql_table() -> anyhow::Result<()> {
+    let pool = tentaflow_core::addon::storage_sql::open_addon_db("org-default", SNAPSHOT_ADDON_ID)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let conn = pool.get().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    conn.execute("DELETE FROM contacts", [])?;
+    let _ = conn.execute("DELETE FROM __tentaflow_sync_conflicts", []);
+    Ok(())
+}
+
+fn sql_capture(action: SqlWriteAction, name: &str) -> SqlWriteCapture {
+    let (query, params) = match action {
+        SqlWriteAction::Insert => (
+            "INSERT INTO contacts (id, name) VALUES (?1, ?2)".to_string(),
+            vec![JsonValue::from(1), JsonValue::String(name.to_string())],
+        ),
+        SqlWriteAction::Update => (
+            "UPDATE contacts SET name = ?1 WHERE id = ?2".to_string(),
+            vec![JsonValue::String(name.to_string()), JsonValue::from(1)],
+        ),
+        SqlWriteAction::Delete => (
+            "DELETE FROM contacts WHERE id = ?1".to_string(),
+            vec![JsonValue::from(1)],
+        ),
+    };
+    SqlWriteCapture {
+        capture_id: format!(
+            "{}-{}-{}",
+            SNAPSHOT_ADDON_ID,
+            action.as_str(),
+            name.replace(' ', "-")
+        ),
+        org_id: "org-default".to_string(),
+        addon_id: SNAPSHOT_ADDON_ID.to_string(),
+        table_name: "contacts".to_string(),
+        action,
+        resource_type: "person".to_string(),
+        resource_id: "person-1".to_string(),
+        query,
+        params,
+        rows_affected: 1,
+        last_insert_id: 1,
+        actor_user_id: Some(7),
+        created_at_ms: tentaflow_core::sync::runtime::now_ms(),
+    }
+}
+
+fn local_sql_insert(name: &str) -> anyhow::Result<()> {
+    open_sql_table()?;
+    let pool = tentaflow_core::addon::storage_sql::open_addon_db("org-default", SNAPSHOT_ADDON_ID)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let conn = pool.get().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    conn.execute(
+        "INSERT INTO contacts (id, name) VALUES (?1, ?2)",
+        rusqlite::params![1_i64, name],
+    )?;
+    Ok(())
+}
+
 async fn wait_for_flow(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
+    wait_for_flow_name(db, "Process Four Node Flow").await
+}
+
+async fn wait_for_flow_name(
+    db: &tentaflow_core::db::DbPool,
+    expected_name: &str,
+) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         if let Some(flow) = repository::get_flow(db, FLOW_ID.parse()?)? {
-            if flow.name == "Process Four Node Flow" {
+            if flow.name == expected_name {
                 return Ok(());
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    anyhow::bail!("flow not materialized")
+    anyhow::bail!("flow not materialized as {expected_name}")
 }
 
 async fn wait_for_core_suite(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
@@ -1151,6 +1629,46 @@ async fn wait_for_core_suite(db: &tentaflow_core::db::DbPool) -> anyhow::Result<
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("core suite not materialized: {status}")
+}
+
+async fn wait_for_sql_name(expected: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        open_sql_table()?;
+        let pool =
+            tentaflow_core::addon::storage_sql::open_addon_db("org-default", SNAPSHOT_ADDON_ID)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let value = {
+            let conn = pool.get().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            conn.query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+        };
+        if value.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("sql name not materialized: expected {expected}")
+}
+
+async fn wait_for_sql_conflict() -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        open_sql_table()?;
+        let conflicts = tentaflow_core::addon::storage_sql_exec::list_sync_conflicts(
+            "org-default",
+            SNAPSHOT_ADDON_ID,
+            Some("open"),
+            10,
+        )?;
+        if !conflicts.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("sql conflict not recorded")
 }
 
 fn core_suite_status(db: &tentaflow_core::db::DbPool) -> anyhow::Result<String> {

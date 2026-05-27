@@ -787,7 +787,7 @@ fn encode_snapshot_sql_blob(blob: &SnapshotSqlBlobPackage) -> LedgerResult<Vec<u
     Ok(bytes)
 }
 
-fn decode_snapshot_sql_blob(bytes: &[u8]) -> LedgerResult<SnapshotSqlBlobPackage> {
+pub(crate) fn decode_snapshot_sql_blob(bytes: &[u8]) -> LedgerResult<SnapshotSqlBlobPackage> {
     let Some(payload) = bytes.strip_prefix(SNAPSHOT_SQL_BLOB_DOMAIN) else {
         return Err(SyncLedgerError::Runtime(
             "snapshot sql blob has invalid domain".to_string(),
