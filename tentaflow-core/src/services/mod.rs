@@ -23,6 +23,8 @@ pub mod catalog;
 pub mod deploy;
 pub mod frame_proxy;
 pub mod frame_storage;
+#[cfg(feature = "camera")]
+pub mod gstreamer_runtime;
 pub mod handles_cache;
 pub mod key_storage;
 pub mod legal;

@@ -224,15 +224,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "core_sync_captures",
             MigrationStep::Sql(CORE_SYNC_CAPTURES),
         ),
-        (
-            46,
-            "kv_sync_captures",
-            MigrationStep::Sql(KV_SYNC_CAPTURES),
-        ),
+        (46, "kv_sync_captures", MigrationStep::Sql(KV_SYNC_CAPTURES)),
         (
             47,
             "blob_sync_captures",
             MigrationStep::Sql(BLOB_SYNC_CAPTURES),
+        ),
+        (
+            48,
+            "cameras_vendor_check_local_sources",
+            MigrationStep::Sql(CAMERAS_VENDOR_CHECK_LOCAL_SOURCES),
         ),
     ]
 }
@@ -1339,6 +1340,61 @@ SELECT
     credentials_encrypted, profile, target_fps, resolution_width,
     resolution_height, retention_class, status, status_message,
     fps_actual, last_frame_at, created_at, updated_at, removed_at
+FROM cameras;
+
+DROP TABLE cameras;
+ALTER TABLE cameras_new RENAME TO cameras;
+
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+
+PRAGMA foreign_keys = ON;
+"#;
+
+const CAMERAS_VENDOR_CHECK_LOCAL_SOURCES: &str = r#"
+PRAGMA foreign_keys = OFF;
+
+DROP TABLE IF EXISTS cameras_new;
+
+CREATE TABLE cameras_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    owner_addon_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    vendor TEXT NOT NULL CHECK(vendor IN ('fake_file', 'rtsp', 'onvif', 'local_camera', 'v4l2')),
+    url TEXT NOT NULL,
+    credentials_encrypted BLOB NULL,
+    profile TEXT NOT NULL DEFAULT 'default',
+    target_fps INTEGER NOT NULL DEFAULT 30 CHECK(target_fps > 0 AND target_fps <= 60),
+    resolution_width INTEGER NULL,
+    resolution_height INTEGER NULL,
+    retention_class TEXT NOT NULL DEFAULT 'C' CHECK(retention_class IN ('A','B','C','Unclassified')),
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('offline','online','error','starting','stopping')),
+    status_message TEXT NULL,
+    fps_actual REAL NULL,
+    last_frame_at INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    removed_at INTEGER NULL,
+    onvif_url TEXT NULL,
+    onvif_profile_token TEXT NULL,
+    metadata_supported INTEGER NOT NULL DEFAULT 0 CHECK(metadata_supported IN (0,1))
+);
+
+INSERT INTO cameras_new (
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at,
+    onvif_url, onvif_profile_token, metadata_supported
+)
+SELECT
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at,
+    onvif_url, onvif_profile_token, metadata_supported
 FROM cameras;
 
 DROP TABLE cameras;

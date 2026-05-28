@@ -108,6 +108,134 @@ run_privileged() {
     fi
 }
 
+configure_macos_gstreamer_pkg_config() {
+    if [[ "$DISTRO" != "macos" ]]; then
+        return
+    fi
+
+    local paths=()
+    local runtime_lib_paths=()
+    local typelib_paths=()
+    local plugin_paths=()
+    local scanner_path=""
+    local brew_prefix
+    brew_prefix=$(brew --prefix 2>/dev/null || true)
+    if [[ -n "$brew_prefix" ]]; then
+        paths+=("$brew_prefix/lib/pkgconfig" "$brew_prefix/share/pkgconfig")
+        runtime_lib_paths+=("$brew_prefix/lib")
+        typelib_paths+=("$brew_prefix/lib/girepository-1.0")
+        plugin_paths+=("$brew_prefix/lib/gstreamer-1.0")
+        if [[ -x "$brew_prefix/libexec/gstreamer-1.0/gst-plugin-scanner" ]]; then
+            scanner_path="$brew_prefix/libexec/gstreamer-1.0/gst-plugin-scanner"
+        fi
+    fi
+
+    local formula_prefix
+    for formula in glib gstreamer gst-plugins-base; do
+        formula_prefix=$(brew --prefix "$formula" 2>/dev/null || true)
+        if [[ -n "$formula_prefix" ]]; then
+            paths+=("$formula_prefix/lib/pkgconfig" "$formula_prefix/share/pkgconfig")
+        fi
+    done
+
+    if [[ -d "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig" ]]; then
+        paths+=("/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig")
+        runtime_lib_paths+=("/Library/Frameworks/GStreamer.framework/Versions/1.0/lib")
+        typelib_paths+=("/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/girepository-1.0")
+        plugin_paths+=("/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/gstreamer-1.0")
+        if [[ -x "/Library/Frameworks/GStreamer.framework/Versions/1.0/libexec/gstreamer-1.0/gst-plugin-scanner" ]]; then
+            scanner_path="/Library/Frameworks/GStreamer.framework/Versions/1.0/libexec/gstreamer-1.0/gst-plugin-scanner"
+        fi
+    fi
+
+    local joined=""
+    local runtime_lib_joined=""
+    local typelib_joined=""
+    local plugin_joined=""
+    local p
+    for p in "${paths[@]}"; do
+        [[ -d "$p" ]] || continue
+        case ":$joined:" in
+            *":$p:"*) ;;
+            *) joined="${joined:+$joined:}$p" ;;
+        esac
+    done
+    for p in "${runtime_lib_paths[@]}"; do
+        [[ -d "$p" ]] || continue
+        case ":$runtime_lib_joined:" in
+            *":$p:"*) ;;
+            *) runtime_lib_joined="${runtime_lib_joined:+$runtime_lib_joined:}$p" ;;
+        esac
+    done
+    for p in "${typelib_paths[@]}"; do
+        [[ -d "$p" ]] || continue
+        case ":$typelib_joined:" in
+            *":$p:"*) ;;
+            *) typelib_joined="${typelib_joined:+$typelib_joined:}$p" ;;
+        esac
+    done
+    for p in "${plugin_paths[@]}"; do
+        [[ -d "$p" ]] || continue
+        case ":$plugin_joined:" in
+            *":$p:"*) ;;
+            *) plugin_joined="${plugin_joined:+$plugin_joined:}$p" ;;
+        esac
+    done
+
+    if [[ -n "$joined" ]]; then
+        export PKG_CONFIG_PATH="${joined}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        log_ok "PKG_CONFIG_PATH dla GStreamer/macOS: $joined"
+        if [[ -n "$runtime_lib_joined" ]]; then
+            export DYLD_FALLBACK_LIBRARY_PATH="${runtime_lib_joined}${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+        fi
+        if [[ -n "$typelib_joined" ]]; then
+            export GI_TYPELIB_PATH="${typelib_joined}${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+        fi
+        if [[ -n "$plugin_joined" ]]; then
+            export GST_PLUGIN_SYSTEM_PATH_1_0="${plugin_joined}${GST_PLUGIN_SYSTEM_PATH_1_0:+:$GST_PLUGIN_SYSTEM_PATH_1_0}"
+        fi
+        if [[ -n "$scanner_path" ]]; then
+            export GST_PLUGIN_SCANNER="$scanner_path"
+        fi
+
+        local profile_file="$HOME/.zprofile"
+        if [[ -n "${SHELL:-}" && "${SHELL##*/}" == "bash" ]]; then
+            profile_file="$HOME/.bash_profile"
+        fi
+        local marker_begin="# >>> tentaflow gstreamer pkg-config >>>"
+        local marker_end="# <<< tentaflow gstreamer pkg-config <<<"
+        local tmp_file
+        tmp_file="$(mktemp)"
+        if [[ -f "$profile_file" ]]; then
+            awk -v begin="$marker_begin" -v end="$marker_end" '
+                $0 == begin { skip = 1; next }
+                $0 == end { skip = 0; next }
+                !skip { print }
+            ' "$profile_file" > "$tmp_file"
+        fi
+        {
+            cat "$tmp_file"
+            printf '\n%s\n' "$marker_begin"
+            printf 'export PKG_CONFIG_PATH="%s${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"\n' "$joined"
+            if [[ -n "$runtime_lib_joined" ]]; then
+                printf 'export DYLD_FALLBACK_LIBRARY_PATH="%s${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"\n' "$runtime_lib_joined"
+            fi
+            if [[ -n "$typelib_joined" ]]; then
+                printf 'export GI_TYPELIB_PATH="%s${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"\n' "$typelib_joined"
+            fi
+            if [[ -n "$plugin_joined" ]]; then
+                printf 'export GST_PLUGIN_SYSTEM_PATH_1_0="%s${GST_PLUGIN_SYSTEM_PATH_1_0:+:$GST_PLUGIN_SYSTEM_PATH_1_0}"\n' "$plugin_joined"
+            fi
+            if [[ -n "$scanner_path" ]]; then
+                printf 'export GST_PLUGIN_SCANNER="%s"\n' "$scanner_path"
+            fi
+            printf '%s\n' "$marker_end"
+        } > "$profile_file"
+        rm -f "$tmp_file"
+        log_ok "Zapisano GStreamer PKG_CONFIG_PATH w $profile_file"
+    fi
+}
+
 # --- Detekcja dystrybucji ---
 
 detect_distro() {
@@ -262,6 +390,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             brew install "${pkgs[@]}"
+            configure_macos_gstreamer_pkg_config
             INSTALLED+=("cmake" "llvm (clang+lld)" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
             ;;
     esac
@@ -862,7 +991,11 @@ verify_installation() {
             arch)   log_error "  Zainstaluj: sudo pacman -S --needed glib2 pkg-config" ;;
             debian) log_error "  Zainstaluj: sudo apt-get install -y libglib2.0-dev pkg-config" ;;
             fedora) log_error "  Zainstaluj: sudo dnf install -y glib2-devel pkg-config" ;;
-            macos)  log_error "  Zainstaluj: brew install glib pkg-config" ;;
+            macos)
+                log_error "  Zainstaluj: brew install glib pkg-config"
+                log_error "  Albo zainstaluj oficjalny GStreamer framework i ustaw:"
+                log_error "  export PKG_CONFIG_PATH=/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig:\$PKG_CONFIG_PATH"
+                ;;
         esac
         log_error "  Sprawdz: pkg-config --modversion glib-2.0"
         ok=false
@@ -879,7 +1012,11 @@ verify_installation() {
             arch)   log_error "  Zainstaluj: sudo pacman -S --needed gstreamer gst-plugins-base-libs pkg-config" ;;
             debian) log_error "  Zainstaluj: sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev pkg-config" ;;
             fedora) log_error "  Zainstaluj: sudo dnf install -y gstreamer1-devel gstreamer1-plugins-base-devel pkg-config" ;;
-            macos)  log_error "  Zainstaluj: brew install gstreamer gst-plugins-base pkg-config" ;;
+            macos)
+                log_error "  Zainstaluj: brew install gstreamer gst-plugins-base pkg-config"
+                log_error "  Albo zainstaluj oficjalny GStreamer framework i ustaw:"
+                log_error "  export PKG_CONFIG_PATH=/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig:\$PKG_CONFIG_PATH"
+                ;;
         esac
         log_error "  Sprawdz: pkg-config --modversion gstreamer-1.0"
         log_error "  Sprawdz: pkg-config --modversion gstreamer-app-1.0"

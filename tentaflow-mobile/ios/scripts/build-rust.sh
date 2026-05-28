@@ -59,6 +59,50 @@ IOS_MIN_VERSION="16.0"
 rustup target add "$DEVICE_TARGET" 2>/dev/null || true
 rustup target add "$SIMULATOR_TARGET" 2>/dev/null || true
 
+find_gstreamer_pkg_config_dir() {
+    local root="${GSTREAMER_IOS_ROOT:-}"
+    local candidates=()
+    if [ -n "$root" ]; then
+        candidates+=(
+            "$root/lib/pkgconfig"
+            "$root/GStreamer.framework/Versions/1.0/lib/pkgconfig"
+            "$root/Versions/1.0/lib/pkgconfig"
+        )
+    fi
+    candidates+=(
+        "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig"
+        "$HOME/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig"
+    )
+
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate/gstreamer-1.0.pc" ] && [ -f "$candidate/gstreamer-app-1.0.pc" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+configure_gstreamer_ios() {
+    local pkg_config_dir
+    if ! pkg_config_dir="$(find_gstreamer_pkg_config_dir)"; then
+        echo "ERROR: Nie znaleziono GStreamer iOS SDK."
+        echo "Zainstaluj oficjalny GStreamer iOS framework albo ustaw GSTREAMER_IOS_ROOT."
+        echo "Oczekiwany plik: GStreamer.framework/Versions/1.0/lib/pkgconfig/gstreamer-1.0.pc"
+        exit 1
+    fi
+
+    export PKG_CONFIG_ALLOW_CROSS=1
+    export PKG_CONFIG_PATH_aarch64_apple_ios="$pkg_config_dir"
+    export PKG_CONFIG_PATH_aarch64_apple_ios_sim="$pkg_config_dir"
+    export PKG_CONFIG_PATH="${pkg_config_dir}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    echo "GStreamer iOS pkg-config: $pkg_config_dir"
+}
+
+configure_gstreamer_ios
+
 BUILD_MODE="${1:-release}"
 CARGO_FLAGS=""
 OUTPUT_DIR="debug"

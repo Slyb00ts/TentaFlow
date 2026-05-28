@@ -47,7 +47,7 @@ function Invoke-NativeCapture {
 
 # Wersja MUSI byc zgodna z dependency w tentaflow-protocol-wasm/Cargo.toml
 # oraz z hardkodowana wartoscia w tentaflow-core/build.rs.
-$WasmBindgenVersion = '0.2.108'
+$WasmBindgenVersion = '0.2.120'
 
 # Lista zainstalowanych komponentow (do podsumowania)
 $script:Installed = @()
@@ -138,6 +138,33 @@ function Add-PersistentPath {
     if (-not (($env:Path -split ';') -contains $Path)) {
         $env:Path = "$env:Path;$Path"
     }
+}
+
+function Add-PersistentPathList {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string[]]$Paths,
+        [ValidateSet('User','Machine')][string]$Scope = 'User'
+    )
+    $existing = [Environment]::GetEnvironmentVariable($Name, $Scope)
+    $entries = @()
+    if ($existing) {
+        $entries = ($existing -split ';') | Where-Object { $_ -and $_.Trim() }
+    }
+    foreach ($path in $Paths) {
+        if (-not (Test-Path $path)) {
+            Log-Warn "Sciezka nie istnieje, pomijam $($Name): $path"
+            continue
+        }
+        if ($entries -notcontains $path) {
+            $entries += $path
+        }
+    }
+    if ($entries.Count -eq 0) { return }
+    $value = $entries -join ';'
+    [Environment]::SetEnvironmentVariable($Name, $value, $Scope)
+    Set-Item -Path "Env:$Name" -Value $value
+    Log-Ok "Ustawiono $Name=$value (scope: $Scope)"
 }
 
 function Winget-Install {
@@ -311,6 +338,7 @@ function Install-Base {
     Configure-Protoc
 
     Configure-CmakeGenerator
+    Configure-Gstreamer
 
     Refresh-Path
     Log-Ok "Bazowe narzedzia zainstalowane"
@@ -342,6 +370,60 @@ function Configure-CmakeGenerator {
     }
     Set-PersistentEnv -Name 'CMAKE_GENERATOR' -Value 'Ninja' -Scope 'User'
     $script:Installed += 'CMAKE_GENERATOR = Ninja (omija MSBuild bug VCEnd)'
+}
+
+function Find-GstreamerInstall {
+    $roots = @(
+        'C:\gstreamer\1.0\msvc_x86_64',
+        'C:\gstreamer\1.0\mingw_x86_64',
+        "$env:ProgramFiles\gstreamer\1.0\msvc_x86_64",
+        "$env:ProgramFiles\gstreamer\1.0\mingw_x86_64",
+        "${env:ProgramFiles(x86)}\gstreamer\1.0\msvc_x86_64",
+        "${env:ProgramFiles(x86)}\gstreamer\1.0\mingw_x86_64"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    foreach ($root in $roots) {
+        $pc = Join-Path $root 'lib\pkgconfig\gstreamer-1.0.pc'
+        if (Test-Path $pc) { return $root }
+    }
+
+    foreach ($base in @('C:\gstreamer', $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $base -or -not (Test-Path $base)) { continue }
+        $pc = Get-ChildItem $base -Recurse -Filter 'gstreamer-1.0.pc' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($pc) {
+            return (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $pc.FullName)))
+        }
+    }
+
+    return $null
+}
+
+function Configure-Gstreamer {
+    Log-Section "GStreamer SDK (kamera, RTSP, file, lokalne zrodla wideo)"
+
+    $root = Find-GstreamerInstall
+    if (-not $root) {
+        Log-Info "Nie znaleziono GStreamer SDK, probuje instalacji przez winget..."
+        Winget-Install -Id 'gstreamerproject.gstreamer' -Label 'GStreamer SDK' | Out-Null
+        Refresh-Path
+        $root = Find-GstreamerInstall
+    }
+
+    if (-not $root) {
+        Log-Error "Nie znaleziono GStreamer SDK."
+        Log-Error "Zainstaluj runtime + development files ze strony:"
+        Log-Error "  https://gstreamer.freedesktop.org/download/#windows"
+        Log-Error "Wybierz wariant MSVC x86_64 i upewnij sie, ze istnieje lib\pkgconfig\gstreamer-1.0.pc."
+        return
+    }
+
+    $pkgConfigDir = Join-Path $root 'lib\pkgconfig'
+    $binDir = Join-Path $root 'bin'
+    Add-PersistentPathList -Name 'PKG_CONFIG_PATH' -Paths @($pkgConfigDir) -Scope 'User'
+    Add-PersistentPath -Path $binDir -Scope 'User'
+    Set-PersistentEnv -Name 'GSTREAMER_1_0_ROOT_MSVC_X86_64' -Value "$root\" -Scope 'User'
+    $script:Installed += "GStreamer SDK = $root"
 }
 
 # --- Rust toolchain ---
@@ -673,6 +755,23 @@ function Verify-Installation {
         Log-Ok "LIBCLANG_PATH: $env:LIBCLANG_PATH (libclang.dll obecny)"
     } else {
         Log-Error "LIBCLANG_PATH nie wskazuje na katalog z libclang.dll — bindgen nie zadziala"
+        $ok = $false
+    }
+
+    if (Test-Command 'pkg-config') {
+        Invoke-NativeCapture { pkg-config --exists 'gstreamer-1.0 >= 1.14' 'gstreamer-app-1.0 >= 1.14' } | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $gstCore = Invoke-NativeCapture { pkg-config --modversion gstreamer-1.0 } | Select-Object -First 1
+            $gstApp = Invoke-NativeCapture { pkg-config --modversion gstreamer-app-1.0 } | Select-Object -First 1
+            Log-Ok "gstreamer-1.0: $gstCore"
+            Log-Ok "gstreamer-app-1.0: $gstApp"
+        } else {
+            Log-Error "GStreamer nie jest widoczny przez pkg-config."
+            Log-Error "Sprawdz PKG_CONFIG_PATH oraz instalacje GStreamer SDK z development files."
+            $ok = $false
+        }
+    } else {
+        Log-Error "Brak pkg-config — gstreamer-sys nie znajdzie GStreamer SDK."
         $ok = $false
     }
 
