@@ -1639,6 +1639,43 @@ pub(crate) fn standard_engine_env() -> HashMap<String, String> {
     env
 }
 
+pub(crate) fn is_cuda_vllm_engine(engine_id: &str) -> bool {
+    matches!(engine_id, "vllm" | "vllm-spark")
+}
+
+pub(crate) fn strip_gpu_memory_utilization(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if tok == "--gpu-memory-utilization" {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with("--gpu-memory-utilization=") {
+            i += 1;
+            continue;
+        }
+        out.push(tok.to_string());
+        i += 1;
+    }
+    out.join(" ")
+}
+
+pub(crate) fn parse_gpu_memory_utilization_arg(raw: &str) -> Option<f64> {
+    let mut iter = raw.split_whitespace();
+    while let Some(tok) = iter.next() {
+        if tok == "--gpu-memory-utilization" {
+            return iter.next().and_then(|v| v.parse::<f64>().ok());
+        }
+        if let Some(rest) = tok.strip_prefix("--gpu-memory-utilization=") {
+            return rest.parse::<f64>().ok();
+        }
+    }
+    None
+}
+
 // ----- Tiny extension on Category to get string capability tag --------------
 
 trait CategoryStr {
