@@ -87,7 +87,7 @@ pub mod sync_kinds {
 /// True iff `disc` is a `MESH_MSG_*` discriminator whose send path has
 /// already been migrated to UFP/2 in some 4c2.x chunk. `send_ufp2_to_peer`
 /// uses this as a gate so that pre-migration types (which still go through
-/// the legacy `[disc][rkyv]` wire) are not accidentally double-routed
+/// the legacy `[disc][CBOR]` wire) are not accidentally double-routed
 /// through the UFP/2 path. Each 4c2.x chunk that migrates a new type
 /// extends this list AND the test below.
 ///

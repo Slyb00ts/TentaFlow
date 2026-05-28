@@ -2298,7 +2298,7 @@ export const encode = {
     );
   },
 
-  /** MessageBody::DeployVllmRecommendRequest — vLLM config recommend (rkyv passthrough). */
+  /** MessageBody::DeployVllmRecommendRequest — vLLM config recommend (CBOR passthrough). */
   deployVllmRecommendRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeDeployVllmRecommendRequest(JSON.stringify(payload));

@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: api/dashboard/ws_binary.rs
-// Opis: Binary WebSocket handler dla nowego protokolu rkyv (Envelope + MessageBody).
+// Opis: Binary WebSocket handler dla protokołu CBOR (Envelope + MessageBody).
 //       Zastapi REST w kolejnych fazach (#36). Na razie obsluguje handshake
 //       schema version + kilka bootstrap wariantow (ModelListRequest,
 //       MetaHeartbeat, MetaCancelStream).
@@ -276,7 +276,7 @@ pub async fn handle_ws_connection<S>(
                     break;
                 }
 
-                let envelope = match rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&bytes) {
+                let envelope = match tentaflow_protocol::cbor::decode::<Envelope>(&bytes) {
                     Ok(env) => env,
                     Err(e) => {
                         warn!("binary-WS: malformed envelope: {}", e);
@@ -338,7 +338,7 @@ pub async fn handle_ws_connection<S>(
                 last_client_sequence = envelope.sequence;
 
                 let body =
-                    match rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&envelope.body) {
+                    match tentaflow_protocol::cbor::decode::<MessageBody>(&envelope.body) {
                         Ok(b) => b,
                         Err(e) => {
                             warn!("binary-WS: malformed body: {}", e);
@@ -632,7 +632,7 @@ where
 }
 
 /// Bytes-only encoder — uzywany przez batch writer task ktory feed'uje
-/// wiele frame'ow w jednym sink.lock + flush. Zwraca None tylko gdy rkyv
+/// wiele frame'ow w jednym sink.lock + flush. Zwraca None tylko gdy CBOR
 /// padlo (loguje sam, caller pomija ten frame).
 fn encode_envelope_bytes(
     correlation_id: u64,
@@ -641,8 +641,8 @@ fn encode_envelope_bytes(
     body: &MessageBody,
     flags: EnvelopeFlags,
 ) -> Option<Vec<u8>> {
-    let body_bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(body) {
-        Ok(b) => b.to_vec(),
+    let body_bytes = match tentaflow_protocol::cbor::encode(body) {
+        Ok(b) => b,
         Err(e) => {
             warn!("binary-WS: encode body failed: {}", e);
             return None;
@@ -650,8 +650,8 @@ fn encode_envelope_bytes(
     };
     let mut env = Envelope::new_direct(correlation_id, sequence, message_kind, body_bytes);
     env.flags = flags;
-    match rkyv::to_bytes::<rkyv::rancor::Error>(&env) {
-        Ok(b) => Some(b.to_vec()),
+    match tentaflow_protocol::cbor::encode(&env) {
+        Ok(b) => Some(b),
         Err(e) => {
             warn!("binary-WS: encode envelope failed: {}", e);
             None

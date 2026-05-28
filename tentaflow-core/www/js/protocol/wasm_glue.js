@@ -20,7 +20,7 @@ export class EnvelopeView {
         wasm.__wbg_envelopeview_free(ptr, 0);
     }
     /**
-     * Rkyv-zakodowany MessageBody — przekazac do `decodeMessageBody()`.
+     * CBOR-zakodowany MessageBody — przekazac do `decodeMessageBody()`.
      * @returns {Uint8Array}
      */
     get body() {
@@ -233,7 +233,7 @@ export function decodeEnvelope(bytes) {
 }
 
 /**
- * Dekoduje rkyv-zakodowany MessageBody na JS object.
+ * Dekoduje CBOR-zakodowany MessageBody na JS object.
  * Dla znanych variantow zwraca obiekt z polem `variant`, a dla nieznanego
  * variantu `{ variant: "Unknown" }`.
  * @param {Uint8Array} bytes
@@ -1461,7 +1461,7 @@ export function encodeDeploymentStatusRequest(deploy_id) {
 
 /**
  * Buduje Envelope (routing=Direct) z podanymi polami + body bytes; zwraca
- * rkyv-zakodowany frame jako Uint8Array.
+ * CBOR-zakodowany frame jako Uint8Array.
  *
  * `correlation_id` przekazywany jako u64 (BigInt po stronie JS).
  * @param {bigint} correlation_id

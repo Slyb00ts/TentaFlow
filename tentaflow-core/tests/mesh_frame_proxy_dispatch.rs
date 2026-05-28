@@ -1,7 +1,7 @@
 // =============================================================================
 // File: tests/mesh_frame_proxy_dispatch.rs
 // Purpose: F1b P3.C-1 — wire-level dispatch tests for frame proxy mesh
-//          frames. Two real IrohMeshManager instances exchange rkyv-encoded
+//          frames. Two real IrohMeshManager instances exchange CBOR-encoded
 //          FrameProxyRequest / FrameProxyResponse payloads over a uni
 //          stream and we assert the receiving side emits the matching
 //          IrohMeshEvent variant with all payload fields preserved.
@@ -160,7 +160,7 @@ async fn test_frame_proxy_request_decoded_and_event_emitted() {
         raw_ref: "frame-store/cam-1/abc-123".into(),
         request_id: "req-p3c1-1".into(),
     };
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&req).expect("encode request");
+    let bytes = tentaflow_protocol::cbor::encode(&req).expect("encode request");
     a.send_frame_proxy_request(&b_hex, &bytes)
         .await
         .expect("A→B send frame proxy request");
@@ -235,7 +235,7 @@ async fn test_frame_proxy_response_decoded_and_event_emitted() {
             timestamp_unix_ms: 1_715_000_000_999,
         },
     };
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resp).expect("encode response");
+    let bytes = tentaflow_protocol::cbor::encode(&resp).expect("encode response");
     b.send_frame_proxy_response(&a_hex, &bytes)
         .await
         .expect("B→A send frame proxy response");

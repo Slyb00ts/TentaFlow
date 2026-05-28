@@ -976,7 +976,7 @@ mod tests {
         let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemStatusUpdate(
             MeetingActionItemStatusUpdateRequest {
                 item_id: id,
-                status: "archived".into(),
+                status: "decoded".into(),
             },
         ));
         let err = meeting_action_item_status_update(&req, &ctx).expect_err("bad");

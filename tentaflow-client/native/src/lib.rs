@@ -4,7 +4,7 @@
 //
 // CEL:
 // Ta biblioteka zapewnia FFI (Foreign Function Interface) dla aplikacji .NET
-// do komunikacji z TentaFlow.Router przez protokół QUIC z serializacją rkyv.
+// do komunikacji z TentaFlow.Router przez protokół QUIC z serializacją CBOR.
 //
 // JAK DZIAŁA:
 // Eksportuje funkcje C-compatible które .NET wywołuje przez P/Invoke.
@@ -12,7 +12,7 @@
 // i zwracają wyniki w strukturach C-compatible.
 //
 // ARCHITEKTURA:
-// .NET App → P/Invoke → tentaflow_client_native.so → QUIC+rkyv → Router
+// .NET App → P/Invoke → tentaflow_client_native.so → QUIC+CBOR → Router
 //
 // PRZYKŁAD UŻYCIA:
 // ```csharp
@@ -26,7 +26,7 @@
 // KLUCZOWE KONCEPCJE:
 // - FFI: Foreign Function Interface dla interoperacji C/.NET
 // - P/Invoke: Platform Invocation Services w .NET
-// - rkyv: Zero-copy serialization dla QUIC
+// - CBOR: Zero-copy serialization dla QUIC
 // - tokio: Async runtime dla operacji sieciowych
 //
 // ============================================================================

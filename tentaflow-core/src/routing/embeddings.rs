@@ -179,7 +179,7 @@ impl Router {
         };
 
         // EXEMPT-MESH-INBOUND (stage 3d v1.5): protocol-native embeddings
-        // mesh reverse path — peer forwarduje rkyv ModelRequest, my
+        // mesh reverse path — peer forwarduje CBOR ModelRequest, my
         // wykonujemy direct executor żeby zachować ultra-low latency
         // budget (LAN 1-5ms). Plan v1.5 dokumentuje to jako jedyny
         // dozwolony wyjątek od "wszystko przez flow_engine".
@@ -189,7 +189,7 @@ impl Router {
         };
 
         // Convert `EmbeddingResponse` → protocol-native `ModelResponse`
-        // (the reverse handler expects the rkyv-encoded protocol shape).
+        // (the reverse handler expects the CBOR-encoded protocol shape).
         let request_id = uuid::Uuid::new_v4().to_string();
         let embeddings: Vec<Vec<f32>> = response.data.into_iter().map(|d| d.embedding).collect();
         let dimensions = embeddings.first().map(|v| v.len()).unwrap_or(0);

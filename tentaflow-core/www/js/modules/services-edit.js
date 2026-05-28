@@ -1,5 +1,5 @@
 // =============================================================================
-// File: modules/services-edit.js — Edit Service modal (rkyv binary)
+// File: modules/services-edit.js — Edit Service modal (CBOR binary)
 // Otwierany przyciskiem ✏️ w wierszu Services. Zmiany wysyłane przez
 // ApiBinary.action('serviceUpdateRequest', ...). VRAM hint pollowany co 2s
 // (ApiBinary.action('serviceVramHintRequest', {gpu_index: 0})) — pasek
@@ -28,7 +28,7 @@ export async function openEditModal(svc, opts = {}) {
   const initialModelRepo = cfg.model_repo || '';
   const isVllm = engineId === 'vllm';
 
-  // Fetch presetow z manifestu (rkyv binary) ZAMIAST hardcoded list. Backend
+  // Fetch presetow z manifestu (CBOR binary) ZAMIAST hardcoded list. Backend
   // zwraca dokladnie te [[model_preset]] ktore sa w pliku TOML silnika.
   let presets = [];
   try {
@@ -89,7 +89,7 @@ export async function openEditModal(svc, opts = {}) {
     card.addEventListener('click', () => scheduleRecommendRefresh(overlay, svc, engineId));
   });
 
-  // HuggingFace search w Custom mode (publiczne API HF, nie nasz rkyv —
+  // HuggingFace search w Custom mode (publiczne API HF, nie nasz CBOR —
   // to bezpośredni katalog modeli HF, nie wewnętrzny stan tentaflow).
   const customInput = overlay.querySelector('[data-custom-repo-input]');
   if (customInput) {

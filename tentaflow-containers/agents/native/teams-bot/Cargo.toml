@@ -52,7 +52,7 @@ uuid = { version = "1", features = ["v4"] }
 bytemuck = "1"
 # Dekodowanie base64 z DomEvent::VideoFrame — JS→Rust przez CDP binding nosi
 # tylko JSON, więc binarne klatki idą jako base64; tu wracamy do bajtów
-# zanim payload trafi do rkyv.
+# zanim payload trafi do CBOR.
 base64 = "0.22.1"
 
 [dev-dependencies]

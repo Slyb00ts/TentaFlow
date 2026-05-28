@@ -7,7 +7,6 @@
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -25,7 +24,7 @@ use crate::mesh::peer_registry::{
 };
 
 /// Informacje o modelu zaladowanym na nodzie mesh
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerModelInfo {
     /// Alias/nazwa modelu (np. "qwen3.5-0.8b", "whisper-large-v3")
     pub alias: String,
@@ -92,7 +91,7 @@ pub struct MeshPeerInfo {
 /// Producent GPU — wykrywany po nazwie / PCI; uzywany do gating profilowania
 /// (np. NVIDIA Nsight Systems wymaga `vendor == Nvidia`).
 #[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize,
 )]
 pub enum GpuVendor {
     Nvidia,
@@ -103,7 +102,7 @@ pub enum GpuVendor {
 }
 
 /// Informacje o GPU peera
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerGpuInfo {
     pub name: String,
     pub vram_total_mb: u64,
@@ -118,7 +117,7 @@ pub struct PeerGpuInfo {
 }
 
 /// Informacje o nodzie — wymieniane przez QUIC po polaczeniu
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub node_id: String,
     pub hostname: String,
@@ -129,7 +128,7 @@ pub struct NodeInfo {
 }
 
 /// Informacje o kontenerze Docker peera
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerContainerInfo {
     pub id: String,
     pub name: String,
@@ -141,7 +140,7 @@ pub struct PeerContainerInfo {
 }
 
 /// Informacje o interfejsie sieciowym peera
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerNetworkInfo {
     pub name: String,
     pub rx_bytes: u64,
@@ -160,7 +159,7 @@ pub struct PeerNetworkInfo {
 }
 
 /// Metryki wysylane w heartbeatach do peerow mesh
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatMetrics {
     pub cpu_usage_percent: f32,
     pub ram_used_mb: u64,
@@ -190,7 +189,7 @@ pub struct HeartbeatMetrics {
 
 /// Broadcast z lista modeli zaladowanych/dostepnych na nodzie. Wysylany co
 /// `models_sync_interval` (domyslnie 30s) oraz po kazdej zmianie listy modeli.
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelsSync {
     pub models: Vec<PeerModelInfo>,
 }
@@ -904,7 +903,7 @@ impl MeshPeerStore {
 
     /// Aktualizuje biezace metryki peera (z heartbeatu).
     /// Bierze `&HeartbeatMetrics` zeby caller (pipeline broadcast) mogl uzyc tej
-    /// samej referencji do serializacji rkyv bez podwojnego klonowania Vec.
+    /// samej referencji do serializacji CBOR bez podwojnego klonowania Vec.
     pub fn update_metrics(&self, node_id: &str, hb: &HeartbeatMetrics) {
         let mut entry = self
             .peers

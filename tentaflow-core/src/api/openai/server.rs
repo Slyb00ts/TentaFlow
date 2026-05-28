@@ -412,7 +412,7 @@ async fn handle_image_generation(
 /// Handler dla /v1/audio/speech (Text-to-Speech)
 ///
 /// Obsluguje backendy:
-/// - QUIC TTS (TentaFlow.TTS z rkyv) - preferowany
+/// - QUIC TTS (TentaFlow.TTS z CBOR) - preferowany
 /// - HTTP TTS (OpenAI API kompatybilny)
 async fn handle_audio_tts(
     req: Request<Incoming>,

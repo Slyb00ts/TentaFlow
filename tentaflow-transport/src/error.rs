@@ -21,10 +21,10 @@ pub enum TransportError {
     #[error("transport: stream io failed: {0}")]
     Io(#[from] io::Error),
 
-    #[error("transport: rkyv serialization failed: {0}")]
+    #[error("transport: CBOR serialization failed: {0}")]
     Serialize(String),
 
-    #[error("transport: rkyv deserialization failed: {0}")]
+    #[error("transport: CBOR deserialization failed: {0}")]
     Deserialize(String),
 
     #[error("transport: frame exceeds {limit} bytes (got {got})")]

@@ -554,7 +554,7 @@ fn storage_err_to_proto(e: crate::profiling::StorageError) -> ProtocolError {
         }
         SE::Io(e) => ProtocolError::internal(format!("io: {e}")),
         SE::ManifestParse(s) => ProtocolError::internal(format!("manifest: {s}")),
-        SE::Rkyv(s) => ProtocolError::internal(format!("rkyv: {s}")),
+        SE::Cbor(s) => ProtocolError::internal(format!("CBOR: {s}")),
     }
 }
 

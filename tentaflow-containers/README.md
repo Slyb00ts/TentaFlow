@@ -49,7 +49,7 @@ Kazdy kontener Docker sklada sie z:
 - **Silnik AI** (vLLM, whisper.cpp, Sherpa, XTTS itp.) — uruchamiany w kontenerze,
   nasluchuje na `localhost` (wewnatrz kontenera) na wlasnym API HTTP.
 - **Sidecar QUIC** (`tentaflow-sidecar`) — generyczna binarka Rust, nasluchuje
-  QUIC na porcie 5000, tlumaczy QUIC/rkyv ↔ lokalne HTTP silnika. Rola wybierana
+  QUIC na porcie 5000, tlumaczy QUIC/CBOR ↔ lokalne HTTP silnika. Rola wybierana
   przez `/data/config.toml`. Dzieki temu kazdy kontener uzywa tej samej binarki
   a roznia sie tylko silnikiem i konfiguracja.
 - **Dockerfile** multistage: builder + runtime.

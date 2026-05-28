@@ -9,7 +9,7 @@
 // - Audio (TTS, STT)
 // - Vision (image understanding)
 //
-// Używa rkyv dla zero-copy serialization (ultra-fast, ~10x faster than serde)
+// Używa CBOR dla zero-copy serialization (ultra-fast, ~10x faster than serde)
 // Obsługuje zarówno streaming jak i non-streaming responses
 //
 // ARCHITEKTURA:
@@ -20,7 +20,6 @@
 //
 // ============================================================================
 
-use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 // ============================================================================
@@ -34,7 +33,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 /// Pola:
 /// - `role`: Rola nadawcy ("system" | "user" | "assistant")
 /// - `content`: Treść wiadomości (tekst)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct Message {
     /// Rola nadawcy: "system", "user", "assistant"
     pub role: String,
@@ -44,7 +43,7 @@ pub struct Message {
 }
 
 /// Message dla vision request (może zawierać tekst + obrazy).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct VisionMessage {
     /// Rola
     pub role: String,
@@ -54,7 +53,7 @@ pub struct VisionMessage {
 }
 
 /// Content part dla vision (text | image_url).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum VisionContentPart {
     /// Text fragment
     Text { text: String },
@@ -71,7 +70,7 @@ pub enum VisionContentPart {
 ///
 /// Każda wiadomość QUIC zaczyna się od jednego bajtu określającego typ:
 /// - Pierwszy bajt to MESSAGE_TYPE_*
-/// - Pozostałe bajty to zserializowane dane (rkyv)
+/// - Pozostałe bajty to zserializowane dane (CBOR)
 pub const MESSAGE_TYPE_CANCEL_REQUEST: u8 = 0x03;
 
 // ============================================================================
@@ -96,10 +95,10 @@ pub const MESSAGE_TYPE_CANCEL_REQUEST: u8 = 0x03;
 ///
 /// // Wysyłanie przez QUIC
 /// let mut bytes = vec![MESSAGE_TYPE_CANCEL_REQUEST];
-/// bytes.extend_from_slice(&rkyv::to_bytes::<rkyv::rancor::Error>(&cancel)?);
+/// bytes.extend_from_slice(&CBOR::to_bytes::<CBOR::rancor::Error>(&cancel)?);
 /// stream.write_all(&bytes).await?;
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct CancelRequest {
     /// ID requestu do anulowania (musi być aktywny streaming request)
     pub request_id: String,
@@ -116,7 +115,7 @@ pub struct CancelRequest {
 /// - `Cancelled`: Operacja została pomyślnie anulowana
 /// - `NotFound`: Request o podanym ID nie istnieje lub już się zakończył
 /// - `AlreadyCompleted`: Request zakończył się przed anulowaniem
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct CancelResponse {
     /// ID requestu (correlation)
     pub request_id: String,
@@ -132,7 +131,7 @@ pub struct CancelResponse {
 }
 
 /// Status anulowania operacji.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum CancellationStatus {
     /// Operacja została pomyślnie anulowana
     Cancelled,
@@ -196,7 +195,7 @@ pub enum CancellationStatus {
 ///     metadata: None,
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelRequest {
     /// Unikalny ID requestu (UUID v4)
     pub request_id: String,
@@ -222,7 +221,7 @@ pub struct ModelRequest {
 /// Payload dla różnych typów modeli.
 ///
 /// Każdy wariant zawiera specyficzne dane dla danego typu operacji.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum ModelPayload {
     /// Embeddings - konwersja tekstu na wektory
     Embeddings(EmbeddingsPayload),
@@ -267,12 +266,12 @@ pub enum ModelPayload {
 
 /// Operacje inspekcji uruchomionej strony przeglądarki w kontenerze bota.
 /// Wspólne użycie: diagnostyka meetingu z dashboardu (co bot aktualnie widzi).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BrowserPayload {
     pub operation: BrowserOperation,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum BrowserOperation {
     /// PNG screenshot. `full_page=true` scrolluje i składa całą stronę;
     /// `false` zwraca tylko viewport (znacznie szybsze, bez stitchowania).
@@ -287,7 +286,7 @@ pub enum BrowserOperation {
 
 /// Request odczytu promptu z DB routera. Router robi fallback na `pl`
 /// gdy wariant w żądanym języku nie istnieje (zgodnie z `repository::find_prompt`).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct PromptFetchRequest {
     /// Identyfikator promptu (np. `transcription_summarization`).
     pub prompt_id: String,
@@ -301,7 +300,7 @@ pub struct PromptFetchRequest {
 
 /// Event od Meeting Bota do Routera. Niesie meeting_key (publiczny identyfikator
 /// sesji) + timestamp + typowy payload (summary albo action items).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingEventData {
     /// meeting_key z tabeli meeting_sessions. Router resolvuje do session_id.
     pub meeting_key: String,
@@ -313,7 +312,7 @@ pub struct MeetingEventData {
 
 /// Warianty eventów meeting. Każdy wariant niesie dane do tej samej sesji
 /// (adresowanej przez `MeetingEventData::meeting_key`).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MeetingEventPayload {
     /// Nowe podsumowanie wygenerowane przez timer bota. Router insertuje
     /// do `meeting_summaries` (append-only historia).
@@ -383,7 +382,7 @@ pub enum MeetingEventPayload {
     /// kafelków z aktywnym `MediaStream` (kamera włączona). `jpeg` to surowe
     /// bajty już zdekodowane z base64 — transport JS→Rust idzie przez
     /// `__tentaflowEvent` (JSON-only binding), więc base64 jest jedynie
-    /// kodowaniem na granicy CDP; po stronie Rust żyje już binarnie i rkyv
+    /// kodowaniem na granicy CDP; po stronie Rust żyje już binarnie i CBOR
     /// pcha to jako `Vec<u8>` bez ponownego kodowania.
     VideoFrame {
         /// `data-tid` kafelka — w obecnym Teams to nazwa uczestnika, traktujemy
@@ -443,7 +442,7 @@ pub const LIFECYCLE_FAILED: &str = "failed";
 /// Pojedynczy uczestnik w `RosterSnapshot`. `status` to stringified enum
 /// — bot wysyła `"joined"`, `"left"`, `"speaking"`. Dashboard odfiltrowuje
 /// nieznane warianty bez błędu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct RosterEntry {
     pub speaker_id: String,
     pub speaker_name: Option<String>,
@@ -468,7 +467,7 @@ pub struct RosterEntry {
 }
 
 /// Pojedynczy action item przesyłany w `ActionItemsUpdate`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingActionItemData {
     pub owner: String,
     pub task: String,
@@ -481,7 +480,7 @@ pub struct MeetingActionItemData {
 /// konieczności odpytywania DB. Filtrowanie po ownership (user_id ↔
 /// meeting_sessions.owner_user_id) dzieje się server-side w writer task,
 /// więc frame nigdy nie dotrze do niepowołanego usera.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingLiveEvent {
     /// meeting_key sesji — adresuje która sesja, GUI route’uje do widoku.
     pub meeting_key: String,
@@ -508,7 +507,7 @@ pub struct MeetingLiveEvent {
 ///     normalize: true,
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct EmbeddingsPayload {
     /// Nazwa modelu (np. "gemma", "qwen", "text-embedding-3-small")
     pub model: String,
@@ -546,7 +545,7 @@ pub struct EmbeddingsPayload {
 ///     return_documents: false,
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct RerankPayload {
     /// Nazwa modelu reranking (np. "bge-reranker-v2-m3", "ms-marco-MiniLM")
     pub model: String,
@@ -586,7 +585,7 @@ pub struct RerankPayload {
 ///     ..Default::default()
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct CompletionPayload {
     /// Nazwa modelu (np. "gpt-4-turbo", "claude-3-5-sonnet", "deepseek-v3")
     pub model: String,
@@ -670,7 +669,7 @@ pub struct CompletionPayload {
 /// 1. Odpytuje Memory o kontekst przed wywołaniem modelu
 /// 2. Wstrzykuje kontekst do system message
 /// 3. Zapisuje nowe fakty z odpowiedzi do Memory (async)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryOptions {
     /// Czy pamięć jest włączona (domyślnie true jeśli session_id podane)
     pub enabled: Option<bool>,
@@ -707,7 +706,7 @@ pub struct MemoryOptions {
 ///     speed: None,
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct TTSStreamingOptions {
     /// Model TTS (np. "sherpa-tts", "tts-1")
     pub model: String,
@@ -764,14 +763,14 @@ impl Default for CompletionPayload {
 ///     },
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ImagePayload {
     /// Typ operacji na obrazie
     pub operation: ImageOperation,
 }
 
 /// Operacje na obrazach.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum ImageOperation {
     /// Generuj obraz z promptu (DALL-E, Stable Diffusion)
     Generate {
@@ -847,14 +846,14 @@ pub enum ImageOperation {
 ///     },
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct AudioPayload {
     /// Typ operacji audio
     pub operation: AudioOperation,
 }
 
 /// Operacje audio.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum AudioOperation {
     /// Text-to-Speech (TTS)
     TTS {
@@ -1261,7 +1260,7 @@ pub enum AudioOperation {
 ///     max_tokens: Some(1000),
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct VisionPayload {
     /// Model (np. "gpt-4-vision-preview", "claude-3-5-sonnet")
     pub model: String,
@@ -1305,14 +1304,14 @@ pub struct VisionPayload {
 ///     },
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryPayload {
     /// Operacja na pamięci
     pub operation: MemoryOperation,
 }
 
 /// Operacje na pamięci AI.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MemoryOperation {
     /// Zapisz fakty do pamięci (working memory → session memory)
     ///
@@ -1445,7 +1444,7 @@ pub enum MemoryOperation {
 /// Fakt do zapisania w pamięci.
 ///
 /// Reprezentuje trójkę (subject, relation, object) z opcjonalnymi metadanymi.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryFact {
     /// Podmiot (subject) - np. "dog", "Mars", "user_preference"
     pub subject: String,
@@ -1467,7 +1466,7 @@ pub struct MemoryFact {
 }
 
 /// Typ zapytania do pamięci.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum MemoryQueryType {
     /// "What is X?" - attribute recall
     What,
@@ -1495,7 +1494,7 @@ pub enum MemoryQueryType {
 }
 
 /// Typ feedbacku dla węzła pamięci.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum MemoryFeedbackType {
     /// Użytkownik potwierdził że fakt jest poprawny
     Positive,
@@ -1531,7 +1530,7 @@ pub enum MemoryFeedbackType {
 ///     metrics: Some(ModelMetrics { /* ... */ }),
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelResponse {
     /// ID requestu (correlation)
     pub request_id: String,
@@ -1544,7 +1543,7 @@ pub struct ModelResponse {
 }
 
 /// Wyniki dla różnych typów modeli.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum ModelResult {
     /// Embeddings result
     Embeddings(EmbeddingsResult),
@@ -1582,9 +1581,9 @@ pub enum ModelResult {
 }
 
 /// Wynik operacji browser wykonanej przez teams-bot.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum BrowserResult {
-    /// Surowy PNG (bajty). Rozmiar ograniczony framingiem rkyv (16 MiB).
+    /// Surowy PNG (bajty). Rozmiar ograniczony framingiem CBOR (16 MiB).
     Screenshot { png: Vec<u8> },
     /// `outerHTML` dokumentu.
     Dom { html: String },
@@ -1595,7 +1594,7 @@ pub enum BrowserResult {
 /// Odpowiedź na `PromptFetchRequest`. `resolved_language` mówi kontenerowi
 /// który wariant faktycznie został zwrócony — np. gdy żądał `de`, a DB ma
 /// tylko `pl`, tu będzie `pl`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct PromptFetchResponse {
     pub content: String,
     pub name: String,
@@ -1603,7 +1602,7 @@ pub struct PromptFetchResponse {
 }
 
 /// Result dla embeddings.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct EmbeddingsResult {
     /// Wektory embeddingów (batch x dimensions)
     pub embeddings: Vec<Vec<f32>>,
@@ -1618,7 +1617,7 @@ pub struct EmbeddingsResult {
 /// Result dla rerank.
 ///
 /// Zawiera posortowaną listę dokumentów z ich relevance scores.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct RerankResult {
     /// Lista wyników rerankingu posortowana malejąco po score
     pub results: Vec<RerankResultItem>,
@@ -1628,7 +1627,7 @@ pub struct RerankResult {
 }
 
 /// Pojedynczy wynik rerankingu dla dokumentu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct RerankResultItem {
     /// Index dokumentu w oryginalnej liście (0-indexed)
     pub index: usize,
@@ -1641,7 +1640,7 @@ pub struct RerankResultItem {
 }
 
 /// Result dla completion (non-streaming).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct CompletionResult {
     /// Wygenerowany tekst (content)
     pub text: String,
@@ -1676,7 +1675,7 @@ pub struct CompletionResult {
 }
 
 /// Pojedyncze wywołanie funkcji w odpowiedzi modelu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ToolCallResult {
     /// ID wywołania
     pub id: String,
@@ -1697,7 +1696,7 @@ pub struct ToolCallResult {
 
 /// Wykryte wywołanie narzędzia z Intent Analyzer.
 /// Różni się od ToolCallResult tym, że zawiera wyniki wykonania i walidacji.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct DetectedToolCall {
     /// ID wywołania (uuid)
     pub call_id: String,
@@ -1722,7 +1721,7 @@ pub struct DetectedToolCall {
 }
 
 /// Wynik wykonania wykrytego narzędzia.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct DetectedToolExecutionResult {
     /// Czy wykonanie się powiodło
     pub success: bool,
@@ -1738,7 +1737,7 @@ pub struct DetectedToolExecutionResult {
 }
 
 /// Result dla image.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ImageResult {
     /// Wygenerowane obrazy (PNG/JPEG bytes)
     pub images: Vec<Vec<u8>>,
@@ -1748,7 +1747,7 @@ pub struct ImageResult {
 }
 
 /// Result dla audio.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct AudioResult {
     /// Audio data (dla TTS) lub transcribed text (dla STT)
     pub data: AudioResultData,
@@ -1757,7 +1756,7 @@ pub struct AudioResult {
     pub model: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum AudioResultData {
     /// Audio bytes (MP3, WAV, etc.) - dla TTS
     Audio(Vec<u8>),
@@ -2105,7 +2104,7 @@ pub enum AudioResultData {
 /// - `AlwaysOn` - zawsze słucha, bez potrzeby wake word
 /// - `WakeWordTimeout` - wake word aktywuje, timeout deaktywuje
 /// - `WakeWordExplicitStop` - wake word aktywuje, explicit stop deaktywuje
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SessionMode {
     /// Zawsze aktywny - nie wymaga wake word.
     ///
@@ -2150,7 +2149,7 @@ impl Default for SessionMode {
 }
 
 /// Stan sesji rozmowy z asystentem.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, SerdeSerialize, SerdeDeserialize)]
 pub enum SessionState {
     /// Nieaktywny - czeka na wake word (lub zawsze aktywny w AlwaysOn)
     #[default]
@@ -2167,7 +2166,7 @@ pub enum SessionState {
 }
 
 /// Konfiguracja sesji rozmowy.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ConversationSessionConfig {
     /// Tryb pracy asystenta
     pub mode: SessionMode,
@@ -2223,7 +2222,7 @@ impl Default for ConversationSessionConfig {
 }
 
 /// Informacje o aktywnej sesji rozmowy.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ConversationSessionInfo {
     /// ID sesji
     pub session_id: String,
@@ -2251,7 +2250,7 @@ pub struct ConversationSessionInfo {
 }
 
 /// Statystyki zakończonej sesji rozmowy.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ConversationSessionStats {
     /// Całkowity czas trwania sesji (ms)
     pub total_duration_ms: u64,
@@ -2290,7 +2289,7 @@ impl Default for ConversationSessionStats {
 }
 
 /// Zdarzenia sesji rozmowy (dla powiadomień client).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum ConversationEvent {
     /// Sesja została aktywowana (wake word detected lub AlwaysOn start)
     SessionActivated {
@@ -2350,7 +2349,7 @@ pub enum ConversationEvent {
 }
 
 /// Powód aktywacji sesji.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum ActivationReason {
     /// Wake word wykryty
     WakeWord {
@@ -2364,7 +2363,7 @@ pub enum ActivationReason {
 }
 
 /// Powód deaktywacji sesji.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum DeactivationReason {
     /// Timeout ciszy
     SilenceTimeout { silence_duration_ms: u32 },
@@ -2389,7 +2388,7 @@ pub enum DeactivationReason {
 /// - no_speech_prob > 0.6: Prawdopodobnie halucynacja (brak mowy)
 /// - avg_logprob < -1.0: Niska pewność modelu
 /// - compression_ratio > 2.4: Nietypowy wzorzec (powtórzenia)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct TranscriptionSegment {
     /// ID segmentu (0-indexed)
     pub id: u32,
@@ -2439,7 +2438,7 @@ pub struct TranscriptionSegment {
 }
 
 /// Result dla vision.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct VisionResult {
     /// Response text (image understanding)
     pub text: String,
@@ -2455,14 +2454,14 @@ pub struct VisionResult {
 /// Result dla Memory operations.
 ///
 /// Zawiera wyniki różnych operacji pamięci (Store, Query, Stats, etc.).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryResult {
     /// Typ wyniku operacji
     pub result_type: MemoryResultType,
 }
 
 /// Typ wyniku operacji pamięci.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MemoryResultType {
     /// Wynik operacji Store
     Store(MemoryStoreResult),
@@ -2493,7 +2492,7 @@ pub enum MemoryResultType {
 }
 
 /// Wynik operacji Store (zapisanie faktów).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryStoreResult {
     /// Liczba zapisanych faktów
     pub facts_stored: u32,
@@ -2509,7 +2508,7 @@ pub struct MemoryStoreResult {
 }
 
 /// Wynik operacji Query (zapytanie do pamięci).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryQueryResult {
     /// Lista odpowiedzi (node_id, score, label)
     pub answers: Vec<MemoryAnswer>,
@@ -2522,7 +2521,7 @@ pub struct MemoryQueryResult {
 }
 
 /// Pojedyncza odpowiedź z zapytania do pamięci.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryAnswer {
     /// ID węzła w grafie
     pub node_id: u64,
@@ -2541,7 +2540,7 @@ pub struct MemoryAnswer {
 }
 
 /// Ścieżka rozumowania (jak dotarliśmy do odpowiedzi).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryReasoningPath {
     /// Lista kroków w ścieżce
     pub steps: Vec<MemoryReasoningStep>,
@@ -2551,7 +2550,7 @@ pub struct MemoryReasoningPath {
 }
 
 /// Pojedynczy krok w ścieżce rozumowania.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryReasoningStep {
     /// ID węzła źródłowego
     pub from_node_id: u64,
@@ -2573,7 +2572,7 @@ pub struct MemoryReasoningStep {
 }
 
 /// Statystyki zapytania do pamięci.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryQueryStats {
     /// Liczba odwiedzonych węzłów
     pub nodes_visited: u32,
@@ -2592,7 +2591,7 @@ pub struct MemoryQueryStats {
 }
 
 /// Wynik operacji Consolidate.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryConsolidateResult {
     /// Liczba skonsolidowanych faktów
     pub facts_consolidated: u32,
@@ -2608,7 +2607,7 @@ pub struct MemoryConsolidateResult {
 }
 
 /// Wynik operacji Stats.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryStatsResult {
     /// Liczba węzłów w grafie
     pub total_nodes: u64,
@@ -2636,7 +2635,7 @@ pub struct MemoryStatsResult {
 }
 
 /// Wynik operacji Clear.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryClearResult {
     /// Czy operacja się powiodła
     pub success: bool,
@@ -2649,7 +2648,7 @@ pub struct MemoryClearResult {
 }
 
 /// Wynik operacji Feedback.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryFeedbackResult {
     /// Czy feedback został zastosowany
     pub success: bool,
@@ -2662,7 +2661,7 @@ pub struct MemoryFeedbackResult {
 }
 
 /// Wynik operacji LinkVoice (linkowanie głosu z osobą).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryLinkVoiceResult {
     /// Czy linkowanie się powiodło
     pub success: bool,
@@ -2675,7 +2674,7 @@ pub struct MemoryLinkVoiceResult {
 }
 
 /// Wynik operacji FindByVoice (wyszukiwanie osoby po głosie).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryFindByVoiceResult {
     /// Czy znaleziono osobę
     pub found: bool,
@@ -2691,7 +2690,7 @@ pub struct MemoryFindByVoiceResult {
 }
 
 /// Wynik operacji UpdatePersonName (aktualizacja nazwy osoby).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MemoryUpdatePersonNameResult {
     /// Czy aktualizacja się powiodła
     pub success: bool,
@@ -2744,7 +2743,7 @@ pub struct MemoryUpdatePersonNameResult {
 ///     chunk: StreamChunkType::Done { final_metrics: Some(metrics) },
 /// });
 /// ```
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ModelStreamChunk {
     /// ID requestu (correlation)
     pub request_id: String,
@@ -2754,7 +2753,7 @@ pub struct ModelStreamChunk {
 }
 
 /// Typy chunków dla streamingu.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub enum StreamChunkType {
     /// Metadata (wysyłane jako pierwsze, opcjonalne)
     /// Np. dla completion: info o modelu, parametrach
@@ -2795,7 +2794,7 @@ pub enum StreamChunkType {
 }
 
 /// Informacje z Intent Analyzer (Bielik 1.5B) dla streamingu.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct IntentAnalyzerInfo {
     /// Wykryta intencja główna
     pub detected_intent: Option<String>,
@@ -2814,7 +2813,7 @@ pub struct IntentAnalyzerInfo {
 }
 
 /// Chunk dla streaming tool calls.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ToolCallDeltaChunk {
     /// Index tool call w liście
     pub index: u32,
@@ -2830,7 +2829,7 @@ pub struct ToolCallDeltaChunk {
 }
 
 /// Metadata wysyłane na początku streamingu.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ModelMetadata {
     /// Typ modelu/operacji
     pub model_type: String,
@@ -2851,7 +2850,7 @@ pub struct ModelMetadata {
 ///
 /// Zawiera podstawowe metryki (latency, throughput) oraz opcjonalne
 /// szczegółowe metryki specyficzne dla typu modelu.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ModelMetrics {
     /// Nazwa modelu
     pub model_name: String,
@@ -2874,7 +2873,7 @@ pub struct ModelMetrics {
 }
 
 /// Szczegółowe metryki specyficzne dla typu modelu.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub enum DetailedMetrics {
     /// Metryki dla embeddings
     Embeddings {
@@ -2894,7 +2893,7 @@ pub enum DetailedMetrics {
 }
 
 /// Error information.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ErrorInfo {
     /// Typ błędu
     pub error_type: ErrorType,
@@ -2908,7 +2907,7 @@ pub struct ErrorInfo {
 
 /// Typy błędów.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub enum ErrorType {
     /// Invalid request (nieprawidłowe parametry)
@@ -2939,9 +2938,6 @@ pub enum ErrorType {
 
 /// Kategoria modelu dla prefix cache
 #[derive(
-    Archive,
-    Deserialize,
-    Serialize,
     Debug,
     Clone,
     Copy,
@@ -2959,7 +2955,7 @@ pub enum PrefixCacheModelCategory {
 
 /// Typ prompta w prefix cache
 #[derive(
-    Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize,
+    Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize,
 )]
 pub enum PrefixCachePromptType {
     /// System prompt - pełny, stały
@@ -2971,7 +2967,7 @@ pub enum PrefixCachePromptType {
 }
 
 /// Pojedynczy prompt do zacheowania
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct PrefixCacheEntry {
     /// Unikalny ID prompta (np. "jarvis_system", "query_analysis_system")
     pub id: String,
@@ -3008,7 +3004,7 @@ pub struct PrefixCacheEntry {
 ///     ],
 /// };
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct PrefixCacheInitRequest {
     /// ID requestu
     pub request_id: String,
@@ -3021,7 +3017,7 @@ pub struct PrefixCacheInitRequest {
 }
 
 /// Response po zainicjalizowaniu prefix cache
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct PrefixCacheInitResponse {
     /// ID requestu (z PrefixCacheInitRequest)
     pub request_id: String,
@@ -3041,7 +3037,7 @@ pub struct PrefixCacheInitResponse {
 /// Silnik LLM używa zacheowanego KV dla tego prompta.
 ///
 /// Używane w CompletionPayload.prefix_cache_id
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct PrefixCacheUseRequest {
     /// ID zacheowanego prompta (z PrefixCacheEntry.id)
     pub prompt_id: String,
@@ -3055,7 +3051,7 @@ pub struct PrefixCacheUseRequest {
 // ============================================================================
 
 /// Informacje o karcie graficznej
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct GpuDeviceInfo {
     /// Indeks GPU w systemie
     pub index: u32,
@@ -3068,7 +3064,7 @@ pub struct GpuDeviceInfo {
 }
 
 /// Dane uwierzytelniania do rejestru Docker
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct RegistryAuth {
     pub server: String,
     pub username: String,
@@ -3080,7 +3076,7 @@ pub struct RegistryAuth {
 
 // ============================================================================
 // Role catalog DTO — backed by services::role_catalog (migracje v40+v41).
-// Translacje sa transportowane jako Vec<(String, String)> bo rkyv 0.8 nie
+// Translacje sa transportowane jako Vec<(String, String)> bo CBOR 0.8 nie
 // posiada natywnego wsparcia dla BTreeMap; dispatcher API zamienia je na
 // BTreeMap<String, String> przy wejsciu do warstwy repo.
 // ============================================================================
@@ -3089,12 +3085,12 @@ pub struct RegistryAuth {
 /// `kind` przyjmuje wartosci: `sales`, `technical`, `management`, `external`, `other`.
 /// `default_visibility_scope` przyjmuje wartosci: `assigned`, `own`, `section`,
 /// `department`, `all`. Walidacja po stronie repo (`services/role_catalog`).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct RoleCatalogSummary {
     pub id: String,
     pub slug: String,
     pub kind: String,
-    /// Pary `(kod_locale, tlumaczenie)`. Kolejnosc jest zachowywana przez rkyv.
+    /// Pary `(kod_locale, tlumaczenie)`. Kolejnosc jest zachowywana przez CBOR.
     pub name_translations: Vec<(String, String)>,
     pub icon: Option<String>,
     pub color_hint: Option<String>,
@@ -3104,7 +3100,7 @@ pub struct RoleCatalogSummary {
 }
 
 /// Pelen wpis katalogu rol — widok szczegolowy i edytor.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct RoleCatalogDetail {
     pub id: String,
     pub org_id: String,
@@ -3127,7 +3123,7 @@ pub struct RoleCatalogDetail {
 /// Wpis tabeli `platform_locales` — dla UI editor'a, zeby wiedzial jakie
 /// jezyki sa aktywne (kazda rola musi miec tlumaczenie dla kazdego aktywnego
 /// locale, walidacja po stronie repo).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct PlatformLocaleSummary {
     pub code: String,
     pub display_name: String,
@@ -3135,7 +3131,7 @@ pub struct PlatformLocaleSummary {
 }
 
 /// Filtry listy rol katalogu. `None` w polu = brak filtra dla tego pola.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, SerdeSerialize, SerdeDeserialize)]
 pub struct RoleCatalogListFilter {
     /// Filtr po `kind` (np. tylko `sales`). `None` = wszystkie kindy.
     pub kind: Option<String>,
@@ -3148,7 +3144,7 @@ pub struct RoleCatalogListFilter {
 }
 
 /// Request stworzenia roli w katalogu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct RoleCatalogCreateRequest {
     pub slug: String,
     pub kind: String,
@@ -3167,22 +3163,55 @@ pub struct RoleCatalogCreateRequest {
 ///   - `None` = nie ruszaj,
 ///   - `Some(None)` = wyzeruj (SET NULL),
 ///   - `Some(Some(v))` = ustaw konkretna wartosc.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, SerdeSerialize, SerdeDeserialize)]
 pub struct RoleCatalogUpdateRequest {
     pub id: String,
     pub kind: Option<String>,
     pub name_translations: Option<Vec<(String, String)>>,
     pub description_translations: Option<Vec<(String, String)>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serde_nullable_patch_string::serialize",
+        deserialize_with = "serde_nullable_patch_string::deserialize"
+    )]
     pub icon: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serde_nullable_patch_string::serialize",
+        deserialize_with = "serde_nullable_patch_string::deserialize"
+    )]
     pub color_hint: Option<Option<String>>,
     pub is_manager: Option<bool>,
     pub default_visibility_scope: Option<String>,
 }
 
+mod serde_nullable_patch_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<Option<String>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(inner) => serializer.serialize_some(inner),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(Some)
+    }
+}
+
 /// Wszystkie RPC katalogu rol biznesowych w jednym slocie `MessageBody`.
 /// Wzorzec „1 slot per feature" — req/res sparowane wewnatrz inner enum,
-/// zeby trzymac globalny limit 256 wariantow rkyv 0.8 pod kontrola.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+/// zeby trzymac globalny limit 256 wariantow CBOR 0.8 pod kontrola.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum RoleCatalogPayload {
     /// Klient -> serwer: lista rol z filtrami (R-LIST).
     ListRequest(RoleCatalogListFilter),
@@ -3221,10 +3250,10 @@ pub enum RoleCatalogPayload {
 mod meeting_event_tests {
     use super::*;
 
-    // Roundtrip SummaryUpdate przez rkyv — wariant ModelPayload::MeetingEvent
+    // Roundtrip SummaryUpdate przez CBOR — wariant ModelPayload::MeetingEvent
     // musi encodować i decodować się zgodnie z archetypowym wzorcem innych variantów.
     #[test]
-    fn rkyv_roundtrip_meeting_event_summary_update() {
+    fn cbor_roundtrip_meeting_event_summary_update() {
         let request = ModelRequest {
             request_id: "req-1".to_string(),
             payload: ModelPayload::MeetingEvent(MeetingEventData {
@@ -3241,9 +3270,9 @@ mod meeting_event_tests {
             session_id: None,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let bytes = crate::cbor::encode(&request).expect("encode");
         let decoded: ModelRequest =
-            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => {
@@ -3266,9 +3295,9 @@ mod meeting_event_tests {
         }
     }
 
-    // Roundtrip ActionItemsUpdate z listą >1 item, żeby sprawdzić Vec w rkyv.
+    // Roundtrip ActionItemsUpdate z listą >1 item, żeby sprawdzić Vec w CBOR.
     #[test]
-    fn rkyv_roundtrip_meeting_event_action_items_update() {
+    fn cbor_roundtrip_meeting_event_action_items_update() {
         let request = ModelRequest {
             request_id: "req-2".to_string(),
             payload: ModelPayload::MeetingEvent(MeetingEventData {
@@ -3294,9 +3323,9 @@ mod meeting_event_tests {
             session_id: None,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let bytes = crate::cbor::encode(&request).expect("encode");
         let decoded: ModelRequest =
-            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => {
@@ -3318,9 +3347,9 @@ mod meeting_event_tests {
     }
 
     // Roundtrip TranscriptEntry — sprawdza że wszystkie pola (Option<String>,
-    // Option<f32>, u64) enkodują się i dekodują stabilnie przez rkyv.
+    // Option<f32>, u64) enkodują się i dekodują stabilnie przez CBOR.
     #[test]
-    fn rkyv_roundtrip_meeting_event_transcript_entry() {
+    fn cbor_roundtrip_meeting_event_transcript_entry() {
         let request = ModelRequest {
             request_id: "req-te-1".to_string(),
             payload: ModelPayload::MeetingEvent(MeetingEventData {
@@ -3342,9 +3371,9 @@ mod meeting_event_tests {
             session_id: None,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let bytes = crate::cbor::encode(&request).expect("encode");
         let decoded: ModelRequest =
-            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => match ev.payload {
@@ -3374,10 +3403,10 @@ mod meeting_event_tests {
     }
 
     // Roundtrip RosterSnapshot — batch z 50 uczestników, mix statusów i pól
-    // opcjonalnych. Sprawdza że Vec<RosterEntry> przechodzi rkyv encode/decode
+    // opcjonalnych. Sprawdza że Vec<RosterEntry> przechodzi CBOR encode/decode
     // bez utraty danych przy realnych rozmiarach burst'u Teams.
     #[test]
-    fn rkyv_roundtrip_meeting_event_roster_snapshot() {
+    fn cbor_roundtrip_meeting_event_roster_snapshot() {
         let entries: Vec<RosterEntry> = (0..50)
             .map(|i| RosterEntry {
                 speaker_id: format!("SPEAKER_{:02}", i),
@@ -3413,9 +3442,9 @@ mod meeting_event_tests {
             session_id: None,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let bytes = crate::cbor::encode(&request).expect("encode");
         let decoded: ModelRequest =
-            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => match ev.payload {
@@ -3434,7 +3463,7 @@ mod meeting_event_tests {
     // Roundtrip BackendUpdate — sprawdza wszystkie None w opcjonalnych liczbach,
     // bo tak bot je wysyła zaraz po join (bez znajomości streaming_latency itp.).
     #[test]
-    fn rkyv_roundtrip_meeting_event_backend_update() {
+    fn cbor_roundtrip_meeting_event_backend_update() {
         let request = ModelRequest {
             request_id: "req-bu-1".to_string(),
             payload: ModelPayload::MeetingEvent(MeetingEventData {
@@ -3455,9 +3484,9 @@ mod meeting_event_tests {
             session_id: None,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let bytes = crate::cbor::encode(&request).expect("encode");
         let decoded: ModelRequest =
-            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => match ev.payload {
@@ -3484,9 +3513,9 @@ mod meeting_event_tests {
         }
     }
 
-    // Roundtrip PromptFetchRequest przez rkyv — wariant ModelPayload::PromptFetch.
+    // Roundtrip PromptFetchRequest przez CBOR — wariant ModelPayload::PromptFetch.
     #[test]
-    fn rkyv_roundtrip_prompt_fetch_request() {
+    fn cbor_roundtrip_prompt_fetch_request() {
         let request = ModelRequest {
             request_id: "req-pf-1".to_string(),
             payload: ModelPayload::PromptFetch(PromptFetchRequest {
@@ -3498,9 +3527,9 @@ mod meeting_event_tests {
             session_id: None,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let bytes = crate::cbor::encode(&request).expect("encode");
         let decoded: ModelRequest =
-            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::PromptFetch(req) => {
@@ -3513,7 +3542,7 @@ mod meeting_event_tests {
 
     // Roundtrip PromptFetchResponse — sprawdza wariant ModelResult::PromptFetched.
     #[test]
-    fn rkyv_roundtrip_prompt_fetched_response() {
+    fn cbor_roundtrip_prompt_fetched_response() {
         let response = ModelResponse {
             request_id: "req-pf-2".to_string(),
             result: ModelResult::PromptFetched(PromptFetchResponse {
@@ -3524,9 +3553,9 @@ mod meeting_event_tests {
             metrics: None,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response).expect("encode");
+        let bytes = crate::cbor::encode(&response).expect("encode");
         let decoded: ModelResponse =
-            rkyv::from_bytes::<ModelResponse, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<ModelResponse>(&bytes).expect("decode");
 
         match decoded.result {
             ModelResult::PromptFetched(p) => {
@@ -3542,9 +3571,7 @@ mod meeting_event_tests {
     // jako `ModelStreamChunk`. Ta kolizja byla zrodlem buga "subtree pointer
     // overran range" w chat streaming path: sidecar dla `request.stream=false`
     // zwracal `ModelResponse`, a klient po stronie routera czytal ramki jako
-    // `ModelStreamChunk`. `request_id: String` na poczatku obu typow przepuszczal
-    // parser az do enum discriminantu (Completion=1 vs TextDelta=1), gdzie rkyv
-    // probowal odczytac String z bledem bytes -> pointer overrun.
+    // `ModelStreamChunk`. Test chroni przed zaakceptowaniem bajtow innego typu.
     #[test]
     fn model_response_bytes_dont_validate_as_stream_chunk() {
         let response = ModelResponse {
@@ -3564,11 +3591,9 @@ mod meeting_event_tests {
             metrics: None,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response).expect("encode");
+        let bytes = crate::cbor::encode(&response).expect("encode");
 
-        // Probujemy zwalidowac bajty ModelResponse jako ArchivedModelStreamChunk.
-        // To MUSI sie skonczyc bledem walidacji (a NIE panika ani sukcesem).
-        let result = rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(&bytes);
+        let result = crate::cbor::decode::<ModelStreamChunk>(&bytes);
         assert!(
             result.is_err(),
             "ModelResponse bytes nie powinny walidowac sie jako ModelStreamChunk \
@@ -3579,14 +3604,14 @@ mod meeting_event_tests {
     // Sanity: roundtrip ModelStreamChunk z TextDelta — kontrola pozytywna do
     // testu wyzej.
     #[test]
-    fn rkyv_roundtrip_stream_chunk_text_delta() {
+    fn cbor_roundtrip_stream_chunk_text_delta() {
         let chunk = ModelStreamChunk {
             request_id: "test-req-id".to_string(),
             chunk: StreamChunkType::TextDelta("Hello world".to_string()),
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk).expect("encode");
+        let bytes = crate::cbor::encode(&chunk).expect("encode");
         let decoded: ModelStreamChunk =
-            rkyv::from_bytes::<ModelStreamChunk, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<ModelStreamChunk>(&bytes).expect("decode");
         assert_eq!(decoded.request_id, "test-req-id");
         match decoded.chunk {
             StreamChunkType::TextDelta(s) => assert_eq!(s, "Hello world"),

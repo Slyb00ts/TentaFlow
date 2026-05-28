@@ -9,5 +9,5 @@ use libfuzzer_sys::fuzz_target;
 use tentaflow_protocol::MessageBody;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(data);
+    let _ = tentaflow_protocol::cbor::decode::<MessageBody>(data);
 });

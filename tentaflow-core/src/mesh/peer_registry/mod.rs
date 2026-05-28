@@ -83,7 +83,7 @@ impl PeerRegistry {
         }
     }
 
-    /// Build the rkyv-free snapshot used by the persistence writer. Reads the
+    /// Build the CBOR-free snapshot used by the persistence writer. Reads the
     /// current entry under a short read lock; callers must already hold an
     /// arc. Returns `None` when `pubkey` is unknown — peer_persisted.pubkey
     /// is NOT NULL, so we skip the UpsertEntry op until pairing/hello fills

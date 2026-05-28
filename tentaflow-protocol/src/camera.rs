@@ -3,11 +3,10 @@
 // Purpose: Admin-side binary protocol for camera discovery + add (F2 P7.a).
 //          Packed into a single `CameraAdminPayload` inner enum so the whole
 //          camera-wizard surface burns one `MessageBody` discriminant slot
-//          (rkyv 0.8 caps `MessageBody` at 256 variants — see profiling.rs
+//          (CBOR 0.8 caps `MessageBody` at 256 variants — see profiling.rs
 //          / vision.rs for the same pack pattern).
 // =============================================================================
 
-use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 /// One device returned by ONVIF WS-Discovery. Mirrors the host-fn
@@ -16,7 +15,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 /// `tentaflow-core` crate can be built without dragging the dashboard
 /// schema into the addon ABI.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct DiscoveredCameraInfo {
     /// Source IP of the ProbeMatch UDP packet (the camera's NIC address).
@@ -33,12 +32,12 @@ pub struct DiscoveredCameraInfo {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct CameraDiscoverRequest {}
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct CameraDiscoverResponse {
     pub discovered: Vec<DiscoveredCameraInfo>,
@@ -49,7 +48,7 @@ pub struct CameraDiscoverResponse {
 /// admin RPC carries the operator's user-session credentials and binds the
 /// resulting row to the org from `ctx.org_context`.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct CameraAddOnvifRequest {
     /// Human-readable label shown in the UI.
@@ -71,7 +70,7 @@ pub struct CameraAddOnvifRequest {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct CameraAddOnvifResponse {
     pub camera_id: String,
@@ -90,7 +89,7 @@ pub struct CameraAddOnvifResponse {
 /// `/frames/<ref>?token=...` URL against the latest frame stored for that
 /// camera in the in-memory LRU.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct CameraFrameUrlRequest {
     /// Camera id (UUID v4 textual form, 36 chars). Strict validation in the
@@ -103,7 +102,7 @@ pub struct CameraFrameUrlRequest {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct CameraFrameUrlResponse {
     /// Same-origin signed URL (`/frames/<ref>?token=&exp=&ref=`).
@@ -115,10 +114,10 @@ pub struct CameraFrameUrlResponse {
 }
 
 /// Inner-enum pack — keeps every admin camera RPC in a single
-/// `MessageBody::CameraAdminBody` slot (rkyv 256-variant budget). Matches the
+/// `MessageBody::CameraAdminBody` slot (CBOR 256-variant budget). Matches the
 /// `ProfilingPayload` / `VisionInferPayload` pattern.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub enum CameraAdminPayload {
     DiscoverRequest(CameraDiscoverRequest),
@@ -135,8 +134,8 @@ mod tests {
 
     macro_rules! round_trip {
         ($ty:ty, $value:expr) => {{
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&$value).expect("encode");
-            rkyv::from_bytes::<$ty, rkyv::rancor::Error>(&bytes).expect("decode")
+            let bytes = crate::cbor::encode(&$value).expect("encode");
+            crate::cbor::decode::<$ty>(&bytes).expect("decode")
         }};
     }
 
@@ -193,8 +192,8 @@ mod tests {
         let body = MessageBody::CameraAdminBody(CameraAdminPayload::DiscoverRequest(
             CameraDiscoverRequest {},
         ));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode message body");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -211,8 +210,8 @@ mod tests {
                 target_fps: Some(10),
             },
         ));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode message body");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -239,8 +238,8 @@ mod tests {
                 ],
             },
         ));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode message body");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -272,8 +271,8 @@ mod tests {
                 ttl_secs: 30,
             },
         ));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -286,8 +285,8 @@ mod tests {
                 expires_at_ms: 1,
             },
         ));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -301,8 +300,8 @@ mod tests {
                 profile_token: "Profile_1".into(),
             },
         ));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode message body");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 }

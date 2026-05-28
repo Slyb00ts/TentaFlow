@@ -1282,7 +1282,7 @@ const ChatScreen = {
 
     // Jeden round-trip do backendu po wszystkie zarejestrowane silniki/modele;
     // rozdzielamy lokalnie per service_type. Zrodlem prawdy jest ApiBinary
-    // (rkyv binary protocol) — REST /api/services/deployed nie istnieje.
+    // (CBOR binary protocol) — REST /api/services/deployed nie istnieje.
     try {
       // Binary RPC `modelListRequest` is the unified surface fed by services +
       // model_registry. We split locally per category; STT/TTS engines are

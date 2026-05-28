@@ -48,7 +48,7 @@ compiled on Linux x86_64 + RTX 4090, and test-bootstrapped.
   clients, client disconnect, handler errors, parallel streams, and
   long-idle keepalive.
 - `ReverseProxy` sidecar role translating `ModelRequest` ↔ OpenAI /
-  llama.cpp / sherpa / raw HTTP, with SSE → rkyv stream passthrough.
+  llama.cpp / sherpa / raw HTTP, with SSE → CBOR stream passthrough.
 - Dockerfile + config + entrypoint for every model container:
   `llm-llamacpp`, `llm-vllm`, `llm-sglang`, `llm-ollama`, `stt-whisper`,
   `stt-parakeet`, `stt-qwen-asr`, `tts-sherpa`, `tts-xtts`, `tts-voxcpm`,

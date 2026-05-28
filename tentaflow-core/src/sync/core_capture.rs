@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use rusqlite::OptionalExtension;
@@ -14,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use super::core_registry::{CoreSyncResourceKind, descriptor_for_kind};
 use super::ledger::FieldValue;
 use super::runtime::SqlWriteAction;
+
+static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoreWriteCapture {
@@ -256,6 +259,7 @@ fn stable_capture_id(
     hasher.update(action.as_str().as_bytes());
     hasher.update([0]);
     hasher.update(created_at_ms.to_le_bytes());
+    hasher.update(CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed).to_le_bytes());
     if let Ok(fields) = encode_changed_fields(changed_fields) {
         hasher.update(fields);
     }

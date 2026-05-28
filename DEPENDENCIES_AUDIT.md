@@ -17,7 +17,7 @@ roundzie; wszystkie sporne pozycje rozstrzygnięte przez `grep`/`cat` z path:lin
 |-------|------|------|------------:|
 | `tentaflow-core` | `tentaflow-core/` | mesh, routing, addon runtime, dashboard API, services, DB, inference, profiling | 102 |
 | `tentaflow` | `tentaflow/` | main binary: API gateway + mesh node bootstrap | 23 |
-| `tentaflow-protocol` | `tentaflow-protocol/` | rkyv wire types (QUIC mesh + dashboard WSS) | 5 |
+| `tentaflow-protocol` | `tentaflow-protocol/` | CBOR wire types (QUIC mesh + dashboard WSS) | 5 |
 | `tentaflow-transport` | `tentaflow-transport/` | iroh QUIC endpoint/framing wrapper | 14 |
 | `tentaflow-voice` | `tentaflow-voice/` | pure Rust ONNX/prost + SIMD/GEMM voice/diarization | 10 |
 | `tentaflow-macros` | `tentaflow-macros/` | proc-macros (handler/policy/observability registration) | 3 |
@@ -76,16 +76,16 @@ crate (path:line gdzie codex wykrył brak callsite).
 | `tentaflow-core` | `core-foundation-sys` (macOS target) | brak `core_foundation_sys::`; `core-foundation` agreguje sys |
 | `tentaflow-core` | `filetime` (dev) | brak callsite |
 | `tentaflow-core` | `thiserror` (build-dep v1) | nieużywany w build.rs |
-| `tentaflow-protocol` | `bytecheck` | tylko `rkyv::bytecheck::CheckBytes`, nie crate path |
-| `tentaflow-protocol-wasm` | `bytecheck`, `getrandom`, `serde`, `wasm-bindgen-futures` | brak callsite (wasm protocol używa rkyv przez re-export + js-sys) |
-| `tentaflow-transport` | `bytecheck`, `futures` | `bytecheck` przez `rkyv::bytecheck` (framing.rs:52); `futures` brak callsite |
+| `tentaflow-protocol` | `bytecheck` | tylko `CBOR::bytecheck::CheckBytes`, nie crate path |
+| `tentaflow-protocol-wasm` | `bytecheck`, `getrandom`, `serde`, `wasm-bindgen-futures` | brak callsite (wasm protocol używa CBOR przez re-export + js-sys) |
+| `tentaflow-transport` | `bytecheck`, `futures` | `bytecheck` przez `CBOR::bytecheck` (framing.rs:52); `futures` brak callsite |
 | `tentaflow-ui` | `serde_json`, `tracing` | brak callsite (egui ma własny state) |
 | `tentaflow-mobile` | `hostname`, `tentaflow-protocol`, `uuid`, `android-activity` (Android target) | brak callsite |
 | `tentaflow-desktop-core` | `hex`, `hostname`, `image`, `tentaflow-protocol` | brak callsite |
 | `tentaflow-iroh-spike` | `hmac`, `tracing`, `tracing-subscriber` | tylko `rand` żywe (pairing.rs:88) — **kandydat do usunięcia całego crate** (patrz §6.3) |
 | `tentaflow-client-native` | `ahash`, `libc`, `smallvec` | brak callsite (cbindgen build-dep ZOSTAJE — używany w `build.rs:24,44`) |
-| `tentaflow-teams-bot` | `async-trait`, `byteorder`, `rkyv` | tylko komentarze; transport agreguje serializację |
-| `tentaflow-sidecar` | `bytes`, `futures`, `parking_lot`, `rkyv`, `thiserror`, `uuid` | tylko `futures-util::StreamExt` żywe (reverse_proxy.rs:243) |
+| `tentaflow-teams-bot` | `async-trait`, `byteorder`, `CBOR` | tylko komentarze; transport agreguje serializację |
+| `tentaflow-sidecar` | `bytes`, `futures`, `parking_lot`, `CBOR`, `thiserror`, `uuid` | tylko `futures-util::StreamExt` żywe (reverse_proxy.rs:243) |
 | `tentaflow-addon-template` | `serde` | importowane z `tentaflow_addon_sdk::prelude::*` |
 | `tentaflow-addon-embeddings-chunker` | `serde` | jw. (lib.rs:31 derive z prelude) |
 | `tentaflow` (binary) | `chrono`, `futures`, `hex`, `http-body`, `http-body-util`, `hyper`, `hyper-util`, `serde`, `tokio-rustls`, `uuid` | per-dep grep `crate::` w `tentaflow/src/` zwraca **0 callsite**; legacy z czasów własnego HTTP server (cały HTTP stack przeniesiony do tentaflow-core) |
@@ -135,8 +135,8 @@ Powód moich błędów: brak weryfikacji `grep` po path:line, zgaduwanie po nazw
 | **JSON** | `serde_json` ✅ | brak overlap | KEEP |
 | **YAML** | `serde_yaml` ❌ | dead | DELETE |
 | **TOML** | `toml` ✅ (config + manifest) | brak overlap | KEEP |
-| **Wire binary** | `rkyv` ✅ (zero-copy QUIC) | brak overlap | KEEP |
-| **bytecheck direct** | declared w 3 crates ❌ | wszędzie kod używa `rkyv::bytecheck` | DELETE z protocol/transport/wasm |
+| **Wire binary** | `CBOR` ✅ (zero-copy QUIC) | brak overlap | KEEP |
+| **bytecheck direct** | declared w 3 crates ❌ | wszędzie kod używa `CBOR::bytecheck` | DELETE z protocol/transport/wasm |
 | **Logging** | `tracing` + `tracing-subscriber` ✅ | brak overlap | KEEP, delete dead z ui/iroh-spike |
 | **HTTP server** | `hyper` + `hyper-util` (core only) | KEEP w core, DEAD w `tentaflow` binary | DELETE z binary |
 | **HTTP client** | `reqwest` 0.13 (core) | brak overlap | KEEP |
