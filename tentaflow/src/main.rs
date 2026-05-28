@@ -148,10 +148,7 @@ async fn run_server(args: Args) -> Result<()> {
     // ukończeniu (zwykle <30s na pierwszym uruchomieniu, instant na kolejnych).
     tokio::spawn(tentaflow_core::audio_models::bootstrap());
 
-    let db_path: PathBuf = args
-        .db_path
-        .clone()
-        .unwrap_or_else(paths::database_path);
+    let db_path: PathBuf = args.db_path.clone().unwrap_or_else(paths::database_path);
 
     // Wczytaj konfiguracje lub utworz domyslna
     let mut config = if args.config.exists() {
@@ -279,6 +276,12 @@ async fn run_server(args: Args) -> Result<()> {
         let _writer_handle = writer.spawn();
     }
 
+    for (node_id, public_key_hex) in mesh_security.get_all_trusted_keys() {
+        if node_id != local_node_id_str {
+            mesh_peer_store.ensure_trusted_peer(&node_id, &public_key_hex, "");
+        }
+    }
+
     // Mesh services registry — agregator widokow `services` ze wszystkich
     // zaufanych peerow. Pisze do niego pipeline mesh (handlery
     // `MeshServicesGet/Announce/Update`); czyta GUI/forwarding (krok N3b).
@@ -348,28 +351,26 @@ async fn run_server(args: Args) -> Result<()> {
     // i wpadał w fallback z innym portem, czyli "magiczna" zmiana portu.
     if let Some(port_allocator) = services_port_allocator.clone() {
         match db.lock() {
-            Ok(conn) => {
-                match tentaflow_core::services_repo::services::list_all(&conn) {
-                    Ok(services) => {
-                        for svc in services {
-                            for port in [svc.runtime_port, svc.sidecar_quic_port]
-                                .into_iter()
-                                .flatten()
-                            {
-                                if let Err(e) = port_allocator.reserve(port) {
-                                    tracing::warn!(
-                                        service_id = svc.id,
-                                        port,
-                                        "boot port reserve skipped: {}",
-                                        e
-                                    );
-                                }
+            Ok(conn) => match tentaflow_core::services_repo::services::list_all(&conn) {
+                Ok(services) => {
+                    for svc in services {
+                        for port in [svc.runtime_port, svc.sidecar_quic_port]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Err(e) = port_allocator.reserve(port) {
+                                tracing::warn!(
+                                    service_id = svc.id,
+                                    port,
+                                    "boot port reserve skipped: {}",
+                                    e
+                                );
                             }
                         }
                     }
-                    Err(e) => tracing::warn!("boot port reserve: list_all failed: {}", e),
                 }
-            }
+                Err(e) => tracing::warn!("boot port reserve: list_all failed: {}", e),
+            },
             Err(e) => tracing::warn!("boot port reserve: db lock poisoned: {}", e),
         }
     }
@@ -679,13 +680,26 @@ async fn run_server(args: Args) -> Result<()> {
         }
     }
 
-    // Reset stale deploymentów po unclean shutdown — wiersze pozostawione jako
-    // 'building'/'running' dostają status='failure' z error='aborted'. Runner
-    // tokio-task który je produkował nie żyje po restarcie.
+    // Reset stale deploymentów po unclean shutdown. Runner tokio-task który je
+    // produkował nie żyje po restarcie, więc oznaczamy je jako przerwane i
+    // odtwarzamy z trwałego wiersza deploymentu.
     match tentaflow_core::db::repository::deployments::reset_stale(&db) {
-        Ok(n) if n > 0 => info!("Deployments cleanup: {} stale rows marked as failure", n),
+        Ok(n) if n > 0 => info!(
+            "Deployments cleanup: {} stale rows marked as interrupted",
+            n
+        ),
         Ok(_) => {}
         Err(e) => warn!("Deployments cleanup: {}", e),
+    }
+    if let Some(port_allocator) = services_port_allocator.clone() {
+        resume_interrupted_deployments(
+            db.clone(),
+            port_allocator,
+            local_node_id_str.clone(),
+            mesh_services_registry.clone(),
+            quic_mesh_for_server.clone(),
+        )
+        .await;
     }
 
     // Uruchom serwer HTTPS (OpenAI API + Dashboard na jednym porcie) — z Core
@@ -736,8 +750,7 @@ async fn run_server(args: Args) -> Result<()> {
     // dla 9B modelu) i nastepny deploy konkurowal o pamiec z poprzedniej
     // instancji.
     if let Some(ports) = services_port_allocator.clone() {
-        let errors =
-            tentaflow_core::services::deploy::stop_all_supervised(&db, ports).await;
+        let errors = tentaflow_core::services::deploy::stop_all_supervised(&db, ports).await;
         if !errors.is_empty() {
             for (id, msg) in &errors {
                 tracing::warn!("shutdown stop service id={}: {}", id, msg);
@@ -865,6 +878,275 @@ fn apply_cli_overrides(config: &mut NodeConfig, args: &Args) {
     if args.no_mesh {
         if let Some(ref mut mesh) = config.mesh {
             mesh.enabled = false;
+        }
+    }
+}
+
+async fn resume_interrupted_deployments(
+    db: tentaflow_core::db::DbPool,
+    port_allocator: Arc<tentaflow_core::services::ports::PortAllocator>,
+    local_node_id: String,
+    mesh_services_registry: Arc<tentaflow_core::services::mesh_registry::MeshServicesRegistry>,
+    quic_mesh: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>>,
+) {
+    let rows = match db.lock() {
+        Ok(conn) => match tentaflow_core::services_repo::deployments::list_resumable(&conn) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("deployment resume: list failed: {}", e);
+                return;
+            }
+        },
+        Err(e) => {
+            warn!("deployment resume: db lock poisoned: {}", e);
+            return;
+        }
+    };
+
+    for row in rows {
+        let Some(service_id) = row.target_service_id else {
+            continue;
+        };
+        let Some(deploy_id) = row.slug.clone() else {
+            continue;
+        };
+        let service = match db.lock() {
+            Ok(conn) => match tentaflow_core::services_repo::services::get(&conn, service_id) {
+                Ok(Some(service)) => service,
+                Ok(None) => {
+                    warn!(
+                        deployment_id = row.id,
+                        service_id, "deployment resume: service missing"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        deployment_id = row.id,
+                        service_id, "deployment resume: service lookup failed: {}", e
+                    );
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!("deployment resume: db lock poisoned: {}", e);
+                continue;
+            }
+        };
+
+        let manifest = match tentaflow_core::services::manifest::registry()
+            .by_id(&service.engine_id)
+            .cloned()
+        {
+            Some(manifest) => manifest,
+            None => {
+                mark_resume_failed(
+                    &db,
+                    service_id,
+                    row.id,
+                    &deploy_id,
+                    Some(&format!("manifest '{}' not found", service.engine_id)),
+                );
+                continue;
+            }
+        };
+        let deploy_method = match tentaflow_core::services_repo::services::parse_deploy_method(
+            &row.deploy_method,
+        ) {
+            Ok(method) => method,
+            Err(e) => {
+                mark_resume_failed(&db, service_id, row.id, &deploy_id, Some(&e.to_string()));
+                continue;
+            }
+        };
+        let user_config = match serde_json::from_str::<serde_json::Value>(&service.config_json) {
+            Ok(value) => value,
+            Err(e) => {
+                mark_resume_failed(&db, service_id, row.id, &deploy_id, Some(&e.to_string()));
+                continue;
+            }
+        };
+
+        if let Ok(conn) = db.lock() {
+            let _ = tentaflow_core::services_repo::services::update_status(
+                &conn,
+                service_id,
+                tentaflow_core::services_repo::services::ServiceStatus::Deploying,
+            );
+            let _ = tentaflow_core::services_repo::services::update_deploy_progress(
+                &conn,
+                service_id,
+                0,
+                Some("resuming deployment"),
+            );
+            let _ = tentaflow_core::services_repo::deployments::set_progress(
+                &conn,
+                &deploy_id,
+                tentaflow_core::services_repo::deployments::DeploymentStatus::Deploying,
+                "resuming",
+                0,
+            );
+        }
+
+        publish_resumed_service(
+            &db,
+            service_id,
+            &local_node_id,
+            &mesh_services_registry,
+            quic_mesh.as_ref(),
+        )
+        .await;
+
+        let db_task = db.clone();
+        let ports_task = port_allocator.clone();
+        let local_node_task = local_node_id.clone();
+        let registry_task = mesh_services_registry.clone();
+        let quic_task = quic_mesh.clone();
+        let manifest_task = manifest.clone();
+        let config_task = user_config.clone();
+        let deploy_id_task = deploy_id.clone();
+        let job = tentaflow_core::services::deploy::DeployJob {
+            deploy_id,
+            deployment_id: row.id,
+            service_id,
+        };
+        let sender_task = tentaflow_core::deploy::log_bus::sender_for(&deploy_id_task);
+        {
+            let mut progress_rx = sender_task.subscribe();
+            let db_progress = db.clone();
+            let local_node_progress = local_node_id.clone();
+            let registry_progress = mesh_services_registry.clone();
+            let quic_progress = quic_mesh.clone();
+            tokio::spawn(async move {
+                loop {
+                    match progress_rx.recv().await {
+                        Ok(tentaflow_core::deploy::log_bus::BusMessage::Line(line))
+                            if line.kind == "phase" || line.kind == "progress" =>
+                        {
+                            publish_resumed_service(
+                                &db_progress,
+                                service_id,
+                                &local_node_progress,
+                                &registry_progress,
+                                quic_progress.as_ref(),
+                            )
+                            .await;
+                        }
+                        Ok(tentaflow_core::deploy::log_bus::BusMessage::Line(_)) => {}
+                        Ok(tentaflow_core::deploy::log_bus::BusMessage::End { .. }) => return,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            });
+        }
+
+        tokio::spawn(async move {
+            let start_ms = tentaflow_core::deploy::log_bus::now_ms();
+            let result = tentaflow_core::services::deploy::deploy(
+                job,
+                deploy_method,
+                &manifest_task,
+                &config_task,
+                &ports_task,
+                &db_task,
+                Some(sender_task.clone()),
+            )
+            .await;
+            match result {
+                Ok(_) => {
+                    let _ = sender_task.send(tentaflow_core::deploy::log_bus::BusMessage::End {
+                        deploy_id: deploy_id_task.clone(),
+                        final_status: "success".to_string(),
+                        image_tag: String::new(),
+                        container_name: String::new(),
+                        error_message: String::new(),
+                        duration_ms: tentaflow_core::deploy::log_bus::now_ms() - start_ms,
+                    });
+                }
+                Err(err) => {
+                    let _ = sender_task.send(tentaflow_core::deploy::log_bus::BusMessage::End {
+                        deploy_id: deploy_id_task.clone(),
+                        final_status: "failed".to_string(),
+                        image_tag: String::new(),
+                        container_name: String::new(),
+                        error_message: err.to_string(),
+                        duration_ms: tentaflow_core::deploy::log_bus::now_ms() - start_ms,
+                    });
+                }
+            }
+            publish_resumed_service(
+                &db_task,
+                service_id,
+                &local_node_task,
+                &registry_task,
+                quic_task.as_ref(),
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tentaflow_core::deploy::log_bus::close(&deploy_id_task);
+        });
+        info!(
+            service_id,
+            deployment_id = row.id,
+            "deployment resume scheduled"
+        );
+    }
+}
+
+fn mark_resume_failed(
+    db: &tentaflow_core::db::DbPool,
+    service_id: i64,
+    deployment_id: i64,
+    deploy_id: &str,
+    message: Option<&str>,
+) {
+    if let Ok(conn) = db.lock() {
+        let _ = tentaflow_core::services_repo::deployments::mark_finished(
+            &conn,
+            deployment_id,
+            tentaflow_core::services_repo::deployments::DeploymentStatus::Failed,
+            message,
+        );
+        let _ = tentaflow_core::services_repo::services::mark_deploy_failed(
+            &conn,
+            service_id,
+            deploy_id,
+            tentaflow_core::services_repo::services::ServiceStatus::Failed,
+            message,
+        );
+    }
+}
+
+async fn publish_resumed_service(
+    db: &tentaflow_core::db::DbPool,
+    service_id: i64,
+    local_node_id: &str,
+    mesh_services_registry: &tentaflow_core::services::mesh_registry::MeshServicesRegistry,
+    quic_mesh: Option<&Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>>,
+) {
+    let Ok(Some(info)) =
+        tentaflow_core::services::snapshot_builder::build_one(db, service_id, local_node_id)
+    else {
+        return;
+    };
+    mesh_services_registry.apply_local_change(
+        local_node_id,
+        tentaflow_protocol::ServiceChange::Updated(info.clone()),
+    );
+    if let Some(qm) = quic_mesh {
+        let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+            from_node_id: local_node_id.to_string(),
+            change: tentaflow_protocol::ServiceChange::Updated(info),
+        };
+        if let Ok(bytes) = tentaflow_core::mesh::cbor::encode(&payload) {
+            let _ = qm
+                .broadcast_ufp2_to_trusted(
+                    tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                    &bytes,
+                    None,
+                )
+                .await;
         }
     }
 }

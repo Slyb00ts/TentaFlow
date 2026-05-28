@@ -3508,8 +3508,6 @@ pub async fn service_manifest_deploy(
         },
     )?;
 
-    let slug = uuid::Uuid::new_v4().to_string();
-
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     audit(
         ctx,
@@ -3548,8 +3546,78 @@ pub async fn service_manifest_deploy(
         ProtocolError::internal("port allocator not initialized (supervisor disabled)")
     })?;
 
+    let job = crate::services::deploy::create_deploy_job(
+        deploy_method,
+        &manifest,
+        &user_config,
+        &ctx.state.db,
+        ctx.state.local_node_id.as_ref(),
+        user_id,
+        None,
+    )
+    .map_err(|e| ProtocolError::internal(e.to_string()))?;
+
+    if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+        &ctx.state.db,
+        job.service_id,
+        ctx.state.local_node_id.as_ref(),
+    ) {
+        broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Added(info));
+    }
+
+    let slug = job.deploy_id.clone();
     let log_sender = crate::deploy::log_bus::sender_for(&slug);
+    {
+        let mut status_rx = log_sender.subscribe();
+        let db_status = ctx.state.db.clone();
+        let service_id_status = job.service_id;
+        let local_node_id_status = ctx.state.local_node_id.to_string();
+        let quic_mesh_status = ctx.state.quic_mesh.clone();
+        let mesh_services_registry_status = ctx.state.mesh_services_registry.clone();
+        tokio::spawn(async move {
+            loop {
+                match status_rx.recv().await {
+                    Ok(crate::deploy::log_bus::BusMessage::Line(line))
+                        if line.kind == "phase" || line.kind == "progress" =>
+                    {
+                        if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+                            &db_status,
+                            service_id_status,
+                            &local_node_id_status,
+                        ) {
+                            mesh_services_registry_status.apply_local_change(
+                                &local_node_id_status,
+                                tentaflow_protocol::ServiceChange::Updated(info.clone()),
+                            );
+                            if let Some(qm) = quic_mesh_status.as_ref() {
+                                let payload =
+                                    tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                                        from_node_id: local_node_id_status.clone(),
+                                        change: tentaflow_protocol::ServiceChange::Updated(info),
+                                    };
+                                if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                                {
+                                    let _ = qm
+                                        .broadcast_ufp2_to_trusted(
+                                            tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                                            &bytes,
+                                            None,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(crate::deploy::log_bus::BusMessage::Line(_)) => {}
+                    Ok(crate::deploy::log_bus::BusMessage::End { .. }) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+    }
     let db_clone = ctx.state.db.clone();
+    let job_task = job.clone();
     let slug_task = slug.clone();
     let manifest_task = manifest.clone();
     let user_config_task = user_config.clone();
@@ -3564,13 +3632,13 @@ pub async fn service_manifest_deploy(
     tokio::spawn(async move {
         let start_ms = crate::deploy::log_bus::now_ms();
         let result = crate::services::deploy::deploy(
+            job_task.clone(),
             deploy_method,
             &manifest_task,
             &user_config_task,
             &port_allocator,
             &db_clone,
             Some(log_sender_task.clone()),
-            Some(slug_task.clone()),
         )
         .await;
         match result {
@@ -3620,7 +3688,7 @@ pub async fn service_manifest_deploy(
                         if let Some(qm) = quic_mesh_task {
                             let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
                                 from_node_id: local_node_id_task.clone(),
-                                change: tentaflow_protocol::ServiceChange::Added(info),
+                                change: tentaflow_protocol::ServiceChange::Updated(info),
                             };
                             if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                                 let _ = qm
@@ -3658,12 +3726,39 @@ pub async fn service_manifest_deploy(
             Err(err) => {
                 let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
                     deploy_id: slug_task.clone(),
-                    final_status: "failure".to_string(),
+                    final_status: "failed".to_string(),
                     image_tag: String::new(),
                     container_name: String::new(),
                     error_message: err.to_string(),
                     duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
                 });
+                if let Ok(Some(info)) =
+                    crate::services::snapshot_builder::build_one(
+                        &db_clone,
+                        job_task.service_id,
+                        &local_node_id_task,
+                    )
+                {
+                    mesh_services_registry_task.apply_local_change(
+                        &local_node_id_task,
+                        tentaflow_protocol::ServiceChange::Updated(info.clone()),
+                    );
+                    if let Some(qm) = quic_mesh_task {
+                        let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                            from_node_id: local_node_id_task.clone(),
+                            change: tentaflow_protocol::ServiceChange::Updated(info),
+                        };
+                        if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                            let _ = qm
+                                .broadcast_ufp2_to_trusted(
+                                    tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                                    &bytes,
+                                    None,
+                                )
+                                .await;
+                        }
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 crate::deploy::log_bus::close(&slug_task);
             }

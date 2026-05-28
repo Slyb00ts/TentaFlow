@@ -101,7 +101,7 @@ pub struct ServiceInfo {
     pub deploy_method: String,
     /// embedded / http_direct / sidecar_quic / external_http.
     pub transport: String,
-    /// starting / running / degraded / failed / stopped.
+    /// deploying / starting / running / degraded / failed / stopped / interrupted.
     pub status: String,
     pub pinned: bool,
     pub paused: bool,
@@ -111,6 +111,9 @@ pub struct ServiceInfo {
     pub endpoint_url: Option<String>,
     pub restart_count: u32,
     pub health_last_err: Option<String>,
+    pub active_deploy_id: String,
+    pub last_deploy_id: String,
+    pub deployment_progress_pct: i32,
     /// Krótki user-friendly opis aktualnej fazy startu (np.
     /// "warming up — alive 30s, waiting for /v1/models"). Aktualizowany
     /// przez supervisor heartbeat co 5s podczas Starting. Frontend
@@ -3047,7 +3050,7 @@ pub struct DeploymentStatusResponse {
 pub struct DeploymentListRequest {
     /// "" = wszystkie engines; inaczej filtr exact match.
     pub engine_id: String,
-    /// "" = wszystkie; inaczej: "queued"/"building"/"pulling"/"running"/"registering"/"success"/"failure"/"cancelled".
+    /// "" = wszystkie; inaczej: "deploying"/"success"/"failed"/"cancelled"/"interrupted".
     pub status: String,
     /// true = tylko moje; false = wszystkie (wymaga admin).
     pub only_mine: bool,
@@ -3082,7 +3085,7 @@ pub struct DeploymentStreamChunk {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentStreamEnd {
     pub deploy_id: String,
-    /// "success" | "failure" | "cancelled".
+    /// "success" | "failed" | "cancelled" | "interrupted".
     pub final_status: String,
     pub image_tag: String,
     pub container_name: String,

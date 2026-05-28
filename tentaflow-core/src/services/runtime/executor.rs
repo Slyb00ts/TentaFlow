@@ -1551,8 +1551,8 @@ impl ModelRuntimeExecutor {
     ///   Local dla embedded whisper).
     /// * `MeshForward{node_id, service_id}` → forward STT request przez
     ///   QUIC/iroh do peera. Aktualnie nie wspierane wprost na poziomie
-    ///   Executor (mesh STT forward jest TODO przy bigger refactor mesh
-    ///   inference proxy); wracamy `SttBackend("mesh forward not implemented")`
+    ///   Executor (mesh STT forward czeka na refactor mesh inference proxy);
+    ///   wracamy `SttBackend("mesh forward not implemented")`
     ///   zeby request padal czytelnie zamiast cicho lokalnym whisperem.
     /// * `Flow` → wracamy clean failure (flow STT idzie przez flow_engine
     ///   adapter, nie executor).

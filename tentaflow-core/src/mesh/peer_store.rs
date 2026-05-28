@@ -322,6 +322,23 @@ impl MeshPeerStore {
         }
     }
 
+    pub fn ensure_trusted_peer(&self, node_id: &str, public_key_hex: &str, hostname: &str) {
+        let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
+        else {
+            return;
+        };
+        reg.upsert_discovered(id, TransportHints::default());
+        let pubkey = hex::decode(public_key_hex)
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
+            .unwrap_or_else(|| id.to_vec());
+        reg.set_pubkey(&id, Arc::<[u8]>::from(pubkey));
+        reg.set_trust(&id, TrustState::Trusted);
+        if !hostname.is_empty() {
+            reg.set_hostname(&id, Arc::<str>::from(hostname));
+        }
+    }
+
     /// Drive the registry into Connected for `node_id`. Synthesises a
     /// fresh conn_id and fires the DialStarted→DialOk pair the state
     /// machine expects when transitioning Disconnected/Offline → Connected.
@@ -1463,5 +1480,27 @@ mod tests {
             registry.is_connected(&node_bytes),
             "update_metrics must wake the registry out of Connecting after a heartbeat proves the peer is live",
         );
+    }
+
+    #[test]
+    fn ensure_trusted_peer_materializes_registry_entry() {
+        let mut store = MeshPeerStore::new();
+        let registry = crate::mesh::peer_registry::PeerRegistry::new(64);
+        store.set_registry(registry.clone());
+
+        let node_bytes = [9u8; 32];
+        let node_id_hex = hex::encode(node_bytes);
+        let public_key_hex = format!("{}{}", node_id_hex, hex::encode([10u8; 32]));
+
+        store.ensure_trusted_peer(&node_id_hex, &public_key_hex, "node-9");
+
+        let detail = registry
+            .snapshot_detail(&node_bytes)
+            .expect("trusted peer detail");
+        assert_eq!(
+            detail.summary.trust,
+            crate::mesh::peer_registry::TrustStateTag::Trusted
+        );
+        assert_eq!(detail.summary.hostname.as_ref(), "node-9");
     }
 }

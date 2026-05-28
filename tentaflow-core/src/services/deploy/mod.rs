@@ -29,7 +29,7 @@ use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
 use crate::services_repo::deployments::{self as deployments_repo, DeploymentStatus};
 use crate::services_repo::models::{self as models_repo, NewModel};
-use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
+use crate::services_repo::services::{self as services_repo, DeployMethod, NewService, ServiceStatus};
 
 // ----- Errors ---------------------------------------------------------------
 
@@ -78,6 +78,7 @@ pub struct LogSink {
     pub slug: String,
     pub sender: broadcast::Sender<BusMessage>,
     pub db: DbPool,
+    pub service_id: Option<i64>,
 }
 
 impl LogSink {
@@ -105,6 +106,7 @@ impl LogSink {
     /// `line` is the human-readable label.
     pub fn phase(&self, phase: &str, line: &str) {
         let _ = deployments_repo::append_log_line(&self.db, &self.slug, line);
+        self.persist_progress(phase, 0, Some(line));
         let _ = self.sender.send(BusMessage::Line(LogLine {
             deploy_id: self.slug.clone(),
             kind: "phase".to_string(),
@@ -120,6 +122,7 @@ impl LogSink {
     /// multi-step deploy can drive multiple progress bars.
     pub fn progress(&self, phase: &str, pct: u8, line: &str) {
         let _ = deployments_repo::append_log_line(&self.db, &self.slug, line);
+        self.persist_progress(phase, pct.min(100) as u32, Some(line));
         let _ = self.sender.send(BusMessage::Line(LogLine {
             deploy_id: self.slug.clone(),
             kind: "progress".to_string(),
@@ -128,6 +131,21 @@ impl LogSink {
             progress_pct: pct.min(100) as u32,
             ts_ms: now_ms(),
         }));
+    }
+
+    fn persist_progress(&self, phase: &str, pct: u32, message: Option<&str>) {
+        if let Ok(conn) = self.db.lock() {
+            let _ = deployments_repo::set_progress(
+                &conn,
+                &self.slug,
+                DeploymentStatus::Deploying,
+                phase,
+                pct,
+            );
+            if let Some(service_id) = self.service_id {
+                let _ = services_repo::update_deploy_progress(&conn, service_id, pct, message);
+            }
+        }
     }
 }
 
@@ -139,6 +157,13 @@ impl LogSink {
 pub struct DeployOutcome {
     pub deployment_id: i64,
     pub endpoint: ServiceEndpoint,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeployJob {
+    pub deploy_id: String,
+    pub deployment_id: i64,
+    pub service_id: i64,
 }
 
 /// Runtime descriptor produced during prepare. Owned by `PreparedDeploy` so
@@ -186,7 +211,12 @@ pub struct PreparedDeploy {
 #[async_trait]
 pub trait DeployStrategy: Send + Sync {
     async fn prepare(&mut self) -> DeployResult<PreparedDeploy>;
-    fn commit(&self, tx: &Transaction<'_>, prepared: &PreparedDeploy) -> DeployResult<i64>;
+    fn commit(
+        &self,
+        tx: &Transaction<'_>,
+        service_id: i64,
+        prepared: &PreparedDeploy,
+    ) -> DeployResult<()>;
     async fn rollback(&self, prepared: PreparedDeploy) -> DeployResult<()>;
 }
 
@@ -200,28 +230,62 @@ pub trait DeployStrategy: Send + Sync {
 /// `BusMessage::Line` keyed by `slug`. `existing_slug` lets the caller pin a
 /// pre-generated slug (e.g. so the WebSocket subscription URL is known
 /// before the audit row is written); when `None` a fresh UUID is used.
+pub fn create_deploy_job(
+    method: DeployMethod,
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+    db: &DbPool,
+    local_node_id: &str,
+    user_id: Option<i64>,
+    existing_slug: Option<String>,
+) -> DeployResult<DeployJob> {
+    let slug = existing_slug.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let config_json = serde_json::to_string(user_config)
+        .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
+    let placeholder = build_placeholder_service(method, manifest, &config_json, &slug);
+    let (service_id, deployment_id) = with_tx(db, |tx| {
+        let sid = services_repo::insert_in_tx(tx, &placeholder)?;
+        let did = deployments_repo::create_with_slug(
+            tx,
+            &manifest.engine.id,
+            method.as_db_tag(),
+            &slug,
+            local_node_id,
+            sid,
+            &config_json,
+        )?;
+        if let Some(uid) = user_id {
+            tx.execute(
+                "UPDATE deployments SET user_id = ?2 WHERE id = ?1",
+                rusqlite::params![did, uid],
+            )
+            .map_err(DeployError::from)?;
+        }
+        Ok((sid, did))
+    })?;
+    Ok(DeployJob {
+        deploy_id: slug,
+        deployment_id,
+        service_id,
+    })
+}
+
 pub async fn deploy(
+    job: DeployJob,
     method: DeployMethod,
     manifest: &ServiceManifest,
     user_config: &serde_json::Value,
     ports: &Arc<PortAllocator>,
     db: &DbPool,
     log_sink: Option<broadcast::Sender<BusMessage>>,
-    existing_slug: Option<String>,
 ) -> DeployResult<DeployOutcome> {
-    let slug = existing_slug.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let slug = job.deploy_id.clone();
     let sink = log_sink.map(|sender| LogSink {
         slug: slug.clone(),
         sender,
         db: db.clone(),
+        service_id: Some(job.service_id),
     });
-
-    // 1. Audit row first so we always have a paper trail, even on prepare failure.
-    let deployment_id = with_tx(db, |tx| {
-        let id =
-            deployments_repo::create_with_slug(tx, &manifest.engine.id, method.as_db_tag(), &slug)?;
-        Ok(id)
-    })?;
 
     if let Some(s) = &sink {
         s.info(&format!(
@@ -247,12 +311,13 @@ pub async fn deploy(
             with_tx(db, |tx| {
                 deployments_repo::mark_finished(
                     tx,
-                    deployment_id,
+                    job.deployment_id,
                     DeploymentStatus::Failed,
                     Some(&err.to_string()),
                 )
                 .map_err(|e| DeployError::Database(format!("mark_finished: {}", e)))
             })?;
+            mark_service_deploy_failed(db, job.service_id, &slug, &err.to_string(), false);
             return Err(DeployError::Manifest(err.to_string()));
         }
     }
@@ -298,10 +363,11 @@ pub async fn deploy(
             }
             mark_finished(
                 db,
-                deployment_id,
+                job.deployment_id,
                 DeploymentStatus::Failed,
                 Some(&e.to_string()),
             );
+            mark_service_deploy_failed(db, job.service_id, &slug, &e.to_string(), false);
             return Err(e);
         }
     };
@@ -312,21 +378,19 @@ pub async fn deploy(
 
     // 4. COMMIT — single transaction over services + model_registry +
     //    deployments.finish. Any failure triggers rollback of side effects.
-    let commit_result: DeployResult<i64> = with_tx(db, |tx| {
-        let sid = strategy.commit(tx, &prepared)?;
+    let commit_result: DeployResult<()> = with_tx(db, |tx| {
+        strategy.commit(tx, job.service_id, &prepared)?;
         for m in &prepared.models {
-            // service_id is filled by commit; the strategy returns NewModel with
-            // service_id = 0 since it's only known here.
             let mut model = m.clone();
-            model.service_id = sid;
+            model.service_id = job.service_id;
             models_repo::insert_in_tx(tx, &model)?;
         }
-        deployments_repo::mark_finished(tx, deployment_id, DeploymentStatus::Success, None)?;
-        Ok(sid)
+        deployments_repo::mark_finished(tx, job.deployment_id, DeploymentStatus::Success, None)?;
+        Ok(())
     });
 
-    let service_id = match commit_result {
-        Ok(id) => id,
+    match commit_result {
+        Ok(()) => {}
         Err(commit_err) => {
             // 5. ROLLBACK side effects (processes, containers, ports).
             let rb_msg = match strategy.rollback(prepared).await {
@@ -339,7 +403,8 @@ pub async fn deploy(
             if let Some(s) = &sink {
                 s.emit("error", &rb_msg);
             }
-            mark_finished(db, deployment_id, DeploymentStatus::Failed, Some(&rb_msg));
+            mark_finished(db, job.deployment_id, DeploymentStatus::Failed, Some(&rb_msg));
+            mark_service_deploy_failed(db, job.service_id, &slug, &rb_msg, false);
             return Err(commit_err);
         }
     };
@@ -347,7 +412,7 @@ pub async fn deploy(
     // 6. Build the outcome endpoint for callers.
     let endpoint = ServiceEndpoint {
         handle: crate::services::lifecycle::ServiceHandle {
-            id: service_id,
+            id: job.service_id,
             engine_id: prepared.engine_id.clone(),
         },
         transport: prepared.transport,
@@ -360,7 +425,7 @@ pub async fn deploy(
     };
 
     Ok(DeployOutcome {
-        deployment_id,
+        deployment_id: job.deployment_id,
         endpoint,
     })
 }
@@ -601,6 +666,23 @@ fn mark_finished(db: &DbPool, id: i64, status: DeploymentStatus, err: Option<&st
     });
 }
 
+fn mark_service_deploy_failed(
+    db: &DbPool,
+    service_id: i64,
+    deploy_id: &str,
+    message: &str,
+    interrupted: bool,
+) {
+    if let Ok(conn) = db.lock() {
+        let status = if interrupted {
+            ServiceStatus::Interrupted
+        } else {
+            ServiceStatus::Failed
+        };
+        let _ = services_repo::mark_deploy_failed(&conn, service_id, deploy_id, status, Some(message));
+    }
+}
+
 // ----- Shared helpers used by strategies -----------------------------------
 
 /// Builds the canonical `NewService` row from the prepared state.
@@ -624,6 +706,44 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         sidecar_quic_port: prepared.runtime.sidecar_port,
         endpoint_url: prepared.runtime.endpoint_url.clone(),
         config_json: prepared.config_json.clone(),
+        active_deploy_id: String::new(),
+        last_deploy_id: String::new(),
+        deployment_progress_pct: if status == ServiceStatus::Running { 100 } else { 0 },
+    }
+}
+
+fn build_placeholder_service(
+    method: DeployMethod,
+    manifest: &ServiceManifest,
+    config_json: &str,
+    deploy_id: &str,
+) -> NewService {
+    NewService {
+        engine_id: manifest.engine.id.clone(),
+        category: category_tag(manifest).to_string(),
+        display_name: resolve_display_name(manifest),
+        deploy_method: method,
+        transport: placeholder_transport(method),
+        status: ServiceStatus::Deploying,
+        pinned: true,
+        paused: false,
+        runtime_pid: None,
+        runtime_port: None,
+        sidecar_quic_port: None,
+        endpoint_url: None,
+        config_json: config_json.to_string(),
+        active_deploy_id: deploy_id.to_string(),
+        last_deploy_id: deploy_id.to_string(),
+        deployment_progress_pct: 0,
+    }
+}
+
+fn placeholder_transport(method: DeployMethod) -> Transport {
+    match method {
+        DeployMethod::NativeEmbedded => Transport::Embedded,
+        DeployMethod::External => Transport::ExternalHttp,
+        DeployMethod::Docker => Transport::SidecarQuic,
+        DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => Transport::HttpDirect,
     }
 }
 
@@ -1641,6 +1761,16 @@ mod tests {
         Arc::new(Mutex::new(conn))
     }
 
+    fn make_job(
+        db: &DbPool,
+        method: DeployMethod,
+        manifest: &ServiceManifest,
+        cfg: &serde_json::Value,
+        slug: Option<String>,
+    ) -> DeployJob {
+        create_deploy_job(method, manifest, cfg, db, "node-test", Some(1), slug).unwrap()
+    }
+
     #[tokio::test]
     async fn smart_probe_returns_ready_when_readiness_url_succeeds() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1735,13 +1865,14 @@ mod tests {
         let ports = Arc::new(PortAllocator::new((46_700, 46_799), Default::default()).unwrap());
         let manifest = dummy_manifest("emb-collide", NativeRuntime::Embedded);
         let cfg = serde_json::json!({});
+        let job = make_job(&db, DeployMethod::NativeEmbedded, &manifest, &cfg, None);
         let result = deploy(
+            job,
             DeployMethod::NativeEmbedded,
             &manifest,
             &cfg,
             &ports,
             &db,
-            None,
             None,
         )
         .await;
@@ -1779,13 +1910,14 @@ mod tests {
         // embedded.rs:145.
         let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
         let cfg = serde_json::json!({});
+        let job = make_job(&db, DeployMethod::NativeEmbedded, &manifest, &cfg, None);
         let outcome = deploy(
+            job,
             DeployMethod::NativeEmbedded,
             &manifest,
             &cfg,
             &ports,
             &db,
-            None,
             None,
         )
         .await
@@ -1813,13 +1945,14 @@ mod tests {
         let ports = Arc::new(PortAllocator::new((46_500, 46_599), Default::default()).unwrap());
         let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
         let cfg = serde_json::json!({});
+        let job = make_job(&db, DeployMethod::NativeEmbedded, &manifest, &cfg, None);
         let outcome = deploy(
+            job,
             DeployMethod::NativeEmbedded,
             &manifest,
             &cfg,
             &ports,
             &db,
-            None,
             None,
         )
         .await
@@ -1869,13 +2002,14 @@ mod tests {
             Some("/nonexistent/path/that/should/not/exist".into());
 
         let cfg = serde_json::json!({});
+        let job = make_job(&db, DeployMethod::NativeBinary, &manifest, &cfg, None);
         let res = deploy(
+            job,
             DeployMethod::NativeBinary,
             &manifest,
             &cfg,
             &ports,
             &db,
-            None,
             None,
         )
         .await;
@@ -1906,14 +2040,21 @@ mod tests {
         let cfg = serde_json::json!({});
 
         let slug = "handler-slug-cccc".to_string();
+        let job = make_job(
+            &db,
+            DeployMethod::NativeEmbedded,
+            &manifest,
+            &cfg,
+            Some(slug.clone()),
+        );
         deploy(
+            job,
             DeployMethod::NativeEmbedded,
             &manifest,
             &cfg,
             &ports,
             &db,
             None,
-            Some(slug.clone()),
         )
         .await
         .unwrap();
@@ -1942,15 +2083,22 @@ mod tests {
         let slug = "test-slug-aaaa".to_string();
         let (tx, mut rx) =
             tokio::sync::broadcast::channel::<crate::deploy::log_bus::BusMessage>(64);
+        let job = make_job(
+            &db,
+            DeployMethod::NativeEmbedded,
+            &manifest,
+            &cfg,
+            Some(slug.clone()),
+        );
 
         let outcome = deploy(
+            job,
             DeployMethod::NativeEmbedded,
             &manifest,
             &cfg,
             &ports,
             &db,
             Some(tx.clone()),
-            Some(slug.clone()),
         )
         .await
         .expect("embedded deploy succeeds");

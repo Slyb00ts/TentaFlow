@@ -32,6 +32,7 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
   footer.slot = 'footer';
   footer.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;padding:8px;';
   footer.innerHTML = `
+    <tf-button variant="ghost" data-background-btn>${escapeHtml(I18n.t('deploy.continue_background'))}</tf-button>
     <tf-button variant="ghost" data-close-btn>${escapeHtml(I18n.t('common.close'))}</tf-button>
   `;
   win.appendChild(footer);
@@ -102,7 +103,7 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
     if (body.variant !== 'DeploymentStreamEnd') return;
     applyProgress(100);
     applyStatus(body.finalStatus || 'ended');
-    if (body.finalStatus === 'failure') {
+    if (body.finalStatus === 'failed' || body.finalStatus === 'interrupted') {
       const box = errorBox();
       if (box) {
         box.textContent = body.errorMessage || I18n.t('deploy.err_generic');
@@ -124,7 +125,7 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
           onChunk,
           onEnd,
           onError: (err) => {
-            applyStatus('failure');
+            applyStatus('failed');
             const box = errorBox();
             if (box) {
               box.textContent = err?.message || I18n.t('deploy.err_generic');
@@ -134,7 +135,7 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
         }
       );
     } catch (err) {
-      applyStatus('failure');
+      applyStatus('failed');
       appendLine(`[stream error] ${err?.message || ''}`);
     }
   })();
@@ -149,6 +150,7 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
     if (win.parentNode) win.parentNode.removeChild(win);
   };
   footer.querySelector('[data-close-btn]')?.addEventListener('click', closeModal);
+  footer.querySelector('[data-background-btn]')?.addEventListener('click', closeModal);
   win.addEventListener('close', closeModal);
 }
 
@@ -164,7 +166,7 @@ function renderBodyInitial({ deployId, engineId, deployMethod }) {
             <code>${escapeHtml(deployId)}</code>
           </div>
         </div>
-        <tf-chip data-status-chip status="warn" dot>${escapeHtml(I18n.t('deploy.status_building'))}</tf-chip>
+        <tf-chip data-status-chip status="warn" dot>${escapeHtml(I18n.t('deploy.status_deploying'))}</tf-chip>
       </div>
       <div class="deploy-progress-phase">
         <span data-phase-label>—</span>
@@ -183,7 +185,8 @@ function statusToChipVariant(status) {
   switch (status) {
     case 'success':
       return 'success';
-    case 'failure':
+    case 'failed':
+    case 'interrupted':
     case 'cancelled':
       return 'danger';
     default:

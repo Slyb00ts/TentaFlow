@@ -607,9 +607,19 @@ impl DeployStrategy for DockerDeploy {
         ))
     }
 
-    fn commit(&self, tx: &Transaction<'_>, prepared: &PreparedDeploy) -> DeployResult<i64> {
+    fn commit(
+        &self,
+        tx: &Transaction<'_>,
+        service_id: i64,
+        prepared: &PreparedDeploy,
+    ) -> DeployResult<()> {
         let new = build_new_service(prepared, ServiceStatus::Running);
-        Ok(services_repo::insert_in_tx(tx, &new)?)
+        Ok(services_repo::finish_deploy_in_tx(
+            tx,
+            service_id,
+            &new,
+            ServiceStatus::Running,
+        )?)
     }
 
     #[cfg(feature = "docker")]
