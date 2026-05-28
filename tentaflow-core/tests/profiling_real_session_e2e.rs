@@ -96,7 +96,7 @@ async fn read_real_session_envelope() {
 #[ignore]
 async fn read_real_session_serializes_to_json_for_gui() {
     // Symulacja co GUI dostaje: backend sklada ProfilingReportResponse z
-    // envelope, rkyv -> wire bytes -> deserialize w JS jako rkyv enum
+    // envelope, CBOR -> wire bytes -> deserialize w JS jako CBOR enum
     // { "V2": {...} } / { "V1Legacy": {...} }. Sprawdzmy ze envelope
     // serializuje sie poprawnie do serde JSON i ma oczekiwany shape.
     let Some(home) = home_for_e2e() else {

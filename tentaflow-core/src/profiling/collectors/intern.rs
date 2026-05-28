@@ -53,7 +53,7 @@ impl Default for NameInterner {
     }
 }
 
-/// Hash-friendly mirror of `Frame` (the rkyv `Frame` cannot derive `Hash`
+/// Hash-friendly mirror of `Frame` (the CBOR `Frame` cannot derive `Hash`
 /// because of its `Option<u32>` and `Option<String>` fields' equality
 /// semantics being preserved here explicitly).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

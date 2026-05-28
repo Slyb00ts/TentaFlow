@@ -9,7 +9,7 @@
 // JAK DZIAŁA:
 // 1. Używa P/Invoke do wywołań natywnej biblioteki Rust (tentaflow_client_native)
 // 2. Biblioteka Rust obsługuje połączenie QUIC z one-way TLS (klient nie wysyła certyfikatu)
-// 3. Dane są serializowane przez rkyv (zero-copy) dla niskiej latencji
+// 3. Dane są serializowane przez CBOR (zero-copy) dla niskiej latencji
 // 4. Wszystkie operacje są thread-safe dzięki wewnętrznej synchronizacji
 //
 // PRZYKŁAD UŻYCIA:
@@ -33,7 +33,7 @@
 // WYDAJNOŚĆ:
 // - Natywna biblioteka Rust z optymalizacją LTO
 // - QUIC multiplexing do 1000 równoległych strumieni
-// - Zero-copy serialization z rkyv
+// - Zero-copy serialization z CBOR
 //
 // ============================================================================
 

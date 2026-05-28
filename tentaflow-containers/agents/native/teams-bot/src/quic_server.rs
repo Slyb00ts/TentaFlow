@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: quic_server.rs
 // Opis: Serwer iroh kontenera meeting bot. Router laczy sie po `EndpointId`,
-//       wysyla `ModelRequest` w length-prefixed rkyv; kontener odpowiada
+//       wysyla `ModelRequest` w length-prefixed CBOR; kontener odpowiada
 //       `ModelResponse` albo strumieniuje `ModelStreamChunk`. Z tego samego
 //       `Connection` kontener moze inicjowac `accept_bi → open_bi` w odwrotna
 //       strone — `RouterClient` wysyla STT/TTS requesty do routera.
@@ -74,7 +74,7 @@ impl RouterClient {
     }
 
     /// Wysyla `ModelRequest` do routera i czeka na `ModelResponse`. Format
-    /// ramki w obu kierunkach: `[u32 BE length][rkyv payload]`.
+    /// ramki w obu kierunkach: `[u32 BE length][CBOR payload]`.
     pub async fn send_request(&self, request: &ModelRequest) -> Result<ModelResponse> {
         let (mut send, mut recv) = self
             .connection
@@ -866,7 +866,7 @@ impl MeetingQuicServer {
         }
     }
 
-    /// Streaming — wysyla chunki transkrypcji na zywo przez length-prefixed rkyv.
+    /// Streaming — wysyla chunki transkrypcji na zywo przez length-prefixed CBOR.
     async fn handle_streaming_request(
         request: &ModelRequest,
         send: &mut iroh::endpoint::SendStream,

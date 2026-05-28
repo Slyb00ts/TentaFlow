@@ -102,7 +102,7 @@ enum DomEvent {
     /// Klatka wideo zescrappowana z `<video>` jednego kafelka. JS koduje JPEG
     /// jako base64 — binding `__tentaflowEvent` nosi tylko JSON, wiec binarka
     /// musi przejechac base64. W listenerze dekodujemy do `Vec<u8>` raz i
-    /// dalej idzie binarnie przez rkyv.
+    /// dalej idzie binarnie przez CBOR.
     VideoFrame {
         participant_id: String,
         name: Option<String>,

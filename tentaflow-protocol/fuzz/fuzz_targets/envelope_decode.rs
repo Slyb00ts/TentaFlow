@@ -10,7 +10,6 @@ use libfuzzer_sys::fuzz_target;
 use tentaflow_protocol::Envelope;
 
 fuzz_target!(|data: &[u8]| {
-    // rkyv::from_bytes z bytecheck walidacja — nigdy nie powinno panic na
-    // dowolnym byte slice. Malformed data MUSI zwrocic Err, nie unwind.
-    let _ = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(data);
+    // Dekoder CBOR nie moze panikowac na dowolnym byte slice.
+    let _ = tentaflow_protocol::cbor::decode::<Envelope>(data);
 });

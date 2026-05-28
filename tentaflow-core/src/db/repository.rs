@@ -11432,7 +11432,7 @@ pub mod deployments {
 
     /// Maksymalna liczba linii logu trzymana w kolumnie log_tail. Starsze linie
     /// są kasowane przy każdym append. 200 linii = ~15 KB tekstu, łatwo mieszczi
-    /// się w rkyv response nawet dla wielu deployów na liście.
+    /// się w CBOR response nawet dla wielu deployów na liście.
     pub const LOG_TAIL_MAX_LINES: usize = 200;
 
     #[derive(Debug, Clone, Serialize)]

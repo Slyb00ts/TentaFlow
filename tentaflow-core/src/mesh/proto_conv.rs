@@ -34,7 +34,7 @@ fn path_kind_to_str(kind: PathKind) -> &'static str {
     }
 }
 
-/// Build the rkyv `MeshConnectionInfo` describing this peer's transport state.
+/// Build the CBOR `MeshConnectionInfo` describing this peer's transport state.
 ///
 /// `summary` is the authoritative source for the connection state machine
 /// (state, since, heartbeat). `iroh_snapshot`, when available, fills in the

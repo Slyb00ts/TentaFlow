@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: binary-ws-client.js
-// Opis: Binary WebSocket client dla nowego protokolu rkyv. Wrappuje WebSocket
+// Opis: Binary WebSocket client dla nowego protokolu CBOR. Wrappuje WebSocket
 //       z bytecheck walidacja, correlation_id trackingiem, reconnect z drain
 //       kolejki wysylkowej i handshake schema version.
 // Przyklad:

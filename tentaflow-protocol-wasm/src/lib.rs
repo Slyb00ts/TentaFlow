@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: tentaflow-protocol-wasm/src/lib.rs
-// Opis: WASM bindings dla browser-side rkyv codec. Eksportuje encode/decode
+// Opis: WASM bindings dla browser-side CBOR codec. Eksportuje encode/decode
 //       dla Envelope + bootstrap MessageBody variants. Bootstrap API zawiera
 //       typed helpery dla najczestszych frameow; pelna serde-wasm-bindgen
 //       integracja po #27 (proc-macro dispatcher) i #36 (bulk migration).
@@ -117,13 +117,13 @@ fn encode_envelope_direct_inner(
     body: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     let env = Envelope::new_direct(correlation_id, sequence, message_kind, body);
-    rkyv::to_bytes::<rkyv::rancor::Error>(&env)
+    tentaflow_protocol::cbor::encode(&env)
         .map(|v| v.to_vec())
         .map_err(|e| format!("envelope encode failed: {e}"))
 }
 
 /// Buduje Envelope (routing=Direct) z podanymi polami + body bytes; zwraca
-/// rkyv-zakodowany frame jako Uint8Array.
+/// CBOR-zakodowany frame jako Uint8Array.
 ///
 /// `correlation_id` przekazywany jako u64 (BigInt po stronie JS).
 #[wasm_bindgen(js_name = encodeEnvelopeDirect)]
@@ -165,7 +165,7 @@ impl EnvelopeView {
         self.target_node_id.clone()
     }
 
-    /// Rkyv-zakodowany MessageBody — przekazac do `decodeMessageBody()`.
+    /// CBOR-zakodowany MessageBody — przekazac do `decodeMessageBody()`.
     #[wasm_bindgen(getter)]
     pub fn body(&self) -> Vec<u8> {
         self.body.clone()
@@ -195,7 +195,7 @@ impl EnvelopeView {
 /// `decodeMessageBody`).
 #[wasm_bindgen(js_name = decodeEnvelope)]
 pub fn decode_envelope(bytes: &[u8]) -> Result<EnvelopeView, JsError> {
-    let env = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(bytes)
+    let env = tentaflow_protocol::cbor::decode::<Envelope>(bytes)
         .map_err(|e| JsError::new(&format!("envelope decode failed: {e}")))?;
 
     let (is_forward, target_node_id) = match env.routing {
@@ -220,7 +220,7 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<EnvelopeView, JsError> {
 /// enqueue do dispatch queue.
 #[wasm_bindgen(js_name = validateFrame)]
 pub fn validate_frame(bytes: &[u8]) -> bool {
-    rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(bytes).is_ok()
+    tentaflow_protocol::cbor::decode::<Envelope>(bytes).is_ok()
 }
 
 // =============================================================================
@@ -228,9 +228,7 @@ pub fn validate_frame(bytes: &[u8]) -> bool {
 // =============================================================================
 
 fn encode_body_inner(body: &MessageBody) -> Result<Vec<u8>, String> {
-    rkyv::to_bytes::<rkyv::rancor::Error>(body)
-        .map(|v| v.to_vec())
-        .map_err(|e| format!("body encode failed: {e}"))
+    tentaflow_protocol::cbor::encode(body).map_err(|e| format!("body encode failed: {e}"))
 }
 
 /// MessageBody::ModelListRequest (unit variant).
@@ -2381,12 +2379,12 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
     }
 }
 
-/// Dekoduje rkyv-zakodowany MessageBody na JS object.
+/// Dekoduje CBOR-zakodowany MessageBody na JS object.
 /// Dla znanych variantow zwraca obiekt z polem `variant`, a dla nieznanego
 /// variantu `{ variant: "Unknown" }`.
 #[wasm_bindgen(js_name = decodeMessageBody)]
 pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
-    let body = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(bytes)
+    let body = tentaflow_protocol::cbor::decode::<MessageBody>(bytes)
         .map_err(|e| JsError::new(&format!("body decode failed: {e}")))?;
 
     let obj = js_sys::Object::new();
@@ -7137,7 +7135,7 @@ mod tests {
         let body = encode_body_inner(&MessageBody::ModelListRequest).unwrap();
         let frame = encode_envelope_direct_inner(42, 1, message_kind::META_HEARTBEAT, body.clone())
             .unwrap();
-        let env = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&frame).unwrap();
+        let env = tentaflow_protocol::cbor::decode::<Envelope>(&frame).unwrap();
         assert_eq!(env.correlation_id, 42);
         assert_eq!(env.sequence, 1);
         assert!(matches!(env.routing, Routing::Direct));
@@ -7148,11 +7146,11 @@ mod tests {
     fn validate_frame_accepts_good_and_rejects_bad() {
         let body = encode_body_inner(&MessageBody::ModelListRequest).unwrap();
         let frame = encode_envelope_direct_inner(1, 1, 0xF001, body).unwrap();
-        assert!(rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&frame).is_ok());
-        assert!(rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&[]).is_err());
-        assert!(rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&[0u8; 8]).is_err());
+        assert!(tentaflow_protocol::cbor::decode::<Envelope>(&frame).is_ok());
+        assert!(tentaflow_protocol::cbor::decode::<Envelope>(&[]).is_err());
+        assert!(tentaflow_protocol::cbor::decode::<Envelope>(&[0u8; 8]).is_err());
         assert!(
-            rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&frame[..frame.len() / 2]).is_err()
+            tentaflow_protocol::cbor::decode::<Envelope>(&frame[..frame.len() / 2]).is_err()
         );
     }
 
@@ -7162,7 +7160,7 @@ mod tests {
             sent_at_epoch: 1_700_000_000,
         };
         let bytes = encode_body_inner(&body).unwrap();
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).unwrap();
+        let decoded = tentaflow_protocol::cbor::decode::<MessageBody>(&bytes).unwrap();
         assert_eq!(decoded, body);
     }
 
@@ -7387,7 +7385,7 @@ pub fn encode_addon_applications_list_request() -> Result<Vec<u8>, JsError> {
 
 // =============================================================================
 // Network settings encoders (interfejsy hosta + konfiguracja bind/filter).
-// Wrapuja NetworkPayload w MessageBody::NetworkBody i serializuja rkyv.
+// Wrapuja NetworkPayload w MessageBody::NetworkBody i serializuja CBOR.
 // =============================================================================
 
 use tentaflow_protocol::{NetworkConfig, NetworkInterfaceInfo, NetworkPayload};
@@ -8595,7 +8593,7 @@ pub fn encode_stream_close_request(stream_id: String) -> Result<Vec<u8>, JsError
 // =============================================================================
 // Role catalog (administrowalny katalog rol biznesowych) — `MessageBody::RoleCatalogBody`.
 // Payloady są bogate (Vec krotek, Option<Option<String>>), więc przyjmujemy
-// JSON string z UI i parsujemy do typów DTO przed enkapsulacją w rkyv.
+// JSON string z UI i parsujemy do typów DTO przed enkapsulacją w CBOR.
 // =============================================================================
 
 /// MessageBody::RoleCatalogBody(ListRequest) — filter jako JSON object.
@@ -8837,7 +8835,7 @@ pub fn encode_role_catalog_deactivate_request(id: String) -> Result<Vec<u8>, JsE
 
 // =============================================================================
 // UI Channel CBOR (Faza 6 Krok 4) — `MessageBody::UiChannelCbor(Vec<u8>)`.
-// The CBOR bytes are opaque to the rkyv layer; the browser JS codec encodes
+// The CBOR bytes are opaque to the outer MessageBody; the browser JS codec encodes
 // the UiPayload as CBOR itself and wraps it in this variant for transport.
 // =============================================================================
 

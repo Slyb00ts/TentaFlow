@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: flow_engine/dispatchers_impl/memory_impl.rs
 // Opis: MemoryStoreImpl — wrapper nad memory engine'em rozmawiającym po QUIC
-//       (rkyv `MemoryPayload`). Adapter `memory` (stage 1c) widzi tylko
+//       (CBOR `MemoryPayload`). Adapter `memory` (stage 1c) widzi tylko
 //       narrow trait `MemoryStore::recall/store`. QuicClientFinder oddziela
 //       wrapper od `ServiceManager` (D4 invariant).
 // =============================================================================

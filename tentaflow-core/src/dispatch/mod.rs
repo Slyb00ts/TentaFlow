@@ -222,8 +222,7 @@ pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody,
         let body_bytes = if is_sensitive_variant(body) {
             Vec::new()
         } else {
-            rkyv::to_bytes::<rkyv::rancor::Error>(body)
-                .map(|b| b.to_vec())
+            tentaflow_protocol::cbor::encode(body)
                 .unwrap_or_default()
         };
         let flags: u8 = if is_sensitive_variant(body) {
@@ -256,8 +255,7 @@ pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody,
         let body_bytes = if is_sensitive_variant(&result.0) {
             Vec::new()
         } else {
-            rkyv::to_bytes::<rkyv::rancor::Error>(&result.0)
-                .map(|b| b.to_vec())
+            tentaflow_protocol::cbor::encode(&result.0)
                 .unwrap_or_default()
         };
         let resp_variant_name = variant_name_of(&result.0);

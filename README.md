@@ -90,7 +90,7 @@ A fine-tuned **Qwen 3.5-0.8B** model that acts as the routing brain:
 |-------|---------|
 | `tentaflow` | Main binary — API gateway and mesh node |
 | `tentaflow-core` | Shared library — networking, routing, auth, mesh, addons, inference, API |
-| `tentaflow-protocol` | QUIC protocol types with rkyv zero-copy serialization |
+| `tentaflow-protocol` | QUIC protocol types with CBOR zero-copy serialization |
 | `tentaflow-desktop` | Native desktop app (egui/wgpu) with system tray |
 | `tentaflow-mobile` | Mobile runtime — Android (JNI) and iOS (Swift bridge) |
 | `tentaflow-ui` | Shared UI framework (egui for native, HTML/CSS/JS SPA for web) |

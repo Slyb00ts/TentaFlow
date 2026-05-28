@@ -325,7 +325,7 @@ impl LocalInferenceHandler {
     /// Przetwarza stream tokenow na chunki SSE w formacie OpenAI.
     /// Hot-path streaming dla ws_binary path. Zero JSON hop — bezposrednio
     /// emituje `ChatCompletionChunk` strukt do mpsc, ktory streaming.rs
-    /// konsumuje i przekazuje do rkyv encoded WS frames.
+    /// konsumuje i przekazuje do CBOR-encoded WS frames.
     async fn stream_tokens_to_chunks(
         mut token_rx: mpsc::Receiver<StreamToken>,
         chunk_tx: mpsc::Sender<ChatCompletionChunk>,

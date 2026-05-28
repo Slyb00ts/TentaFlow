@@ -296,7 +296,7 @@ pub struct ProtocolsConfig {
     #[serde(default)]
     pub grpc: Option<ProtocolConfig>,
 
-    /// QUIC + rkyv - opcjonalne w Fazie 0
+    /// QUIC + CBOR - opcjonalne w Fazie 0
     #[serde(default)]
     pub quic: Option<QuicProtocolConfig>,
 }

@@ -62,8 +62,8 @@
 1. **One wire format end-to-end.** Frontend → Node A → Node B → Node C → response — every hop sees the same bytes. Routing nodes **never decode body**, only read envelope header to make routing decisions.
 2. **Multi-language compatible.** Spec uses CBOR (RFC 8949) so a future Zig, Go, Python or C# node implements UFP/2 by reading this doc — no Rust dependency.
 3. **End-to-end authentication.** Sender signs envelope (excluding mutable hop trail). Receiver verifies sender's pubkey directly, regardless of how many hops the message took.
-4. **Production performance.** Strict canonical CBOR with optional lz4 compression. Heartbeats, sync batches, GUI updates, frame blobs — all on the same protocol with negligible overhead vs prior rkyv-only mesh path.
-5. **Zero parallel-stack.** UFP/2 replaces every prior wire format (rkyv `Envelope`/`MessageBody`, mesh `0x10..0x4C` discriminators standalone, raw HTTP frame pickup body, Faza 6 sdk-spec CBOR envelope v1). After migration: one envelope, one validator, one debug tool.
+4. **Production performance.** Strict canonical CBOR with optional lz4 compression. Heartbeats, sync batches, GUI updates, frame blobs — all on the same protocol with negligible overhead vs prior CBOR-only mesh path.
+5. **Zero parallel-stack.** UFP/2 replaces every prior wire format (CBOR `Envelope`/`MessageBody`, mesh `0x10..0x4C` discriminators standalone, raw HTTP frame pickup body, Faza 6 sdk-spec CBOR envelope v1). After migration: one envelope, one validator, one debug tool.
 
 ## 2. Non-goals
 
@@ -194,7 +194,7 @@ The envelope is encoding-agnostic about body content. **Routing decisions are ma
 | `0x04` | Mesh | `0x0010..0x004C` | Structured CBOR | Peer-to-peer control (existing `MESH_MSG_HEARTBEAT`..`MESH_MSG_FRAME_PROXY_RESPONSE` discriminators become `kind` values). |
 | `0x05` | Control | `0x0001..0x00FF` | Structured CBOR | Handshake, auth, heartbeat, resume, rate-limit notifications, session_end. |
 | `0x06` | SyncLedger | `0x0001..0x00FF` | Structured CBOR | Existing Sync Ledger ops/acks/pulls/snapshots. |
-| `0x07` | Frontend | `0x0001..0xFFFF` | Structured CBOR | Frontend ↔ Core (chat completions, dashboard CRUD, settings) — replaces rkyv `MessageBody` enum. Kind = MessageBody variant index. |
+| `0x07` | Frontend | `0x0001..0xFFFF` | Structured CBOR | Frontend ↔ Core (chat completions, dashboard CRUD, settings) — replaces CBOR `MessageBody` enum. Kind = MessageBody variant index. |
 | `0x08` | Domain | `0x0001..0xFFFF` | Structured CBOR | Application domain messages (recorder, scheduler, camera_admin, sync_conflict). |
 | `0x09` | FrameBlob | `0x0001..0x000F` | **Body = raw bytes** | Camera frame transport (pixel/JPEG passthrough). Routing nodes forward verbatim. |
 | `0x0A..0xFF` | reserved | — | — | Future channels (Zig node, GPU mesh, etc.). |
@@ -528,7 +528,7 @@ Standard `error_code` values:
 UFP/2 has a single live protocol version (`protocol_version = 2`). There is NO negotiated downgrade to any prior protocol.
 
 - Every receiver MUST reject envelopes with `protocol_version != 2` with `UnknownProtocolVersion` (§11 code `0x0002`). Rejection is final — receivers do not propose alternatives.
-- After the Faza 6 Krok 4 migration (commits 4c1–4c6), the v1 rkyv `Envelope` type is DELETED from the codebase. No dispatch path exists that accepts v1 bytes.
+- After the Faza 6 Krok 4 migration (commits 4c1–4c6), the v1 CBOR `Envelope` type is DELETED from the codebase. No dispatch path exists that accepts v1 bytes.
 - During the migration window itself (between 4c1 and 4c6), receivers MAY temporarily accept both v1 and v2 on a single dedicated transport endpoint to keep the system green between commits. As soon as 4c6 lands, that endpoint hard-rejects anything that isn't v2.
 - A future UFP/3 upgrade SHALL follow the same model: hard cutover, no silent downgrade, no negotiation field. The `protocol_version` byte is the only version signal.
 - All rejected-protocol-version events MUST be logged (with `source.id`, `created_at_ms`, observed version) to detect tooling lag or active downgrade attempts post-migration.
@@ -633,9 +633,9 @@ Migration is performed in **6 atomic commits**, each leaving the system green (`
 - **Used by zero channels.** This commit only adds the type; nothing depends on it yet.
 
 ### 4c2 — Mesh channel migration
-- Replace `tentaflow-protocol::Envelope` (rkyv) for mesh traffic with UFP/2.
+- Replace `tentaflow-protocol::Envelope` (CBOR) for mesh traffic with UFP/2.
 - All `MESH_MSG_*` discriminators become `kind` values under `channel=0x04`.
-- DELETE: `tentaflow-protocol::mesh::*` rkyv encoders/decoders.
+- DELETE: `tentaflow-protocol::mesh::*` CBOR encoders/decoders.
 - Tests: mesh heartbeat, peer pairing, frame proxy, all sync_ledger mesh messages.
 
 ### 4c3 — Sync ledger channel migration
@@ -645,9 +645,9 @@ Migration is performed in **6 atomic commits**, each leaving the system green (`
 - Tests: full sync flow A→B with old operations still verifying.
 
 ### 4c4 — Frontend channel migration (BREAKING for browser)
-- Frontend WS protocol switches from rkyv `Envelope`/`MessageBody` to UFP/2 with `channel=0x07`.
+- Frontend WS protocol switches from CBOR `Envelope`/`MessageBody` to UFP/2 with `channel=0x07`.
 - Frontend JS (`www/js/protocol/codec.js`, `www/js/protocol/wasm_glue.js`) regenerated for CBOR.
-- DELETE: `tentaflow-protocol::envelope::*` rkyv, `tentaflow-protocol::message_body::*` rkyv variants.
+- DELETE: `tentaflow-protocol::envelope::*` CBOR, `tentaflow-protocol::message_body::*` CBOR variants.
 - Coordinated deploy: core + dashboard JS must ship together. Browser cache busts on UFP/2 cutover.
 - Tests: dashboard E2E (Playwright) on every MessageBody variant.
 
@@ -661,7 +661,7 @@ Migration is performed in **6 atomic commits**, each leaving the system green (`
 - HTTP frame pickup (`/core/frame/pickup`) wraps response in UFP/2 `channel=0x09 FrameBlob` envelope. Raw RGB/JPEG bytes go in `body` with `IS_COMPRESSED` if applicable.
 - OpenAI-compat `/v1/*` API converts internal UFP/2 responses to the JSON SSE format clients expect (clients NEVER see UFP/2 directly; conversion is at the edge).
 - Domain messages (recorder, scheduler, sync_conflict) move from `tentaflow-protocol::message_body` variants into `channel=0x08`.
-- DELETE: any remaining rkyv message types.
+- DELETE: any remaining CBOR message types.
 - Tests: frame pickup E2E, OpenAI completion E2E, scheduler binary protocol E2E.
 
 After 4c6: ONLY UFP/2 exists. All other wire formats are removed from the codebase. The migration window is roughly 6 commits, each codex-reviewed, each atomic. No version negotiation, no fallback path.
@@ -688,17 +688,17 @@ Brief enumeration; full STRIDE/OWASP coverage lives in `docs/SECURITY_THREAT_MOD
 
 ## 15. Performance characteristics (target)
 
-Measured against current rkyv baselines on a typical TentaFlow deployment (Linux x86_64, ~10 mesh peers, ~5 active addons):
+Measured against current CBOR baselines on a typical TentaFlow deployment (Linux x86_64, ~10 mesh peers, ~5 active addons):
 
-| Operation | rkyv baseline | UFP/2 target | Notes |
+| Operation | CBOR baseline | UFP/2 target | Notes |
 |-----------|---------------|--------------|-------|
 | Encode envelope (no body) | 0.5 µs | < 2 µs | CBOR canonical sort overhead |
 | Decode envelope (header only) | 0.3 µs | < 1.5 µs | Skip body decoding for routing |
-| Validate canonical | n/a (rkyv bytecheck) | < 3 µs | One pass over raw bytes |
+| Validate canonical | n/a (CBOR bytecheck) | < 3 µs | One pass over raw bytes |
 | Mesh heartbeat round-trip (local) | 80 µs | < 100 µs | TLS+UFP/2 overhead minimal |
-| Sync push batch (500 ops, 2.5MB rkyv) | rkyv: 2.5MB on wire | UFP/2 + lz4: ~600KB on wire | Net win |
-| Frontend chat completion token | rkyv: 200B | UFP/2: ~300B | Negligible per-token, 50% larger but lz4 buys back if streamed in batches |
-| Routing hop CPU (B forwards A→C) | rkyv: ~5 µs (decode+route+encode) | UFP/2: < 1 µs (header parse + bytes copy) | Major win — no body decode |
+| Sync push batch (500 ops, 2.5MB CBOR) | CBOR: 2.5MB on wire | UFP/2 + lz4: ~600KB on wire | Net win |
+| Frontend chat completion token | CBOR: 200B | UFP/2: ~300B | Negligible per-token, 50% larger but lz4 buys back if streamed in batches |
+| Routing hop CPU (B forwards A→C) | CBOR: ~5 µs (decode+route+encode) | UFP/2: < 1 µs (header parse + bytes copy) | Major win — no body decode |
 
 The "routing hop CPU" line is the architectural payoff: at 1000 mesh msgs/sec through a relay node, UFP/2 saves ~4 ms/sec of CPU. At 100k msgs/sec (large mesh), that's 40% of a core saved on routing alone.
 

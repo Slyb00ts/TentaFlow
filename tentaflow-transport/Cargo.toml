@@ -2,7 +2,7 @@
 name = "tentaflow-transport"
 version = "0.1.0"
 edition = "2021"
-description = "Wspolny transport iroh + rkyv uzywany przez tentaflow, tentaflow-client i sidecar"
+description = "Wspolny transport iroh + CBOR uzywany przez tentaflow, tentaflow-client i sidecar"
 
 [lib]
 name = "tentaflow_transport"
@@ -15,7 +15,7 @@ tentaflow-protocol = { path = "../tentaflow-protocol" }
 iroh = { version = "=0.98.2", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
 
 # Serialization
-rkyv = { version = "0.8.16", features = ["std", "bytecheck", "unaligned"] }
+serde = { version = "1.0.228", features = ["derive"] }
 
 # Async runtime
 tokio = { version = "1.52.2", features = ["rt", "sync", "time", "macros", "io-util"] }

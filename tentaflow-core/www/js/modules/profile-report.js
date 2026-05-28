@@ -697,7 +697,7 @@ function renderCpuDetailTab(ctx) {
   }).join('');
 
   // -- PMU counters -----------------------------------------------------------
-  // Kazde CpuCounter event ma { kind, value }. kind to enum rkyv: unit warianty
+  // Kazde CpuCounter event ma { kind, value }. kind to enum CBOR: unit warianty
   // (Ipc/CacheMissL3/BranchMiss/ContextSwitches/...) serializuja sie jako string;
   // Custom(...) jako { Custom: "..." }.
   const counterKindLabel = (k) => {

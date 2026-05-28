@@ -2,7 +2,7 @@
 // File: mesh/ufp2/receive.rs — UFP/2 receive dispatcher
 // Purpose: classify incoming mesh frames as UFP/2 envelopes and reject
 // any other shape. After 4c2.6c every unicast send path emits a signed
-// UFP/2 envelope, so the legacy `[disc][rkyv-payload]` wire is no longer
+// UFP/2 envelope, so the legacy `[disc][CBOR-payload]` wire is no longer
 // accepted on uni-streams (FORWARD_REQ / FORWARD_STREAM_REQ travel on a
 // separate bi-stream protocol that does not flow through this path).
 //
@@ -54,7 +54,7 @@ pub fn classify_inbound(
         return Err(FrameError::new(
             FrameErrorCode::BodyValidationFailed,
             format!(
-                "classify_inbound: first byte 0x{:02X} is not a UFP/2 envelope CBOR map header (0xAA..=0xB1); legacy `[disc][rkyv]` wire was removed in 4c2.6c",
+                "classify_inbound: first byte 0x{:02X} is not a UFP/2 envelope CBOR map header (0xAA..=0xB1); legacy `[disc][CBOR]` wire was removed in 4c2.6c",
                 first_byte
             ),
         ));
@@ -95,12 +95,12 @@ mod tests {
 
     #[test]
     fn classify_legacy_discriminator_first_byte_is_rejected() {
-        // 4c2.6c removed the legacy `[disc][rkyv]` receive path. A raw
+        // 4c2.6c removed the legacy `[disc][CBOR]` receive path. A raw
         // MESH_MSG_* first byte MUST now produce a BodyValidationFailed
         // FrameError instead of being routed.
         let r = classify_inbound(
             tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT,
-            b"raw-rkyv-bytes".to_vec(),
+            b"raw-CBOR-bytes".to_vec(),
             [0xAAu8; NODE_ID_LEN],
             [0xBBu8; NODE_ID_LEN],
         );

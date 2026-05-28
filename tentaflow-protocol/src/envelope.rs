@@ -2,14 +2,63 @@
 // Plik: envelope.rs
 // Opis: Framing dla binary WebSocket/QUIC. Envelope = header nad MessageBody
 //       (routing, policy_hint, sequence, forwarded_session_claim). Zero-copy
-//       przez rkyv, walidacja przez bytecheck na WSS input.
+//       przez CBOR, walidacja przez bytecheck na WSS input.
 // Przyklad:
 //   let env = Envelope::new_direct(1, 42, MSG_KIND_NODE_LIST_REQUEST, body_bytes);
-//   let wire = rkyv::to_bytes::<rkyv::rancor::Error>(&env)?;
-//   let decoded = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&wire)?;
+//   let wire = CBOR::to_bytes::<CBOR::rancor::Error>(&env)?;
+//   let decoded = crate::cbor::decode::<Envelope>(&wire)?;
 // =============================================================================
 
-use rkyv::{Archive, Deserialize, Serialize};
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
+
+mod serde_array64 {
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Bytes64Visitor;
+
+        impl<'de> Visitor<'de> for Bytes64Visitor {
+            type Value = [u8; 64];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("64 bytes")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut out = [0u8; 64];
+                for (idx, item) in out.iter_mut().enumerate() {
+                    *item = seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(idx, &self))?;
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_bytes(Bytes64Visitor)
+    }
+}
 
 // =============================================================================
 // Schema version
@@ -63,11 +112,11 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///     dostaja decode error.
 ///   - Added (D.3): `SttRequestOptions { speaker_identification, diarization,
 ///     timestamps, response_format }` w `TranscriptionRequest` (multipart,
-///     nie-rkyv) i `SpeakerSegment { start, end, text, speaker_label,
+///     nie-CBOR) i `SpeakerSegment { start, end, text, speaker_label,
 ///     speaker_id, similarity }` w `TranscriptionResponse.speakers` (JSON).
 ///     Pole `speakers` jest `Option` z `skip_serializing_if` zeby starsi
 ///     klienci nie crashowali — ale brak guarantee dla TranscriptionRequest
-///     jezeli ktokolwiek deserialize'owalby przez rkyv (REST multipart only).
+///     jezeli ktokolwiek deserialize'owalby przez CBOR (REST multipart only).
 // v13 changes: ServiceInfo niesie typed `request_time_parameters`
 // (RequestTimeParameters + KeyValue), AudioOperation::STT pole
 // `extra_params: Option<String>` (typed JSON dla sidecar multipart
@@ -78,7 +127,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 // (deklaratywne drzewo UiComponent renderowane przez frontend tf-*
 // komponenty, bez HTML renderingu po stronie hosta). Trzy nowe
 // MessageBody warianty (6 paired structs) — dodanie wariantu do enum
-// zmienia tag value w rkyv, wymagany handshake bump.
+// zmienia tag value w CBOR, wymagany handshake bump.
 pub const SCHEMA_VERSION: u16 = 14;
 
 // =============================================================================
@@ -108,7 +157,7 @@ pub mod message_kind {
 /// Jak zaadresowany jest ten frame.
 /// `Direct` = serwer/klient obsluguje lokalnie. `Forward` = adresat to inny
 /// node w mesh, obecny node ma tylko przekazac (z policy re-check po stronie B).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum Routing {
     /// Adresat = ten node/klient.
     Direct,
@@ -128,7 +177,7 @@ pub enum Routing {
 /// - 0x02 IS_STREAM_CHUNK — jeden z frameow streamingowej odpowiedzi
 /// - 0x04 IS_STREAM_END — ostatni frame streama (opcjonalnie z usage/payload)
 /// - 0x08 .. 0x80 — zarezerwowane
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct EnvelopeFlags(pub u8);
 
 impl EnvelopeFlags {
@@ -180,7 +229,7 @@ impl std::ops::BitOrAssign for EnvelopeFlags {
 /// i przenoszone w `SignedSessionClaim` przy mesh forward.
 ///
 /// Nigdy nie jest re-negotiowane per-message.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SessionAuth {
     /// Publiczne endpointy (OpenAI-compat `/v1/*`). Brak user contextu.
     Anonymous,
@@ -212,7 +261,7 @@ pub enum SessionAuth {
 /// Realna mitigation: timely TrustRevoked broadcast + epoch rotation (24h + 7d grace).
 ///
 /// Signature pokrywa canonical bytes: `signing_message()` output.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SignedSessionClaim {
     /// UUID uzytkownika ktory zainicjowal lancuch requestow (16 bajtow raw UUID).
     pub originating_user_id: [u8; 16],
@@ -223,12 +272,13 @@ pub struct SignedSessionClaim {
     /// Ed25519 public key noda ktory forwarduje (32 bajty).
     pub forwarding_node_id: [u8; 32],
     /// Ed25519 signature nad `signing_message()` (64 bajty).
+    #[serde(with = "serde_array64")]
     pub signature: [u8; 64],
 }
 
 impl SignedSessionClaim {
     /// Kanoniczne bajty do podpisu/weryfikacji. Deterministyczne, little-endian,
-    /// bez paddingu rkyv. Format (134+ bajtow):
+    /// bez paddingu CBOR. Format (134+ bajtow):
     ///   [16] originating_user_id
     ///   [8]  issued_at_epoch (LE)
     ///   [32] forwarding_node_id
@@ -275,15 +325,15 @@ impl SignedSessionClaim {
 
 /// Framing header dla jednej wiadomosci WSS/QUIC.
 ///
-/// Body jest trzymane jako `Vec<u8>` (rkyv-serializowane MessageBody). Taki
+/// Body jest trzymane jako `Vec<u8>` (CBOR-serializowane MessageBody). Taki
 /// layered pattern pozwala:
 /// 1. Zdekodowac tylko envelope (policy check) zanim tkniemy drozszy body.
 /// 2. Forwardowac frame bit-for-bit przez mesh bez re-encode payloadu.
 /// 3. Wyabstrahowac opaque body = MessageBody trzymany w osobnym module.
 ///
-/// Wire-level: caly `Envelope` jest rkyv-encoded w jeden WSS binary frame.
-/// `rkyv::access` z bytecheck NA KAZDYM WSS input (nigdy `access_unchecked`).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+/// Wire-level: caly `Envelope` jest CBOR-encoded w jeden WSS binary frame.
+/// `CBOR::access` z bytecheck NA KAZDYM WSS input (nigdy `access_unchecked`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct Envelope {
     /// Wersja schematu. Klient wysyla swoja, serwer odrzuca mismatch.
     pub schema_version: u16,
@@ -300,7 +350,7 @@ pub struct Envelope {
     pub routing: Routing,
     /// Wypelniane gdy Node A forwarduje do Node B. Node B re-checks policy.
     pub forwarded_session_claim: Option<SignedSessionClaim>,
-    /// rkyv-serializowany MessageBody jako opaque bytes.
+    /// CBOR-serializowany MessageBody jako opaque bytes.
     pub body: Vec<u8>,
 }
 
@@ -388,9 +438,9 @@ mod tests {
     #[test]
     fn envelope_direct_round_trip() {
         let env = Envelope::new_direct(42, 1, message_kind::META_HEARTBEAT, vec![1, 2, 3, 4]);
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&env).expect("encode");
+        let bytes = crate::cbor::encode(&env).expect("encode");
         let decoded: Envelope =
-            rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<Envelope>(&bytes).expect("decode");
         assert_eq!(decoded, env);
         assert_eq!(decoded.schema_version, SCHEMA_VERSION);
         assert!(matches!(decoded.routing, Routing::Direct));
@@ -408,9 +458,9 @@ mod tests {
             claim.clone(),
             vec![0xAA, 0xBB],
         );
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&env).expect("encode");
+        let bytes = crate::cbor::encode(&env).expect("encode");
         let decoded: Envelope =
-            rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<Envelope>(&bytes).expect("decode");
         assert_eq!(decoded, env);
         match decoded.routing {
             Routing::Forward { target_node_id } => assert_eq!(target_node_id, [9u8; 32]),
@@ -434,12 +484,12 @@ mod tests {
     }
 
     #[test]
-    fn envelope_flags_persist_through_rkyv() {
+    fn envelope_flags_persist_through_CBOR() {
         let mut env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, vec![]);
         env = env.with_stream_chunk().with_stream_end();
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&env).expect("encode");
+        let bytes = crate::cbor::encode(&env).expect("encode");
         let decoded: Envelope =
-            rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<Envelope>(&bytes).expect("decode");
         assert!(decoded.flags.contains(EnvelopeFlags::IS_STREAM_CHUNK));
         assert!(decoded.flags.contains(EnvelopeFlags::IS_STREAM_END));
     }
@@ -447,9 +497,9 @@ mod tests {
     #[test]
     fn truncated_bytes_rejected() {
         let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, vec![1, 2, 3, 4]);
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&env).expect("encode");
+        let bytes = crate::cbor::encode(&env).expect("encode");
         let truncated = &bytes[..bytes.len() / 2];
-        let result = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(truncated);
+        let result = crate::cbor::decode::<Envelope>(truncated);
         assert!(
             result.is_err(),
             "truncated bytes must fail bytecheck validation"
@@ -458,21 +508,20 @@ mod tests {
 
     #[test]
     fn empty_bytes_rejected() {
-        let result = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&[]);
+        let result = crate::cbor::decode::<Envelope>(&[]);
         assert!(result.is_err(), "empty bytes must fail");
     }
 
     #[test]
     fn corrupted_tail_rejected() {
         let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, vec![1, 2, 3, 4]);
-        let mut bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&env)
-            .expect("encode")
+        let mut bytes = crate::cbor::encode(&env).expect("encode")
             .to_vec();
-        // Uszkodzenie ostatniego bajtu (relative pointer / len trailer w rkyv)
+        // Uszkodzenie ostatniego bajtu (relative pointer / len trailer w CBOR)
         if let Some(last) = bytes.last_mut() {
             *last = last.wrapping_add(0x7F);
         }
-        let result = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&bytes);
+        let result = crate::cbor::decode::<Envelope>(&bytes);
         assert!(result.is_err(), "corrupted tail must fail bytecheck");
     }
 
@@ -549,9 +598,9 @@ mod tests {
                 epoch: 7,
             },
         ] {
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&auth).expect("encode");
+            let bytes = crate::cbor::encode(&auth).expect("encode");
             let decoded: SessionAuth =
-                rkyv::from_bytes::<SessionAuth, rkyv::rancor::Error>(&bytes).expect("decode");
+                crate::cbor::decode::<SessionAuth>(&bytes).expect("decode");
             assert_eq!(decoded, auth);
         }
     }

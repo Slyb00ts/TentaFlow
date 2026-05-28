@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: routing/audio_stream.rs
-// Opis: Bridge `StreamingExecution` (rkyv `EnvelopeDelta::Audio`) na strumień
+// Opis: Bridge `StreamingExecution` (CBOR `EnvelopeDelta::Audio`) na strumień
 //       SSE z base64-zakodowanymi audio chunkami. Używany przez
 //       `/v1/audio/speech/flow-stream` (Krok 5) — flow_engine streaming
 //       kanał audio dla flowów z `tts_stream_bridge` lub blocking TTS-as-flow.

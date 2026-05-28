@@ -5403,36 +5403,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rkyv"
-version = "0.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a30e631b7f4a03dee9056b8ef6982e8ba371dd5bedb74d3ec86df4499132c70"
-dependencies = [
- "bytecheck",
- "bytes",
- "hashbrown 0.16.1",
- "indexmap 2.13.0",
- "munge",
- "ptr_meta",
- "rancor",
- "rend",
- "rkyv_derive",
- "tinyvec",
- "uuid",
-]
-
-[[package]]
-name = "rkyv_derive"
-version = "0.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8100bb34c0a1d0f907143db3149e6b4eea3c33b9ee8b189720168e818303986f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "rusqlite"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6102,7 +6072,6 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.11.27",
- "rkyv",
  "rusqlite",
  "rustls 0.23.37",
  "rustls-pemfile 2.2.0",
@@ -6165,7 +6134,6 @@ name = "tentaflow-protocol"
 version = "0.1.0"
 dependencies = [
  "bytecheck",
- "rkyv",
  "serde",
  "serde_with",
 ]

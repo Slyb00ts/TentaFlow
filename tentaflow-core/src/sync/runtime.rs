@@ -2220,8 +2220,7 @@ mod tests {
         receiver_events: &mut tokio::sync::broadcast::Receiver<IrohMeshEvent>,
         push: MeshSyncPushPayload,
     ) -> MeshSyncAckPayload {
-        let push_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&push)
-            .map(|bytes| bytes.to_vec())
+        let push_bytes = tentaflow_protocol::cbor::encode(&push)
             .expect("encode push");
         source_mesh
             .send_ufp2_to_peer(
@@ -2246,16 +2245,12 @@ mod tests {
         })
         .await
         .expect("sync push event");
-        let received_push = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPushPayload,
-            rkyv::rancor::Error,
-        >(&received_push)
+        let received_push = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&received_push)
         .expect("decode push");
         let ack = receiver
             .handle_push_payload(&source.local_node_id, received_push)
             .expect("handle push");
-        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-            .map(|bytes| bytes.to_vec())
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
             .expect("encode ack");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -2280,10 +2275,7 @@ mod tests {
         })
         .await
         .expect("sync ack event");
-        let received_ack = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncAckPayload,
-            rkyv::rancor::Error,
-        >(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
         .expect("decode ack");
         source
             .handle_ack_payload(&receiver.local_node_id, received_ack.clone())
@@ -3716,8 +3708,7 @@ mod tests {
             .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
             .expect("build push")
             .expect("pending push");
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&push)
-            .map(|bytes| bytes.to_vec())
+        let bytes = tentaflow_protocol::cbor::encode(&push)
             .expect("encode push");
         source_mesh
             .send_ufp2_to_peer(
@@ -3742,17 +3733,13 @@ mod tests {
         })
         .await
         .expect("sync push event");
-        let received_push = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPushPayload,
-            rkyv::rancor::Error,
-        >(&received_push)
+        let received_push = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&received_push)
         .expect("decode push");
         let ack = receiver
             .runtime
             .handle_push_payload(&source.runtime.local_node_id, received_push)
             .expect("handle push");
-        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-            .map(|bytes| bytes.to_vec())
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
             .expect("encode ack");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -3777,10 +3764,7 @@ mod tests {
         })
         .await
         .expect("sync ack event");
-        let received_ack = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncAckPayload,
-            rkyv::rancor::Error,
-        >(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
         .expect("decode ack");
         source
             .runtime
@@ -4208,17 +4192,13 @@ mod tests {
         })
         .await
         .expect("restart push event");
-        let received_push = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPushPayload,
-            rkyv::rancor::Error,
-        >(&received_push)
+        let received_push = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&received_push)
         .expect("decode restart push");
         let ack = receiver
             .runtime
             .handle_push_payload(&source.local_node_id, received_push)
             .expect("handle restart push");
-        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-            .map(|bytes| bytes.to_vec())
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
             .expect("encode restart ack");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -4243,10 +4223,7 @@ mod tests {
         })
         .await
         .expect("restart ack event");
-        let received_ack = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncAckPayload,
-            rkyv::rancor::Error,
-        >(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
         .expect("decode restart ack");
         source
             .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
@@ -4312,8 +4289,7 @@ mod tests {
             from_sequence: update_operation.body.partition_sequence,
             operations: vec![operation_to_wire(&update_operation).expect("wire update")],
         };
-        let gap_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gap_payload)
-            .map(|bytes| bytes.to_vec())
+        let gap_bytes = tentaflow_protocol::cbor::encode(&gap_payload)
             .expect("encode gap response");
         source_mesh
             .send_ufp2_to_peer(
@@ -4338,10 +4314,7 @@ mod tests {
         })
         .await
         .expect("gap response event");
-        let received_gap = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
-            rkyv::rancor::Error,
-        >(&received_gap)
+        let received_gap = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&received_gap)
         .expect("decode gap response");
         receiver
             .runtime
@@ -4353,8 +4326,7 @@ mod tests {
             .expect("repair pulls");
         assert_eq!(repair_pulls.len(), 1);
         assert_eq!(repair_pulls[0].from_sequence, 1);
-        let pull_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&repair_pulls[0])
-            .map(|bytes| bytes.to_vec())
+        let pull_bytes = tentaflow_protocol::cbor::encode(&repair_pulls[0])
             .expect("encode repair pull");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -4379,10 +4351,7 @@ mod tests {
         })
         .await
         .expect("repair pull event");
-        let received_pull = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPullPayload,
-            rkyv::rancor::Error,
-        >(&received_pull)
+        let received_pull = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullPayload>(&received_pull)
         .expect("decode repair pull");
         let repair_response = source
             .runtime
@@ -4392,8 +4361,7 @@ mod tests {
             panic!("expected operations repair response");
         };
         assert_eq!(repair_response.operations.len(), 2);
-        let repair_response_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&repair_response)
-            .map(|bytes| bytes.to_vec())
+        let repair_response_bytes = tentaflow_protocol::cbor::encode(&repair_response)
             .expect("encode repair response");
         source_mesh
             .send_ufp2_to_peer(
@@ -4418,17 +4386,13 @@ mod tests {
         })
         .await
         .expect("repair response event");
-        let received_repair = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
-            rkyv::rancor::Error,
-        >(&received_repair)
+        let received_repair = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&received_repair)
         .expect("decode repair response");
         let ack = receiver
             .runtime
             .handle_pull_response_payload(&source.runtime.local_node_id, received_repair)
             .expect("handle repair response");
-        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-            .map(|bytes| bytes.to_vec())
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
             .expect("encode repair ack");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -4453,10 +4417,7 @@ mod tests {
         })
         .await
         .expect("repair ack event");
-        let received_ack = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncAckPayload,
-            rkyv::rancor::Error,
-        >(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
         .expect("decode repair ack");
         source
             .runtime
@@ -4539,8 +4500,7 @@ mod tests {
             from_sequence: update_operation.body.partition_sequence,
             operations: vec![operation_to_wire(&update_operation).expect("wire update")],
         };
-        let gap_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gap_payload)
-            .map(|bytes| bytes.to_vec())
+        let gap_bytes = tentaflow_protocol::cbor::encode(&gap_payload)
             .expect("encode gap response");
         source_mesh
             .send_ufp2_to_peer(
@@ -4565,10 +4525,7 @@ mod tests {
         })
         .await
         .expect("gap response event");
-        let received_gap = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
-            rkyv::rancor::Error,
-        >(&received_gap)
+        let received_gap = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&received_gap)
         .expect("decode gap response");
         receiver
             .runtime
@@ -4627,10 +4584,7 @@ mod tests {
         })
         .await
         .expect("scheduler repair pull event");
-        let received_pull = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPullPayload,
-            rkyv::rancor::Error,
-        >(&received_pull)
+        let received_pull = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullPayload>(&received_pull)
         .expect("decode scheduler repair pull");
         assert_eq!(received_pull.from_sequence, 1);
         let repair_response = source
@@ -4640,8 +4594,7 @@ mod tests {
         let MeshSyncPullResult::Operations(repair_response) = repair_response else {
             panic!("expected operations repair response");
         };
-        let repair_response_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&repair_response)
-            .map(|bytes| bytes.to_vec())
+        let repair_response_bytes = tentaflow_protocol::cbor::encode(&repair_response)
             .expect("encode scheduler repair response");
         source_mesh
             .send_ufp2_to_peer(
@@ -4666,17 +4619,13 @@ mod tests {
         })
         .await
         .expect("scheduler repair response event");
-        let received_repair = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
-            rkyv::rancor::Error,
-        >(&received_repair)
+        let received_repair = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&received_repair)
         .expect("decode scheduler repair response");
         let ack = receiver
             .runtime
             .handle_pull_response_payload(&source.runtime.local_node_id, received_repair)
             .expect("handle scheduler repair response");
-        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-            .map(|bytes| bytes.to_vec())
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
             .expect("encode scheduler repair ack");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -4701,10 +4650,7 @@ mod tests {
         })
         .await
         .expect("scheduler repair ack event");
-        let received_ack = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncAckPayload,
-            rkyv::rancor::Error,
-        >(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
         .expect("decode scheduler repair ack");
         source
             .runtime
@@ -4840,8 +4786,7 @@ mod tests {
             .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
             .expect("build initial push")
             .expect("initial push");
-        let push_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&push)
-            .map(|bytes| bytes.to_vec())
+        let push_bytes = tentaflow_protocol::cbor::encode(&push)
             .expect("encode initial push");
         source_mesh
             .send_ufp2_to_peer(
@@ -4866,17 +4811,13 @@ mod tests {
         })
         .await
         .expect("initial push event");
-        let received_push = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPushPayload,
-            rkyv::rancor::Error,
-        >(&received_push)
+        let received_push = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&received_push)
         .expect("decode initial push");
         let ack = receiver
             .runtime
             .handle_push_payload(&source.runtime.local_node_id, received_push)
             .expect("handle initial push");
-        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-            .map(|bytes| bytes.to_vec())
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
             .expect("encode initial ack");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -4901,10 +4842,7 @@ mod tests {
         })
         .await
         .expect("initial ack event");
-        let received_ack = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncAckPayload,
-            rkyv::rancor::Error,
-        >(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
         .expect("decode initial ack");
         source
             .runtime
@@ -5188,8 +5126,7 @@ mod tests {
             from_sequence: 1,
             limit: 64,
         };
-        let pull_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&pull)
-            .map(|bytes| bytes.to_vec())
+        let pull_bytes = tentaflow_protocol::cbor::encode(&pull)
             .expect("encode snapshot pull");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -5214,10 +5151,7 @@ mod tests {
         })
         .await
         .expect("snapshot pull event");
-        let received_pull = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncPullPayload,
-            rkyv::rancor::Error,
-        >(&received_pull)
+        let received_pull = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullPayload>(&received_pull)
         .expect("decode snapshot pull");
         let response = source
             .runtime
@@ -5228,8 +5162,7 @@ mod tests {
         };
         assert_eq!(snapshot_response.snapshot_id, snapshot.snapshot_id.as_str());
         assert_eq!(snapshot_response.operations_after_snapshot.len(), 1);
-        let response_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot_response)
-            .map(|bytes| bytes.to_vec())
+        let response_bytes = tentaflow_protocol::cbor::encode(&snapshot_response)
             .expect("encode snapshot response");
         source_mesh
             .send_ufp2_to_peer(
@@ -5254,17 +5187,13 @@ mod tests {
         })
         .await
         .expect("snapshot response event");
-        let received_response = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload,
-            rkyv::rancor::Error,
-        >(&received_response)
+        let received_response = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload>(&received_response)
         .expect("decode snapshot response");
         let ack = receiver
             .runtime
             .handle_snapshot_response_payload(&source.runtime.local_node_id, received_response)
             .expect("handle snapshot response");
-        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-            .map(|bytes| bytes.to_vec())
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
             .expect("encode snapshot ack");
         receiver_mesh
             .send_ufp2_to_peer(
@@ -5289,10 +5218,7 @@ mod tests {
         })
         .await
         .expect("snapshot ack event");
-        let received_ack = rkyv::from_bytes::<
-            tentaflow_protocol::mesh::MeshSyncAckPayload,
-            rkyv::rancor::Error,
-        >(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
         .expect("decode snapshot ack");
         source
             .runtime

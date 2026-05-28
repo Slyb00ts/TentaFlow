@@ -1895,7 +1895,7 @@ CREATE TABLE flows (
     is_default INTEGER NOT NULL DEFAULT 0,
     service_type TEXT,
     flow_json TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','active','archived')),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','active','decoded')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     published_model_name TEXT NULL

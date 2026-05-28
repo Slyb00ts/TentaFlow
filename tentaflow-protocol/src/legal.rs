@@ -4,17 +4,16 @@
 //          (F2 P8.c). All RPCs are packed into a single `LegalAdminPayload`
 //          inner enum so the whole legal surface burns one `MessageBody`
 //          discriminant slot — same pattern as `CameraAdminPayload` and
-//          `ProfilingPayload` (rkyv 0.8 256-variant cap).
+//          `ProfilingPayload` (CBOR 0.8 256-variant cap).
 // =============================================================================
 
-use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 /// One row in `legal_documents` projected onto the wire. Mirrors the columns
 /// the dashboard list view needs without exposing the on-disk PDF path —
 /// downloads always go through the signed-URL endpoint, never the listing.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct LegalDocumentSummary {
     pub doc_id: String,
@@ -33,7 +32,7 @@ pub struct LegalDocumentSummary {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct LegalDocumentsListRequest {
     /// When `true`, soft-deleted rows are included. Default `false` matches
@@ -42,14 +41,14 @@ pub struct LegalDocumentsListRequest {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct LegalDocumentsListResponse {
     pub documents: Vec<LegalDocumentSummary>,
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct LegalDocumentGenerateRequest {
     /// Canonical lowercase variant string: `short` | `standard` | `full`.
@@ -58,7 +57,7 @@ pub struct LegalDocumentGenerateRequest {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct LegalDocumentGenerateResponse {
     pub doc_id: String,
@@ -71,14 +70,14 @@ pub struct LegalDocumentGenerateResponse {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct LegalDocumentRevokeRequest {
     pub doc_id: String,
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct LegalDocumentRevokeResponse {
     pub doc_id: String,
@@ -88,7 +87,7 @@ pub struct LegalDocumentRevokeResponse {
 /// Inner-enum pack — keeps every admin legal RPC in a single
 /// `MessageBody::LegalAdminBody` slot. Same shape as `CameraAdminPayload`.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub enum LegalAdminPayload {
     ListRequest(LegalDocumentsListRequest),
@@ -106,8 +105,8 @@ mod tests {
 
     macro_rules! round_trip {
         ($ty:ty, $value:expr) => {{
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&$value).expect("encode");
-            rkyv::from_bytes::<$ty, rkyv::rancor::Error>(&bytes).expect("decode")
+            let bytes = crate::cbor::encode(&$value).expect("encode");
+            crate::cbor::decode::<$ty>(&bytes).expect("decode")
         }};
     }
 
@@ -178,8 +177,8 @@ mod tests {
                 variant: "short".into(),
             },
         ));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 }
