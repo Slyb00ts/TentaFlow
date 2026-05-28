@@ -260,12 +260,12 @@ async fn send_and_wait(
     request.request_id = format!("sp-{}", Uuid::new_v4());
     let request_id = request.request_id.clone();
     let rx = client.register(&request_id);
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).map_err(|e| {
+    let bytes = crate::mesh::cbor::encode(&request).map_err(|e| {
         client.cancel(&request_id);
         StorageProxyError::Encode(e.to_string())
     })?;
     if let Err(e) = iroh
-        .send_storage_proxy_request(authority_node_id, bytes.as_ref())
+        .send_storage_proxy_request(authority_node_id, &bytes)
         .await
     {
         client.cancel(&request_id);

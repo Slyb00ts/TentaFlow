@@ -574,7 +574,7 @@ mod linux_rdma {
             .await??;
 
         // Wyslij lokalne QP info
-        let info_bytes = serde_json::to_vec(&local_info)?;
+        let info_bytes = crate::mesh::cbor::encode(&local_info)?;
         let len = info_bytes.len() as u32;
         stream.write_all(&len.to_le_bytes()).await?;
         stream.write_all(&info_bytes).await?;
@@ -588,7 +588,7 @@ mod linux_rdma {
         }
         let mut remote_buf = vec![0u8; remote_len];
         stream.read_exact(&mut remote_buf).await?;
-        let remote_info: QpInfo = serde_json::from_slice(&remote_buf)?;
+        let remote_info: QpInfo = crate::mesh::cbor::decode(&remote_buf)?;
 
         // Polacz QP i odbieraj dane
         let result = tokio::task::spawn_blocking(move || -> Result<RdmaProbeResult> {
@@ -633,10 +633,10 @@ mod linux_rdma {
         }
         let mut remote_buf = vec![0u8; remote_len];
         stream.read_exact(&mut remote_buf).await?;
-        let remote_info: QpInfo = serde_json::from_slice(&remote_buf)?;
+        let remote_info: QpInfo = crate::mesh::cbor::decode(&remote_buf)?;
 
         // Wyslij lokalne QP info
-        let info_bytes = serde_json::to_vec(&local_info)?;
+        let info_bytes = crate::mesh::cbor::encode(&local_info)?;
         let len = info_bytes.len() as u32;
         stream.write_all(&len.to_le_bytes()).await?;
         stream.write_all(&info_bytes).await?;

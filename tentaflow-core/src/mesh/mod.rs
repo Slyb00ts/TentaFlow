@@ -5,6 +5,7 @@
 
 pub mod admin_ops;
 pub mod bandwidth_probe;
+pub mod cbor;
 pub mod cluster_probe;
 pub mod command_executor;
 pub mod frame_policy;

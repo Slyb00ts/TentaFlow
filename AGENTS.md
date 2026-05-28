@@ -36,9 +36,8 @@ Feature flags on `tentaflow-core`:
 | `inference-llamacpp` | llama.cpp backend |
 | `inference-mlx` | Apple MLX (macOS only) |
 | `dashboard-api` | Axum HTTP dashboard + API |
-| `metrics-prometheus` | Prometheus metrics |
 
-The main binary enables `docker`, `dashboard-api`, `metrics-prometheus` by default. macOS additionally enables `inference-mlx`.
+The main binary enables `docker` and `dashboard-api` by default. macOS additionally enables `inference-mlx`.
 
 ## Tests
 
@@ -385,7 +384,7 @@ Test reference: `cargo test --lib seeded_flows_pass_adapter_validation`.
 
 ## Configuration
 
-`config.toml` at project root. Key sections: `[server]`, `[protocols.quic]`, `[mesh]`, `[load_balancing]`, `[monitoring]`. Default ports: HTTPS/QUIC on 8090, Prometheus on 9090.
+`config.toml` at project root. Key sections: `[server]`, `[protocols.quic]`, `[mesh]`, `[load_balancing]`, `[monitoring]`. Default HTTPS/QUIC port: 8090.
 
 ## Conventions
 

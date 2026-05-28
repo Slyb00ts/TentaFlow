@@ -156,7 +156,8 @@ pub async fn mesh_pairing_confirm(
         &ctx.state.quic_mesh,
         ctx.state.local_node_id.as_ref(),
         &ctx.state.mesh_peer_store,
-    )?;
+    )
+    .await?;
 
     Ok(MessageBody::MeshPairingConfirmResponseBody(
         MeshPairingConfirmResponse {
@@ -611,8 +612,8 @@ async fn forward_profiling_to_peer(
     target_node_id: &str,
     cmd: tentaflow_protocol::mesh::MeshCommandType,
 ) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
-    use tentaflow_protocol::ProfilingPayload as PP;
     use tentaflow_protocol::mesh::MeshCommandResponsePayload as RP;
+    use tentaflow_protocol::ProfilingPayload as PP;
 
     let qm = require_quic_mesh(ctx)?;
     let is_trusted = ctx
@@ -889,8 +890,8 @@ async fn profiling_route(
     ctx: &HandlerContext,
     payload: tentaflow_protocol::ProfilingPayload,
 ) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
-    use tentaflow_protocol::ProfilingPayload as PP;
     use tentaflow_protocol::mesh::MeshCommandType as MC;
+    use tentaflow_protocol::ProfilingPayload as PP;
 
     let local = ctx.state.local_node_id.as_ref();
     let target: String = match &payload {
