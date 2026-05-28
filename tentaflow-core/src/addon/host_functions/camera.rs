@@ -61,11 +61,11 @@ const PERM_CAMERAS_SNAPSHOT: &str = "cameras.snapshot";
 /// RTSP URI from the device-service URL and persists the derivation
 /// (`onvif_url` + `onvif_profile_token`) so a later credentials rotation
 /// can re-resolve without re-running discovery.
-const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif"];
+const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2"];
 
 /// Vendors `camera_test_connection_v1` knows how to probe. ONVIF is included
 /// — we probe its device-service HTTP endpoint as a reachability check.
-const TESTABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif"];
+const TESTABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2"];
 
 fn vendor_addable(v: &str) -> bool {
     ADDABLE_VENDORS.iter().any(|s| *s == v)
@@ -2284,6 +2284,21 @@ pub fn camera_test_connection_v1(
                 message: msg,
             },
         },
+        "local_camera" | "v4l2" => {
+            match crate::services::camera_ingest::local::validate_local_source(
+                &input.vendor,
+                &input.url,
+            ) {
+                Ok(()) => CameraTestConnectionOut {
+                    ok: true,
+                    message: format!("{} source accepted", input.vendor),
+                },
+                Err(e) => CameraTestConnectionOut {
+                    ok: false,
+                    message: e.to_string(),
+                },
+            }
+        }
         other => CameraTestConnectionOut {
             ok: false,
             message: format!("vendor '{other}' has no test_connection handler"),

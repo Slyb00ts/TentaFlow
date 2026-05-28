@@ -35,6 +35,7 @@ pub async fn save_segment_mp4(
         ));
     }
 
+    crate::services::gstreamer_runtime::prepare_runtime_environment();
     gst::init().map_err(|e| RecordingError::GstPipeline(format!("gst init: {e}")))?;
 
     let source_path = parse_file_url(source_url)?;

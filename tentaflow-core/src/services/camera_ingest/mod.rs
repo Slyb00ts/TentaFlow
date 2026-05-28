@@ -9,6 +9,7 @@
 pub mod credentials;
 pub mod error;
 pub mod fakefile;
+pub mod local;
 pub mod metadata_bus;
 pub mod metadata_supervisor;
 pub mod onvif_discovery;
