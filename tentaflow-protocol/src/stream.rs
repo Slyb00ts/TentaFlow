@@ -2,7 +2,7 @@
 // File: stream.rs
 // Purpose: Binary stream pub/sub protocol — packed into a single
 //          `MessageBody::StreamBody(StreamPayload)` slot so the whole live
-//          streaming surface burns one discriminant of the rkyv 0.8 256-variant
+//          streaming surface burns one discriminant of the CBOR 0.8 256-variant
 //          budget (same pattern as `CameraAdminPayload` / `LegalAdminPayload`).
 //
 //          Wire shape:
@@ -16,13 +16,12 @@
 //              in an envelope with `IS_STREAM_CHUNK` / `IS_STREAM_END`.
 // =============================================================================
 
-use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 /// Inner payload for `MessageBody::StreamBody`. See module docs for the
 /// request/response ordering contract.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub enum StreamPayload {
     /// Client -> server. Asks the hub to subscribe this WS connection to the
@@ -49,7 +48,7 @@ pub enum StreamPayload {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct StreamSubscribeRequest {
     /// Hub-registered stream id, e.g. `camera:<uuid>` for the camera tier.
@@ -57,7 +56,7 @@ pub struct StreamSubscribeRequest {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct StreamSubscribeResponse {
     pub stream_id: String,
@@ -68,7 +67,7 @@ pub struct StreamSubscribeResponse {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct StreamFramePayload {
     pub stream_id: String,
@@ -78,14 +77,14 @@ pub struct StreamFramePayload {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct StreamCloseRequest {
     pub stream_id: String,
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct StreamClosedPayload {
     pub stream_id: String,
@@ -101,8 +100,8 @@ mod tests {
 
     macro_rules! round_trip {
         ($ty:ty, $value:expr) => {{
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&$value).expect("encode");
-            rkyv::from_bytes::<$ty, rkyv::rancor::Error>(&bytes).expect("decode")
+            let bytes = crate::cbor::encode(&$value).expect("encode");
+            crate::cbor::decode::<$ty>(&bytes).expect("decode")
         }};
     }
 
@@ -157,8 +156,8 @@ mod tests {
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "camera:abc".into(),
             }));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -169,8 +168,8 @@ mod tests {
             is_init: true,
             data: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }));
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 }

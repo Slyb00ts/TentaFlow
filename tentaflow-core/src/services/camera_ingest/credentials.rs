@@ -16,7 +16,7 @@
 // Rotation: the CLI command `tentaflow-cli camera rotate-key` generates a new
 // master key, re-encrypts every `cameras.credentials_encrypted` row inside a
 // single SQL transaction, then atomically replaces `cameras.key` with the new
-// one (old key archived as `cameras.key.<UTC-stamp>`).
+// one (old key decoded as `cameras.key.<UTC-stamp>`).
 
 use std::io;
 use std::path::PathBuf;
@@ -86,7 +86,7 @@ impl CredentialsCipher {
     }
 
     /// Same as [`load_or_generate`] but with an explicit file path. Used by
-    /// the rotate-key CLI to load the *previous* key from an archived path
+    /// the rotate-key CLI to load the *previous* key from an decoded path
     /// without touching the live one.
     ///
     /// Startup recovery: if a sibling `*.key.new` file is found, an earlier

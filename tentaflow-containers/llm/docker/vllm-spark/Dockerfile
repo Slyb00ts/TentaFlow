@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: Dockerfile (vllm-spark)
-# Opis: vLLM 0.20.1 budowane ze zrodel pod NVIDIA DGX Spark (GB10 Grace
+# Opis: vLLM 0.21.0 budowane ze zrodel pod NVIDIA DGX Spark (GB10 Grace
 #       Blackwell, aarch64, sm_121a). PyPI wheels vllm/torch celuja w sm_120
 #       i crashuja na sm_121 — tu odpalamy lokalny build z
 #       TORCH_CUDA_ARCH_LIST=12.1a w devel-image (nvcc + toolchain).
@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bin tentaflow-sidecar \
     && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
-# --- Stage 2: vLLM 0.20.1 build from source ---
+# --- Stage 2: vLLM 0.21.0 build from source ---
 # Devel variant — potrzebujemy nvcc + cuda headers do kompilacji kerneli.
 # Runtime variant nie ma toolchainu, vanilla `pip install -e .` by sie wywalil
 # na "nvcc not found".
@@ -56,10 +56,10 @@ ENV TORCH_CUDA_ARCH_LIST="12.1a" \
     VLLM_ATTENTION_BACKEND="FLASHINFER" \
     MAX_JOBS="8"
 
-# Klon vllm @ v0.20.1 i build editable. Trzymamy `--depth 1` zeby skrocic
+# Klon vllm @ v0.21.0 i build editable. Trzymamy `--depth 1` zeby skrocic
 # clone — caly history nie jest potrzebny do builda.
 WORKDIR /src
-RUN git clone --depth 1 --branch v0.20.1 https://github.com/vllm-project/vllm.git \
+RUN git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm.git \
     && cd vllm \
     && pip install --no-cache-dir -e . \
     && pip cache purge

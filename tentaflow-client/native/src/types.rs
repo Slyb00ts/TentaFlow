@@ -39,6 +39,19 @@
 use std::ffi::{c_char, CString};
 use std::ptr;
 
+#[repr(C)]
+pub struct ClientConfig {
+    pub router_url: *const c_char,
+    pub ca_path: *const c_char,
+    pub timeout_ms: u32,
+}
+
+#[repr(C)]
+pub struct ChatMessage {
+    pub role: *const c_char,
+    pub content: *const c_char,
+}
+
 // ============================================================================
 // RESULT TYPES
 // ============================================================================

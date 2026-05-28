@@ -17,9 +17,6 @@ tentaflow-protocol = { path = "../../tentaflow-protocol" }
 tentaflow-transport = { path = "../../tentaflow-transport" }
 iroh = { version = "0.98.2", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
 
-# Serialization
-rkyv = { version = "0.8.16", features = ["std", "bytecheck"] }
-
 # Async runtime
 tokio = { version = "1.52.2", features = ["rt-multi-thread", "sync", "time", "macros"] }
 

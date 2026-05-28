@@ -2,18 +2,17 @@
 // Plik: vision.rs
 // Opis: Typy protokolu dla inference vision (face detection / age+gender /
 //       emotion). Spakowane jako jeden `VisionInferPayload` enum z 2 parami
-//       request/response — zeby zaoszczedzic sloty w MessageBody (rkyv 0.8
+//       request/response — zeby zaoszczedzic sloty w MessageBody (CBOR 0.8
 //       ma twardy limit 256 wariantow w enumie). Patrn `ProfilingPayload`.
 // =============================================================================
 
-use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 /// Format obrazka w wire — kodek decyduje klient. Server uzyje crate `image`
 /// zeby zdekodowac do RgbImage. Surowy bufor RGB tez wspierany dla minimum
 /// latency (po stronie meeting-bota juz mamy RGB w pamieci).
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub enum VisionImageFormat {
     /// JPEG / PNG / WEBP — auto-detect po magic bytes.
@@ -23,7 +22,7 @@ pub enum VisionImageFormat {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct VisionInferRequest {
     /// Nazwa zdeployowanego serwisu (klucz w `vision::registry`). Caller
@@ -36,7 +35,7 @@ pub struct VisionInferRequest {
 /// Bbox (x1, y1, x2, y2) w pikselach oryginalnego obrazka + score + opcjonalne
 /// 5 keypointow (lewe oko, prawe oko, nos, lewy kacik ust, prawy kacik ust).
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct VisionFaceDet {
     pub x1: f32,
@@ -49,7 +48,7 @@ pub struct VisionFaceDet {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct VisionPoseKeypoint {
     pub id: u8,
@@ -60,7 +59,7 @@ pub struct VisionPoseKeypoint {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct VisionPoseDet {
     pub x1: f32,
@@ -72,7 +71,7 @@ pub struct VisionPoseDet {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub enum VisionInferResult {
     Faces(Vec<VisionFaceDet>),
@@ -90,7 +89,7 @@ pub enum VisionInferResult {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct VisionInferResponse {
     pub service_name: String,
@@ -100,7 +99,7 @@ pub struct VisionInferResponse {
 
 /// Inner-enum pack — jeden slot w MessageBody. Patrz ProfilingPayload jako wzor.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub enum VisionInferPayload {
     InferRequest(VisionInferRequest),

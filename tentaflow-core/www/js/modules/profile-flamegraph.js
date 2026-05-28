@@ -178,7 +178,7 @@ export class CpuFlamegraph {
       if (!ev) continue;
       const cat = ev.category;
       const payload = ev.payload || {};
-      // Accept both rkyv-shape ({CpuSample: {...}}) and flat shape used by fixtures.
+      // Accept both CBOR-shape ({CpuSample: {...}}) and flat shape used by fixtures.
       const cpuPayload = (cat === 'CpuSample' || cat === 0)
         ? (payload.CpuSample || payload)
         : (payload.CpuSample || null);
@@ -1013,7 +1013,7 @@ function escapeText(s) {
 // FlamegraphView — adapter for profile-report dispatcher.
 // Dispatcher (renderLazyTab) wymaga `render(host, ctx)`. Tutaj montujemy
 // CpuFlamegraph w hostowym kontenerze i mapujemy ksztalt `ctx.report` (kompat
-// z TimelineView) na argumenty konstruktora. names moze byc obiektem (rkyv)
+// z TimelineView) na argumenty konstruktora. names moze byc obiektem (CBOR)
 // albo tablica (fixtures) — flatten do tablicy zeby data lookup dzialal.
 // =============================================================================
 

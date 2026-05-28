@@ -141,7 +141,7 @@ przechowuje `operation_id`, a startup nodu odpala drainer dla zainstalowanych
 addonow SQL i ponawia wpisy ze statusem `pending` albo `error`. Po migracji
 UFP/2 sync wire idzie przez `channel=0x06 SyncLedger`; payloady `SyncPush`,
 `SyncAck`, `SyncPull`, `SyncPullResponse` i snapshot nadal niosa binarne
-CBOR/rkyv body potrzebne obecnemu runtime, a nie JSON. Po polaczeniu z
+CBOR/CBOR body potrzebne obecnemu runtime, a nie JSON. Po polaczeniu z
 trusted peerem pipeline wysyla pending outbox, odbiorca zapisuje zweryfikowane
 operacje do inbox i odsyla ACK.
 Incoming operations z inbox sa aplikowane do lokalnego SQLite addona przez
@@ -653,6 +653,6 @@ Key routing rules:
 
 ## Sync Storage Proxy
 
-- Central-only addon SQL/KV/Blob uses binary rkyv mesh messages `MESH_MSG_STORAGE_PROXY_REQUEST` (`0x34`) and `MESH_MSG_STORAGE_PROXY_RESPONSE` (`0x35`) on UFP/2 Mesh channel.
+- Central-only addon SQL/KV/Blob uses binary CBOR mesh messages `MESH_MSG_STORAGE_PROXY_REQUEST` (`0x34`) and `MESH_MSG_STORAGE_PROXY_RESPONSE` (`0x35`) on UFP/2 Mesh channel.
 - Authority-backed policies may use `authority_readthrough`, `authority_write`, or `replicated_by_permission`/`sharded` with `authority_node_id`. Nodes with `sync_receive` materialize locally; nodes without it read/write through the authority without storing addon rows locally.
 - Blob central-only proxy is chunked: clients call `BlobPutChunk`/`BlobGetChunk`, authority validates chunk hash and final sha256, writes the content-addressed blob, records blob capture and returns range bytes without local client materialization.

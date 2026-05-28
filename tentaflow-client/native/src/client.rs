@@ -10,8 +10,8 @@
 // JAK DZIAŁA:
 // 1. Nawiązuje połączenie QUIC z mutual TLS do Router
 // 2. Dla każdego requestu otwiera nowy strumień bidirektionalny (multiplexing)
-// 3. Serializuje request przez rkyv (zero-copy) i wysyła
-// 4. Odbiera odpowiedź i deserializuje przez rkyv
+// 3. Serializuje request przez CBOR i wysyła
+// 4. Odbiera odpowiedź i deserializuje przez CBOR
 // 5. Przy utracie połączenia automatycznie próbuje reconnect (do 5 prób)
 //
 // PRZYKŁAD UŻYCIA:
@@ -30,7 +30,7 @@
 // KLUCZOWE KONCEPCJE:
 // - QUIC multiplexing: Jedno połączenie obsługuje do 1000 równoległych strumieni
 // - Auto-reconnect: Automatyczne ponowne połączenie po utracie (5 prób, 2s interwał)
-// - rkyv: Zero-copy serialization dla minimalnej latencji
+// - CBOR: binarny format ramek protokołu
 // - Mutual TLS: Certyfikat klienta + CA dla bezpieczeństwa
 // - parking_lot::Mutex: Szybszy mutex (2-3x) dla krótkich sekcji krytycznych
 //
@@ -532,8 +532,8 @@ impl TentaFlowClient {
         // Otwórz strumień bidirektionalny
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        // Serialize request with rkyv
-        let request_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request)
+        // Serialize request with CBOR
+        let request_bytes = tentaflow_protocol::cbor::encode(&request)
             .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?;
 
         info!("Sending request: {} bytes, stream={}, tts={}", request_bytes.len(), options.stream, tts_enabled);
@@ -552,10 +552,7 @@ impl TentaFlowClient {
             }
 
             // Deserialize ModelResponse
-            let archived = rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(&response_bytes)
-                .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
-
-            let response: ModelResponse = rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived)
+            let response: ModelResponse = tentaflow_protocol::cbor::decode(&response_bytes)
                 .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
 
             // Wyciągnij CompletionResult z ModelResponse
@@ -664,12 +661,12 @@ impl TentaFlowClient {
                 .map_err(|e| anyhow::anyhow!("Error reading chunk data: {}", e))?;
 
             // Deserializuj ModelStreamChunk
-            let archived = rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(&chunk_buf)
+            let chunk: ModelStreamChunk = tentaflow_protocol::cbor::decode(&chunk_buf)
                 .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
 
             // Przetwórz chunk type
-            match &archived.chunk {
-                ArchivedStreamChunkType::TextDelta(text) => {
+            match chunk.chunk {
+                StreamChunkType::TextDelta(text) => {
                     let text_str = text.as_str();
 
                     // Zakończ reasoning jeśli był i zaczyna się content
@@ -687,7 +684,7 @@ impl TentaFlowClient {
                     full_text.push_str(text_str);
                     on_content(text_str);
                 }
-                ArchivedStreamChunkType::ReasoningDelta(reasoning) => {
+                StreamChunkType::ReasoningDelta(reasoning) => {
                     let reasoning_str = reasoning.as_str();
 
                     // Rozpocznij reasoning jeśli jeszcze nie
@@ -699,13 +696,13 @@ impl TentaFlowClient {
                     full_reasoning.push_str(reasoning_str);
                     on_reasoning(reasoning_str);
                 }
-                ArchivedStreamChunkType::AudioChunk(audio_data) => {
+                StreamChunkType::AudioChunk(audio_data) => {
                     // Audio chunk z TTS - wywołaj callback i zapisz
                     let audio_bytes: Vec<u8> = audio_data.iter().copied().collect();
                     on_audio(&audio_bytes);
                     audio_chunks.push(audio_bytes);
                 }
-                ArchivedStreamChunkType::Done { final_metrics } => {
+                StreamChunkType::Done { final_metrics } => {
                     // Zakończ reasoning jeśli nie było content
                     if reasoning_started && !reasoning_ended {
                         on_reasoning_end();
@@ -720,11 +717,11 @@ impl TentaFlowClient {
                         StreamingMetrics {
                             text: full_text,
                             reasoning_content: reasoning_opt,
-                            model: m.model_name.to_string(),
-                            completion_tokens: m.tokens_processed.as_ref().map(|t| t.to_native() as u32).unwrap_or(0),
-                            time_to_first_token_ms: m.time_to_first_token_ms.as_ref().map(|t| t.to_native()).unwrap_or(0),
-                            latency_ms: m.latency_ms.to_native(),
-                            tokens_per_sec: m.throughput_tokens_per_sec.as_ref().map(|t| t.to_native()).unwrap_or(0.0),
+                            model: m.model_name.clone(),
+                            completion_tokens: m.tokens_processed.unwrap_or(0) as u32,
+                            time_to_first_token_ms: m.time_to_first_token_ms.unwrap_or(0),
+                            latency_ms: m.latency_ms,
+                            tokens_per_sec: m.throughput_tokens_per_sec.unwrap_or(0.0),
                             audio_chunks,
                             transcribed_text: stream_transcribed_text,
                             speaker_id: stream_speaker_id,
@@ -751,59 +748,36 @@ impl TentaFlowClient {
                     };
                     return Ok((metrics, request_id));
                 }
-                ArchivedStreamChunkType::Error(err) => {
-                    anyhow::bail!("Stream error: {}", err.message.as_str());
+                StreamChunkType::Error(err) => {
+                    anyhow::bail!("Stream error: {}", err.message);
                 }
-                ArchivedStreamChunkType::IntentInfo(info) => {
-                    // Zapisz intent info ze streama (używając rkyv ArchivedOption)
-                    if let rkyv::option::ArchivedOption::Some(intent) = &info.detected_intent {
-                        stream_detected_intent = Some(intent.as_str().to_string());
-                    }
-                    if let rkyv::option::ArchivedOption::Some(tools) = &info.detected_tools {
-                        let converted: Vec<DetectedToolCallData> = tools.iter().map(|t| {
+                StreamChunkType::IntentInfo(info) => {
+                    // Zapisz intent info ze streama.
+                    stream_detected_intent = info.detected_intent;
+                    if let Some(tools) = info.detected_tools {
+                        let converted: Vec<DetectedToolCallData> = tools.into_iter().map(|t| {
                             DetectedToolCallData {
-                                call_id: t.call_id.as_str().to_string(),
-                                tool_name: t.tool_name.as_str().to_string(),
-                                parameters: t.parameters.as_str().to_string(),
+                                call_id: t.call_id,
+                                tool_name: t.tool_name,
+                                parameters: t.parameters,
                                 is_complete: t.is_complete,
-                                missing_params: match &t.missing_params {
-                                    rkyv::option::ArchivedOption::Some(mp) => Some(mp.iter().map(|s| s.as_str().to_string()).collect()),
-                                    rkyv::option::ArchivedOption::None => None,
-                                },
-                                execution_result: match &t.execution_result {
-                                    rkyv::option::ArchivedOption::Some(er) => Some(DetectedToolExecutionResultData {
+                                missing_params: t.missing_params,
+                                execution_result: t.execution_result.map(|er| DetectedToolExecutionResultData {
                                         success: er.success,
-                                        message: er.message.as_str().to_string(),
-                                        data: match &er.data {
-                                            rkyv::option::ArchivedOption::Some(d) => Some(d.as_str().to_string()),
-                                            rkyv::option::ArchivedOption::None => None,
-                                        },
-                                        error: match &er.error {
-                                            rkyv::option::ArchivedOption::Some(e) => Some(e.as_str().to_string()),
-                                            rkyv::option::ArchivedOption::None => None,
-                                        },
+                                        message: er.message,
+                                        data: er.data,
+                                        error: er.error,
                                     }),
-                                    rkyv::option::ArchivedOption::None => None,
-                                },
-                                follow_up_question: match &t.follow_up_question {
-                                    rkyv::option::ArchivedOption::Some(q) => Some(q.as_str().to_string()),
-                                    rkyv::option::ArchivedOption::None => None,
-                                },
+                                follow_up_question: t.follow_up_question,
                             }
                         }).collect();
                         stream_detected_tools = Some(converted);
                     }
-                    if let rkyv::option::ArchivedOption::Some(text) = &info.transcribed_text {
-                        stream_transcribed_text = Some(text.as_str().to_string());
-                    }
-                    if let rkyv::option::ArchivedOption::Some(id) = &info.speaker_id {
-                        stream_speaker_id = Some(id.as_str().to_string());
-                    }
-                    if let rkyv::option::ArchivedOption::Some(name) = &info.speaker_name {
-                        stream_speaker_name = Some(name.as_str().to_string());
-                    }
+                    stream_transcribed_text = info.transcribed_text;
+                    stream_speaker_id = info.speaker_id;
+                    stream_speaker_name = info.speaker_name;
                 }
-                ArchivedStreamChunkType::Metadata(_) => {}
+                StreamChunkType::Metadata(_) => {}
                 _ => {}
             }
         }
@@ -853,8 +827,8 @@ impl TentaFlowClient {
         // Otwórz strumień bidirektionalny
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        // Serialize request with rkyv
-        let request_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cancel)
+        // Serialize request with CBOR
+        let request_bytes = tentaflow_protocol::cbor::encode(&cancel)
             .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?;
 
         // Prepend message type discriminator
@@ -876,10 +850,10 @@ impl TentaFlowClient {
         }
 
         // Deserialize response
-        let archived = rkyv::access::<ArchivedCancelResponse, rkyv::rancor::Error>(&response_bytes)
+        let response: CancelResponse = tentaflow_protocol::cbor::decode(&response_bytes)
             .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
 
-        Ok(archived.success)
+        Ok(response.success)
     }
 
     /// Wysyła request TTS i zwraca audio bytes z metrykami.
@@ -902,6 +876,7 @@ impl TentaFlowClient {
                     voice: voice.to_string(),
                     format: format.map(|s| s.to_string()),
                     speed: None,
+                    language: None,
                 },
             }),
             stream: false,
@@ -1414,8 +1389,8 @@ impl TentaFlowClient {
         // Otwórz strumień bidirektionalny
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        // Serialize request with rkyv
-        let request_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request)
+        // Serialize request with CBOR
+        let request_bytes = tentaflow_protocol::cbor::encode(&request)
             .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?;
 
         debug!("Sending request: {} bytes", request_bytes.len());
@@ -1434,10 +1409,7 @@ impl TentaFlowClient {
         }
 
         // Deserialize response
-        let archived = rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(&response_bytes)
-            .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
-
-        let response: ModelResponse = rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived)
+        let response: ModelResponse = tentaflow_protocol::cbor::decode(&response_bytes)
             .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
 
         Ok(response)
@@ -1843,4 +1815,3 @@ fn parse_endpoint_id(url: &str) -> Result<EndpointId> {
     arr.copy_from_slice(&bytes);
     EndpointId::from_bytes(&arr).map_err(|e| anyhow::anyhow!("niepoprawny EndpointId: {e}"))
 }
-

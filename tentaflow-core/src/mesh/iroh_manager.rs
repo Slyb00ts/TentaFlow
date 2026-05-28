@@ -587,7 +587,11 @@ impl IrohMeshManager {
                     let me = Arc::clone(&self_arc);
                     tokio::spawn(async move {
                         if let Err(e) = me.handle_incoming(incoming).await {
-                            warn!("iroh_mesh: obsluga incoming nieudana: {}", e);
+                            if is_transient_incoming_finalize_error(&e) {
+                                debug!("iroh_mesh: incoming handshake zakonczony przed finalizacja: {}", e);
+                            } else {
+                                warn!("iroh_mesh: obsluga incoming nieudana: {}", e);
+                            }
                         }
                     });
                 }
@@ -2385,6 +2389,11 @@ fn transport_addr_label(addr: &TransportAddr) -> String {
         TransportAddr::Custom(addr) => addr.to_string(),
         _ => addr.to_string(),
     }
+}
+
+fn is_transient_incoming_finalize_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("finalize connection"))
 }
 
 fn is_private_socket_addr(addr: &std::net::SocketAddr) -> bool {

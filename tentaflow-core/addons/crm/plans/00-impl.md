@@ -16,7 +16,7 @@
 - **Istnieje `services/org/`** z multi-tenant orgs + auth roles (admin/member/viewer z permissions strings). Nasz katalog ról to **inna domena** (role biznesowe / typy stanowisk). Nazwa modułu: **`services/role_catalog/`** żeby uniknąć kolizji.
 - **Auth/admin check:** istnieje wzorzec `is_admin(ctx: &HandlerContext) -> bool` w `src/api/dashboard/`. Używamy go bezpośrednio.
 - **Audit log:** istnieje tabela `audit_log` używana w `services/legal/`, `services/mesh_keys/`, `services/service_call.rs`. Wzorzec INSERT z polami: user_id, addon_id, instance_id, action, resource_type, resource_id, result, action_hash, risk_class, request_id, timestamp, prev_hash, hash, org_id.
-- **Binary protocol:** `tentaflow-protocol/src/message_body.rs` — `pub enum MessageBody` z handrolled wariantami per operation (`RoleCatalogListRequest`, `RoleCatalogListResponse`, ...). Używa `rkyv::Archive, Deserialize, Serialize`. Typy w `types.rs`.
+- **Binary protocol:** `tentaflow-protocol/src/message_body.rs` — `pub enum MessageBody` z handrolled wariantami per operation (`RoleCatalogListRequest`, `RoleCatalogListResponse`, ...). Używa `CBOR::Archive, Deserialize, Serialize`. Typy w `types.rs`.
 
 ---
 

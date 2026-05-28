@@ -32,7 +32,7 @@ pub enum FlowDataType {
 }
 
 impl FlowDataType {
-    /// Stable lowercase tag uzywany w wire (rkyv) i GUI rendering. Spojny z
+    /// Stable lowercase tag uzywany w wire (CBOR) i GUI rendering. Spojny z
     /// `serde(rename_all = "snake_case")` zeby JSON i string surface daly ten
     /// sam tag.
     pub fn as_wire_str(self) -> &'static str {

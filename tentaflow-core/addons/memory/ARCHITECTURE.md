@@ -538,4 +538,4 @@ Total context budget: ~2048 tokens for memory + last 4 messages. Rest for LLM re
 | Procedural memory | Patterns + Skills | Removed | Too complex for addon, not needed |
 | Multilingual | 12 languages | Not needed (embeddings handle) | Model is multilingual |
 | Hot/Warm/Cold storage | Custom 3-tier | Addon storage + cache | Simpler, uses addon APIs |
-| Serialization | rkyv zero-copy | serde_json (WASM compat) | Slower but portable |
+| Serialization | CBOR zero-copy | serde_json (WASM compat) | Slower but portable |

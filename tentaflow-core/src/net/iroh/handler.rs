@@ -2,7 +2,7 @@
 // Plik: net/iroh/handler.rs
 // Opis: Pomocnicze typy dla implementacji `iroh::protocol::ProtocolHandler`.
 //       Opakowuje `iroh::endpoint::Connection` w `IrohConnection` ktory
-//       ujawnia wygodne API read/write rkyv-zakodowanych ramek MessageBody.
+//       ujawnia wygodne API read/write CBOR-zakodowanych ramek MessageBody.
 // =============================================================================
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -22,11 +22,11 @@ pub enum IrohStreamError {
     Io(String),
     #[error("frame too large: {0} bajtow")]
     FrameTooLarge(usize),
-    #[error("rkyv decode envelope: {0}")]
+    #[error("CBOR decode envelope: {0}")]
     EnvelopeDecode(String),
-    #[error("rkyv decode body: {0}")]
+    #[error("CBOR decode body: {0}")]
     BodyDecode(String),
-    #[error("rkyv encode: {0}")]
+    #[error("CBOR encode: {0}")]
     Encode(String),
 }
 
@@ -48,13 +48,13 @@ impl IrohConnection {
     }
 }
 
-/// Zapisuje `Envelope` na stream jako len-prefixed (u32 big-endian) rkyv.
+/// Zapisuje `Envelope` na stream jako len-prefixed (u32 big-endian) CBOR.
 pub async fn write_envelope(
     send: &mut SendStream,
     envelope: &Envelope,
 ) -> Result<(), IrohStreamError> {
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(envelope)
-        .map_err(|e| IrohStreamError::Encode(format!("{e}")))?;
+    let bytes = tentaflow_protocol::cbor::encode(envelope)
+        .map_err(IrohStreamError::Encode)?;
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(IrohStreamError::FrameTooLarge(bytes.len()));
     }
@@ -84,9 +84,9 @@ pub async fn read_envelope_and_body(
         .await
         .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
 
-    let envelope = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&buf)
-        .map_err(|e| IrohStreamError::EnvelopeDecode(format!("{e}")))?;
-    let body = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&envelope.body)
-        .map_err(|e| IrohStreamError::BodyDecode(format!("{e}")))?;
+    let envelope = tentaflow_protocol::cbor::decode::<Envelope>(&buf)
+        .map_err(IrohStreamError::EnvelopeDecode)?;
+    let body = tentaflow_protocol::cbor::decode::<MessageBody>(&envelope.body)
+        .map_err(IrohStreamError::BodyDecode)?;
     Ok((envelope, body))
 }

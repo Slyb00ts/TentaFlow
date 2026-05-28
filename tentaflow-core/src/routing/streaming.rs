@@ -13,7 +13,7 @@ use std::pin::Pin;
 
 use futures::Stream;
 
-/// Bridge `StreamingExecution.stream` (rkyv `EnvelopeDelta::Llm`) na strumień
+/// Bridge `StreamingExecution.stream` (CBOR `EnvelopeDelta::Llm`) na strumień
 /// `ChatCompletionChunk` zgodny z OpenAI SSE. Outcome receiver z executor'a
 /// jest spawnowany do background task'a (per plan: routing nie czeka na
 /// outcome). Disconnect klienta propaguje się przez `CancelOnDropStream`

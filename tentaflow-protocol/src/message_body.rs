@@ -1,16 +1,15 @@
 // =============================================================================
 // Plik: message_body.rs
 // Opis: Bootstrap 10 wariantow MessageBody (bootstrap). MessageBody to tresc
-//       envelope'u — rkyv-serializowana osobno i trzymana jako Vec<u8> w polu
+//       envelope'u — CBOR-serializowana osobno i trzymana jako Vec<u8> w polu
 //       Envelope.body. Dzieki temu policy check dziala na envelope bez tykania
 //       body, a dispatcher decoduje dopiero po przejsciu auth.
 // Przyklad:
 //   let body = MessageBody::ModelListRequest;
-//   let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)?.to_vec();
+//   let body_bytes = CBOR::to_bytes::<CBOR::rancor::Error>(&body)?.to_vec();
 //   let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, body_bytes);
 // =============================================================================
 
-use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 // =============================================================================
@@ -20,7 +19,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 /// Wide model view sourced from `model_registry` joined with the parent
 /// `services` row. Returned by `ModelListRequest` so the chat picker can
 /// disambiguate duplicates and the catalog can show transport/endpoint.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelSummary {
     /// Stable model identifier used for dispatch (alias key). Equal to the
     /// row's `model_name` — keeps backward compat with existing call sites
@@ -60,15 +59,14 @@ pub struct ModelSummary {
 
 // =============================================================================
 // Services — runtime view of deployed services + grouped models. The whole
-// surface is packed into `ServicePayload` to keep the 256-variant rkyv limit
+// surface is packed into `ServicePayload` to keep the 256-variant CBOR limit
 // on `MessageBody` (same trick as `DeploymentPayload` / `MeetingPayload`).
 // =============================================================================
 
 /// Single model row attached to a `ServiceInfo`.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
 )]
-#[rkyv(derive(Debug))]
 pub struct ServiceModelEntry {
     pub model_name: String,
     pub display_name: Option<String>,
@@ -84,9 +82,8 @@ pub struct ServiceModelEntry {
 /// requestcie (Ollama options, python wrapper extra fields, whisper/mlx
 /// deploy defaults z opcjonalnym per-request override).
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
 )]
-#[rkyv(derive(Debug))]
 pub struct ServiceInfo {
     pub id: i64,
     /// Owning mesh node — endpoint-id hex. Same as the local node when the row
@@ -141,9 +138,6 @@ pub struct ServiceInfo {
 ///     moze nadpisac per request.
 ///   * `mlx_overridable` → analogicznie dla MLX engine.
 #[derive(
-    Archive,
-    Deserialize,
-    Serialize,
     SerdeSerialize,
     SerdeDeserialize,
     Debug,
@@ -152,7 +146,6 @@ pub struct ServiceInfo {
     Eq,
     Default,
 )]
-#[rkyv(derive(Debug))]
 pub struct RequestTimeParameters {
     pub ollama_options: Vec<KeyValue>,
     pub python_request: Vec<KeyValue>,
@@ -161,12 +154,11 @@ pub struct RequestTimeParameters {
 }
 
 /// Generic key-value pair dla typed parametrow propagowanych przez wire.
-/// Wartosc jako serialized JSON string (rkyv nie obsluguje natywnie
+/// Wartosc jako serialized JSON string (CBOR nie obsluguje natywnie
 /// `serde_json::Value`).
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
 )]
-#[rkyv(derive(Debug))]
 pub struct KeyValue {
     pub key: String,
     /// JSON-serialized value. Konsument deserializuje przez `serde_json::from_str`.
@@ -177,28 +169,27 @@ pub struct KeyValue {
 /// by `MeshServicesUpdate` push messages so peers do not have to re-broadcast
 /// the full snapshot on every deploy / stop / pin / pause / rename / delete.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
 )]
-#[rkyv(derive(Debug))]
 pub enum ServiceChange {
     Added(ServiceInfo),
     Updated(ServiceInfo),
     Removed { service_id: i64 },
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceListRequest {
     /// Reserved for future filtering (engine / category). Empty vec = no filter.
     pub engine_id_filter: Option<String>,
     pub category_filter: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceListResponse {
     pub services: Vec<ServiceInfo>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceDeleteRequest {
     pub service_id: i64,
     /// Target mesh node. `None` (or local node id) = run locally; otherwise
@@ -208,13 +199,13 @@ pub struct ServiceDeleteRequest {
     pub node_id: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceDeleteResponse {
     pub success: bool,
     pub error: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServicePinRequest {
     pub service_id: i64,
     pub pinned: bool,
@@ -222,26 +213,26 @@ pub struct ServicePinRequest {
     pub node_id: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServicePinResponse {
     pub success: bool,
     pub error: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceStartRequest {
     pub service_id: i64,
     /// See `ServiceDeleteRequest::node_id`.
     pub node_id: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceStartResponse {
     pub success: bool,
     pub error: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServicePauseRequest {
     pub service_id: i64,
     pub paused: bool,
@@ -249,7 +240,7 @@ pub struct ServicePauseRequest {
     pub node_id: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServicePauseResponse {
     pub success: bool,
     pub error: Option<String>,
@@ -264,7 +255,7 @@ pub struct ServicePauseResponse {
 /// parameters — backend regeneruje `vllm_args` ze schema bindings, więc
 /// klient może wysłać albo typed pola albo `vllm_args` raw (power user).
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct ServiceUpdateRequest {
     pub service_id: i64,
@@ -293,7 +284,7 @@ pub struct ServiceUpdateRequest {
     pub restart_after_save: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceUpdateResponse {
     pub success: bool,
     pub error: Option<String>,
@@ -304,7 +295,7 @@ pub struct ServiceUpdateResponse {
 /// Snapshot aktualnego zajęcia VRAM per GPU + lista zewnętrznych procesów.
 /// Klient wywołuje co 2s podczas modal Edit / wizard Advanced step żeby
 /// pokazać user'owi "co już używa GPU" + zalecony `gpu_memory_utilization`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceVramHintRequest {
     /// `None` = wszystkie GPU. Zawęź do indeksu jeśli wizard już wybrał GPU.
     pub gpu_index: Option<u32>,
@@ -316,7 +307,7 @@ pub struct ServiceVramHintRequest {
     pub exclude_service_id: Option<i64>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceVramHintResponse {
     pub gpus: Vec<GpuVramSnapshot>,
     /// Sugerowane `gpu_memory_utilization` z uwzględnieniem external
@@ -326,7 +317,7 @@ pub struct ServiceVramHintResponse {
     pub recommended_utilization: Option<f32>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct GpuVramSnapshot {
     pub gpu_index: u32,
     pub gpu_name: String,
@@ -336,7 +327,7 @@ pub struct GpuVramSnapshot {
     pub external_processes: Vec<GpuProcessInfo>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct GpuProcessInfo {
     pub pid: u32,
     pub process_name: String,
@@ -347,12 +338,12 @@ pub struct GpuProcessInfo {
 /// zmianie dropdown'a "Preset z manifestu" — backend zwraca dokładnie te
 /// `[[model_preset]]` które są zadeklarowane w `<engine>.toml` (single
 /// source of truth, build.rs generuje z TOML do `services_generated.rs`).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceEnginePresetsRequest {
     pub engine_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceEnginePresetsResponse {
     pub presets: Vec<ServicePresetInfo>,
 }
@@ -361,7 +352,7 @@ pub struct ServiceEnginePresetsResponse {
 /// w Edit modal lub deploy wizard. `repo` to HF repository, `quantization`
 /// pochodzi z manifestu (auto/awq/gptq/nvfp4/...). Pełen VRAM estimate
 /// liczony jest osobno przez `DeployVllmRecommendRequest` po wyborze.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServicePresetInfo {
     pub id: String,
     pub display_name: String,
@@ -372,7 +363,7 @@ pub struct ServicePresetInfo {
 
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum ServicePayload {
     ReqList(ServiceListRequest),
     ResList(ServiceListResponse),
@@ -398,7 +389,7 @@ pub enum ServicePayload {
 
 /// Ustabilizowane kody bledu dla `ProtocolError.code`. Dodatkowe (numeryczne)
 /// mozna zawsze dorzucic — klient powinien obslugiwac nieznane graceful.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum ProtocolErrorCode {
     /// Malformed frame, failed bytecheck, wrong schema version.
     InvalidFrame = 1,
@@ -428,7 +419,7 @@ pub enum ProtocolErrorCode {
 
 /// Ujednolicony blad protokolu. Zwracany jako `MessageBody::Error(..)` z flagą
 /// `EnvelopeFlags::IS_ERROR` ustawioną dla szybkiego branchowania.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ProtocolError {
     /// Kod ustabilizowany.
     pub code: ProtocolErrorCode,
@@ -482,7 +473,7 @@ impl std::error::Error for ProtocolError {}
 // API Keys (R-LIST + W-CREATE + W-DELETE archetypes, migration-map #37-#39)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ApiKeySummary {
     pub key_id: String,
     pub name: String,
@@ -490,13 +481,13 @@ pub struct ApiKeySummary {
     pub last_used_at_epoch: Option<u64>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ApiKeyCreateRequest {
     pub name: String,
     pub scopes: Vec<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ApiKeyCreateResponse {
     pub key_id: String,
     /// Pelny token (widoczny TYLKO raz, w odpowiedzi na creation).
@@ -507,20 +498,20 @@ pub struct ApiKeyCreateResponse {
 // Auth (W-ACTION + R-ONE archetypes, migration-map #40-#42)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuthLoginRequest {
     pub username: String,
     pub password: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuthLoginResponse {
     pub jwt: String,
     pub user_id: [u8; 16],
     pub role: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuthMeResponse {
     pub user_id: [u8; 16],
     pub username: String,
@@ -531,20 +522,20 @@ pub struct AuthMeResponse {
 // Me / User preferences (preferowany jezyk dla TTS itd.)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MePreferencesGetRequest {}
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MePreferencesGetResponse {
     pub language: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MePreferencesUpdateRequest {
     pub language: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MePreferencesUpdateResponse {
     pub language: Option<String>,
 }
@@ -553,14 +544,14 @@ pub struct MePreferencesUpdateResponse {
 // Chat streaming (R-STREAM archetyp, migration-map #43)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ChatMessage {
     /// "system" / "user" / "assistant" / "tool".
     pub role: String,
     pub content: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct ChatStreamRequest {
     pub model_id: String,
     pub messages: Vec<ChatMessage>,
@@ -568,13 +559,13 @@ pub struct ChatStreamRequest {
     pub max_tokens: Option<u32>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ChatStreamChunk {
     /// Partial token/fragment od modelu.
     pub delta: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ChatStreamEnd {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -585,7 +576,7 @@ pub struct ChatStreamEnd {
 // migration-map #218-#227
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelDetail {
     pub id: String,
     pub category: String,
@@ -602,7 +593,7 @@ pub struct ModelDetail {
     pub checksum_sha256: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelInstallRequest {
     pub model_id: String,
     /// Repozytorium HuggingFace (np. "Qwen/Qwen3.5-0.8B").
@@ -614,7 +605,7 @@ pub struct ModelInstallRequest {
 // migration-map #81-#86
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct HubEngineSummary {
     pub id: String,
     pub display_name: String,
@@ -624,7 +615,7 @@ pub struct HubEngineSummary {
     pub default_port: u16,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct HubModelSearchResult {
     pub repo_id: String,
     pub display_name: String,
@@ -635,7 +626,7 @@ pub struct HubModelSearchResult {
     pub last_modified_epoch: u64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct HubDownloadProgress {
     pub model_id: String,
     pub bytes_downloaded: u64,
@@ -648,7 +639,7 @@ pub struct HubDownloadProgress {
 // Flows — workflow CRUD + executions (migration-map #65-#80)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowSummary {
     pub id: String,
     pub name: String,
@@ -658,7 +649,7 @@ pub struct FlowSummary {
     pub enabled: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowDetail {
     pub id: String,
     pub name: String,
@@ -666,11 +657,11 @@ pub struct FlowDetail {
     /// JSON DAG definition (zachowane jako string — parsowane przez flow_engine).
     pub graph_json: String,
     pub enabled: bool,
-    /// Raw flow status column: "active" | "draft" | "archived" itp.
+    /// Raw flow status column: "active" | "draft" | "decoded" itp.
     pub status: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowCreateRequest {
     pub name: String,
     pub description: Option<String>,
@@ -683,7 +674,7 @@ pub struct FlowCreateRequest {
     pub published_model_name: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowExecutionSummary {
     pub id: String,
     pub flow_id: String,
@@ -697,7 +688,7 @@ pub struct FlowExecutionSummary {
 // Prompts — prompt templates (migration-map #265-#269)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct PromptSummary {
     pub id: String,
     pub name: String,
@@ -705,7 +696,7 @@ pub struct PromptSummary {
     pub updated_at_epoch: u64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct PromptDetail {
     pub id: String,
     pub name: String,
@@ -719,7 +710,7 @@ pub struct PromptDetail {
 // Registries — Docker/Conda registries (migration-map #275-#279)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct RegistrySummary {
     pub id: String,
     pub url: String,
@@ -732,7 +723,7 @@ pub struct RegistrySummary {
 // Audit logs — read-only event stream (event-push archetype)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditEvent {
     pub ts_epoch: u64,
     pub user_id: Option<[u8; 16]>,
@@ -745,7 +736,7 @@ pub struct AuditEvent {
 // ----- Audit log screen (Admin only) -----
 
 /// Optional filters for audit log list/export — all fields nullable.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogFilters {
     pub user_id: Option<i64>,
     pub addon_id: Option<String>,
@@ -756,7 +747,7 @@ pub struct AuditLogFilters {
 }
 
 /// Single audit log row as returned to the Admin screen.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogEntry {
     pub id: i64,
     pub timestamp: String,
@@ -769,100 +760,100 @@ pub struct AuditLogEntry {
     pub node_id: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogListRequest {
     pub filters: AuditLogFilters,
     pub offset: u64,
     pub limit: u32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogListResponse {
     pub entries: Vec<AuditLogEntry>,
     pub total_count: u64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogExportRequest {
     pub filters: AuditLogFilters,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogExportResponse {
     pub csv: String,
     pub row_count: u64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogCleanupRequest {
     pub keep_days: u32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogCleanupResponse {
     pub deleted_count: u64,
 }
 
 // ----- Scheduler screen (Admin only) -----
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerJobsListRequest;
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerJobsListResponse {
     pub jobs_json: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerActionsListRequest;
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerActionsListResponse {
     pub actions_json: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerRunsListRequest {
     pub job_id: String,
     pub limit: u32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerRunsListResponse {
     pub runs_json: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerJobUpsertRequest {
     pub job_json: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerJobUpsertResponse {
     pub job_json: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerJobDeleteRequest {
     pub job_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerJobDeleteResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerJobRunNowRequest {
     pub job_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SchedulerJobRunNowResponse {
     pub run_json: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SchedulerPayload {
     JobsListRequest(SchedulerJobsListRequest),
     JobsListResponse(SchedulerJobsListResponse),
@@ -882,14 +873,14 @@ pub enum SchedulerPayload {
 // Sync conflict manager — admin-only conflict review and resolution.
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SyncConflictResolution {
     KeepLocal,
     Ignore,
     AcceptRemote,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SyncConflictRow {
     pub operation_id: String,
     pub org_id: String,
@@ -907,7 +898,7 @@ pub struct SyncConflictRow {
     pub resolution: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SyncConflictsListRequest {
     pub org_id: String,
     pub addon_id: String,
@@ -915,12 +906,12 @@ pub struct SyncConflictsListRequest {
     pub limit: u32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SyncConflictsListResponse {
     pub conflicts: Vec<SyncConflictRow>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SyncConflictResolveRequest {
     pub org_id: String,
     pub addon_id: String,
@@ -928,7 +919,7 @@ pub struct SyncConflictResolveRequest {
     pub resolution: SyncConflictResolution,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SyncConflictResolveResponse {
     pub operation_id: String,
     pub status: String,
@@ -936,7 +927,7 @@ pub struct SyncConflictResolveResponse {
     pub rows_affected: u64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SyncConflictPayload {
     ListRequest(SyncConflictsListRequest),
     ListResponse(SyncConflictsListResponse),
@@ -948,7 +939,7 @@ pub enum SyncConflictPayload {
 // Sync storage pressure — admin-only disk and ledger storage report.
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SyncStoragePressureLevel {
     Ok,
     Info,
@@ -957,17 +948,17 @@ pub enum SyncStoragePressureLevel {
     Unknown,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SyncStoragePathUsage {
     pub label: String,
     pub path: String,
     pub bytes: u64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SyncStorageReportRequest;
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SyncStorageReportResponse {
     pub root: String,
     pub level: SyncStoragePressureLevel,
@@ -983,7 +974,7 @@ pub struct SyncStorageReportResponse {
     pub paths: Vec<SyncStoragePathUsage>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SyncStoragePayload {
     ReportRequest(SyncStorageReportRequest),
     ReportResponse(SyncStorageReportResponse),
@@ -993,7 +984,7 @@ pub enum SyncStoragePayload {
 // Portainer — Docker container ops (migration-map #248-#259)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ContainerSummary {
     pub id: String,
     pub name: String,
@@ -1004,7 +995,7 @@ pub struct ContainerSummary {
     pub ports: Vec<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ContainerLogChunk {
     pub container_id: String,
     pub stream: String, // "stdout" | "stderr"
@@ -1013,9 +1004,9 @@ pub struct ContainerLogChunk {
 }
 
 /// Wszystkie operacje Portainer/Docker spakowane w jeden slot `MessageBody`.
-/// Wzorzec „1 slot per feature" — odciaza globalny limit 256 wariantow rkyv 0.8
+/// Wzorzec „1 slot per feature" — odciaza globalny limit 256 wariantow CBOR 0.8
 /// i utrzymuje wszystkie req/res/stream-chunk pod jedna dyskryminanta.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum ContainerPayload {
     /// Klient -> serwer: lista kontenerow widzianych przez node.
     ListRequest,
@@ -1039,7 +1030,7 @@ pub enum ContainerPayload {
 // Voice profiles — speaker enrollment (migration-map #325-#332)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VoiceProfileSummary {
     pub id: String,
     pub display_name: String,
@@ -1051,7 +1042,7 @@ pub struct VoiceProfileSummary {
 // TTS rules — text→speech routing rules (migration-map #316-#319)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct TtsRule {
     pub id: String,
     /// Regex pattern w treści wiadomości.
@@ -1065,7 +1056,7 @@ pub struct TtsRule {
 // PII rules — personally-identifiable-info redaction (migration-map #239-#242)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct PiiRule {
     pub id: String,
     /// "email" | "phone" | "ssn" | "credit-card" | "custom".
@@ -1079,7 +1070,7 @@ pub struct PiiRule {
 // Teams-bot wake words — slowa aktywujace odpowiedz bota
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct WakeWord {
     pub id: i64,
     pub word: String,
@@ -1088,7 +1079,7 @@ pub struct WakeWord {
 }
 
 /// Sub-action `WakeWordRequest` — list/create/toggle/delete.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum WakeWordOp {
     List,
     Create { word: String },
@@ -1100,7 +1091,7 @@ pub enum WakeWordOp {
 // Fast-path patterns — bypass routing for known prompts (migration-map #61-#64)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FastPathPattern {
     pub id: String,
     pub pattern: String,
@@ -1114,7 +1105,7 @@ pub struct FastPathPattern {
 
 /// Broadcast: trust dla noda zostal cofniety (TrustRevoked, mesh discriminant 0x23).
 /// Rozsylany do wszystkich peerow zeby usunac compromised key z trusted_keys.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshTrustRevokedEvent {
     /// Node ktorego trust cofniety (Ed25519 public key, 32 bajty).
     pub revoked_node_id: [u8; 32],
@@ -1126,7 +1117,7 @@ pub struct MeshTrustRevokedEvent {
 
 /// Sync trusted_keys po pairing — node A wysyla swoja liste do noda B
 /// zeby B widzial peerow A's mesh (mesh discriminant 0x24).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshTrustedKeysSyncEvent {
     /// Lista trusted Ed25519 public keys (kazdy 32 bajty).
     pub trusted_keys: Vec<[u8; 32]>,
@@ -1135,8 +1126,8 @@ pub struct MeshTrustedKeysSyncEvent {
 }
 
 /// Inner-enum pack — wszystkie trust eventy w jednym slocie MessageBody.
-/// Konsolidacja zwalnia slot pod nowe warianty (rkyv 0.8 ma twardy limit 256).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+/// Konsolidacja zwalnia slot pod nowe warianty (CBOR 0.8 ma twardy limit 256).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshTrustEventPayload {
     /// Broadcast cofniecia trust (mesh discriminant 0x23).
     Revoked(MeshTrustRevokedEvent),
@@ -1148,7 +1139,7 @@ pub enum MeshTrustEventPayload {
 // Mesh peers (R-LIST + W-ACTION archetypy, migration-map #87-#92)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPeerSummary {
     pub node_id: [u8; 32],
     pub display_name: String,
@@ -1159,14 +1150,14 @@ pub struct MeshPeerSummary {
     pub last_seen_epoch: Option<u64>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairInitRequest {
     pub node_id: [u8; 32],
     /// PIN wpisany przez administratora (6 cyfr).
     pub pin: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairInitResponse {
     pub pair_id: String,
     pub expires_at_epoch: u64,
@@ -1178,7 +1169,7 @@ pub struct MeshPairInitResponse {
 // per-variant encoders in `tentaflow-protocol-wasm`.
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeGpuInfo {
     pub vendor: String,
     pub name: String,
@@ -1191,7 +1182,7 @@ pub struct MeshNodeGpuInfo {
     pub cuda_version: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeNetworkInterface {
     pub name: String,
     pub link_up: bool,
@@ -1205,7 +1196,7 @@ pub struct MeshNodeNetworkInterface {
     pub tx_bytes_per_sec: Option<u64>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeModel {
     pub alias: String,
     pub kind: Option<String>,
@@ -1214,7 +1205,7 @@ pub struct MeshNodeModel {
     pub loaded: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeContainer {
     pub name: String,
     pub image: String,
@@ -1224,14 +1215,14 @@ pub struct MeshNodeContainer {
     pub memory_limit_mb: Option<u64>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeRoute {
     pub hops: u32,
     pub direct: bool,
     pub next_hop: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshConnectionPathInfo {
     pub transport: String,
     pub address: String,
@@ -1239,7 +1230,7 @@ pub struct MeshConnectionPathInfo {
     pub closed: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshConnState {
     Disconnected,
     Connecting,
@@ -1249,7 +1240,7 @@ pub enum MeshConnState {
     Offline,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshConnectionInfo {
     pub state: MeshConnState,
     pub transport: String,
@@ -1263,7 +1254,7 @@ pub struct MeshConnectionInfo {
     pub last_app_heartbeat_ms: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeInfo {
     pub node_id: String,
     pub hostname: String,
@@ -1297,22 +1288,22 @@ pub struct MeshNodeInfo {
     pub profiling_collectors_available: Vec<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeListResponse {
     pub nodes: Vec<MeshNodeInfo>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeDetailRequest {
     pub node_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeDetailResponse {
     pub node: MeshNodeInfo,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPendingPair {
     pub pair_id: String,
     pub remote_node_id: String,
@@ -1323,12 +1314,12 @@ pub struct MeshPendingPair {
     pub pin: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPendingListResponse {
     pub pending: Vec<MeshPendingPair>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshIdentityResponse {
     pub node_id: String,
     pub hostname: String,
@@ -1343,7 +1334,7 @@ pub struct MeshIdentityResponse {
     pub invite_pin_expires_sec: u32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshServicesEntry {
     pub service_name: String,
     pub node_id: String,
@@ -1351,24 +1342,24 @@ pub struct MeshServicesEntry {
     pub endpoint: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshServicesListResponse {
     pub services: Vec<MeshServicesEntry>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshTrustedNode {
     pub node_id: String,
     pub hostname: Option<String>,
     pub trusted_since_epoch: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshTrustedListResponse {
     pub trusted: Vec<MeshTrustedNode>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingStartRequest {
     pub remote_address: String,
     /// Opcjonalny PIN z QR — gdy podany, initiate uzywa go zamiast generowac
@@ -1386,87 +1377,87 @@ pub struct MeshPairingStartRequest {
     pub remote_hostname: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingStartResponse {
     pub pair_id: String,
     pub pin: String,
     pub completed: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingConfirmRequest {
     pub pair_id: String,
     pub pin: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingConfirmResponse {
     pub ok: bool,
     pub trusted_node_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingRejectRequest {
     pub pair_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingRejectResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshTrustRevokeRequest {
     pub node_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshTrustRevokeResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshTrustRetrustRequest {
     pub node_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshTrustRetrustResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshConnectRequest {
     pub address: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshConnectResponse {
     pub ok: bool,
     pub remote_node_id: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeCommandRequest {
     pub node_id: String,
     pub command: String,
     pub args: Vec<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeCommandResponse {
     pub ok: bool,
     pub output: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeNetworkConfigRequest {
     pub node_id: String,
     pub interface_name: String,
     pub config_json: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshNodeNetworkConfigResponse {
     pub ok: bool,
 }
@@ -1475,7 +1466,7 @@ pub struct MeshNodeNetworkConfigResponse {
 // Settings (R-LIST + W-UPDATE archetypy, migration-map #147-#148)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SettingEntry {
     pub key: String,
     pub value: String,
@@ -1483,7 +1474,7 @@ pub struct SettingEntry {
     pub is_secret: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SettingsUpdateRequest {
     pub entries: Vec<SettingEntry>,
 }
@@ -1494,7 +1485,7 @@ pub struct SettingsUpdateRequest {
 
 /// Pojedynczy interfejs sieciowy hosta z adresami IPv4 (v6 odrzucane).
 /// `kind` jest znormalizowaną kategorią dla GUI (nie surowy `InterfaceType`).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NetworkInterfaceInfo {
     pub name: String,
     pub mac: String,
@@ -1509,7 +1500,7 @@ pub struct NetworkInterfaceInfo {
 /// Perzistowana konfiguracja mesh networking. `bind_mode="auto"` pozwala iroh
 /// bindowac 0.0.0.0, `"custom"` wymusza `bind_ipv4`. Flagi `hide_*` filtruja
 /// adresy wysylane peerom. `iroh_relay_url` pusty = default N0 preset.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NetworkConfig {
     /// "auto" | "custom"
     pub bind_mode: String,
@@ -1527,7 +1518,7 @@ pub struct NetworkConfig {
 /// `rtt_ms == 0` gdy relay unreachable; `last_success_unix_secs == 0` gdy nigdy
 /// nie udalo sie zpingowac. `status` jest jedna z czterech wartosci:
 /// `"connected" | "degraded" | "unreachable" | "disabled"`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct RelayHealthInfo {
     pub url: String,
     pub reachable: bool,
@@ -1543,8 +1534,8 @@ pub struct RelayHealthInfo {
 
 /// Skonsolidowany payload dla Mesh & Network settings — 6 logicznych variantow
 /// (interfaces list req/res, config get req/res, config update req/res) zajmuje
-/// 1 slot w `MessageBody` zeby zmiescic sie w 256-variant limicie rkyv.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+/// 1 slot w `MessageBody` zeby zmiescic sie w 256-variant limicie CBOR.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum NetworkPayload {
     ReqInterfacesList,
     ResInterfacesList {
@@ -1564,7 +1555,7 @@ pub enum NetworkPayload {
 // Dashboard metrics (R-LIST z subscription candidate, migration-map #60)
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct DashboardSnapshot {
     pub cpu_usage_percent: f32,
     pub ram_used_mb: u64,
@@ -1582,7 +1573,7 @@ pub struct DashboardSnapshot {
 
 /// Cluster summary returned by list/detail endpoints. Aggregates derived in
 /// handler (members_count, members_online, status from online count).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterInfo {
     pub id: String,
     pub name: String,
@@ -1602,7 +1593,7 @@ pub struct ClusterInfo {
 }
 
 /// Single member of a cluster (node + interface info).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterMember {
     /// Hex-encoded 32-byte mesh node id.
     pub node_id: String,
@@ -1616,23 +1607,23 @@ pub struct ClusterMember {
     pub joined_at: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterListResponse {
     pub clusters: Vec<ClusterInfo>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterDetailRequest {
     pub cluster_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterDetailResponse {
     pub cluster: ClusterInfo,
     pub members: Vec<ClusterMember>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterCreateRequest {
     pub name: String,
     pub description: Option<String>,
@@ -1644,13 +1635,13 @@ pub struct ClusterCreateRequest {
     pub timeout_ms: u32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterCreateResponse {
     pub cluster_id: String,
 }
 
 /// Partial-update request: `None` leaves the current value untouched server-side.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterUpdateRequest {
     pub cluster_id: String,
     pub name: Option<String>,
@@ -1662,22 +1653,22 @@ pub struct ClusterUpdateRequest {
     pub timeout_ms: Option<u32>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterUpdateResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterDeleteRequest {
     pub cluster_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterDeleteResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterAddMemberRequest {
     pub cluster_id: String,
     pub node_id: String,
@@ -1685,30 +1676,30 @@ pub struct ClusterAddMemberRequest {
     pub interface_speed_mbps: Option<u32>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterAddMemberResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterRemoveMemberRequest {
     pub cluster_id: String,
     pub node_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterRemoveMemberResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterProbeStreamRequest {
     pub node_ids: Vec<String>,
 }
 
 /// Single probe event. `event_type` is one of "started" | "probing_pair" |
 /// "result" | "complete"; the populated optional fields depend on it.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterProbeStreamChunk {
     pub event_type: String,
     pub source_node: Option<String>,
@@ -1720,7 +1711,7 @@ pub struct ClusterProbeStreamChunk {
     pub message: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterProbeStreamEnd {
     pub total_pairs: u32,
     pub successful: u32,
@@ -1732,14 +1723,14 @@ pub struct ClusterProbeStreamEnd {
 // =============================================================================
 
 /// Partial update — fields left `None` keep their existing server-side value.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowUpdateRequest {
     pub flow_id: String,
     pub name: Option<String>,
     pub description: Option<String>,
     /// Full DAG JSON replacement when present.
     pub flow_json: Option<String>,
-    /// Raw status column ("active" | "draft" | "archived" ...).
+    /// Raw status column ("active" | "draft" | "decoded" ...).
     pub status: Option<String>,
     /// Update or clear the catalog publish name. `Some(Some("..."))`
     /// publishes / re-publishes; `Some(None)` un-publishes; `None` leaves
@@ -1748,13 +1739,13 @@ pub struct FlowUpdateRequest {
     pub published_model_name: Option<Option<String>>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowUpdateResponse {
     pub ok: bool,
 }
 
 /// Single entry in the node-template palette shown by the flow builder.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowNodeTemplate {
     /// Database row id (palette template id).
     pub id: i64,
@@ -1788,18 +1779,18 @@ pub struct FlowNodeTemplate {
     pub params_schema: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowNodeTemplatesListResponse {
     pub templates: Vec<FlowNodeTemplate>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowVersionListRequest {
     pub flow_id: String,
 }
 
 /// Lightweight view (no full flow_json) for the version-history list.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowVersionSummary {
     pub id: String,
     pub flow_id: String,
@@ -1811,19 +1802,19 @@ pub struct FlowVersionSummary {
     pub created_by: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowVersionListResponse {
     pub versions: Vec<FlowVersionSummary>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowVersionGetRequest {
     pub flow_id: String,
     pub version_id: String,
 }
 
 /// Full version payload including embedded DAG JSON for diff/restore.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowVersionFull {
     pub id: String,
     pub flow_id: String,
@@ -1836,18 +1827,18 @@ pub struct FlowVersionFull {
     pub created_by: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowVersionGetResponse {
     pub version: FlowVersionFull,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowVersionRestoreRequest {
     pub flow_id: String,
     pub version_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowVersionRestoreResponse {
     pub ok: bool,
 }
@@ -1857,7 +1848,7 @@ pub struct FlowVersionRestoreResponse {
 /// Pojedynczy wpis providera SSO dla listy admina. `client_secret` nie jest
 /// zwracany do GUI — jedynie pola nie-sekretne. `default_group_id` jest opcjonalny
 /// (Option) bo provider moze nie mapowac uzytkownikow do grupy domyslnej.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SsoProviderEntry {
     pub id: i64,
     pub name: String,
@@ -1870,14 +1861,14 @@ pub struct SsoProviderEntry {
 }
 
 /// Response: lista wszystkich skonfigurowanych providerow SSO (Admin only).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SsoProvidersListResponse {
     pub providers: Vec<SsoProviderEntry>,
 }
 
 /// Request: utworz nowego providera SSO/OIDC. `client_secret` jest szyfrowany
 /// po stronie serwera przed zapisem do bazy (cipher w AppState).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SsoProviderCreateRequest {
     pub name: String,
     pub provider_type: String,
@@ -1889,7 +1880,7 @@ pub struct SsoProviderCreateRequest {
 }
 
 /// Response: potwierdzenie utworzenia providera SSO.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SsoProviderCreateResponse {
     pub id: i64,
     pub name: String,
@@ -1897,26 +1888,26 @@ pub struct SsoProviderCreateResponse {
 }
 
 /// Request: usun providera SSO po id.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SsoProviderDeleteRequest {
     pub id: i64,
 }
 
 /// Response: flagaczy provider istnial i zostal usuniety.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct SsoProviderDeleteResponse {
     pub deleted: bool,
 }
 
 /// Response: status konfiguracji TLS (obecnosc cert/key w settings, bez ujawniania wartosci).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct TlsStatusResponse {
     pub has_cert: bool,
     pub has_key: bool,
 }
 
 /// Response: status konfiguracji NGC (czy API key jest ustawiony, bez ujawniania wartosci).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NgcStatusResponse {
     pub configured: bool,
 }
@@ -1926,7 +1917,7 @@ pub struct NgcStatusResponse {
 // =============================================================================
 
 /// One node hosting a service model. Reused inside `CatalogEntryKind::ServiceModel`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct CatalogModelInstance {
     pub node_id: String,
     pub node_hostname: Option<String>,
@@ -1944,7 +1935,7 @@ pub struct CatalogModelInstance {
 /// `services::catalog::CatalogEntryKind` from `tentaflow-core` but expresses
 /// enums as plain strings so that adding a new surface or modality on the
 /// service side does not require a protocol bump.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum CatalogEntryKindWire {
     ServiceModel {
         instances: Vec<CatalogModelInstance>,
@@ -1963,7 +1954,7 @@ pub enum CatalogEntryKindWire {
 
 /// Diagnostic flag attached to an entry. Strings instead of typed enums for
 /// the same forward-compatibility reason as `CatalogEntryKindWire`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum CatalogDiagnosticWire {
     RemoteShadowed {
         local_owner: String,
@@ -1980,7 +1971,7 @@ pub enum CatalogDiagnosticWire {
 
 /// One advertised model in the unified catalog. Surface and modality lists
 /// stay as strings so protocol can absorb new values without a schema bump.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct CatalogEntryWire {
     pub id: String,
     pub kind: CatalogEntryKindWire,
@@ -1994,7 +1985,7 @@ pub struct CatalogEntryWire {
 
 /// Catalog list request. The wire form lets callers narrow by surface and
 /// admin tooling opt into seeing entries hidden from `/v1/models`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, SerdeSerialize, SerdeDeserialize)]
 pub struct CatalogListRequest {
     /// When set, return only entries whose `service_surfaces` contain the
     /// given surface string (e.g. "chat", "stt"). `None` = no filter.
@@ -2007,14 +1998,14 @@ pub struct CatalogListRequest {
 
 /// Catalog list response. `version` is monotonic and lets clients cheaply
 /// detect "anything changed since my last poll" without diffing entries.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct CatalogListResponse {
     pub entries: Vec<CatalogEntryWire>,
     pub version: u64,
 }
 
 /// Single model alias entry mapped from `DbModelAlias`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelAliasEntry {
     pub id: i64,
     pub alias: String,
@@ -2025,13 +2016,13 @@ pub struct ModelAliasEntry {
 }
 
 /// Response for `ModelAliasListRequest`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelAliasListResponse {
     pub aliases: Vec<ModelAliasEntry>,
 }
 
 /// Request: create new model alias (Admin).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelAliasCreateRequest {
     pub alias: String,
     pub target_model: String,
@@ -2040,13 +2031,13 @@ pub struct ModelAliasCreateRequest {
 }
 
 /// Response: id of the newly created alias row.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelAliasCreateResponse {
     pub id: i64,
 }
 
 /// Request: update existing model alias by id (Admin).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelAliasUpdateRequest {
     pub id: i64,
     pub alias: String,
@@ -2057,25 +2048,25 @@ pub struct ModelAliasUpdateRequest {
 }
 
 /// Response: whether update succeeded.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelAliasUpdateResponse {
     pub ok: bool,
 }
 
 /// Request: delete alias by id (Admin).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelAliasDeleteRequest {
     pub id: i64,
 }
 
 /// Response: whether delete succeeded.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelAliasDeleteResponse {
     pub ok: bool,
 }
 
 /// Single NIM catalog container entry mirrored from `api_nim::NimContainer`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NimContainerEntry {
     pub name: String,
     pub display_name: String,
@@ -2090,7 +2081,7 @@ pub struct NimContainerEntry {
 }
 
 /// Response for `NimCatalogListRequest` (optional fetch error string).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NimCatalogListResponse {
     pub containers: Vec<NimContainerEntry>,
     pub error: Option<String>,
@@ -2102,7 +2093,7 @@ pub struct NimCatalogListResponse {
 // =============================================================================
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct DeployVllmGpuInfo {
     pub index: u32,
@@ -2111,7 +2102,7 @@ pub struct DeployVllmGpuInfo {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct DeployVllmRecommendRequest {
     pub model: String,
@@ -2130,7 +2121,7 @@ pub struct DeployVllmRecommendRequest {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct DeployVllmConfig {
     pub tensor_parallel: u32,
@@ -2142,7 +2133,7 @@ pub struct DeployVllmConfig {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct DeployVllmModelSpecSummary {
     pub model_type: String,
@@ -2161,7 +2152,7 @@ pub struct DeployVllmModelSpecSummary {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct DeployVllmVramEstimate {
     pub model_weights_gb: f64,
@@ -2176,7 +2167,7 @@ pub struct DeployVllmVramEstimate {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct DeployVllmGpuCompatibility {
     pub used_tp: u32,
@@ -2188,7 +2179,7 @@ pub struct DeployVllmGpuCompatibility {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct DeployVllmRecommendResponse {
     pub model_spec: DeployVllmModelSpecSummary,
@@ -2210,7 +2201,7 @@ pub struct DeployVllmRecommendResponse {
 /// silniki maja proste defaulty per kategoria). Zwraca typed mape
 /// `parameter.key → JSON value` ktora wizard pre-filluje do formularza.
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct EngineRecommendRequest {
     pub engine_id: String,
@@ -2220,7 +2211,7 @@ pub struct EngineRecommendRequest {
 }
 
 #[derive(
-    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]
 pub struct EngineRecommendResponse {
     /// JSON-serialized values per parameter key. Wizard JS deserializuje
@@ -2230,7 +2221,7 @@ pub struct EngineRecommendResponse {
 }
 
 /// Request: deploy engine described by Service Manifest (Admin).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceManifestDeployRequest {
     pub engine_id: String,
     pub deploy_method: String,
@@ -2239,7 +2230,7 @@ pub struct ServiceManifestDeployRequest {
 }
 
 /// Response: deploy descriptor plus websocket URL for progress stream.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceManifestDeployResponse {
     pub status: String,
     pub deploy_id: String,
@@ -2262,7 +2253,7 @@ pub struct ServiceManifestDeployResponse {
 // =============================================================================
 
 /// Summary wiersz dla listy addonow (kafelki w dashboard / catalog).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonInfo {
     pub addon_id: String,
     pub name: String,
@@ -2281,7 +2272,7 @@ pub struct AddonInfo {
     pub file_size_bytes: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonsListResponse {
     pub addons: Vec<AddonInfo>,
 }
@@ -2292,7 +2283,7 @@ pub struct AddonsListResponse {
 
 /// Application tile shown in the launcher / "My applications". Sourced from
 /// the addon manifest `[application]` section at install time.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonApplicationInfo {
     pub addon_id: String,
     pub title: String,
@@ -2310,9 +2301,9 @@ pub struct AddonApplicationInfo {
 }
 
 /// Multiplex Apps menu endpoints in a single `MessageBody` slot to stay within
-/// the 256-variant rkyv limit. Panel get / UI action removed in chunk 4.2 —
+/// the 256-variant CBOR limit. Panel get / UI action removed in chunk 4.2 —
 /// addon UI now goes through the CBOR channel (`ui_render_cbor`).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonUiPayload {
     // ---- Apps menu ----
     ReqApplicationsList,
@@ -2321,13 +2312,13 @@ pub enum AddonUiPayload {
     },
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonDetailRequest {
     pub addon_id: String,
 }
 
 /// Deklaracja uprawnienia (z manifestu addona).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionDecl {
     pub permission_id: String,
     pub display_name: String,
@@ -2337,7 +2328,7 @@ pub struct AddonPermissionDecl {
 }
 
 /// Deklaracja providera OAuth (z manifestu).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthProviderDecl {
     pub addon_id: String,
     pub provider_id: String,
@@ -2350,7 +2341,7 @@ pub struct AddonOAuthProviderDecl {
     pub pkce: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonDetailResponse {
     pub addon_id: String,
     pub name: String,
@@ -2375,26 +2366,26 @@ pub struct AddonDetailResponse {
     pub show_in_catalog: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonToggleRequest {
     pub addon_id: String,
     pub enabled: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonToggleResponse {
     pub ok: bool,
     pub enabled: bool,
     pub message: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonInstallRequest {
     pub filename: String,
     pub content: Vec<u8>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonInstallResponse {
     pub ok: bool,
     pub addon_id: Option<String>,
@@ -2403,29 +2394,29 @@ pub struct AddonInstallResponse {
     pub error: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonUninstallRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonUninstallResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonReloadRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonReloadResponse {
     pub ok: bool,
     pub message: Option<String>,
 }
 
 /// Pojedyncze pole konfiguracji addona (z manifestu).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonConfigField {
     pub id: String,
     pub label: String,
@@ -2437,29 +2428,29 @@ pub struct AddonConfigField {
     pub secret: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonConfigGetRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonConfigGetResponse {
     pub schema: Vec<AddonConfigField>,
     pub values: Vec<(String, String)>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonConfigSetRequest {
     pub addon_id: String,
     pub values: Vec<(String, String)>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonConfigSetResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonLogsRequest {
     pub addon_id: String,
     pub limit: i64,
@@ -2468,7 +2459,7 @@ pub struct AddonLogsRequest {
     pub search: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonLogEntry {
     pub id: i64,
     pub timestamp: String,
@@ -2480,14 +2471,14 @@ pub struct AddonLogEntry {
     pub details: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonLogsResponse {
     pub entries: Vec<AddonLogEntry>,
     pub total: i64,
 }
 
 /// Parametr pojedynczego narzedzia deklarowanego przez addon.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonToolParam {
     pub name: String,
     pub param_type: String,
@@ -2496,7 +2487,7 @@ pub struct AddonToolParam {
     pub default_value: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonToolDecl {
     pub name: String,
     pub description: String,
@@ -2504,22 +2495,22 @@ pub struct AddonToolDecl {
     pub return_type: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonToolsRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonToolsResponse {
     pub tools: Vec<AddonToolDecl>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonResourcesGetRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonResourcesGetResponse {
     pub max_instances: i32,
     pub cpu_limit_pct: i32,
@@ -2529,7 +2520,7 @@ pub struct AddonResourcesGetResponse {
     pub llm_tokens_per_min: i32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonResourcesSetRequest {
     pub addon_id: String,
     pub max_instances: i32,
@@ -2540,13 +2531,13 @@ pub struct AddonResourcesSetRequest {
     pub llm_tokens_per_min: i32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonResourcesSetResponse {
     pub ok: bool,
 }
 
 /// Zmergowana regula sieciowa zadeklarowana w manifescie + status pokrycia.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonNetworkRuleDecl {
     pub rule_id: String,
     pub host: String,
@@ -2558,12 +2549,12 @@ pub struct AddonNetworkRuleDecl {
     pub approved: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonNetworkRulesGetRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonNetworkRulesGetResponse {
     pub allowed_hosts: Vec<String>,
     pub blocked_hosts: Vec<String>,
@@ -2571,7 +2562,7 @@ pub struct AddonNetworkRulesGetResponse {
     pub declared_rules: Vec<AddonNetworkRuleDecl>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonNetworkRulesSetRequest {
     pub addon_id: String,
     pub allowed_hosts: Vec<String>,
@@ -2579,13 +2570,13 @@ pub struct AddonNetworkRulesSetRequest {
     pub mode: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonNetworkRulesSetResponse {
     pub ok: bool,
 }
 
 /// Wiersz widocznosci addona per grupa.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilityRow {
     pub addon_id: String,
     pub group_id: i64,
@@ -2595,69 +2586,69 @@ pub struct AddonVisibilityRow {
     pub user_count: i32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilityListRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilityListResponse {
     pub addon_id: String,
     pub rows: Vec<AddonVisibilityRow>,
     pub show_in_catalog: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilitySetRequest {
     pub addon_id: String,
     pub group_id: i64,
     pub visible: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilitySetResponse {
     pub addon_id: String,
     pub group_id: i64,
     pub visible: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonAdminOnlySetRequest {
     pub addon_id: String,
     pub admin_only: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonAdminOnlySetResponse {
     pub addon_id: String,
     pub admin_only: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonShowInCatalogSetRequest {
     pub addon_id: String,
     pub show_in_catalog: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonShowInCatalogSetResponse {
     pub addon_id: String,
     pub show_in_catalog: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionCatalogRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionCatalogResponse {
     pub addon_id: String,
     pub entries: Vec<AddonPermissionDecl>,
 }
 
 /// Explicit allow/deny/inherit per subject (user|group) + permission.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionRow {
     pub addon_id: String,
     pub subject_type: String,
@@ -2668,7 +2659,7 @@ pub struct AddonPermissionRow {
 }
 
 /// Default grant per addon + permission.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionDefault {
     pub addon_id: String,
     pub permission_id: String,
@@ -2676,12 +2667,12 @@ pub struct AddonPermissionDefault {
     pub updated_at_epoch: u64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionMatrixRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionMatrixResponse {
     pub addon_id: String,
     pub rows: Vec<AddonPermissionRow>,
@@ -2690,7 +2681,7 @@ pub struct AddonPermissionMatrixResponse {
     pub last_change_at_epoch: u64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionSetRequest {
     pub addon_id: String,
     pub subject_type: String,
@@ -2699,7 +2690,7 @@ pub struct AddonPermissionSetRequest {
     pub grant_mode: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionSetResponse {
     pub addon_id: String,
     pub subject_type: String,
@@ -2708,28 +2699,28 @@ pub struct AddonPermissionSetResponse {
     pub grant_mode: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionDefaultSetRequest {
     pub addon_id: String,
     pub permission_id: String,
     pub grant_mode: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionDefaultSetResponse {
     pub addon_id: String,
     pub permission_id: String,
     pub grant_mode: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionCheckRequest {
     pub addon_id: String,
     pub permission_id: String,
     pub user_id: Option<i64>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionCheckResponse {
     pub addon_id: String,
     pub permission_id: String,
@@ -2738,7 +2729,7 @@ pub struct AddonPermissionCheckResponse {
 }
 
 /// Server-push event wysylany gdy admin zmieni grant/visibility/default.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonPermissionChangedEvent {
     pub addon_id: String,
     pub subject_type: Option<String>,
@@ -2747,7 +2738,7 @@ pub struct AddonPermissionChangedEvent {
 }
 
 /// Konfiguracja OAuth per (addon, provider) — bez sekretow.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthConfigRow {
     pub addon_id: String,
     pub provider_id: String,
@@ -2761,18 +2752,18 @@ pub struct AddonOAuthConfigRow {
     pub shared_account_email: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthConfigListRequest {
     pub addon_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthConfigListResponse {
     pub addon_id: String,
     pub configs: Vec<AddonOAuthConfigRow>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthConfigSetRequest {
     pub addon_id: String,
     pub provider_id: String,
@@ -2783,7 +2774,7 @@ pub struct AddonOAuthConfigSetRequest {
     pub oauth_mode: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthConfigSetResponse {
     pub addon_id: String,
     pub provider_id: String,
@@ -2791,20 +2782,20 @@ pub struct AddonOAuthConfigSetResponse {
     pub enabled: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthConfigClearSecretRequest {
     pub addon_id: String,
     pub provider_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthConfigClearSecretResponse {
     pub addon_id: String,
     pub provider_id: String,
     pub cleared: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthAuthorizeStartRequest {
     pub addon_id: String,
     pub provider_id: String,
@@ -2812,14 +2803,14 @@ pub struct AddonOAuthAuthorizeStartRequest {
     pub redirect_after: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthAuthorizeStartResponse {
     pub authorize_url: String,
     pub state: String,
 }
 
 /// Metadane konta OAuth (tokeny nigdy nie wychodza poza core).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct UserOAuthAccountRow {
     pub id: i64,
     pub user_id: Option<i64>,
@@ -2835,47 +2826,47 @@ pub struct UserOAuthAccountRow {
     pub revoked: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthLinkedAccountsRequest {
     pub addon_id: String,
     pub scope: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthLinkedAccountsResponse {
     pub addon_id: String,
     pub accounts: Vec<UserOAuthAccountRow>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthRevokeRequest {
     pub account_id: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthRevokeResponse {
     pub account_id: i64,
     pub revoked: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthReauthorizeRequest {
     pub account_id: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthReauthorizeResponse {
     pub authorize_url: String,
     pub state: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthTestConnectionRequest {
     pub addon_id: String,
     pub provider_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonOAuthTestConnectionResponse {
     pub ok: bool,
     pub message: Option<String>,
@@ -2883,7 +2874,7 @@ pub struct AddonOAuthTestConnectionResponse {
 }
 
 /// Wpis widoku "Moje polaczone konta" (per uzytkownik).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MyOAuthEntry {
     pub addon_id: String,
     pub addon_name: String,
@@ -2903,10 +2894,10 @@ pub struct MyOAuthEntry {
 }
 
 /// Unit request (bez pol) — jawna struct aby trzymac Body(T) pattern.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MyOAuthAccountsListRequest;
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MyOAuthAccountsListResponse {
     pub accounts: Vec<MyOAuthEntry>,
 }
@@ -2916,10 +2907,10 @@ pub struct MyOAuthAccountsListResponse {
 // MessageBody. Payloady opakowane w strukty (nawet puste) dla spojnego wzorca.
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NotesListRequest;
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteEntry {
     pub id: i64,
     pub title: String,
@@ -2929,17 +2920,17 @@ pub struct NoteEntry {
     pub updated_at_epoch: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NotesListResponse {
     pub notes: Vec<NoteEntry>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteDetailRequest {
     pub note_id: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteDetailResponse {
     pub id: i64,
     pub title: String,
@@ -2949,52 +2940,52 @@ pub struct NoteDetailResponse {
     pub updated_at_epoch: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteCreateRequest {
     pub title: String,
     pub body: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteCreateResponse {
     pub id: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteUpdateRequest {
     pub note_id: i64,
     pub title: String,
     pub body: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteUpdateResponse {
     pub ok: bool,
     pub updated_at_epoch: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteSetPinnedRequest {
     pub note_id: i64,
     pub pinned: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteSetPinnedResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteDeleteRequest {
     pub note_id: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct NoteDeleteResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum NotesRequest {
     List(NotesListRequest),
     Detail(NoteDetailRequest),
@@ -3004,7 +2995,7 @@ pub enum NotesRequest {
     Delete(NoteDeleteRequest),
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum NotesResponse {
     List(NotesListResponse),
     Detail(NoteDetailResponse),
@@ -3018,7 +3009,7 @@ pub enum NotesResponse {
 // Deployments — real build/run pipeline with streaming progress + log tail.
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct DeploymentSummary {
     pub deploy_id: String,
     pub engine_id: String,
@@ -3036,17 +3027,17 @@ pub struct DeploymentSummary {
     pub user_id: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct DeploymentStatusRequest {
     pub deploy_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct DeploymentStatusResponse {
     pub deployment: DeploymentSummary,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct DeploymentListRequest {
     /// "" = wszystkie engines; inaczej filtr exact match.
     pub engine_id: String,
@@ -3058,19 +3049,19 @@ pub struct DeploymentListRequest {
     pub limit: i32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct DeploymentListResponse {
     pub deployments: Vec<DeploymentSummary>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct DeploymentLogStreamRequest {
     pub deploy_id: String,
     /// Czy emitować historyczne log_tail zanim stream zacznie live.
     pub replay_tail: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct DeploymentStreamChunk {
     pub deploy_id: String,
     /// "log" = linia build output, "phase" = zmiana fazy, "progress" = update %.
@@ -3082,7 +3073,7 @@ pub struct DeploymentStreamChunk {
     pub ts_ms: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct DeploymentStreamEnd {
     pub deploy_id: String,
     /// "success" | "failed" | "cancelled" | "interrupted".
@@ -3096,7 +3087,7 @@ pub struct DeploymentStreamEnd {
 /// System events — push-only, wysylane przez serwer jako unsolicited frames.
 /// Jeden wariant `MessageBody::SystemEventBody` oszczedza sloty dla kazdego
 /// typu eventu (service status, mesh peer status, cokolwiek dalej).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SystemEventPayload {
     /// Zmiana stanu uslugi QUIC (LLM/TTS/STT/embeddings). Emitowany gdy
     /// ConnectionStatus transitions: Disconnected→Connected lub odwrotnie.
@@ -3121,11 +3112,11 @@ pub enum SystemEventPayload {
 /// `MessageBody::DeploymentBody` kosztuje 1 slot w 256-limicie — inner enum
 /// rozgalezia sie lokalnie. Stream handler emituje `StreamChunk`/`StreamEnd`
 /// przez SubscriptionEvent::Chunk/End tak samo jak ChatStream.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum DeploymentPayload {
     /// Start deploymentu — odpowiednik starego top-level
     /// `ServiceManifestDeployRequestBody`, przeniesiony tu żeby zmieścić się
-    /// w 256-variant limicie rkyv (jedna top-level `DeploymentBody` zamiast
+    /// w 256-variant limicie CBOR (jedna top-level `DeploymentBody` zamiast
     /// dwóch osobnych Req/Res).
     ReqStart(ServiceManifestDeployRequest),
     ResStart(ServiceManifestDeployResponse),
@@ -3142,7 +3133,7 @@ pub enum DeploymentPayload {
 // Meeting Bot (per-meeting container, live transcript, AI summary).
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionDescriptor {
     pub session_id: i64,
     pub meeting_key: String,
@@ -3178,7 +3169,7 @@ pub struct MeetingSessionDescriptor {
     pub backend_total_participants: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionStartRequest {
     pub meeting_url: String,
     pub title: String,
@@ -3189,33 +3180,33 @@ pub struct MeetingSessionStartRequest {
     pub llm_alias: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionStartResponse {
     pub session: MeetingSessionDescriptor,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionLeaveRequest {
     pub session_id: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionLeaveResponse {
     pub ok: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionListRequest {
     /// true = tylko moje sesje, false = wszystkie (admin)
     pub only_mine: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionListResponse {
     pub sessions: Vec<MeetingSessionDescriptor>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingTranscriptEntry {
     pub id: i64,
     pub session_id: i64,
@@ -3228,60 +3219,60 @@ pub struct MeetingTranscriptEntry {
     pub model: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionDetailRequest {
     pub session_id: i64,
     pub include_transcripts: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSessionDetailResponse {
     pub session: MeetingSessionDescriptor,
     pub transcripts: Vec<MeetingTranscriptEntry>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingTranscriptsListRequest {
     pub session_id: i64,
     /// Zwroc tylko wpisy z timestamp_ms > since_ms. 0 = wszystko.
     pub since_ms: i64,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingTranscriptsListResponse {
     pub entries: Vec<MeetingTranscriptEntry>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingActiveSessionRequest;
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingActiveSessionResponse {
     /// session_id = 0 jesli brak aktywnej sesji.
     pub session: MeetingSessionDescriptor,
     pub has_active: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSettingKv {
     pub key: String,
     pub value: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSettingsGetRequest;
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSettingsGetResponse {
     pub settings: Vec<MeetingSettingKv>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSettingsUpdateRequest {
     pub settings: Vec<MeetingSettingKv>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSettingsUpdateResponse {
     pub ok: bool,
 }
@@ -3292,7 +3283,7 @@ pub struct MeetingSettingsUpdateResponse {
 
 /// Jedno podsumowanie sesji z `meeting_summaries`. Protokolowa forma bez
 /// content_hash — dedup jest szczegolem DB i nie jedzie po wire.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSummaryItem {
     pub id: i64,
     pub created_at: String,
@@ -3301,20 +3292,20 @@ pub struct MeetingSummaryItem {
     pub model: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSummariesListRequest {
     pub meeting_key: String,
     /// Limit najnowszych rekordow. `None` = domyslnie 20.
     pub limit: Option<u32>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSummariesListResponse {
     pub items: Vec<MeetingSummaryItem>,
 }
 
 /// Action item wyekstrahowany przez LLM z transkryptu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingActionItemItem {
     pub id: i64,
     pub owner: String,
@@ -3325,35 +3316,35 @@ pub struct MeetingActionItemItem {
     pub updated_at: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingActionItemsListRequest {
     pub meeting_key: String,
     /// `None` = wszystkie; `Some("pending"|"done"|"cancelled")` = filtr po statusie.
     pub status_filter: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingActionItemsListResponse {
     pub items: Vec<MeetingActionItemItem>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingActionItemStatusUpdateRequest {
     pub item_id: i64,
     pub status: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingActionItemStatusUpdateResponse {
     pub success: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingTranscriptExportRequest {
     pub meeting_key: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingTranscriptExportResponse {
     /// Sformatowany plain text gotowy do zapisu jako .txt (naglowek + linie).
     pub content: String,
@@ -3377,14 +3368,14 @@ pub const VNC_TUNNEL_OPEN_NO_PORT: &str = "no_port";
 pub const VNC_TUNNEL_OPEN_REMOTE_NODE: &str = "remote_node";
 pub const VNC_TUNNEL_OPEN_FAILED: &str = "failed";
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VncTunnelOpenRequest {
     pub session_id: i64,
 }
 
 /// First frame on the subscription stream. When `status != "ok"`, the stream
 /// also ends immediately and `tunnel_id` is empty.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VncTunnelOpenResponse {
     pub status: String,
     pub tunnel_id: String,
@@ -3392,38 +3383,38 @@ pub struct VncTunnelOpenResponse {
 }
 
 /// RFB bytes read from the container TCP socket, pushed to the browser.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VncTunnelChunk {
     pub tunnel_id: String,
     pub bytes: Vec<u8>,
 }
 
 /// Browser → container RFB bytes (keyboard/mouse, client init). One-shot.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VncTunnelSendRequest {
     pub tunnel_id: String,
     pub bytes: Vec<u8>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VncTunnelSendResponse {
     pub ok: bool,
     pub error: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VncTunnelCloseRequest {
     pub tunnel_id: String,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VncTunnelCloseResponse {
     pub ok: bool,
 }
 
 /// Emitted as the terminal stream chunk when the container-side TCP socket
 /// closes (either EOF, I/O error, or handler-initiated shutdown).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct VncTunnelStreamEnd {
     pub tunnel_id: String,
     pub reason: String,
@@ -3431,7 +3422,7 @@ pub struct VncTunnelStreamEnd {
 
 /// Single inner enum carrying every VNC tunnel message so the top-level
 /// `MessageBody` spends only one variant slot on the feature.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum VncTunnelPayload {
     ReqOpen(VncTunnelOpenRequest),
     ResOpen(VncTunnelOpenResponse),
@@ -3458,7 +3449,7 @@ pub const BROWSER_CAPTURE_FAILED: &str = "failed";
 pub const BROWSER_CAPTURE_KIND_SCREENSHOT: &str = "screenshot";
 pub const BROWSER_CAPTURE_KIND_DOM: &str = "dom";
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BrowserCaptureRequest {
     pub session_id: i64,
     /// `"screenshot"` albo `"dom"`. Inna wartość => `status="failed"`.
@@ -3468,7 +3459,7 @@ pub struct BrowserCaptureRequest {
     pub full_page: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BrowserCaptureResponse {
     pub status: String,
     pub kind: String,
@@ -3482,7 +3473,7 @@ pub struct BrowserCaptureResponse {
 
 /// Single inner enum carrying both browser capture messages so the top-level
 /// `MessageBody` spends only one variant slot on the feature.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum BrowserCapturePayload {
     Request(BrowserCaptureRequest),
     Response(BrowserCaptureResponse),
@@ -3490,7 +3481,7 @@ pub enum BrowserCapturePayload {
 
 /// Zbiorczy payload Meeting Bot (req + res w jednym enumie). Handler rozpoznaje
 /// wariant i zwraca odpowiedni Res*. Pozwala na jeden wariant w MessageBody.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MeetingPayload {
     ReqSessionStart(MeetingSessionStartRequest),
     ResSessionStart(MeetingSessionStartResponse),
@@ -3521,12 +3512,12 @@ pub enum MeetingPayload {
     ResWakeWord(MeetingWakeWordResponse),
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingWakeWordRequest {
     pub op: WakeWordOp,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingWakeWordResponse {
     pub words: Vec<WakeWord>,
 }
@@ -3535,7 +3526,7 @@ pub struct MeetingWakeWordResponse {
 // Translate (LLM-backed translator w user app).
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct TranslateRequest {
     pub source_text: String,
     pub source_lang: String,
@@ -3543,7 +3534,7 @@ pub struct TranslateRequest {
     pub tone: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct TranslateResponse {
     pub translated_text: String,
     pub detected_source_lang: Option<String>,
@@ -3552,8 +3543,8 @@ pub struct TranslateResponse {
 }
 
 // Skonsolidowane w `TranslatePayload` — 1 slot w `MessageBody` zamiast 2,
-// zeby zmiescic sie w limicie 256 wariantow rkyv 0.8.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+// zeby zmiescic sie w limicie 256 wariantow CBOR 0.8.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum TranslatePayload {
     Req(TranslateRequest),
     Res(TranslateResponse),
@@ -3563,7 +3554,7 @@ pub enum TranslatePayload {
 // Users list (Admin only) — rozszerzone metadane konta z last_login.
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct UserInfo {
     pub id: i64,
     pub username: String,
@@ -3580,12 +3571,12 @@ pub struct UserInfo {
     pub group_ids: Vec<i64>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct UsersListResponse {
     pub users: Vec<UserInfo>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct GroupInfo {
     pub id: i64,
     pub name: String,
@@ -3593,7 +3584,7 @@ pub struct GroupInfo {
     pub member_count: u32,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct PermissionEntry {
     pub resource_type: String,
     pub resource_id: String,
@@ -3604,7 +3595,7 @@ pub struct PermissionEntry {
 
 /// Inner-enum pack dla calego Identity & Access Management —
 /// users + groups + resource permissions. Jeden slot w MessageBody (IamBody).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum IamPayload {
     // ---- Users ----
     ReqListUsers,
@@ -3713,7 +3704,7 @@ pub enum IamPayload {
 ///
 /// UWAGA: `Eq` NIE implementowane bo ChatStreamRequest ma `Option<f32>` (floaty
 /// nie sa Eq przez NaN). Uzywamy `PartialEq` wszedzie.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MessageBody {
     // ---- Meta (schema/handshake/keepalive) ----
     /// Klient -> serwer: sprawdz wersje protokolu przy handshake.
@@ -4014,7 +4005,7 @@ pub enum MessageBody {
     },
 
     // ---- Mesh & Network settings (enumeracja NIC + bind/advertise rules) ----
-    // Skonsolidowane w `NetworkPayload` — 1 slot w enum (256-variant limit rkyv).
+    // Skonsolidowane w `NetworkPayload` — 1 slot w enum (256-variant limit CBOR).
     NetworkBody(NetworkPayload),
 
     // ---- Dashboard (R-LIST + subscription candidate) ----
@@ -4039,13 +4030,13 @@ pub enum MessageBody {
     EngineRecommendRequestBody(EngineRecommendRequest),
     EngineRecommendResponseBody(EngineRecommendResponse),
     // ServiceManifestDeployRequest/Response przeniesione do DeploymentPayload
-    // (ReqStart/ResStart). Oszczędza 1 slot w 256-variant limicie rkyv.
+    // (ReqStart/ResStart). Oszczędza 1 slot w 256-variant limicie CBOR.
 
     // ---- Addons: list / detail / toggle / lifecycle ----
     AddonsListRequest,
     AddonsListResponseBody(AddonsListResponse),
     // v14: Apps menu + UI v2 — multiplex w 1 slocie zeby zmiescic sie w 256
-    // wariantach rkyv (vide IamBody/ServicePayload).
+    // wariantach CBOR (vide IamBody/ServicePayload).
     AddonUiBody(AddonUiPayload),
     AddonDetailRequestBody(AddonDetailRequest),
     AddonDetailResponseBody(AddonDetailResponse),
@@ -4159,7 +4150,7 @@ pub enum MessageBody {
     IamBody(IamPayload),
 
     // ---- Multi-source profiling (single-variant, req+res w inner enum) ----
-    // 9 par request/response w jednym slocie — rkyv 0.8 ma twardy limit 256
+    // 9 par request/response w jednym slocie — CBOR 0.8 ma twardy limit 256
     // wariantow MessageBody, wiec wszystkie wiadomosci profiling pakujemy do
     // jednego `ProfilingPayload`.
     ProfilingBody(crate::profiling::ProfilingPayload),
@@ -4171,13 +4162,13 @@ pub enum MessageBody {
 
     // ---- Camera admin RPCs (F2 P7.a) ----
     // 2 par request/response (Discover, AddOnvif) spakowane w jeden slot,
-    // analogicznie do ProfilingBody / VisionBody. Powod: rkyv 0.8 256-variant
+    // analogicznie do ProfilingBody / VisionBody. Powod: CBOR 0.8 256-variant
     // limit + dashboard wizard need (P7.b).
     CameraAdminBody(crate::camera::CameraAdminPayload),
 
     // ---- Legal admin RPCs (F2 P8.c) ----
     // 3 par request/response (List, Generate, Revoke) spakowane w jeden slot,
-    // analogicznie do CameraAdminBody / ProfilingBody. Powod: rkyv 0.8
+    // analogicznie do CameraAdminBody / ProfilingBody. Powod: CBOR 0.8
     // 256-variant limit + dashboard RODO surface (P8.d).
     LegalAdminBody(crate::legal::LegalAdminPayload),
 
@@ -4229,8 +4220,8 @@ mod tests {
     }
 
     fn round_trip(body: MessageBody) -> MessageBody {
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode")
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        crate::cbor::decode::<MessageBody>(&bytes).expect("decode")
     }
 
     #[test]
@@ -4324,18 +4315,18 @@ mod tests {
         let body = MessageBody::ModelListResponse {
             models: vec![sample_model(), sample_model()],
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        // Truncate aggressively (first quarter) zeby na pewno odciac rkyv
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        // Truncate aggressively (first quarter) zeby na pewno odciac CBOR
         // root pointer — half-bytes po RAG-removal cleanup'ie jest na tyle
         // krotki ze przypadkowo parsuje sie jako valid prefix dla maléjszego
         // payloadu. 1/4 jest gwarantowanie nizej niz pointer table.
         let quarter = &bytes[..bytes.len() / 4];
-        assert!(rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(quarter).is_err());
+        assert!(crate::cbor::decode::<MessageBody>(quarter).is_err());
     }
 
     #[test]
     fn empty_body_bytes_rejected() {
-        let result = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&[]);
+        let result = crate::cbor::decode::<MessageBody>(&[]);
         assert!(result.is_err());
     }
 
@@ -4826,7 +4817,7 @@ mod tests {
     #[test]
     fn test_role_catalog_update_icon_set_to_null() {
         // Some(None) = wyzeruj (SET NULL). Sprawdza ze nested Option przechodzi
-        // przez rkyv round-trip bez zmiany na None/None.
+        // przez CBOR round-trip bez zmiany na None/None.
         let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(
             crate::types::RoleCatalogUpdateRequest {
                 id: "role-1".to_string(),
@@ -4914,15 +4905,14 @@ mod tests {
     fn body_nests_inside_envelope() {
         use crate::envelope::{message_kind, Envelope};
         let body = MessageBody::ModelListRequest;
-        let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)
-            .expect("encode body")
+        let body_bytes = crate::cbor::encode(&body).expect("encode body")
             .to_vec();
         let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, body_bytes);
-        let env_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&env).expect("encode env");
+        let env_bytes = crate::cbor::encode(&env).expect("encode env");
         let decoded_env: Envelope =
-            rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&env_bytes).expect("decode env");
+            crate::cbor::decode::<Envelope>(&env_bytes).expect("decode env");
         let decoded_body: MessageBody =
-            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&decoded_env.body)
+            crate::cbor::decode::<MessageBody>(&decoded_env.body)
                 .expect("decode body");
         assert_eq!(decoded_body, body);
     }

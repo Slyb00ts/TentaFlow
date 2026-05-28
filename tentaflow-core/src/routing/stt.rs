@@ -255,7 +255,7 @@ impl Router {
 
                 // EXEMPT-MESH-INBOUND (stage 3d v1.5): protocol-native STT
                 // dociera tu z `route_audio_via_protocol` — mesh peer
-                // forwarduje AudioOperation rkyv przez QUIC. Plan v1.5:
+                // forwarduje AudioOperation CBOR przez QUIC. Plan v1.5:
                 // mesh inbound = remote backend call (analogiczny do
                 // HTTP/QUIC service), flow żyje po stronie inicjatora,
                 // peer wykonuje direct executor żeby zachować ultra-low

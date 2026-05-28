@@ -742,7 +742,7 @@ pub async fn handle_request(
         return Ok(response);
     }
 
-    // WebSocket upgrade /ws/api — binary rkyv protocol (bootstrap, Task #30).
+    // WebSocket upgrade /ws/api — binary CBOR protocol (bootstrap, Task #30).
     // Dispatch do `ws_binary::handle_ws_connection`. Auth jest re-checkowany
     // wewnatrz loopu per MessageBody variant po implementacji #26/#27.
     if method == Method::GET && path == "/ws/api" {

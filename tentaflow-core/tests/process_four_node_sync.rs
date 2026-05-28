@@ -670,16 +670,12 @@ async fn child_main() {
         loop {
             match events.recv().await {
                 Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data }) => {
-                    let payload = rkyv::from_bytes::<
-                        tentaflow_protocol::mesh::MeshSyncPushPayload,
-                        rkyv::rancor::Error,
-                    >(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&data)
                     .expect("decode sync push");
                     match tentaflow_core::sync::runtime::handle_push_payload(&from_node_id, payload)
                     {
                         Ok(Some(ack)) => {
-                            let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-                                .map(|bytes| bytes.to_vec())
+                            let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
                                 .expect("encode ack");
                             mesh_for_events
                                 .send_sync_ack(&from_node_id, &ack_bytes)
@@ -691,19 +687,13 @@ async fn child_main() {
                     }
                 }
                 Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data }) => {
-                    let payload = rkyv::from_bytes::<
-                        tentaflow_protocol::mesh::MeshSyncAckPayload,
-                        rkyv::rancor::Error,
-                    >(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&data)
                     .expect("decode sync ack");
                     tentaflow_core::sync::runtime::handle_ack_payload(&from_node_id, payload)
                         .expect("handle ack");
                 }
                 Ok(IrohMeshEvent::SyncPullReceived { from_node_id, data }) => {
-                    let payload = rkyv::from_bytes::<
-                        tentaflow_protocol::mesh::MeshSyncPullPayload,
-                        rkyv::rancor::Error,
-                    >(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullPayload>(&data)
                     .expect("decode sync pull");
                     let Some(result) =
                         tentaflow_core::sync::runtime::handle_pull_payload(&from_node_id, payload)
@@ -716,8 +706,7 @@ async fn child_main() {
                             mesh_for_events
                                 .send_sync_pull_response(
                                     &from_node_id,
-                                    &rkyv::to_bytes::<rkyv::rancor::Error>(&response)
-                                        .map(|bytes| bytes.to_vec())
+                                    &tentaflow_protocol::cbor::encode(&response)
                                         .expect("encode pull response"),
                                 )
                                 .await
@@ -726,8 +715,7 @@ async fn child_main() {
                             mesh_for_events
                                 .send_sync_snapshot_response(
                                     &from_node_id,
-                                    &rkyv::to_bytes::<rkyv::rancor::Error>(&response)
-                                        .map(|bytes| bytes.to_vec())
+                                    &tentaflow_protocol::cbor::encode(&response)
                                         .expect("encode snapshot response"),
                                 )
                                 .await
@@ -736,10 +724,7 @@ async fn child_main() {
                     .expect("send pull result");
                 }
                 Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data }) => {
-                    let payload = rkyv::from_bytes::<
-                        tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
-                        rkyv::rancor::Error,
-                    >(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&data)
                     .expect("decode sync pull response");
                     let Some(ack) = tentaflow_core::sync::runtime::handle_pull_response_payload(
                         &from_node_id,
@@ -748,8 +733,7 @@ async fn child_main() {
                     .expect("handle pull response") else {
                         continue;
                     };
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-                        .map(|bytes| bytes.to_vec())
+                    let bytes = tentaflow_protocol::cbor::encode(&ack)
                         .expect("encode ack");
                     mesh_for_events
                         .send_sync_ack(&from_node_id, &bytes)
@@ -757,10 +741,7 @@ async fn child_main() {
                         .expect("send pull ack");
                 }
                 Ok(IrohMeshEvent::SyncSnapshotPullReceived { from_node_id, data }) => {
-                    let payload = rkyv::from_bytes::<
-                        tentaflow_protocol::mesh::MeshSyncSnapshotPullPayload,
-                        rkyv::rancor::Error,
-                    >(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncSnapshotPullPayload>(&data)
                     .expect("decode sync snapshot pull");
                     let Some(response) =
                         tentaflow_core::sync::runtime::handle_snapshot_pull_payload(
@@ -771,8 +752,7 @@ async fn child_main() {
                     else {
                         continue;
                     };
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response)
-                        .map(|bytes| bytes.to_vec())
+                    let bytes = tentaflow_protocol::cbor::encode(&response)
                         .expect("encode snapshot response");
                     mesh_for_events
                         .send_sync_snapshot_response(&from_node_id, &bytes)
@@ -780,10 +760,7 @@ async fn child_main() {
                         .expect("send snapshot response");
                 }
                 Ok(IrohMeshEvent::SyncSnapshotResponseReceived { from_node_id, data }) => {
-                    let payload = rkyv::from_bytes::<
-                        tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload,
-                        rkyv::rancor::Error,
-                    >(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload>(&data)
                     .expect("decode sync snapshot response");
                     let Some(ack) =
                         tentaflow_core::sync::runtime::handle_snapshot_response_payload(
@@ -794,8 +771,7 @@ async fn child_main() {
                     else {
                         continue;
                     };
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
-                        .map(|bytes| bytes.to_vec())
+                    let bytes = tentaflow_protocol::cbor::encode(&ack)
                         .expect("encode snapshot ack");
                     mesh_for_events
                         .send_sync_ack(&from_node_id, &bytes)
@@ -1011,8 +987,7 @@ async fn handle_child_command(
         ["PUSH", target] => {
             let payload = tentaflow_core::sync::runtime::build_push_payload_for_target(target, 32)?
                 .expect("push payload");
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                .map(|bytes| bytes.to_vec())
+            let bytes = tentaflow_protocol::cbor::encode(&payload)
                 .expect("encode push");
             mesh.send_sync_push(target, &bytes).await?;
             Ok("PUSH".to_string())
@@ -1094,8 +1069,7 @@ async fn send_repair_pull(mesh: &IrohMeshManager, peer: &str) -> anyhow::Result<
             continue;
         }
         for payload in payloads {
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                .map(|bytes| bytes.to_vec())
+            let bytes = tentaflow_protocol::cbor::encode(&payload)
                 .expect("encode repair pull");
             mesh.send_sync_pull(peer, &bytes).await?;
         }
@@ -1118,8 +1092,7 @@ async fn send_snapshot_pull(
         64,
     )?
     .expect("runtime initialized");
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-        .map(|bytes| bytes.to_vec())
+    let bytes = tentaflow_protocol::cbor::encode(&payload)
         .expect("encode snapshot pull");
     mesh.send_sync_snapshot_pull(peer, &bytes).await?;
     Ok(())

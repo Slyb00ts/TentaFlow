@@ -95,7 +95,7 @@ function aggregateRange(report, s, en) {
       case 'PowerSample': {
         const watts = p.watts || 0;
         powerSamples.push({ tNs: ev.t_start_ns, watts });
-        // Domain may be { Cpu: null } or { Gpu: <id> } from rkyv.
+        // Domain may be { Cpu: null } or { Gpu: <id> } from CBOR.
         let domainKey = 'other';
         if (p.domain && typeof p.domain === 'object') {
           if ('Cpu' in p.domain) domainKey = 'cpu';

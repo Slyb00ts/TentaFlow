@@ -3,7 +3,7 @@
 // Opis: Cienki wrapper na `tentaflow_transport::ServiceClient`. Udostepnia API
 //       zgodne z dotychczasowym `QuicClient` (pole `url`, `endpoint_id_hex`,
 //       `auto_reconnect` itd.) zeby callery w `routing/*` i `services/*` dzialaly
-//       bez zmian — caly ruch do peera idzie przez wspolny iroh+rkyv kanal.
+//       bez zmian — caly ruch do peera idzie przez wspolny iroh+CBOR kanal.
 // =============================================================================
 
 use std::sync::Arc;
@@ -136,7 +136,7 @@ impl IrohServiceClient {
     }
 
     /// Otwiera bidi stream do peera, wysyla `ModelRequest`, zwraca oba strumienie.
-    /// Caller czyta kolejne `ModelStreamChunk` ramki (length-prefixed rkyv).
+    /// Caller czyta kolejne `ModelStreamChunk` ramki (length-prefixed CBOR).
     pub async fn send_request_stream_raw(
         &self,
         request: ModelRequest,

@@ -15,10 +15,10 @@ use async_trait::async_trait;
 use rusqlite::Transaction;
 
 use super::{
-    auto_gpu_memory_utilization, build_endpoint_url, build_new_service, category_tag,
-    host_os_supported, models_from_manifest, query_cuda0_vram_mib, resolve_display_name,
-    smart_health_probe, DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy,
-    RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+    DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
+    SmartProbeConfig, SmartProbeOutcome, auto_gpu_memory_utilization, build_endpoint_url,
+    build_new_service, category_tag, host_os_supported, models_from_manifest, query_cuda0_vram_mib,
+    resolve_display_name, smart_health_probe,
 };
 use crate::deploy::process_ctl;
 use crate::deploy::python_venv::{self, NativeDeployRequest};
@@ -50,6 +50,32 @@ fn strip_gpu_memory_utilization(raw: &str) -> String {
         i += 1;
     }
     out.join(" ")
+}
+
+fn is_vllm_python_bundle_engine(engine_id: &str) -> bool {
+    matches!(engine_id, "vllm" | "vllm-spark" | "vllm-metal")
+}
+
+fn is_cuda_vllm_python_bundle_engine(engine_id: &str) -> bool {
+    matches!(engine_id, "vllm" | "vllm-spark")
+}
+
+fn apply_vllm_user_args(
+    engine_id: &str,
+    user_config: &serde_json::Value,
+    env: &mut HashMap<String, String>,
+) {
+    if !is_vllm_python_bundle_engine(engine_id) {
+        return;
+    }
+    if let Some(raw_args) = user_config
+        .get("vllm_args")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        env.insert("VLLM_ARGS".into(), raw_args.to_string());
+    }
 }
 
 /// Tracked state for rollback: the spawned engine's PID. The venv dir is
@@ -209,13 +235,14 @@ impl DeployStrategy for PythonBundleDeploy {
         if let Some(model) = model_repo {
             env.insert("MODEL".into(), model);
         }
+        let is_cuda_vllm = is_cuda_vllm_python_bundle_engine(&engine_id);
+        apply_vllm_user_args(&engine_id, &self.user_config, &mut env);
         // VLLM_ARGS / gpu_memory_utilization sa pojeciami specyficznymi dla
         // vllm. Inne python-bundle silniki (qwen-asr, parakeet, xtts itd.)
         // odpalaja przez uvicorn lub wlasny entrypoint, ktore nie znaja
         // `--gpu-memory-utilization` — bez tego guarda flaga byla appendowana
         // do uvicorn argv przez `build_engine_args` (rozwija VLLM_ARGS env
         // dla kazdego engine'a) i serwis padal na `No such option`.
-        let is_vllm = engine_id == "vllm";
         // Single source of truth dla --gpu-memory-utilization.
         //   - Manual mode: wizard wysyla user's value (top-level
         //     `gpu_memory_utilization` lub w `vllm_args`). Backend ją honoruje
@@ -228,7 +255,7 @@ impl DeployStrategy for PythonBundleDeploy {
         //     zeby vllm wstal niezaleznie od stanu hosta.
         // Niezaleznie od trybu, finalnie w VLLM_ARGS jest **dokladnie jedna**
         // flaga --gpu-memory-utilization — wszystkie poprzednie sa wyciete.
-        let user_explicit_ratio = if !is_vllm {
+        let user_explicit_ratio = if !is_cuda_vllm {
             None
         } else {
             env.get("GPU_MEMORY_UTILIZATION")
@@ -239,7 +266,7 @@ impl DeployStrategy for PythonBundleDeploy {
                         .and_then(|v| v.as_f64())
                 })
         };
-        let from_vllm_args = if !is_vllm {
+        let from_vllm_args = if !is_cuda_vllm {
             None
         } else {
             env.get("VLLM_ARGS").and_then(|raw| {
@@ -260,7 +287,7 @@ impl DeployStrategy for PythonBundleDeploy {
         //   2. wartosc w vllm_args (gdy wizard manual jeszcze nie laduje
         //      do osobnego pola) — manual mode legacy
         //   3. auto-safe z aktualnego free VRAM — auto mode / no-input
-        let final_ratio: Option<f64> = if !is_vllm {
+        let final_ratio: Option<f64> = if !is_cuda_vllm {
             None
         } else {
             user_explicit_ratio
@@ -518,6 +545,63 @@ mod tests {
     fn strip_no_op_when_flag_absent() {
         let raw = "--dtype auto --max-model-len 8192";
         assert_eq!(strip_gpu_memory_utilization(raw), raw);
+    }
+
+    #[test]
+    fn vllm_spark_is_vllm_python_bundle_engine() {
+        assert!(is_vllm_python_bundle_engine("vllm"));
+        assert!(is_vllm_python_bundle_engine("vllm-spark"));
+        assert!(is_vllm_python_bundle_engine("vllm-metal"));
+        assert!(!is_vllm_python_bundle_engine("qwen-asr"));
+    }
+
+    #[test]
+    fn only_cuda_vllm_engines_get_gpu_memory_utilization() {
+        assert!(is_cuda_vllm_python_bundle_engine("vllm"));
+        assert!(is_cuda_vllm_python_bundle_engine("vllm-spark"));
+        assert!(!is_cuda_vllm_python_bundle_engine("vllm-metal"));
+    }
+
+    #[test]
+    fn apply_vllm_user_args_sets_env_for_vllm_spark() {
+        let mut env = HashMap::new();
+        let config = serde_json::json!({
+            "vllm_args": "--max-model-len 8192 --gpu-memory-utilization 0.70"
+        });
+
+        apply_vllm_user_args("vllm-spark", &config, &mut env);
+
+        assert_eq!(
+            env.get("VLLM_ARGS").map(String::as_str),
+            Some("--max-model-len 8192 --gpu-memory-utilization 0.70")
+        );
+    }
+
+    #[test]
+    fn apply_vllm_user_args_sets_env_for_vllm_metal() {
+        let mut env = HashMap::new();
+        let config = serde_json::json!({
+            "vllm_args": "--max-model-len 4096"
+        });
+
+        apply_vllm_user_args("vllm-metal", &config, &mut env);
+
+        assert_eq!(
+            env.get("VLLM_ARGS").map(String::as_str),
+            Some("--max-model-len 4096")
+        );
+    }
+
+    #[test]
+    fn apply_vllm_user_args_ignores_non_vllm_engines() {
+        let mut env = HashMap::new();
+        let config = serde_json::json!({
+            "vllm_args": "--gpu-memory-utilization 0.70"
+        });
+
+        apply_vllm_user_args("qwen-asr", &config, &mut env);
+
+        assert!(!env.contains_key("VLLM_ARGS"));
     }
 
     // Cover the missing-bundle-path failure path; doesn't need python.

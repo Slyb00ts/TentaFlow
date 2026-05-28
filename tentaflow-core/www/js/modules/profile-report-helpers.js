@@ -541,7 +541,7 @@ export function uniqueDevices(events) {
   return Array.from(seen.keys()).sort((a, b) => a - b);
 }
 
-// rkyv enums in JSON look like { Variant: { ...fields } } or { Variant: null }.
+// CBOR enums in JSON look like { Variant: { ...fields } } or { Variant: null }.
 // This helper unwraps to the inner object (or null) for the categories we use.
 export function unwrapPayload(payload) {
   if (!payload || typeof payload !== 'object') return null;
@@ -1044,7 +1044,7 @@ export function vendorBadge(vendor) {
 
 // Wasm-glue emituje status jako `{ kind: 'used'|'skipped_requires_elevation'|
 // 'skipped_unavailable'|'failed', reason?: string }`. Backward-compat:
-// dopuszczamy tez stary PascalCase rkyv-tagged kszt­alt `{ Used: ... }`.
+// dopuszczamy tez stary PascalCase CBOR-tagged kszt­alt `{ Used: ... }`.
 export function normalizeCollectorStatus(status) {
   if (!status) return { kind: 'unknown', reason: '' };
   if (typeof status === 'string') return { kind: status.toLowerCase(), reason: '' };

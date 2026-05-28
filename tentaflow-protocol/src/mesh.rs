@@ -4,7 +4,6 @@
 //       i service discovery miedzy nodami TentaFlow.AI przez QUIC.
 // =============================================================================
 
-use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 use crate::profiling::{
@@ -21,7 +20,7 @@ use crate::profiling::{
 
 /// Wiadomosc protokolu mesh - gossip, membership, service discovery
 /// i forwarding requestow miedzy nodami.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshMessage {
     // -- Gossip --
     /// Ping do sprawdzenia czy nod zyje
@@ -168,7 +167,7 @@ pub enum MeshMessage {
 // =============================================================================
 
 /// Metryki pojedynczego GPU przesylane w heartbeat.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshGpuMetric {
     /// Indeks GPU na nodzie
     pub index: u32,
@@ -188,7 +187,7 @@ pub struct MeshGpuMetric {
 
 /// Heartbeat wysylany co 500ms na stalym polaczeniu QUIC.
 /// Zawiera metryki zasobow noda do load balancingu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshHeartbeat {
     /// Identyfikator noda
     pub node_id: String,
@@ -223,7 +222,7 @@ pub struct MeshHeartbeat {
 // =============================================================================
 
 /// Opis modelu AI zaladowanego na nodzie mesh.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshModelInfo {
     /// Nazwa modelu
     pub name: String,
@@ -242,7 +241,7 @@ pub struct MeshModelInfo {
 // =============================================================================
 
 /// Opis kontenera Docker dzialajacego na nodzie mesh.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshContainerInfo {
     /// Identyfikator kontenera
     pub id: String,
@@ -266,7 +265,7 @@ pub struct MeshContainerInfo {
 
 /// Pelna wymiana stanu po nawiazaniu polaczenia QUIC.
 /// Wysylana jednokrotnie przy handshake, potem aktualizacje przyrostowe.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshFullState {
     /// Identyfikator noda
     pub node_id: String,
@@ -302,7 +301,7 @@ pub struct MeshFullState {
 
 /// Rodzaj komendy zarzadzania wysylanej przez mesh do sparowanego noda.
 /// Obejmuje operacje Docker, certyfikaty i serwisy.
-#[derive(Archive, Deserialize, Serialize, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshCommandType {
     /// Uruchomienie kontenera
     ContainerStart {
@@ -427,7 +426,7 @@ pub enum MeshCommandType {
 /// Typed payload odpowiedzi na `MeshCommandType`. Zastepuje `output: String`,
 /// zeby kazda komenda miala scisle zdefiniowany typ wyniku — bez parsowania
 /// JSON-a w warstwie aplikacyjnej.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshCommandResponsePayload {
     /// Komendy void — zwracaja sam status (start/stop/restart/remove kontenera,
     /// add service, deploy stack, pull image, provision certs, bandwidth-cancel).
@@ -691,32 +690,28 @@ pub const MESH_MSG_SYNC_SNAPSHOT_PULL: u8 = 0x4B;
 pub const MESH_MSG_SYNC_SNAPSHOT_RESPONSE: u8 = 0x4C;
 
 // =============================================================================
-// Struktury wire format dla nowych wiadomosci mesh (rkyv zero-copy)
+// Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)
 // =============================================================================
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct TrustRevokedPayload {
     pub revoked_node_id: String,
     pub from_node_id: String,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct KeyRotationPayload {
     pub from_node_id: String,
     pub ephemeral_public_key: String,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct KeyRotationResponsePayload {
     pub from_node_id: String,
     pub ephemeral_public_key: String,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct TrustedKeyEntry {
     pub node_id: String,
     pub public_key_hex: String,
@@ -725,16 +720,14 @@ pub struct TrustedKeyEntry {
 /// Minimal payload dla `MESH_MSG_HELLO` — tylko hostname + platform + OS.
 /// Wysylany do kazdego peera (trusted/discovered) po nawiazaniu polaczenia,
 /// zeby GUI mogl pokazac nazwe hosta przed zakończeniem pairingu.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshHelloPayload {
     pub hostname: String,
     pub platform: String,
     pub os_info: String,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct TrustedKeysSyncPayload {
     pub keys: Vec<TrustedKeyEntry>,
 }
@@ -747,8 +740,7 @@ pub struct TrustedKeysSyncPayload {
 /// is the active 32-byte HMAC secret. `previous_key` carries the still-valid
 /// previous-window key after a rotation; `previous_expires_unix_ms = 0`
 /// signals no previous-window key is active.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct HmacKeyEntry {
     pub scope: String,
     pub current_key: Vec<u8>,
@@ -761,8 +753,7 @@ pub struct HmacKeyEntry {
 
 /// Payload of `MESH_MSG_HMAC_KEYS_SYNC` — one entry per issuer scope held by
 /// the sender. F1b P3.B sends three: pickup_token, frame_url, recording_url.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct HmacKeysSyncPayload {
     pub from_node_id: String,
     pub keys: Vec<HmacKeyEntry>,
@@ -770,11 +761,10 @@ pub struct HmacKeysSyncPayload {
 
 /// F1b P3.C — wire-stable mirror of `services::frame_storage::FrameMetadata`.
 /// The in-memory struct uses a Rust `enum` for pixel format and an `Option`
-/// for the PTS, which do not round-trip cleanly through every rkyv
+/// for the PTS, which do not round-trip cleanly through every CBOR
 /// derivation chain we support. The wire form keeps everything as primitives
 /// + strings so receivers in any language / version pair safely.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct FrameMetadataWire {
     pub camera_id: String,
     pub width: u32,
@@ -793,8 +783,7 @@ pub struct FrameMetadataWire {
 /// sent). `request_id` is generated by the requester and copied back into
 /// the response so the requester can match async replies — multiple
 /// in-flight requests share the same uni-stream peer connection.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct FrameProxyRequestPayload {
     pub raw_ref: String,
     pub request_id: String,
@@ -808,8 +797,7 @@ pub struct FrameProxyRequestPayload {
 /// case (source connector disconnected while we were assembling the
 /// response, IO error, etc.) so the requester can distinguish a hard miss
 /// from a transient one.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum FrameProxyResponsePayload {
     Found {
         raw_ref: String,
@@ -831,8 +819,7 @@ pub enum FrameProxyResponsePayload {
 /// Wire payload dla `MESH_MSG_PAIRING_REQUEST` — wysylany przez istniejacy mesh
 /// stream przez inicjatora parowania. `from_node_id` to Ed25519 pubkey hex
 /// (= iroh endpoint id). `public_key` to X25519 pubkey hex uzywany do KEX.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingRequestPayload {
     pub from_node_id: String,
     pub public_key: String,
@@ -877,8 +864,7 @@ pub enum PairingFirstContactResponse {
 
 /// Wire payload dla `MESH_MSG_PAIRING_CONFIRM` — wysylany w odpowiedzi przez
 /// receivera po walidacji PIN-u przez admina.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingConfirmPayload {
     pub from_node_id: String,
     pub public_key: String,
@@ -887,21 +873,18 @@ pub struct MeshPairingConfirmPayload {
 }
 
 /// Wire payload dla `MESH_MSG_PAIRING_REJECT` — wysylany gdy admin odrzuca prosbe.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshPairingRejectPayload {
     pub from_node_id: String,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct NodeLeavingPayload {
     pub node_id: String,
 }
 
 /// Podsumowanie uslugi dostepnej na zdalnym nodzie — wysylane w TopologyAnnounce.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceSummary {
     pub name: String,
     pub service_type: String,
@@ -909,8 +892,7 @@ pub struct ServiceSummary {
 }
 
 /// Podsumowanie modelu zaladowanego na zdalnym nodzie — wysylane w TopologyAnnounce.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ModelSummary {
     pub alias: String,
     pub backend: String,
@@ -918,8 +900,7 @@ pub struct ModelSummary {
 }
 
 /// Jeden wpis w TopologyAnnounce — metadane noda + jego bezposredni sasiedzi + uslugi.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct TopologyEntry {
     pub node_id: String,
     pub hostname: String,
@@ -934,8 +915,7 @@ pub struct TopologyEntry {
 
 /// Pojedynczy wpis w KnownPeersPayload — minimalne dane potrzebne zeby
 /// spoznionemu nodowi udalo sie dial'nac peera bez polegania na mDNS.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct KnownPeerEntry {
     pub node_id: String,
     pub hostname: String,
@@ -946,8 +926,7 @@ pub struct KnownPeerEntry {
 /// Payload KnownPeers — wysylany po PeerConnected przez nowo podlaczonego
 /// peera. Zawiera liste wszystkich aktualnie polaczonych peerow, zeby odbiorca
 /// mogl proboxac sie z nimi polaczyc bez mDNS.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct KnownPeersPayload {
     pub peers: Vec<KnownPeerEntry>,
 }
@@ -955,8 +934,7 @@ pub struct KnownPeersPayload {
 /// Payload gossip topologii — floodowany z dedupem.
 /// `origin_node_id` + `epoch` identyfikuja unikalna wersje wiadomosci.
 /// `ttl` zmniejszane przy kazdym rebroadcascie (start 5, drop przy 0).
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct TopologyAnnouncePayload {
     pub origin_node_id: String,
     pub epoch: u64,
@@ -974,15 +952,13 @@ pub struct TopologyAnnouncePayload {
 // snapshot straight into the in-memory `MeshServicesRegistry`.
 
 /// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshServicesGetPayload {
     pub from_node_id: String,
 }
 
 /// Odpowiedz na `MeshServicesGetPayload` — pelen snapshot lokalnego nodu.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshServicesGetResponsePayload {
     pub from_node_id: String,
     pub services: Vec<crate::message_body::ServiceInfo>,
@@ -990,8 +966,7 @@ pub struct MeshServicesGetResponsePayload {
 
 /// Periodyczny anti-drift broadcast (co ~5 min). Pelen stan zastepuje to co
 /// odbiorca trzyma w `MeshServicesRegistry` dla danego nodu.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshServicesAnnouncePayload {
     pub from_node_id: String,
     pub services: Vec<crate::message_body::ServiceInfo>,
@@ -999,8 +974,7 @@ pub struct MeshServicesAnnouncePayload {
 
 /// Push delta — wysylane natychmiast po lokalnej mutacji (deploy/stop/pin/
 /// pause/rename/delete). Odbiorca aplikuje `change` na swoim widoku nodu.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshServicesUpdatePayload {
     pub from_node_id: String,
     pub change: crate::message_body::ServiceChange,
@@ -1010,8 +984,7 @@ pub struct MeshServicesUpdatePayload {
 // Sync Ledger — wire payloads
 // =============================================================================
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncOperationWire {
     pub op_id: Vec<u8>,
     pub partition_id: String,
@@ -1019,22 +992,19 @@ pub struct MeshSyncOperationWire {
     pub operation: Vec<u8>,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncPushPayload {
     pub from_node_id: String,
     pub operations: Vec<MeshSyncOperationWire>,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncAckPayload {
     pub from_node_id: String,
     pub operation_ids: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncPullPayload {
     pub from_node_id: String,
     pub partition_id: String,
@@ -1042,8 +1012,7 @@ pub struct MeshSyncPullPayload {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncPullResponsePayload {
     pub from_node_id: String,
     pub partition_id: String,
@@ -1051,8 +1020,7 @@ pub struct MeshSyncPullResponsePayload {
     pub operations: Vec<MeshSyncOperationWire>,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncSnapshotPullPayload {
     pub from_node_id: String,
     pub partition_id: String,
@@ -1062,8 +1030,7 @@ pub struct MeshSyncSnapshotPullPayload {
     pub tail_limit: u32,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncSnapshotResponsePayload {
     pub from_node_id: String,
     pub partition_id: String,
@@ -1074,8 +1041,7 @@ pub struct MeshSyncSnapshotResponsePayload {
     pub operations_after_snapshot: Vec<MeshSyncOperationWire>,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum StorageValueWire {
     Null,
     Bool(bool),
@@ -1085,8 +1051,7 @@ pub enum StorageValueWire {
     Bytes(Vec<u8>),
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum StorageProxyRequestKind {
     SqlExec {
         query: String,
@@ -1132,8 +1097,7 @@ pub enum StorageProxyRequestKind {
     },
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct StorageProxyRequestPayload {
     pub request_id: String,
     pub from_node_id: String,
@@ -1145,8 +1109,7 @@ pub struct StorageProxyRequestPayload {
     pub kind: StorageProxyRequestKind,
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum StorageProxyResponseKind {
     SqlExec {
         rows_affected: u64,
@@ -1187,8 +1150,7 @@ pub enum StorageProxyResponseKind {
     },
 }
 
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct StorageProxyResponsePayload {
     pub request_id: String,
     pub from_node_id: String,
@@ -1200,8 +1162,7 @@ pub struct StorageProxyResponsePayload {
 // =============================================================================
 
 /// Wiadomosc transkrypcji z sidecara meeting bot
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingTranscript {
     /// Nazwa mowcy
     pub speaker: String,
@@ -1212,8 +1173,7 @@ pub struct MeetingTranscript {
 }
 
 /// Komenda mowienia wysylana do sidecara meeting bot (TTS)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeetingSpeakCommand {
     /// Tekst do wypowiedzenia
     pub text: String,
@@ -1224,8 +1184,7 @@ pub struct MeetingSpeakCommand {
 }
 
 /// Kontrola spotkania — komendy i zdarzenia miedzy addonem a sidecarem
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeetingControl {
     /// Dolacz do spotkania pod podanym URL
     Join { meeting_url: String },
@@ -1240,8 +1199,7 @@ pub enum MeetingControl {
 }
 
 /// Stan spotkania raportowany przez sidecar
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
-#[rkyv(derive(Debug))]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeetingState {
     /// Laczenie ze spotkaniem
     Joining,
@@ -1262,15 +1220,14 @@ pub enum MeetingState {
 // =============================================================================
 
 impl MeshMessage {
-    /// Serializacja do bajtow rkyv (zero-copy format).
-    /// Zwraca AlignedVec ktory derefuje do &[u8].
-    pub fn serialize_rkyv(&self) -> Result<rkyv::util::AlignedVec, rkyv::rancor::Error> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self)
+    /// Serializacja do bajtow CBOR.
+    pub fn serialize_cbor(&self) -> Result<Vec<u8>, String> {
+        crate::cbor::encode(self)
     }
 
-    /// Deserializacja z bajtow rkyv (zero-copy access do archived formy)
-    pub fn deserialize_rkyv(bytes: &[u8]) -> Result<&ArchivedMeshMessage, rkyv::rancor::Error> {
-        rkyv::access::<ArchivedMeshMessage, rkyv::rancor::Error>(bytes)
+    /// Deserializacja z bajtow CBOR.
+    pub fn deserialize_cbor(bytes: &[u8]) -> Result<MeshMessage, String> {
+        crate::cbor::decode(bytes)
     }
 }
 
@@ -1286,15 +1243,15 @@ mod tests {
         };
 
         let bytes = msg
-            .serialize_rkyv()
+            .serialize_cbor()
             .expect("Serializacja ping powinna sie udac");
-        let archived =
-            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja ping powinna sie udac");
+        let decoded =
+            MeshMessage::deserialize_cbor(&bytes).expect("Deserializacja ping powinna sie udac");
 
-        match archived {
-            ArchivedMeshMessage::Ping { from, incarnation } => {
+        match decoded {
+            MeshMessage::Ping { from, incarnation } => {
                 assert_eq!(from.as_str(), "node-1");
-                assert_eq!(*incarnation, 42);
+                assert_eq!(incarnation, 42);
             }
             _ => panic!("Oczekiwano wariantu Ping"),
         }
@@ -1310,13 +1267,13 @@ mod tests {
         };
 
         let bytes = msg
-            .serialize_rkyv()
+            .serialize_cbor()
             .expect("Serializacja join powinna sie udac");
-        let archived =
-            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja join powinna sie udac");
+        let decoded =
+            MeshMessage::deserialize_cbor(&bytes).expect("Deserializacja join powinna sie udac");
 
-        match archived {
-            ArchivedMeshMessage::Join {
+        match decoded {
+            MeshMessage::Join {
                 node_id,
                 addr,
                 role,
@@ -1341,20 +1298,20 @@ mod tests {
         };
 
         let bytes = msg
-            .serialize_rkyv()
+            .serialize_cbor()
             .expect("Serializacja forward powinna sie udac");
-        let archived =
-            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja forward powinna sie udac");
+        let decoded =
+            MeshMessage::deserialize_cbor(&bytes).expect("Deserializacja forward powinna sie udac");
 
-        match archived {
-            ArchivedMeshMessage::ForwardRequest {
+        match decoded {
+            MeshMessage::ForwardRequest {
                 request_id,
                 target_node,
-                payload: archived_payload,
+                payload: decoded_payload,
             } => {
                 assert_eq!(request_id.as_str(), "req-001");
                 assert_eq!(target_node.as_str(), "node-5");
-                assert_eq!(archived_payload.as_slice(), &[1, 2, 3, 4, 5]);
+                assert_eq!(decoded_payload.as_slice(), &[1, 2, 3, 4, 5]);
             }
             _ => panic!("Oczekiwano wariantu ForwardRequest"),
         }
@@ -1364,12 +1321,11 @@ mod tests {
     // Testy typow meeting bot
     // =========================================================================
 
-    /// Pomocnicza makra do roundtrip testow rkyv dla typow meeting bot.
-    /// Serializuje do bajtow i deserializuje z archived — zwraca &Archived.
-    macro_rules! rkyv_serialize {
+    /// Pomocnicza makra do roundtrip testow CBOR dla typow meeting bot.
+    /// Serializuje do bajtow i deserializuje z decoded — zwraca &Decoded.
+    macro_rules! cbor_serialize {
         ($value:expr) => {
-            rkyv::to_bytes::<rkyv::rancor::Error>($value)
-                .expect("Serializacja rkyv powinna sie udac")
+            crate::cbor::encode($value).expect("Serializacja CBOR powinna sie udac")
         };
     }
 
@@ -1382,13 +1338,12 @@ mod tests {
             timestamp_ms: 1_710_000_000_000,
         };
 
-        let bytes = rkyv_serialize!(&transcript);
-        let archived = rkyv::access::<ArchivedMeetingTranscript, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&transcript);
+        let decoded = crate::cbor::decode::<MeetingTranscript>(&bytes).expect("decode");
 
-        assert_eq!(archived.speaker.as_str(), "Jan Kowalski");
-        assert_eq!(archived.text.as_str(), "Dzien dobry, zaczynamy spotkanie.");
-        assert_eq!(archived.timestamp_ms, 1_710_000_000_000);
+        assert_eq!(decoded.speaker.as_str(), "Jan Kowalski");
+        assert_eq!(decoded.text.as_str(), "Dzien dobry, zaczynamy spotkanie.");
+        assert_eq!(decoded.timestamp_ms, 1_710_000_000_000);
     }
 
     #[test]
@@ -1400,13 +1355,12 @@ mod tests {
             timestamp_ms: 0,
         };
 
-        let bytes = rkyv_serialize!(&transcript);
-        let archived = rkyv::access::<ArchivedMeetingTranscript, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&transcript);
+        let decoded = crate::cbor::decode::<MeetingTranscript>(&bytes).expect("decode");
 
-        assert_eq!(archived.speaker.as_str(), "");
-        assert_eq!(archived.text.as_str(), "");
-        assert_eq!(archived.timestamp_ms, 0);
+        assert_eq!(decoded.speaker.as_str(), "");
+        assert_eq!(decoded.text.as_str(), "");
+        assert_eq!(decoded.timestamp_ms, 0);
     }
 
     #[test]
@@ -1418,13 +1372,12 @@ mod tests {
             model: "tts-1".to_string(),
         };
 
-        let bytes = rkyv_serialize!(&cmd);
-        let archived = rkyv::access::<ArchivedMeetingSpeakCommand, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&cmd);
+        let decoded = crate::cbor::decode::<MeetingSpeakCommand>(&bytes).expect("decode");
 
-        assert_eq!(archived.text.as_str(), "Prosze o ciszę.");
-        assert_eq!(archived.voice.as_str(), "alloy");
-        assert_eq!(archived.model.as_str(), "tts-1");
+        assert_eq!(decoded.text.as_str(), "Prosze o ciszę.");
+        assert_eq!(decoded.voice.as_str(), "alloy");
+        assert_eq!(decoded.model.as_str(), "tts-1");
     }
 
     #[test]
@@ -1433,12 +1386,11 @@ mod tests {
             meeting_url: "https://teams.microsoft.com/l/meetup-join/abc".to_string(),
         };
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingControl::Join { meeting_url } => {
+        match decoded {
+            MeetingControl::Join { meeting_url } => {
                 assert_eq!(
                     meeting_url.as_str(),
                     "https://teams.microsoft.com/l/meetup-join/abc"
@@ -1452,11 +1404,10 @@ mod tests {
     fn test_meeting_control_leave_roundtrip() {
         let ctrl = MeetingControl::Leave;
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        assert!(matches!(archived, ArchivedMeetingControl::Leave));
+        assert!(matches!(decoded, MeetingControl::Leave));
     }
 
     #[test]
@@ -1465,12 +1416,11 @@ mod tests {
         for muted_val in [true, false] {
             let ctrl = MeetingControl::Mute { muted: muted_val };
 
-            let bytes = rkyv_serialize!(&ctrl);
-            let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-                .expect("Dostep do archived powinna sie udac");
+            let bytes = cbor_serialize!(&ctrl);
+            let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-            match archived {
-                ArchivedMeetingControl::Mute { muted } => assert_eq!(*muted, muted_val),
+            match decoded {
+                MeetingControl::Mute { muted } => assert_eq!(muted, muted_val),
                 _ => panic!("Oczekiwano wariantu Mute"),
             }
         }
@@ -1482,13 +1432,12 @@ mod tests {
             state: MeetingState::Joining,
         };
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingControl::StateChanged { state } => {
-                assert!(matches!(state, ArchivedMeetingState::Joining));
+        match decoded {
+            MeetingControl::StateChanged { state } => {
+                assert!(matches!(state, MeetingState::Joining));
             }
             _ => panic!("Oczekiwano wariantu StateChanged"),
         }
@@ -1500,13 +1449,12 @@ mod tests {
             state: MeetingState::Connected,
         };
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingControl::StateChanged { state } => {
-                assert!(matches!(state, ArchivedMeetingState::Connected));
+        match decoded {
+            MeetingControl::StateChanged { state } => {
+                assert!(matches!(state, MeetingState::Connected));
             }
             _ => panic!("Oczekiwano wariantu StateChanged"),
         }
@@ -1518,13 +1466,12 @@ mod tests {
             state: MeetingState::Reconnecting,
         };
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingControl::StateChanged { state } => {
-                assert!(matches!(state, ArchivedMeetingState::Reconnecting));
+        match decoded {
+            MeetingControl::StateChanged { state } => {
+                assert!(matches!(state, MeetingState::Reconnecting));
             }
             _ => panic!("Oczekiwano wariantu StateChanged"),
         }
@@ -1538,13 +1485,12 @@ mod tests {
             },
         };
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingControl::StateChanged { state } => match state {
-                ArchivedMeetingState::Ended { reason } => {
+        match decoded {
+            MeetingControl::StateChanged { state } => match state {
+                MeetingState::Ended { reason } => {
                     assert_eq!(reason.as_str(), "host ended");
                 }
                 _ => panic!("Oczekiwano MeetingState::Ended"),
@@ -1559,13 +1505,12 @@ mod tests {
             state: MeetingState::AuthExpired,
         };
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingControl::StateChanged { state } => {
-                assert!(matches!(state, ArchivedMeetingState::AuthExpired));
+        match decoded {
+            MeetingControl::StateChanged { state } => {
+                assert!(matches!(state, MeetingState::AuthExpired));
             }
             _ => panic!("Oczekiwano wariantu StateChanged"),
         }
@@ -1579,13 +1524,12 @@ mod tests {
             },
         };
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingControl::StateChanged { state } => match state {
-                ArchivedMeetingState::Kicked { reason } => {
+        match decoded {
+            MeetingControl::StateChanged { state } => match state {
+                MeetingState::Kicked { reason } => {
                     assert_eq!(reason.as_str(), "disruption");
                 }
                 _ => panic!("Oczekiwano MeetingState::Kicked"),
@@ -1601,14 +1545,13 @@ mod tests {
             uptime_s: 3600,
         };
 
-        let bytes = rkyv_serialize!(&ctrl);
-        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&ctrl);
+        let decoded = crate::cbor::decode::<MeetingControl>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingControl::SidecarHealth { healthy, uptime_s } => {
-                assert!(*healthy);
-                assert_eq!(*uptime_s, 3600);
+        match decoded {
+            MeetingControl::SidecarHealth { healthy, uptime_s } => {
+                assert!(healthy);
+                assert_eq!(uptime_s, 3600);
             }
             _ => panic!("Oczekiwano wariantu SidecarHealth"),
         }
@@ -1620,12 +1563,11 @@ mod tests {
             reason: "Meeting ended by host".to_string(),
         };
 
-        let bytes = rkyv_serialize!(&state);
-        let archived = rkyv::access::<ArchivedMeetingState, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&state);
+        let decoded = crate::cbor::decode::<MeetingState>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingState::Ended { reason } => {
+        match decoded {
+            MeetingState::Ended { reason } => {
                 assert_eq!(reason.as_str(), "Meeting ended by host");
             }
             _ => panic!("Oczekiwano wariantu Ended"),
@@ -1638,12 +1580,11 @@ mod tests {
             reason: "Removed by moderator".to_string(),
         };
 
-        let bytes = rkyv_serialize!(&state);
-        let archived = rkyv::access::<ArchivedMeetingState, rkyv::rancor::Error>(&bytes)
-            .expect("Dostep do archived powinna sie udac");
+        let bytes = cbor_serialize!(&state);
+        let decoded = crate::cbor::decode::<MeetingState>(&bytes).expect("decode");
 
-        match archived {
-            ArchivedMeetingState::Kicked { reason } => {
+        match decoded {
+            MeetingState::Kicked { reason } => {
                 assert_eq!(reason.as_str(), "Removed by moderator");
             }
             _ => panic!("Oczekiwano wariantu Kicked"),
@@ -1745,13 +1686,13 @@ mod tests {
         });
 
         let bytes = msg
-            .serialize_rkyv()
+            .serialize_cbor()
             .expect("Serializacja heartbeat powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
+        let decoded = MeshMessage::deserialize_cbor(&bytes)
             .expect("Deserializacja heartbeat powinna sie udac");
 
-        match archived {
-            ArchivedMeshMessage::Heartbeat(hb) => {
+        match decoded {
+            MeshMessage::Heartbeat(hb) => {
                 assert_eq!(hb.node_id.as_str(), "node-10");
                 assert_eq!(hb.timestamp_ms, 1_710_000_000_000);
                 assert_eq!(hb.gpu_metrics.len(), 2);
@@ -1796,13 +1737,13 @@ mod tests {
         });
 
         let bytes = msg
-            .serialize_rkyv()
+            .serialize_cbor()
             .expect("Serializacja full state powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
+        let decoded = MeshMessage::deserialize_cbor(&bytes)
             .expect("Deserializacja full state powinna sie udac");
 
-        match archived {
-            ArchivedMeshMessage::FullStateExchange(state) => {
+        match decoded {
+            MeshMessage::FullStateExchange(state) => {
                 assert_eq!(state.node_id.as_str(), "node-20");
                 assert_eq!(state.role.as_str(), "worker");
                 assert_eq!(state.capabilities.len(), 2);
@@ -1837,14 +1778,14 @@ mod tests {
             MeshCommandResponsePayload::Text("Total reclaimed space: 1.2GB".into()),
         ];
         for p in payloads {
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&p).expect("encode");
-            rkyv::from_bytes::<MeshCommandResponsePayload, rkyv::rancor::Error>(&bytes)
+            let bytes = crate::cbor::encode(&p).expect("encode");
+            crate::cbor::decode::<MeshCommandResponsePayload>(&bytes)
                 .expect("decode");
         }
     }
 
     #[test]
-    fn sync_ledger_payloads_roundtrip_rkyv() {
+    fn sync_ledger_payloads_roundtrip_cbor() {
         let op = MeshSyncOperationWire {
             op_id: vec![7; 32],
             partition_id: "addon/contacts/persons/1".to_string(),
@@ -1855,8 +1796,8 @@ mod tests {
             from_node_id: "node-a".to_string(),
             operations: vec![op.clone()],
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&push).expect("encode push");
-        let decoded = rkyv::from_bytes::<MeshSyncPushPayload, rkyv::rancor::Error>(&bytes)
+        let bytes = crate::cbor::encode(&push).expect("encode push");
+        let decoded = crate::cbor::decode::<MeshSyncPushPayload>(&bytes)
             .expect("decode push");
         assert_eq!(decoded.operations[0].op_id, op.op_id);
         assert_eq!(decoded.operations[0].partition_sequence, 4);
@@ -1865,8 +1806,8 @@ mod tests {
             from_node_id: "node-b".to_string(),
             operation_ids: vec![vec![7; 32]],
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack).expect("encode ack");
-        let decoded = rkyv::from_bytes::<MeshSyncAckPayload, rkyv::rancor::Error>(&bytes)
+        let bytes = crate::cbor::encode(&ack).expect("encode ack");
+        let decoded = crate::cbor::decode::<MeshSyncAckPayload>(&bytes)
             .expect("decode ack");
         assert_eq!(decoded.operation_ids.len(), 1);
 
@@ -1876,8 +1817,8 @@ mod tests {
             from_sequence: 2,
             limit: 128,
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&pull).expect("encode pull");
-        let decoded = rkyv::from_bytes::<MeshSyncPullPayload, rkyv::rancor::Error>(&bytes)
+        let bytes = crate::cbor::encode(&pull).expect("encode pull");
+        let decoded = crate::cbor::decode::<MeshSyncPullPayload>(&bytes)
             .expect("decode pull");
         assert_eq!(decoded.from_sequence, 2);
 
@@ -1887,8 +1828,8 @@ mod tests {
             from_sequence: 2,
             operations: vec![op],
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response).expect("encode response");
-        let decoded = rkyv::from_bytes::<MeshSyncPullResponsePayload, rkyv::rancor::Error>(&bytes)
+        let bytes = crate::cbor::encode(&response).expect("encode response");
+        let decoded = crate::cbor::decode::<MeshSyncPullResponsePayload>(&bytes)
             .expect("decode response");
         assert_eq!(decoded.operations.len(), 1);
 
@@ -1901,8 +1842,8 @@ mod tests {
             tail_limit: 64,
         };
         let bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot_pull).expect("encode snapshot pull");
-        let decoded = rkyv::from_bytes::<MeshSyncSnapshotPullPayload, rkyv::rancor::Error>(&bytes)
+            crate::cbor::encode(&snapshot_pull).expect("encode snapshot pull");
+        let decoded = crate::cbor::decode::<MeshSyncSnapshotPullPayload>(&bytes)
             .expect("decode snapshot pull");
         assert_eq!(decoded.snapshot_id, "snapshot-a");
         assert!(decoded.include_tail);
@@ -1921,10 +1862,9 @@ mod tests {
                 operation: vec![7, 8],
             }],
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot_response)
-            .expect("encode snapshot response");
+        let bytes = crate::cbor::encode(&snapshot_response).expect("encode snapshot response");
         let decoded =
-            rkyv::from_bytes::<MeshSyncSnapshotResponsePayload, rkyv::rancor::Error>(&bytes)
+            crate::cbor::decode::<MeshSyncSnapshotResponsePayload>(&bytes)
                 .expect("decode snapshot response");
         assert_eq!(decoded.blob_bytes, vec![4, 5, 6]);
         assert_eq!(decoded.operations_after_snapshot.len(), 1);
@@ -1947,9 +1887,9 @@ mod tests {
     #[test]
     fn test_frame_metadata_wire_roundtrip() {
         let meta = sample_metadata();
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&meta).expect("encode metadata");
+        let bytes = crate::cbor::encode(&meta).expect("encode metadata");
         let decoded =
-            rkyv::from_bytes::<FrameMetadataWire, rkyv::rancor::Error>(&bytes).expect("decode");
+            crate::cbor::decode::<FrameMetadataWire>(&bytes).expect("decode");
         assert_eq!(decoded.camera_id, "cam-front-door");
         assert_eq!(decoded.width, 1920);
         assert_eq!(decoded.height, 1080);
@@ -1963,8 +1903,8 @@ mod tests {
             raw_ref: "frame-store/cam-front-door/2026-05-15T10:00:00.123".into(),
             request_id: "req-abc-001".into(),
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&req).expect("encode");
-        let decoded = rkyv::from_bytes::<FrameProxyRequestPayload, rkyv::rancor::Error>(&bytes)
+        let bytes = crate::cbor::encode(&req).expect("encode");
+        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes)
             .expect("decode");
         assert_eq!(
             decoded.raw_ref,
@@ -1981,8 +1921,8 @@ mod tests {
             bytes: vec![0x10, 0x20, 0x30, 0x40, 0x50],
             metadata: sample_metadata(),
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resp).expect("encode");
-        let decoded = rkyv::from_bytes::<FrameProxyResponsePayload, rkyv::rancor::Error>(&bytes)
+        let bytes = crate::cbor::encode(&resp).expect("encode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
             .expect("decode");
         match decoded {
             FrameProxyResponsePayload::Found {
@@ -2007,8 +1947,8 @@ mod tests {
             raw_ref: "frame-store/cam-1/missing".into(),
             request_id: "req-2".into(),
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resp).expect("encode");
-        let decoded = rkyv::from_bytes::<FrameProxyResponsePayload, rkyv::rancor::Error>(&bytes)
+        let bytes = crate::cbor::encode(&resp).expect("encode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
             .expect("decode");
         match decoded {
             FrameProxyResponsePayload::NotFound {
@@ -2029,8 +1969,8 @@ mod tests {
             request_id: "req-3".into(),
             reason: "source connector disconnected mid-fetch".into(),
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resp).expect("encode");
-        let decoded = rkyv::from_bytes::<FrameProxyResponsePayload, rkyv::rancor::Error>(&bytes)
+        let bytes = crate::cbor::encode(&resp).expect("encode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
             .expect("decode");
         match decoded {
             FrameProxyResponsePayload::Unavailable {

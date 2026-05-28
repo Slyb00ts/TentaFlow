@@ -1,8 +1,8 @@
 // =============================================================================
 // Plik: tentaflow-transport/src/lib.rs
-// Opis: Wspolny crate z transportem iroh + rkyv. Uzywany przez tentaflow-core,
+// Opis: Wspolny crate z transportem iroh + CBOR. Uzywany przez tentaflow-core,
 //       tentaflow-client/native oraz tentaflow-containers/sidecar. Wystawia:
-//       - `framing`   — length-prefixed rkyv frame po bidi streamie iroh
+//       - `framing`   — length-prefixed CBOR frame po bidi streamie iroh
 //       - `client`    — `ServiceClient` z auto-reconnect (client→node, node→sidecar)
 //       - `server`    — `serve_model_requests` + trait `ModelHandler`
 //       - `endpoint`  — helper do budowania `iroh::Endpoint` dla klienta i serwera

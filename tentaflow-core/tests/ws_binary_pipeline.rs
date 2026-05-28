@@ -1,11 +1,11 @@
 // =============================================================================
 // Plik: tests/ws_binary_pipeline.rs
 // Opis: Pipeline test dla WSS binary dispatch. Symuluje pelny flow:
-//         1. Klient buduje Envelope + MessageBody (rkyv encode)
-//         2. Serwer decoduje Envelope z bytecheck
+//         1. Klient buduje Envelope + MessageBody (CBOR encode)
+//         2. Serwer decoduje Envelope z CBOR
 //         3. Serwer decoduje MessageBody z envelope.body
 //         4. Dispatch przez registry (dispatch::dispatch)
-//         5. Response body + envelope encode
+//         5. Response body + envelope CBOR encode
 //         6. Klient decoduje envelope + body
 //       Nie odpala realnego TCP/WS — testuje tylko protocol layer.
 //       Pelny 3-nodowy e2e test (Task #34) wymaga spawned cluster.
@@ -19,24 +19,20 @@ use tentaflow_protocol::{
 
 /// Helper: encode klient -> serwer frame.
 fn encode_request(correlation_id: u64, body: MessageBody) -> Vec<u8> {
-    let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)
-        .unwrap()
-        .to_vec();
+    let body_bytes = tentaflow_protocol::cbor::encode(&body).unwrap();
     let env = Envelope::new_direct(correlation_id, 1, message_kind::META_HEARTBEAT, body_bytes);
-    rkyv::to_bytes::<rkyv::rancor::Error>(&env)
-        .unwrap()
-        .to_vec()
+    tentaflow_protocol::cbor::encode(&env).unwrap()
 }
 
 /// Helper: serwer-side flow — decode envelope + body, dispatch, encode response.
 fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
     let env =
-        rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(request_bytes).expect("decode envelope");
+        tentaflow_protocol::cbor::decode::<Envelope>(request_bytes).expect("decode envelope");
     assert!(matches!(env.routing, Routing::Direct));
     assert_eq!(env.schema_version, tentaflow_protocol::SCHEMA_VERSION);
 
     let body =
-        rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&env.body).expect("decode body");
+        tentaflow_protocol::cbor::decode::<MessageBody>(&env.body).expect("decode body");
 
     let ctx = HandlerContext {
         session,
@@ -54,24 +50,20 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
         .unwrap()
         .block_on(dispatch::dispatch(&body, &ctx));
 
-    let resp_body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resp_body)
-        .unwrap()
-        .to_vec();
+    let resp_body_bytes = tentaflow_protocol::cbor::encode(&resp_body).unwrap();
     let mut resp_env =
         Envelope::new_direct(env.correlation_id, 1, env.message_kind, resp_body_bytes);
     if is_error {
         resp_env.flags = EnvelopeFlags::IS_ERROR;
     }
-    rkyv::to_bytes::<rkyv::rancor::Error>(&resp_env)
-        .unwrap()
-        .to_vec()
+    tentaflow_protocol::cbor::encode(&resp_env).unwrap()
 }
 
 /// Helper: klient decoduje response, wyciaga body.
 fn decode_response(bytes: &[u8]) -> (Envelope, MessageBody) {
-    let env = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(bytes).expect("decode env");
+    let env = tentaflow_protocol::cbor::decode::<Envelope>(bytes).expect("decode env");
     let body =
-        rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&env.body).expect("decode body");
+        tentaflow_protocol::cbor::decode::<MessageBody>(&env.body).expect("decode body");
     (env, body)
 }
 

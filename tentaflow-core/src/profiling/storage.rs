@@ -3,7 +3,7 @@
 // Opis: Layout per sesja:
 //   <TENTAFLOW_HOME>/profiling/<node_id>/<session_id>/
 //   ├── manifest.json     (serde JSON, operator-readable)
-//   ├── summary.bin       (rkyv ProfileReportV2)
+//   ├── summary.bin       (CBOR ProfileReportV2)
 //   ├── flamegraph.bin    (optional, side-data — owned by CPU sampling parser)
 //   └── raw/<collector_id>/<artifact files...>
 //
@@ -75,8 +75,8 @@ pub enum StorageError {
     InvalidCollectorId(String),
     #[error("manifest parse: {0}")]
     ManifestParse(String),
-    #[error("rkyv: {0}")]
-    Rkyv(String),
+    #[error("CBOR: {0}")]
+    Cbor(String),
     #[error("session size cap exceeded: {actual} > {cap}")]
     SizeCapExceeded { actual: u64, cap: u64 },
     #[error("not found: {0}")]
@@ -86,7 +86,7 @@ pub enum StorageError {
 }
 
 // -----------------------------------------------------------------------------
-// Manifest types (serde JSON, NOT rkyv)
+// Manifest types (serde JSON, NOT CBOR)
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -229,9 +229,9 @@ impl ProfileStorage {
         let dir = self.session_dir(node_id, session_id).await?;
 
         // 1) Write summary first; manifest size_bytes will include it.
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(report)
-            .map_err(|e| StorageError::Rkyv(format!("encode: {e}")))?;
-        fs::write(dir.join("summary.bin"), bytes.as_ref()).await?;
+        let bytes = tentaflow_protocol::cbor::encode(report)
+            .map_err(|e| StorageError::Cbor(format!("encode: {e}")))?;
+        fs::write(dir.join("summary.bin"), bytes.as_slice()).await?;
 
         // 2) Write manifest with placeholder size, then update.
         let mut manifest = manifest.clone();
@@ -328,8 +328,8 @@ impl ProfileStorage {
             )));
         }
         let bytes = fs::read(&p).await?;
-        rkyv::from_bytes::<ProfileReportV2, rkyv::rancor::Error>(&bytes)
-            .map_err(|e| StorageError::Rkyv(format!("decode: {e}")))
+        tentaflow_protocol::cbor::decode::<ProfileReportV2>(&bytes)
+            .map_err(|e| StorageError::Cbor(format!("decode: {e}")))
     }
 
     /// Idempotent: delete a session directory if it exists.

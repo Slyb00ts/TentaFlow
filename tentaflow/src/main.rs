@@ -535,9 +535,7 @@ async fn run_server(args: Args) -> Result<()> {
                             let router = router_for_forward.clone();
                             Box::pin(async move {
                                 use tentaflow_protocol::*;
-                                let request: ModelRequest = match rkyv::access::<ArchivedModelRequest, rkyv::rancor::Error>(&payload)
-                                    .and_then(|archived| rkyv::deserialize::<ModelRequest, rkyv::rancor::Error>(archived))
-                                {
+                                let request: ModelRequest = match tentaflow_protocol::cbor::decode(&payload) {
                                     Ok(r) => r,
                                     Err(e) => {
                                         tracing::error!("Forward handler: blad deserializacji ModelRequest: {}", e);
@@ -550,8 +548,7 @@ async fn run_server(args: Args) -> Result<()> {
                                             }),
                                             metrics: None,
                                         };
-                                        return rkyv::to_bytes::<rkyv::rancor::Error>(&error_response)
-                                            .map(|b| b.into_vec())
+                                        return tentaflow_protocol::cbor::encode(&error_response)
                                             .unwrap_or_default();
                                     }
                                 };
@@ -561,8 +558,7 @@ async fn run_server(args: Args) -> Result<()> {
                                     request,
                                 ).await;
 
-                                rkyv::to_bytes::<rkyv::rancor::Error>(&response)
-                                    .map(|b| b.into_vec())
+                                tentaflow_protocol::cbor::encode(&response)
                                     .unwrap_or_default()
                             })
                         })).await;
@@ -573,9 +569,7 @@ async fn run_server(args: Args) -> Result<()> {
                                 let router = router_for_stream_forward.clone();
                                 Box::pin(async move {
                                     use tentaflow_protocol::*;
-                                    let request: ModelRequest = match rkyv::access::<ArchivedModelRequest, rkyv::rancor::Error>(&payload)
-                                        .and_then(|archived| rkyv::deserialize::<ModelRequest, rkyv::rancor::Error>(archived))
-                                    {
+                                    let request: ModelRequest = match tentaflow_protocol::cbor::decode(&payload) {
                                         Ok(r) => r,
                                         Err(e) => {
                                             tracing::error!("Forward stream handler: blad deserializacji ModelRequest: {}", e);
@@ -587,8 +581,8 @@ async fn run_server(args: Args) -> Result<()> {
                                                     details: None,
                                                 }),
                                             };
-                                            if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk) {
-                                                let _ = tx.send(bytes.into_vec());
+                                            if let Ok(bytes) = tentaflow_protocol::cbor::encode(&chunk) {
+                                                let _ = tx.send(bytes);
                                             }
                                             return;
                                         }

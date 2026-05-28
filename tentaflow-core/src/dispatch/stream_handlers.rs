@@ -517,7 +517,7 @@ fn subscribe_resume_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
                 Ok(frames) => {
                     for frame in frames {
                         if let Ok(body) =
-                            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&frame.body_bytes)
+                            tentaflow_protocol::cbor::decode::<MessageBody>(&frame.body_bytes)
                         {
                             if push_chunk(&sub, body).is_err() {
                                 return;

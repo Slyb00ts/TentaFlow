@@ -10,7 +10,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 tentaflow-protocol = { path = ".." }
-rkyv = { version = "0.8.12", features = ["unaligned"] }
 
 [[bin]]
 name = "envelope_decode"

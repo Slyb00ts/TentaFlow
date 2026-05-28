@@ -531,14 +531,14 @@ impl ModelRuntimeExecutor {
                     metadata: None,
                     session_id: None,
                 };
-                let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
+                let payload = tentaflow_protocol::cbor::encode(&model_request)
                     .map_err(|e| {
                         ExecutorError::Internal(format!(
                             "mesh stream serialize ModelRequest: {}",
                             e
                         ))
                     })?
-                    .into_vec();
+                    ;
                 let frame_stream = mesh
                     .forward_stream_request(node_id, &request_id, payload)
                     .await
@@ -552,20 +552,13 @@ impl ModelRuntimeExecutor {
                             message: format!("mesh stream read: {}", e),
                             source: e,
                         })?;
-                    let archived =
-                        rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(&frame)
-                            .map_err(|e| crate::error::CoreError::BackendError {
-                                backend_url: backend_url.clone(),
-                                message: format!("mesh stream access ModelStreamChunk: {}", e),
-                                source: None,
-                            })?;
-                    rkyv::deserialize::<ModelStreamChunk, rkyv::rancor::Error>(archived).map_err(
-                        |e| crate::error::CoreError::BackendError {
+                    tentaflow_protocol::cbor::decode::<ModelStreamChunk>(&frame).map_err(|e| {
+                        crate::error::CoreError::BackendError {
                             backend_url: backend_url.clone(),
                             message: format!("mesh stream deserialize ModelStreamChunk: {}", e),
                             source: None,
-                        },
-                    )
+                        }
+                    })
                 });
                 Ok(
                     crate::routing::stream_helpers::quic_stream_to_openai_chunks(
@@ -858,18 +851,13 @@ impl ModelRuntimeExecutor {
         }
 
         let request_id = model_request.request_id.clone();
-        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
-            .map_err(|e| ExecutorError::Internal(format!("mesh forward serialize: {}", e)))?
-            .into_vec();
+        let payload = tentaflow_protocol::cbor::encode(&model_request)
+            .map_err(|e| ExecutorError::Internal(format!("mesh forward serialize: {}", e)))?;
         let response_bytes = mesh
             .forward_request(target_node_id, &request_id, payload)
             .await
             .map_err(|e| ExecutorError::Internal(format!("mesh forward request: {}", e)))?;
-        let archived = rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(&response_bytes)
-            .map_err(|e| {
-                ExecutorError::Internal(format!("mesh forward access ModelResponse: {}", e))
-            })?;
-        rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived).map_err(|e| {
+        tentaflow_protocol::cbor::decode::<ModelResponse>(&response_bytes).map_err(|e| {
             ExecutorError::Internal(format!("mesh forward deserialize ModelResponse: {}", e))
         })
     }

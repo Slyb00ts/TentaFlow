@@ -62,7 +62,7 @@ cargo test --lib    # not cargo test (which includes examples)
 ```
 tentaflow (binary: API gateway + mesh node)
   └── tentaflow-core (shared library)
-        └── tentaflow-protocol (QUIC protocol types, rkyv zero-copy)
+        └── tentaflow-protocol (QUIC protocol types, CBOR zero-copy)
 
 tentaflow-desktop/{linux,macos,windows} (native desktop apps)
   ├── tentaflow-desktop/core (shared desktop logic)
@@ -99,7 +99,7 @@ mlx-models (Apple MLX inference bindings)
 
 ### Key Design Patterns
 
-**Protocol serialization**: All QUIC messages use rkyv (zero-copy binary), not JSON. Protocol types live in `tentaflow-protocol/src/`. Two ALPN protocols: `tentaflow` (client→node) and `tentaflow-mesh` (node↔node).
+**Protocol serialization**: All QUIC messages use CBOR (zero-copy binary), not JSON. Protocol types live in `tentaflow-protocol/src/`. Two ALPN protocols: `tentaflow` (client→node) and `tentaflow-mesh` (node↔node).
 
 **build.rs does two things**: (1) compiles WASM addons from `addons/` and `addons-pro/` to `wasm32-wasip1` and embeds them via `include_bytes!`, (2) embeds `www/` static files into the binary with MIME detection. Changes to `www/` require recompilation.
 Bundled addon updates at startup are driven by `bundle_hash` (computed from embedded addon payload), not only by manifest `version`, so manifest-only changes propagate to the installed DB state without a forced version bump.
@@ -120,7 +120,7 @@ Bundled addon updates at startup are driven by `bundle_hash` (computed from embe
 - Discovery and auto-connect are intentionally separate concerns now: `PeerDiscovered` always feeds GUI/peer_store, but automatic mesh dialing is only for trusted peers. Discovery/known-peers/topology merge fresh addresses into `trusted_contact:*`, keep the currently working direct path first, and reconnect via hints instead of dialing every newly seen interface.
 - On simultaneous dial (A→B and B→A concurrently) iroh produces two distinct QUIC connections. `register_connection` applies a deterministic tie-break: **outgoing wins only if `self_hex < peer_hex`** (lexicographic on endpoint-id hex). Both sides converge on the same physical connection; the loser is closed with reason `"tie-break-loser"`.
 - `dial_locks: HashMap<peer_hex, Arc<Mutex<()>>>` — per-peer async mutex. All three `connect_to_peer*` variants acquire the lock before `endpoint.connect`, so at most one dial per peer is in flight. Lock is dropped on `disconnect_peer`.
-- Heartbeat: sole producer is the loop in `pipeline.rs` (broadcasts rkyv `HeartbeatMetrics` every `heartbeat_interval_ms`, default 500). The empty `run_heartbeat_loop` stub in `iroh_manager.rs` has been removed.
+- Heartbeat: sole producer is the loop in `pipeline.rs` (broadcasts CBOR `HeartbeatMetrics` every `heartbeat_interval_ms`, default 500). The empty `run_heartbeat_loop` stub in `iroh_manager.rs` has been removed.
 - Upgrade path: `sanitize_trusted_contacts` runs at startup and strips `settings.trusted_contact:*` entries still pointing at the dead `use.iroh.network` default.
 
 **Dashboard**:
@@ -266,14 +266,14 @@ Implementacja: `tentaflow-core/src/api/dashboard/api_services_manifest.rs`.
 
 ## Profilowanie Nsight Systems
 
-Profilowanie CPU + GPU (NVIDIA Nsight Systems) per-card / per-node sterowane z GUI. Sesja jest uruchamiana lokalnie albo na zaufanym nodzie mesh przez forwarding rkyv; raport jest renderowany w przeglądarce bez zewnętrznego viewera.
+Profilowanie CPU + GPU (NVIDIA Nsight Systems) per-card / per-node sterowane z GUI. Sesja jest uruchamiana lokalnie albo na zaufanym nodzie mesh przez forwarding CBOR; raport jest renderowany w przeglądarce bez zewnętrznego viewera.
 
 ### Architektura
 
 - **`tentaflow-core/src/profiling/`** — runner `nsys`, parser SQLite eksportu, builder timeline, storage (FIFO 20 sesji), capability detection (`nsys --version`, cache 5s).
-- **`tentaflow-protocol/src/profiling.rs`** — typy rkyv: `NsightScope`, `ProfileReport`, oraz `NsightPayload` z 5+1 parami request/response.
+- **`tentaflow-protocol/src/profiling.rs`** — typy CBOR: `NsightScope`, `ProfileReport`, oraz `NsightPayload` z 5+1 parami request/response.
 - **`tentaflow-core/src/dispatch/mesh_write_handlers.rs`** — 6 handlerów (`start`, `stop`, `sessions`, `report`, `delete`, `download`), `policy=Admin`.
-- **`tentaflow-core/src/dispatch/command_executor.rs`** — wykonanie zdalne; forwarding przez `MeshCommandType::Nsight*` (typed payloady rkyv, tylko trusted peer).
+- **`tentaflow-core/src/dispatch/command_executor.rs`** — wykonanie zdalne; forwarding przez `MeshCommandType::Nsight*` (typed payloady CBOR, tylko trusted peer).
 - **`tentaflow-core/src/mesh/peer_store.rs`** — propagacja capability `nsys_available` + `nsys_version` przez `HeartbeatMetrics`.
 - **GUI**: `tentaflow-core/www/js/modules/mesh-detail-nsight.js` (modal startu, badge REC z countdown, lista sesji), `tentaflow-core/www/js/modules/profile-report.js` (6 KPI tiles, 7 zakładek `tf-tabs`: Overview / GPU Kernels / CUDA APIs / Memory / CPU Samples / NVTX / Timeline; vanilla SVG line chart per karta dla SM / Memory / Power). Routing: `Router.navigate('profile-report', { nodeId, sessionId })`. Per-card przycisk "Profile" widoczny gdy `gpu.vendor === 'Nvidia'` ORAZ `node.nsys_available`.
 
@@ -305,7 +305,7 @@ Profilowanie CPU + GPU (NVIDIA Nsight Systems) per-card / per-node sterowane z G
 ```
 <TENTAFLOW_HOME>/nsight/<node_id>/<session_id>/
 ├── report.nsys-rep    # surowy raport nsys
-└── summary.bin        # rkyv ProfileReport (parsed timeline + KPI)
+└── summary.bin        # CBOR ProfileReport (parsed timeline + KPI)
 ```
 
 `session_id` walidowane regex `^[a-f0-9]{16,32}$`. Przed `nsys export` runner robi `tokio::fs::symlink_metadata` na ścieżce wyjściowej (anty path-traversal).

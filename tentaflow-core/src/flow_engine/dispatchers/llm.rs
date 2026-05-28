@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: flow_engine/dispatchers/llm.rs
 // Opis: LlmDispatcher trait + DTO. Wrapper nad services/runtime/executor.rs::
-//       execute_chat / stream_chat. Mapping do/z OpenAI-compat rkyv idzie
+//       execute_chat / stream_chat. Mapping do/z OpenAI-compat CBOR idzie
 //       w impl wrapperu (dochodzi razem z executor rewrite).
 // =============================================================================
 

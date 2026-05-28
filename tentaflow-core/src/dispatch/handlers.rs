@@ -1523,7 +1523,7 @@ pub fn cluster_update(
         payload.strategy.as_deref(),
         payload.failover_enabled,
         // Convertujemy Option<String> na Option<Option<&str>> — Some(None) NIE oznacza
-        // tutaj wyczyszczenia (rkyv encoding nie odroznia "missing" od "set to null").
+        // tutaj wyczyszczenia (CBOR encoding nie odroznia "missing" od "set to null").
         // Aktualizujemy failover_target tylko gdy klient go podal.
         payload.failover_target.as_ref().map(|s| Some(s.as_str())),
         payload.health_check_interval_ms.map(|v| v as i64),
@@ -3595,8 +3595,7 @@ pub async fn service_manifest_deploy(
                                         from_node_id: local_node_id_status.clone(),
                                         change: tentaflow_protocol::ServiceChange::Updated(info),
                                     };
-                                if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                                {
+                                if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
                                     let _ = qm
                                         .broadcast_ufp2_to_trusted(
                                             tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
@@ -3690,7 +3689,7 @@ pub async fn service_manifest_deploy(
                                 from_node_id: local_node_id_task.clone(),
                                 change: tentaflow_protocol::ServiceChange::Updated(info),
                             };
-                            if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                            if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
                                 let _ = qm
                                     .broadcast_ufp2_to_trusted(
                                         tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
@@ -3748,7 +3747,7 @@ pub async fn service_manifest_deploy(
                             from_node_id: local_node_id_task.clone(),
                             change: tentaflow_protocol::ServiceChange::Updated(info),
                         };
-                        if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                        if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
                             let _ = qm
                                 .broadcast_ufp2_to_trusted(
                                     tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
@@ -4796,7 +4795,7 @@ pub fn audit_log_cleanup(
 
 // =============================================================================
 // IAM — users + groups + resource permissions. Jeden top-level variant
-// IamBody z inner enum IamPayload (zeby zmiescic sie w 256-variant rkyv limit).
+// IamBody z inner enum IamPayload (zeby zmiescic sie w 256-variant CBOR limit).
 // Wszystkie operacje mutujace wymagaja policy(Admin).
 // =============================================================================
 
@@ -5148,7 +5147,7 @@ register_iam_variant!(
 );
 
 // =============================================================================
-// Apps menu — multiplexed in `AddonUiBody` (256-variant rkyv limit).
+// Apps menu — multiplexed in `AddonUiBody` (256-variant CBOR limit).
 // =============================================================================
 
 #[handler(variant = "AddonUiBody", since = (1, 0))]
@@ -5824,10 +5823,10 @@ fn broadcast_service_change(ctx: &HandlerContext, change: tentaflow_protocol::Se
         from_node_id: from,
         change,
     };
-    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
-        Ok(b) => b.to_vec(),
+    let bytes = match crate::mesh::cbor::encode(&payload) {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!(error = %e, "MeshServicesUpdate: rkyv encode failed");
+            tracing::warn!(error = %e, "MeshServicesUpdate: CBOR encode failed");
             return;
         }
     };

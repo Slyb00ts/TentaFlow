@@ -1,26 +1,22 @@
 // ============================================================================
-// TENTAFLOW PROTOCOL - Wspólne typy protokołu QUIC + rkyv
+// TENTAFLOW PROTOCOL - Wspólne typy protokołu QUIC + CBOR
 // ============================================================================
 //
 // CEL:
-// Definicje typów protokołu QUIC + rkyv używanych w komunikacji wewnątrz
-// klastra TentaFlow. Typy są serializowane używając rkyv (zero-copy) dla
-// maksymalnej wydajności.
+// Definicje typów protokołu QUIC + CBOR używanych w komunikacji wewnątrz
+// klastra TentaFlow.
 //
 // KLUCZOWE KONCEPCJE:
-// - rkyv: Zero-copy deserialization (10x szybsze niż serde)
-// - Archive: Trait dla archived representation (zero-copy access)
-// - Serialize/Deserialize: Traits dla konwersji to/from archived form
-// - #[archive(check_bytes)]: Runtime validation dla bezpieczeństwa
+// - CBOR: binarny format ramek po stronie dashboardu, mesh i sidecarów
+// - Serialize/Deserialize: Traits dla konwersji to/from wire form
 //
 // UWAGI:
-// - Wszystkie typy muszą implementować Archive + Serialize + Deserialize
-// - Używamy #[archive(check_bytes)] dla walidacji (ochrona przed corrupted data)
-// - Stringi są serializowane jako archived strings (zero-copy)
+// - Wszystkie typy komunikacyjne muszą implementować serde Serialize + Deserialize
 //
 // ============================================================================
 
 pub mod camera;
+pub mod cbor;
 pub mod envelope;
 pub mod legal;
 pub mod mesh;
