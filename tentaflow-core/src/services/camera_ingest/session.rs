@@ -23,6 +23,7 @@ use super::fakefile::{
     build_pipeline, ensure_gst_initialized, resolve_file_url, seek_to_start, FrameCounters,
     FrameMailbox,
 };
+use super::local::build_local_pipeline;
 
 /// Pixel format of the latest frame. F1a only emits RGB24 because the
 /// pipeline forces `video/x-raw,format=RGB`.
@@ -178,6 +179,7 @@ pub fn spawn_session(config: CameraConfig) -> Result<CameraHandle> {
 
     let (cmd_tx, health_rx, join_handle) = match vendor.as_str() {
         "fake_file" => spawn_fakefile_inner(config)?,
+        "local_camera" | "v4l2" => spawn_local_inner(config)?,
         "rtsp" => {
             use super::rtsp::{spawn_rtsp_session, ReconnectPolicy};
             spawn_rtsp_session(config, ReconnectPolicy::default())?
@@ -211,14 +213,49 @@ fn spawn_fakefile_inner(
     let counters = Arc::new(FrameCounters::new());
 
     let join_handle = tokio::spawn(run_session(
-        config, path, cmd_rx, health_tx, mailbox, counters,
+        SessionSource::File(path),
+        config,
+        cmd_rx,
+        health_tx,
+        mailbox,
+        counters,
     ));
     Ok((cmd_tx, health_rx, join_handle))
 }
 
-async fn run_session(
+fn spawn_local_inner(
     config: CameraConfig,
-    path: std::path::PathBuf,
+) -> Result<(
+    mpsc::Sender<SessionCommand>,
+    watch::Receiver<CameraHealth>,
+    tokio::task::JoinHandle<()>,
+)> {
+    ensure_gst_initialized()?;
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
+    let (health_tx, health_rx) = watch::channel(CameraHealth::initial(&config.camera_id));
+    let mailbox = Arc::new(FrameMailbox::new());
+    let counters = Arc::new(FrameCounters::new());
+
+    let join_handle = tokio::spawn(run_session(
+        SessionSource::Local,
+        config,
+        cmd_rx,
+        health_tx,
+        mailbox,
+        counters,
+    ));
+    Ok((cmd_tx, health_rx, join_handle))
+}
+
+enum SessionSource {
+    File(std::path::PathBuf),
+    Local,
+}
+
+async fn run_session(
+    source: SessionSource,
+    config: CameraConfig,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     health_tx: watch::Sender<CameraHealth>,
     mailbox: Arc<FrameMailbox>,
@@ -234,7 +271,13 @@ async fn run_session(
         None,
     );
 
-    let pipeline = match build_pipeline(&path, cam_id.clone(), mailbox.clone(), counters.clone()) {
+    let pipeline = match source {
+        SessionSource::File(ref path) => {
+            build_pipeline(path, cam_id.clone(), mailbox.clone(), counters.clone())
+        }
+        SessionSource::Local => build_local_pipeline(&config, mailbox.clone(), counters.clone()),
+    };
+    let pipeline = match pipeline {
         Ok(p) => p,
         Err(e) => {
             let reason = e.to_string();
@@ -369,14 +412,25 @@ async fn run_session(
                     use gst::MessageView;
                     match msg.view() {
                         MessageView::Eos(_) => {
-                            // Seek back to start to implement replay loop.
-                            if let Err(e) = seek_to_start(&pipeline.pipeline) {
-                                let reason = e.to_string();
-                                publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.clone()), &counters, fps_window.back().copied());
-                                let _ = pipeline.pipeline.set_state(gst::State::Null);
-                                crate::services::streaming_bus().close_camera(&cam_id, &reason).await;
-                                drain_until_stop(&mut cmd_rx, &health_tx).await;
-                                return;
+                            match &source {
+                                SessionSource::File(_) => {
+                                    if let Err(e) = seek_to_start(&pipeline.pipeline) {
+                                        let reason = e.to_string();
+                                        publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.clone()), &counters, fps_window.back().copied());
+                                        let _ = pipeline.pipeline.set_state(gst::State::Null);
+                                        crate::services::streaming_bus().close_camera(&cam_id, &reason).await;
+                                        drain_until_stop(&mut cmd_rx, &health_tx).await;
+                                        return;
+                                    }
+                                }
+                                SessionSource::Local => {
+                                    let reason = "local camera source ended";
+                                    publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, fps_window.back().copied());
+                                    let _ = pipeline.pipeline.set_state(gst::State::Null);
+                                    crate::services::streaming_bus().close_camera(&cam_id, reason).await;
+                                    drain_until_stop(&mut cmd_rx, &health_tx).await;
+                                    return;
+                                }
                             }
                         }
                         MessageView::Error(err) => {

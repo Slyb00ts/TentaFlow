@@ -93,6 +93,7 @@ impl FrameCounters {
 /// Initialize GStreamer once. Safe to call multiple times; `gst::init` is
 /// idempotent and guarded internally with a `std::sync::Once`.
 pub fn ensure_gst_initialized() -> Result<()> {
+    crate::services::gstreamer_runtime::prepare_runtime_environment();
     gst::init().map_err(|e| CameraIngestError::GstInit(e.to_string()))
 }
 
@@ -173,6 +174,15 @@ pub fn build_pipeline(
         "filesrc location=\"{}\" ! decodebin ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink emit-signals=false sync=true max-buffers=1 drop=true",
         location.replace('"', "\\\"")
     );
+    build_pipeline_from_description(&desc, camera_id, mailbox, counters)
+}
+
+pub(crate) fn build_pipeline_from_description(
+    desc: &str,
+    camera_id: String,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<FakeFilePipeline> {
     let element =
         gst::parse::launch(&desc).map_err(|e| CameraIngestError::PipelineBuild(e.to_string()))?;
     let pipeline = element
