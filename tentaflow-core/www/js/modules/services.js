@@ -260,7 +260,10 @@ function bindTabEvents() {
       const svcId = b.dataset.svcEdit;
       const engineId = b.dataset.svcEngine;
       const nodeId = b.dataset.svcNode || undefined;
-      const svc = (services || []).find((s) => String(s.id) === String(svcId));
+      const svc = (services || []).find((s) =>
+        String(s.id) === String(svcId)
+        && String(s.node_id || s.nodeId || '') === String(nodeId || '')
+      );
       if (!svc) return;
       import('./services-edit.js').then((mod) => {
         mod.openEditModal(svc, { engineId, nodeId, onSaved: refreshServiceList });
@@ -664,7 +667,8 @@ function renderRow(s) {
   const displayName = s.display_name || s.engine_id || '';
   const engineLabel = s.engine_id || '';
   const category = s.category || '';
-  const nodeInfo = nodeLabelFor(s.node_id);
+  const serviceNodeId = s.node_id || s.nodeId || '';
+  const nodeInfo = nodeLabelFor(serviceNodeId);
   const nodeBadge = nodeInfo.isLocal
     ? `<span class="svc-node-local">${escapeHtml(I18n.t('services.node_local_badge'))}</span>`
     : '';
@@ -690,8 +694,10 @@ function renderRow(s) {
     : I18n.t('services.tooltip_pin_off');
 
   const svcId = escapeAttr(s.id);
-  const svcNodeId = escapeAttr(s.node_id || '');
+  const svcNodeId = escapeAttr(serviceNodeId);
   const svcNodeLabel = escapeAttr(nodeInfo.label);
+  const rowKey = escapeAttr(`svc-${serviceNodeId || 'unknown'}-${s.id}`);
+  const svcActionKey = escapeAttr(`${serviceNodeId || 'unknown'}:${s.id}`);
   const deployId = s.active_deploy_id || s.activeDeployId || s.last_deploy_id || s.lastDeployId || '';
   const deployAction = deployId
     ? `<tf-button variant="ghost" size="sm" icon="terminal"
@@ -702,7 +708,7 @@ function renderRow(s) {
     : '';
 
   return `
-    <tr data-key="svc-${svcId}">
+    <tr data-key="${rowKey}">
       <td data-label="${escapeAttr(I18n.t('services.col_node'))}">${nodeCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
         <strong style="color: var(--accent-2);">${escapeHtml(engineLabel)}</strong>
@@ -728,6 +734,7 @@ function renderRow(s) {
           data-svc-pause-play="${svcId}"
           data-svc-action="${ppAction}"
           data-svc-node="${svcNodeId}"
+          data-svc-key="${svcActionKey}"
           ${isStarting ? 'disabled' : ''}
           title="${escapeAttr(ppTooltip)}"></tf-button>
         <tf-button variant="ghost" size="sm" icon="pin"
@@ -735,6 +742,7 @@ function renderRow(s) {
           data-svc-pin-toggle="${svcId}"
           data-svc-pinned="${pinned ? 'true' : 'false'}"
           data-svc-node="${svcNodeId}"
+          data-svc-key="${svcActionKey}"
           title="${escapeAttr(pinTooltip)}"></tf-button>
         <tf-button variant="ghost" size="sm" icon="edit"
           data-svc-edit="${svcId}"
@@ -748,7 +756,7 @@ function renderRow(s) {
           data-svc-node="${svcNodeId}"
           data-svc-node-label="${svcNodeLabel}"
           title="${escapeAttr(I18n.t('services.btn_delete'))}"></tf-button>
-        <span class="svc-row-error" data-svc-error="${svcId}" hidden></span>
+        <span class="svc-row-error" data-svc-error="${svcActionKey}" hidden></span>
       </td>
     </tr>
   `;
@@ -1582,7 +1590,7 @@ async function stopService(id, name, nodeId, nodeLabel) {
     }
     await refreshServiceList();
   } catch (err) {
-    showRowError(id, err.message);
+    showRowError(`${nodeId || 'unknown'}:${id}`, err.message);
   }
 }
 
@@ -1593,6 +1601,7 @@ async function togglePauseStart(button) {
   const id = button.dataset.svcPausePlay;
   const action = button.dataset.svcAction;
   const nodeId = button.dataset.svcNode;
+  const errorKey = button.dataset.svcKey || `${nodeId || 'unknown'}:${id}`;
   if (!id || !action) return;
   button.setAttribute('disabled', '');
   button.setAttribute('icon', 'rotate');
@@ -1611,7 +1620,7 @@ async function togglePauseStart(button) {
     }
     await refreshServiceList();
   } catch (err) {
-    showRowError(id, err.message);
+    showRowError(errorKey, err.message);
     button.removeAttribute('disabled');
     button.setAttribute('icon', action === 'pause' ? 'pause' : 'play');
   }
@@ -1622,6 +1631,7 @@ async function togglePauseStart(button) {
 async function togglePin(button) {
   const id = button.dataset.svcPinToggle;
   const nodeId = button.dataset.svcNode;
+  const errorKey = button.dataset.svcKey || `${nodeId || 'unknown'}:${id}`;
   const current = button.dataset.svcPinned === 'true';
   if (!id) return;
   const next = !current;
@@ -1641,7 +1651,7 @@ async function togglePin(button) {
     button.classList.toggle('pinned', current);
     button.dataset.svcPinned = current ? 'true' : 'false';
     button.removeAttribute('disabled');
-    showRowError(id, err.message);
+    showRowError(errorKey, err.message);
   }
 }
 
