@@ -127,14 +127,19 @@ pub fn load_core_write_capture(
 }
 
 pub fn drain_pending_core_captures(pool: &crate::db::DbPool, limit: usize) -> Result<usize> {
-    let mut conn = pool
-        .lock()
-        .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
-    let captures = load_pending_core_captures(&conn, limit)?;
+    let captures = {
+        let conn = pool
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
+        load_pending_core_captures(&conn, limit)?
+    };
     let mut drained = 0usize;
     for capture in captures {
         match super::runtime::record_core_capture(capture.clone()) {
             Ok(Some(record)) => {
+                let mut conn = pool
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
                 mark_core_capture_status(
                     &mut conn,
                     &capture.capture_id,
@@ -146,6 +151,9 @@ pub fn drain_pending_core_captures(pool: &crate::db::DbPool, limit: usize) -> Re
             }
             Ok(None) => break,
             Err(e) => {
+                let mut conn = pool
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
                 mark_core_capture_status(
                     &mut conn,
                     &capture.capture_id,
