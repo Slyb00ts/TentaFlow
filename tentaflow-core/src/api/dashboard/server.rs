@@ -303,6 +303,41 @@ fn make_response_with_origin(
         .unwrap()
 }
 
+fn make_static_response_with_origin(
+    path: &str,
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+    origin: Option<&str>,
+) -> Response<DashboardBody> {
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        .header("Content-Type", content_type);
+
+    if path == "/sw.js" || path.starts_with("/js/protocol/") {
+        builder = builder
+            .header("Cache-Control", "no-store")
+            .header("Pragma", "no-cache");
+    }
+
+    if let Some(o) = origin {
+        builder = builder
+            .header("Access-Control-Allow-Origin", o)
+            .header(
+                "Access-Control-Allow-Methods",
+                "GET, POST, PUT, DELETE, OPTIONS",
+            )
+            .header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization",
+            );
+    }
+
+    builder
+        .body(Either::Left(Full::new(Bytes::from(body))))
+        .unwrap()
+}
+
 fn json_response_cors(status: u16, body: String, origin: Option<&str>) -> Response<DashboardBody> {
     make_response_with_origin(status, "application/json", body.into_bytes(), origin)
 }
@@ -1501,7 +1536,8 @@ pub async fn handle_request(
     // Pliki statyczne - sciezki poza /api/
     if method == Method::GET && !path.starts_with("/api/") {
         let (status, content_type, body) = static_files::serve(&path);
-        return Ok(make_response_with_origin(
+        return Ok(make_static_response_with_origin(
+            &path,
             status,
             content_type,
             body,

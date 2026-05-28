@@ -280,15 +280,11 @@ pub async fn handle_ws_connection<S>(
                     Ok(env) => env,
                     Err(e) => {
                         warn!("binary-WS: malformed envelope: {}", e);
-                        let _ = send_protocol_error(
-                            &sink,
-                            0,
-                            next_seq(&next_server_sequence),
-                            ProtocolErrorCode::InvalidFrame,
-                            "malformed envelope",
-                        )
-                        .await;
-                        continue;
+                        let mut guard = sink.lock().await;
+                        let _ = guard
+                            .send(Message::Close(Some(close_frame(1002, "malformed envelope"))))
+                            .await;
+                        break;
                     }
                 };
 
