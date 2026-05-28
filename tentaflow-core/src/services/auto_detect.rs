@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::db::DbPool;
-use crate::services::deploy::{deploy, DeployError};
+use crate::services::deploy::{create_deploy_job, deploy, DeployError};
 use crate::services::manifest::registry;
 use crate::services::ports::PortAllocator;
 use crate::services_repo::services::{self as services_repo, DeployMethod};
@@ -88,13 +88,23 @@ pub async fn auto_register_ollama(db: &DbPool, ports: Arc<PortAllocator>) -> Res
     // 5. Persist via the unified deploy pipeline so model_registry rows get
     //    populated identically to a manual external deploy.
     let user_config = serde_json::json!({});
+    let job = create_deploy_job(
+        DeployMethod::External,
+        &manifest,
+        &user_config,
+        db,
+        "local",
+        None,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("auto_detect deploy job failed: {}", e))?;
     match deploy(
+        job,
         DeployMethod::External,
         &manifest,
         &user_config,
         &ports,
         db,
-        None,
         None,
     )
     .await

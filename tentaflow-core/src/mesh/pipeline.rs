@@ -1749,6 +1749,11 @@ fn spawn_quic_event_handler(
                             }
                             match sec.add_trusted_key(remote_node_id, public_key_hex, "") {
                                 Ok(()) => {
+                                    peer_store.ensure_trusted_peer(
+                                        remote_node_id,
+                                        public_key_hex,
+                                        "",
+                                    );
                                     added += 1;
                                     info!(node_id = %remote_node_id, "Dodano zaufany klucz z TrustedKeysSync od {}", node_id);
                                 }
@@ -1814,6 +1819,61 @@ fn spawn_quic_event_handler(
                     qm_events
                         .handle_command_response_received(&from_node_id, &data)
                         .await;
+                }
+                Ok(IrohMeshEvent::MeshDeployProgressReceived { from_node_id, data }) => {
+                    let sender_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !sender_trusted {
+                        warn!("Odrzucono DeployProgress od niezaufanego noda {}", from_node_id);
+                        continue;
+                    }
+                    match crate::mesh::cbor::decode::<tentaflow_protocol::mesh::MeshMessage>(&data)
+                    {
+                        Ok(tentaflow_protocol::mesh::MeshMessage::MeshDeployProgress {
+                            command_id,
+                            phase,
+                            message,
+                            percent,
+                            is_done,
+                            ..
+                        }) => {
+                            let sender = crate::deploy::log_bus::sender_for(&command_id);
+                            if is_done {
+                                let _ = sender.send(crate::deploy::log_bus::BusMessage::End {
+                                    deploy_id: command_id.clone(),
+                                    final_status: phase.clone(),
+                                    image_tag: String::new(),
+                                    container_name: String::new(),
+                                    error_message: message.clone(),
+                                    duration_ms: 0,
+                                });
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                crate::deploy::log_bus::close(&command_id);
+                            } else {
+                                let line = crate::deploy::log_bus::LogLine {
+                                    deploy_id: command_id,
+                                    kind: phase.clone(),
+                                    line: message.clone(),
+                                    phase: if phase == "phase" || phase == "progress" {
+                                        message
+                                    } else {
+                                        String::new()
+                                    },
+                                    progress_pct: percent as u32,
+                                    ts_ms: crate::deploy::log_bus::now_ms(),
+                                };
+                                let _ = sender.send(crate::deploy::log_bus::BusMessage::Line(line));
+                            }
+                        }
+                        Ok(other) => {
+                            warn!(from = %from_node_id, kind = ?other, "Nieoczekiwany payload DeployProgress");
+                        }
+                        Err(e) => {
+                            warn!(from = %from_node_id, "Blad dekodowania DeployProgress: {}", e);
+                        }
+                    }
                 }
                 Ok(IrohMeshEvent::ModelListUpdate { node_id, data }) => {
                     // ModelsSync — nadpisuje liste modeli danego peera.

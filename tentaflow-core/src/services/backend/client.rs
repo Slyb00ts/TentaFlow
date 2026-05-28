@@ -9,11 +9,6 @@ use crate::config::ServiceBackend;
 use crate::error::{CoreError, Result};
 use crate::services::runtime::{CircuitBreaker, CircuitBreakerConfig};
 
-// TODO: typy OpenAI API nie sa jeszcze przeniesione do Core
-// Po przeniesieniu modulu protocols::openai::types zamien na:
-//   use crate::api::openai::types::*;
-// Tymczasowo importujemy z Router crate (wymaga dodania zaleznosci)
-// lub nalezy najpierw przeniesc typy OpenAI do crate::api::openai::types
 use crate::api::openai::types::*;
 
 use reqwest::{Client, StatusCode};

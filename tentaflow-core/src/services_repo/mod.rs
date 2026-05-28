@@ -4,7 +4,7 @@ pub mod deployments;
 pub mod models;
 pub mod services;
 
-pub use deployments::{DeploymentRow, DeploymentStatus, NewDeployment};
+pub use deployments::{DeploymentRow, DeploymentStatus};
 pub use models::{ModelRow, NewModel};
 pub use services::{
     parse_deploy_method, parse_status, DeployMethod, NewService, ServiceRow, ServiceStatus,

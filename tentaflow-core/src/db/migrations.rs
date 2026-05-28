@@ -235,6 +235,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_vendor_check_local_sources",
             MigrationStep::Sql(CAMERAS_VENDOR_CHECK_LOCAL_SOURCES),
         ),
+        (
+            49,
+            "deployment_jobs_as_services",
+            MigrationStep::Sql(DEPLOYMENT_JOBS_AS_SERVICES),
+        ),
     ]
 }
 
@@ -1724,7 +1729,7 @@ CREATE TABLE deployments (
     engine_id TEXT NOT NULL,
     deploy_method TEXT NOT NULL,
     node_id TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'queued',
+    status TEXT NOT NULL DEFAULT 'deploying',
     phase TEXT NOT NULL DEFAULT '',
     progress_pct INTEGER NOT NULL DEFAULT 0,
     image_tag TEXT NOT NULL DEFAULT '',
@@ -1738,6 +1743,73 @@ CREATE TABLE deployments (
 );
 CREATE INDEX idx_deployments_deploy_id ON deployments(deploy_id);
 CREATE INDEX idx_deployments_engine ON deployments(engine_id);
+"#;
+
+const DEPLOYMENT_JOBS_AS_SERVICES: &str = r#"
+CREATE TABLE services_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    engine_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    deploy_method TEXT NOT NULL CHECK(deploy_method IN ('docker','native_embedded','native_binary','native_python_bundle','external')),
+    transport TEXT NOT NULL CHECK(transport IN ('embedded','http_direct','sidecar_quic','external_http')),
+    status TEXT NOT NULL CHECK(status IN ('deploying','starting','running','degraded','failed','stopped','interrupted')) DEFAULT 'starting',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    paused INTEGER NOT NULL DEFAULT 0,
+    runtime_pid INTEGER,
+    runtime_port INTEGER,
+    sidecar_quic_port INTEGER,
+    endpoint_url TEXT,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    active_deploy_id TEXT NOT NULL DEFAULT '',
+    last_deploy_id TEXT NOT NULL DEFAULT '',
+    deployment_progress_pct INTEGER NOT NULL DEFAULT 0,
+    health_last_ok TIMESTAMP,
+    health_last_err TEXT,
+    progress_message TEXT,
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO services_new (
+    id, engine_id, category, display_name, deploy_method, transport, status,
+    pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url,
+    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct,
+    health_last_ok, health_last_err, progress_message,
+    restart_count, created_at, updated_at
+)
+SELECT
+    id, engine_id, category, display_name, deploy_method, transport, status,
+    pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url,
+    config_json, '', '', 0, health_last_ok, health_last_err, progress_message,
+    restart_count, created_at, updated_at
+FROM services;
+
+DROP TABLE services;
+ALTER TABLE services_new RENAME TO services;
+CREATE INDEX idx_services_status ON services(status);
+CREATE INDEX idx_services_engine ON services(engine_id);
+CREATE INDEX idx_services_category ON services(category);
+CREATE INDEX idx_services_active_deploy ON services(active_deploy_id);
+
+ALTER TABLE deployments ADD COLUMN target_service_id INTEGER;
+ALTER TABLE deployments ADD COLUMN resume_policy TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE deployments ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE deployments ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+UPDATE deployments
+   SET status = CASE status
+       WHEN 'queued' THEN 'deploying'
+       WHEN 'building' THEN 'deploying'
+       WHEN 'running' THEN 'deploying'
+       WHEN 'failure' THEN 'failed'
+       ELSE status
+   END;
+
+CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status);
+CREATE INDEX IF NOT EXISTS idx_deployments_node ON deployments(node_id);
+CREATE INDEX IF NOT EXISTS idx_deployments_target_service ON deployments(target_service_id);
 "#;
 
 // SQLite nie pozwala na ALTER TABLE dla CHECK constraintu — robimy klasyczne
@@ -2553,7 +2625,7 @@ CREATE TABLE services (
     display_name TEXT NOT NULL,
     deploy_method TEXT NOT NULL CHECK(deploy_method IN ('docker','native_embedded','native_binary','native_python_bundle','external')),
     transport TEXT NOT NULL CHECK(transport IN ('embedded','http_direct','sidecar_quic','external_http')),
-    status TEXT NOT NULL CHECK(status IN ('starting','running','degraded','failed','stopped')) DEFAULT 'starting',
+    status TEXT NOT NULL CHECK(status IN ('deploying','starting','running','degraded','failed','stopped','interrupted')) DEFAULT 'starting',
     pinned INTEGER NOT NULL DEFAULT 0,
     paused INTEGER NOT NULL DEFAULT 0,
     runtime_pid INTEGER,
@@ -2561,6 +2633,9 @@ CREATE TABLE services (
     sidecar_quic_port INTEGER,
     endpoint_url TEXT,
     config_json TEXT NOT NULL DEFAULT '{}',
+    active_deploy_id TEXT NOT NULL DEFAULT '',
+    last_deploy_id TEXT NOT NULL DEFAULT '',
+    deployment_progress_pct INTEGER NOT NULL DEFAULT 0,
     health_last_ok TIMESTAMP,
     health_last_err TEXT,
     -- progress_message dodawany przez migration 5 (services_progress_message).
@@ -2595,7 +2670,7 @@ CREATE TABLE deployments (
     engine_id TEXT NOT NULL,
     deploy_method TEXT NOT NULL,
     node_id TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'queued',
+    status TEXT NOT NULL DEFAULT 'deploying',
     phase TEXT NOT NULL DEFAULT '',
     progress_pct INTEGER NOT NULL DEFAULT 0,
     image_tag TEXT NOT NULL DEFAULT '',

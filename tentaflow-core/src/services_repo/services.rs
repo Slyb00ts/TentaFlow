@@ -41,32 +41,38 @@ pub fn parse_deploy_method(tag: &str) -> Result<DeployMethod> {
 /// Runtime status of a deployed service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceStatus {
+    Deploying,
     Starting,
     Running,
     Degraded,
     Failed,
     Stopped,
+    Interrupted,
 }
 
 impl ServiceStatus {
     pub fn as_db_tag(self) -> &'static str {
         match self {
+            ServiceStatus::Deploying => "deploying",
             ServiceStatus::Starting => "starting",
             ServiceStatus::Running => "running",
             ServiceStatus::Degraded => "degraded",
             ServiceStatus::Failed => "failed",
             ServiceStatus::Stopped => "stopped",
+            ServiceStatus::Interrupted => "interrupted",
         }
     }
 }
 
 pub fn parse_status(tag: &str) -> Result<ServiceStatus> {
     Ok(match tag {
+        "deploying" => ServiceStatus::Deploying,
         "starting" => ServiceStatus::Starting,
         "running" => ServiceStatus::Running,
         "degraded" => ServiceStatus::Degraded,
         "failed" => ServiceStatus::Failed,
         "stopped" => ServiceStatus::Stopped,
+        "interrupted" => ServiceStatus::Interrupted,
         other => return Err(anyhow!("unknown service status tag: {}", other)),
     })
 }
@@ -87,6 +93,9 @@ pub struct NewService {
     pub sidecar_quic_port: Option<u16>,
     pub endpoint_url: Option<String>,
     pub config_json: String,
+    pub active_deploy_id: String,
+    pub last_deploy_id: String,
+    pub deployment_progress_pct: i64,
 }
 
 impl NewService {
@@ -110,6 +119,9 @@ impl NewService {
             sidecar_quic_port: None,
             endpoint_url: None,
             config_json: "{}".to_string(),
+            active_deploy_id: String::new(),
+            last_deploy_id: String::new(),
+            deployment_progress_pct: 0,
         }
     }
 }
@@ -131,6 +143,9 @@ pub struct ServiceRow {
     pub sidecar_quic_port: Option<u16>,
     pub endpoint_url: Option<String>,
     pub config_json: String,
+    pub active_deploy_id: String,
+    pub last_deploy_id: String,
+    pub deployment_progress_pct: i64,
     pub health_last_ok: Option<String>,
     pub health_last_err: Option<String>,
     pub progress_message: Option<String>,
@@ -171,6 +186,9 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
             .map(|v| v as u16),
         endpoint_url: row.get("endpoint_url")?,
         config_json: row.get("config_json")?,
+        active_deploy_id: row.get("active_deploy_id")?,
+        last_deploy_id: row.get("last_deploy_id")?,
+        deployment_progress_pct: row.get("deployment_progress_pct")?,
         health_last_ok: row.get("health_last_ok")?,
         health_last_err: row.get("health_last_err")?,
         progress_message: row.get("progress_message").ok().flatten(),
@@ -182,12 +200,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
 
 const SELECT_COLUMNS: &str = "id, engine_id, category, display_name, deploy_method, transport, \
     status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
-    config_json, health_last_ok, health_last_err, progress_message, restart_count, created_at, updated_at";
+    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct, health_last_ok, \
+    health_last_err, progress_message, restart_count, created_at, updated_at";
 
 const INSERT_SQL: &str = "INSERT INTO services (engine_id, category, display_name, deploy_method, \
     transport, status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
-    config_json) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
+    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
 
 /// Inserts a new service row. Returns the assigned id.
 pub fn insert(conn: &Connection, new: &NewService) -> Result<i64> {
@@ -207,6 +226,9 @@ pub fn insert(conn: &Connection, new: &NewService) -> Result<i64> {
             new.sidecar_quic_port.map(|v| v as i64),
             new.endpoint_url,
             new.config_json,
+            new.active_deploy_id,
+            new.last_deploy_id,
+            new.deployment_progress_pct,
         ],
     )
     .context("insert services")?;
@@ -231,6 +253,9 @@ pub fn insert_in_tx(tx: &Transaction<'_>, new: &NewService) -> Result<i64> {
             new.sidecar_quic_port.map(|v| v as i64),
             new.endpoint_url,
             new.config_json,
+            new.active_deploy_id,
+            new.last_deploy_id,
+            new.deployment_progress_pct,
         ],
     )
     .context("insert services (tx)")?;
@@ -259,8 +284,8 @@ pub fn list_alive(conn: &Connection) -> Result<Vec<ServiceRow>> {
     Ok(rows)
 }
 
-/// Lists services that the supervisor must keep watch over: any non-terminal
-/// state (running, degraded, starting). Terminal states (failed, stopped) are
+/// Lists services that the supervisor must keep watch over: runtime states
+/// after deployment has produced an executable endpoint. Terminal states are
 /// excluded — they require an explicit user action to come back online.
 pub fn list_supervised(conn: &Connection) -> Result<Vec<ServiceRow>> {
     let sql = format!(
@@ -308,6 +333,102 @@ pub fn update_status(conn: &Connection, id: i64, status: ServiceStatus) -> Resul
     )?;
     if n == 0 {
         return Err(anyhow!("update_status: service id={} not found", id));
+    }
+    Ok(())
+}
+
+pub fn finish_deploy_in_tx(
+    tx: &Transaction<'_>,
+    id: i64,
+    new: &NewService,
+    status: ServiceStatus,
+) -> Result<()> {
+    let n = tx.execute(
+        "UPDATE services
+            SET engine_id = ?2,
+                category = ?3,
+                display_name = ?4,
+                deploy_method = ?5,
+                transport = ?6,
+                status = ?7,
+                pinned = ?8,
+                paused = ?9,
+                runtime_pid = ?10,
+                runtime_port = ?11,
+                sidecar_quic_port = ?12,
+                endpoint_url = ?13,
+                config_json = ?14,
+                active_deploy_id = '',
+                last_deploy_id = CASE WHEN ?15 = '' THEN last_deploy_id ELSE ?15 END,
+                deployment_progress_pct = CASE WHEN ?7 = 'running' THEN 100 ELSE deployment_progress_pct END,
+                health_last_err = CASE WHEN ?7 = 'running' THEN NULL ELSE health_last_err END,
+                progress_message = NULL,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1",
+        params![
+            id,
+            new.engine_id,
+            new.category,
+            new.display_name,
+            new.deploy_method.as_db_tag(),
+            new.transport.as_db_tag(),
+            status.as_db_tag(),
+            new.pinned as i64,
+            new.paused as i64,
+            new.runtime_pid,
+            new.runtime_port.map(|v| v as i64),
+            new.sidecar_quic_port.map(|v| v as i64),
+            new.endpoint_url,
+            new.config_json,
+            new.last_deploy_id,
+        ],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("finish_deploy_in_tx: service id={} not found", id));
+    }
+    Ok(())
+}
+
+pub fn mark_deploy_failed(
+    conn: &Connection,
+    id: i64,
+    deploy_id: &str,
+    status: ServiceStatus,
+    err: Option<&str>,
+) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services
+            SET status = ?2,
+                active_deploy_id = '',
+                last_deploy_id = ?3,
+                health_last_err = ?4,
+                progress_message = ?4,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1",
+        params![id, status.as_db_tag(), deploy_id, err],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("mark_deploy_failed: service id={} not found", id));
+    }
+    Ok(())
+}
+
+pub fn update_deploy_progress(
+    conn: &Connection,
+    id: i64,
+    progress_pct: u32,
+    message: Option<&str>,
+) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services
+            SET deployment_progress_pct = ?2,
+                progress_message = COALESCE(?3, progress_message),
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1",
+        params![id, progress_pct as i64, message],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("update_deploy_progress: service id={} not found", id));
     }
     Ok(())
 }

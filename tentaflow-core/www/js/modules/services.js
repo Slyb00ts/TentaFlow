@@ -17,6 +17,7 @@ import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
+import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 
 let services = [];
 let aliases = [];
@@ -263,6 +264,16 @@ function bindTabEvents() {
       if (!svc) return;
       import('./services-edit.js').then((mod) => {
         mod.openEditModal(svc, { engineId, nodeId, onSaved: refreshServiceList });
+      });
+    };
+  });
+  body.querySelectorAll('[data-svc-deploy-log]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      openDeployProgressModal({
+        deployId: b.dataset.svcDeployLog,
+        engineId: b.dataset.svcEngine || '',
+        deployMethod: b.dataset.svcMethod || '',
       });
     };
   });
@@ -581,8 +592,10 @@ function mapStatusToChip(status, paused) {
   const key = (status || '').toLowerCase();
   switch (key) {
     case 'running': return { variant: 'online', dot: true, key };
+    case 'deploying': return { variant: 'warn', dot: true, key };
     case 'degraded': return { variant: 'pending', dot: true, key };
     case 'failed': return { variant: 'err', dot: true, key };
+    case 'interrupted': return { variant: 'err', dot: true, key };
     case 'starting': return { variant: 'info', dot: true, key };
     case 'stopped': return { variant: 'offline', dot: false, key };
     default: return { variant: 'info', dot: false, key };
@@ -622,6 +635,12 @@ function renderRow(s) {
   const progressBadge = progressMsg
     ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(progressMsg)}</div>`
     : '';
+  const deployPct = Number.isFinite(s.deployment_progress_pct)
+    ? s.deployment_progress_pct
+    : (Number.isFinite(s.deploymentProgressPct) ? s.deploymentProgressPct : 0);
+  const deployProgress = statusInfo.key === 'deploying'
+    ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(String(Math.max(0, Math.min(100, deployPct))))}%</div>`
+    : '';
   const endpoint = s.endpoint_url
     ? `<code style="font-size:11px;" title="${escapeAttr(s.endpoint_url)}">${escapeHtml(truncateMiddle(s.endpoint_url, 36))}</code>`
     : '<span style="color:var(--text-3);">—</span>';
@@ -655,7 +674,7 @@ function renderRow(s) {
     </span>`;
 
   // Pause/Play toggle — paused row OR not-running ⇒ Play (start). Running ⇒ Pause.
-  const isStarting = (s.status || '').toLowerCase() === 'starting';
+  const isStarting = ['starting', 'deploying'].includes((s.status || '').toLowerCase());
   const isRunning = ['running', 'degraded'].includes((s.status || '').toLowerCase()) && !paused;
   const showPlay = paused || !isRunning;
   const ppIcon = isStarting ? 'rotate' : (showPlay ? 'play' : 'pause');
@@ -673,6 +692,14 @@ function renderRow(s) {
   const svcId = escapeAttr(s.id);
   const svcNodeId = escapeAttr(s.node_id || '');
   const svcNodeLabel = escapeAttr(nodeInfo.label);
+  const deployId = s.active_deploy_id || s.activeDeployId || s.last_deploy_id || s.lastDeployId || '';
+  const deployAction = deployId
+    ? `<tf-button variant="ghost" size="sm" icon="terminal"
+          data-svc-deploy-log="${escapeAttr(deployId)}"
+          data-svc-engine="${escapeAttr(s.engine_id || '')}"
+          data-svc-method="${escapeAttr(s.deploy_method || '')}"
+          title="${escapeAttr(I18n.t('services.btn_deploy_logs'))}"></tf-button>`
+    : '';
 
   return `
     <tr data-key="svc-${svcId}">
@@ -689,6 +716,7 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
         <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
         ${progressBadge}
+        ${deployProgress}
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_endpoint'))}">${endpoint}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_models'))}">
@@ -713,6 +741,7 @@ function renderRow(s) {
           data-svc-engine="${escapeAttr(s.engine_id || '')}"
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(I18n.t('services.btn_edit') || 'Edit')}"></tf-button>
+        ${deployAction}
         <tf-button variant="danger" size="sm" icon="trash"
           data-svc-delete="${svcId}"
           data-svc-name="${escapeAttr(displayName)}"
