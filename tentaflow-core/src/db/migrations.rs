@@ -1796,7 +1796,7 @@ CREATE INDEX idx_services_active_deploy ON services(active_deploy_id);
 ALTER TABLE deployments ADD COLUMN target_service_id INTEGER;
 ALTER TABLE deployments ADD COLUMN resume_policy TEXT NOT NULL DEFAULT 'manual';
 ALTER TABLE deployments ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE deployments ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE deployments ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT '';
 
 UPDATE deployments
    SET status = CASE status
@@ -1805,7 +1805,8 @@ UPDATE deployments
        WHEN 'running' THEN 'deploying'
        WHEN 'failure' THEN 'failed'
        ELSE status
-   END;
+   END,
+       updated_at = COALESCE(finished_at, started_at, datetime('now'));
 
 CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status);
 CREATE INDEX IF NOT EXISTS idx_deployments_node ON deployments(node_id);
