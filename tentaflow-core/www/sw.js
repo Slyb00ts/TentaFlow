@@ -7,7 +7,7 @@
 //       biaglego ekranu.
 // =============================================================================
 
-const CACHE_VERSION = 'tentaflow-v1';
+const CACHE_VERSION = 'tentaflow-v14-cbor';
 const SHELL_ASSETS = [
   '/',
   '/index.html',
@@ -19,10 +19,6 @@ const SHELL_ASSETS = [
   '/css/notes.css',
   '/css/connection-overlay.css',
   '/js/app.js',
-  '/js/protocol/codec.js',
-  '/js/protocol/transport.js',
-  '/js/protocol/binary-ws-client.js',
-  '/js/protocol/api-binary-shim.js',
   '/js/i18n.js',
   '/js/router.js',
 ];
@@ -57,6 +53,10 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws/') || url.pathname.startsWith('/wt/')) {
+    return;
+  }
+  if (url.pathname.startsWith('/js/protocol/')) {
+    event.respondWith(fetch(new Request(req, { cache: 'reload' })));
     return;
   }
   event.respondWith((async () => {
