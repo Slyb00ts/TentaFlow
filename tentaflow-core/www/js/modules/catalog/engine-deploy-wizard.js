@@ -106,6 +106,7 @@ export async function openDeployWizard(engineId, opts = {}) {
       max_num_seqs: null,
       kv_cache_dtype: 'auto',
       gpu_memory_utilization: 0.9,
+      gpu_memory_touched: false,
       lockedParam: null,           // 'max_model_len' | 'max_num_seqs' | 'tensor_parallel' | 'gpu_memory_utilization' | null
       // Speculative decoding via vLLM `--speculative-config`. Pre-fillsuje
       // sie z presetu (model_preset.speculator_*) jezeli wybrany preset go
@@ -1088,6 +1089,7 @@ function bindAdvancedHandlers() {
     el.addEventListener('input', () => {
       const v = transform(el.value);
       selection.advanced[key] = v;
+      if (key === 'gpu_memory_utilization') selection.advanced.gpu_memory_touched = true;
       if (lockable) selection.advanced.lockedParam = lockable;
       if (valSpan) valSpan.textContent = displayFn ? displayFn(v) : v.toLocaleString();
       updateLiveKvTile();
@@ -1210,6 +1212,7 @@ function bindAdvancedHandlers() {
       a.max_model_len = null;
       a.max_num_seqs = null;
       a.gpu_memory_utilization = 0.9;
+      a.gpu_memory_touched = false;
       a.kv_cache_dtype = 'auto';
       debounceRecompute({});
     });
@@ -1745,11 +1748,10 @@ async function startDeploy() {
     container_name: selection.containerName || null,
     gpu_select_mode: selection.gpuSelectMode,
     gpu_ids: selection.gpuSelectMode === 'specific' ? selection.gpuIds : null,
-    // gpu_memory_utilization wysylamy TYLKO gdy user explicit dotknal panelu
-    // Advanced (mode === 'manual'). W trybie 'auto' wartosc w state ma default
-    // 0.9 ktorego user nie wybieral — wysylanie jej kazaloby backendowi
-    // traktowac to jako 'user explicit' i nadpisalo auto-clamp z free VRAM.
-    gpu_memory_utilization: (advActive && selection.advanced.mode === 'manual')
+    // gpu_memory_utilization wysylamy gdy user wybral manual albo poruszyl
+    // suwakiem w auto. Nietykany default 0.9 zostaje po stronie backendu jako
+    // auto-clamp z aktualnego free VRAM.
+    gpu_memory_utilization: (advActive && (selection.advanced.mode === 'manual' || selection.advanced.gpu_memory_touched))
       ? selection.advanced.gpu_memory_utilization
       : null,
     vllm_args: vllmArgs,

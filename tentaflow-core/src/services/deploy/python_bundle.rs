@@ -17,8 +17,9 @@ use rusqlite::Transaction;
 use super::{
     DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
     SmartProbeConfig, SmartProbeOutcome, auto_gpu_memory_utilization, build_endpoint_url,
-    build_new_service, category_tag, host_os_supported, models_from_manifest, query_cuda0_vram_mib,
-    resolve_display_name, smart_health_probe,
+    build_new_service, category_tag, host_os_supported, is_cuda_vllm_engine, models_from_manifest,
+    parse_gpu_memory_utilization_arg, query_cuda0_vram_mib, resolve_display_name,
+    smart_health_probe, strip_gpu_memory_utilization,
 };
 use crate::deploy::process_ctl;
 use crate::deploy::python_venv::{self, NativeDeployRequest};
@@ -27,37 +28,8 @@ use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
 use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
 
-/// Wycina wszystkie wystapienia flagi `--gpu-memory-utilization X` (oraz
-/// `--gpu-memory-utilization=X`) ze stringa VLLM_ARGS. Backend dolepia
-/// pozniej dokladnie jedno wystapienie, zeby vllm nigdy nie widzial
-/// duplikatow.
-fn strip_gpu_memory_utilization(raw: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
-    let mut i = 0;
-    while i < tokens.len() {
-        let tok = tokens[i];
-        if tok == "--gpu-memory-utilization" {
-            // Skip flag and its value.
-            i += 2;
-            continue;
-        }
-        if tok.starts_with("--gpu-memory-utilization=") {
-            i += 1;
-            continue;
-        }
-        out.push(tok.to_string());
-        i += 1;
-    }
-    out.join(" ")
-}
-
 fn is_vllm_python_bundle_engine(engine_id: &str) -> bool {
     matches!(engine_id, "vllm" | "vllm-spark" | "vllm-metal")
-}
-
-fn is_cuda_vllm_python_bundle_engine(engine_id: &str) -> bool {
-    matches!(engine_id, "vllm" | "vllm-spark")
 }
 
 fn apply_vllm_user_args(
@@ -235,7 +207,7 @@ impl DeployStrategy for PythonBundleDeploy {
         if let Some(model) = model_repo {
             env.insert("MODEL".into(), model);
         }
-        let is_cuda_vllm = is_cuda_vllm_python_bundle_engine(&engine_id);
+        let is_cuda_vllm = is_cuda_vllm_engine(&engine_id);
         apply_vllm_user_args(&engine_id, &self.user_config, &mut env);
         // VLLM_ARGS / gpu_memory_utilization sa pojeciami specyficznymi dla
         // vllm. Inne python-bundle silniki (qwen-asr, parakeet, xtts itd.)
@@ -269,18 +241,8 @@ impl DeployStrategy for PythonBundleDeploy {
         let from_vllm_args = if !is_cuda_vllm {
             None
         } else {
-            env.get("VLLM_ARGS").and_then(|raw| {
-                let mut iter = raw.split_whitespace();
-                while let Some(tok) = iter.next() {
-                    if tok == "--gpu-memory-utilization" {
-                        return iter.next().and_then(|v| v.parse::<f64>().ok());
-                    }
-                    if let Some(rest) = tok.strip_prefix("--gpu-memory-utilization=") {
-                        return rest.parse::<f64>().ok();
-                    }
-                }
-                None
-            })
+            env.get("VLLM_ARGS")
+                .and_then(|raw| parse_gpu_memory_utilization_arg(raw))
         };
         // Wybor finalnej wartosci:
         //   1. user explicit (osobne pole) — zawsze wygrywa, manual mode
@@ -557,9 +519,9 @@ mod tests {
 
     #[test]
     fn only_cuda_vllm_engines_get_gpu_memory_utilization() {
-        assert!(is_cuda_vllm_python_bundle_engine("vllm"));
-        assert!(is_cuda_vllm_python_bundle_engine("vllm-spark"));
-        assert!(!is_cuda_vllm_python_bundle_engine("vllm-metal"));
+        assert!(is_cuda_vllm_engine("vllm"));
+        assert!(is_cuda_vllm_engine("vllm-spark"));
+        assert!(!is_cuda_vllm_engine("vllm-metal"));
     }
 
     #[test]

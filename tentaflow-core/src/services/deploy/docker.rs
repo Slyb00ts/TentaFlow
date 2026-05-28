@@ -390,9 +390,61 @@ impl DeployStrategy for DockerDeploy {
             (p, None)
         };
 
+        let (param_app, request_time) = super::apply_parameters_deploy(
+            &self.manifest,
+            &self.user_config,
+            super::DeployTarget::Docker,
+        )
+        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+
         // Build env / labels.
         let mut env = super::standard_engine_env();
+        for (k, v) in param_app.env {
+            env.insert(k, v);
+        }
         env.insert("PORT".into(), internal_port.to_string());
+        env.insert("VLLM_PORT".into(), internal_port.to_string());
+        if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
+            env.insert("MODEL".into(), model);
+        }
+        if let Some(raw_args) = self
+            .user_config
+            .get("vllm_args")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            env.insert("VLLM_ARGS".into(), raw_args.to_string());
+        }
+        if super::is_cuda_vllm_engine(&self.manifest.engine.id) {
+            let user_explicit_ratio = self
+                .user_config
+                .get("gpu_memory_utilization")
+                .and_then(|v| v.as_f64());
+            let from_vllm_args = env
+                .get("VLLM_ARGS")
+                .and_then(|raw| super::parse_gpu_memory_utilization_arg(raw));
+            let ratio = user_explicit_ratio
+                .or(from_vllm_args)
+                .or_else(super::auto_gpu_memory_utilization);
+            if let Some(ratio) = ratio {
+                let cleaned = env
+                    .get("VLLM_ARGS")
+                    .map(|raw| super::strip_gpu_memory_utilization(raw))
+                    .unwrap_or_default();
+                let mut merged = Vec::new();
+                if !cleaned.is_empty() {
+                    merged.push(cleaned);
+                }
+                merged.push(format!("--gpu-memory-utilization {:.2}", ratio));
+                let final_args = merged.join(" ");
+                env.insert("VLLM_ARGS".into(), final_args);
+                env.insert("GPU_MEMORY_UTILIZATION".into(), format!("{:.2}", ratio));
+                if let Some(s) = &self.log_sink {
+                    s.info(&format!("[docker] gpu_memory_utilization={:.2}", ratio));
+                }
+            }
+        }
 
         let mut labels = HashMap::new();
         labels.insert(
@@ -578,12 +630,6 @@ impl DeployStrategy for DockerDeploy {
         // konsumuja env binding (vllm/sglang/tensorrt-llm — env do
         // entrypoint.sh) plus opcjonalnie request-time (gdy api jest
         // OpenAI-compat, materializuje sie przez BackendClient).
-        let (_param_app, request_time) = super::apply_parameters_deploy(
-            &self.manifest,
-            &self.user_config,
-            super::DeployTarget::Docker,
-        )
-        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
         let config_json = super::merge_config_json(&self.user_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
