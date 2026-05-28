@@ -2167,6 +2167,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             for s in r.services {
                 let item = js_sys::Object::new();
                 set(&item, "id", (s.id as f64).into());
+                set(&item, "nodeId", s.node_id.clone().into());
+                set(&item, "node_id", s.node_id.into());
                 set(&item, "engineId", s.engine_id.clone().into());
                 set(&item, "engine_id", s.engine_id.into());
                 set(&item, "category", s.category.into());
@@ -2257,6 +2259,10 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             set(obj, "variant", "ServiceDeleteRequest".into());
             set(obj, "serviceId", (r.service_id as f64).into());
             set(obj, "service_id", (r.service_id as f64).into());
+            if let Some(n) = r.node_id {
+                set(obj, "nodeId", n.clone().into());
+                set(obj, "node_id", n.into());
+            }
         }
         SP::ResDelete(r) => {
             set(obj, "variant", "ServiceDeleteResponse".into());
@@ -2270,6 +2276,10 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             set(obj, "serviceId", (r.service_id as f64).into());
             set(obj, "service_id", (r.service_id as f64).into());
             set(obj, "pinned", r.pinned.into());
+            if let Some(n) = r.node_id {
+                set(obj, "nodeId", n.clone().into());
+                set(obj, "node_id", n.into());
+            }
         }
         SP::ResPin(r) => {
             set(obj, "variant", "ServicePinResponse".into());
@@ -2283,6 +2293,10 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             set(obj, "serviceId", (r.service_id as f64).into());
             set(obj, "service_id", (r.service_id as f64).into());
             set(obj, "paused", r.paused.into());
+            if let Some(n) = r.node_id {
+                set(obj, "nodeId", n.clone().into());
+                set(obj, "node_id", n.into());
+            }
         }
         SP::ResPause(r) => {
             set(obj, "variant", "ServicePauseResponse".into());
@@ -2295,6 +2309,10 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             set(obj, "variant", "ServiceStartRequest".into());
             set(obj, "serviceId", (r.service_id as f64).into());
             set(obj, "service_id", (r.service_id as f64).into());
+            if let Some(n) = r.node_id {
+                set(obj, "nodeId", n.clone().into());
+                set(obj, "node_id", n.into());
+            }
         }
         SP::ResStart(r) => {
             set(obj, "variant", "ServiceStartResponse".into());

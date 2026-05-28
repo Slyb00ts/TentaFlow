@@ -5934,6 +5934,28 @@ fn forward_target_node<'a>(ctx: &'a HandlerContext, target: &'a Option<String>) 
     }
 }
 
+fn reject_ambiguous_local_service_action(
+    ctx: &HandlerContext,
+    target: &Option<String>,
+    service_id: i64,
+) -> Result<(), ProtocolError> {
+    let explicit_target = target.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    if explicit_target.is_some() {
+        return Ok(());
+    }
+    if let Some(remote_node_id) = ctx
+        .state
+        .mesh_services_registry
+        .find_node_for_service(service_id)
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "service_id={} is ambiguous across mesh; request must include node_id (remote owner: {})",
+            service_id, remote_node_id
+        )));
+    }
+    Ok(())
+}
+
 /// Forward a service-action `MeshCommandType::*Remote` over iroh and convert
 /// the typed `MeshCommandResponse` envelope into the boolean ok/error pair the
 /// dispatch-side `Service*Response` expects. Errors from the transport
@@ -6010,6 +6032,7 @@ pub async fn service_delete(
             ),
         ));
     }
+    reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
@@ -6094,6 +6117,7 @@ pub async fn service_pin(
             }),
         ));
     }
+    reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
 
     let conn = ctx
         .state
@@ -6154,6 +6178,7 @@ pub async fn service_pause(
             ),
         ));
     }
+    reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
 
     // When transitioning into paused, actively stop the runtime so the user's
     // intent ("frozen, do not consume resources") is enforced. Unpause does
@@ -6259,6 +6284,7 @@ pub async fn service_start(
             ),
         ));
     }
+    reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
@@ -6428,6 +6454,7 @@ pub async fn service_update(
             ),
         ));
     }
+    reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
 
