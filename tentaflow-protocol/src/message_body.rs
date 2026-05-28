@@ -65,7 +65,9 @@ pub struct ModelSummary {
 // =============================================================================
 
 /// Single model row attached to a `ServiceInfo`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 #[rkyv(derive(Debug))]
 pub struct ServiceModelEntry {
     pub model_name: String,
@@ -81,7 +83,9 @@ pub struct ServiceModelEntry {
 /// — typed mape wartosci ktore BackendClient materializuje przy kazdym
 /// requestcie (Ollama options, python wrapper extra fields, whisper/mlx
 /// deploy defaults z opcjonalnym per-request override).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 #[rkyv(derive(Debug))]
 pub struct ServiceInfo {
     pub id: i64,
@@ -133,7 +137,18 @@ pub struct ServiceInfo {
 ///     `request_override = true`; backend uzywa jako baseline, klient API
 ///     moze nadpisac per request.
 ///   * `mlx_overridable` → analogicznie dla MLX engine.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(
+    Archive,
+    Deserialize,
+    Serialize,
+    SerdeSerialize,
+    SerdeDeserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Default,
+)]
 #[rkyv(derive(Debug))]
 pub struct RequestTimeParameters {
     pub ollama_options: Vec<KeyValue>,
@@ -158,7 +173,9 @@ pub struct KeyValue {
 /// Incremental change applied to one entry in the mesh services registry. Used
 /// by `MeshServicesUpdate` push messages so peers do not have to re-broadcast
 /// the full snapshot on every deploy / stop / pin / pause / rename / delete.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 #[rkyv(derive(Debug))]
 pub enum ServiceChange {
     Added(ServiceInfo),
@@ -4892,7 +4909,7 @@ mod tests {
 
     #[test]
     fn body_nests_inside_envelope() {
-        use crate::envelope::{Envelope, message_kind};
+        use crate::envelope::{message_kind, Envelope};
         let body = MessageBody::ModelListRequest;
         let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)
             .expect("encode body")

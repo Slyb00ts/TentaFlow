@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // Glue between the local HMAC issuers (`pickup_tokens` + `signed_urls`),
-// the rkyv wire payload (`tentaflow_protocol::mesh::HmacKeysSyncPayload`),
+// the CBOR wire payload (`tentaflow_protocol::mesh::HmacKeysSyncPayload`),
 // and the in-memory `MeshKeyPool`. The actual QUIC send path is in
 // `mesh::iroh_manager::send_hmac_keys_sync`; this module only deals with
 // payload construction + post-receive ingestion.
@@ -59,12 +59,12 @@ fn make_entry(
     }
 }
 
-/// Encode an advertise payload into rkyv bytes ready for
+/// Encode an advertise payload into CBOR bytes ready for
 /// `IrohMeshManager::send_to_peer`. Returns `None` on serialization failure
 /// (logged) so callers can simply skip the send.
 pub fn encode_advertise(payload: &HmacKeysSyncPayload) -> Option<Vec<u8>> {
-    match rkyv::to_bytes::<rkyv::rancor::Error>(payload) {
-        Ok(b) => Some(b.to_vec()),
+    match crate::mesh::cbor::encode(payload) {
+        Ok(b) => Some(b),
         Err(e) => {
             warn!("mesh_keys: failed to encode HmacKeysSync: {}", e);
             None

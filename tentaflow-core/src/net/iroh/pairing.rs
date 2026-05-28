@@ -73,11 +73,14 @@ impl PairingHandler {
         &self,
         req: &PairingFirstContactRequest,
         transport_node_id: &str,
-    ) -> PairingFirstContactResponse {
+    ) -> (PairingFirstContactResponse, Option<PairingContactHints>) {
         if !self.security.check_pin_rate_limit(&req.sender_node_id) {
-            return PairingFirstContactResponse::Reject {
-                reason: "przekroczony limit prob PIN".into(),
-            };
+            return (
+                PairingFirstContactResponse::Reject {
+                    reason: "przekroczony limit prob PIN".into(),
+                },
+                None,
+            );
         }
 
         if let Err(reason) = validate_pairing_identity(
@@ -85,13 +88,16 @@ impl PairingHandler {
             &req.sender_public_key_hex,
             transport_node_id,
         ) {
-            return PairingFirstContactResponse::Reject { reason };
+            return (PairingFirstContactResponse::Reject { reason }, None);
         }
 
         if req.pin.len() != 6 || !req.pin.chars().all(|c| c.is_ascii_digit()) {
-            return PairingFirstContactResponse::Reject {
-                reason: "PIN musi miec 6 cyfr".into(),
-            };
+            return (
+                PairingFirstContactResponse::Reject {
+                    reason: "PIN musi miec 6 cyfr".into(),
+                },
+                None,
+            );
         }
 
         if let Err(e) = self.security.receive_pairing_request(
@@ -99,9 +105,12 @@ impl PairingHandler {
             &req.pin,
             &req.sender_public_key_hex,
         ) {
-            return PairingFirstContactResponse::Reject {
-                reason: format!("zapis pending pairing nieudany: {e}"),
-            };
+            return (
+                PairingFirstContactResponse::Reject {
+                    reason: format!("zapis pending pairing nieudany: {e}"),
+                },
+                None,
+            );
         }
 
         let hints = PairingContactHints {
@@ -123,9 +132,12 @@ impl PairingHandler {
                 &req.sender_hostname,
                 "iroh-pairing",
             ) {
-                return PairingFirstContactResponse::Reject {
-                    reason: format!("zapis trusted_node nieudany: {e}"),
-                };
+                return (
+                    PairingFirstContactResponse::Reject {
+                        reason: format!("zapis trusted_node nieudany: {e}"),
+                    },
+                    None,
+                );
             }
             if let Err(e) =
                 store_trusted_contact_hints(&self.security.db, &req.sender_node_id, &hints)
@@ -142,28 +154,34 @@ impl PairingHandler {
                 hostname = %req.sender_hostname,
                 "Parowanie zaakceptowane nad iroh transportem"
             );
-            PairingFirstContactResponse::Confirm {
-                receiver_public_key_hex: self.security.public_key_hex(),
-                receiver_hostname: self.local_hostname.clone(),
-                trusted_keys: self
-                    .security
-                    .get_all_trusted_keys()
-                    .into_iter()
-                    .map(|(node_id, public_key_hex)| PairingTrustedKeyEntry {
-                        node_id,
-                        public_key_hex,
-                    })
-                    .collect(),
-            }
+            (
+                PairingFirstContactResponse::Confirm {
+                    receiver_public_key_hex: self.security.public_key_hex(),
+                    receiver_hostname: self.local_hostname.clone(),
+                    trusted_keys: self
+                        .security
+                        .get_all_trusted_keys()
+                        .into_iter()
+                        .map(|(node_id, public_key_hex)| PairingTrustedKeyEntry {
+                            node_id,
+                            public_key_hex,
+                        })
+                        .collect(),
+                },
+                Some(hints),
+            )
         } else {
             info!(
                 peer = %req.sender_node_id,
                 hostname = %req.sender_hostname,
                 "Parowanie zapisane jako pending nad iroh transportem"
             );
-            PairingFirstContactResponse::Pending {
-                receiver_hostname: self.local_hostname.clone(),
-            }
+            (
+                PairingFirstContactResponse::Pending {
+                    receiver_hostname: self.local_hostname.clone(),
+                },
+                None,
+            )
         }
     }
 
@@ -172,11 +190,11 @@ impl PairingHandler {
         connection_remote_id: iroh::EndpointId,
         mut send: iroh::endpoint::SendStream,
         mut recv: iroh::endpoint::RecvStream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<PairingContactHints>> {
         let transport_node_id = hex::encode(connection_remote_id.as_bytes());
         let request: PairingFirstContactRequest = read_cbor_frame(&mut recv, "request").await?;
 
-        let response = self.verify_request(&request, &transport_node_id);
+        let (response, trusted_hints) = self.verify_request(&request, &transport_node_id);
         write_cbor_frame(&mut send, &response, "response").await?;
         send.finish()
             .map_err(|e| anyhow::anyhow!("pairing: finish send stream: {e}"))?;
@@ -185,12 +203,13 @@ impl PairingHandler {
         // nie zgubil koncowki odpowiedzi przy szybkim zamknieciu streamu.
         let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
 
-        Ok(())
+        Ok(trusted_hints)
     }
-}
 
-impl ProtocolHandler for PairingHandler {
-    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+    pub async fn accept_with_outcome(
+        &self,
+        connection: Connection,
+    ) -> Result<Option<PairingContactHints>, iroh::protocol::AcceptError> {
         let (send, recv) = match connection.accept_bi().await {
             Ok(v) => v,
             Err(e) => {
@@ -200,17 +219,24 @@ impl ProtocolHandler for PairingHandler {
         };
 
         let remote_id = connection.remote_id();
-        if let Err(e) = self.handle_stream(remote_id, send, recv).await {
-            warn!("pairing: obsluga streamu nieudana: {}", e);
+        match self.handle_stream(remote_id, send, recv).await {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                warn!("pairing: obsluga streamu nieudana: {}", e);
+                Ok(None)
+            }
         }
+    }
+}
+
+impl ProtocolHandler for PairingHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let _ = self.accept_with_outcome(connection).await?;
         Ok(())
     }
 }
 
-async fn read_cbor_frame<T>(
-    recv: &mut iroh::endpoint::RecvStream,
-    label: &str,
-) -> anyhow::Result<T>
+async fn read_cbor_frame<T>(recv: &mut iroh::endpoint::RecvStream, label: &str) -> anyhow::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -340,8 +366,12 @@ pub async fn initiate_pairing_over_iroh(
             receiver_hostname,
             trusted_keys,
         } => {
-            validate_pairing_identity(&receiver.node_id, &receiver_public_key_hex, &receiver.node_id)
-                .map_err(|e| anyhow::anyhow!("pairing response identity: {e}"))?;
+            validate_pairing_identity(
+                &receiver.node_id,
+                &receiver_public_key_hex,
+                &receiver.node_id,
+            )
+            .map_err(|e| anyhow::anyhow!("pairing response identity: {e}"))?;
             security
                 .confirm_pairing(
                     &receiver.node_id,
@@ -375,18 +405,7 @@ pub fn load_pending_contact_hints(
     db: &crate::db::DbPool,
     remote_node_id: &str,
 ) -> anyhow::Result<Option<PairingContactHints>> {
-    if let Some(hints) =
-        load_contact_hints_from_peer_db(db, remote_node_id, db::repository::TRUST_PENDING_PAIRING)?
-    {
-        return Ok(Some(hints));
-    }
-    let Some(raw) = db::repository::get_setting(db, &pending_contact_setting_key(remote_node_id))?
-    else {
-        return Ok(None);
-    };
-    let hints = serde_json::from_str::<PairingContactHints>(&raw)
-        .map_err(|e| anyhow::anyhow!("pending contact decode: {e}"))?;
-    Ok(Some(hints))
+    load_contact_hints_from_peer_db(db, remote_node_id, db::repository::TRUST_PENDING_PAIRING)
 }
 
 pub fn store_pending_contact_hints(
@@ -394,7 +413,12 @@ pub fn store_pending_contact_hints(
     remote_node_id: &str,
     hints: &PairingContactHints,
 ) -> anyhow::Result<()> {
-    store_contact_hints_to_peer_db(db, remote_node_id, hints, db::repository::TRUST_PENDING_PAIRING)
+    store_contact_hints_to_peer_db(
+        db,
+        remote_node_id,
+        hints,
+        db::repository::TRUST_PENDING_PAIRING,
+    )
 }
 
 pub fn delete_pending_contact_hints(
@@ -410,18 +434,7 @@ pub fn load_trusted_contact_hints(
     db: &crate::db::DbPool,
     remote_node_id: &str,
 ) -> anyhow::Result<Option<PairingContactHints>> {
-    if let Some(hints) =
-        load_contact_hints_from_peer_db(db, remote_node_id, db::repository::TRUST_TRUSTED)?
-    {
-        return Ok(Some(hints));
-    }
-    let Some(raw) = db::repository::get_setting(db, &trusted_contact_setting_key(remote_node_id))?
-    else {
-        return Ok(None);
-    };
-    let hints = serde_json::from_str::<PairingContactHints>(&raw)
-        .map_err(|e| anyhow::anyhow!("trusted contact decode: {e}"))?;
-    Ok(Some(hints))
+    load_contact_hints_from_peer_db(db, remote_node_id, db::repository::TRUST_TRUSTED)
 }
 
 pub fn store_trusted_contact_hints(
@@ -470,7 +483,8 @@ fn load_contact_hints_from_peer_db(
                 out.addresses.push(hint.payload.clone());
             } else if hint.hint_kind == db::repository::HINT_KIND_RELAY_URL {
                 out.relay_url = hint.payload.clone();
-            } else if hint.hint_kind == db::repository::HINT_KIND_HOSTNAME && out.hostname.is_empty()
+            } else if hint.hint_kind == db::repository::HINT_KIND_HOSTNAME
+                && out.hostname.is_empty()
             {
                 out.hostname = hint.payload.clone();
             }
@@ -635,39 +649,26 @@ pub fn merge_contact_hints(
 /// musi go wyczyscic zanim `connect_to_peer_with_hints` wejdzie w dial fail.
 const DEAD_RELAY_PATTERNS: &[&str] = &["use.iroh.network"];
 
-/// Upgrade-path cleanup dla `trusted_contact:*`:
+/// Czyszczenie zapisanych hintow zaufanych peerow:
 ///  1. Czysci `relay_url` gdy matchuje wzorzec martwego hosta (`DEAD_RELAY_PATTERNS`).
-///     Stare instalacje mialy zapisane `https://use.iroh.network/`, ktore nie
-///     resolwuje DNS — bez czyszczenia `connect_to_peer_with_hints` wchodzi w
-///     dial fail.
 ///  2. Przepuszcza liste `addresses` przez biezace `AdvertiseFilters` z settings.
-///     Gdy user wlaczy np. `hide_docker=true` w trakcie zycia aplikacji, stare
-///     adresy `172.17.x.y` juz zapisane w `trusted_contact:*` musza zniknac —
-///     inaczej relaunch uzyje ich z cache i znow wyciekna do peera.
 ///  3. IPv6 jest usuwany bezwarunkowo (mesh IPv4-only).
-///
-/// Pojedyncze bledy dekodowania/zapisu sa tylko logowane — iteracja idzie dalej
-/// zeby jeden skorumpowany wpis nie blokowal startu mesh.
 ///
 /// Zwraca liczbe faktycznie zaktualizowanych wpisow.
 pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize> {
-    let rows = db::repository::list_settings_with_prefix(db, TRUSTED_CONTACT_PREFIX)?;
+    let rows = db::repository::load_peer_persisted_all(db)?;
     let mut cleaned = 0usize;
 
     let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
     let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
 
-    for (key, raw_value) in rows {
-        let mut hints = match serde_json::from_str::<PairingContactHints>(&raw_value) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(
-                    key = %key,
-                    "sanitize_trusted_contacts: pominieto wpis — decode nieudany: {}",
-                    e
-                );
-                continue;
-            }
+    for row in rows {
+        if row.trust_state != db::repository::TRUST_TRUSTED {
+            continue;
+        }
+        let node_id = hex::encode(row.node_id);
+        let Some(mut hints) = load_trusted_contact_hints(db, &node_id)? else {
+            continue;
         };
 
         let original_addresses = hints.addresses.clone();
@@ -707,29 +708,18 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
             continue;
         }
 
-        let serialized = match serde_json::to_string(&hints) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    key = %key,
-                    "sanitize_trusted_contacts: pominieto wpis — encode nieudany: {}",
-                    e
-                );
-                continue;
-            }
-        };
-        match db::repository::set_setting(db, &key, &serialized) {
+        match store_trusted_contact_hints(db, &node_id, &hints) {
             Ok(()) => {
                 cleaned += 1;
                 info!(
-                    key = %key,
+                    node_id = %node_id,
                     dropped_addrs = original_addresses.len() - hints.addresses.len(),
                     relay_cleared = (has_dead_relay),
                     "sanitize_trusted_contacts: zaktualizowano wpis"
                 );
             }
             Err(e) => warn!(
-                key = %key,
+                node_id = %node_id,
                 "sanitize_trusted_contacts: zapis nieudany: {}",
                 e
             ),
@@ -1012,52 +1002,40 @@ mod tests {
     #[test]
     fn sanitize_trusted_contacts_clears_dead_relay() {
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("init test DB");
+        let dead_id = test_node_id();
+        let good_id = test_node_id();
+        let empty_id = test_node_id();
 
         let dead = PairingContactHints {
-            node_id: "peer-dead".to_string(),
-            public_key_hex: "aa".to_string(),
+            node_id: dead_id.clone(),
+            public_key_hex: test_public_key(&dead_id),
             hostname: "host-dead".to_string(),
             addresses: vec!["10.0.0.1:8090".to_string()],
             relay_url: "https://use.iroh.network/".to_string(),
         };
         let good = PairingContactHints {
-            node_id: "peer-good".to_string(),
-            public_key_hex: "bb".to_string(),
+            node_id: good_id.clone(),
+            public_key_hex: test_public_key(&good_id),
             hostname: "host-good".to_string(),
             addresses: vec![],
             relay_url: "https://my-relay.example.com/".to_string(),
         };
         let empty = PairingContactHints {
-            node_id: "peer-empty".to_string(),
-            public_key_hex: "cc".to_string(),
+            node_id: empty_id.clone(),
+            public_key_hex: test_public_key(&empty_id),
             hostname: "host-empty".to_string(),
             addresses: vec![],
             relay_url: String::new(),
         };
 
-        db::repository::set_setting(
-            &db,
-            "trusted_contact:peer-dead",
-            &serde_json::to_string(&dead).unwrap(),
-        )
-        .unwrap();
-        db::repository::set_setting(
-            &db,
-            "trusted_contact:peer-good",
-            &serde_json::to_string(&good).unwrap(),
-        )
-        .unwrap();
-        db::repository::set_setting(
-            &db,
-            "trusted_contact:peer-empty",
-            &serde_json::to_string(&empty).unwrap(),
-        )
-        .unwrap();
+        store_trusted_contact_hints(&db, &dead_id, &dead).unwrap();
+        store_trusted_contact_hints(&db, &good_id, &good).unwrap();
+        store_trusted_contact_hints(&db, &empty_id, &empty).unwrap();
 
         let cleaned = sanitize_trusted_contacts(&db).expect("sanitize");
         assert_eq!(cleaned, 1, "tylko jeden wpis powinien byc czyszczony");
 
-        let loaded_dead = load_trusted_contact_hints(&db, "peer-dead")
+        let loaded_dead = load_trusted_contact_hints(&db, &dead_id)
             .expect("load dead")
             .expect("dead present");
         assert!(
@@ -1068,7 +1046,7 @@ mod tests {
         assert_eq!(loaded_dead.hostname, "host-dead");
         assert_eq!(loaded_dead.addresses, vec!["10.0.0.1:8090".to_string()]);
 
-        let loaded_good = load_trusted_contact_hints(&db, "peer-good")
+        let loaded_good = load_trusted_contact_hints(&db, &good_id)
             .expect("load good")
             .expect("good present");
         assert_eq!(
@@ -1076,7 +1054,7 @@ mod tests {
             "dobry URL nietkniety"
         );
 
-        let loaded_empty = load_trusted_contact_hints(&db, "peer-empty")
+        let loaded_empty = load_trusted_contact_hints(&db, &empty_id)
             .expect("load empty")
             .expect("empty present");
         assert!(loaded_empty.relay_url.is_empty(), "pusty dalej pusty");

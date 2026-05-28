@@ -974,14 +974,14 @@ pub struct TopologyAnnouncePayload {
 // snapshot straight into the in-memory `MeshServicesRegistry`.
 
 /// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshServicesGetPayload {
     pub from_node_id: String,
 }
 
 /// Odpowiedz na `MeshServicesGetPayload` — pelen snapshot lokalnego nodu.
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshServicesGetResponsePayload {
     pub from_node_id: String,
@@ -990,7 +990,7 @@ pub struct MeshServicesGetResponsePayload {
 
 /// Periodyczny anti-drift broadcast (co ~5 min). Pelen stan zastepuje to co
 /// odbiorca trzyma w `MeshServicesRegistry` dla danego nodu.
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshServicesAnnouncePayload {
     pub from_node_id: String,
@@ -999,7 +999,7 @@ pub struct MeshServicesAnnouncePayload {
 
 /// Push delta — wysylane natychmiast po lokalnej mutacji (deploy/stop/pin/
 /// pause/rename/delete). Odbiorca aplikuje `change` na swoim widoku nodu.
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshServicesUpdatePayload {
     pub from_node_id: String,
@@ -1010,7 +1010,7 @@ pub struct MeshServicesUpdatePayload {
 // Sync Ledger — wire payloads
 // =============================================================================
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshSyncOperationWire {
     pub op_id: Vec<u8>,
@@ -1019,21 +1019,21 @@ pub struct MeshSyncOperationWire {
     pub operation: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshSyncPushPayload {
     pub from_node_id: String,
     pub operations: Vec<MeshSyncOperationWire>,
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshSyncAckPayload {
     pub from_node_id: String,
     pub operation_ids: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshSyncPullPayload {
     pub from_node_id: String,
@@ -1042,7 +1042,7 @@ pub struct MeshSyncPullPayload {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshSyncPullResponsePayload {
     pub from_node_id: String,
@@ -1051,7 +1051,7 @@ pub struct MeshSyncPullResponsePayload {
     pub operations: Vec<MeshSyncOperationWire>,
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshSyncSnapshotPullPayload {
     pub from_node_id: String,
@@ -1062,7 +1062,7 @@ pub struct MeshSyncSnapshotPullPayload {
     pub tail_limit: u32,
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct MeshSyncSnapshotResponsePayload {
     pub from_node_id: String,
@@ -1074,7 +1074,7 @@ pub struct MeshSyncSnapshotResponsePayload {
     pub operations_after_snapshot: Vec<MeshSyncOperationWire>,
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub enum StorageValueWire {
     Null,
@@ -1085,7 +1085,7 @@ pub enum StorageValueWire {
     Bytes(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub enum StorageProxyRequestKind {
     SqlExec {
@@ -1132,7 +1132,7 @@ pub enum StorageProxyRequestKind {
     },
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct StorageProxyRequestPayload {
     pub request_id: String,
@@ -1145,7 +1145,7 @@ pub struct StorageProxyRequestPayload {
     pub kind: StorageProxyRequestKind,
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub enum StorageProxyResponseKind {
     SqlExec {
@@ -1187,7 +1187,7 @@ pub enum StorageProxyResponseKind {
     },
 }
 
-#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct StorageProxyResponsePayload {
     pub request_id: String,

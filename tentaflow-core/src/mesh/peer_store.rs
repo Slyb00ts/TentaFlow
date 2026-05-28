@@ -160,7 +160,7 @@ pub struct PeerNetworkInfo {
 }
 
 /// Metryki wysylane w heartbeatach do peerow mesh
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct HeartbeatMetrics {
     pub cpu_usage_percent: f32,
     pub ram_used_mb: u64,
@@ -190,7 +190,7 @@ pub struct HeartbeatMetrics {
 
 /// Broadcast z lista modeli zaladowanych/dostepnych na nodzie. Wysylany co
 /// `models_sync_interval` (domyslnie 30s) oraz po kazdej zmianie listy modeli.
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct ModelsSync {
     pub models: Vec<PeerModelInfo>,
 }
@@ -919,18 +919,15 @@ impl MeshPeerStore {
         if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             r.ensure_present(id);
             // Receiving an app-level heartbeat is provable liveness: bytes
-            // arrived over a live transport. If liveness previously tripped
-            // and parked the registry in Offline/Disconnected, the bare
-            // Heartbeat trigger will not wake it (state machine returns
-            // no_change for those cases — we cannot fabricate a Connected
-            // state without a real conn_id+path). Resync via the synthetic
-            // DialStarted+DialOk path used elsewhere on the read side; this
-            // fires at most once per drift event because the next heartbeat
-            // sees Connected and skips the branch.
+            // arrived over a live transport. Resync states that cannot be
+            // corrected by the bare Heartbeat trigger.
             if let Some(detail) = r.snapshot_detail(&id) {
                 if matches!(
                     detail.summary.conn_tag,
-                    ConnectionStateTag::Offline | ConnectionStateTag::Disconnected
+                    ConnectionStateTag::Offline
+                        | ConnectionStateTag::Disconnected
+                        | ConnectionStateTag::Connecting
+                        | ConnectionStateTag::Reconnecting
                 ) {
                     self.shadow_mark_connected(node_id);
                 }
@@ -1313,8 +1310,8 @@ mod tests {
             vendor: GpuVendor::Nvidia,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gpu).expect("encode");
-        let decoded = rkyv::from_bytes::<PeerGpuInfo, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::mesh::cbor::encode(&gpu).expect("encode");
+        let decoded = crate::mesh::cbor::decode::<PeerGpuInfo>(&bytes).expect("decode");
 
         assert_eq!(decoded.name, gpu.name);
         assert_eq!(decoded.vram_total_mb, gpu.vram_total_mb);
@@ -1335,14 +1332,13 @@ mod tests {
             GpuVendor::Apple,
             GpuVendor::Other,
         ] {
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&v).expect("encode");
-            let decoded =
-                rkyv::from_bytes::<GpuVendor, rkyv::rancor::Error>(&bytes).expect("decode");
+            let bytes = crate::mesh::cbor::encode(&v).expect("encode");
+            let decoded = crate::mesh::cbor::decode::<GpuVendor>(&bytes).expect("decode");
             assert_eq!(decoded, v);
         }
     }
 
-    /// Heartbeat z polami `nsys_available` / `nsys_version` round-trip rkyv —
+    /// Heartbeat z polami `nsys_available` / `nsys_version` round-trip CBOR —
     /// peer odbierajacy ramke musi widziec capability nadawcy. Walidacja
     /// schematu po dodaniu pol w PR3b (advertisement Nsight w heartbeat).
     #[test]
@@ -1367,9 +1363,8 @@ mod tests {
                 "nvidia.nsys.gpu".to_string(),
             ],
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&hb).expect("encode");
-        let decoded =
-            rkyv::from_bytes::<HeartbeatMetrics, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = crate::mesh::cbor::encode(&hb).expect("encode");
+        let decoded = crate::mesh::cbor::decode::<HeartbeatMetrics>(&bytes).expect("decode");
         assert!(decoded.nsys_available);
         assert_eq!(decoded.nsys_version, "2024.5.1");
         assert_eq!(decoded.platform, "linux");
@@ -1424,6 +1419,49 @@ mod tests {
         assert!(
             registry.is_connected(&node_bytes),
             "update_metrics must wake the registry out of Disconnected/Offline so the consistency check stops re-detecting drift on every heartbeat",
+        );
+    }
+
+    #[test]
+    fn update_metrics_wakes_connecting_registry() {
+        let mut store = MeshPeerStore::new();
+        let registry = crate::mesh::peer_registry::PeerRegistry::new(64);
+        store.set_registry(registry.clone());
+
+        let node_bytes = [8u8; 32];
+        let node_id_hex = hex::encode(node_bytes);
+
+        registry.upsert_discovered(node_bytes, Default::default());
+        registry.transition_state(
+            &node_bytes,
+            crate::mesh::peer_registry::StateTrigger::DialStarted {
+                via: crate::mesh::peer_registry::DialPath::Direct,
+            },
+        );
+        assert!(!registry.is_connected(&node_bytes));
+
+        let hb = HeartbeatMetrics {
+            cpu_usage_percent: 1.0,
+            ram_used_mb: 0,
+            gpus: vec![],
+            containers: vec![],
+            networks: vec![],
+            platform: String::new(),
+            cpu_temperature_c: None,
+            swap_total_mb: 0,
+            swap_used_mb: 0,
+            connected_peers: vec![],
+            active_requests: 0,
+            tokens_per_sec: 0.0,
+            nsys_available: false,
+            nsys_version: String::new(),
+            profiling_collectors_available: vec![],
+        };
+        store.update_metrics(&node_id_hex, &hb);
+
+        assert!(
+            registry.is_connected(&node_bytes),
+            "update_metrics must wake the registry out of Connecting after a heartbeat proves the peer is live",
         );
     }
 }

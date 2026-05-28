@@ -191,9 +191,6 @@ configure_macos_gstreamer_pkg_config() {
         if [[ -n "$typelib_joined" ]]; then
             export GI_TYPELIB_PATH="${typelib_joined}${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
         fi
-        if [[ -n "$plugin_joined" ]]; then
-            export GST_PLUGIN_SYSTEM_PATH_1_0="${plugin_joined}${GST_PLUGIN_SYSTEM_PATH_1_0:+:$GST_PLUGIN_SYSTEM_PATH_1_0}"
-        fi
         if [[ -n "$scanner_path" ]]; then
             export GST_PLUGIN_SCANNER="$scanner_path"
         fi
@@ -222,9 +219,6 @@ configure_macos_gstreamer_pkg_config() {
             fi
             if [[ -n "$typelib_joined" ]]; then
                 printf 'export GI_TYPELIB_PATH="%s${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"\n' "$typelib_joined"
-            fi
-            if [[ -n "$plugin_joined" ]]; then
-                printf 'export GST_PLUGIN_SYSTEM_PATH_1_0="%s${GST_PLUGIN_SYSTEM_PATH_1_0:+:$GST_PLUGIN_SYSTEM_PATH_1_0}"\n' "$plugin_joined"
             fi
             if [[ -n "$scanner_path" ]]; then
                 printf 'export GST_PLUGIN_SCANNER="%s"\n' "$scanner_path"

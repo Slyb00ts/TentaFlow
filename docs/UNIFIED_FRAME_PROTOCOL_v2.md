@@ -178,7 +178,7 @@ Allocated bits:
 
 2. **Opaque blob** (frame pickup, raw streams). Body is application-specific bytes — e.g. raw RGB24 pixels or JPEG bytes for `(channel=FrameBlob, kind=Frame)`. Routing nodes pass through without inspection. End receiver knows how to parse based on `kind`.
 
-3. **Verbatim inner payload during migration** (legacy compatibility). For `(channel=SyncLedger, kind=PushOperation)` body is the existing MessagePack `SyncOperation` with its existing Ed25519 signature — UFP/2 wraps without re-encoding, preserving in-flight signatures. After migration this can be re-issued as structured CBOR with new sigs; existing operations stay verifiable indefinitely.
+3. **Verbatim inner payload during migration** (legacy compatibility). For `(channel=SyncLedger, kind=PushOperation)` body is the existing CBOR `SyncOperation` with its existing Ed25519 signature — UFP/2 wraps without re-encoding, preserving in-flight signatures.
 
 The envelope is encoding-agnostic about body content. **Routing decisions are made entirely from envelope header (fields 0–8 + 10–12).** No hop decodes body.
 
@@ -193,7 +193,7 @@ The envelope is encoding-agnostic about body content. **Routing decisions are ma
 | `0x03` | Stream | `0x0001..0x00FF` | Structured CBOR + fragment bytes | Long-lived streams (LLM tokens, file upload, log tail). Uses `IS_FRAGMENT` heavily. |
 | `0x04` | Mesh | `0x0010..0x004C` | Structured CBOR | Peer-to-peer control (existing `MESH_MSG_HEARTBEAT`..`MESH_MSG_FRAME_PROXY_RESPONSE` discriminators become `kind` values). |
 | `0x05` | Control | `0x0001..0x00FF` | Structured CBOR | Handshake, auth, heartbeat, resume, rate-limit notifications, session_end. |
-| `0x06` | SyncLedger | `0x0001..0x00FF` | **Body = verbatim MessagePack SyncOperation** (preserves Ed25519 sig) | Existing Sync Ledger ops/acks/pulls/snapshots. |
+| `0x06` | SyncLedger | `0x0001..0x00FF` | Structured CBOR | Existing Sync Ledger ops/acks/pulls/snapshots. |
 | `0x07` | Frontend | `0x0001..0xFFFF` | Structured CBOR | Frontend ↔ Core (chat completions, dashboard CRUD, settings) — replaces rkyv `MessageBody` enum. Kind = MessageBody variant index. |
 | `0x08` | Domain | `0x0001..0xFFFF` | Structured CBOR | Application domain messages (recorder, scheduler, camera_admin, sync_conflict). |
 | `0x09` | FrameBlob | `0x0001..0x000F` | **Body = raw bytes** | Camera frame transport (pixel/JPEG passthrough). Routing nodes forward verbatim. |
@@ -595,7 +595,7 @@ The envelope-level validator (4c1) MUST enforce the following invariants on ever
 | `0x03` Stream | Session, NodeIdentity, or UserIdentity | PER_KIND | OFF (per-chunk overhead too high) | Stream/Open MUST be signed; subsequent chunks NO (covered by session). |
 | `0x04` Mesh | NodeIdentity | YES | OFF (intra-cluster TLS) | Mesh peers always sign with node key. |
 | `0x05` Control | Anonymous (Hello only) OR NodeIdentity/UserIdentity | PER_KIND | OFF | `Hello` is NO (Anonymous); everything else YES. |
-| `0x06` SyncLedger | NodeIdentity | YES | OFF | Sync ops also have inner Ed25519 sig over MessagePack body (legacy); envelope adds outer sig over wrapper. |
+| `0x06` SyncLedger | NodeIdentity | YES | OFF | Sync ops also have inner Ed25519 sig over CBOR body; envelope adds outer sig over wrapper. |
 | `0x07` Frontend | Session (browser) OR ApiKey (external) | PER_KIND | OFF (TLS) | Read-only requests may be NO; mutating requests YES. |
 | `0x08` Domain | Session OR NodeIdentity OR UserIdentity | PER_KIND | OFF | Read: NO; admin: YES (UserIdentity required). |
 | `0x09` FrameBlob | NodeIdentity (issuing node) | YES | OFF | Frame data signed by source node. |
@@ -640,7 +640,7 @@ Migration is performed in **6 atomic commits**, each leaving the system green (`
 
 ### 4c3 — Sync ledger channel migration
 - Sync operations wrap inside `(channel=0x06, kind=PushOperation/Ack/Pull/...)` envelopes.
-- Body remains existing MessagePack `SyncOperation` (preserves existing Ed25519 sigs in flight).
+- Body remains CBOR `SyncOperation` (preserves existing Ed25519 sigs in flight).
 - DELETE: bespoke sync push/pull wire types (only kept as logical schema, no longer their own outer envelope).
 - Tests: full sync flow A→B with old operations still verifying.
 

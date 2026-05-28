@@ -1697,7 +1697,7 @@ pub struct ToolCallResult {
 
 /// Wykryte wywołanie narzędzia z Intent Analyzer.
 /// Różni się od ToolCallResult tym, że zawiera wyniki wykonania i walidacji.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct DetectedToolCall {
     /// ID wywołania (uuid)
     pub call_id: String,
@@ -1722,7 +1722,7 @@ pub struct DetectedToolCall {
 }
 
 /// Wynik wykonania wykrytego narzędzia.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct DetectedToolExecutionResult {
     /// Czy wykonanie się powiodło
     pub success: bool,
@@ -2744,7 +2744,7 @@ pub struct MemoryUpdatePersonNameResult {
 ///     chunk: StreamChunkType::Done { final_metrics: Some(metrics) },
 /// });
 /// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ModelStreamChunk {
     /// ID requestu (correlation)
     pub request_id: String,
@@ -2754,7 +2754,7 @@ pub struct ModelStreamChunk {
 }
 
 /// Typy chunków dla streamingu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub enum StreamChunkType {
     /// Metadata (wysyłane jako pierwsze, opcjonalne)
     /// Np. dla completion: info o modelu, parametrach
@@ -2795,7 +2795,7 @@ pub enum StreamChunkType {
 }
 
 /// Informacje z Intent Analyzer (Bielik 1.5B) dla streamingu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct IntentAnalyzerInfo {
     /// Wykryta intencja główna
     pub detected_intent: Option<String>,
@@ -2814,7 +2814,7 @@ pub struct IntentAnalyzerInfo {
 }
 
 /// Chunk dla streaming tool calls.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ToolCallDeltaChunk {
     /// Index tool call w liście
     pub index: u32,
@@ -2830,7 +2830,7 @@ pub struct ToolCallDeltaChunk {
 }
 
 /// Metadata wysyłane na początku streamingu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ModelMetadata {
     /// Typ modelu/operacji
     pub model_type: String,
@@ -2851,7 +2851,7 @@ pub struct ModelMetadata {
 ///
 /// Zawiera podstawowe metryki (latency, throughput) oraz opcjonalne
 /// szczegółowe metryki specyficzne dla typu modelu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ModelMetrics {
     /// Nazwa modelu
     pub model_name: String,
@@ -2874,7 +2874,7 @@ pub struct ModelMetrics {
 }
 
 /// Szczegółowe metryki specyficzne dla typu modelu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub enum DetailedMetrics {
     /// Metryki dla embeddings
     Embeddings {
@@ -2894,7 +2894,7 @@ pub enum DetailedMetrics {
 }
 
 /// Error information.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct ErrorInfo {
     /// Typ błędu
     pub error_type: ErrorType,
@@ -2907,7 +2907,9 @@ pub struct ErrorInfo {
 }
 
 /// Typy błędów.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub enum ErrorType {
     /// Invalid request (nieprawidłowe parametry)
     InvalidRequest,

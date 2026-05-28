@@ -15,7 +15,7 @@ use tentaflow_protocol::mesh::{
 };
 
 use crate::addon::storage_sql_exec::{exec_for_addon, query_for_addon, query_one_for_addon};
-use crate::db::{DbPool, repository};
+use crate::db::{repository, DbPool};
 use crate::mesh::iroh_manager::IrohMeshManager;
 
 const MAX_BLOB_PROXY_CHUNK_BYTES: u32 = 1024 * 1024;
@@ -30,7 +30,7 @@ pub async fn handle_request(
     let blob_root = crate::paths::tentaflow_home().to_path_buf();
     let response =
         execute_request_with_blob_root(&db, &local_node_id, &from_node_id, payload, &blob_root);
-    match rkyv::to_bytes::<rkyv::rancor::Error>(&response).map(|bytes| bytes.to_vec()) {
+    match crate::mesh::cbor::encode(&response) {
         Ok(bytes) => {
             if let Err(e) = iroh
                 .send_storage_proxy_response(&from_node_id, &bytes)
@@ -498,11 +498,7 @@ fn blob_get_chunk(
     let mut data = vec![0u8; readable as usize];
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(&mut data)?;
-    Ok((
-        "application/octet-stream".to_string(),
-        size_bytes,
-        data,
-    ))
+    Ok(("application/octet-stream".to_string(), size_bytes, data))
 }
 
 fn blob_put_chunk(
@@ -615,11 +611,7 @@ fn count_blob_chunks(upload_dir: &Path) -> anyhow::Result<u32> {
     for entry in std::fs::read_dir(upload_dir)? {
         let entry = entry?;
         if entry.file_type()?.is_file()
-            && entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                == Some("part")
+            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("part")
         {
             count = count.saturating_add(1);
         }

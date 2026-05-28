@@ -373,7 +373,7 @@ impl GossipEngine {
                 match sock.recv_from(&mut buf).await {
                     Ok((len, from)) => {
                         let data = &buf[..len];
-                        match serde_json::from_slice::<GossipMessage>(data) {
+                        match crate::mesh::cbor::decode::<GossipMessage>(data) {
                             Ok(msg) => {
                                 engine_ref.handle_message(msg, from).await;
                             }
@@ -448,7 +448,7 @@ impl GossipEngine {
                         seq,
                     };
 
-                    let data = match serde_json::to_vec(&msg) {
+                    let data = match crate::mesh::cbor::encode(&msg) {
                         Ok(d) => d,
                         Err(_) => continue,
                     };
@@ -562,7 +562,7 @@ impl GossipEngine {
                                 seq: new_seq,
                             };
 
-                            let data = match serde_json::to_vec(&msg) {
+                            let data = match crate::mesh::cbor::encode(&msg) {
                                 Ok(d) => d,
                                 Err(_) => continue,
                             };
@@ -705,7 +705,7 @@ impl GossipEngine {
                     };
 
                     let msg = GossipMessage::FullSyncReq { sender: summary };
-                    if let Ok(data) = serde_json::to_vec(&msg) {
+                    if let Ok(data) = crate::mesh::cbor::encode(&msg) {
                         if let Err(e) = sock.send_to(&data, addr).await {
                             warn!(addr = %addr, error = %e, "Blad wysylania FullSyncReq");
                         } else {
@@ -971,10 +971,11 @@ async fn do_send_message(
     msg: &GossipMessage,
     to: SocketAddr,
 ) -> Result<(), crate::error::CoreError> {
-    let data = serde_json::to_vec(msg).map_err(|e| crate::error::CoreError::GossipError {
-        message: format!("Blad serializacji: {}", e),
-        source: Some(e.into()),
-    })?;
+    let data =
+        crate::mesh::cbor::encode(msg).map_err(|e| crate::error::CoreError::GossipError {
+            message: format!("Blad serializacji: {}", e),
+            source: Some(e.into()),
+        })?;
 
     sock.send_to(&data, to)
         .await
