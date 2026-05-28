@@ -59,7 +59,7 @@ pub(crate) fn build_response(
 
 /// Full request handler — used by the mesh event loop. Looks up the frame
 /// in the process-wide `frame_storage()` singleton, builds the payload,
-/// encodes with rkyv, and pushes the response back to `from_node_id`. Any
+/// encodes with CBOR, and pushes the response back to `from_node_id`. Any
 /// encode or send failure is logged and dropped (the requester's timeout
 /// handles the no-reply case).
 pub async fn handle_request(
@@ -70,7 +70,7 @@ pub async fn handle_request(
     let storage = crate::services::frame_storage();
     let response = build_response(storage.as_ref(), &payload);
 
-    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
+    let bytes = match crate::mesh::cbor::encode(&response) {
         Ok(b) => b,
         Err(e) => {
             warn!(

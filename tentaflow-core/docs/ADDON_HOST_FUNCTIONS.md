@@ -4,6 +4,9 @@ Addony TentaFlow dzialaja jako moduly WASM (WebAssembly) uruchamiane w sandboxie
 Komunikacja z hostem (Core) odbywa sie wylacznie przez zdefiniowane host functions.
 Kazda funkcja operuje na pamieci liniowej guest (WASM) przez wskazniki i dlugosci.
 
+Dokumentacja zasad ACL i synchronizacji czesciowej dla autorow addonow jest w
+`tentaflow-core/addon-sdk/SYNC_ACL.md`.
+
 ---
 
 ## Konwencje ABI

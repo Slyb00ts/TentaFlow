@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use crate::db::{self, DbPool};
 use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::mesh::node_info_collector;
+use crate::mesh::peer_registry::{TransportHints, TrustState};
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::pairing::{
@@ -44,6 +45,105 @@ fn pin_eq(a: &str, b: &str) -> bool {
         return false;
     }
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+fn registry_hints_from_pairing(hints: Option<&PairingContactHints>) -> TransportHints {
+    let mut out = TransportHints::default();
+    if let Some(hints) = hints {
+        for address in &hints.addresses {
+            if let Ok(socket) = address.parse::<SocketAddr>() {
+                out.addresses.push(socket);
+            }
+        }
+        if !hints.relay_url.is_empty() {
+            out.relay_url = Some(Arc::<str>::from(hints.relay_url.as_str()));
+        }
+        if !hints.hostname.is_empty() {
+            out.hostname_dns = Some(Arc::<str>::from(hints.hostname.as_str()));
+        }
+    }
+    out
+}
+
+pub fn mirror_trusted_peer_to_registry(
+    peer_store: &MeshPeerStore,
+    remote_node_id: &str,
+    remote_public_key_hex: &str,
+    hostname: &str,
+    hints: Option<&PairingContactHints>,
+) {
+    let Some(reg) = peer_store.registry() else {
+        return;
+    };
+    let mut id_bytes = [0u8; 32];
+    if hex::decode_to_slice(remote_node_id, &mut id_bytes).is_err() {
+        return;
+    }
+    reg.upsert_discovered(id_bytes, registry_hints_from_pairing(hints));
+    if let Ok(pubkey_bytes) = hex::decode(remote_public_key_hex) {
+        if !pubkey_bytes.is_empty() {
+            reg.set_pubkey(&id_bytes, Arc::<[u8]>::from(pubkey_bytes.as_slice()));
+        }
+    }
+    reg.set_trust(&id_bytes, TrustState::Trusted);
+    if !hostname.is_empty() {
+        reg.set_hostname(&id_bytes, Arc::<str>::from(hostname));
+    }
+}
+
+async fn send_pairing_bootstrap(
+    qm: &Arc<IrohMeshManager>,
+    security: &Arc<MeshSecurity>,
+    target_node_id: &str,
+    local_node_id: &str,
+) -> Result<(), AdminError> {
+    let local_info = node_info_collector::collect_node_info(local_node_id);
+    let info_bytes = crate::mesh::cbor::encode(&local_info).map_err(|e| {
+        error!(target_node = %target_node_id, "CBOR encode NodeInfo failed: {}", e);
+        AdminError::new(AdminErrorKind::Internal, "internal mesh error")
+    })?;
+    qm.send_node_info(target_node_id, &info_bytes)
+        .await
+        .map_err(|e| {
+            warn!(
+                target_node = %target_node_id,
+                "NodeInfo send after pairing failed: {}",
+                e
+            );
+            AdminError::new(
+                AdminErrorKind::DeliveryFailed,
+                "pairing completed, but node info exchange failed",
+            )
+        })?;
+
+    let all_keys = security.get_all_trusted_keys();
+    if !all_keys.is_empty() {
+        let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
+            .iter()
+            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                node_id: nid.clone(),
+                public_key_hex: pk.clone(),
+            })
+            .collect();
+        let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+        if let Ok(sync_data) = crate::mesh::cbor::encode(&payload) {
+            if let Err(e) = qm.send_trusted_keys_sync(target_node_id, &sync_data).await {
+                warn!(
+                    target_node = %target_node_id,
+                    "TrustedKeysSync after pairing failed: {}",
+                    e
+                );
+            }
+            qm.broadcast_ufp2_to_trusted(
+                tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
+                &sync_data,
+                Some(target_node_id),
+            )
+            .await;
+        }
+    }
+
+    Ok(())
 }
 
 /// SSRF / hostile-network guard for raw IPs given by the client. Rejects
@@ -366,12 +466,10 @@ pub async fn initiate_pairing(
             public_key: security.public_key_hex(),
             pin: pin.clone(),
         };
-        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-            .map(|v| v.to_vec())
-            .map_err(|e| {
-                error!(target_node = %remote_hints.node_id, "rkyv encode PairingRequest failed: {}", e);
-                AdminError::new(AdminErrorKind::Internal, "internal mesh error")
-            })?;
+        let data = crate::mesh::cbor::encode(&payload).map_err(|e| {
+            error!(target_node = %remote_hints.node_id, "CBOR encode PairingRequest failed: {}", e);
+            AdminError::new(AdminErrorKind::Internal, "internal mesh error")
+        })?;
         info!(target_node = %remote_hints.node_id, "pairing: sending PairingRequest via existing mesh stream");
         if let Err(e) = qm.send_pairing_request(&remote_hints.node_id, &data).await {
             warn!(target_node = %remote_hints.node_id, "PairingRequest via mesh failed: {}", e);
@@ -400,52 +498,34 @@ pub async fn initiate_pairing(
                         error!(target_node = %remote_hints.node_id, "store_trusted_contact_hints failed: {}", e);
                         AdminError::new(AdminErrorKind::Internal, "internal mesh error")
                     })?;
-                if let Err(e) = qm.connect_to_peer_with_hints(&remote_hints).await {
-                    warn!(
-                        target_node = %remote_hints.node_id,
-                        "Pairing confirmed, ale mesh connect nieudany: {}",
-                        e
-                    );
-                } else {
-                    let local_info = node_info_collector::collect_node_info(local_node_id);
-                    if let Ok(info_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&local_info) {
-                        if let Err(e) = qm.send_node_info(&remote_hints.node_id, &info_bytes).await
-                        {
-                            warn!(
-                                target_node = %remote_hints.node_id,
-                                "Pairing confirmed, ale NodeInfo send nieudany: {}",
-                                e
-                            );
-                        }
-                    }
-
-                    let all_keys = security.get_all_trusted_keys();
-                    if !all_keys.is_empty() {
-                        let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
-                            .iter()
-                            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                                node_id: nid.clone(),
-                                public_key_hex: pk.clone(),
-                            })
-                            .collect();
-                        let payload =
-                            tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
-                        if let Ok(sync_data) =
-                            rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
-                        {
-                            if let Err(e) = qm
-                                .send_trusted_keys_sync(&remote_hints.node_id, &sync_data)
-                                .await
-                            {
-                                warn!(
-                                    target_node = %remote_hints.node_id,
-                                    "Pairing confirmed, ale TrustedKeysSync send nieudany: {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
+                let trusted_public_key =
+                    db::repository::get_trusted_node_public_key(&security.db, remote_node_id)
+                        .map_err(|e| {
+                            error!(target_node = %remote_hints.node_id, "load trusted pubkey failed: {}", e);
+                            AdminError::new(AdminErrorKind::Internal, "internal mesh error")
+                        })?
+                        .unwrap_or_else(|| remote_hints.public_key_hex.clone());
+                mirror_trusted_peer_to_registry(
+                    peer_store,
+                    remote_node_id,
+                    &trusted_public_key,
+                    &remote_hints.hostname,
+                    Some(&remote_hints),
+                );
+                qm.connect_to_peer_with_hints(&remote_hints)
+                    .await
+                    .map_err(|e| {
+                        warn!(
+                            target_node = %remote_hints.node_id,
+                            "Pairing confirmed, but mesh connect failed: {}",
+                            e
+                        );
+                        AdminError::new(
+                            AdminErrorKind::DeliveryFailed,
+                            "pairing completed, but mesh connection is not ready",
+                        )
+                    })?;
+                send_pairing_bootstrap(qm, security, &remote_hints.node_id, local_node_id).await?;
                 completed = true;
             }
             Ok(PairingAttemptOutcome::Pending) => {
@@ -484,7 +564,7 @@ pub async fn initiate_pairing(
 /// Potwierdza parowanie (rate-limit PIN, walidacja, sync kluczy w tle).
 /// Hostname pobierany z `peer_store` po sparowaniu — eliminuje duplikat pola
 /// w protokole. Fallback do pustego stringa gdy peer nieznany.
-pub fn confirm_pairing(
+pub async fn confirm_pairing(
     security: &Arc<MeshSecurity>,
     remote_node_id: &str,
     pin: Option<&str>,
@@ -554,103 +634,67 @@ pub fn confirm_pairing(
             AdminError::new(AdminErrorKind::BadRequest, "failed to confirm pairing")
         })?;
 
-    // Mirror the freshly-trusted pubkey into the peer registry so the
-    // persistence writer can produce a peer_persisted row for this peer.
-    // remote_public_key is hex (Ed25519 32B = 64 chars, or Ed25519+X25519
-    // 64B = 128 chars). The registry stores raw bytes.
-    if let (Some(reg), Ok(pubkey_bytes)) = (
-        peer_store.registry(),
-        hex::decode(remote_public_key.as_str()),
-    ) {
-        let mut id_bytes = [0u8; 32];
-        if hex::decode_to_slice(remote_node_id, &mut id_bytes).is_ok() {
-            reg.set_pubkey(
-                &id_bytes,
-                std::sync::Arc::<[u8]>::from(pubkey_bytes.as_slice()),
-            );
-            reg.set_trust(&id_bytes, crate::mesh::peer_registry::TrustState::Trusted);
-        }
-    }
-
     let pending_hints = load_pending_contact_hints(&security.db, remote_node_id)
         .ok()
         .flatten();
     if let Some(ref hints) = pending_hints {
         let _ = store_trusted_contact_hints(&security.db, remote_node_id, hints);
     }
+    mirror_trusted_peer_to_registry(
+        peer_store,
+        remote_node_id,
+        &remote_public_key,
+        &hostname,
+        pending_hints.as_ref(),
+    );
 
     if let Some(ref qm) = quic_mesh {
-        // from_node_id MUST be Ed25519 pubkey hex — initiator identifies peer
-        // by iroh endpoint_id (= Ed25519 pubkey hex).
+        if let Some(ref hints) = pending_hints {
+            qm.connect_to_peer_with_hints(hints).await.map_err(|e| {
+                warn!(
+                    target_node = %remote_node_id,
+                    "mesh connect after confirm failed: {}",
+                    e
+                );
+                AdminError::new(
+                    AdminErrorKind::DeliveryFailed,
+                    "pairing confirmed, but mesh connection is not ready",
+                )
+            })?;
+        }
+
         let payload = tentaflow_protocol::mesh::MeshPairingConfirmPayload {
             from_node_id: security.ed25519_public_key_hex(),
             public_key: security.public_key_hex(),
             hostname: hostname.clone(),
             pin: provided.to_string(),
         };
-        let data = match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+        let data = match crate::mesh::cbor::encode(&payload) {
             Ok(d) => d,
             Err(e) => {
-                error!(target_node = %remote_node_id, "rkyv encode PairingConfirm failed: {}", e);
+                error!(target_node = %remote_node_id, "CBOR encode PairingConfirm failed: {}", e);
                 return Err(AdminError::new(
                     AdminErrorKind::Internal,
                     "internal mesh error",
                 ));
             }
         };
-        let qm = qm.clone();
-        let sec_clone = security.clone();
-        let node_id = remote_node_id.to_string();
-        let local_nid = local_node_id.to_string();
-        let pending_hints = pending_hints.clone();
-        tokio::spawn(async move {
-            if let Some(hints) = pending_hints {
-                if let Err(e) = qm.connect_to_peer_with_hints(&hints).await {
-                    warn!("Blad laczenia do peera z pending hints {}: {}", node_id, e);
-                }
-            }
-            if let Err(e) = qm.send_pairing_confirm(&node_id, &data).await {
-                warn!("Blad wysylania PairingConfirm przez QUIC: {}", e);
-            }
+        qm.send_pairing_confirm(remote_node_id, &data)
+            .await
+            .map_err(|e| {
+                warn!(
+                    target_node = %remote_node_id,
+                    "PairingConfirm send failed: {}",
+                    e
+                );
+                AdminError::new(
+                    AdminErrorKind::DeliveryFailed,
+                    "pairing confirmed, but confirmation delivery failed",
+                )
+            })?;
 
-            // QUIC nie gwarantuje kolejnosci miedzy streamami — pozwol PairingConfirm dotrzec.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-            let local_info = node_info_collector::collect_node_info(&local_nid);
-            if let Ok(info_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&local_info) {
-                if let Err(e) = qm.send_node_info(&node_id, &info_bytes).await {
-                    warn!(
-                        "Blad wysylania NodeInfo po sparowaniu do {}: {}",
-                        node_id, e
-                    );
-                }
-            }
-
-            let all_keys = sec_clone.get_all_trusted_keys();
-            if !all_keys.is_empty() {
-                let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
-                    .iter()
-                    .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                        node_id: nid.clone(),
-                        public_key_hex: pk.clone(),
-                    })
-                    .collect();
-                let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
-                if let Ok(sync_data) =
-                    rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
-                {
-                    if let Err(e) = qm.send_trusted_keys_sync(&node_id, &sync_data).await {
-                        warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
-                    }
-                    qm.broadcast_ufp2_to_trusted(
-                        tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
-                        &sync_data,
-                        Some(&node_id),
-                    )
-                    .await;
-                }
-            }
-        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        send_pairing_bootstrap(qm, security, remote_node_id, local_node_id).await?;
     }
 
     let _ =
@@ -687,12 +731,10 @@ pub fn reject_pairing(
         let payload = tentaflow_protocol::mesh::MeshPairingRejectPayload {
             from_node_id: security.ed25519_public_key_hex(),
         };
-        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-            .map(|v| v.to_vec())
-            .map_err(|e| {
-                error!(target_node = %remote_node_id, "rkyv encode PairingReject failed: {}", e);
-                AdminError::new(AdminErrorKind::Internal, "internal mesh error")
-            })?;
+        let data = crate::mesh::cbor::encode(&payload).map_err(|e| {
+            error!(target_node = %remote_node_id, "CBOR encode PairingReject failed: {}", e);
+            AdminError::new(AdminErrorKind::Internal, "internal mesh error")
+        })?;
         let qm = qm.clone();
         let node_id = remote_node_id.to_string();
         let pending_hints = pending_hints.clone();
@@ -746,9 +788,7 @@ pub fn revoke_trust(
         };
         let qm = qm.clone();
         let sec = security.clone();
-        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-            .map(|v| v.to_vec())
-            .unwrap_or_default();
+        let data = crate::mesh::cbor::encode(&payload).unwrap_or_default();
         let revoked_id = node_id.to_string();
         security.mark_revoking(node_id);
         tokio::spawn(async move {

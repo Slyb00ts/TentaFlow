@@ -26,10 +26,18 @@ fn prepare_macos_runtime_environment() {
     let lib_dirs = collect_existing_dirs(&prefixes, &["lib"]);
     let typelib_dirs = collect_existing_dirs(&prefixes, &["lib/girepository-1.0"]);
     let plugin_dirs = collect_existing_dirs(&prefixes, &["lib/gstreamer-1.0"]);
+    let runtime_plugin_dirs = prepare_macos_plugin_dirs(&plugin_dirs).unwrap_or_else(|| {
+        tracing::warn!(
+            "gstreamer_runtime: nie mozna przygotowac filtrowanego katalogu pluginow macOS"
+        );
+        plugin_dirs.clone()
+    });
 
     prepend_path_env("DYLD_FALLBACK_LIBRARY_PATH", &lib_dirs);
     prepend_path_env("GI_TYPELIB_PATH", &typelib_dirs);
-    prepend_path_env("GST_PLUGIN_SYSTEM_PATH_1_0", &plugin_dirs);
+    set_path_env("GST_PLUGIN_PATH_1_0", &runtime_plugin_dirs);
+    set_path_env("GST_PLUGIN_SYSTEM_PATH_1_0", &runtime_plugin_dirs);
+    set_macos_registry_path();
 
     if std::env::var_os("GST_PLUGIN_SCANNER").is_none() {
         if let Some(scanner) = find_macos_plugin_scanner(&prefixes) {
@@ -118,6 +126,105 @@ fn find_macos_plugin_scanner(prefixes: &[PathBuf]) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
+fn prepare_macos_plugin_dirs(plugin_dirs: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    if plugin_dirs.is_empty() {
+        return None;
+    }
+
+    let filtered_dir = crate::paths::cache_dir()
+        .join("gstreamer")
+        .join("plugins-macos-no-gtk");
+    if let Err(err) = std::fs::create_dir_all(&filtered_dir) {
+        tracing::warn!(
+            path = %filtered_dir.display(),
+            error = %err,
+            "gstreamer_runtime: tworzenie katalogu pluginow nie powiodlo sie"
+        );
+        return None;
+    }
+
+    let mut wanted = std::collections::HashSet::new();
+    for dir in plugin_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let source = entry.path();
+            if !source.is_file() || source.extension().and_then(|v| v.to_str()) != Some("dylib") {
+                continue;
+            }
+            let Some(file_name) = source.file_name() else {
+                continue;
+            };
+            let file_name_str = file_name.to_string_lossy().to_ascii_lowercase();
+            if file_name_str.contains("gtk") {
+                continue;
+            }
+            let target = filtered_dir.join(file_name);
+            wanted.insert(target.clone());
+            let should_link = match std::fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    match std::fs::read_link(&target) {
+                        Ok(existing) if existing == source => false,
+                        _ => {
+                            let _ = std::fs::remove_file(&target);
+                            true
+                        }
+                    }
+                }
+                Ok(_) => false,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                Err(err) => {
+                    tracing::warn!(
+                        target = %target.display(),
+                        error = %err,
+                        "gstreamer_runtime: odczyt linku pluginu nie powiodl sie"
+                    );
+                    false
+                }
+            };
+            if !should_link {
+                continue;
+            }
+            #[cfg(unix)]
+            if let Err(err) = std::os::unix::fs::symlink(&source, &target) {
+                tracing::warn!(
+                    source = %source.display(),
+                    target = %target.display(),
+                    error = %err,
+                    "gstreamer_runtime: tworzenie linku pluginu nie powiodlo sie"
+                );
+            }
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&filtered_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if wanted.contains(&path) {
+                continue;
+            }
+            if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    Some(vec![filtered_dir])
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_registry_path() {
+    let registry = crate::paths::cache_dir()
+        .join("gstreamer")
+        .join("registry-macos-no-gtk.bin");
+    if let Some(parent) = registry.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::env::set_var("GST_REGISTRY", registry);
+}
+
+#[cfg(target_os = "macos")]
 fn prepend_path_env(name: &str, dirs: &[PathBuf]) {
     if dirs.is_empty() {
         return;
@@ -137,4 +244,20 @@ fn prepend_path_env(name: &str, dirs: &[PathBuf]) {
         }
     }
     std::env::set_var(name, entries.join(separator));
+}
+
+#[cfg(target_os = "macos")]
+fn set_path_env(name: &str, dirs: &[PathBuf]) {
+    if dirs.is_empty() {
+        return;
+    }
+
+    let value = dirs
+        .iter()
+        .filter_map(|p| p.to_str())
+        .collect::<Vec<_>>()
+        .join(":");
+    if !value.is_empty() {
+        std::env::set_var(name, value);
+    }
 }

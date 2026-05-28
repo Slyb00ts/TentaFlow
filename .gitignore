@@ -3,6 +3,7 @@
 # =============================================================================
 target/
 target_shared/
+target-service-context-test/*
 
 # Runtime data (SQLite, HMAC keys, container bundles, model cache).
 # Wczesniej trzymane w target/debug/ — `cargo clean` je wywalal. Teraz
@@ -183,3 +184,4 @@ notes/
 # npm lockfiles — repo nie używa Node poza tests/e2e (Playwright)
 package-lock.json
 tests/e2e/package-lock.json
+

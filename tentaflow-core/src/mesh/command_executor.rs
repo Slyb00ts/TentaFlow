@@ -897,7 +897,7 @@ impl MeshCommandExecutor {
                             from_node_id: local_node_id_task.clone(),
                             change: tentaflow_protocol::ServiceChange::Added(info),
                         };
-                        if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                        if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
                             let _ = iroh_task
                                 .broadcast_ufp2_to_trusted(
                                     tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
@@ -1469,7 +1469,7 @@ async fn push_service_change_after_action(
         from_node_id: local_node_id.to_string(),
         change,
     };
-    if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+    if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
         let _ = actions
             .iroh
             .broadcast_ufp2_to_trusted(

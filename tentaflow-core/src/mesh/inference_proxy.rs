@@ -518,8 +518,8 @@ fn send_stream_chunk_bytes(
     tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     chunk: tentaflow_protocol::ModelStreamChunk,
 ) {
-    if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk) {
-        let _ = tx.send(bytes.into_vec());
+    if let Ok(bytes) = crate::mesh::cbor::encode(&chunk) {
+        let _ = tx.send(bytes);
     }
 }
 

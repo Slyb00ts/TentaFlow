@@ -54,7 +54,6 @@ Two ALPN protocols handle all communication:
 - OpenAI-compatible API at `/v1/*`
 - Dashboard API at `/api/*` (JWT-authenticated)
 - WebSocket metrics streaming
-- Prometheus metrics endpoint
 - 15+ views: Dashboard, Services, Mesh, Clusters, Models, Playground, Flow Builder, Addons, Users, Audit Log, and more
 
 ### Addon System (WASM)
@@ -210,7 +209,6 @@ Feature flags on `tentaflow-core`:
 | `inference-llamacpp` | llama.cpp inference backend |
 | `inference-mlx` | Apple MLX inference backend |
 | `dashboard-api` | Web dashboard and API |
-| `metrics-prometheus` | Prometheus metrics endpoint |
 
 ### Running
 

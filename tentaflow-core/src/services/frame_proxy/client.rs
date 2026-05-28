@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // Requester side. `fetch_from_peer` registers a oneshot in the pending map
-// keyed by request_id, sends the rkyv-encoded FrameProxyRequestPayload over
+// keyed by request_id, sends the CBOR-encoded FrameProxyRequestPayload over
 // the trust-paired mesh stream, and awaits the matching response with a
 // timeout. The event loop in `mesh/pipeline.rs` calls
 // `handle_response` when a FrameProxyResponseReceived event lands; that
@@ -116,7 +116,7 @@ pub async fn fetch_from_peer(
         raw_ref: raw_ref.to_string(),
         request_id: request_id.clone(),
     };
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).map_err(|e| {
+    let bytes = crate::mesh::cbor::encode(&request).map_err(|e| {
         client.cancel(&request_id);
         FrameProxyError::Encode(e.to_string())
     })?;

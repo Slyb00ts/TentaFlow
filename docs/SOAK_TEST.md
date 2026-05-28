@@ -30,10 +30,10 @@ criticals is manual.
    tentaflow-core/assets/test/sample_traffic.mp4
    ```
 
-3. **System tools** — `bash`, `ps`, `curl`, `python3` (>= 3.9).
+3. **System tools** — `bash`, `ps`, `python3` (>= 3.9).
 
 4. **Config** — `tests/e2e/config-soak.toml` (provided). Uses isolated DB at
-   `/tmp/tentaflow-soak.db` and Prometheus at `:19099` to avoid collisions.
+   `/tmp/tentaflow-soak.db` to avoid collisions.
 
 5. **Memory leak deep-dive (optional)** — requires a dhat-enabled rebuild:
 
@@ -107,14 +107,7 @@ Every `SAMPLE_INTERVAL_SEC` (default 60s), `run_soak.sh` records a CSV row:
 | `cpu_pct`         | `ps -o %cpu=`                           |
 | `fd_count`        | `ls /proc/<pid>/fd \| wc -l`            |
 | `thread_count`    | `ps -o nlwp=`                           |
-| `db_pool_in_use`  | Prometheus `sqlite_pool_in_use` (if exposed) |
-| `db_pool_idle`    | Prometheus `sqlite_pool_idle` (if exposed)   |
 | `uptime_sec`      | computed                                |
-
-The Prometheus columns may stay empty if those specific metric names are not
-exposed — the script is metric-name tolerant (also accepts
-`tentaflow_db_pool_*`). Add the missing exporter if pool tracking is required
-for acceptance sign-off.
 
 Override sampling cadence:
 
@@ -130,8 +123,7 @@ SAMPLE_INTERVAL_SEC=30 scripts/soak/run_soak.sh 24
 │   ├── tentaflow.log         # full stdout/stderr from the binary
 │   └── seed.log              # output of seed_cameras.py
 ├── metrics/
-│   ├── snapshot.csv          # one row per sample
-│   └── prom-raw.txt          # last Prometheus scrape (raw text)
+│   └── snapshot.csv          # one row per sample
 └── summary.txt               # analyze.py output (PASS / FAIL + numbers)
 ```
 
@@ -317,10 +309,7 @@ What to do during / after a soak:
 ## Troubleshooting
 
 - **`tentaflow died during warm-up`** — see `logs/tentaflow.log`. Usually a
-  port conflict (something already on 18099 / 19099) or a missing migration.
-- **All `db_pool_*` cells empty** — Prometheus metric names differ. Inspect
-  `metrics/prom-raw.txt` and update the grep patterns in `run_soak.sh`
-  accordingly (or expose the metrics in the binary).
+  port conflict (something already on 18099) or a missing migration.
 - **FD count climbs steadily** — that is the signal this test is designed to
   catch. Inspect `lsof -p <pid>` mid-run; correlate growth with camera/stream
   lifecycle.

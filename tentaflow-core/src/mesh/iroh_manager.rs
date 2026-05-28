@@ -8,8 +8,8 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,19 +17,19 @@ use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use parking_lot::RwLock;
-use tokio::sync::{RwLock as AsyncRwLock, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock as AsyncRwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::{
-    ALPN_API, ALPN_MESH, ALPN_PAIRING, IrohConfig, IrohEndpoint, IrohEndpointError,
     handler::IrohStreamError,
     pairing::{
-        PairingContactHints, PairingHandler, endpoint_addr_from_hints, hints_with_relay_fallback,
-        load_trusted_contact_hints, merge_contact_hints,
+        endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
+        merge_contact_hints, PairingContactHints, PairingHandler,
     },
+    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_MESH, ALPN_PAIRING,
 };
 
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
@@ -129,6 +129,9 @@ pub enum IrohMeshEvent {
     PairingRejectReceived {
         peer_id: String,
         data: Vec<u8>,
+    },
+    PairingTrusted {
+        hints: PairingContactHints,
     },
     AliasSyncReceived {
         from_node_id: String,
@@ -644,8 +647,12 @@ impl IrohMeshManager {
                 // zastepowany manualnym obslugiwaniem — w pelnej integracji
                 // ProtocolHandler jest rejestrowany przy bind przez Router.
                 let handler = PairingHandler::new(Arc::clone(&self.security), hostname());
-                if let Err(e) = handler_accept_connection(&handler, connection).await {
-                    warn!("iroh_mesh: pairing accept blad: {}", e);
+                match handler_accept_connection(&handler, connection).await {
+                    Ok(Some(hints)) => {
+                        let _ = self.event_tx.send(IrohMeshEvent::PairingTrusted { hints });
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!("iroh_mesh: pairing accept blad: {}", e),
                 }
             }
             a if a == ALPN_API => {
@@ -991,8 +998,7 @@ impl IrohMeshManager {
 
     pub async fn send_heartbeat_data(&self, data: &[u8]) {
         use futures::future::join_all;
-        // UFP/2 wire: the heartbeat body is the legacy rkyv-serialized
-        // MeshHeartbeat blob, wrapped in a signed UFP/2 envelope.
+        // UFP/2 wire: the heartbeat body is CBOR, wrapped in a signed envelope.
         let mut futs = Vec::with_capacity(self.connections.len());
         for entry in self.connections.iter() {
             let id = entry.key().clone();
@@ -1038,7 +1044,7 @@ impl IrohMeshManager {
 
     /// Build a signed UFP/2 envelope around `data` for a single peer and
     /// dispatch it on a fresh uni-stream. Used by every send wrapper that
-    /// has been migrated off the legacy `[disc][rkyv]` wire (4c2.x). The
+    /// has been migrated off the legacy raw discriminator wire. The
     /// destination peer's Ed25519 pubkey is derived from its iroh node id
     /// (which IS the pubkey in iroh's identity model).
     pub(crate) async fn send_ufp2_to_peer(
@@ -1092,7 +1098,7 @@ impl IrohMeshManager {
     /// UFP/2 broadcast helper: build a per-peer signed envelope (each
     /// envelope's `destination.id` must match the receiver's pubkey, so
     /// broadcast cannot share one wire blob the way the legacy
-    /// `[disc][rkyv]` path could) and send to every trusted peer except
+    /// raw discriminator path could) and send to every trusted peer except
     /// `exclude`. Returns per-peer results so callers can log failures.
     pub(crate) async fn broadcast_ufp2_to_trusted(
         &self,
@@ -1272,7 +1278,7 @@ impl IrohMeshManager {
     /// F1b P3.C-1 — send a frame proxy request to a trust-paired peer.
     /// Caller is responsible for trust gating + correlating the
     /// `request_id` with a pending response slot (P3.C-2 wires the slot
-    /// map). `data` is the rkyv-encoded `FrameProxyRequestPayload`.
+    /// map). `data` is the CBOR-encoded `FrameProxyRequestPayload`.
     pub async fn send_frame_proxy_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
         self.send_ufp2_to_peer(
             node_id,
@@ -1493,13 +1499,19 @@ impl IrohMeshManager {
             self.node_id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let envelope = serde_json::json!({
-            "command_id": command_id,
-            "sender_node_id": self.node_id(),
-            "command": command,
-        });
-        let data =
-            serde_json::to_vec(&envelope).map_err(|e| anyhow::anyhow!("encode command: {e}"))?;
+        #[derive(serde::Serialize)]
+        struct RequestEnvelope {
+            command_id: String,
+            sender_node_id: String,
+            command: tentaflow_protocol::mesh::MeshCommandType,
+        }
+        let envelope = RequestEnvelope {
+            command_id: command_id.clone(),
+            sender_node_id: self.node_id(),
+            command,
+        };
+        let data = crate::mesh::cbor::encode(&envelope)
+            .map_err(|e| anyhow::anyhow!("encode command: {e}"))?;
         self.send_command_and_wait_bytes(target_node_id, command_id, data, Duration::from_secs(600))
             .await
             .map(|r| crate::mesh::command_executor::CommandResponse {
@@ -1521,13 +1533,19 @@ impl IrohMeshManager {
             self.node_id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let envelope = serde_json::json!({
-            "command_id": command_id,
-            "sender_node_id": self.node_id(),
-            "command": command,
-        });
-        let data =
-            serde_json::to_vec(&envelope).map_err(|e| anyhow::anyhow!("encode command: {e}"))?;
+        #[derive(serde::Serialize)]
+        struct RequestEnvelope {
+            command_id: String,
+            sender_node_id: String,
+            command: tentaflow_protocol::mesh::MeshCommandType,
+        }
+        let envelope = RequestEnvelope {
+            command_id: command_id.clone(),
+            sender_node_id: self.node_id(),
+            command,
+        };
+        let data = crate::mesh::cbor::encode(&envelope)
+            .map_err(|e| anyhow::anyhow!("encode command: {e}"))?;
         self.send_command_and_wait_bytes(
             target_node_id,
             command_id,
@@ -1596,11 +1614,10 @@ impl IrohMeshManager {
         }
     }
 
-    /// Obsluzyc komende otrzymana od peera — dekoduje envelope JSON, deleguje do
+    /// Obsluzyc komende otrzymana od peera — dekoduje envelope CBOR, deleguje do
     /// `MeshCommandExecutor` (z weryfikacja trust), serializuje wynik i odsyla
     /// peerowi przez `MESH_MSG_COMMAND_RESPONSE`. Wire format jest symetryczny
-    /// z `send_command`/`send_command_and_wait` — taki sam envelope po obu
-    /// stronach upraszcza debug i pozwala probnym narzedziom (CLI) gadac.
+    /// z `send_command`/`send_command_and_wait`.
     pub async fn handle_command_received(&self, from_node_id: &str, data: &[u8]) {
         #[derive(serde::Deserialize)]
         struct RequestEnvelope {
@@ -1619,7 +1636,7 @@ impl IrohMeshManager {
             error: Option<&'a str>,
         }
 
-        let envelope: RequestEnvelope = match serde_json::from_slice(data) {
+        let envelope: RequestEnvelope = match crate::mesh::cbor::decode(data) {
             Ok(e) => e,
             Err(e) => {
                 warn!(from = %from_node_id, "Niepoprawny envelope MeshCommand: {}", e);
@@ -1646,7 +1663,7 @@ impl IrohMeshManager {
                     payload: &tentaflow_protocol::mesh::MeshCommandResponsePayload::Empty,
                     error: Some("command executor not configured"),
                 };
-                if let Ok(bytes) = serde_json::to_vec(&resp) {
+                if let Ok(bytes) = crate::mesh::cbor::encode(&resp) {
                     let _ = self
                         .send_ufp2_to_peer(
                             from_node_id,
@@ -1666,7 +1683,7 @@ impl IrohMeshManager {
             payload: &response.payload,
             error: response.error.as_deref(),
         };
-        match serde_json::to_vec(&resp_envelope) {
+        match crate::mesh::cbor::encode(&resp_envelope) {
             Ok(bytes) => {
                 if let Err(e) = self
                     .send_ufp2_to_peer(
@@ -1694,7 +1711,7 @@ impl IrohMeshManager {
 
     /// Obsluzyc odpowiedz na komende otrzymana od peera.
     pub async fn handle_command_response_received(&self, _from_node_id: &str, data: &[u8]) {
-        // Wire format: JSON envelope { command_id, ok, payload, error? } gdzie
+        // Wire format: CBOR envelope { command_id, ok, payload, error? } gdzie
         // `payload` to serde-zserializowany MeshCommandResponsePayload.
         #[derive(serde::Deserialize)]
         struct ResponseEnvelope {
@@ -1704,7 +1721,7 @@ impl IrohMeshManager {
             #[serde(default)]
             error: Option<String>,
         }
-        if let Ok(env) = serde_json::from_slice::<ResponseEnvelope>(data) {
+        if let Ok(env) = crate::mesh::cbor::decode::<ResponseEnvelope>(data) {
             if !env.command_id.is_empty() {
                 self.resolve_command_waiter(&env.command_id, env.ok, env.payload, env.error)
                     .await;
@@ -1993,9 +2010,8 @@ impl IrohMeshManagerRef {
                 data: payload,
             },
             x if x == MESH_MSG_TRUSTED_KEYS_SYNC => {
-                let parsed = rkyv::from_bytes::<
+                let parsed = crate::mesh::cbor::decode::<
                     tentaflow_protocol::mesh::TrustedKeysSyncPayload,
-                    rkyv::rancor::Error,
                 >(&payload);
                 match parsed {
                     Ok(p) => IrohMeshEvent::TrustedKeysSyncReceived {
@@ -2013,9 +2029,8 @@ impl IrohMeshManagerRef {
                 }
             }
             x if x == MESH_MSG_HMAC_KEYS_SYNC => {
-                let parsed = rkyv::from_bytes::<
+                let parsed = crate::mesh::cbor::decode::<
                     tentaflow_protocol::mesh::HmacKeysSyncPayload,
-                    rkyv::rancor::Error,
                 >(&payload);
                 match parsed {
                     Ok(p) => IrohMeshEvent::HmacKeysSyncReceived {
@@ -2033,9 +2048,8 @@ impl IrohMeshManagerRef {
                 }
             }
             x if x == MESH_MSG_FRAME_PROXY_REQUEST => {
-                let parsed = rkyv::from_bytes::<
+                let parsed = crate::mesh::cbor::decode::<
                     tentaflow_protocol::mesh::FrameProxyRequestPayload,
-                    rkyv::rancor::Error,
                 >(&payload);
                 match parsed {
                     Ok(p) => IrohMeshEvent::FrameProxyRequestReceived {
@@ -2053,9 +2067,8 @@ impl IrohMeshManagerRef {
                 }
             }
             x if x == MESH_MSG_FRAME_PROXY_RESPONSE => {
-                let parsed = rkyv::from_bytes::<
+                let parsed = crate::mesh::cbor::decode::<
                     tentaflow_protocol::mesh::FrameProxyResponsePayload,
-                    rkyv::rancor::Error,
                 >(&payload);
                 match parsed {
                     Ok(p) => IrohMeshEvent::FrameProxyResponseReceived {
@@ -2073,9 +2086,8 @@ impl IrohMeshManagerRef {
                 }
             }
             x if x == MESH_MSG_STORAGE_PROXY_REQUEST => {
-                let parsed = rkyv::from_bytes::<
+                let parsed = crate::mesh::cbor::decode::<
                     tentaflow_protocol::mesh::StorageProxyRequestPayload,
-                    rkyv::rancor::Error,
                 >(&payload);
                 match parsed {
                     Ok(p) => IrohMeshEvent::StorageProxyRequestReceived {
@@ -2093,9 +2105,8 @@ impl IrohMeshManagerRef {
                 }
             }
             x if x == MESH_MSG_STORAGE_PROXY_RESPONSE => {
-                let parsed = rkyv::from_bytes::<
+                let parsed = crate::mesh::cbor::decode::<
                     tentaflow_protocol::mesh::StorageProxyResponsePayload,
-                    rkyv::rancor::Error,
                 >(&payload);
                 match parsed {
                     Ok(p) => IrohMeshEvent::StorageProxyResponseReceived {
@@ -2113,15 +2124,16 @@ impl IrohMeshManagerRef {
                 }
             }
             x if x == MESH_MSG_TRUST_REVOKED => {
-                // payload: JSON { revoked_node_id }
-                let revoked: String = serde_json::from_slice::<serde_json::Value>(&payload)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("revoked_node_id")
-                            .and_then(|x| x.as_str())
-                            .map(String::from)
-                    })
-                    .unwrap_or_default();
+                let revoked = match crate::mesh::cbor::decode::<
+                    tentaflow_protocol::mesh::TrustRevokedPayload,
+                >(&payload)
+                {
+                    Ok(p) => p.revoked_node_id,
+                    Err(e) => {
+                        warn!(peer = %remote_hex, "iroh_mesh: failed to decode TrustRevoked CBOR: {}", e);
+                        return Ok(());
+                    }
+                };
                 IrohMeshEvent::TrustRevokedReceived {
                     node_id: remote_hex,
                     revoked_node_id: revoked,
@@ -2233,13 +2245,15 @@ async fn read_forward_payload(
 
 /// Funkcja pomocnicza wywolywana przez accept loop przy pairing ALPN. Separacja
 /// od manager-a ulatwia testowanie.
-async fn handler_accept_connection(handler: &PairingHandler, connection: Connection) -> Result<()> {
-    use iroh::protocol::ProtocolHandler;
-    handler
-        .accept(connection)
+async fn handler_accept_connection(
+    handler: &PairingHandler,
+    connection: Connection,
+) -> Result<Option<PairingContactHints>> {
+    let outcome = handler
+        .accept_with_outcome(connection)
         .await
         .map_err(|e| anyhow::anyhow!("pairing accept: {e:?}"))?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Parse an iroh node id (hex-encoded 32-byte Ed25519 public key) into the
