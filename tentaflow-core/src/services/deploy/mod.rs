@@ -1676,6 +1676,18 @@ pub(crate) fn parse_gpu_memory_utilization_arg(raw: &str) -> Option<f64> {
     None
 }
 
+pub(crate) fn normalize_vllm_spark_args(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for tok in raw.split_whitespace() {
+        if tok == "--enable-flashinfer-autotune" || tok == "--no-enable-flashinfer-autotune" {
+            continue;
+        }
+        out.push(tok.to_string());
+    }
+    out.push("--no-enable-flashinfer-autotune".to_string());
+    out.join(" ")
+}
+
 // ----- Tiny extension on Category to get string capability tag --------------
 
 trait CategoryStr {

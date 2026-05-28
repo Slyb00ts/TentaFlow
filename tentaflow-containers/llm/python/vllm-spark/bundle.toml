@@ -32,10 +32,10 @@ args = [
     # vllm/bundle.toml).
     "--enable-prefix-caching",
     "--enable-chunked-prefill",
-    # FlashInfer autotune — Spark forcuje VLLM_ATTENTION_BACKEND=FLASHINFER,
-    # wiec autotune ma sens 1:1. Wybiera najlepsze sm_121a kernele per
-    # (shape, dtype) przy pierwszym starcie, cache w VLLM_CACHE_ROOT.
-    "--enable-flashinfer-autotune",
+    # GB10/SM121 nie powinien startowac z FlashInfer autotune: autotuner
+    # testuje taktyki dla datacenter Blackwell i potrafi zuzyc dodatkowy VRAM
+    # albo opoznic gotowosc o kilkanascie minut.
+    "--no-enable-flashinfer-autotune",
     # NOTE: vllm 0.21.0 NIE ma juz `--swap-space` (flaga zostala wyrzucona).
     # Spark unified memory i tak nie potrzebuje CPU swap — default behaviour
     # OK. Dla offloadu (gdyby kiedys byl potrzebny) sa nowe: `--cpu-offload-gb`,
@@ -48,10 +48,8 @@ internal_port = 8000
 # eelbaz/dgx-spark-vllm-setup i eugr/spark-vllm-docker dla detali sm_121a.
 TORCH_CUDA_ARCH_LIST = "12.1a"
 VLLM_USE_FLASHINFER_MXFP4_MOE = "1"
-# FlashInfer attention backend ma natywne sm_121 kernele Blackwell.
-# Bez tej zmiennej vllm moze fallback na FlashAttention ktora celuje sm_120
-# i bywa wolniejsza na GB10.
-VLLM_ATTENTION_BACKEND = "FLASHINFER"
+VLLM_SKIP_P2P_CHECK = "1"
+TRITON_PTXAS_PATH = "/usr/local/cuda/bin/ptxas"
 
 [requires]
 gpu_memory_gb = 8

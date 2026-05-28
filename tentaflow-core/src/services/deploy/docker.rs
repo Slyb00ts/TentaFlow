@@ -428,20 +428,30 @@ impl DeployStrategy for DockerDeploy {
                 .or(from_vllm_args)
                 .or_else(super::auto_gpu_memory_utilization);
             if let Some(ratio) = ratio {
-                let cleaned = env
-                    .get("VLLM_ARGS")
-                    .map(|raw| super::strip_gpu_memory_utilization(raw))
-                    .unwrap_or_default();
-                let mut merged = Vec::new();
-                if !cleaned.is_empty() {
-                    merged.push(cleaned);
+                if let Some(raw) = env.get("VLLM_ARGS").cloned() {
+                    let cleaned = super::strip_gpu_memory_utilization(&raw);
+                    let mut merged = Vec::new();
+                    if !cleaned.is_empty() {
+                        merged.push(cleaned);
+                    }
+                    merged.push(format!("--gpu-memory-utilization {:.2}", ratio));
+                    let mut final_args = merged.join(" ");
+                    if self.manifest.engine.id == "vllm-spark" {
+                        final_args = super::normalize_vllm_spark_args(&final_args);
+                    }
+                    env.insert("VLLM_ARGS".into(), final_args);
                 }
-                merged.push(format!("--gpu-memory-utilization {:.2}", ratio));
-                let final_args = merged.join(" ");
-                env.insert("VLLM_ARGS".into(), final_args);
                 env.insert("GPU_MEMORY_UTILIZATION".into(), format!("{:.2}", ratio));
                 if let Some(s) = &self.log_sink {
                     s.info(&format!("[docker] gpu_memory_utilization={:.2}", ratio));
+                }
+            }
+            if self.manifest.engine.id == "vllm-spark" {
+                if let Some(raw) = env.get("VLLM_ARGS").cloned() {
+                    env.insert(
+                        "VLLM_ARGS".into(),
+                        super::normalize_vllm_spark_args(&raw),
+                    );
                 }
             }
         }

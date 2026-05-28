@@ -18,8 +18,8 @@ use super::{
     DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
     SmartProbeConfig, SmartProbeOutcome, auto_gpu_memory_utilization, build_endpoint_url,
     build_new_service, category_tag, host_os_supported, is_cuda_vllm_engine, models_from_manifest,
-    parse_gpu_memory_utilization_arg, query_cuda0_vram_mib, resolve_display_name,
-    smart_health_probe, strip_gpu_memory_utilization,
+    normalize_vllm_spark_args, parse_gpu_memory_utilization_arg, query_cuda0_vram_mib,
+    resolve_display_name, smart_health_probe, strip_gpu_memory_utilization,
 };
 use crate::deploy::process_ctl;
 use crate::deploy::python_venv::{self, NativeDeployRequest};
@@ -318,6 +318,10 @@ impl DeployStrategy for PythonBundleDeploy {
                 }
             }
         }
+        if engine_id == "vllm-spark" {
+            let raw = env.get("VLLM_ARGS").map(String::as_str).unwrap_or("");
+            env.insert("VLLM_ARGS".into(), normalize_vllm_spark_args(raw));
+        }
 
         let req = NativeDeployRequest {
             engine: engine_id.clone(),
@@ -507,6 +511,24 @@ mod tests {
     fn strip_no_op_when_flag_absent() {
         let raw = "--dtype auto --max-model-len 8192";
         assert_eq!(strip_gpu_memory_utilization(raw), raw);
+    }
+
+    #[test]
+    fn normalize_vllm_spark_args_forces_no_autotune() {
+        let raw = "--dtype auto --enable-flashinfer-autotune --max-model-len 8192";
+        assert_eq!(
+            normalize_vllm_spark_args(raw),
+            "--dtype auto --max-model-len 8192 --no-enable-flashinfer-autotune"
+        );
+    }
+
+    #[test]
+    fn normalize_vllm_spark_args_dedupes_no_autotune() {
+        let raw = "--no-enable-flashinfer-autotune --gpu-memory-utilization 0.70";
+        assert_eq!(
+            normalize_vllm_spark_args(raw),
+            "--gpu-memory-utilization 0.70 --no-enable-flashinfer-autotune"
+        );
     }
 
     #[test]
