@@ -2,9 +2,8 @@
 # =============================================================================
 # Plik: entrypoint.sh (vllm-spark)
 # Opis: Identyczny lifecycle co `llm/docker/vllm/entrypoint.sh` (sidecar QUIC
-#       + vllm OpenAI API rownolegle), ale z DGX Spark env baseline:
-#       TORCH_CUDA_ARCH_LIST=12.1a + VLLM_USE_FLASHINFER_MXFP4_MOE=1 zeby
-#       runtime nie cofal sie do sm_120 forward-compat na FP8/Mamba kernelach.
+#       + vllm OpenAI API rownolegle), ale z DGX Spark env baseline dla
+#       GB10/SM121 i stabilnego startu bez FlashInfer autotune.
 # =============================================================================
 
 set -uo pipefail
@@ -13,8 +12,8 @@ set -uo pipefail
 # dla deploy.native — duplikujemy tu zeby docker dzialal niezaleznie od bundla.
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 export VLLM_USE_FLASHINFER_MXFP4_MOE="${VLLM_USE_FLASHINFER_MXFP4_MOE:-1}"
-# FlashInfer attention backend — natywne sm_121 kernele.
-export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
+export VLLM_SKIP_P2P_CHECK="${VLLM_SKIP_P2P_CHECK:-1}"
+export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}"
 
 CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 [[ -f "$CONFIG_PATH" ]] || CONFIG_PATH=/app/config.default.toml
@@ -33,7 +32,8 @@ case "$GPU_COUNT" in
   *) AUTO_PARALLEL="--tensor-parallel-size $GPU_COUNT" ;;
 esac
 
-VLLM_ARGS="${VLLM_ARGS:---dtype auto --gpu-memory-utilization 0.9 --max-model-len 8192 --max-num-batched-tokens 8192 --enable-chunked-prefill --enable-prefix-caching --enable-flashinfer-autotune $AUTO_PARALLEL}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+VLLM_ARGS="${VLLM_ARGS:---dtype auto --gpu-memory-utilization $GPU_MEMORY_UTILIZATION --max-model-len 8192 --max-num-batched-tokens 8192 --enable-chunked-prefill --enable-prefix-caching --no-enable-flashinfer-autotune $AUTO_PARALLEL}"
 
 echo "[entrypoint] sidecar config=$CONFIG_PATH"
 NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \

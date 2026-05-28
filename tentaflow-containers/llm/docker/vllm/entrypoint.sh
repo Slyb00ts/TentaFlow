@@ -35,7 +35,8 @@ case "$GPU_COUNT" in
   *) AUTO_PARALLEL="--tensor-parallel-size $GPU_COUNT" ;;
 esac
 
-VLLM_ARGS="${VLLM_ARGS:---dtype auto --gpu-memory-utilization 0.9 --max-model-len 8192 --max-num-batched-tokens 8192 --enable-chunked-prefill --enable-prefix-caching --enable-flashinfer-autotune $AUTO_PARALLEL}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+VLLM_ARGS="${VLLM_ARGS:---dtype auto --gpu-memory-utilization $GPU_MEMORY_UTILIZATION --max-model-len 8192 --max-num-batched-tokens 8192 --enable-chunked-prefill --enable-prefix-caching --enable-flashinfer-autotune $AUTO_PARALLEL}"
 
 echo "[entrypoint] sidecar config=$CONFIG_PATH"
 NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
