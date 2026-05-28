@@ -47,13 +47,14 @@ RUN pip install --no-cache-dir \
 
 # Build env wymuszony PRZED `pip install -e .` zeby nvcc emitowal sm_121a
 # i resolver nie probowal sciagac prebuilt wheela z PyPI. Dwie z tych
-# zmiennych (TORCH_CUDA_ARCH_LIST, VLLM_USE_FLASHINFER_MXFP4_MOE) zostaja
-# tez w runtime — entrypoint.sh przepuszcza je przez `${VAR:-default}`.
+# zmiennych zostaje tez w runtime — entrypoint.sh przepuszcza je przez
+# `${VAR:-default}`.
 ENV TORCH_CUDA_ARCH_LIST="12.1a" \
     VLLM_TARGET_DEVICE="cuda" \
     VLLM_USE_PRECOMPILED="0" \
     VLLM_USE_FLASHINFER_MXFP4_MOE="1" \
-    VLLM_ATTENTION_BACKEND="FLASHINFER" \
+    VLLM_SKIP_P2P_CHECK="1" \
+    TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas" \
     MAX_JOBS="8"
 
 # Klon vllm @ v0.21.0 i build editable. Trzymamy `--depth 1` zeby skrocic
