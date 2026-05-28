@@ -7,39 +7,34 @@ use crate::db::DbPool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeploymentStatus {
-    Pending,
-    Running,
+    Deploying,
     Success,
     Failed,
+    Cancelled,
+    Interrupted,
 }
 
 impl DeploymentStatus {
     pub fn as_db_tag(self) -> &'static str {
         match self {
-            DeploymentStatus::Pending => "pending",
-            DeploymentStatus::Running => "running",
+            DeploymentStatus::Deploying => "deploying",
             DeploymentStatus::Success => "success",
             DeploymentStatus::Failed => "failed",
+            DeploymentStatus::Cancelled => "cancelled",
+            DeploymentStatus::Interrupted => "interrupted",
         }
     }
 
     pub fn parse(tag: &str) -> Result<Self> {
         Ok(match tag {
-            "pending" => Self::Pending,
-            "running" => Self::Running,
+            "deploying" => Self::Deploying,
             "success" => Self::Success,
             "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "interrupted" => Self::Interrupted,
             other => return Err(anyhow!("unknown deployment status: {}", other)),
         })
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct NewDeployment {
-    pub engine_id: String,
-    pub deploy_method: String,
-    pub status: DeploymentStatus,
-    pub config_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +43,10 @@ pub struct DeploymentRow {
     pub engine_id: String,
     pub deploy_method: String,
     pub status: DeploymentStatus,
+    pub target_service_id: Option<i64>,
+    pub node_id: String,
     pub started_at: String,
+    pub updated_at: String,
     pub finished_at: Option<String>,
     pub error_text: Option<String>,
     pub config_json: Option<String>,
@@ -61,7 +59,8 @@ pub struct DeploymentRow {
 // strukturze (slug/error_text) zeby nie psuc callerow, ale w SQL siegamy do
 // rzeczywistych nazw kolumn.
 const COLS: &str = "id, engine_id, deploy_method, status, started_at, finished_at, \
-    error_message AS error_text, config_json, deploy_id AS slug, log_tail";
+    error_message AS error_text, config_json, deploy_id AS slug, log_tail, \
+    target_service_id, node_id, updated_at";
 
 /// Maximum number of log lines kept in `log_tail`. Older lines are dropped
 /// FIFO-style when this limit is exceeded so the column stays bounded.
@@ -77,7 +76,10 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
         engine_id: row.get("engine_id")?,
         deploy_method: row.get("deploy_method")?,
         status,
+        target_service_id: row.get("target_service_id")?,
+        node_id: row.get("node_id")?,
         started_at: row.get("started_at")?,
+        updated_at: row.get("updated_at")?,
         finished_at: row.get("finished_at")?,
         error_text: row.get("error_text")?,
         config_json: row.get("config_json")?,
@@ -86,39 +88,27 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
     })
 }
 
-pub fn insert(conn: &Connection, new: &NewDeployment) -> Result<i64> {
-    // `deploy_id` jest NOT NULL UNIQUE w schemie. Caller niepodajacy slug-a
-    // dostaje wygenerowany UUID — wpis i tak musi miec stable handle
-    // (log streamowanie, status update przez log_bus klucza po deploy_id).
-    let deploy_id = uuid::Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO deployments (deploy_id, engine_id, deploy_method, status, config_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            deploy_id,
-            new.engine_id,
-            new.deploy_method,
-            new.status.as_db_tag(),
-            new.config_json.clone().unwrap_or_else(|| "{}".to_string()),
-        ],
-    )
-    .context("insert deployments")?;
-    Ok(conn.last_insert_rowid())
-}
-
-/// Inserts an audit row pre-bound to a client-supplied slug. Status is forced
-/// to `Running` because callers always create the row at the moment they
-/// kick off the deploy job. The slug must be unique (enforced at DB level).
 pub fn create_with_slug(
     conn: &Connection,
     engine_id: &str,
     deploy_method: &str,
     slug: &str,
+    node_id: &str,
+    target_service_id: i64,
+    config_json: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO deployments (engine_id, deploy_method, status, deploy_id) \
-         VALUES (?1, ?2, 'running', ?3)",
-        params![engine_id, deploy_method, slug],
+        "INSERT INTO deployments (
+             engine_id, deploy_method, status, deploy_id, node_id, target_service_id, config_json
+         ) VALUES (?1, ?2, 'deploying', ?3, ?4, ?5, ?6)",
+        params![
+            engine_id,
+            deploy_method,
+            slug,
+            node_id,
+            target_service_id,
+            config_json
+        ],
     )
     .context("insert deployments with slug")?;
     Ok(conn.last_insert_rowid())
@@ -183,11 +173,33 @@ pub fn mark_finished(
 ) -> Result<()> {
     let n = conn.execute(
         "UPDATE deployments SET status = ?2, finished_at = CURRENT_TIMESTAMP, \
-         error_message = ?3 WHERE id = ?1",
+         updated_at = CURRENT_TIMESTAMP, error_message = ?3 WHERE id = ?1",
         params![id, status.as_db_tag(), error_text],
     )?;
     if n == 0 {
         return Err(anyhow!("mark_finished: deployment id={} not found", id));
+    }
+    Ok(())
+}
+
+pub fn set_progress(
+    conn: &Connection,
+    slug: &str,
+    status: DeploymentStatus,
+    phase: &str,
+    progress_pct: u32,
+) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE deployments
+            SET status = ?2,
+                phase = ?3,
+                progress_pct = ?4,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE deploy_id = ?1",
+        params![slug, status.as_db_tag(), phase, progress_pct as i64],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("set_progress: slug='{}' not found", slug));
     }
     Ok(())
 }
@@ -209,6 +221,20 @@ pub fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<DeploymentRow>> 
     Ok(rows)
 }
 
+pub fn list_resumable(conn: &Connection) -> Result<Vec<DeploymentRow>> {
+    let sql = format!(
+        "SELECT {} FROM deployments
+          WHERE status = 'interrupted' AND target_service_id IS NOT NULL
+          ORDER BY id ASC",
+        COLS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], map_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,12 +247,25 @@ mod tests {
         Arc::new(Mutex::new(conn))
     }
 
+    fn insert_service(conn: &Connection) -> i64 {
+        crate::services_repo::services::insert(
+            conn,
+            &crate::services_repo::services::NewService::minimal(
+                "vllm",
+                crate::services_repo::services::DeployMethod::Docker,
+                crate::services::transport::Transport::HttpDirect,
+            ),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn slug_unique_constraint() {
         let db = open_db();
         let conn = db.lock().unwrap();
-        create_with_slug(&conn, "vllm", "docker", "abc123").unwrap();
-        let dup = create_with_slug(&conn, "vllm", "docker", "abc123");
+        let service_id = insert_service(&conn);
+        create_with_slug(&conn, "vllm", "docker", "abc123", "node-a", service_id, "{}").unwrap();
+        let dup = create_with_slug(&conn, "vllm", "docker", "abc123", "node-a", service_id, "{}");
         assert!(dup.is_err(), "duplicate slug must violate unique index");
     }
 
@@ -235,7 +274,9 @@ mod tests {
         let db = open_db();
         {
             let conn = db.lock().unwrap();
-            create_with_slug(&conn, "vllm", "docker", "slug-aa").unwrap();
+            let service_id = insert_service(&conn);
+            create_with_slug(&conn, "vllm", "docker", "slug-aa", "node-a", service_id, "{}")
+                .unwrap();
         }
         append_log_line(&db, "slug-aa", "hello").unwrap();
         append_log_line(&db, "slug-aa", "world").unwrap();
@@ -255,12 +296,22 @@ mod tests {
         let db = open_db();
         let id = {
             let conn = db.lock().unwrap();
-            create_with_slug(&conn, "ollama", "external", "slug-bb").unwrap()
+            let service_id = insert_service(&conn);
+            create_with_slug(
+                &conn,
+                "ollama",
+                "external",
+                "slug-bb",
+                "node-a",
+                service_id,
+                "{}",
+            )
+            .unwrap()
         };
         let row = get_by_slug(&db, "slug-bb").unwrap().unwrap();
         assert_eq!(row.id, id);
         assert_eq!(row.engine_id, "ollama");
         assert_eq!(row.deploy_method, "external");
-        assert_eq!(row.status, DeploymentStatus::Running);
+        assert_eq!(row.status, DeploymentStatus::Deploying);
     }
 }

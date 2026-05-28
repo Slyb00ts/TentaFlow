@@ -353,7 +353,12 @@ impl MeshCommandExecutor {
                 deploy_method,
                 config_json,
             } => {
-                self.handle_service_deploy_remote(&engine_id, &deploy_method, &config_json)
+                self.handle_service_deploy_remote(
+                    from_node_id,
+                    &engine_id,
+                    &deploy_method,
+                    &config_json,
+                )
                     .await
             }
             MeshCommandType::ServiceUpdateRemote {
@@ -819,6 +824,7 @@ impl MeshCommandExecutor {
 
     async fn handle_service_deploy_remote(
         &self,
+        requester_node_id: &str,
         engine_id: &str,
         deploy_method: &str,
         config_json: &str,
@@ -852,10 +858,45 @@ impl MeshCommandExecutor {
             }
         };
 
-        let slug = uuid::Uuid::new_v4().to_string();
+        let job = match crate::services::deploy::create_deploy_job(
+            resolved,
+            &manifest,
+            &user_config,
+            &actions.db,
+            &self.local_node_id,
+            None,
+            None,
+        ) {
+            Ok(job) => job,
+            Err(e) => return CommandResponse::fail(e.to_string()),
+        };
+
+        if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+            &actions.db,
+            job.service_id,
+            &self.local_node_id,
+        ) {
+            let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                from_node_id: self.local_node_id.clone(),
+                change: tentaflow_protocol::ServiceChange::Added(info),
+            };
+            if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
+                let _ = actions
+                    .iroh
+                    .broadcast_ufp2_to_trusted(
+                        tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                        &bytes,
+                        None,
+                    )
+                    .await;
+            }
+        }
+
+        let slug = job.deploy_id.clone();
         let log_sender = crate::deploy::log_bus::sender_for(&slug);
         let db_clone = actions.db.clone();
         let port_alloc = actions.port_allocator.clone();
+        let job_task = job.clone();
         let manifest_task = manifest.clone();
         let user_config_task = user_config.clone();
         let log_sender_task = log_sender.clone();
@@ -863,16 +904,110 @@ impl MeshCommandExecutor {
         let local_node_id_task = self.local_node_id.clone();
         let iroh_task = actions.iroh.clone();
 
+        {
+            let mut progress_rx = log_sender.subscribe();
+            let iroh_progress = actions.iroh.clone();
+            let local_node_id_progress = self.local_node_id.clone();
+            let requester_node_id_progress = requester_node_id.to_string();
+            let db_progress = actions.db.clone();
+            let service_id_progress = job.service_id;
+            tokio::spawn(async move {
+                loop {
+                    match progress_rx.recv().await {
+                        Ok(crate::deploy::log_bus::BusMessage::Line(line)) => {
+                            let should_publish_service =
+                                line.kind == "phase" || line.kind == "progress";
+                            if should_publish_service {
+                                if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+                                    &db_progress,
+                                    service_id_progress,
+                                    &local_node_id_progress,
+                                ) {
+                                    let payload =
+                                        tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                                            from_node_id: local_node_id_progress.clone(),
+                                            change: tentaflow_protocol::ServiceChange::Updated(
+                                                info,
+                                            ),
+                                        };
+                                    if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
+                                        let _ = iroh_progress
+                                            .broadcast_ufp2_to_trusted(
+                                                tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                                                &bytes,
+                                                None,
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
+                            let message = if line.line.is_empty() {
+                                line.phase.clone()
+                            } else {
+                                line.line.clone()
+                            };
+                            let payload =
+                                tentaflow_protocol::mesh::MeshMessage::MeshDeployProgress {
+                                    command_id: line.deploy_id,
+                                    from_node_id: local_node_id_progress.clone(),
+                                    phase: line.kind,
+                                    message,
+                                    percent: line.progress_pct.min(100) as u8,
+                                    is_done: false,
+                                };
+                            if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
+                                let _ = iroh_progress
+                                    .send_ufp2_to_peer(
+                                        &requester_node_id_progress,
+                                        tentaflow_protocol::mesh::MESH_MSG_DEPLOY_PROGRESS,
+                                        &bytes,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(crate::deploy::log_bus::BusMessage::End {
+                            deploy_id,
+                            final_status,
+                            error_message,
+                            ..
+                        }) => {
+                            let payload =
+                                tentaflow_protocol::mesh::MeshMessage::MeshDeployProgress {
+                                    command_id: deploy_id,
+                                    from_node_id: local_node_id_progress.clone(),
+                                    phase: final_status,
+                                    message: error_message,
+                                    percent: 100,
+                                    is_done: true,
+                                };
+                            if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
+                                let _ = iroh_progress
+                                    .send_ufp2_to_peer(
+                                        &requester_node_id_progress,
+                                        tentaflow_protocol::mesh::MESH_MSG_DEPLOY_PROGRESS,
+                                        &bytes,
+                                    )
+                                    .await;
+                            }
+                            return;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            });
+        }
+
         tokio::spawn(async move {
             let start_ms = crate::deploy::log_bus::now_ms();
             let result = crate::services::deploy::deploy(
+                job_task.clone(),
                 resolved,
                 &manifest_task,
                 &user_config_task,
                 &port_alloc,
                 &db_clone,
                 Some(log_sender_task.clone()),
-                Some(slug_task.clone()),
             )
             .await;
             match result {
@@ -895,7 +1030,7 @@ impl MeshCommandExecutor {
                     ) {
                         let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
                             from_node_id: local_node_id_task.clone(),
-                            change: tentaflow_protocol::ServiceChange::Added(info),
+                            change: tentaflow_protocol::ServiceChange::Updated(info),
                         };
                         if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
                             let _ = iroh_task
@@ -911,12 +1046,31 @@ impl MeshCommandExecutor {
                 Err(err) => {
                     let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
                         deploy_id: slug_task.clone(),
-                        final_status: "failure".to_string(),
+                        final_status: "failed".to_string(),
                         image_tag: String::new(),
                         container_name: String::new(),
                         error_message: err.to_string(),
                         duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
                     });
+                    if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+                        &db_clone,
+                        job_task.service_id,
+                        &local_node_id_task,
+                    ) {
+                        let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                            from_node_id: local_node_id_task.clone(),
+                            change: tentaflow_protocol::ServiceChange::Updated(info),
+                        };
+                        if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
+                            let _ = iroh_task
+                                .broadcast_ufp2_to_trusted(
+                                    tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                                    &bytes,
+                                    None,
+                                )
+                                .await;
+                        }
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     crate::deploy::log_bus::close(&slug_task);
                 }

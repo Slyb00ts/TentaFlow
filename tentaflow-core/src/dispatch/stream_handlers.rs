@@ -608,7 +608,11 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                 }
                 let final_status = match v2.status {
                     crate::services_repo::deployments::DeploymentStatus::Success => "success",
-                    crate::services_repo::deployments::DeploymentStatus::Failed => "failure",
+                    crate::services_repo::deployments::DeploymentStatus::Failed => "failed",
+                    crate::services_repo::deployments::DeploymentStatus::Cancelled => "cancelled",
+                    crate::services_repo::deployments::DeploymentStatus::Interrupted => {
+                        "interrupted"
+                    }
                     _ => "",
                 };
                 if !final_status.is_empty() {

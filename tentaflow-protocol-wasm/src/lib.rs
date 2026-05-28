@@ -2202,6 +2202,24 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                     set(&item, "healthLastErr", err.clone().into());
                     set(&item, "health_last_err", err.into());
                 }
+                set(&item, "activeDeployId", s.active_deploy_id.clone().into());
+                set(&item, "active_deploy_id", s.active_deploy_id.into());
+                set(&item, "lastDeployId", s.last_deploy_id.clone().into());
+                set(&item, "last_deploy_id", s.last_deploy_id.into());
+                set(
+                    &item,
+                    "deploymentProgressPct",
+                    s.deployment_progress_pct.into(),
+                );
+                set(
+                    &item,
+                    "deployment_progress_pct",
+                    s.deployment_progress_pct.into(),
+                );
+                if let Some(msg) = s.progress_message {
+                    set(&item, "progressMessage", msg.clone().into());
+                    set(&item, "progress_message", msg.into());
+                }
                 set(&item, "createdAt", s.created_at.clone().into());
                 set(&item, "created_at", s.created_at.into());
                 set(&item, "updatedAt", s.updated_at.clone().into());

@@ -1100,7 +1100,7 @@ impl IrohMeshManager {
     /// broadcast cannot share one wire blob the way the legacy
     /// raw discriminator path could) and send to every trusted peer except
     /// `exclude`. Returns per-peer results so callers can log failures.
-    pub(crate) async fn broadcast_ufp2_to_trusted(
+    pub async fn broadcast_ufp2_to_trusted(
         &self,
         legacy_discriminator: u8,
         data: &[u8],

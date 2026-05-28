@@ -11480,26 +11480,6 @@ pub mod deployments {
         })
     }
 
-    /// Tworzy wiersz deployment w status='queued'. Caller (runner) zmienia
-    /// status → 'building' → ... → 'success'/'failure'.
-    pub fn create(
-        pool: &DbPool,
-        deploy_id: &str,
-        engine_id: &str,
-        deploy_method: &str,
-        node_id: &str,
-        config_json: &str,
-        user_id: Option<i64>,
-    ) -> Result<i64> {
-        let conn = pool.lock().unwrap();
-        conn.execute(
-            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, config_json, user_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![deploy_id, engine_id, deploy_method, node_id, config_json, user_id],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
     pub fn set_status(
         pool: &DbPool,
         deploy_id: &str,
@@ -11509,7 +11489,7 @@ pub mod deployments {
     ) -> Result<()> {
         let conn = pool.lock().unwrap();
         conn.execute(
-            "UPDATE deployments SET status = ?2, phase = ?3, progress_pct = ?4 WHERE deploy_id = ?1",
+            "UPDATE deployments SET status = ?2, phase = ?3, progress_pct = ?4, updated_at = CURRENT_TIMESTAMP WHERE deploy_id = ?1",
             params![deploy_id, status, phase, progress_pct as i64],
         )?;
         Ok(())
@@ -11543,6 +11523,7 @@ pub mod deployments {
         conn.execute(
             "UPDATE deployments SET status = ?2, finished_at = datetime('now'),
                  progress_pct = CASE WHEN ?2 = 'success' THEN 100 ELSE progress_pct END,
+                 updated_at = CURRENT_TIMESTAMP,
                  error_message = ?3 WHERE deploy_id = ?1",
             params![deploy_id, final_status, error_message],
         )?;
@@ -11626,16 +11607,25 @@ pub mod deployments {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Deployy w stanie 'queued' lub 'running'-ish zostawione przez crash.
-    /// Startup cleanup oznacza je jako 'failure' z error='aborted by shutdown'.
+    /// Deployy niedokończone przez shutdown zostają widoczne jako interrupted.
     pub fn reset_stale(pool: &DbPool) -> Result<u32> {
         let conn = pool.lock().unwrap();
         let n = conn.execute(
             "UPDATE deployments
-             SET status = 'failure',
+             SET status = 'interrupted',
                  finished_at = datetime('now'),
-                 error_message = 'aborted by tentaflow shutdown'
-             WHERE status NOT IN ('success', 'failure', 'cancelled')",
+                 updated_at = CURRENT_TIMESTAMP,
+                 error_message = 'interrupted by tentaflow shutdown'
+             WHERE status NOT IN ('success', 'failed', 'cancelled', 'interrupted')",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE services
+                SET status = 'interrupted',
+                    health_last_err = 'interrupted by tentaflow shutdown',
+                    progress_message = 'interrupted by tentaflow shutdown',
+                    updated_at = CURRENT_TIMESTAMP
+              WHERE status = 'deploying'",
             [],
         )?;
         Ok(n as u32)

@@ -385,7 +385,10 @@ impl Supervisor {
                 );
                 continue;
             }
-            if !matches!(svc.status, ServiceStatus::Stopped | ServiceStatus::Failed) {
+            if !matches!(
+                svc.status,
+                ServiceStatus::Stopped | ServiceStatus::Failed | ServiceStatus::Interrupted
+            ) {
                 continue;
             }
             tracing::info!(
@@ -1378,6 +1381,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: Some("http://127.0.0.1:1".into()),
                     config_json: "{}".into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap()
@@ -1441,6 +1447,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: None,
                     config_json: "{}".into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap();
@@ -1491,6 +1500,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: None,
                     config_json: "{}".into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap()
@@ -1606,6 +1618,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: None,
                     config_json: r#"{"timeout_ms":45000,"weight":75}"#.into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap();
@@ -1674,6 +1689,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: None,
                     config_json: "{}".into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap();
@@ -1742,6 +1760,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: None,
                     config_json: "{}".into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap()
@@ -1790,6 +1811,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: None,
                     config_json: "{}".into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap()
@@ -1848,6 +1872,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: None,
                     config_json: "{}".into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap()
@@ -1885,6 +1912,9 @@ mod tests {
                     sidecar_quic_port: None,
                     endpoint_url: None,
                     config_json: "{}".into(),
+                    active_deploy_id: String::new(),
+                    last_deploy_id: String::new(),
+                    deployment_progress_pct: 0,
                 },
             )
             .unwrap()
@@ -1931,6 +1961,9 @@ mod tests {
             endpoint_url: None,
             restart_count: 0,
             health_last_err: None,
+            active_deploy_id: String::new(),
+            last_deploy_id: String::new(),
+            deployment_progress_pct: 0,
             progress_message: None,
             models: vec![tentaflow_protocol::ServiceModelEntry {
                 model_name: "qwen-tiny".into(),

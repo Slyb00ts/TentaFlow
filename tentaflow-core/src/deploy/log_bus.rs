@@ -117,12 +117,12 @@ pub fn progress(
     tx: &tokio::sync::broadcast::Sender<BusMessage>,
     pct: u32,
 ) {
-    let _ = deployments_repo::set_status(db, deploy_id, "building", "building", pct);
+    let _ = deployments_repo::set_status(db, deploy_id, "deploying", "deploying", pct);
     let _ = tx.send(BusMessage::Line(LogLine {
         deploy_id: deploy_id.to_string(),
         kind: "progress".to_string(),
         line: String::new(),
-        phase: "building".to_string(),
+        phase: "deploying".to_string(),
         progress_pct: pct,
         ts_ms: now_ms(),
     }));
@@ -176,10 +176,10 @@ pub async fn fail(
     msg: &str,
 ) {
     let _ = deployments_repo::append_log_line(db, deploy_id, &format!("[error] {}", msg));
-    let _ = deployments_repo::mark_finished(db, deploy_id, "failure", Some(msg));
+    let _ = deployments_repo::mark_finished(db, deploy_id, "failed", Some(msg));
     let _ = tx.send(BusMessage::End {
         deploy_id: deploy_id.to_string(),
-        final_status: "failure".to_string(),
+        final_status: "failed".to_string(),
         image_tag: String::new(),
         container_name: String::new(),
         error_message: msg.to_string(),
