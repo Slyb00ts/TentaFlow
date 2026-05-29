@@ -40,7 +40,6 @@
     "section_integrations": "Intégrations",
     "section_management": "Gestion",
     "section_apps": "Mes applications",
-    "section_network": "Réseau",
     "section_account": "Compte",
     "apps_home": "Toutes les applications",
     "images": "Images",
@@ -50,8 +49,6 @@
     "search_app": "Rechercher",
     "flows_user": "Flux",
     "prompts_user": "Invites",
-    "mesh_user": "Mesh (aperçu)",
-    "tailscale_user": "Tailscale",
     "profile": "Profil",
     "my_accounts": "Mes comptes",
     "settings_user": "Paramètres"
@@ -400,9 +397,9 @@
     "tab_sso": "SSO / OIDC",
     "tab_oauth": "OAuth",
     "tab_tls": "TLS",
-    "tab_ngc": "NVIDIA NGC",
+    "tab_external_access": "Accès externes",
     "general_title": "Paramètres globaux",
-    "general_hint": "Paires clé–valeur brutes de la base de données. Les modifications sont appliquées immédiatement. Les sections spéciales (TLS, NGC, OAuth) ont leurs propres onglets.",
+    "general_hint": "Paires clé–valeur brutes de la base de données. Les modifications sont appliquées immédiatement. Les sections spéciales (TLS, OAuth, accès externes) ont leurs propres onglets.",
     "general_empty": "Aucun paramètre en base",
     "saved": "Enregistré",
     "refresh": "Actualiser",
@@ -436,6 +433,12 @@
     "ngc_hint": "Requis pour récupérer les conteneurs NVIDIA NIM. Obtenez votre clé sur build.nvidia.com.",
     "ngc_key_label": "API Key",
     "ngc_save_empty": "Saisir la clé NGC pour enregistrer",
+    "external_hf_title": "Hugging Face",
+    "external_hf_hint": "Token utilisé pour télécharger les modèles et config.json depuis les dépôts nécessitant une autorisation.",
+    "external_hf_token": "Token Hugging Face",
+    "external_hf_save_empty": "Saisir un token Hugging Face pour l'enregistrer",
+    "external_configured": "Configuré",
+    "external_not_configured": "Non configuré",
     "speakers": {
       "title": "Reconnaissance des locuteurs",
       "conf_high": "Confiance élevée (speaker_confidence_high)",
@@ -2411,9 +2414,7 @@
     "meeting": "Meeting Bot nécessite l’addon teams-bot avec OAuth et un handler binaire pour les transcriptions. Dans la feuille de route.",
     "tts": "La synthèse vocale nécessite un moteur TTS déployé et un handler de synthèse. Les règles admin existent déjà ; le parcours utilisateur est dans la feuille de route.",
     "translate": "Traduire réutilisera le backend LLM du chat dès qu’un handler utilisateur dédié sera branché. Dans la feuille de route.",
-    "search": "La recherche dans tes données est dans la feuille de route.",
-    "mesh_user": "La vue mesh utilisateur est dans la feuille de route. Les admins la voient sous Core → Mesh.",
-    "tailscale": "La vue Tailscale utilisateur est dans la feuille de route."
+    "search": "La recherche dans tes données est dans la feuille de route."
   },
   "profile": {
     "title": "Profil",

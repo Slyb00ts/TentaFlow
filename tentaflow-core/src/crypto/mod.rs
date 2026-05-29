@@ -169,6 +169,7 @@ const ENCRYPTED_SETTING_KEYS: &[&str] = &[
     "node_private_key",
     "node_x25519_private_key",
     "ngc_api_key",
+    "hf_token",
 ];
 
 /// Okresla sciezke do master key — priorytet: custom_dir, document_dir (iOS sandbox), home_dir, data_dir
@@ -344,7 +345,7 @@ pub fn migrate_plaintext_secrets(
     let mut migrated = 0;
     for key in ENCRYPTED_SETTING_KEYS {
         if let Some(val) = crate::db::repository::get_setting(pool, key)? {
-            if !val.starts_with(ENCRYPTED_PREFIX) {
+            if !val.is_empty() && !val.starts_with(ENCRYPTED_PREFIX) {
                 let encrypted = cipher.encrypt(&val)?;
                 crate::db::repository::set_setting(pool, key, &encrypted)?;
                 migrated += 1;

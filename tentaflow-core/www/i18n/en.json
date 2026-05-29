@@ -41,7 +41,6 @@
     "section_integrations": "Integrations",
     "section_management": "Management",
     "section_apps": "My apps",
-    "section_network": "Network",
     "section_account": "Account",
     "apps_home": "All apps",
     "images": "Images",
@@ -51,8 +50,6 @@
     "search_app": "Search",
     "flows_user": "Workflows",
     "prompts_user": "Prompts",
-    "mesh_user": "Mesh (preview)",
-    "tailscale_user": "Tailscale",
     "profile": "Profile",
     "my_accounts": "My accounts",
     "settings_user": "Settings"
@@ -443,9 +440,9 @@
     "tab_oauth": "OAuth",
     "tab_tls": "TLS",
     "tab_mesh": "Mesh & Network",
-    "tab_ngc": "NVIDIA NGC",
+    "tab_external_access": "External Access",
     "general_title": "Global settings",
-    "general_hint": "Raw key–value pairs from DB. Changes apply immediately. Special sections (TLS, NGC, OAuth) are handled in dedicated tabs.",
+    "general_hint": "Raw key–value pairs from DB. Changes apply immediately. Special sections (TLS, OAuth, external access) are handled in dedicated tabs.",
     "general_empty": "No settings in DB",
     "saved": "Saved",
     "refresh": "Refresh",
@@ -479,6 +476,12 @@
     "ngc_hint": "Required to pull NVIDIA NIM containers. Get your key at build.nvidia.com.",
     "ngc_key_label": "API Key",
     "ngc_save_empty": "Enter NGC key to save",
+    "external_hf_title": "Hugging Face",
+    "external_hf_hint": "Token used to download models and config.json from repositories that require authorization.",
+    "external_hf_token": "Hugging Face token",
+    "external_hf_save_empty": "Enter a Hugging Face token to save it",
+    "external_configured": "Configured",
+    "external_not_configured": "Not configured",
     "speakers": {
       "title": "Speaker Recognition",
       "conf_high": "High confidence (speaker_confidence_high)",
@@ -3341,9 +3344,7 @@
     "meeting": "Meeting Bot requires the teams-bot addon with OAuth configured, plus a backend binary handler for transcripts. Tracked on the roadmap.",
     "tts": "Text-to-Speech requires a deployed TTS engine and a synthesize binary handler. The TTS rules admin already exists; the user-facing synthesize flow is tracked on the roadmap.",
     "translate": "Translate will reuse the chat LLM backend once a dedicated user-facing handler is wired. Tracked on the roadmap.",
-    "search": "Search across your data is on the roadmap.",
-    "mesh_user": "A user-facing mesh status view is on the roadmap. Admins can view mesh state under Core → Mesh.",
-    "tailscale": "User-facing Tailscale status is on the roadmap."
+    "search": "Search across your data is on the roadmap."
   },
   "profile": {
     "title": "Profile",

@@ -40,7 +40,6 @@
     "section_integrations": "Integraciones",
     "section_management": "Gestión",
     "section_apps": "Mis aplicaciones",
-    "section_network": "Red",
     "section_account": "Cuenta",
     "apps_home": "Todas las aplicaciones",
     "images": "Imágenes",
@@ -50,8 +49,6 @@
     "search_app": "Buscar",
     "flows_user": "Flujos",
     "prompts_user": "Indicaciones",
-    "mesh_user": "Malla (vista previa)",
-    "tailscale_user": "Tailscale",
     "profile": "Perfil",
     "my_accounts": "Mis cuentas",
     "settings_user": "Ajustes"
@@ -400,9 +397,9 @@
     "tab_sso": "SSO / OIDC",
     "tab_oauth": "OAuth",
     "tab_tls": "TLS",
-    "tab_ngc": "NVIDIA NGC",
+    "tab_external_access": "Accesos externos",
     "general_title": "Ajustes globales",
-    "general_hint": "Pares clave–valor brutos de la base de datos. Los cambios se aplican de inmediato. Las secciones especiales (TLS, NGC, OAuth) tienen pestañas dedicadas.",
+    "general_hint": "Pares clave–valor brutos de la base de datos. Los cambios se aplican de inmediato. Las secciones especiales (TLS, OAuth, accesos externos) tienen pestañas dedicadas.",
     "general_empty": "Sin ajustes en la base de datos",
     "saved": "Guardado",
     "refresh": "Actualizar",
@@ -436,6 +433,12 @@
     "ngc_hint": "Necesario para descargar contenedores NVIDIA NIM. Obtén tu clave en build.nvidia.com.",
     "ngc_key_label": "API Key",
     "ngc_save_empty": "Introduce la clave NGC para guardar",
+    "external_hf_title": "Hugging Face",
+    "external_hf_hint": "Token usado para descargar modelos y config.json desde repositorios que requieren autorización.",
+    "external_hf_token": "Token de Hugging Face",
+    "external_hf_save_empty": "Introduce un token de Hugging Face para guardarlo",
+    "external_configured": "Configurado",
+    "external_not_configured": "No configurado",
     "speakers": {
       "title": "Reconocimiento de hablantes",
       "conf_high": "Confianza alta (speaker_confidence_high)",
@@ -2411,9 +2414,7 @@
     "meeting": "Meeting Bot requiere el addon teams-bot con OAuth y un handler binario de transcripciones. En la hoja de ruta.",
     "tts": "Texto a voz requiere un motor TTS desplegado y un handler de síntesis. Las reglas para admin ya existen; el flujo de usuario está en la hoja de ruta.",
     "translate": "Traducir reutilizará el backend de chat LLM cuando se conecte un handler dedicado de usuario. En la hoja de ruta.",
-    "search": "La búsqueda en tus datos está en la hoja de ruta.",
-    "mesh_user": "La vista de mesh para el usuario está en la hoja de ruta. Los admins la ven en Core → Mesh.",
-    "tailscale": "La vista de Tailscale para el usuario está en la hoja de ruta."
+    "search": "La búsqueda en tus datos está en la hoja de ruta."
   },
   "profile": {
     "title": "Perfil",
