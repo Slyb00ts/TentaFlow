@@ -1833,8 +1833,17 @@ pub fn settings_update(
     };
 
     let mut applied = 0u32;
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     for entry in &payload.entries {
-        let result = if entry.is_secret {
+        let result = if entry.is_secret && repository::is_shared_secret_setting_key(&entry.key) {
+            repository::set_shared_secret_setting_secure(
+                &ctx.state.db,
+                &entry.key,
+                &entry.value,
+                &ctx.state.settings_cipher,
+                user_id,
+            )
+        } else if entry.is_secret {
             repository::set_setting_secure(
                 &ctx.state.db,
                 &entry.key,
@@ -1850,7 +1859,6 @@ pub fn settings_update(
         }
     }
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
         user_id,

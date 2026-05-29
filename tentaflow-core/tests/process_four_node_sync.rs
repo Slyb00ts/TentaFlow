@@ -643,9 +643,9 @@ async fn child_main() {
 
     let db = tentaflow_core::db::init(&home.join("data").join("tentaflow.db")).expect("db");
     let cipher = std::sync::Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[0x44; 32]));
-    let security = std::sync::Arc::new(MeshSecurity::new(db.clone(), cipher).expect("security"));
+    let security = std::sync::Arc::new(MeshSecurity::new(db.clone(), cipher.clone()).expect("security"));
     let _runtime =
-        tentaflow_core::sync::runtime::init(db.clone(), security.clone()).expect("runtime");
+        tentaflow_core::sync::runtime::init(db.clone(), security.clone(), cipher).expect("runtime");
     let local_node_id = security.ed25519_public_key_hex();
     let mesh = std::sync::Arc::new(
         IrohMeshManager::new(

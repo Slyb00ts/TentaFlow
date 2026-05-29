@@ -126,6 +126,10 @@ hash-chain oraz Merkle summary dla ciaglych zakresow partycji.
 `sync::runtime::init()` zawsze zwraca autorytatywna globalna instancje
 `SyncRuntime` z `OnceLock`, wiec handlery dispatch i caller startowy nie moga
 rozjechac sie na dwoch roznych runtime'ach po ponownej inicjalizacji.
+Sekrety zewnetrznych integracji zapisane w `settings` sa synchronizowane tylko
+przez jawna allowliste `core.shared_setting_secret` (`hf_token`, `ngc_api_key`).
+Nadawca zapisuje lokalnie wartosc zaszyfrowana swoim `SettingsCipher`, ledger
+niesie wartosc operacji, a odbiorca materializuje ja ponownie lokalnym szyfrem.
 Identity Registry dla syncu jest w migracji `sync_identity_registry` i
 repozytorium `db::repository`: `sync_nodes` przechowuje techniczna tozsamosc
 node/device, `user_identity_keys` przechowuje kryptograficzne klucze usera, a

@@ -27,6 +27,7 @@ pub enum CoreSyncResourceKind {
     SyncPolicy,
     SyncResourceAcl,
     SyncExplicitShare,
+    SharedSettingSecret,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +227,15 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "sync-control",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::SharedSettingSecret,
+        table_name: "settings",
+        resource_type: "core.shared_setting_secret",
+        primary_key_column: "key",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "external-credentials",
     },
 ];
 

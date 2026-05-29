@@ -612,6 +612,95 @@ pub fn set_setting_secure(
     }
 }
 
+pub fn is_shared_secret_setting_key(key: &str) -> bool {
+    matches!(key, "hf_token" | "ngc_api_key")
+}
+
+fn shared_secret_setting_fields(
+    key: &str,
+    value: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("key".to_string(), field_string(key));
+    fields.insert("value".to_string(), field_string(value));
+    fields
+}
+
+pub fn set_shared_secret_setting_secure(
+    pool: &DbPool,
+    key: &str,
+    value: &str,
+    cipher: &crate::crypto::SettingsCipher,
+    actor_user_id: Option<i64>,
+) -> Result<()> {
+    if !is_shared_secret_setting_key(key) {
+        anyhow::bail!("setting nie jest syncowalnym sekretem: {}", key);
+    }
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let encrypted = cipher.encrypt(value).map_err(|e| anyhow::anyhow!("{}", e))?;
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+        rusqlite::params![key, encrypted],
+    )?;
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
+        key,
+        crate::sync::runtime::SqlWriteAction::Update,
+        shared_secret_setting_fields(key, value),
+        actor_user_id,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn enqueue_existing_shared_secret_settings(
+    pool: &DbPool,
+    cipher: &crate::crypto::SettingsCipher,
+) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let mut count = 0usize;
+    for key in ["hf_token", "ngc_api_key"] {
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw_value) = raw else {
+            continue;
+        };
+        if raw_value.is_empty() {
+            continue;
+        }
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = 'core.shared_setting_secret' AND resource_id = ?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        )?;
+        if existing > 0 {
+            continue;
+        }
+        let value = cipher.decrypt(&raw_value).map_err(|e| anyhow::anyhow!("{}", e))?;
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
+            key,
+            crate::sync::runtime::SqlWriteAction::Update,
+            shared_secret_setting_fields(key, &value),
+            None,
+        )?;
+        count += 1;
+    }
+    tx.commit()?;
+    Ok(count)
+}
+
 /// Usuwa ustawienie po kluczu (CR-016: jednorazowe tokeny SSO state)
 pub fn delete_setting(pool: &DbPool, key: &str) -> Result<()> {
     let conn = acquire(pool)?;
