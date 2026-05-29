@@ -10,13 +10,18 @@
 pub mod macros;
 
 pub mod camera;
+pub mod camera_metadata;
 pub mod canonical;
 pub mod control;
 pub mod envelope;
+pub mod flow;
 pub mod frame;
+pub mod gate;
 pub mod ids;
 pub mod recording;
+pub mod services;
 pub mod stream;
 pub mod streaming;
 pub mod ui;
 pub mod value;
+pub mod vector;
