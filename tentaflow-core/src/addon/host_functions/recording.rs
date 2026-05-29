@@ -5,9 +5,9 @@
 // 7 host functions that bridge addon-side WASM calls to the
 // `services::recording` filesystem layer and the `services::signed_urls`
 // HMAC issuers. Each call:
-//   1. enforces input payload size BEFORE materializing a String,
-//   2. parses TOML, validates ownership / refs / lengths,
-//   3. enforces permission,
+//   1. enforces permission,
+//   2. enforces input payload size BEFORE materializing bytes and decodes CBOR,
+//   3. validates ownership / refs / lengths,
 //   4. mutates filesystem + DB and/or issues a signed URL,
 //   5. records an audit-log entry on every exit path (ok / denied / error),
 //   6. enforces output payload max before write_output_with_retry_semantics.
@@ -24,13 +24,16 @@ use std::sync::OnceLock;
 
 use base64::Engine;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use tentaflow_sdk_spec::{
+    FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingRefInput,
+    RecordingSaveSegmentInput, RecordingSaveSnapshotInput, RecordingStatsInput, SaveRecordingOut,
+    StatsOut, StatsPerCamera, StatsTotals, UrlOut,
+};
 use tracing::warn;
 
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
-use super::{
-    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
-};
+use super::abi_helpers::{enforce_payload_size, PayloadKind};
+use super::cbor_io::{decode_cbor_exact, read_input_cbor, write_cbor_capped};
+use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller};
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
@@ -93,144 +96,8 @@ fn validate_frame_ref(s: &str) -> Result<(), &'static str> {
 }
 
 // =============================================================================
-// Payload structs — input / output
+// Helpers — audit + risk mapping + output estimation
 // =============================================================================
-
-#[derive(Debug, Deserialize)]
-struct SaveSnapshotInput {
-    camera_id: String,
-    frame_ref: String,
-    retention_class: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SaveSegmentInput {
-    camera_id: String,
-    duration_secs: u32,
-    retention_class: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RecordingRefInput {
-    recording_ref: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GetUrlInput {
-    recording_ref: String,
-    ttl_secs: u64,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct StatsInput {
-    #[serde(default)]
-    camera_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FrameUrlInput {
-    frame_ref: String,
-    ttl_secs: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct SaveRecordingOut {
-    recording_ref: String,
-    file_path: String,
-    file_size_bytes: u64,
-    duration_ms: Option<u32>,
-    width: Option<u32>,
-    height: Option<u32>,
-    hash_sha256: String,
-    created_at: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct UrlOut {
-    url: String,
-    expires_unix_ms: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct GetStreamOut {
-    data_b64: String,
-    file_size_bytes: u64,
-    hash_sha256: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PurgeOut {
-    purged: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsPerCamera {
-    camera_id: String,
-    snapshots: u64,
-    segments: u64,
-    size_bytes: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsTotals {
-    total_snapshots: u64,
-    total_segments: u64,
-    total_size_bytes: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsOut {
-    stats: StatsTotals,
-    per_camera: Vec<StatsPerCamera>,
-}
-
-// =============================================================================
-// Helpers — TOML io + audit + risk mapping
-// =============================================================================
-
-fn read_input_toml(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &WasmCaller<'_, AddonState>,
-    input_ptr: i32,
-    input_len: i32,
-) -> Result<String, AbiError> {
-    if input_len < 0 {
-        return Err(AbiError::Operation);
-    }
-    if enforce_payload_size(input_len as usize, PayloadKind::ServiceCall).is_err() {
-        return Err(AbiError::PayloadTooLarge);
-    }
-    let bytes =
-        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| AbiError::Operation)
-}
-
-fn write_toml_capped<T: Serialize>(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &mut WasmCaller<'_, AddonState>,
-    value: &T,
-    out_ptr: i32,
-    out_cap: i32,
-    out_len_ptr: i32,
-) -> i32 {
-    let serialized = match toml::to_string(value) {
-        Ok(s) => s,
-        Err(_) => return AbiError::Operation.as_i32(),
-    };
-    if enforce_payload_size(serialized.len(), PayloadKind::ServiceCall).is_err() {
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-    write_output_with_retry_semantics(
-        memory,
-        caller,
-        serialized.as_bytes(),
-        out_ptr,
-        out_cap,
-        out_len_ptr,
-    )
-}
 
 fn audit(
     state: &AddonState,
@@ -278,10 +145,10 @@ fn map_recording_error(e: &RecordingError) -> AbiError {
     }
 }
 
-/// Estimate the TOML output size for `recording_get_stream_v1` given a raw
-/// file size in bytes. Returns `None` if any arithmetic step would overflow.
-/// `data_b64` expands to `ceil(N/3)*4` bytes; we add a 256 B TOML envelope
-/// allowance for keys, the SHA-256 hex (64 B) and numeric fields.
+/// Estimate the CBOR output size for `recording_get_stream_v1` given a raw file
+/// size in bytes. Returns `None` if any arithmetic step would overflow.
+/// `data_b64` expands to `ceil(N/3)*4` bytes; we add a 256 B envelope allowance
+/// for map keys, the SHA-256 hex (64 B) and numeric fields.
 fn estimate_get_stream_output(file_size_bytes: i64) -> Option<usize> {
     if file_size_bytes < 0 {
         return None;
@@ -315,24 +182,6 @@ pub fn recording_save_snapshot_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "recording.save_snapshot",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_RECORDING_WRITE, None) {
         audit(
             caller.data(),
@@ -344,185 +193,31 @@ pub fn recording_save_snapshot_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: SaveSnapshotInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.save_snapshot",
-                None,
-                RiskClass::A,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-    if let Err(reason) = validate_frame_ref(&input.frame_ref) {
-        audit(
-            caller.data(),
-            "recording.save_snapshot",
-            Some(&input.camera_id),
-            RiskClass::A,
-            "denied",
-            Some(reason),
-        );
-        return AbiError::Operation.as_i32();
-    }
-    if let Some(rc) = input.retention_class.as_ref() {
-        if rc.len() > MAX_RETENTION_CLASS || !retention_class_valid(rc) {
-            audit(
-                caller.data(),
-                "recording.save_snapshot",
-                Some(&input.camera_id),
-                RiskClass::A,
-                "denied",
-                Some("invalid_retention_class"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    }
-
-    let addon_id = caller.data().addon_id.clone();
-    let db = caller.data().db.clone();
-    // Ownership check + retention pull from cameras table.
-    let cam_row = match get_camera_for_addon(
-        &db,
-        &addon_id,
-        &input.camera_id,
-        caller.data().org_id.as_deref(),
-    ) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            audit(
-                caller.data(),
-                "recording.save_snapshot",
-                Some(&input.camera_id),
-                RiskClass::A,
-                "denied",
-                Some("camera_not_found_or_not_owned"),
-            );
-            return AbiError::NotFound.as_i32();
-        }
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.save_snapshot",
-                Some(&input.camera_id),
-                RiskClass::A,
-                "error",
-                Some("db_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-    let retention_class = input
-        .retention_class
-        .clone()
-        .unwrap_or_else(|| cam_row.retention_class.clone());
-    let risk = risk_for_retention(&retention_class);
-
-    // Pull frame from LRU. peek via get; if the frame metadata's camera does
-    // not match the validated `camera_id`, treat as NotFound (no cross-camera
-    // capture).
-    let stored = match frame_storage().get(&RawFrameRef::from_string(input.frame_ref.clone())) {
-        Some(f) => f,
-        None => {
-            audit(
-                caller.data(),
-                "recording.save_snapshot",
-                Some(&input.frame_ref),
-                risk,
-                "denied",
-                Some("frame_ref_not_found"),
-            );
-            return AbiError::NotFound.as_i32();
-        }
-    };
-    if stored.metadata.camera_id != input.camera_id {
-        audit(
-            caller.data(),
-            "recording.save_snapshot",
-            Some(&input.frame_ref),
-            risk,
-            "denied",
-            Some("frame_camera_mismatch"),
-        );
-        return AbiError::NotFound.as_i32();
-    }
-
-    let width = stored.metadata.width;
-    let height = stored.metadata.height;
-    let camera_id = input.camera_id.clone();
-    let data: Vec<u8> = stored.data.to_vec();
-    let saved: SavedRecording =
-        match run_async(save_snapshot_rgb24(&camera_id, &data, width, height)) {
+    let input: RecordingSaveSnapshotInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len) {
             Ok(v) => v,
             Err(e) => {
-                let mapped = map_recording_error(&e);
                 audit(
                     caller.data(),
                     "recording.save_snapshot",
-                    Some(&camera_id),
-                    risk,
+                    None,
+                    RiskClass::A,
                     "error",
-                    Some(&format!("save_failed: {e}")),
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
                 );
-                return mapped.as_i32();
+                return e.as_i32();
             }
         };
-
-    let file_path_str = saved.file_path.to_string_lossy().to_string();
-    let org_id = caller.data().org_id.clone();
-    if let Err(e) = insert_recording(
-        &db,
-        saved.recording_ref.as_str(),
-        "snapshot",
-        &addon_id,
-        &camera_id,
-        &file_path_str,
-        saved.file_size_bytes as i64,
-        None,
-        saved.width.map(|v| v as i64),
-        saved.height.map(|v| v as i64),
-        saved.pixel_format.as_deref(),
-        &saved.hash_sha256,
-        &retention_class,
-        org_id.as_deref(),
-    ) {
-        warn!("recording.save_snapshot insert_recording failed (compensating purge): {e}");
-        let _ = run_async(purge_recording(&saved.file_path));
-        audit(
-            caller.data(),
-            "recording.save_snapshot",
-            Some(&camera_id),
-            risk,
-            "error",
-            Some("db_insert_failed"),
-        );
-        return AbiError::Operation.as_i32();
+    match save_snapshot_core(caller.data(), &input) {
+        CoreResult::Ok(out) => {
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+        }
+        CoreResult::Err(code) => code,
     }
-
-    let recording_ref = saved.recording_ref.as_str().to_string();
-    audit(
-        caller.data(),
-        "recording.save_snapshot",
-        Some(&recording_ref),
-        risk,
-        "ok",
-        None,
-    );
-    let out = SaveRecordingOut {
-        recording_ref,
-        file_path: file_path_str,
-        file_size_bytes: saved.file_size_bytes,
-        duration_ms: saved.duration_ms,
-        width: saved.width,
-        height: saved.height,
-        hash_sha256: saved.hash_sha256,
-        created_at: saved.created_at,
-    };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
 // =============================================================================
@@ -541,24 +236,6 @@ pub fn recording_save_segment_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "recording.save_segment",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_RECORDING_WRITE, None) {
         audit(
             caller.data(),
@@ -570,175 +247,31 @@ pub fn recording_save_segment_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: SaveSegmentInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.save_segment",
-                None,
-                RiskClass::A,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
+    let input: RecordingSaveSegmentInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "recording.save_segment",
+                    None,
+                    RiskClass::A,
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
+    match save_segment_core(caller.data(), &input) {
+        CoreResult::Ok(out) => {
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
-    };
-    if !(1..=60).contains(&input.duration_secs) {
-        audit(
-            caller.data(),
-            "recording.save_segment",
-            Some(&input.camera_id),
-            RiskClass::A,
-            "denied",
-            Some("duration_out_of_range"),
-        );
-        return AbiError::Operation.as_i32();
+        CoreResult::Err(code) => code,
     }
-    if let Some(rc) = input.retention_class.as_ref() {
-        if rc.len() > MAX_RETENTION_CLASS || !retention_class_valid(rc) {
-            audit(
-                caller.data(),
-                "recording.save_segment",
-                Some(&input.camera_id),
-                RiskClass::A,
-                "denied",
-                Some("invalid_retention_class"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    }
-
-    let addon_id = caller.data().addon_id.clone();
-    let db = caller.data().db.clone();
-    let cam_row = match get_camera_for_addon(
-        &db,
-        &addon_id,
-        &input.camera_id,
-        caller.data().org_id.as_deref(),
-    ) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            audit(
-                caller.data(),
-                "recording.save_segment",
-                Some(&input.camera_id),
-                RiskClass::A,
-                "denied",
-                Some("camera_not_found_or_not_owned"),
-            );
-            return AbiError::NotFound.as_i32();
-        }
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.save_segment",
-                Some(&input.camera_id),
-                RiskClass::A,
-                "error",
-                Some("db_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-    let retention_class = input
-        .retention_class
-        .clone()
-        .unwrap_or_else(|| cam_row.retention_class.clone());
-    let risk = risk_for_retention(&retention_class);
-
-    // Source URL is always the camera row's stored URL — never accepted from
-    // the addon — so an addon can't pivot recording into reading arbitrary
-    // host files. F1a only supports `vendor='fake_file'`; reject anything else
-    // before invoking the GStreamer pipeline.
-    if cam_row.vendor != "fake_file" {
-        audit(
-            caller.data(),
-            "recording.save_segment",
-            Some(&input.camera_id),
-            risk,
-            "denied",
-            Some("vendor_unsupported"),
-        );
-        return AbiError::Operation.as_i32();
-    }
-    let camera_id = input.camera_id.clone();
-    let source_url = if cam_row.url.starts_with("file://") {
-        cam_row.url.clone()
-    } else {
-        format!("file://{}", cam_row.url)
-    };
-    let saved: SavedRecording = match run_async(save_segment_mp4(
-        &camera_id,
-        &source_url,
-        input.duration_secs,
-    )) {
-        Ok(v) => v,
-        Err(e) => {
-            let mapped = map_recording_error(&e);
-            audit(
-                caller.data(),
-                "recording.save_segment",
-                Some(&camera_id),
-                risk,
-                "error",
-                Some(&format!("save_failed: {e}")),
-            );
-            return mapped.as_i32();
-        }
-    };
-
-    let file_path_str = saved.file_path.to_string_lossy().to_string();
-    let org_id = caller.data().org_id.clone();
-    if let Err(e) = insert_recording(
-        &db,
-        saved.recording_ref.as_str(),
-        "segment",
-        &addon_id,
-        &camera_id,
-        &file_path_str,
-        saved.file_size_bytes as i64,
-        saved.duration_ms.map(|v| v as i64),
-        None,
-        None,
-        None,
-        &saved.hash_sha256,
-        &retention_class,
-        org_id.as_deref(),
-    ) {
-        warn!("recording.save_segment insert_recording failed (compensating purge): {e}");
-        let _ = run_async(purge_recording(&saved.file_path));
-        audit(
-            caller.data(),
-            "recording.save_segment",
-            Some(&camera_id),
-            risk,
-            "error",
-            Some("db_insert_failed"),
-        );
-        return AbiError::Operation.as_i32();
-    }
-
-    let recording_ref = saved.recording_ref.as_str().to_string();
-    audit(
-        caller.data(),
-        "recording.save_segment",
-        Some(&recording_ref),
-        risk,
-        "ok",
-        None,
-    );
-    let out = SaveRecordingOut {
-        recording_ref,
-        file_path: file_path_str,
-        file_size_bytes: saved.file_size_bytes,
-        duration_ms: saved.duration_ms,
-        width: None,
-        height: None,
-        hash_sha256: saved.hash_sha256,
-        created_at: saved.created_at,
-    };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
 // =============================================================================
@@ -757,24 +290,6 @@ pub fn recording_get_url_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "recording.get_url",
-                None,
-                RiskClass::B,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_RECORDING_READ, None) {
         audit(
             caller.data(),
@@ -786,95 +301,31 @@ pub fn recording_get_url_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: GetUrlInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.get_url",
-                None,
-                RiskClass::B,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
+    let input: RecordingGetUrlInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "recording.get_url",
+                    None,
+                    RiskClass::B,
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
+    match get_url_core(caller.data(), &input) {
+        CoreResult::Ok(out) => {
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
-    };
-    if let Err(reason) = validate_recording_ref(&input.recording_ref) {
-        audit(
-            caller.data(),
-            "recording.get_url",
-            None,
-            RiskClass::B,
-            "denied",
-            Some(reason),
-        );
-        return AbiError::Operation.as_i32();
+        CoreResult::Err(code) => code,
     }
-
-    let addon_id = caller.data().addon_id.clone();
-    let db = caller.data().db.clone();
-    let org_id = caller.data().org_id.clone();
-    match get_recording_for_addon(&db, &addon_id, &input.recording_ref, org_id.as_deref()) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            audit(
-                caller.data(),
-                "recording.get_url",
-                Some(&input.recording_ref),
-                RiskClass::B,
-                "denied",
-                Some("not_found_or_not_owned"),
-            );
-            return AbiError::NotFound.as_i32();
-        }
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.get_url",
-                Some(&input.recording_ref),
-                RiskClass::B,
-                "error",
-                Some("db_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    }
-
-    let issued = match recording_url_issuer().issue(input.recording_ref.clone(), input.ttl_secs) {
-        Ok(u) => u,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "recording.get_url",
-                Some(&input.recording_ref),
-                RiskClass::B,
-                "denied",
-                Some(&format!("issue_failed: {e}")),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-    // ref validated by `validate_recording_ref` — safe to interpolate into a
-    // URL path (only [a-f0-9-] plus the snap_/clip_ prefix).
-    let url = format!(
-        "/recordings/{}?{}",
-        input.recording_ref,
-        issued.query_string()
-    );
-    audit(
-        caller.data(),
-        "recording.get_url",
-        Some(&input.recording_ref),
-        RiskClass::B,
-        "ok",
-        None,
-    );
-    let out = UrlOut {
-        url,
-        expires_unix_ms: issued.expiry_unix_ms,
-    };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
 // =============================================================================
@@ -893,24 +344,6 @@ pub fn recording_get_stream_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "recording.get_stream",
-                None,
-                RiskClass::B,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_RECORDING_READ, None) {
         audit(
             caller.data(),
@@ -922,132 +355,30 @@ pub fn recording_get_stream_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingRefInput = match toml::from_str(&raw) {
+    let input: RecordingRefInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             audit(
                 caller.data(),
                 "recording.get_stream",
                 None,
                 RiskClass::B,
                 "error",
-                Some("invalid_toml"),
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
-    if let Err(reason) = validate_recording_ref(&input.recording_ref) {
-        audit(
-            caller.data(),
-            "recording.get_stream",
-            None,
-            RiskClass::B,
-            "denied",
-            Some(reason),
-        );
-        return AbiError::Operation.as_i32();
+    match get_stream_core(caller.data(), &input) {
+        CoreResult::Ok(out) => {
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+        }
+        CoreResult::Err(code) => code,
     }
-
-    let addon_id = caller.data().addon_id.clone();
-    let db = caller.data().db.clone();
-    let org_id = caller.data().org_id.clone();
-    let row = match get_recording_for_addon(&db, &addon_id, &input.recording_ref, org_id.as_deref())
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            audit(
-                caller.data(),
-                "recording.get_stream",
-                Some(&input.recording_ref),
-                RiskClass::B,
-                "denied",
-                Some("not_found_or_not_owned"),
-            );
-            return AbiError::NotFound.as_i32();
-        }
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.get_stream",
-                Some(&input.recording_ref),
-                RiskClass::B,
-                "error",
-                Some("db_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-    // Enforce the ServiceCall ceiling BEFORE reading the file, accounting for
-    // base64 expansion + TOML envelope. ceil(N/3)*4 bytes of base64 plus a
-    // 256 B headroom for TOML keys (`data_b64=`, `file_size_bytes=`, hash hex,
-    // newlines) — addons calling get_stream on a multi-MB file shouldn't blow
-    // host RAM only to have the response rejected after the read.
-    if let Some(est) = estimate_get_stream_output(row.file_size_bytes) {
-        if est > PayloadKind::ServiceCall.max_bytes() {
-            audit(
-                caller.data(),
-                "recording.get_stream",
-                Some(&input.recording_ref),
-                RiskClass::B,
-                "error",
-                Some("payload_too_large"),
-            );
-            return AbiError::PayloadTooLarge.as_i32();
-        }
-    } else {
-        audit(
-            caller.data(),
-            "recording.get_stream",
-            Some(&input.recording_ref),
-            RiskClass::B,
-            "error",
-            Some("payload_too_large"),
-        );
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-
-    let file_path = std::path::PathBuf::from(&row.file_path);
-    let bytes = match run_async(read_recording(&file_path)) {
-        Ok(b) => b,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "recording.get_stream",
-                Some(&input.recording_ref),
-                RiskClass::B,
-                "error",
-                Some(&format!("read_failed: {e}")),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-    if enforce_payload_size(bytes.len(), PayloadKind::ServiceCall).is_err() {
-        audit(
-            caller.data(),
-            "recording.get_stream",
-            Some(&input.recording_ref),
-            RiskClass::B,
-            "error",
-            Some("payload_too_large"),
-        );
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-
-    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let out = GetStreamOut {
-        data_b64,
-        file_size_bytes: bytes.len() as u64,
-        hash_sha256: row.hash_sha256,
-    };
-    audit(
-        caller.data(),
-        "recording.get_stream",
-        Some(&input.recording_ref),
-        RiskClass::B,
-        "ok",
-        None,
-    );
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
 // =============================================================================
@@ -1066,24 +397,6 @@ pub fn recording_purge_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "recording.purge",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_RECORDING_WRITE, None) {
         audit(
             caller.data(),
@@ -1095,102 +408,30 @@ pub fn recording_purge_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingRefInput = match toml::from_str(&raw) {
+    let input: RecordingRefInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             audit(
                 caller.data(),
                 "recording.purge",
                 None,
                 RiskClass::A,
                 "error",
-                Some("invalid_toml"),
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
-    if let Err(reason) = validate_recording_ref(&input.recording_ref) {
-        audit(
-            caller.data(),
-            "recording.purge",
-            None,
-            RiskClass::A,
-            "denied",
-            Some(reason),
-        );
-        return AbiError::Operation.as_i32();
-    }
-
-    let addon_id = caller.data().addon_id.clone();
-    let db = caller.data().db.clone();
-    let org_id = caller.data().org_id.clone();
-    let row = match get_recording_for_addon(&db, &addon_id, &input.recording_ref, org_id.as_deref())
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            audit(
-                caller.data(),
-                "recording.purge",
-                Some(&input.recording_ref),
-                RiskClass::A,
-                "denied",
-                Some("not_found_or_not_owned"),
-            );
-            return AbiError::NotFound.as_i32();
+    match purge_core(caller.data(), &input) {
+        CoreResult::Ok(out) => {
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.purge",
-                Some(&input.recording_ref),
-                RiskClass::A,
-                "error",
-                Some("db_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-
-    let file_path = std::path::PathBuf::from(&row.file_path);
-    // Honest audit: if FS removal fails, do not soft-delete the DB row and do
-    // not claim success — the addon must be able to retry. `purge_recording`
-    // already treats NotFound as Ok (idempotent), so a returned Err here means
-    // a real I/O failure.
-    if let Err(e) = run_async(purge_recording(&file_path)) {
-        warn!("recording.purge file removal failed (aborting purge): {e}");
-        audit(
-            caller.data(),
-            "recording.purge",
-            Some(&input.recording_ref),
-            RiskClass::A,
-            "error",
-            Some("purge_io_error"),
-        );
-        return AbiError::Operation.as_i32();
+        CoreResult::Err(code) => code,
     }
-    if let Err(_e) = soft_delete_recording(&db, &addon_id, &input.recording_ref, org_id.as_deref())
-    {
-        audit(
-            caller.data(),
-            "recording.purge",
-            Some(&input.recording_ref),
-            RiskClass::A,
-            "error",
-            Some("db_soft_delete_failed"),
-        );
-        return AbiError::Operation.as_i32();
-    }
-
-    audit(
-        caller.data(),
-        "recording.purge",
-        Some(&input.recording_ref),
-        RiskClass::A,
-        "ok",
-        None,
-    );
-    let out = PurgeOut { purged: true };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
 // =============================================================================
@@ -1209,42 +450,6 @@ pub fn recording_stats_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    // Empty payload is OK — `StatsInput` defaults to "no filter". A negative
-    // `input_len` is always a protocol error and must surface as InvalidArgument
-    // rather than being silently re-interpreted as "no filter".
-    if input_len < 0 {
-        audit(
-            caller.data(),
-            "recording.stats",
-            None,
-            RiskClass::B,
-            "error",
-            Some("invalid_input_len"),
-        );
-        return AbiError::Operation.as_i32();
-    }
-    let raw = if input_len == 0 {
-        String::new()
-    } else {
-        match read_input_toml(&memory, &caller, input_ptr, input_len) {
-            Ok(s) => s,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "recording.stats",
-                    None,
-                    RiskClass::B,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "input_read_failed"
-                    }),
-                );
-                return e.as_i32();
-            }
-        }
-    };
     if !check_permission(caller.data(), PERM_RECORDING_READ, None) {
         audit(
             caller.data(),
@@ -1256,75 +461,48 @@ pub fn recording_stats_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: StatsInput = if raw.is_empty() {
-        StatsInput::default()
+    // Empty payload is OK — `RecordingStatsInput` defaults to "no filter". A
+    // negative `input_len` is always a protocol error and must surface as an
+    // error rather than being silently re-interpreted as "no filter".
+    if input_len < 0 {
+        audit(
+            caller.data(),
+            "recording.stats",
+            None,
+            RiskClass::B,
+            "error",
+            Some("invalid_input_len"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    let input: RecordingStatsInput = if input_len == 0 {
+        RecordingStatsInput::default()
     } else {
-        match toml::from_str(&raw) {
+        match read_input_cbor(&memory, &caller, input_ptr, input_len) {
             Ok(v) => v,
-            Err(_) => {
+            Err(e) => {
                 audit(
                     caller.data(),
                     "recording.stats",
                     None,
                     RiskClass::B,
                     "error",
-                    Some("invalid_toml"),
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
                 );
-                return AbiError::Operation.as_i32();
+                return e.as_i32();
             }
         }
     };
-
-    let addon_id = caller.data().addon_id.clone();
-    let db = caller.data().db.clone();
-    let org_id = caller.data().org_id.clone();
-    let agg: RecordingStatsAggregate = match recording_stats_for_addon(
-        &db,
-        &addon_id,
-        input.camera_id.as_deref(),
-        org_id.as_deref(),
-    ) {
-        Ok(a) => a,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.stats",
-                None,
-                RiskClass::B,
-                "error",
-                Some("db_error"),
-            );
-            return AbiError::Operation.as_i32();
+    match stats_core(caller.data(), &input) {
+        CoreResult::Ok(out) => {
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
-    };
-
-    let per_camera: Vec<StatsPerCamera> = agg
-        .per_camera
-        .into_iter()
-        .map(|r| StatsPerCamera {
-            camera_id: r.camera_id,
-            snapshots: r.snapshots,
-            segments: r.segments,
-            size_bytes: r.size_bytes,
-        })
-        .collect();
-    let out = StatsOut {
-        stats: StatsTotals {
-            total_snapshots: agg.total_snapshots,
-            total_segments: agg.total_segments,
-            total_size_bytes: agg.total_size_bytes,
-        },
-        per_camera,
-    };
-    audit(
-        caller.data(),
-        "recording.stats",
-        None,
-        RiskClass::B,
-        "ok",
-        None,
-    );
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+        CoreResult::Err(code) => code,
+    }
 }
 
 // =============================================================================
@@ -1343,24 +521,6 @@ pub fn frame_url_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "recording.frame_url",
-                None,
-                RiskClass::B,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_RECORDING_READ, None) {
         audit(
             caller.data(),
@@ -1372,216 +532,49 @@ pub fn frame_url_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: FrameUrlInput = match toml::from_str(&raw) {
+    let input: FrameUrlInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
         Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.frame_url",
-                None,
-                RiskClass::B,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-    if let Err(reason) = validate_frame_ref(&input.frame_ref) {
-        audit(
-            caller.data(),
-            "recording.frame_url",
-            None,
-            RiskClass::B,
-            "denied",
-            Some(reason),
-        );
-        return AbiError::Operation.as_i32();
-    }
-
-    let stored = match frame_storage().get(&RawFrameRef::from_string(input.frame_ref.clone())) {
-        Some(f) => f,
-        None => {
-            audit(
-                caller.data(),
-                "recording.frame_url",
-                Some(&input.frame_ref),
-                RiskClass::B,
-                "denied",
-                Some("frame_ref_not_found"),
-            );
-            return AbiError::NotFound.as_i32();
-        }
-    };
-    // Ownership: the frame's `camera_id` must resolve to a camera owned by
-    // the calling addon. We swallow the DB row beyond ownership — the
-    // frame_url doesn't expose camera metadata.
-    let addon_id = caller.data().addon_id.clone();
-    let db = caller.data().db.clone();
-    match get_camera_for_addon(
-        &db,
-        &addon_id,
-        &stored.metadata.camera_id,
-        caller.data().org_id.as_deref(),
-    ) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            audit(
-                caller.data(),
-                "recording.frame_url",
-                Some(&input.frame_ref),
-                RiskClass::B,
-                "denied",
-                Some("camera_not_owned"),
-            );
-            return AbiError::NotFound.as_i32();
-        }
-        Err(_) => {
-            audit(
-                caller.data(),
-                "recording.frame_url",
-                Some(&input.frame_ref),
-                RiskClass::B,
-                "error",
-                Some("db_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    }
-
-    let issued = match frame_url_issuer().issue(input.frame_ref.clone(), input.ttl_secs) {
-        Ok(u) => u,
         Err(e) => {
             audit(
                 caller.data(),
                 "recording.frame_url",
-                Some(&input.frame_ref),
+                None,
                 RiskClass::B,
-                "denied",
-                Some(&format!("issue_failed: {e}")),
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
-    let url = format!("/frames/{}?{}", input.frame_ref, issued.query_string());
-    audit(
-        caller.data(),
-        "recording.frame_url",
-        Some(&input.frame_ref),
-        RiskClass::B,
-        "ok",
-        None,
-    );
-    let out = UrlOut {
-        url,
-        expires_unix_ms: issued.expiry_unix_ms,
-    };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    match frame_url_core(caller.data(), &input) {
+        CoreResult::Ok(out) => {
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+        }
+        CoreResult::Err(code) => code,
+    }
 }
 
 // =============================================================================
-// Test surface — sync entry points so integration tests can drive the host
-// functions without standing up a wasmtime Store.
+// Pure-Rust cores — operate on decoded sdk-spec inputs and an explicit
+// `AddonState`, returning a typed sdk-spec output or an ABI error code. The
+// permission gate lives in the host wrappers (and the test_api shim) before
+// decode; the cores assume permission was already granted.
 // =============================================================================
 
 #[doc(hidden)]
-pub mod test_api {
-    use super::*;
-
-    /// Wraps `recording_save_snapshot_v1` for tests: accepts a TOML payload as
-    /// raw bytes and the AddonState directly, returning the same TOML output
-    /// (or an empty Vec on error) plus the ABI return code. Skips the wasmtime
-    /// caller indirection that requires an InstancePool.
-    pub fn save_snapshot_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, save_snapshot_core)
-    }
-
-    pub fn save_segment_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, save_segment_core)
-    }
-
-    pub fn get_url_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, get_url_core)
-    }
-
-    pub fn get_stream_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, get_stream_core)
-    }
-
-    pub fn purge_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, purge_core)
-    }
-
-    pub fn stats_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, stats_core)
-    }
-
-    pub fn frame_url_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, frame_url_core)
-    }
-
-    fn run_input(
-        state: &AddonState,
-        raw_input: &[u8],
-        f: fn(&AddonState, &str) -> CoreResult,
-    ) -> (i32, Vec<u8>) {
-        if enforce_payload_size(raw_input.len(), PayloadKind::ServiceCall).is_err() {
-            return (AbiError::PayloadTooLarge.as_i32(), Vec::new());
-        }
-        let raw = match std::str::from_utf8(raw_input) {
-            Ok(s) => s,
-            Err(_) => return (AbiError::Operation.as_i32(), Vec::new()),
-        };
-        match f(state, raw) {
-            CoreResult::Ok(bytes) => (AbiError::Ok.as_i32(), bytes),
-            CoreResult::Err(code) => (code, Vec::new()),
-        }
-    }
-}
-
-#[doc(hidden)]
-pub enum CoreResult {
-    Ok(Vec<u8>),
+pub enum CoreResult<T> {
+    Ok(T),
     Err(i32),
 }
 
-fn serialize<T: Serialize>(v: &T) -> CoreResult {
-    match toml::to_string(v) {
-        Ok(s) => {
-            if enforce_payload_size(s.len(), PayloadKind::ServiceCall).is_err() {
-                return CoreResult::Err(AbiError::PayloadTooLarge.as_i32());
-            }
-            CoreResult::Ok(s.into_bytes())
-        }
-        Err(_) => CoreResult::Err(AbiError::Operation.as_i32()),
-    }
-}
-
-fn save_snapshot_core(state: &AddonState, raw: &str) -> CoreResult {
-    if !check_permission(state, PERM_RECORDING_WRITE, None) {
-        audit(
-            state,
-            "recording.save_snapshot",
-            None,
-            RiskClass::A,
-            "denied",
-            Some("missing_permission"),
-        );
-        return CoreResult::Err(AbiError::Permission.as_i32());
-    }
-    let input: SaveSnapshotInput = match toml::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                state,
-                "recording.save_snapshot",
-                None,
-                RiskClass::A,
-                "error",
-                Some("invalid_toml"),
-            );
-            return CoreResult::Err(AbiError::Operation.as_i32());
-        }
-    };
+fn save_snapshot_core(
+    state: &AddonState,
+    input: &RecordingSaveSnapshotInput,
+) -> CoreResult<SaveRecordingOut> {
     if let Err(reason) = validate_frame_ref(&input.frame_ref) {
         audit(
             state,
@@ -1642,6 +635,8 @@ fn save_snapshot_core(state: &AddonState, raw: &str) -> CoreResult {
         .unwrap_or_else(|| cam_row.retention_class.clone());
     let risk = risk_for_retention(&retention_class);
 
+    // Pull frame from LRU; if the frame metadata's camera does not match the
+    // validated `camera_id`, treat as NotFound (no cross-camera capture).
     let stored = match frame_storage().get(&RawFrameRef::from_string(input.frame_ref.clone())) {
         Some(f) => f,
         None => {
@@ -1723,7 +718,7 @@ fn save_snapshot_core(state: &AddonState, raw: &str) -> CoreResult {
         "ok",
         None,
     );
-    let out = SaveRecordingOut {
+    CoreResult::Ok(SaveRecordingOut {
         recording_ref: saved.recording_ref.as_str().to_string(),
         file_path: file_path_str,
         file_size_bytes: saved.file_size_bytes,
@@ -1732,36 +727,13 @@ fn save_snapshot_core(state: &AddonState, raw: &str) -> CoreResult {
         height: saved.height,
         hash_sha256: saved.hash_sha256,
         created_at: saved.created_at,
-    };
-    serialize(&out)
+    })
 }
 
-fn save_segment_core(state: &AddonState, raw: &str) -> CoreResult {
-    if !check_permission(state, PERM_RECORDING_WRITE, None) {
-        audit(
-            state,
-            "recording.save_segment",
-            None,
-            RiskClass::A,
-            "denied",
-            Some("missing_permission"),
-        );
-        return CoreResult::Err(AbiError::Permission.as_i32());
-    }
-    let input: SaveSegmentInput = match toml::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                state,
-                "recording.save_segment",
-                None,
-                RiskClass::A,
-                "error",
-                Some("invalid_toml"),
-            );
-            return CoreResult::Err(AbiError::Operation.as_i32());
-        }
-    };
+fn save_segment_core(
+    state: &AddonState,
+    input: &RecordingSaveSegmentInput,
+) -> CoreResult<SaveRecordingOut> {
     if !(1..=60).contains(&input.duration_secs) {
         audit(
             state,
@@ -1822,6 +794,10 @@ fn save_segment_core(state: &AddonState, raw: &str) -> CoreResult {
         .unwrap_or_else(|| cam_row.retention_class.clone());
     let risk = risk_for_retention(&retention_class);
 
+    // Source URL is always the camera row's stored URL — never accepted from
+    // the addon — so an addon can't pivot recording into reading arbitrary
+    // host files. F1a only supports `vendor='fake_file'`; reject anything else
+    // before invoking the GStreamer pipeline.
     if cam_row.vendor != "fake_file" {
         audit(
             state,
@@ -1894,7 +870,7 @@ fn save_segment_core(state: &AddonState, raw: &str) -> CoreResult {
         "ok",
         None,
     );
-    let out = SaveRecordingOut {
+    CoreResult::Ok(SaveRecordingOut {
         recording_ref: saved.recording_ref.as_str().to_string(),
         file_path: file_path_str,
         file_size_bytes: saved.file_size_bytes,
@@ -1903,36 +879,10 @@ fn save_segment_core(state: &AddonState, raw: &str) -> CoreResult {
         height: None,
         hash_sha256: saved.hash_sha256,
         created_at: saved.created_at,
-    };
-    serialize(&out)
+    })
 }
 
-fn get_url_core(state: &AddonState, raw: &str) -> CoreResult {
-    if !check_permission(state, PERM_RECORDING_READ, None) {
-        audit(
-            state,
-            "recording.get_url",
-            None,
-            RiskClass::B,
-            "denied",
-            Some("missing_permission"),
-        );
-        return CoreResult::Err(AbiError::Permission.as_i32());
-    }
-    let input: GetUrlInput = match toml::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                state,
-                "recording.get_url",
-                None,
-                RiskClass::B,
-                "error",
-                Some("invalid_toml"),
-            );
-            return CoreResult::Err(AbiError::Operation.as_i32());
-        }
-    };
+fn get_url_core(state: &AddonState, input: &RecordingGetUrlInput) -> CoreResult<UrlOut> {
     if let Err(reason) = validate_recording_ref(&input.recording_ref) {
         audit(
             state,
@@ -1996,43 +946,20 @@ fn get_url_core(state: &AddonState, raw: &str) -> CoreResult {
         "ok",
         None,
     );
+    // ref validated by `validate_recording_ref` — safe to interpolate into a
+    // URL path (only [a-f0-9-] plus the snap_/clip_ prefix).
     let url = format!(
         "/recordings/{}?{}",
         input.recording_ref,
         issued.query_string()
     );
-    serialize(&UrlOut {
+    CoreResult::Ok(UrlOut {
         url,
         expires_unix_ms: issued.expiry_unix_ms,
     })
 }
 
-fn get_stream_core(state: &AddonState, raw: &str) -> CoreResult {
-    if !check_permission(state, PERM_RECORDING_READ, None) {
-        audit(
-            state,
-            "recording.get_stream",
-            None,
-            RiskClass::B,
-            "denied",
-            Some("missing_permission"),
-        );
-        return CoreResult::Err(AbiError::Permission.as_i32());
-    }
-    let input: RecordingRefInput = match toml::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                state,
-                "recording.get_stream",
-                None,
-                RiskClass::B,
-                "error",
-                Some("invalid_toml"),
-            );
-            return CoreResult::Err(AbiError::Operation.as_i32());
-        }
-    };
+fn get_stream_core(state: &AddonState, input: &RecordingRefInput) -> CoreResult<GetStreamOut> {
     if let Err(reason) = validate_recording_ref(&input.recording_ref) {
         audit(
             state,
@@ -2074,6 +1001,10 @@ fn get_stream_core(state: &AddonState, raw: &str) -> CoreResult {
             return CoreResult::Err(AbiError::Operation.as_i32());
         }
     };
+    // Enforce the ServiceCall ceiling BEFORE reading the file, accounting for
+    // base64 expansion + CBOR envelope — addons calling get_stream on a
+    // multi-MB file shouldn't blow host RAM only to have the response rejected
+    // after the read.
     match estimate_get_stream_output(row.file_size_bytes) {
         Some(est) if est <= PayloadKind::ServiceCall.max_bytes() => {}
         _ => {
@@ -2122,40 +1053,14 @@ fn get_stream_core(state: &AddonState, raw: &str) -> CoreResult {
         "ok",
         None,
     );
-    let out = GetStreamOut {
+    CoreResult::Ok(GetStreamOut {
         data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
         file_size_bytes: bytes.len() as u64,
         hash_sha256: row.hash_sha256,
-    };
-    serialize(&out)
+    })
 }
 
-fn purge_core(state: &AddonState, raw: &str) -> CoreResult {
-    if !check_permission(state, PERM_RECORDING_WRITE, None) {
-        audit(
-            state,
-            "recording.purge",
-            None,
-            RiskClass::A,
-            "denied",
-            Some("missing_permission"),
-        );
-        return CoreResult::Err(AbiError::Permission.as_i32());
-    }
-    let input: RecordingRefInput = match toml::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                state,
-                "recording.purge",
-                None,
-                RiskClass::A,
-                "error",
-                Some("invalid_toml"),
-            );
-            return CoreResult::Err(AbiError::Operation.as_i32());
-        }
-    };
+fn purge_core(state: &AddonState, input: &RecordingRefInput) -> CoreResult<PurgeOut> {
     if let Err(reason) = validate_recording_ref(&input.recording_ref) {
         audit(
             state,
@@ -2198,6 +1103,10 @@ fn purge_core(state: &AddonState, raw: &str) -> CoreResult {
         }
     };
     let file_path = std::path::PathBuf::from(&row.file_path);
+    // Honest audit: if FS removal fails, do not soft-delete the DB row and do
+    // not claim success — the addon must be able to retry. `purge_recording`
+    // already treats NotFound as Ok (idempotent), so a returned Err here means
+    // a real I/O failure.
     if let Err(e) = run_async(purge_recording(&file_path)) {
         warn!("recording.purge file removal failed (aborting purge): {e}");
         audit(
@@ -2236,40 +1145,11 @@ fn purge_core(state: &AddonState, raw: &str) -> CoreResult {
         "ok",
         None,
     );
-    serialize(&PurgeOut { purged: true })
+    CoreResult::Ok(PurgeOut { purged: true })
 }
 
-fn stats_core(state: &AddonState, raw: &str) -> CoreResult {
-    if !check_permission(state, PERM_RECORDING_READ, None) {
-        audit(
-            state,
-            "recording.stats",
-            None,
-            RiskClass::B,
-            "denied",
-            Some("missing_permission"),
-        );
-        return CoreResult::Err(AbiError::Permission.as_i32());
-    }
-    let input: StatsInput = if raw.trim().is_empty() {
-        StatsInput::default()
-    } else {
-        match toml::from_str(raw) {
-            Ok(v) => v,
-            Err(_) => {
-                audit(
-                    state,
-                    "recording.stats",
-                    None,
-                    RiskClass::B,
-                    "error",
-                    Some("invalid_toml"),
-                );
-                return CoreResult::Err(AbiError::Operation.as_i32());
-            }
-        }
-    };
-    let agg = match recording_stats_for_addon(
+fn stats_core(state: &AddonState, input: &RecordingStatsInput) -> CoreResult<StatsOut> {
+    let agg: RecordingStatsAggregate = match recording_stats_for_addon(
         &state.db,
         &state.addon_id,
         input.camera_id.as_deref(),
@@ -2298,44 +1178,18 @@ fn stats_core(state: &AddonState, raw: &str) -> CoreResult {
             size_bytes: r.size_bytes,
         })
         .collect();
-    let out = StatsOut {
+    audit(state, "recording.stats", None, RiskClass::B, "ok", None);
+    CoreResult::Ok(StatsOut {
         stats: StatsTotals {
             total_snapshots: agg.total_snapshots,
             total_segments: agg.total_segments,
             total_size_bytes: agg.total_size_bytes,
         },
         per_camera,
-    };
-    audit(state, "recording.stats", None, RiskClass::B, "ok", None);
-    serialize(&out)
+    })
 }
 
-fn frame_url_core(state: &AddonState, raw: &str) -> CoreResult {
-    if !check_permission(state, PERM_RECORDING_READ, None) {
-        audit(
-            state,
-            "recording.frame_url",
-            None,
-            RiskClass::B,
-            "denied",
-            Some("missing_permission"),
-        );
-        return CoreResult::Err(AbiError::Permission.as_i32());
-    }
-    let input: FrameUrlInput = match toml::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                state,
-                "recording.frame_url",
-                None,
-                RiskClass::B,
-                "error",
-                Some("invalid_toml"),
-            );
-            return CoreResult::Err(AbiError::Operation.as_i32());
-        }
-    };
+fn frame_url_core(state: &AddonState, input: &FrameUrlInput) -> CoreResult<UrlOut> {
     if let Err(reason) = validate_frame_ref(&input.frame_ref) {
         audit(
             state,
@@ -2361,6 +1215,9 @@ fn frame_url_core(state: &AddonState, raw: &str) -> CoreResult {
             return CoreResult::Err(AbiError::NotFound.as_i32());
         }
     };
+    // Ownership: the frame's `camera_id` must resolve to a camera owned by the
+    // calling addon. We swallow the DB row beyond ownership — the frame_url
+    // doesn't expose camera metadata.
     match get_camera_for_addon(
         &state.db,
         &state.addon_id,
@@ -2414,8 +1271,143 @@ fn frame_url_core(state: &AddonState, raw: &str) -> CoreResult {
         None,
     );
     let url = format!("/frames/{}?{}", input.frame_ref, issued.query_string());
-    serialize(&UrlOut {
+    CoreResult::Ok(UrlOut {
         url,
         expires_unix_ms: issued.expiry_unix_ms,
     })
+}
+
+// =============================================================================
+// Test surface — sync entry points so integration tests can drive the host
+// functions without standing up a wasmtime Store. Inputs are raw CBOR bytes
+// (the only allowed ABI format); outputs are raw CBOR bytes plus the ABI code.
+// =============================================================================
+
+#[doc(hidden)]
+pub mod test_api {
+    use super::*;
+
+    pub fn save_snapshot_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
+        run_input(state, raw_input, PERM_RECORDING_WRITE, "recording.save_snapshot", |s, i| {
+            save_snapshot_core(s, &i)
+        })
+    }
+
+    pub fn save_segment_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
+        run_input(state, raw_input, PERM_RECORDING_WRITE, "recording.save_segment", |s, i| {
+            save_segment_core(s, &i)
+        })
+    }
+
+    pub fn get_url_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
+        run_input(state, raw_input, PERM_RECORDING_READ, "recording.get_url", |s, i| {
+            get_url_core(s, &i)
+        })
+    }
+
+    pub fn get_stream_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
+        run_input(state, raw_input, PERM_RECORDING_READ, "recording.get_stream", |s, i| {
+            get_stream_core(s, &i)
+        })
+    }
+
+    pub fn purge_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
+        run_input(state, raw_input, PERM_RECORDING_WRITE, "recording.purge", |s, i| {
+            purge_core(s, &i)
+        })
+    }
+
+    /// Stats accepts an empty payload (no filter); a non-empty payload is a
+    /// CBOR `RecordingStatsInput`.
+    pub fn stats_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
+        if !check_permission(state, PERM_RECORDING_READ, None) {
+            audit(
+                state,
+                "recording.stats",
+                None,
+                RiskClass::B,
+                "denied",
+                Some("missing_permission"),
+            );
+            return (AbiError::Permission.as_i32(), Vec::new());
+        }
+        if enforce_payload_size(raw_input.len(), PayloadKind::ServiceCall).is_err() {
+            return (AbiError::PayloadTooLarge.as_i32(), Vec::new());
+        }
+        let input = if raw_input.is_empty() {
+            RecordingStatsInput::default()
+        } else {
+            match decode_cbor_exact::<RecordingStatsInput>(raw_input) {
+                Ok(v) => v,
+                Err(_) => {
+                    audit(
+                        state,
+                        "recording.stats",
+                        None,
+                        RiskClass::B,
+                        "error",
+                        Some("invalid_payload"),
+                    );
+                    return (AbiError::Operation.as_i32(), Vec::new());
+                }
+            }
+        };
+        finish(stats_core(state, &input))
+    }
+
+    pub fn frame_url_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
+        run_input(state, raw_input, PERM_RECORDING_READ, "recording.frame_url", |s, i| {
+            frame_url_core(s, &i)
+        })
+    }
+
+    fn run_input<I, O, F>(
+        state: &AddonState,
+        raw_input: &[u8],
+        perm: &str,
+        action: &str,
+        f: F,
+    ) -> (i32, Vec<u8>)
+    where
+        I: for<'b> minicbor::Decode<'b, ()>,
+        O: minicbor::Encode<()>,
+        F: FnOnce(&AddonState, I) -> CoreResult<O>,
+    {
+        let risk = if perm == PERM_RECORDING_WRITE {
+            RiskClass::A
+        } else {
+            RiskClass::B
+        };
+        if !check_permission(state, perm, None) {
+            audit(state, action, None, risk, "denied", Some("missing_permission"));
+            return (AbiError::Permission.as_i32(), Vec::new());
+        }
+        if enforce_payload_size(raw_input.len(), PayloadKind::ServiceCall).is_err() {
+            return (AbiError::PayloadTooLarge.as_i32(), Vec::new());
+        }
+        let input: I = match decode_cbor_exact(raw_input) {
+            Ok(v) => v,
+            Err(_) => {
+                audit(state, action, None, risk, "error", Some("invalid_payload"));
+                return (AbiError::Operation.as_i32(), Vec::new());
+            }
+        };
+        finish(f(state, input))
+    }
+
+    fn finish<O: minicbor::Encode<()>>(result: CoreResult<O>) -> (i32, Vec<u8>) {
+        match result {
+            CoreResult::Ok(out) => {
+                let mut buf = Vec::new();
+                if minicbor::encode(&out, &mut buf).is_err() {
+                    return (AbiError::Operation.as_i32(), Vec::new());
+                }
+                if enforce_payload_size(buf.len(), PayloadKind::ServiceCall).is_err() {
+                    return (AbiError::PayloadTooLarge.as_i32(), Vec::new());
+                }
+                (AbiError::Ok.as_i32(), buf)
+            }
+            CoreResult::Err(code) => (code, Vec::new()),
+        }
+    }
 }

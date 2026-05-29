@@ -36,6 +36,11 @@ pub use protocol::{
     },
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
+    recording::{
+        FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingRefInput,
+        RecordingSaveSegmentInput, RecordingSaveSnapshotInput, RecordingStatsInput,
+        SaveRecordingOut, StatsOut, StatsPerCamera, StatsTotals, UrlOut,
+    },
     stream::{
         StreamAccepted, StreamCancel, StreamChunk, StreamEnd, StreamError, StreamKind,
         StreamOpen, StreamPayload, StreamProgress, StreamRejected, StreamTag,
