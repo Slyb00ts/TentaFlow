@@ -448,6 +448,128 @@ test('handleSlotContent replaces previous content', () => {
   sm.destroy();
 });
 
+test('handleSlotContent buffers content for unregistered slot and replays on registerSlot', () => {
+  setup();
+  const { sm } = makeSlotManager();
+
+  // Content arrives before the dynamic overlay container is registered.
+  sm.handleSlotContent({ slot_id: 'add_camera_body', fragment: comp('Buffered body') });
+  assert(!sm.hasSlot('add_camera_body'), 'slot must still be absent (only buffered)');
+
+  // Later the overlay renderer's container is registered explicitly.
+  const el = document.createElement('div');
+  el.setAttribute('data-slot-id', 'add_camera_body');
+  document.body.appendChild(el);
+  sm.registerSlot('add_camera_body', el);
+
+  assertEq(el.children.length, 1, 'buffered content replayed into container');
+  assertEq(el.children[0].textContent, 'Buffered body', 'replayed content text');
+
+  sm.destroy();
+});
+
+test('buffered content replays when observe auto-registers a dynamic slot', () => {
+  setup();
+  const { sm } = makeSlotManager();
+  sm.observe(document.body);
+
+  // SlotContent for the dynamic overlay footer arrives before its DOM node.
+  sm.handleSlotContent({ slot_id: 'add_camera_footer', fragment: comp('Buffered footer') });
+  assert(!sm.hasSlot('add_camera_footer'), 'slot absent until container inserted');
+
+  // Overlay renderer inserts the container; MutationObserver auto-registers it.
+  const footer = document.createElement('div');
+  footer.setAttribute('data-slot-id', 'add_camera_footer');
+  document.body.appendChild(footer);
+
+  assert(sm.hasSlot('add_camera_footer'), 'dynamic slot auto-registered');
+  assertEq(footer.children.length, 1, 'buffered content replayed on auto-register');
+  assertEq(footer.children[0].textContent, 'Buffered footer', 'replayed footer text');
+
+  sm.destroy();
+});
+
+test('repeated SlotContent before registration overwrites pending (last wins)', () => {
+  setup();
+  const { sm } = makeSlotManager();
+
+  sm.handleSlotContent({ slot_id: 'pending-slot', fragment: comp('First') });
+  sm.handleSlotContent({ slot_id: 'pending-slot', fragment: comp('Second') });
+
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  sm.registerSlot('pending-slot', el);
+
+  assertEq(el.children.length, 1, 'single child after replay');
+  assertEq(el.children[0].textContent, 'Second', 'only the latest pending content replays');
+
+  sm.destroy();
+});
+
+test('buffered state_overlay is applied when pending content replays', () => {
+  setup();
+  const store = makeStore();
+  const renderer = makeRenderer(store);
+  const sm = new SlotManager({ store, componentRenderer: renderer });
+
+  sm.handleSlotContent({
+    slot_id: 'overlay-pending',
+    fragment: comp('Body'),
+    state_overlay: [{ path: PATH('title'), value: 'Add camera' }],
+  });
+  assertEq(store.read(PATH('title')), undefined, 'overlay deferred until replay');
+
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  sm.registerSlot('overlay-pending', el);
+
+  assertEq(store.read(PATH('title')), 'Add camera', 'overlay applied on replay');
+  assertEq(el.children.length, 1, 'fragment rendered on replay');
+
+  sm.destroy();
+});
+
+test('destroy clears pending content buffer', () => {
+  setup();
+  const { sm } = makeSlotManager();
+
+  sm.handleSlotContent({ slot_id: 'leaky-slot', fragment: comp('Stale') });
+  sm.destroy();
+
+  // A fresh manager (mirrors panel rebuild) must not inherit the stale buffer.
+  const { sm: sm2 } = makeSlotManager();
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  sm2.registerSlot('leaky-slot', el);
+
+  assertEq(el.children.length, 0, 'no stale content leaked into rebuilt panel');
+
+  sm2.destroy();
+});
+
+test('unregisterSlot drops pending content so a removed overlay does not replay', () => {
+  setup();
+  const { sm } = makeSlotManager();
+
+  // Register, then buffer fresh content arriving after the container was gone.
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  sm.registerSlot('overlay-slot', el);
+  sm.unregisterSlot('overlay-slot');
+
+  sm.handleSlotContent({ slot_id: 'overlay-slot', fragment: comp('Late') });
+  // Overlay container removed again before it ever re-registers.
+  sm.unregisterSlot('overlay-slot');
+
+  const el2 = document.createElement('div');
+  document.body.appendChild(el2);
+  sm.registerSlot('overlay-slot', el2);
+
+  assertEq(el2.children.length, 0, 'pending dropped on unregister, no replay');
+
+  sm.destroy();
+});
+
 // =============================================================================
 // Report
 // =============================================================================
