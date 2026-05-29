@@ -1245,9 +1245,9 @@ mod tests {
             let db = crate::db::init(&db_path).expect("test DB init");
             let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[0xB2; 32]));
             let security = std::sync::Arc::new(
-                crate::mesh::security::MeshSecurity::new(db, cipher).expect("mesh security"),
+                crate::mesh::security::MeshSecurity::new(db, cipher.clone()).expect("mesh security"),
             );
-            crate::sync::runtime::init(security.db.clone(), security).expect("sync runtime");
+            crate::sync::runtime::init(security.db.clone(), security, cipher).expect("sync runtime");
             crate::addon::storage_sql_exec::record_sync_conflict(
                 &sync_conflict_capture(addon_id),
                 operation_id,
