@@ -671,3 +671,12 @@ Key routing rules:
 - Central-only addon SQL/KV/Blob uses binary CBOR mesh messages `MESH_MSG_STORAGE_PROXY_REQUEST` (`0x34`) and `MESH_MSG_STORAGE_PROXY_RESPONSE` (`0x35`) on UFP/2 Mesh channel.
 - Authority-backed policies may use `authority_readthrough`, `authority_write`, or `replicated_by_permission`/`sharded` with `authority_node_id`. Nodes with `sync_receive` materialize locally; nodes without it read/write through the authority without storing addon rows locally.
 - Blob central-only proxy is chunked: clients call `BlobPutChunk`/`BlobGetChunk`, authority validates chunk hash and final sha256, writes the content-addressed blob, records blob capture and returns range bytes without local client materialization.
+
+## Compliance Core
+
+- `tentaflow-core/src/compliance/` to wspólna warstwa core dla RODO/GDPR, AI audit, retencji, ROPA, DSAR, zgód, DPIA i rejestru naruszeń.
+- Migracja `compliance_core_foundation` tworzy kanoniczne tabele compliance i provisionuje domyślne rekordy dla każdej organizacji. Teksty widoczne w UI używają pól `*_translations` walidowanych przez `json_valid`; seed musi zawierać co najmniej `pl` i `en`.
+- `compliance_ai_events` przechowuje jedno wywołanie/sesję AI i łączy się z istniejącym chainem `audit_log` przez `audit_log_id`; prompty, odpowiedzi, źródła i tool calls zostają w dedykowanych tabelach compliance AI.
+- Retencja AI audit jest rozwiązywana przez `compliance_retention_policies` i nie może być krótsza niż 183 dni.
+- Protokół administracyjny używa `MessageBody::ComplianceAdminBody` i `tentaflow-protocol/src/compliance.rs`; przez CBOR przechodzą skróty kategorii, retencji i eventów AI, bez treści promptów/odpowiedzi.
+- Dostęp administracyjny wymaga `compliance.read`; role `org_admin` i `dpo` dostają także `compliance.write` na potrzeby dalszych operacji zarządzania.

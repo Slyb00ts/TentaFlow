@@ -17,6 +17,7 @@
 
 pub mod camera;
 pub mod cbor;
+pub mod compliance;
 pub mod envelope;
 pub mod legal;
 pub mod mesh;
@@ -30,6 +31,10 @@ pub mod vision;
 pub use camera::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDiscoverRequest,
     CameraDiscoverResponse, CameraFrameUrlRequest, CameraFrameUrlResponse, DiscoveredCameraInfo,
+};
+pub use compliance::{
+    ComplianceAdminPayload, ComplianceAiEventListFilter, ComplianceAiEventSummary,
+    ComplianceDataCategorySummary, ComplianceLocalizedText, ComplianceRetentionPolicySummary,
 };
 pub use envelope::{
     Envelope, EnvelopeFlags, Routing, SCHEMA_VERSION, SessionAuth, SignedSessionClaim, message_kind,

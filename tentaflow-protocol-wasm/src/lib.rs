@@ -5384,6 +5384,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "revokedAtMs", (resp.revoked_at_ms as f64).into());
             }
         },
+        MessageBody::ComplianceAdminBody(payload) => {
+            compliance_admin_payload_to_js(&obj, payload);
+        }
         MessageBody::StreamBody(payload) => match payload {
             // Request variants never legitimately decode in a response path.
             // Surface the tag only — same defense-in-depth as
@@ -5441,6 +5444,243 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
     }
     Ok(obj.into())
+}
+
+fn localized_texts_to_js(items: Vec<tentaflow_protocol::ComplianceLocalizedText>) -> js_sys::Array {
+    let arr = js_sys::Array::new();
+    for item in items {
+        let obj = js_sys::Object::new();
+        set(&obj, "locale", item.locale.into());
+        set(&obj, "text", item.text.into());
+        arr.push(&obj);
+    }
+    arr
+}
+
+fn compliance_admin_payload_to_js(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::ComplianceAdminPayload,
+) {
+    use tentaflow_protocol::ComplianceAdminPayload as P;
+    match payload {
+        P::ListDataCategoriesRequest => {
+            set(obj, "variant", "ComplianceDataCategoriesListRequest".into());
+            set(
+                obj,
+                "warning",
+                "unexpected_request_variant_in_response".into(),
+            );
+        }
+        P::ListDataCategoriesResponse { categories } => {
+            set(
+                obj,
+                "variant",
+                "ComplianceDataCategoriesListResponse".into(),
+            );
+            let arr = js_sys::Array::new();
+            for category in categories {
+                let item = js_sys::Object::new();
+                set(&item, "categoryId", category.category_id.clone().into());
+                set(&item, "category_id", category.category_id.into());
+                set(&item, "slug", category.slug.into());
+                set(
+                    &item,
+                    "nameTranslations",
+                    localized_texts_to_js(category.name_translations).into(),
+                );
+                set(
+                    &item,
+                    "descriptionTranslations",
+                    localized_texts_to_js(category.description_translations).into(),
+                );
+                set(&item, "personalData", category.personal_data.into());
+                set(&item, "personal_data", category.personal_data.into());
+                set(&item, "sensitiveData", category.sensitive_data.into());
+                set(&item, "sensitive_data", category.sensitive_data.into());
+                set(&item, "riskClass", category.risk_class.clone().into());
+                set(&item, "risk_class", category.risk_class.into());
+                set(&item, "sourceScope", category.source_scope.clone().into());
+                set(&item, "source_scope", category.source_scope.into());
+                if let Some(addon_id) = category.addon_id {
+                    set(&item, "addonId", addon_id.clone().into());
+                    set(&item, "addon_id", addon_id.into());
+                }
+                arr.push(&item);
+            }
+            set(obj, "categories", arr.into());
+        }
+        P::ListRetentionPoliciesRequest => {
+            set(
+                obj,
+                "variant",
+                "ComplianceRetentionPoliciesListRequest".into(),
+            );
+            set(
+                obj,
+                "warning",
+                "unexpected_request_variant_in_response".into(),
+            );
+        }
+        P::ListRetentionPoliciesResponse { policies } => {
+            set(
+                obj,
+                "variant",
+                "ComplianceRetentionPoliciesListResponse".into(),
+            );
+            let arr = js_sys::Array::new();
+            for policy in policies {
+                let item = js_sys::Object::new();
+                set(
+                    &item,
+                    "retentionPolicyId",
+                    policy.retention_policy_id.clone().into(),
+                );
+                set(
+                    &item,
+                    "retention_policy_id",
+                    policy.retention_policy_id.into(),
+                );
+                set(&item, "slug", policy.slug.into());
+                set(
+                    &item,
+                    "nameTranslations",
+                    localized_texts_to_js(policy.name_translations).into(),
+                );
+                set(&item, "scopeKind", policy.scope_kind.clone().into());
+                set(&item, "scope_kind", policy.scope_kind.into());
+                if let Some(category_id) = policy.category_id {
+                    set(&item, "categoryId", category_id.clone().into());
+                    set(&item, "category_id", category_id.into());
+                }
+                set(
+                    &item,
+                    "retentionDays",
+                    (policy.retention_days as f64).into(),
+                );
+                set(
+                    &item,
+                    "retention_days",
+                    (policy.retention_days as f64).into(),
+                );
+                set(&item, "minimumDays", (policy.minimum_days as f64).into());
+                set(&item, "minimum_days", (policy.minimum_days as f64).into());
+                set(
+                    &item,
+                    "actionAfterRetention",
+                    policy.action_after_retention.clone().into(),
+                );
+                set(
+                    &item,
+                    "action_after_retention",
+                    policy.action_after_retention.into(),
+                );
+                set(&item, "isDefault", policy.is_default.into());
+                set(&item, "is_default", policy.is_default.into());
+                set(&item, "isActive", policy.is_active.into());
+                set(&item, "is_active", policy.is_active.into());
+                arr.push(&item);
+            }
+            set(obj, "policies", arr.into());
+        }
+        P::ListAiEventsRequest(filter) => {
+            set(obj, "variant", "ComplianceAiEventsListRequest".into());
+            if let Some(status) = filter.status {
+                set(obj, "status", status.into());
+            }
+            if let Some(user_id) = filter.user_id {
+                set(obj, "userId", (user_id as f64).into());
+                set(obj, "user_id", (user_id as f64).into());
+            }
+            if let Some(addon_id) = filter.addon_id {
+                set(obj, "addonId", addon_id.clone().into());
+                set(obj, "addon_id", addon_id.into());
+            }
+            if let Some(limit) = filter.limit {
+                set(obj, "limit", limit.into());
+            }
+            if let Some(offset) = filter.offset {
+                set(obj, "offset", offset.into());
+            }
+            set(
+                obj,
+                "warning",
+                "unexpected_request_variant_in_response".into(),
+            );
+        }
+        P::ListAiEventsResponse { events } => {
+            set(obj, "variant", "ComplianceAiEventsListResponse".into());
+            let arr = js_sys::Array::new();
+            for event in events {
+                let item = js_sys::Object::new();
+                set(&item, "eventId", event.event_id.clone().into());
+                set(&item, "event_id", event.event_id.into());
+                if let Some(user_id) = event.user_id {
+                    set(&item, "userId", (user_id as f64).into());
+                    set(&item, "user_id", (user_id as f64).into());
+                }
+                set(&item, "nodeId", event.node_id.clone().into());
+                set(&item, "node_id", event.node_id.into());
+                if let Some(addon_id) = event.addon_id {
+                    set(&item, "addonId", addon_id.clone().into());
+                    set(&item, "addon_id", addon_id.into());
+                }
+                if let Some(instance_id) = event.instance_id {
+                    set(&item, "instanceId", instance_id.clone().into());
+                    set(&item, "instance_id", instance_id.into());
+                }
+                if let Some(flow_id) = event.flow_id {
+                    set(&item, "flowId", (flow_id as f64).into());
+                    set(&item, "flow_id", (flow_id as f64).into());
+                }
+                if let Some(flow_node_id) = event.flow_node_id {
+                    set(&item, "flowNodeId", flow_node_id.clone().into());
+                    set(&item, "flow_node_id", flow_node_id.into());
+                }
+                set(&item, "requestId", event.request_id.clone().into());
+                set(&item, "request_id", event.request_id.into());
+                set(&item, "modelId", event.model_id.clone().into());
+                set(&item, "model_id", event.model_id.into());
+                set(&item, "backend", event.backend.into());
+                set(&item, "startedAt", event.started_at.clone().into());
+                set(&item, "started_at", event.started_at.into());
+                if let Some(finished_at) = event.finished_at {
+                    set(&item, "finishedAt", finished_at.clone().into());
+                    set(&item, "finished_at", finished_at.into());
+                }
+                set(&item, "status", event.status.into());
+                set(&item, "riskClass", event.risk_class.clone().into());
+                set(&item, "risk_class", event.risk_class.into());
+                if let Some(legal_basis_id) = event.legal_basis_id {
+                    set(&item, "legalBasisId", legal_basis_id.clone().into());
+                    set(&item, "legal_basis_id", legal_basis_id.into());
+                }
+                set(
+                    &item,
+                    "retentionPolicyId",
+                    event.retention_policy_id.clone().into(),
+                );
+                set(
+                    &item,
+                    "retention_policy_id",
+                    event.retention_policy_id.into(),
+                );
+                set(&item, "promptHash", event.prompt_hash.clone().into());
+                set(&item, "prompt_hash", event.prompt_hash.into());
+                set(&item, "responseHash", event.response_hash.clone().into());
+                set(&item, "response_hash", event.response_hash.into());
+                if let Some(audit_log_id) = event.audit_log_id {
+                    set(&item, "auditLogId", (audit_log_id as f64).into());
+                    set(&item, "audit_log_id", (audit_log_id as f64).into());
+                }
+                if let Some(error_message) = event.error_message {
+                    set(&item, "errorMessage", error_message.clone().into());
+                    set(&item, "error_message", error_message.into());
+                }
+                arr.push(&item);
+            }
+            set(obj, "events", arr.into());
+        }
+    }
 }
 
 // Decoder dla `RoleCatalogPayload` — kazdy wariant payloadu wystawia camelCase
@@ -7167,9 +7407,7 @@ mod tests {
         assert!(tentaflow_protocol::cbor::decode::<Envelope>(&frame).is_ok());
         assert!(tentaflow_protocol::cbor::decode::<Envelope>(&[]).is_err());
         assert!(tentaflow_protocol::cbor::decode::<Envelope>(&[0u8; 8]).is_err());
-        assert!(
-            tentaflow_protocol::cbor::decode::<Envelope>(&frame[..frame.len() / 2]).is_err()
-        );
+        assert!(tentaflow_protocol::cbor::decode::<Envelope>(&frame[..frame.len() / 2]).is_err());
     }
 
     #[test]
@@ -8576,6 +8814,47 @@ pub fn encode_legal_document_revoke_request(doc_id: String) -> Result<Vec<u8>, J
 }
 
 // =============================================================================
+// Compliance Core — `MessageBody::ComplianceAdminBody(ComplianceAdminPayload)`.
+// =============================================================================
+
+#[wasm_bindgen(js_name = encodeComplianceDataCategoriesListRequest)]
+pub fn encode_compliance_data_categories_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ComplianceAdminBody(
+        tentaflow_protocol::ComplianceAdminPayload::ListDataCategoriesRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeComplianceRetentionPoliciesListRequest)]
+pub fn encode_compliance_retention_policies_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ComplianceAdminBody(
+        tentaflow_protocol::ComplianceAdminPayload::ListRetentionPoliciesRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeComplianceAiEventsListRequest)]
+pub fn encode_compliance_ai_events_list_request(
+    status: Option<String>,
+    user_id: Option<f64>,
+    addon_id: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<u8>, JsError> {
+    let filter = tentaflow_protocol::ComplianceAiEventListFilter {
+        status,
+        user_id: user_id.map(|value| value as i64),
+        addon_id,
+        limit,
+        offset,
+    };
+    encode_body_inner(&MessageBody::ComplianceAdminBody(
+        tentaflow_protocol::ComplianceAdminPayload::ListAiEventsRequest(filter),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// =============================================================================
 // Stream pub/sub (Chunk B) — `MessageBody::StreamBody(StreamPayload)`.
 // Client only encodes the two request variants; frame / closed / response
 // variants are server-issued and travel through `decode_message_body_inner`.
@@ -9009,23 +9288,39 @@ fn patch_ops_to_js(
         match &op.op {
             PatchOpKind::Set { value } => {
                 set(&obj, "op", "set".into());
-                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+                set(
+                    &obj,
+                    "value",
+                    value_to_js(value).map_err(|e| JsError::new(&e))?,
+                );
             }
             PatchOpKind::Delete => {
                 set(&obj, "op", "delete".into());
             }
             PatchOpKind::AppendArray { value } => {
                 set(&obj, "op", "append_array".into());
-                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+                set(
+                    &obj,
+                    "value",
+                    value_to_js(value).map_err(|e| JsError::new(&e))?,
+                );
             }
             PatchOpKind::PrependArray { value } => {
                 set(&obj, "op", "prepend_array".into());
-                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+                set(
+                    &obj,
+                    "value",
+                    value_to_js(value).map_err(|e| JsError::new(&e))?,
+                );
             }
             PatchOpKind::InsertArray { index, value } => {
                 set(&obj, "op", "insert_array".into());
                 set(&obj, "index", (*index as f64).into());
-                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+                set(
+                    &obj,
+                    "value",
+                    value_to_js(value).map_err(|e| JsError::new(&e))?,
+                );
             }
             PatchOpKind::RemoveArray { index } => {
                 set(&obj, "op", "remove_array".into());
@@ -9085,11 +9380,7 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "slots", slots.into());
             // Initial state entries decoded directly to JS array
-            set(
-                &obj,
-                "initialState",
-                state_entries_to_js(&s.initial_state)?,
-            );
+            set(&obj, "initialState", state_entries_to_js(&s.initial_state)?);
         }
         UiPayload::PanelReady(r) => {
             set(&obj, "addonId", r.addon_id.into());
@@ -9438,7 +9729,8 @@ pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
 
 /// Look up the ComponentMeta for a given tag from the schema catalog.
 fn component_meta_for_tag(tag: u16) -> Option<&'static tentaflow_sdk_spec::ComponentMeta> {
-    static MAP: OnceLock<HashMap<u16, &'static tentaflow_sdk_spec::ComponentMeta>> = OnceLock::new();
+    static MAP: OnceLock<HashMap<u16, &'static tentaflow_sdk_spec::ComponentMeta>> =
+        OnceLock::new();
     let map = MAP.get_or_init(|| {
         tentaflow_sdk_spec::ALL_COMPONENTS
             .iter()
@@ -9450,7 +9742,8 @@ fn component_meta_for_tag(tag: u16) -> Option<&'static tentaflow_sdk_spec::Compo
 
 /// Look up an InlineMeta by name from the catalog.
 fn inline_meta_by_name(name: &str) -> Option<&'static tentaflow_sdk_spec::InlineMeta> {
-    static MAP: OnceLock<HashMap<&'static str, &'static tentaflow_sdk_spec::InlineMeta>> = OnceLock::new();
+    static MAP: OnceLock<HashMap<&'static str, &'static tentaflow_sdk_spec::InlineMeta>> =
+        OnceLock::new();
     let map = MAP.get_or_init(|| {
         tentaflow_sdk_spec::ALL_INLINE_STRUCTS
             .iter()
@@ -9715,7 +10008,12 @@ fn handler_to_js(
             set(&obj, "kind", "local".into());
             set(&obj, "action", local_action_to_js(action)?);
         }
-        Handler::Backend { action_id, params, optimistic, on_failure } => {
+        Handler::Backend {
+            action_id,
+            params,
+            optimistic,
+            on_failure,
+        } => {
             set(&obj, "kind", "backend".into());
             set(&obj, "action_id", action_id.as_str().into());
             set(&obj, "params", cbor_map_to_js(params)?);
@@ -9724,7 +10022,12 @@ fn handler_to_js(
             }
             set(&obj, "on_failure", failure_policy_to_js(on_failure)?);
         }
-        Handler::Both { action_id, params, optimistic, on_failure } => {
+        Handler::Both {
+            action_id,
+            params,
+            optimistic,
+            on_failure,
+        } => {
             set(&obj, "kind", "both".into());
             set(&obj, "action_id", action_id.as_str().into());
             set(&obj, "params", cbor_map_to_js(params)?);
@@ -9779,7 +10082,10 @@ fn local_action_to_js(
             set(&obj, "kind", "focus".into());
             set(&obj, "component_id", component_id.as_str().into());
         }
-        LocalAction::Scroll { component_id, behavior } => {
+        LocalAction::Scroll {
+            component_id,
+            behavior,
+        } => {
             set(&obj, "kind", "scroll".into());
             set(&obj, "component_id", component_id.as_str().into());
             set(&obj, "behavior", behavior.as_str().into());
@@ -9788,16 +10094,29 @@ fn local_action_to_js(
             set(&obj, "kind", "copy".into());
             set(&obj, "value", value.as_str().into());
         }
-        LocalAction::Confirm { title, message, destructive, then } => {
+        LocalAction::Confirm {
+            title,
+            message,
+            destructive,
+            then,
+        } => {
             set(&obj, "kind", "confirm".into());
             set(&obj, "title", title.as_str().into());
             set(&obj, "message", message.as_str().into());
             set(&obj, "destructive", (*destructive).into());
             set(&obj, "then", handler_to_js(then)?);
         }
-        LocalAction::Validate { field_component_id, rules, on_invalid } => {
+        LocalAction::Validate {
+            field_component_id,
+            rules,
+            on_invalid,
+        } => {
             set(&obj, "kind", "validate".into());
-            set(&obj, "field_component_id", field_component_id.as_str().into());
+            set(
+                &obj,
+                "field_component_id",
+                field_component_id.as_str().into(),
+            );
             let rules_arr = js_sys::Array::new();
             for r in rules {
                 rules_arr.push(&encode_decode_to_js(r)?);
@@ -9818,7 +10137,11 @@ fn local_action_to_js(
             }
             set(&obj, "steps", steps_arr.into());
         }
-        LocalAction::Conditional { when, then, else_branch } => {
+        LocalAction::Conditional {
+            when,
+            then,
+            else_branch,
+        } => {
             set(&obj, "kind", "conditional".into());
             set(&obj, "when", state_condition_to_js(when)?);
             set(&obj, "then", handler_to_js(then)?);
@@ -9909,9 +10232,7 @@ fn state_condition_to_js(
     Ok(obj.into())
 }
 
-fn cbor_map_to_js(
-    m: &tentaflow_sdk_spec::protocol::control::CborMap,
-) -> Result<JsValue, String> {
+fn cbor_map_to_js(m: &tentaflow_sdk_spec::protocol::control::CborMap) -> Result<JsValue, String> {
     let obj = js_sys::Object::new();
     for (k, v) in &m.0 {
         set(&obj, k, value_to_js(v)?);
@@ -9947,7 +10268,11 @@ fn bind_spec_to_js(
             set(&obj, "name", name.as_str().into());
             set(&obj, "path", state_path_to_js(path)?);
         }
-        BindSpec::ClassToggle { class_name, path, negate } => {
+        BindSpec::ClassToggle {
+            class_name,
+            path,
+            negate,
+        } => {
             set(&obj, "kind", "class_toggle".into());
             set(&obj, "class_name", class_name.as_str().into());
             set(&obj, "path", state_path_to_js(path)?);
@@ -9958,7 +10283,11 @@ fn bind_spec_to_js(
             set(&obj, "path", state_path_to_js(path)?);
             set(&obj, "negate", (*negate).into());
         }
-        BindSpec::List { path, item_template_id, key_field } => {
+        BindSpec::List {
+            path,
+            item_template_id,
+            key_field,
+        } => {
             set(&obj, "kind", "list".into());
             set(&obj, "path", state_path_to_js(path)?);
             set(&obj, "item_template_id", item_template_id.as_str().into());
