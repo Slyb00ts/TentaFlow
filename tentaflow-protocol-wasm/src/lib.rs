@@ -9376,6 +9376,25 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
             for slot in &s.slots {
                 let s_obj = js_sys::Object::new();
                 set(&s_obj, "id", slot.id.clone().into());
+                // Emit the full slot policy so the JS SlotManager can apply
+                // default-state/visibility/cache rules and so addon-app can
+                // detect overlay slots (modal/drawer) and skip the static
+                // container — id alone makes every slot look like main content.
+                set(&s_obj, "semantics", slot.semantics.as_str().into());
+                set(
+                    &s_obj,
+                    "default_state",
+                    slot_default_to_js(&slot.default_state).map_err(|e| JsError::new(&e))?,
+                );
+                set(&s_obj, "cache_policy", cache_policy_to_js(&slot.cache_policy)?);
+                set(
+                    &s_obj,
+                    "visibility",
+                    slot_visibility_to_js(&slot.visibility)?,
+                );
+                if let Some(max) = slot.max_payload_bytes {
+                    set(&s_obj, "max_payload_bytes", (max as f64).into());
+                }
                 slots.push(&s_obj.into());
             }
             set(&obj, "slots", slots.into());
@@ -10171,6 +10190,72 @@ fn failure_policy_to_js(
         FailurePolicy::Custom { action } => {
             set(&obj, "kind", "custom".into());
             set(&obj, "action", local_action_to_js(action)?);
+        }
+    }
+    Ok(obj.into())
+}
+
+fn slot_default_to_js(
+    sd: &tentaflow_sdk_spec::protocol::ui::slot::SlotDefault,
+) -> Result<JsValue, String> {
+    use tentaflow_sdk_spec::protocol::ui::slot::SlotDefault;
+    let obj = js_sys::Object::new();
+    match sd {
+        SlotDefault::Empty => {
+            set(&obj, "kind", "empty".into());
+        }
+        SlotDefault::Loading => {
+            set(&obj, "kind", "loading".into());
+        }
+        SlotDefault::Static { fragment } => {
+            set(&obj, "kind", "static".into());
+            set(&obj, "fragment", component_to_js(fragment)?);
+        }
+    }
+    Ok(obj.into())
+}
+
+fn cache_policy_to_js(
+    cp: &tentaflow_sdk_spec::protocol::ui::slot::CachePolicy,
+) -> Result<JsValue, JsError> {
+    use tentaflow_sdk_spec::protocol::ui::slot::CachePolicy;
+    let obj = js_sys::Object::new();
+    match cp {
+        CachePolicy::None => {
+            set(&obj, "kind", "none".into());
+        }
+        CachePolicy::OnNavigateBack => {
+            set(&obj, "kind", "on_navigate_back".into());
+        }
+        CachePolicy::TtlSeconds { value } => {
+            set(&obj, "kind", "ttl_seconds".into());
+            set(&obj, "value", (*value as f64).into());
+        }
+    }
+    Ok(obj.into())
+}
+
+fn slot_visibility_to_js(
+    vis: &tentaflow_sdk_spec::protocol::ui::slot::SlotVisibility,
+) -> Result<JsValue, JsError> {
+    use tentaflow_sdk_spec::protocol::ui::slot::SlotVisibility;
+    let obj = js_sys::Object::new();
+    match vis {
+        SlotVisibility::Always => {
+            set(&obj, "kind", "always".into());
+        }
+        SlotVisibility::Hidden => {
+            set(&obj, "kind", "hidden".into());
+        }
+        SlotVisibility::Conditional { path } => {
+            set(&obj, "kind", "conditional".into());
+            // JS visibility.conditional expects a StatePath array (same shape
+            // as state_path_to_js) so the SlotManager can subscribe to it.
+            set(
+                &obj,
+                "path",
+                state_path_to_js(path).map_err(|e| JsError::new(&e))?,
+            );
         }
     }
     Ok(obj.into())
