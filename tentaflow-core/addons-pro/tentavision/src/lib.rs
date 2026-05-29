@@ -1412,20 +1412,15 @@ impl SearchState {
 struct DiscoverState {
     visible: bool, scanning: bool, cameras: Vec<DiscoveredCam>,
     selected_index: Option<usize>, custom_name: String, error_message: Option<String>,
-    // Discovered cameras default to vendor `onvif`, which the host requires
-    // credentials for; the discovery flow has no bound form, so these mirror the
-    // wizard's `camera_user`/`camera_password` inputs into addon state.
-    cred_user: String, cred_pass: String,
 }
 struct DiscoveredCam { vendor: String, url: String, suggested_name: String }
 impl DiscoverState {
     const fn new() -> Self {
-        Self { visible: false, scanning: false, cameras: Vec::new(), selected_index: None, custom_name: String::new(), error_message: None, cred_user: String::new(), cred_pass: String::new() }
+        Self { visible: false, scanning: false, cameras: Vec::new(), selected_index: None, custom_name: String::new(), error_message: None }
     }
     fn reset(&mut self) {
         self.visible = false; self.scanning = false; self.cameras.clear();
         self.selected_index = None; self.custom_name.clear(); self.error_message = None;
-        self.cred_user.clear(); self.cred_pass.clear();
     }
 }
 
@@ -1672,9 +1667,6 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
             let idx = v.parse::<u64>().ok();
             handle_discover_select(&json!({"index": idx}))
         }
-        "discover-name-change" => handle_discover_name_change(params),
-        "discover-cred-change" => handle_discover_cred_change(params),
-        "discover-add" => handle_discover_add(),
         "cameras-refresh" | "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
         "panel-navigate" => {
             let target = params.get("panel_id")
@@ -1732,8 +1724,32 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
 
 fn handle_camera_add_submit(params: &JsonValue) -> JsonValue {
     let values = params.get("values");
-    let name = values.and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let url = values.and_then(|v| v.get("url")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let form_name = values.and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let form_url = values.and_then(|v| v.get("url")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let form_user = values.and_then(|v| v.get("camera_user")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let form_pass = values.and_then(|v| v.get("camera_password")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+
+    // A camera picked in the discovery step (step 0/1) carries its url+vendor in
+    // discover state, not in the form (the selection cards have no url field).
+    // Resolve the effective spec from discovery when a row is selected, falling
+    // back to the form for the manual rtsp/onvif entry path. Form values still
+    // win for fields the user typed (name, credentials).
+    let discovery = with_state(|s| match s.discover.selected_index {
+        Some(i) if i < s.discover.cameras.len() => {
+            let cam = &s.discover.cameras[i];
+            Some((cam.url.clone(), cam.vendor.clone(), s.discover.custom_name.trim().to_string()))
+        }
+        _ => None,
+    });
+
+    let (name, url, vendor_hint) = match discovery {
+        Some((d_url, d_vendor, d_name)) => {
+            let name = if form_name.is_empty() { d_name } else { form_name };
+            (name, d_url, Some(d_vendor))
+        }
+        None => (form_name, form_url, None),
+    };
+
     with_state(|s| { s.form_name = name.clone(); s.form_url = url.clone(); s.clear_messages(); });
     if name.is_empty() || name.chars().count() > 60 {
         with_state(|s| { s.error_message = Some("Nazwa musi mieć 1–60 znaków.".to_string()); });
@@ -1743,19 +1759,23 @@ fn handle_camera_add_submit(params: &JsonValue) -> JsonValue {
         with_state(|s| { s.error_message = Some("URL nie może być pusty.".to_string()); });
         return json!({"ok":false,"error":"invalid url"});
     }
-    let vendor = match detect_vendor(&url) {
+    // Trust the discovery vendor for discovered cameras (ONVIF service xaddr
+    // URLs do not always contain `/onvif`); detect from the URL only for the
+    // manual entry path.
+    let vendor = match vendor_hint {
         Some(v) => v,
-        None => { with_state(|s| { s.error_message = Some("Nieobsługiwany protokół (wspierane: rtsp://, rtsps://, http(s)://.../onvif).".to_string()); }); return json!({"ok":false,"error":"unsupported protocol"}); }
+        None => match detect_vendor(&url) {
+            Some(v) => v.to_string(),
+            None => { with_state(|s| { s.error_message = Some("Nieobsługiwany protokół (wspierane: rtsp://, rtsps://, http(s)://.../onvif).".to_string()); }); return json!({"ok":false,"error":"unsupported protocol"}); }
+        },
     };
-    let user = values.and_then(|v| v.get("camera_user")).and_then(|v| v.as_str()).unwrap_or("");
-    let pass = values.and_then(|v| v.get("camera_password")).and_then(|v| v.as_str()).unwrap_or("");
-    let credentials_b64 = match build_credentials_b64(vendor, user, pass) {
+    let credentials_b64 = match build_credentials_b64(&vendor, &form_user, &form_pass) {
         Ok(c) => c,
         Err(msg) => { with_state(|s| { s.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid credentials"}); }
     };
     let spec = CameraAddInput {
         display_name: name,
-        vendor: vendor.to_string(),
+        vendor,
         url,
         target_fps: Some(15),
         resolution_width: None,
@@ -1766,7 +1786,7 @@ fn handle_camera_add_submit(params: &JsonValue) -> JsonValue {
         onvif_profile_token: None,
     };
     match camera_add(spec) {
-        Ok(result) => { with_state(|s| { s.add_form_visible = false; s.form_name.clear(); s.form_url.clear(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); }); json!({"ok":true,"camera_id":result.camera_id}) }
+        Ok(result) => { with_state(|s| { s.add_form_visible = false; s.form_name.clear(); s.form_url.clear(); s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); }); json!({"ok":true,"camera_id":result.camera_id}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd dodawania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
 }
@@ -1808,58 +1828,6 @@ fn handle_discover_select(params: &JsonValue) -> JsonValue {
         }
     });
     json!({"ok":true})
-}
-
-fn handle_discover_name_change(params: &JsonValue) -> JsonValue {
-    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    with_state(|s| { s.discover.custom_name = name; s.discover.error_message = None; });
-    json!({"ok":true})
-}
-
-/// Updates the discovery-flow credential inputs (`camera_user` /
-/// `camera_password`) in addon state. The `field` selects which one; the value
-/// carries the raw input. Plaintext is held in state only until `handle_discover_add`
-/// encodes it and is never logged.
-fn handle_discover_cred_change(params: &JsonValue) -> JsonValue {
-    let field = params.get("field").and_then(|v| v.as_str()).or_else(|| params.get("id").and_then(|v| v.as_str())).unwrap_or("");
-    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    with_state(|s| {
-        match field {
-            "camera_user" => s.discover.cred_user = value,
-            "camera_password" => s.discover.cred_pass = value,
-            _ => {}
-        }
-        s.discover.error_message = None;
-    });
-    json!({"ok":true})
-}
-
-fn handle_discover_add() -> JsonValue {
-    let snapshot = with_state(|s| { s.clear_messages(); s.discover.error_message = None; (s.discover.selected_index, s.discover.custom_name.trim().to_string(), s.discover.cameras.len()) });
-    let (selected_index, name, total) = snapshot;
-    let index = match selected_index { Some(i) if i < total => i, _ => { with_state(|s| { s.discover.error_message = Some("Wybierz kamerę z listy.".to_string()); }); return json!({"ok":false,"error":"no selection"}); } };
-    if name.is_empty() || name.chars().count() > 60 { with_state(|s| { s.discover.error_message = Some("Nazwa musi mieć 1–60 znaków.".to_string()); }); return json!({"ok":false,"error":"invalid name"}); }
-    let (vendor, url, cred_user, cred_pass) = with_state(|s| { let cam = &s.discover.cameras[index]; (cam.vendor.clone(), cam.url.clone(), s.discover.cred_user.clone(), s.discover.cred_pass.clone()) });
-    let credentials_b64 = match build_credentials_b64(&vendor, &cred_user, &cred_pass) {
-        Ok(c) => c,
-        Err(msg) => { with_state(|s| { s.discover.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid credentials"}); }
-    };
-    let spec = CameraAddInput {
-        display_name: name,
-        vendor,
-        url,
-        target_fps: Some(15),
-        resolution_width: None,
-        resolution_height: None,
-        retention_class: Some("C".to_string()),
-        profile: Some("default".to_string()),
-        credentials_b64,
-        onvif_profile_token: None,
-    };
-    match camera_add(spec) {
-        Ok(_) => { with_state(|s| { s.discover.reset(); s.success_message = Some("Kamera dodana z ONVIF.".to_string()); }); json!({"ok":true}) }
-        Err(e) => { with_state(|s| { s.discover.error_message = Some(alloc::format!("Błąd dodawania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
-    }
 }
 
 fn handle_zone_canvas_pointer(params: &JsonValue) -> JsonValue {
