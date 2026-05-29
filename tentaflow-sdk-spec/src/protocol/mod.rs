@@ -15,6 +15,7 @@ pub mod control;
 pub mod envelope;
 pub mod frame;
 pub mod ids;
+pub mod recording;
 pub mod stream;
 pub mod streaming;
 pub mod ui;

@@ -2206,23 +2206,20 @@ pub fn camera_metadata_unsubscribe(subscription_id: &str) -> Result<bool, AbiErr
 /// Metadata for a recording artifact persisted on the host (PNG snapshot or
 /// MP4 segment). `recording_ref` is the public handle (`snap_<uuid>` /
 /// `clip_<uuid>`) used by the other recording APIs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SavedRecordingInfo {
     pub recording_ref: String,
     pub file_path: String,
     pub file_size_bytes: u64,
-    #[serde(default)]
     pub duration_ms: Option<u32>,
-    #[serde(default)]
     pub width: Option<u32>,
-    #[serde(default)]
     pub height: Option<u32>,
     pub hash_sha256: String,
     pub created_at: u64,
 }
 
 /// Signed URL for a stored recording or a raw frame. Multi-use until expiry.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecordingUrl {
     pub url: String,
     pub expires_unix_ms: u64,
@@ -2231,13 +2228,13 @@ pub struct RecordingUrl {
 /// Signed URL for a raw frame in the LRU. Shape mirrors `RecordingUrl` so the
 /// SDK surface stays symmetric; lives as its own type for self-documenting
 /// call sites.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FrameUrl {
     pub url: String,
     pub expires_unix_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecordingStatsPerCamera {
     pub camera_id: String,
     pub snapshots: u64,
@@ -2245,27 +2242,12 @@ pub struct RecordingStatsPerCamera {
     pub size_bytes: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecordingStats {
     pub total_snapshots: u64,
     pub total_segments: u64,
     pub total_size_bytes: u64,
-    #[serde(default)]
     pub per_camera: Vec<RecordingStatsPerCamera>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RecordingStatsRaw {
-    stats: RecordingStatsTotalsRaw,
-    #[serde(default)]
-    per_camera: Vec<RecordingStatsPerCamera>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RecordingStatsTotalsRaw {
-    total_snapshots: u64,
-    total_segments: u64,
-    total_size_bytes: u64,
 }
 
 /// Inline raw bytes of a stored recording plus integrity metadata so the addon
@@ -2277,21 +2259,21 @@ pub struct RecordingStream {
     pub hash_sha256: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct RecordingGetStreamRaw {
-    data_b64: String,
-    file_size_bytes: u64,
-    hash_sha256: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RecordingPurgeRaw {
-    #[allow(dead_code)]
-    purged: bool,
-}
-
 fn push_kv_str(s: &mut String, key: &str, value: &str) {
     s.push_str(&format!("{} = {}\n", key, toml::Value::String(value.to_string())));
+}
+
+fn save_recording_info_from(out: tentaflow_sdk_spec::SaveRecordingOut) -> SavedRecordingInfo {
+    SavedRecordingInfo {
+        recording_ref: out.recording_ref,
+        file_path: out.file_path,
+        file_size_bytes: out.file_size_bytes,
+        duration_ms: out.duration_ms,
+        width: out.width,
+        height: out.height,
+        hash_sha256: out.hash_sha256,
+        created_at: out.created_at,
+    }
 }
 
 /// Persist a PNG snapshot for a frame already living in the host's LRU.
@@ -2301,14 +2283,14 @@ pub fn recording_save_snapshot(
     frame_ref: &str,
     retention_class: Option<&str>,
 ) -> Result<SavedRecordingInfo, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "camera_id", camera_id);
-    push_kv_str(&mut s, "frame_ref", frame_ref);
-    if let Some(rc) = retention_class {
-        push_kv_str(&mut s, "retention_class", rc);
-    }
-    let bytes = call_sql_with_one_input(recording_save_snapshot_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingSaveSnapshotInput {
+        camera_id: camera_id.to_string(),
+        frame_ref: frame_ref.to_string(),
+        retention_class: retention_class.map(|s| s.to_string()),
+    })?;
+    let bytes = call_sql_with_one_input(recording_save_snapshot_v1, &payload)?;
+    let out: tentaflow_sdk_spec::SaveRecordingOut = decode_cbor(&bytes)?;
+    Ok(save_recording_info_from(out))
 }
 
 /// Capture `duration_secs` of the camera's bound source into an MP4 segment.
@@ -2321,41 +2303,44 @@ pub fn recording_save_segment(
     duration_secs: u32,
     retention_class: Option<&str>,
 ) -> Result<SavedRecordingInfo, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "camera_id", camera_id);
-    s.push_str(&format!("duration_secs = {}\n", duration_secs));
-    if let Some(rc) = retention_class {
-        push_kv_str(&mut s, "retention_class", rc);
-    }
-    let bytes = call_sql_with_one_input(recording_save_segment_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingSaveSegmentInput {
+        camera_id: camera_id.to_string(),
+        duration_secs,
+        retention_class: retention_class.map(|s| s.to_string()),
+    })?;
+    let bytes = call_sql_with_one_input(recording_save_segment_v1, &payload)?;
+    let out: tentaflow_sdk_spec::SaveRecordingOut = decode_cbor(&bytes)?;
+    Ok(save_recording_info_from(out))
 }
 
 /// Issue a multi-use signed URL for a stored recording. TTL must be in
 /// `60..=3600` seconds.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_get_url(recording_ref: &str, ttl_secs: u64) -> Result<RecordingUrl, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "recording_ref", recording_ref);
-    s.push_str(&format!("ttl_secs = {}\n", ttl_secs));
-    let bytes = call_sql_with_one_input(recording_get_url_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingGetUrlInput {
+        recording_ref: recording_ref.to_string(),
+        ttl_secs,
+    })?;
+    let bytes = call_sql_with_one_input(recording_get_url_v1, &payload)?;
+    let out: tentaflow_sdk_spec::UrlOut = decode_cbor(&bytes)?;
+    Ok(RecordingUrl {
+        url: out.url,
+        expires_unix_ms: out.expires_unix_ms,
+    })
 }
 
 /// Fetch the raw bytes (PNG or MP4) of a stored recording inline together with
-/// the host's reported size and SHA-256 hash. The TOML envelope is hard-capped
+/// the host's reported size and SHA-256 hash. The CBOR envelope is hard-capped
 /// at 8 MiB; after base64 expansion this admits files up to ~6 MiB raw. Larger
 /// artifacts must be fetched via the signed URL + HTTP handler.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_get_stream(recording_ref: &str) -> Result<RecordingStream, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "recording_ref", recording_ref);
-    let bytes = call_sql_with_one_input_capped(
-        recording_get_stream_v1,
-        s.as_bytes(),
-        MAX_OUT_CAP_SNAPSHOT,
-    )?;
-    let raw: RecordingGetStreamRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingRefInput {
+        recording_ref: recording_ref.to_string(),
+    })?;
+    let bytes =
+        call_sql_with_one_input_capped(recording_get_stream_v1, &payload, MAX_OUT_CAP_SNAPSHOT)?;
+    let raw: tentaflow_sdk_spec::GetStreamOut = decode_cbor(&bytes)?;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw.data_b64.as_bytes())
         .map_err(|_| AbiError::Operation)?;
@@ -2370,10 +2355,11 @@ pub fn recording_get_stream(recording_ref: &str) -> Result<RecordingStream, AbiE
 /// returns `NotFound`.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_purge(recording_ref: &str) -> Result<(), AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "recording_ref", recording_ref);
-    let bytes = call_sql_with_one_input(recording_purge_v1, s.as_bytes())?;
-    let _: RecordingPurgeRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingRefInput {
+        recording_ref: recording_ref.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(recording_purge_v1, &payload)?;
+    let _: tentaflow_sdk_spec::PurgeOut = decode_cbor(&bytes)?;
     Ok(())
 }
 
@@ -2381,17 +2367,25 @@ pub fn recording_purge(recording_ref: &str) -> Result<(), AbiError> {
 /// single camera).
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_stats(camera_id: Option<&str>) -> Result<RecordingStats, AbiError> {
-    let mut s = String::new();
-    if let Some(cam) = camera_id {
-        push_kv_str(&mut s, "camera_id", cam);
-    }
-    let bytes = call_sql_with_one_input(recording_stats_v1, s.as_bytes())?;
-    let raw: RecordingStatsRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingStatsInput {
+        camera_id: camera_id.map(|s| s.to_string()),
+    })?;
+    let bytes = call_sql_with_one_input(recording_stats_v1, &payload)?;
+    let raw: tentaflow_sdk_spec::StatsOut = decode_cbor(&bytes)?;
     Ok(RecordingStats {
         total_snapshots: raw.stats.total_snapshots,
         total_segments: raw.stats.total_segments,
         total_size_bytes: raw.stats.total_size_bytes,
-        per_camera: raw.per_camera,
+        per_camera: raw
+            .per_camera
+            .into_iter()
+            .map(|c| RecordingStatsPerCamera {
+                camera_id: c.camera_id,
+                snapshots: c.snapshots,
+                segments: c.segments,
+                size_bytes: c.size_bytes,
+            })
+            .collect(),
     })
 }
 
@@ -2400,11 +2394,16 @@ pub fn recording_stats(camera_id: Option<&str>) -> Result<RecordingStats, AbiErr
 /// addon.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn frame_url(frame_ref: &str, ttl_secs: u64) -> Result<FrameUrl, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "frame_ref", frame_ref);
-    s.push_str(&format!("ttl_secs = {}\n", ttl_secs));
-    let bytes = call_sql_with_one_input(frame_url_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::FrameUrlInput {
+        frame_ref: frame_ref.to_string(),
+        ttl_secs,
+    })?;
+    let bytes = call_sql_with_one_input(frame_url_v1, &payload)?;
+    let out: tentaflow_sdk_spec::UrlOut = decode_cbor(&bytes)?;
+    Ok(FrameUrl {
+        url: out.url,
+        expires_unix_ms: out.expires_unix_ms,
+    })
 }
 
 // =============================================================================
