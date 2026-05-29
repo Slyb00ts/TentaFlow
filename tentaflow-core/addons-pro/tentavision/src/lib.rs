@@ -40,6 +40,7 @@ use tentaflow_sdk_spec::protocol::ui::{
     actions::{Button as ButtonComp, IconButton as IconButtonComp, Link as LinkComp,
               FilterChips as FilterChipsComp},
     feedback::{Alert as AlertComp, Spinner as SpinnerComp, GateScreen as GateScreenComp},
+    feedback::overlays::Modal as ModalComp,
     molecules::EmptyState as EmptyStateComp,
     specialized::{VideoStream as VideoStreamComp, StepProgress as StepProgressComp},
     tokens::*,
@@ -1597,6 +1598,26 @@ fn send_initial_shell() {
             visibility: SlotVisibility::Always,
             max_payload_bytes: Some(256 * 1024),
         },
+        // The "Add camera" wizard renders into a Modal overlay. The Modal's
+        // body/footer slot containers are created dynamically by the host only
+        // while the Modal is in the layout tree, so these declarations describe
+        // their semantics for the renderer. Content is pushed via SlotContent.
+        SlotDecl {
+            id: "add_camera_body".into(),
+            semantics: SlotSemantics::Modal,
+            default_state: SlotDefault::Empty,
+            cache_policy: CachePolicy::None,
+            visibility: SlotVisibility::Always,
+            max_payload_bytes: Some(256 * 1024),
+        },
+        SlotDecl {
+            id: "add_camera_footer".into(),
+            semantics: SlotSemantics::Modal,
+            default_state: SlotDefault::Empty,
+            cache_policy: CachePolicy::None,
+            visibility: SlotVisibility::Always,
+            max_payload_bytes: Some(64 * 1024),
+        },
     ];
     send_panel_shell(layout, slots, vec![]);
 }
@@ -1639,7 +1660,17 @@ fn render_panel(panel_id: &str) {
         "bindings" => build_bindings_content(),
         _ => build_overview_content(),
     };
+    // Send "content" first so the host has the Modal (and thus the dynamic
+    // body/footer slot containers) in the DOM before we push their content.
     send_slot_content("content", content);
+
+    // When the "Add camera" wizard is open on the cameras panel, fill the
+    // Modal's body/footer slots. These must be sent AFTER "content" so their
+    // target data-slot-id containers already exist.
+    if panel_id == "cameras" && with_state(|s| s.add_form_visible) {
+        send_slot_content("add_camera_body", build_add_camera_body());
+        send_slot_content("add_camera_footer", build_add_camera_footer());
+    }
 }
 
 // =============================================================================
@@ -2259,9 +2290,12 @@ fn build_cameras_content() -> Component {
     );
     children.push(sub_tabs);
 
-    // Wizard modal (when visible)
+    // The "Add camera" wizard renders as a Modal overlay. While visible, the
+    // Modal shell is placed in the content tree; its body/footer are filled by
+    // SlotContent (see render_panel). When hidden, the Modal is absent so the
+    // host unregisters its dynamic body/footer slots.
     if add_visible {
-        children.push(build_add_camera_wizard());
+        children.push(build_add_camera_modal());
     }
 
     let filtered: Vec<&CameraInfoOut> = cameras
@@ -2434,7 +2468,45 @@ fn camera_diagnostics(c: &CameraInfoOut) -> (String, &'static str) {
 }
 
 
-fn build_add_camera_wizard() -> Component {
+/// Total number of wizard steps. The wizard is 0-indexed internally.
+const ADD_CAMERA_WIZARD_STEPS: u8 = 4;
+
+/// The "Add camera" wizard lives in a Modal overlay. This builds the Modal
+/// shell that is placed in the "content" slot tree while `add_form_visible`.
+/// Its body/footer are filled separately via SlotContent on the dynamic slots
+/// `add_camera_body` / `add_camera_footer`, which the host registers only while
+/// this Modal is in the DOM. The Dismiss event (×/backdrop/ESC) is routed to
+/// the same `camera-add-cancel` action as the footer cancel button so closing
+/// the dialog any way resets the wizard state.
+fn build_add_camera_modal() -> Component {
+    let step = with_state(|s| s.wizard_step);
+    let title = alloc::format!("Dodaj kamerę \u{2014} krok {} z {}", step + 1, ADD_CAMERA_WIZARD_STEPS);
+
+    let mut modal = ModalComp {
+        title: lit(&title),
+        subtitle: None,
+        body_slot: "add_camera_body".into(),
+        footer_slot: Some("add_camera_footer".into()),
+        size: ModalSize::Lg,
+        dismissible: true,
+        prevent_scroll: true,
+        closable: true,
+    }.into_component(next_id()).expect("Modal");
+    modal.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Dismiss,
+        Handler::Backend {
+            action_id: "camera-add-cancel".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    modal
+}
+
+/// Builds the wizard body fragment for the `add_camera_body` slot: step
+/// progress, the current step's content, and an optional error alert.
+fn build_add_camera_body() -> Component {
     let (step, scanning, discovered_count, err) = with_state(|s| {
         (s.wizard_step, s.discover.scanning, s.discover.cameras.len(), s.error_message.clone())
     });
@@ -2451,8 +2523,6 @@ fn build_add_camera_wizard() -> Component {
         &alloc::format!("step{}", step),
     );
 
-    let title = alloc::format!("Dodaj kamerę \u{2014} krok {} z 4", step + 1);
-
     let body = match step {
         0 => build_wizard_step_discovery(scanning, discovered_count),
         1 => build_wizard_step_selection(),
@@ -2463,14 +2533,21 @@ fn build_add_camera_wizard() -> Component {
 
     let mut body_children = vec![step_indicator, body];
     if let Some(e) = err { body_children.push(alert(&e, "critical")); }
+    stack_v(body_children)
+}
 
-    // Footer buttons
+/// Builds the wizard navigation buttons for the `add_camera_footer` slot.
+/// Back is shown after the first step, Finish replaces Next on the last step.
+fn build_add_camera_footer() -> Component {
+    let step = with_state(|s| s.wizard_step);
+    let last = ADD_CAMERA_WIZARD_STEPS - 1;
+
     let mut footer = Vec::new();
     if step > 0 {
         footer.push(button_with_icon("Wstecz", "wizard-prev", "ghost", "info"));
     }
     footer.push(button("Anuluj", "camera-add-cancel", "ghost"));
-    if step < 3 {
+    if step < last {
         let next_label = match step {
             0 => "Dalej: Wybór",
             1 => "Dalej: Podgląd",
@@ -2481,23 +2558,7 @@ fn build_add_camera_wizard() -> Component {
     } else {
         footer.push(button("Zakończ", "camera-add-submit", "primary"));
     }
-
-    SectionCard {
-        title: lit(&title),
-        subtitle: None,
-        header_actions: vec![button("×", "camera-add-cancel", "ghost")],
-        header_divider: true,
-        body: body_children,
-        footer: Some(vec![stack_h(footer)]),
-        padding: Spacing::Lg,
-        gap: Spacing::Md,
-        variant: CardVariant::Outlined,
-        radius: RadiusToken::Lg,
-        shadow: ShadowToken::Medium,
-        border: BorderToken::Hairline,
-        background: BackgroundToken::None,
-        accent: None,
-    }.into_component(next_id()).expect("SectionCard")
+    stack_h(footer)
 }
 
 fn build_wizard_step_discovery(scanning: bool, discovered_count: usize) -> Component {
