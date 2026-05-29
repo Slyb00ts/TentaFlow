@@ -2380,7 +2380,16 @@ fn build_cameras_table() -> Component {
         Some("cameras"),
     );
 
-    let mut table = TableComp {
+    // The per-row "⋯" menu carries the deletion action. The Table renderer
+    // injects the row key into the menu-item action params as both `row_id`
+    // and the concrete `row_key_field` (`camera_id`), so this Button dispatches
+    // `camera-row-select` with the clicked camera_id. Deletion stays gated:
+    // `camera-row-select` only arms the pending-remove confirmation bar
+    // (`build_camera_remove_confirm`); the real `camera-remove` runs from that
+    // bar's explicit Usuń button.
+    let remove_action = button("Usuń", "camera-row-select", "destructive");
+
+    TableComp {
         columns,
         rows_path: StatePath::new(vec![PathSegment::Key("cameras_rows".into())]),
         row_key_field: "camera_id".into(),
@@ -2394,28 +2403,12 @@ fn build_cameras_table() -> Component {
         sticky_columns: 0,
         pagination: None,
         empty_state: Some(empty),
-        row_actions: vec![],
+        row_actions: vec![remove_action],
         bulk_actions: vec![],
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table");
-
-    // The stock Table renderer surfaces per-row identity only through
-    // `row_click`, emitting detail `{ row_id: <camera_id> }` (row_key_field).
-    // The dispatcher merges that detail into the action params, so
-    // `camera-row-select` receives the clicked camera_id and arms the delete
-    // confirmation instead of deleting on a single click.
-    table.handlers = Some(HandlerMap(vec![(
-        tentaflow_sdk_spec::EventKind::RowClick,
-        Handler::Backend {
-            action_id: "camera-row-select".into(),
-            params: CborMap::default(),
-            optimistic: None,
-            on_failure: FailurePolicy::Toast,
-        },
-    )]));
-    table
+    }.into_component(next_id()).expect("Table")
 }
 
 /// Confirmation bar for deleting the selected camera. Usuń dispatches
