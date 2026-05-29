@@ -357,6 +357,41 @@ test('MutationObserver auto-registers elements with data-slot-id', () => {
   sm.destroy();
 });
 
+test('observe auto-registers dynamic slot so later handleSlotContent renders into it', () => {
+  setup();
+  const { sm } = makeSlotManager();
+
+  // Static declared slot exists before observe (mirrors handlePanelShell order).
+  const staticSlot = document.createElement('div');
+  staticSlot.setAttribute('data-slot-id', 'content');
+  document.body.appendChild(staticSlot);
+  sm.registerSlot('content', staticSlot);
+
+  sm.observe(document.body);
+
+  // Before observe wires the dynamic slot, handleSlotContent for it warns+returns.
+  assert(!sm.hasSlot('modal-body-1'), 'dynamic slot absent before insertion');
+
+  // Overlay renderer creates a dynamic container with a new data-slot-id
+  // (e.g. modal body slot) under the observed root.
+  const modalBody = document.createElement('div');
+  modalBody.setAttribute('data-slot-id', 'modal-body-1');
+  document.body.appendChild(modalBody);
+
+  assert(sm.hasSlot('modal-body-1'), 'dynamic slot should be auto-registered');
+
+  // A later SlotContent for the dynamic slot must render into it, not warn+return.
+  sm.handleSlotContent({ slot_id: 'modal-body-1', fragment: comp('Modal body') });
+  assertEq(modalBody.children.length, 1, 'dynamic slot received content');
+  assertEq(modalBody.children[0].textContent, 'Modal body', 'dynamic slot content text');
+
+  // Static slot still works (no regression).
+  sm.handleSlotContent({ slot_id: 'content', fragment: comp('Static') });
+  assert(staticSlot.querySelector('[data-test-rendered]'), 'static slot still renders');
+
+  sm.destroy();
+});
+
 test('observe picks up existing data-slot-id elements', () => {
   setup();
   const { sm } = makeSlotManager();
