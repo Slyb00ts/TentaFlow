@@ -35,6 +35,11 @@ class TfTable extends HTMLElement {
     this._rows = [];
     this._sortKey = null;
     this._sortDir = 'asc';
+    // Optional per-row actions builder: (row, index) => Element | null.
+    // When set, tf-table renders a trailing actions column hosting the
+    // returned element (e.g. a kebab tf-menu). Cells are rebuilt on every
+    // render so the element stays bound to its current row object.
+    this._rowActions = null;
     this._onClick = this._onClick.bind(this);
   }
 
@@ -51,6 +56,14 @@ class TfTable extends HTMLElement {
   get rows() { return this._rows; }
   set rows(arr) {
     this._rows = Array.isArray(arr) ? arr.slice() : [];
+    this._render();
+  }
+
+  get rowActions() { return this._rowActions; }
+  set rowActions(fn) {
+    this._rowActions = typeof fn === 'function' ? fn : null;
+    // Column count changes when actions toggle on/off — force thead rebuild.
+    this._lastColsSig = null;
     this._render();
   }
 
@@ -104,6 +117,12 @@ class TfTable extends HTMLElement {
       }
       tr.appendChild(th);
     });
+    if (this._rowActions) {
+      const actTh = document.createElement('th');
+      actTh.className = 'tf-table__actions-col';
+      actTh.setAttribute('aria-label', 'Akcje');
+      tr.appendChild(actTh);
+    }
     this._thead.replaceChildren(tr);
   }
 
@@ -130,7 +149,7 @@ class TfTable extends HTMLElement {
     for (let i = 0; i < reuseCount; i += 1) {
       const tr = existingRows[i];
       tr.dataset.idx = String(i);
-      this._updateRowCells(tr, cols, rows[i]);
+      this._updateRowCells(tr, cols, rows[i], i);
     }
 
     // 2) Dodaj brakujace
@@ -158,28 +177,51 @@ class TfTable extends HTMLElement {
       this._writeCell(td, col, row[col.key]);
       rtr.appendChild(td);
     });
+    if (this._rowActions) {
+      const actTd = document.createElement('td');
+      actTd.className = 'tf-table__actions-cell';
+      this._writeActionsCell(actTd, row, idx);
+      rtr.appendChild(actTd);
+    }
     return rtr;
   }
 
-  _updateRowCells(tr, cols, row) {
+  _updateRowCells(tr, cols, row, idx) {
     const tds = tr.children;
-    for (let i = 0; i < cols.length; i += 1) {
-      const td = tds[i];
-      if (!td) {
-        // Brakujaca kolumna (zmiana liczby kolumn) — odbuduj caly wiersz.
-        // Rzadki przypadek; szybka sciezka i tak zwykle dziala.
-        tr.replaceChildren();
-        cols.forEach((col) => {
-          const fresh = document.createElement('td');
-          fresh.dataset.label = col.label;
-          if (col.renderer === 'num' || col.align === 'num') fresh.classList.add('num');
-          this._writeCell(fresh, col, row[col.key]);
-          tr.appendChild(fresh);
-        });
-        return;
+    const expected = cols.length + (this._rowActions ? 1 : 0);
+    if (tds.length !== expected) {
+      // Liczba kolumn sie zmienila (np. wlaczono row actions) — odbuduj wiersz.
+      tr.replaceChildren();
+      cols.forEach((col) => {
+        const fresh = document.createElement('td');
+        fresh.dataset.label = col.label;
+        if (col.renderer === 'num' || col.align === 'num') fresh.classList.add('num');
+        this._writeCell(fresh, col, row[col.key]);
+        tr.appendChild(fresh);
+      });
+      if (this._rowActions) {
+        const actTd = document.createElement('td');
+        actTd.className = 'tf-table__actions-cell';
+        this._writeActionsCell(actTd, row, idx);
+        tr.appendChild(actTd);
       }
-      this._writeCell(td, cols[i], row[cols[i].key]);
+      return;
     }
+    for (let i = 0; i < cols.length; i += 1) {
+      this._writeCell(tds[i], cols[i], row[cols[i].key]);
+    }
+    if (this._rowActions) {
+      // Recyklowany wiersz wskazuje teraz na inny obiekt row — odbuduj
+      // element akcji, zeby byl zbindowany do aktualnego wiersza.
+      this._writeActionsCell(tds[cols.length], row, idx);
+    }
+  }
+
+  _writeActionsCell(td, row, idx) {
+    let el = null;
+    try { el = this._rowActions(row, idx); } catch { el = null; }
+    if (el instanceof Node) td.replaceChildren(el);
+    else td.replaceChildren();
   }
 
   _writeCell(td, col, value) {
@@ -257,6 +299,9 @@ class TfTable extends HTMLElement {
       this._render();
       return;
     }
+    // Klik w komorce akcji nie wyzwala row-click/selection — menu obsluguje
+    // wlasne zdarzenia per pozycja.
+    if (e.target.closest('.tf-table__actions-cell')) return;
     const tr = e.target.closest('tbody tr');
     if (!tr) return;
     const idx = parseInt(tr.dataset.idx, 10);
