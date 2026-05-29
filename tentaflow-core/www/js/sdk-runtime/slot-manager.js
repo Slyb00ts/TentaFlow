@@ -84,6 +84,13 @@ export class SlotManager {
     this._renderer = componentRenderer;
     // Map<string, { element, decl, currentFragment, cleanups: Array<fn> }>
     this._slots = new Map();
+    // Buffer for SlotContent that arrived before its container was registered.
+    // Overlay renderers (modal/drawer body+footer) create dynamic data-slot-id
+    // containers that the MutationObserver auto-registers asynchronously, so a
+    // SlotContent sent right after the panel content can race ahead of the
+    // registration. We keep the last content per slot_id and replay it on
+    // register. Map<string, { fragment, state_overlay }> (last write wins).
+    this._pendingContent = new Map();
     this._observer = null;
     this._destroyed = false;
   }
@@ -110,9 +117,19 @@ export class SlotManager {
     this._slots.set(slotId, entry);
     this._applyDefaultState(entry);
     this._applyVisibility(entry);
+
+    // Replay any content buffered before this slot existed (dynamic overlay
+    // containers auto-registered after their SlotContent already arrived).
+    const pending = this._pendingContent.get(slotId);
+    if (pending) {
+      this._pendingContent.delete(slotId);
+      this._applySlotContent(entry, pending.fragment, pending.state_overlay);
+    }
   }
 
   unregisterSlot(slotId) {
+    // A removed overlay container must not leave a stale pending replay behind.
+    this._pendingContent.delete(slotId);
     const entry = this._slots.get(slotId);
     if (!entry) return;
     this._runCleanups(entry);
@@ -127,10 +144,17 @@ export class SlotManager {
     this._assertAlive();
     const entry = this._slots.get(slot_id);
     if (!entry) {
-      console.warn(`[slot-manager] handleSlotContent: unknown slot '${slot_id}'`);
+      // Container not registered yet — buffer the latest content and replay it
+      // when the slot is registered (dynamic overlay containers register
+      // asynchronously via MutationObserver). Last write wins.
+      this._pendingContent.set(slot_id, { fragment, state_overlay });
       return;
     }
 
+    this._applySlotContent(entry, fragment, state_overlay);
+  }
+
+  _applySlotContent(entry, fragment, state_overlay) {
     // Apply state overlay before rendering so bindings see updated values
     if (state_overlay != null && Array.isArray(state_overlay) && state_overlay.length > 0) {
       this._store.applyOverlay(state_overlay);
@@ -241,6 +265,7 @@ export class SlotManager {
       this._runCleanups(entry);
     }
     this._slots.clear();
+    this._pendingContent.clear();
   }
 
   // ---------------------------------------------------------------------------
