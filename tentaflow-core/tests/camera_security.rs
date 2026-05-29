@@ -13,7 +13,7 @@
 //   6. PayloadKind::ServiceCall input size ceiling
 //   7. Audit log entries are persisted in order with consistent metadata
 //
-// The TOML-level "payload too large" path requires a wasmtime caller; that
+// The wire-level "payload too large" path requires a wasmtime caller; that
 // path is exercised by tests/camera_integration_e2e.rs and by the existing
 // abi_helpers unit tests. Here we cover the validators + supervisor surface
 // that can be driven without an InstancePool.
@@ -352,7 +352,7 @@ fn resolve_file_url_rejects_special_files() {
 }
 
 // =============================================================================
-// 6. Raw-input host calls — malformed TOML + payload-too-large
+// 6. Raw-input host calls — malformed CBOR + payload-too-large
 // =============================================================================
 
 fn make_state(db: &DbPool, addon_id: &str, permissions: Vec<String>) -> AddonState {
@@ -403,24 +403,24 @@ fn read_camera_add_audit(db: &DbPool, addon_id: &str) -> Vec<(String, String, Op
 }
 
 #[test]
-fn malformed_toml_input_returns_operation_and_audits_invalid_toml() {
+fn malformed_cbor_input_returns_operation_and_audits_invalid_payload() {
     let db = make_db();
-    let addon_id = format!("mal_toml_{}", uuid::Uuid::new_v4());
+    let addon_id = format!("mal_cbor_{}", uuid::Uuid::new_v4());
     let state = make_state(&db, &addon_id, vec!["cameras.write".into()]);
-    let bad_toml = b"this is not valid toml = [[[[";
-    let rc = camera_add_with_raw_input(&state, bad_toml);
+    let bad_cbor = b"this is not valid cbor \xff\xff\xff\xff";
+    let rc = camera_add_with_raw_input(&state, bad_cbor);
     assert_eq!(
         rc,
         AbiError::Operation.as_i32(),
-        "malformed TOML must map to Operation"
+        "malformed CBOR must map to Operation"
     );
     let entries = read_camera_add_audit(&db, &addon_id);
     assert_eq!(entries.len(), 1, "exactly one audit row, got {entries:?}");
     assert_eq!(entries[0].1, "error");
     let reason = entries[0].2.as_deref().unwrap_or("");
     assert!(
-        reason.contains("invalid_toml"),
-        "reason should be invalid_toml, got {reason:?}"
+        reason.contains("invalid_payload"),
+        "reason should be invalid_payload, got {reason:?}"
     );
 }
 

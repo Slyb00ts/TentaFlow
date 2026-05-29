@@ -20,6 +20,12 @@
 pub mod protocol;
 
 pub use protocol::{
+    camera::{
+        CameraAddInput, CameraAddOutput, CameraCredentialsRotateInput, CameraCredentialsRotateOut,
+        CameraDiscoverOut, CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut,
+        CameraRemoveOut, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
+        CameraUpdateInput, DiscoveredCameraOut,
+    },
     canonical::{validate_canonical, CanonicalError, CanonicalErrorKind},
     control::{
         AuthContext, Backpressure, BackpressureSeverity, Capability, CapabilityRejection,
