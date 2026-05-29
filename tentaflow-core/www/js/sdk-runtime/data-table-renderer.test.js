@@ -716,6 +716,10 @@ test('Table row_action klik niesie row_id i klucz wiersza do backend params', ()
   })));
   const tfTable = el.querySelector('tf-table');
   const menuEl = tfTable.rowActions({ camera_id: 'cam-42', name: 'A' }, 0);
+  // tf-menu zamyka się we własnym listenerze na zbubblowanym tf-menu-select,
+  // więc listener pozycji nie może zatrzymać propagacji.
+  let reachedMenu = 0;
+  menuEl.addEventListener('tf-menu-select', () => { reachedMenu += 1; });
   // Symulacja wyboru pozycji menu — emituje tf-menu-select jak tf-menu-item.
   const item = menuEl.querySelector('tf-menu-item');
   item.dispatchEvent(new (globalThis.CustomEvent)('tf-menu-select', {
@@ -725,6 +729,8 @@ test('Table row_action klik niesie row_id i klucz wiersza do backend params', ()
   assertEq(captured[0].action_id, 'edit_camera');
   // Statyczne params zachowane + wzbogacone o klucz wiersza.
   assertEq(captured[0].params, { mode: 'inline', row_id: 'cam-42', camera_id: 'cam-42' });
+  // Event musi dotrzeć do <tf-menu>, żeby menu się zamknęło — dokładnie raz.
+  assertEq(reachedMenu, 1, 'tf-menu-select musi bubblować do tf-menu (brak stopPropagation)');
 });
 
 test('Table bez row_actions nie ustawia buildera akcji', () => {

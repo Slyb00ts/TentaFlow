@@ -530,12 +530,13 @@ function renderTable(component, ctx) {
       const label = resolveBindRef(desc.labelBind, ctx.store);
       item.textContent = label == null ? '' : String(label);
 
-      const onSelect = (e) => {
-        e.stopPropagation();
-        // tf-menu closes itself on tf-menu-select (its own _onSelect). Row key
-        // is injected via dom_event.detail so the backend handler's params end
-        // up carrying both `row_id` and the concrete key field (e.g.
-        // `camera_id`).
+      const onSelect = () => {
+        // Do NOT stop tf-menu-select here: it must bubble to <tf-menu> so the
+        // menu closes via its own _onSelect. Row-click/selection is already
+        // suppressed by tf-table's .tf-table__actions-cell guard, not by this
+        // listener. Row key is injected via dom_event.detail so the backend
+        // handler's params end up carrying both `row_id` and the concrete key
+        // field (e.g. `camera_id`).
         const syntheticEvent = {
           detail: { row_id: rowId, [rowKeyField]: rowId },
         };
