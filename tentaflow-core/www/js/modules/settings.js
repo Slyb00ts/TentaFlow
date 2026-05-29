@@ -61,6 +61,7 @@ let syncConflicts = [];
 let syncConflictsStatus = 'open';
 let syncConflictsAddonId = 'contacts';
 let storageReport = null;
+const CONFIGURED_SECRET_MASK = '••••••••••••';
 
 const SSO_TYPES = [
   { value: 'azure_ad', label: 'Azure AD' },
@@ -147,6 +148,26 @@ function getSetting(key, dflt = '') {
 function hasConfiguredSetting(key) {
   const value = getSetting(key, '').trim();
   return value.length > 0;
+}
+
+function configuredSecretValue(configured) {
+  return configured ? CONFIGURED_SECRET_MASK : '';
+}
+
+function readSecretInputValue(id) {
+  const value = byId(id)?.value?.trim() || '';
+  return value === CONFIGURED_SECRET_MASK ? '' : value;
+}
+
+function bindConfiguredSecretInput(id, configured) {
+  const input = byId(id);
+  if (!input || !configured) return;
+  input.addEventListener('focus', () => {
+    if (input.value === CONFIGURED_SECRET_MASK) input.value = '';
+  });
+  input.addEventListener('blur', () => {
+    if (!input.value.trim()) input.value = CONFIGURED_SECRET_MASK;
+  });
 }
 
 async function saveSettingKey(key, value) {
@@ -826,6 +847,7 @@ function renderRegistryRows() {
 
 function renderExternalAccessTab() {
   const hfConfigured = hasConfiguredSetting('hf_token');
+  const ngcConfigured = hasConfiguredSetting('ngc_api_key');
   const hfChip = hfConfigured
     ? `<tf-chip status="ok">${escapeHtml(I18n.t('settings.external_configured'))}</tf-chip>`
     : `<tf-chip status="warn">${escapeHtml(I18n.t('settings.external_not_configured'))}</tf-chip>`;
@@ -839,7 +861,7 @@ function renderExternalAccessTab() {
       <div class="card-body">
         <p class="form-hint" style="margin:0 0 16px;">${escapeHtml(I18n.t('settings.external_hf_hint'))}</p>
         <div class="form-row">
-          <tf-input id="hf-token" type="password" label="${escapeAttr(I18n.t('settings.external_hf_token'))}" placeholder="hf_..."></tf-input>
+          <tf-input id="hf-token" type="password" label="${escapeAttr(I18n.t('settings.external_hf_token'))}" placeholder="hf_..." value="${escapeAttr(configuredSecretValue(hfConfigured))}"></tf-input>
         </div>
         <div style="display:flex;gap:8px;margin-top:16px;">
           <tf-button variant="primary" icon="check" id="hf-save">${escapeHtml(I18n.t('common.save'))}</tf-button>
@@ -854,7 +876,7 @@ function renderExternalAccessTab() {
       <div class="card-body">
         <p class="form-hint" style="margin:0 0 16px;">${escapeHtml(I18n.t('settings.ngc_hint'))}</p>
         <div class="form-row">
-          <tf-input id="ngc-key" type="password" label="${escapeAttr(I18n.t('settings.ngc_key_label'))}" placeholder="nvapi-..."></tf-input>
+          <tf-input id="ngc-key" type="password" label="${escapeAttr(I18n.t('settings.ngc_key_label'))}" placeholder="nvapi-..." value="${escapeAttr(configuredSecretValue(ngcConfigured))}"></tf-input>
         </div>
         <div style="display:flex;gap:8px;margin-top:16px;">
           <tf-button variant="primary" icon="check" id="ngc-save">${escapeHtml(I18n.t('common.save'))}</tf-button>
@@ -885,6 +907,9 @@ function renderExternalAccessTab() {
 }
 
 function bindExternalAccessTab() {
+  bindConfiguredSecretInput('hf-token', hasConfiguredSetting('hf_token'));
+  bindConfiguredSecretInput('ngc-key', hasConfiguredSetting('ngc_api_key'));
+
   (async () => {
     try {
       const { configured } = await ApiBinary.one('ngcStatusRequest');
@@ -903,7 +928,7 @@ function bindExternalAccessTab() {
   })();
 
   byId('hf-save')?.addEventListener('click', async () => {
-    const value = byId('hf-token')?.value?.trim() || '';
+    const value = readSecretInputValue('hf-token');
     if (!value) {
       toast(I18n.t('settings.external_hf_save_empty'), 'error');
       return;
@@ -920,7 +945,7 @@ function bindExternalAccessTab() {
   });
 
   byId('ngc-save')?.addEventListener('click', async () => {
-    const value = byId('ngc-key')?.value?.trim() || '';
+    const value = readSecretInputValue('ngc-key');
     if (!value) {
       toast(I18n.t('settings.ngc_save_empty'), 'error');
       return;

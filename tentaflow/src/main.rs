@@ -218,9 +218,23 @@ async fn run_server(args: Args) -> Result<()> {
         "Mesh identity: {}",
         &local_node_id_str[..16.min(local_node_id_str.len())]
     );
-    match tentaflow_core::sync::runtime::init(db.clone(), mesh_security.clone()) {
+    match tentaflow_core::sync::runtime::init(
+        db.clone(),
+        mesh_security.clone(),
+        settings_cipher.clone(),
+    ) {
         Ok(_) => {
             info!("Sync Ledger runtime initialized");
+            match tentaflow_core::db::repository::enqueue_existing_shared_secret_settings(
+                &db,
+                &settings_cipher,
+            ) {
+                Ok(enqueued) if enqueued > 0 => {
+                    info!("Sync Ledger enqueued {} shared secret settings", enqueued)
+                }
+                Err(e) => error!("Sync Ledger shared secret enqueue failed: {}", e),
+                _ => {}
+            }
             match tentaflow_core::addon::storage_sql_exec::drain_installed_sql_captures(&db, 1000) {
                 Ok(drained) => info!("Sync Ledger drained {} pending SQL captures", drained),
                 Err(e) => error!("Sync Ledger SQL capture drain failed: {}", e),

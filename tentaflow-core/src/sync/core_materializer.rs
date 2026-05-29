@@ -6,8 +6,13 @@
 use super::core_registry::{CORE_SYNC_ADDON_ID, CoreSyncResourceKind, descriptor_for_table};
 use super::ledger::{ActionType, FieldValue, LedgerResult, SyncLedgerError, SyncOperation};
 use crate::db::DbPool;
+use std::sync::Arc;
 
-pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerResult<usize> {
+pub fn apply_core_operation(
+    pool: &DbPool,
+    settings_cipher: &Arc<crate::crypto::SettingsCipher>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
     if operation.body.addon_id != CORE_SYNC_ADDON_ID {
         return Err(SyncLedgerError::Runtime(format!(
             "operation is not core sync: {}",
@@ -49,6 +54,9 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
         CoreSyncResourceKind::SyncPolicy => apply_sync_policy(&tx, operation)?,
         CoreSyncResourceKind::SyncResourceAcl => apply_sync_resource_acl(&tx, operation)?,
         CoreSyncResourceKind::SyncExplicitShare => apply_sync_explicit_share(&tx, operation)?,
+        CoreSyncResourceKind::SharedSettingSecret => {
+            apply_shared_setting_secret(&tx, settings_cipher, operation)?
+        }
         CoreSyncResourceKind::LegacyUser => {
             return Err(SyncLedgerError::Runtime(
                 "legacy users materialization is disabled".to_string(),
@@ -58,6 +66,39 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
     tx.commit()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
     Ok(rows)
+}
+
+fn apply_shared_setting_secret(
+    tx: &rusqlite::Transaction<'_>,
+    settings_cipher: &crate::crypto::SettingsCipher,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let key = field_string(operation, "key")?;
+    if !crate::db::repository::is_shared_secret_setting_key(&key) {
+        return Err(SyncLedgerError::Runtime(format!(
+            "setting secret is not syncable: {key}"
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let value = field_string(operation, "value")?;
+            let encrypted = settings_cipher
+                .encrypt(&value)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+                rusqlite::params![key, encrypted],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "UPDATE settings SET value = '', updated_at = datetime('now') WHERE key = ?1",
+                rusqlite::params![key],
+            )
+            .map_err(sql_error),
+    }
 }
 
 fn apply_organization(

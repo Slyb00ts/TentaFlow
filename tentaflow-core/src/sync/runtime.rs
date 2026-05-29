@@ -38,6 +38,7 @@ pub struct SyncRuntime {
     ledger: Arc<FjallSyncLedgerStore>,
     signer: RuntimeSigner,
     local_node_id: String,
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
 }
 
 struct RuntimeSigner {
@@ -103,7 +104,11 @@ pub enum MeshSyncPullResult {
     Snapshot(MeshSyncSnapshotResponsePayload),
 }
 
-pub fn init(db: DbPool, signer: Arc<MeshSecurity>) -> LedgerResult<Arc<SyncRuntime>> {
+pub fn init(
+    db: DbPool,
+    signer: Arc<MeshSecurity>,
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
+) -> LedgerResult<Arc<SyncRuntime>> {
     let ledger_path = paths::tentaflow_home().join("sync").join("ledger");
     let ledger = Arc::new(FjallSyncLedgerStore::open(&ledger_path)?);
     let local_node_id = signer.ed25519_public_key_hex();
@@ -115,6 +120,7 @@ pub fn init(db: DbPool, signer: Arc<MeshSecurity>) -> LedgerResult<Arc<SyncRunti
             security: signer,
         },
         local_node_id,
+        settings_cipher,
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
     Ok(SYNC_RUNTIME
@@ -1069,6 +1075,7 @@ impl SyncRuntime {
             if entry.operation.body.addon_id == crate::sync::core_registry::CORE_SYNC_ADDON_ID {
                 match crate::sync::core_materializer::apply_core_operation(
                     &self.db,
+                    &self.settings_cipher,
                     &entry.operation,
                 ) {
                     Ok(_) => {
@@ -2068,6 +2075,10 @@ mod tests {
         Arc::new(MeshSecurity::new(db, cipher).expect("mesh security"))
     }
 
+    fn make_settings_cipher(key_seed: u8) -> Arc<crate::crypto::SettingsCipher> {
+        Arc::new(crate::crypto::SettingsCipher::new(&[key_seed; 32]))
+    }
+
     fn make_runtime(key_seed: u8) -> RuntimeHarness {
         let ledger_dir = tempfile::tempdir().expect("ledger dir");
         let db = make_db();
@@ -2083,6 +2094,7 @@ mod tests {
                     security,
                 },
                 local_node_id,
+                settings_cipher: make_settings_cipher(key_seed),
             },
             _ledger_dir: ledger_dir,
         }
@@ -2101,6 +2113,7 @@ mod tests {
                 security,
             },
             local_node_id,
+            settings_cipher: make_settings_cipher(key_seed),
         }
     }
 
@@ -2649,8 +2662,12 @@ mod tests {
                 .get_operation(result.op_id)
                 .expect("operation");
 
-            crate::sync::core_materializer::apply_core_operation(&receiver.runtime.db, &operation)
-                .expect("apply core operation");
+            crate::sync::core_materializer::apply_core_operation(
+                &receiver.runtime.db,
+                &receiver.runtime.settings_cipher,
+                &operation,
+            )
+            .expect("apply core operation");
             let flow = repository::get_flow(&receiver.runtime.db, 41)
                 .expect("get flow")
                 .expect("flow");
@@ -2697,8 +2714,12 @@ mod tests {
                 .get_operation(result.op_id)
                 .expect("operation");
 
-            crate::sync::core_materializer::apply_core_operation(&receiver.runtime.db, &operation)
-                .expect("merge core operation");
+            crate::sync::core_materializer::apply_core_operation(
+                &receiver.runtime.db,
+                &receiver.runtime.settings_cipher,
+                &operation,
+            )
+            .expect("merge core operation");
             let flow = repository::get_flow(&receiver.runtime.db, 43)
                 .expect("get flow")
                 .expect("flow");
@@ -2706,6 +2727,63 @@ mod tests {
             assert_eq!(flow.name, "Merged Flow");
             assert_eq!(flow.status, "active");
             assert_eq!(flow.flow_json, r#"{"nodes":[{"id":"remote"}]}"#);
+        });
+    }
+
+    #[test]
+    fn shared_setting_secret_capture_materializes_with_receiver_cipher() {
+        with_tmp_home(|| {
+            let source = make_runtime(31);
+            let receiver = make_runtime(32);
+            repository::set_shared_secret_setting_secure(
+                &source.runtime.db,
+                "hf_token",
+                "hf_test_secret",
+                &source.runtime.settings_cipher,
+                None,
+            )
+            .expect("set shared secret");
+            let capture_id = {
+                let conn = source.runtime.db.lock().expect("db lock");
+                conn.query_row(
+                    "SELECT capture_id FROM __tentaflow_core_sync_captures \
+                     WHERE resource_type = 'core.shared_setting_secret' AND resource_id = 'hf_token' \
+                     ORDER BY created_at_ms DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("capture id")
+            };
+            let capture = {
+                let conn = source.runtime.db.lock().expect("db lock");
+                crate::sync::core_capture::load_core_write_capture(&conn, &capture_id)
+                    .expect("load capture")
+                    .expect("capture")
+            };
+            let result = source
+                .runtime
+                .record_core_capture(capture)
+                .expect("record core capture");
+            let operation = source
+                .runtime
+                .ledger
+                .get_operation(result.op_id)
+                .expect("operation");
+
+            crate::sync::core_materializer::apply_core_operation(
+                &receiver.runtime.db,
+                &receiver.runtime.settings_cipher,
+                &operation,
+            )
+            .expect("apply shared secret");
+            let value = repository::get_setting_secure(
+                &receiver.runtime.db,
+                "hf_token",
+                &receiver.runtime.settings_cipher,
+            )
+            .expect("get secret");
+
+            assert_eq!(value.as_deref(), Some("hf_test_secret"));
         });
     }
 
