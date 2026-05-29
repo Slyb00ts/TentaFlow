@@ -40,6 +40,10 @@ pub use protocol::{
         StreamAccepted, StreamCancel, StreamChunk, StreamEnd, StreamError, StreamKind,
         StreamOpen, StreamPayload, StreamProgress, StreamRejected, StreamTag,
     },
+    streaming::{
+        StreamCloseInput, StreamCloseOutput, StreamNextInput, StreamNextOutput,
+        StreamSubscribeFilter, StreamSubscribeInput, StreamSubscribeOutput,
+    },
     ui::{
         a11y::{Accessibility, EventKind, Visibility},
         action::{Action, ActionAck, ActionStatus, FieldError, FormFieldMap, FormFieldValue, ParamEntry},

@@ -16,5 +16,6 @@ pub mod envelope;
 pub mod frame;
 pub mod ids;
 pub mod stream;
+pub mod streaming;
 pub mod ui;
 pub mod value;

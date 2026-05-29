@@ -1971,7 +1971,7 @@ pub fn camera_credentials_rotate(
 /// Payload metadata for a Frame message returned by `stream_next`. Bytes live
 /// in the core LRU and travel to a service via `service_call` + PickupToken —
 /// the addon never receives them inline.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StreamFrameMeta {
     pub frame_ref: String,
     pub camera_id: String,
@@ -1991,90 +1991,66 @@ pub enum StreamNextMessage {
     Timeout,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum StreamNextRaw {
-    Frame {
-        frame_ref: String,
-        camera_id: String,
-        width: u32,
-        height: u32,
-        pixel_format: String,
-        timestamp_unix_ms: u64,
-    },
-    Drop {
-        count: u64,
-    },
-    CameraOffline {
-        reason: String,
-    },
-    StreamClosed,
-    Timeout,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct StreamSubscribeOut {
-    stream_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct StreamCloseOut {
-    #[allow(dead_code)]
-    closed: bool,
-}
-
 /// Subscribe to a camera's frame bus. F1a target format: `camera:<camera_id>`.
 /// Ownership is enforced — addons cannot subscribe to cameras owned by other
 /// addons (returns `NotFound`).
 pub fn stream_subscribe(target: &str, max_fps: Option<u32>) -> Result<String, AbiError> {
-    let mut s = format!("target = {}\n", toml::Value::String(target.to_string()));
-    if let Some(fps) = max_fps {
-        s.push_str(&format!("[filter]\nmax_fps = {}\nskip_frames = 0\n", fps));
-    }
-    let bytes = call_sql_with_one_input_capped(stream_subscribe_v1, s.as_bytes(), MAX_OUT_CAP_STREAM)?;
-    let out: StreamSubscribeOut = parse_toml(&bytes)?;
+    let input = tentaflow_sdk_spec::StreamSubscribeInput {
+        target: target.to_string(),
+        filter: max_fps.map(|fps| tentaflow_sdk_spec::StreamSubscribeFilter {
+            max_fps: Some(fps),
+            skip_frames: Some(0),
+        }),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(stream_subscribe_v1, &payload, MAX_OUT_CAP_STREAM)?;
+    let out: tentaflow_sdk_spec::StreamSubscribeOutput = decode_cbor(&bytes)?;
     Ok(out.stream_id)
 }
 
 /// Bounded-await poll for the next stream message. `timeout_ms` is clamped to
 /// 5000 ms by the host.
 pub fn stream_next(stream_id: &str, timeout_ms: u64) -> Result<StreamNextMessage, AbiError> {
-    let payload = format!(
-        "stream_id = {}\ntimeout_ms = {}\n",
-        toml::Value::String(stream_id.to_string()),
+    let input = tentaflow_sdk_spec::StreamNextInput {
+        stream_id: stream_id.to_string(),
         timeout_ms,
-    );
-    let bytes = call_sql_with_one_input_capped(stream_next_v1, payload.as_bytes(), MAX_OUT_CAP_STREAM)?;
-    let raw: StreamNextRaw = parse_toml(&bytes)?;
-    Ok(match raw {
-        StreamNextRaw::Frame {
-            frame_ref,
-            camera_id,
-            width,
-            height,
-            pixel_format,
-            timestamp_unix_ms,
-        } => StreamNextMessage::Frame(StreamFrameMeta {
-            frame_ref,
-            camera_id,
-            width,
-            height,
-            pixel_format,
-            timestamp_unix_ms,
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(stream_next_v1, &payload, MAX_OUT_CAP_STREAM)?;
+    let out: tentaflow_sdk_spec::StreamNextOutput = decode_cbor(&bytes)?;
+    // Map the host's tagged output onto the SDK enum. A missing field for the
+    // declared `kind` means the host produced a malformed frame, which we
+    // surface as `Operation` rather than silently dropping it.
+    match out.kind.as_str() {
+        "frame" => Ok(StreamNextMessage::Frame(StreamFrameMeta {
+            frame_ref: out.frame_ref.ok_or(AbiError::Operation)?,
+            camera_id: out.camera_id.ok_or(AbiError::Operation)?,
+            width: out.width.ok_or(AbiError::Operation)?,
+            height: out.height.ok_or(AbiError::Operation)?,
+            pixel_format: out.pixel_format.ok_or(AbiError::Operation)?,
+            timestamp_unix_ms: out.timestamp_unix_ms.ok_or(AbiError::Operation)?,
+        })),
+        "drop" => Ok(StreamNextMessage::Drop {
+            count: out.count.ok_or(AbiError::Operation)?,
         }),
-        StreamNextRaw::Drop { count } => StreamNextMessage::Drop { count },
-        StreamNextRaw::CameraOffline { reason } => StreamNextMessage::CameraOffline { reason },
-        StreamNextRaw::StreamClosed => StreamNextMessage::StreamClosed,
-        StreamNextRaw::Timeout => StreamNextMessage::Timeout,
-    })
+        "camera_offline" => Ok(StreamNextMessage::CameraOffline {
+            reason: out.reason.ok_or(AbiError::Operation)?,
+        }),
+        "stream_closed" => Ok(StreamNextMessage::StreamClosed),
+        "timeout" => Ok(StreamNextMessage::Timeout),
+        _ => Err(AbiError::Operation),
+    }
 }
 
 /// Drop the subscription. Subsequent `stream_next` calls for the same id
 /// return `StreamNotFound`.
 pub fn stream_close(stream_id: &str) -> Result<(), AbiError> {
-    let payload = format!("stream_id = {}\n", toml::Value::String(stream_id.to_string()));
-    let bytes = call_sql_with_one_input_capped(stream_close_v1, payload.as_bytes(), MAX_OUT_CAP_STREAM)?;
-    let _: StreamCloseOut = parse_toml(&bytes)?;
+    let input = tentaflow_sdk_spec::StreamCloseInput {
+        stream_id: stream_id.to_string(),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(stream_close_v1, &payload, MAX_OUT_CAP_STREAM)?;
+    let _: tentaflow_sdk_spec::StreamCloseOutput = decode_cbor(&bytes)?;
     Ok(())
 }
 
