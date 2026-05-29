@@ -1589,36 +1589,22 @@ fn write_guest_string(ptr: i32, cap: i32, s: &str) -> i32 {
 
 fn send_initial_shell() {
     let layout = build_shell_layout();
-    let slots = vec![
-        SlotDecl {
-            id: "content".into(),
-            semantics: SlotSemantics::MainContent,
-            default_state: SlotDefault::Loading,
-            cache_policy: CachePolicy::OnNavigateBack,
-            visibility: SlotVisibility::Always,
-            max_payload_bytes: Some(256 * 1024),
-        },
-        // The "Add camera" wizard renders into a Modal overlay. The Modal's
-        // body/footer slot containers are created dynamically by the host only
-        // while the Modal is in the layout tree, so these declarations describe
-        // their semantics for the renderer. Content is pushed via SlotContent.
-        SlotDecl {
-            id: "add_camera_body".into(),
-            semantics: SlotSemantics::Modal,
-            default_state: SlotDefault::Empty,
-            cache_policy: CachePolicy::None,
-            visibility: SlotVisibility::Always,
-            max_payload_bytes: Some(256 * 1024),
-        },
-        SlotDecl {
-            id: "add_camera_footer".into(),
-            semantics: SlotSemantics::Modal,
-            default_state: SlotDefault::Empty,
-            cache_policy: CachePolicy::None,
-            visibility: SlotVisibility::Always,
-            max_payload_bytes: Some(64 * 1024),
-        },
-    ];
+    // Only "content" is declared statically. The "Add camera" wizard's
+    // `add_camera_body` / `add_camera_footer` slots must NOT be declared here:
+    // the host would build fixed placeholder containers as siblings of
+    // "content", outside the Modal, which the slot manager would then refuse to
+    // re-register when the Modal renders its own dynamic containers with the
+    // same IDs. Instead those slot containers are created dynamically by the
+    // Modal and auto-registered by the host's `observe(shell)`, with their
+    // SlotContent buffered until registration completes.
+    let slots = vec![SlotDecl {
+        id: "content".into(),
+        semantics: SlotSemantics::MainContent,
+        default_state: SlotDefault::Loading,
+        cache_policy: CachePolicy::OnNavigateBack,
+        visibility: SlotVisibility::Always,
+        max_payload_bytes: Some(256 * 1024),
+    }];
     send_panel_shell(layout, slots, vec![]);
 }
 
