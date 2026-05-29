@@ -37,6 +37,23 @@ use tentaflow_core::db::repository::{
 };
 use tentaflow_core::db::DbPool;
 use tentaflow_core::services::frame_storage::{FrameMetadata, FramePixelFormat, StoredFrame};
+use tentaflow_sdk_spec::{
+    FrameUrlInput, GetStreamOut, RecordingGetUrlInput, RecordingRefInput,
+    RecordingSaveSegmentInput, RecordingSaveSnapshotInput, SaveRecordingOut, StatsOut, UrlOut,
+};
+
+fn encode<T: minicbor::Encode<()>>(value: &T) -> Vec<u8> {
+    let mut buf = Vec::new();
+    minicbor::encode(value, &mut buf).expect("encode cbor");
+    buf
+}
+
+fn decode<T>(bytes: &[u8]) -> T
+where
+    T: for<'b> minicbor::Decode<'b, ()>,
+{
+    minicbor::decode(bytes).expect("decode cbor")
+}
 
 fn make_db() -> DbPool {
     tentaflow_core::db::init(std::path::Path::new(":memory:")).expect("core db init")
@@ -134,12 +151,12 @@ fn insert_frame(camera_id: &str, w: u32, h: u32, data: Vec<u8>) -> String {
         .into_string()
 }
 
-fn snapshot_payload(camera_id: &str, frame_ref: &str) -> String {
-    format!(
-        "camera_id = {}\nframe_ref = {}\n",
-        toml::Value::String(camera_id.into()),
-        toml::Value::String(frame_ref.into()),
-    )
+fn snapshot_payload(camera_id: &str, frame_ref: &str) -> Vec<u8> {
+    encode(&RecordingSaveSnapshotInput {
+        camera_id: camera_id.to_string(),
+        frame_ref: frame_ref.to_string(),
+        retention_class: None,
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -152,10 +169,10 @@ async fn test_save_snapshot_basic() {
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
     let frame_ref = insert_frame(&camera, 16, 12, rgb_buf(16, 12));
     let (rc, out) =
-        rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
+        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &frame_ref));
     assert_eq!(rc, AbiError::Ok.as_i32(), "save_snapshot must succeed");
-    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    let recording_ref = parsed["recording_ref"].as_str().unwrap();
+    let parsed: SaveRecordingOut = decode(&out);
+    let recording_ref = parsed.recording_ref.as_str();
     assert!(recording_ref.starts_with("snap_"));
     // DB row persisted + readable through the repo helper.
     let row = get_recording_for_addon(&db, &addon, recording_ref, None)
@@ -181,7 +198,7 @@ fn test_save_snapshot_permission_denied() {
     let state = make_state(&db, &addon, vec![]); // no recording.write
     let (rc, _) = rec::save_snapshot_with_raw_input(
         &state,
-        snapshot_payload(&camera, "frame_does_not_matter").as_bytes(),
+        &snapshot_payload(&camera, "frame_does_not_matter"),
     );
     assert_eq!(rc, AbiError::Permission.as_i32());
 }
@@ -196,7 +213,7 @@ async fn test_save_snapshot_invalid_frame_ref_format() {
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
     let (rc, _) = rec::save_snapshot_with_raw_input(
         &state,
-        snapshot_payload(&camera, "bogus_no_prefix").as_bytes(),
+        &snapshot_payload(&camera, "bogus_no_prefix"),
     );
     assert_eq!(
         rc,
@@ -215,7 +232,7 @@ async fn test_save_snapshot_nonexistent_frame_ref() {
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
     let made_up = format!("frame_{}", uuid::Uuid::new_v4());
     let (rc, _) =
-        rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &made_up).as_bytes());
+        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &made_up));
     assert_eq!(rc, AbiError::NotFound.as_i32());
 }
 
@@ -234,7 +251,7 @@ async fn test_save_snapshot_cross_addon_frame_denied() {
     let frame_ref = insert_frame(&camera_a, 8, 8, rgb_buf(8, 8));
     let (rc, _) = rec::save_snapshot_with_raw_input(
         &state_b,
-        snapshot_payload(&camera_a, &frame_ref).as_bytes(),
+        &snapshot_payload(&camera_a, &frame_ref),
     );
     assert_eq!(
         rc,
@@ -252,12 +269,12 @@ fn test_save_segment_duration_out_of_range() {
     seed_camera(&db, &addon, &camera);
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
     for bad in [0u32, 61] {
-        let payload = format!(
-            "camera_id = {}\nduration_secs = {}\n",
-            toml::Value::String(camera.clone()),
-            bad,
-        );
-        let (rc, _) = rec::save_segment_with_raw_input(&state, payload.as_bytes());
+        let payload = encode(&RecordingSaveSegmentInput {
+            camera_id: camera.clone(),
+            duration_secs: bad,
+            retention_class: None,
+        });
+        let (rc, _) = rec::save_segment_with_raw_input(&state, &payload);
         assert_eq!(
             rc,
             AbiError::Operation.as_i32(),
@@ -266,12 +283,11 @@ fn test_save_segment_duration_out_of_range() {
     }
 }
 
-/// Addon-supplied `source_url` must be ignored entirely — the host always
-/// derives the segment source from the owned camera row. We probe by feeding
-/// a hostile `file:///etc/passwd` URL alongside a real camera with a benign
-/// fake-file URL and asserting that the only thing failing is the GStreamer
-/// pipeline against the (nonexistent) `/tmp/whatever.mp4` from the camera row —
-/// never the hostile path the addon tried to inject.
+/// The segment source is always derived host-side from the owned camera row —
+/// the input wire shape has no `source_url` field at all, so an addon cannot
+/// inject a path. We assert the only thing failing is the GStreamer pipeline
+/// against the (nonexistent) `/tmp/whatever.mp4` from the camera row, never a
+/// success that would imply the host read an addon-controlled path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_save_segment_uses_camera_url_not_input() {
     let _home = temp_home_guard();
@@ -280,19 +296,19 @@ async fn test_save_segment_uses_camera_url_not_input() {
     let camera = uniq("cam_seg_src");
     seed_camera(&db, &addon, &camera); // seeds url=/tmp/whatever.mp4
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
-    let payload = format!(
-        "camera_id = {}\nsource_url = {}\nduration_secs = 1\n",
-        toml::Value::String(camera),
-        toml::Value::String("file:///etc/passwd".into()),
-    );
-    let (rc, _) = rec::save_segment_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingSaveSegmentInput {
+        camera_id: camera,
+        duration_secs: 1,
+        retention_class: None,
+    });
+    let (rc, _) = rec::save_segment_with_raw_input(&state, &payload);
     // Either Operation (pipeline failure on the missing /tmp/whatever.mp4) or
     // PayloadTooLarge — what must NOT happen is success (Ok=0), which would
-    // mean the host honored the addon-supplied source_url and read /etc/passwd.
+    // mean the host honored an addon-supplied source instead of the camera row.
     assert_ne!(
         rc,
         AbiError::Ok.as_i32(),
-        "addon-supplied source_url must never be honored"
+        "addon must never control the segment source"
     );
 }
 
@@ -310,11 +326,11 @@ fn test_recording_ref_invalid_format_rejected() {
         "clip_12345678-1234-1234-1234-12345678901Z",
         "frame_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", // wrong prefix for recording ref
     ] {
-        let payload = format!(
-            "recording_ref = {}\nttl_secs = 120\n",
-            toml::Value::String(hostile.into()),
-        );
-        let (rc, _) = rec::get_url_with_raw_input(&state, payload.as_bytes());
+        let payload = encode(&RecordingGetUrlInput {
+            recording_ref: hostile.to_string(),
+            ttl_secs: 120,
+        });
+        let (rc, _) = rec::get_url_with_raw_input(&state, &payload);
         assert_eq!(
             rc,
             AbiError::Operation.as_i32(),
@@ -338,21 +354,15 @@ async fn test_save_segment_basic() {
         eprintln!("skipping — sample mp4 missing");
         return;
     }
-    let payload = format!(
-        "camera_id = {}\nsource_url = {}\nduration_secs = 2\n",
-        toml::Value::String(camera),
-        toml::Value::String(format!(
-            "file://{}",
-            sample.canonicalize().unwrap().display()
-        )),
-    );
-    let (rc, out) = rec::save_segment_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingSaveSegmentInput {
+        camera_id: camera,
+        duration_secs: 2,
+        retention_class: None,
+    });
+    let (rc, out) = rec::save_segment_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::Ok.as_i32());
-    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    assert!(parsed["recording_ref"]
-        .as_str()
-        .unwrap()
-        .starts_with("clip_"));
+    let parsed: SaveRecordingOut = decode(&out);
+    assert!(parsed.recording_ref.starts_with("clip_"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -369,37 +379,36 @@ async fn test_get_url_basic_and_ttl_bounds() {
     );
     let frame_ref = insert_frame(&camera, 16, 12, rgb_buf(16, 12));
     let (_rc, out) =
-        rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
-    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    let recording_ref = parsed["recording_ref"].as_str().unwrap();
+        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &frame_ref));
+    let parsed: SaveRecordingOut = decode(&out);
+    let recording_ref = parsed.recording_ref.as_str();
 
     // happy path
-    let payload = format!(
-        "recording_ref = {}\nttl_secs = 300\n",
-        toml::Value::String(recording_ref.into())
-    );
-    let (rc, body) = rec::get_url_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingGetUrlInput {
+        recording_ref: recording_ref.to_string(),
+        ttl_secs: 300,
+    });
+    let (rc, body) = rec::get_url_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::Ok.as_i32());
-    let v: toml::Value = toml::from_str(std::str::from_utf8(&body).unwrap()).unwrap();
-    let url = v["url"].as_str().unwrap();
-    assert!(url.contains("token="));
-    assert!(url.contains("exp="));
-    assert!(url.contains("ref="));
+    let v: UrlOut = decode(&body);
+    assert!(v.url.contains("token="));
+    assert!(v.url.contains("exp="));
+    assert!(v.url.contains("ref="));
 
     // TTL too small
-    let payload = format!(
-        "recording_ref = {}\nttl_secs = 30\n",
-        toml::Value::String(recording_ref.into())
-    );
-    let (rc, _) = rec::get_url_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingGetUrlInput {
+        recording_ref: recording_ref.to_string(),
+        ttl_secs: 30,
+    });
+    let (rc, _) = rec::get_url_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::Operation.as_i32());
 
     // TTL too large
-    let payload = format!(
-        "recording_ref = {}\nttl_secs = 4000\n",
-        toml::Value::String(recording_ref.into())
-    );
-    let (rc, _) = rec::get_url_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingGetUrlInput {
+        recording_ref: recording_ref.to_string(),
+        ttl_secs: 4000,
+    });
+    let (rc, _) = rec::get_url_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::Operation.as_i32());
 }
 
@@ -419,17 +428,17 @@ async fn test_get_url_cross_addon_denied() {
     let frame_ref = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
     let (_rc, out) = rec::save_snapshot_with_raw_input(
         &state_a,
-        snapshot_payload(&camera, &frame_ref).as_bytes(),
+        &snapshot_payload(&camera, &frame_ref),
     );
-    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    let recording_ref = parsed["recording_ref"].as_str().unwrap();
+    let parsed: SaveRecordingOut = decode(&out);
+    let recording_ref = parsed.recording_ref.as_str();
 
     let state_b = make_state(&db, &addon_b, vec!["recording.read".into()]);
-    let payload = format!(
-        "recording_ref = {}\nttl_secs = 120\n",
-        toml::Value::String(recording_ref.into())
-    );
-    let (rc, _) = rec::get_url_with_raw_input(&state_b, payload.as_bytes());
+    let payload = encode(&RecordingGetUrlInput {
+        recording_ref: recording_ref.to_string(),
+        ttl_secs: 120,
+    });
+    let (rc, _) = rec::get_url_with_raw_input(&state_b, &payload);
     assert_eq!(
         rc,
         AbiError::NotFound.as_i32(),
@@ -451,24 +460,22 @@ async fn test_get_stream_basic() {
     );
     let frame_ref = insert_frame(&camera, 16, 12, rgb_buf(16, 12));
     let (_rc, out) =
-        rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
-    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    let recording_ref = parsed["recording_ref"].as_str().unwrap();
+        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &frame_ref));
+    let parsed: SaveRecordingOut = decode(&out);
+    let recording_ref = parsed.recording_ref.as_str();
     let row = get_recording_for_addon(&db, &addon, recording_ref, None)
         .unwrap()
         .unwrap();
 
-    let payload = format!(
-        "recording_ref = {}\n",
-        toml::Value::String(recording_ref.into())
-    );
-    let (rc, body) = rec::get_stream_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingRefInput {
+        recording_ref: recording_ref.to_string(),
+    });
+    let (rc, body) = rec::get_stream_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::Ok.as_i32());
-    let v: toml::Value = toml::from_str(std::str::from_utf8(&body).unwrap()).unwrap();
-    let b64 = v["data_b64"].as_str().unwrap();
+    let v: GetStreamOut = decode(&body);
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64)
+        .decode(v.data_b64.as_bytes())
         .unwrap();
     let on_disk = std::fs::read(&row.file_path).unwrap();
     assert_eq!(
@@ -496,9 +503,9 @@ async fn test_get_stream_oversized_rejected_before_read() {
     );
     let frame_ref = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
     let (_rc, out) =
-        rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
-    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    let recording_ref = parsed["recording_ref"].as_str().unwrap().to_string();
+        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &frame_ref));
+    let parsed: SaveRecordingOut = decode(&out);
+    let recording_ref = parsed.recording_ref.clone();
 
     // Forge the DB row's file_size_bytes to 7 MiB — base64 expands to >9 MiB
     // which exceeds the ServiceCall 8 MiB cap.
@@ -512,11 +519,10 @@ async fn test_get_stream_oversized_rejected_before_read() {
             .unwrap();
         assert_eq!(n, 1);
     }
-    let payload = format!(
-        "recording_ref = {}\n",
-        toml::Value::String(recording_ref.clone())
-    );
-    let (rc, _) = rec::get_stream_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingRefInput {
+        recording_ref: recording_ref.clone(),
+    });
+    let (rc, _) = rec::get_stream_with_raw_input(&state, &payload);
     assert_eq!(
         rc,
         AbiError::PayloadTooLarge.as_i32(),
@@ -538,9 +544,9 @@ async fn test_purge_io_error_returns_error_no_db_soft_delete() {
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
     let frame_ref = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
     let (_rc, out) =
-        rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
-    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    let recording_ref = parsed["recording_ref"].as_str().unwrap().to_string();
+        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &frame_ref));
+    let parsed: SaveRecordingOut = decode(&out);
+    let recording_ref = parsed.recording_ref.clone();
 
     // Repoint the on-disk file at a bogus path whose parent is a file — any
     // `unlink` against it surfaces a non-NotFound IO error.
@@ -559,11 +565,10 @@ async fn test_purge_io_error_returns_error_no_db_soft_delete() {
         assert_eq!(n, 1);
     }
 
-    let payload = format!(
-        "recording_ref = {}\n",
-        toml::Value::String(recording_ref.clone())
-    );
-    let (rc, _) = rec::purge_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingRefInput {
+        recording_ref: recording_ref.clone(),
+    });
+    let (rc, _) = rec::purge_with_raw_input(&state, &payload);
     assert_eq!(
         rc,
         AbiError::Operation.as_i32(),
@@ -589,9 +594,9 @@ async fn test_purge_idempotent_and_file_missing_ok() {
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
     let frame_ref = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
     let (_rc, out) =
-        rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
-    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    let recording_ref = parsed["recording_ref"].as_str().unwrap().to_string();
+        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &frame_ref));
+    let parsed: SaveRecordingOut = decode(&out);
+    let recording_ref = parsed.recording_ref.clone();
 
     // Manually drop the file first to test idempotency when the file is gone.
     let row = get_recording_for_addon(&db, &addon, &recording_ref, None)
@@ -599,11 +604,10 @@ async fn test_purge_idempotent_and_file_missing_ok() {
         .unwrap();
     std::fs::remove_file(&row.file_path).ok();
 
-    let payload = format!(
-        "recording_ref = {}\n",
-        toml::Value::String(recording_ref.clone())
-    );
-    let (rc1, _) = rec::purge_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&RecordingRefInput {
+        recording_ref: recording_ref.clone(),
+    });
+    let (rc1, _) = rec::purge_with_raw_input(&state, &payload);
     assert_eq!(
         rc1,
         AbiError::Ok.as_i32(),
@@ -611,7 +615,7 @@ async fn test_purge_idempotent_and_file_missing_ok() {
     );
 
     // Second purge: row is already soft-deleted, so it surfaces NotFound.
-    let (rc2, _) = rec::purge_with_raw_input(&state, payload.as_bytes());
+    let (rc2, _) = rec::purge_with_raw_input(&state, &payload);
     assert_eq!(
         rc2,
         AbiError::NotFound.as_i32(),
@@ -635,21 +639,20 @@ async fn test_stats_basic_aggregation() {
     for _ in 0..3 {
         let fr = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
         let (rc, _) =
-            rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &fr).as_bytes());
+            rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &fr));
         assert_eq!(rc, AbiError::Ok.as_i32());
     }
     let (rc, out) = rec::stats_with_raw_input(&state, b"");
     assert_eq!(rc, AbiError::Ok.as_i32());
-    let v: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
-    let stats = v.get("stats").expect("stats table");
-    assert_eq!(stats["total_snapshots"].as_integer().unwrap(), 3);
-    assert_eq!(stats["total_segments"].as_integer().unwrap(), 0);
-    let total_size = stats["total_size_bytes"].as_integer().unwrap();
+    let v: StatsOut = decode(&out);
+    assert_eq!(v.stats.total_snapshots, 3);
+    assert_eq!(v.stats.total_segments, 0);
+    let total_size = v.stats.total_size_bytes;
     assert!(total_size > 0);
     // Cross-check against the repo helper directly.
     let agg = recording_stats_for_addon(&db, &addon, None, None).unwrap();
     assert_eq!(agg.total_snapshots, 3);
-    assert_eq!(agg.total_size_bytes as i64, total_size);
+    assert_eq!(agg.total_size_bytes, total_size);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -663,39 +666,38 @@ async fn test_frame_url_basic_and_validation() {
     let frame_ref = insert_frame(&camera, 4, 4, rgb_buf(4, 4));
 
     // happy path
-    let payload = format!(
-        "frame_ref = {}\nttl_secs = 120\n",
-        toml::Value::String(frame_ref.clone())
-    );
-    let (rc, body) = rec::frame_url_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&FrameUrlInput {
+        frame_ref: frame_ref.clone(),
+        ttl_secs: 120,
+    });
+    let (rc, body) = rec::frame_url_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::Ok.as_i32());
-    let v: toml::Value = toml::from_str(std::str::from_utf8(&body).unwrap()).unwrap();
-    let url = v["url"].as_str().unwrap();
-    assert!(url.starts_with("/frames/"));
-    assert!(url.contains("token="));
+    let v: UrlOut = decode(&body);
+    assert!(v.url.starts_with("/frames/"));
+    assert!(v.url.contains("token="));
 
     // TTL too small — FrameUrl scope min is 5 s (dashboard live tile needs short
     // TTLs so a leaked URL becomes useless quickly). 4 s falls below the floor.
-    let payload = format!(
-        "frame_ref = {}\nttl_secs = 4\n",
-        toml::Value::String(frame_ref.clone())
-    );
-    let (rc, _) = rec::frame_url_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&FrameUrlInput {
+        frame_ref: frame_ref.clone(),
+        ttl_secs: 4,
+    });
+    let (rc, _) = rec::frame_url_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::Operation.as_i32());
     // TTL too large
-    let payload = format!(
-        "frame_ref = {}\nttl_secs = 700\n",
-        toml::Value::String(frame_ref.clone())
-    );
-    let (rc, _) = rec::frame_url_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&FrameUrlInput {
+        frame_ref: frame_ref.clone(),
+        ttl_secs: 700,
+    });
+    let (rc, _) = rec::frame_url_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::Operation.as_i32());
 
     // Non-existent
     let made_up = format!("frame_{}", uuid::Uuid::new_v4());
-    let payload = format!(
-        "frame_ref = {}\nttl_secs = 120\n",
-        toml::Value::String(made_up)
-    );
-    let (rc, _) = rec::frame_url_with_raw_input(&state, payload.as_bytes());
+    let payload = encode(&FrameUrlInput {
+        frame_ref: made_up,
+        ttl_secs: 120,
+    });
+    let (rc, _) = rec::frame_url_with_raw_input(&state, &payload);
     assert_eq!(rc, AbiError::NotFound.as_i32());
 }
