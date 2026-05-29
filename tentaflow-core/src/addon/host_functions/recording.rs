@@ -194,7 +194,7 @@ pub fn recording_save_snapshot_v1(
         return AbiError::Permission.as_i32();
     }
     let input: RecordingSaveSnapshotInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
             Ok(v) => v,
             Err(e) => {
                 audit(
@@ -214,7 +214,7 @@ pub fn recording_save_snapshot_v1(
         };
     match save_snapshot_core(caller.data(), &input) {
         CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         CoreResult::Err(code) => code,
     }
@@ -248,7 +248,7 @@ pub fn recording_save_segment_v1(
         return AbiError::Permission.as_i32();
     }
     let input: RecordingSaveSegmentInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
             Ok(v) => v,
             Err(e) => {
                 audit(
@@ -268,7 +268,7 @@ pub fn recording_save_segment_v1(
         };
     match save_segment_core(caller.data(), &input) {
         CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         CoreResult::Err(code) => code,
     }
@@ -302,7 +302,7 @@ pub fn recording_get_url_v1(
         return AbiError::Permission.as_i32();
     }
     let input: RecordingGetUrlInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
             Ok(v) => v,
             Err(e) => {
                 audit(
@@ -322,7 +322,7 @@ pub fn recording_get_url_v1(
         };
     match get_url_core(caller.data(), &input) {
         CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         CoreResult::Err(code) => code,
     }
@@ -355,7 +355,7 @@ pub fn recording_get_stream_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingRefInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+    let input: RecordingRefInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -375,7 +375,7 @@ pub fn recording_get_stream_v1(
     };
     match get_stream_core(caller.data(), &input) {
         CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         CoreResult::Err(code) => code,
     }
@@ -408,7 +408,7 @@ pub fn recording_purge_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingRefInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+    let input: RecordingRefInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -428,7 +428,7 @@ pub fn recording_purge_v1(
     };
     match purge_core(caller.data(), &input) {
         CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         CoreResult::Err(code) => code,
     }
@@ -478,7 +478,7 @@ pub fn recording_stats_v1(
     let input: RecordingStatsInput = if input_len == 0 {
         RecordingStatsInput::default()
     } else {
-        match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
             Ok(v) => v,
             Err(e) => {
                 audit(
@@ -499,7 +499,7 @@ pub fn recording_stats_v1(
     };
     match stats_core(caller.data(), &input) {
         CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         CoreResult::Err(code) => code,
     }
@@ -532,7 +532,7 @@ pub fn frame_url_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: FrameUrlInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+    let input: FrameUrlInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -552,7 +552,7 @@ pub fn frame_url_v1(
     };
     match frame_url_core(caller.data(), &input) {
         CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         CoreResult::Err(code) => code,
     }

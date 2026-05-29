@@ -23,12 +23,14 @@
 #![allow(clippy::too_many_arguments)]
 
 use base64::Engine;
-use serde::{Deserialize, Serialize};
-
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
-use super::{
-    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
+use tentaflow_sdk_spec::{
+    VectorDeleteInput, VectorDeleteOutput, VectorSearchHit, VectorSearchInput, VectorSearchOutput,
+    VectorUpsertInput, VectorUpsertOutput,
 };
+
+use super::abi_helpers::PayloadKind;
+use super::cbor_io::{read_input_cbor, write_cbor_capped};
+use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller};
 use crate::addon::errors::AbiError;
 use crate::addon::manifest::VectorNamespaceSpec;
 use crate::audit::RiskClass;
@@ -42,63 +44,6 @@ use crate::services::vector::{
 
 const PERM_VECTOR_READ: &str = "vector.read";
 const PERM_VECTOR_WRITE: &str = "vector.write";
-
-// =============================================================================
-// Input / output payloads (TOML on the wire — same convention as camera_*_v1)
-// =============================================================================
-
-#[derive(Debug, Deserialize)]
-struct UpsertInput {
-    namespace: String,
-    ref_id: u64,
-    /// Base64-encoded little-endian f32 vector bytes.
-    vector_b64: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchInput {
-    namespace: String,
-    query_b64: String,
-    k: u32,
-    /// Required only when the namespace declares a `gate` in the manifest.
-    /// F1c P3 keeps this a placeholder — P4 (policy/claims engine) will
-    /// resolve the claim id against `policy_claims` + `legal_grants`.
-    #[serde(default)]
-    gate_claim_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeleteInput {
-    namespace: String,
-    ref_id: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct UpsertOutput {
-    namespace: String,
-    ref_id: u64,
-    count: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct SearchHitOut {
-    ref_id: u64,
-    score: f32,
-}
-
-#[derive(Debug, Serialize)]
-struct SearchOutput {
-    namespace: String,
-    hits: Vec<SearchHitOut>,
-}
-
-#[derive(Debug, Serialize)]
-struct DeleteOutput {
-    namespace: String,
-    ref_id: u64,
-    removed: bool,
-    count: u64,
-}
 
 // =============================================================================
 // Shared helpers
@@ -144,54 +89,6 @@ fn audit_with_claim(
         result,
         reason,
     );
-}
-
-/// Reads a TOML payload from guest memory while enforcing the payload size
-/// limit BEFORE materializing a `String` on the host heap. Vector payloads
-/// fall under `PayloadKind::VectorItem` (1 MiB) which is wide enough for a
-/// 4096-dim f32 vector plus the base64 overhead and TOML framing.
-fn read_toml(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &WasmCaller<'_, AddonState>,
-    input_ptr: i32,
-    input_len: i32,
-) -> Result<String, AbiError> {
-    if input_len < 0 {
-        return Err(AbiError::Operation);
-    }
-    if enforce_payload_size(input_len as usize, PayloadKind::VectorItem).is_err() {
-        return Err(AbiError::PayloadTooLarge);
-    }
-    let bytes =
-        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| AbiError::Operation)
-}
-
-fn write_toml_capped<T: Serialize>(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &mut WasmCaller<'_, AddonState>,
-    value: &T,
-    out_ptr: i32,
-    out_cap: i32,
-    out_len_ptr: i32,
-) -> i32 {
-    let serialized = match toml::to_string(value) {
-        Ok(s) => s,
-        Err(_) => return AbiError::Operation.as_i32(),
-    };
-    if enforce_payload_size(serialized.len(), PayloadKind::VectorItem).is_err() {
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-    write_output_with_retry_semantics(
-        memory,
-        caller,
-        serialized.as_bytes(),
-        out_ptr,
-        out_cap,
-        out_len_ptr,
-    )
 }
 
 /// Decode a `base64(little-endian f32)` payload into a `Vec<f32>`. Rejects
@@ -353,8 +250,8 @@ fn manager(state: &AddonState) -> &'static std::sync::Arc<NamespaceManager> {
 
 /// ABI: (input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
 ///
-/// Input TOML: `namespace`, `ref_id`, `vector_b64` (base64 of LE f32 bytes).
-/// Output TOML: `namespace`, `ref_id`, `count` (post-upsert vector count).
+/// Input CBOR: `namespace`, `ref_id`, `vector_b64` (base64 of LE f32 bytes).
+/// Output CBOR: `namespace`, `ref_id`, `count` (post-upsert vector count).
 /// Requires `vector.write` permission. Risk class B — embeddings of regulated
 /// data classes (faces / persons) flow through here.
 pub fn vector_upsert_v1(
@@ -370,47 +267,37 @@ pub fn vector_upsert_v1(
         None => return AbiError::Operation.as_i32(),
     };
 
-    let toml_str = match read_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "vector.upsert",
-                None,
-                RiskClass::B,
-                "denied",
-                Some("payload_invalid"),
-            );
-            return e.as_i32();
-        }
-    };
-
-    let input: UpsertInput = match toml::from_str(&toml_str) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "vector.upsert",
-                None,
-                RiskClass::B,
-                "denied",
-                Some("toml_parse_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-
     if !check_permission(caller.data(), PERM_VECTOR_WRITE, None) {
         audit(
             caller.data(),
             "vector.upsert",
-            Some(&input.namespace),
+            None,
             RiskClass::B,
             "denied",
             Some("missing_permission"),
         );
         return AbiError::Permission.as_i32();
     }
+
+    let input: VectorUpsertInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::VectorItem) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "vector.upsert",
+                    None,
+                    RiskClass::B,
+                    "denied",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
 
     if let Err(_e) = validate_namespace_name(&input.namespace) {
         audit(
@@ -514,12 +401,20 @@ pub fn vector_upsert_v1(
         None,
     );
 
-    let out = UpsertOutput {
+    let out = VectorUpsertOutput {
         namespace: input.namespace,
         ref_id: input.ref_id,
         count,
     };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::VectorItem,
+    )
 }
 
 // =============================================================================
@@ -528,8 +423,8 @@ pub fn vector_upsert_v1(
 
 /// ABI: (input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
 ///
-/// Input TOML: `namespace`, `query_b64`, `k`, optional `gate_claim_id`.
-/// Output TOML: `namespace`, `hits = [{ref_id, score}, ...]` (top-k, closest
+/// Input CBOR: `namespace`, `query_b64`, `k`, optional `gate_claim_id`.
+/// Output CBOR: `namespace`, `hits = [{ref_id, score}, ...]` (top-k, closest
 /// first). Requires `vector.read` permission. Risk class B.
 pub fn vector_search_v1(
     mut caller: WasmCaller<'_, AddonState>,
@@ -544,47 +439,37 @@ pub fn vector_search_v1(
         None => return AbiError::Operation.as_i32(),
     };
 
-    let toml_str = match read_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "vector.search",
-                None,
-                RiskClass::B,
-                "denied",
-                Some("payload_invalid"),
-            );
-            return e.as_i32();
-        }
-    };
-
-    let input: SearchInput = match toml::from_str(&toml_str) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "vector.search",
-                None,
-                RiskClass::B,
-                "denied",
-                Some("toml_parse_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-
     if !check_permission(caller.data(), PERM_VECTOR_READ, None) {
         audit(
             caller.data(),
             "vector.search",
-            Some(&input.namespace),
+            None,
             RiskClass::B,
             "denied",
             Some("missing_permission"),
         );
         return AbiError::Permission.as_i32();
     }
+
+    let input: VectorSearchInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::VectorItem) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "vector.search",
+                    None,
+                    RiskClass::B,
+                    "denied",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
 
     if input.k == 0 || input.k > MAX_SEARCH_K {
         audit(
@@ -708,11 +593,19 @@ pub fn vector_search_v1(
             "ok",
             Some("namespace_empty"),
         );
-        let out = SearchOutput {
+        let out = VectorSearchOutput {
             namespace: input.namespace,
             hits: Vec::new(),
         };
-        return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+        return write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::VectorItem,
+        );
     };
 
     let hits = match backend.search(&query, input.k as usize) {
@@ -740,17 +633,25 @@ pub fn vector_search_v1(
         None,
     );
 
-    let out = SearchOutput {
+    let out = VectorSearchOutput {
         namespace: input.namespace,
         hits: hits
             .into_iter()
-            .map(|h| SearchHitOut {
+            .map(|h| VectorSearchHit {
                 ref_id: h.ref_id,
                 score: h.score,
             })
             .collect(),
     };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::VectorItem,
+    )
 }
 
 // =============================================================================
@@ -759,7 +660,7 @@ pub fn vector_search_v1(
 
 /// ABI: (input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
 ///
-/// Input TOML: `namespace`, `ref_id`. Output TOML: `namespace`, `ref_id`,
+/// Input CBOR: `namespace`, `ref_id`. Output CBOR: `namespace`, `ref_id`,
 /// `removed` (true if the key existed), `count`. Requires `vector.write`.
 pub fn vector_delete_v1(
     mut caller: WasmCaller<'_, AddonState>,
@@ -774,47 +675,37 @@ pub fn vector_delete_v1(
         None => return AbiError::Operation.as_i32(),
     };
 
-    let toml_str = match read_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "vector.delete",
-                None,
-                RiskClass::B,
-                "denied",
-                Some("payload_invalid"),
-            );
-            return e.as_i32();
-        }
-    };
-
-    let input: DeleteInput = match toml::from_str(&toml_str) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "vector.delete",
-                None,
-                RiskClass::B,
-                "denied",
-                Some("toml_parse_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-
     if !check_permission(caller.data(), PERM_VECTOR_WRITE, None) {
         audit(
             caller.data(),
             "vector.delete",
-            Some(&input.namespace),
+            None,
             RiskClass::B,
             "denied",
             Some("missing_permission"),
         );
         return AbiError::Permission.as_i32();
     }
+
+    let input: VectorDeleteInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::VectorItem) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "vector.delete",
+                    None,
+                    RiskClass::B,
+                    "denied",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
 
     if validate_namespace_name(&input.namespace).is_err() {
         audit(
@@ -878,13 +769,21 @@ pub fn vector_delete_v1(
             "ok",
             Some("namespace_empty"),
         );
-        let out = DeleteOutput {
+        let out = VectorDeleteOutput {
             namespace: input.namespace,
             ref_id: input.ref_id,
             removed: false,
             count: 0,
         };
-        return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+        return write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::VectorItem,
+        );
     };
 
     // backend.delete() persists internally before returning Ok — a success
@@ -920,13 +819,21 @@ pub fn vector_delete_v1(
         None,
     );
 
-    let out = DeleteOutput {
+    let out = VectorDeleteOutput {
         namespace: input.namespace,
         ref_id: input.ref_id,
         removed,
         count,
     };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::VectorItem,
+    )
 }
 
 // =============================================================================

@@ -23,6 +23,7 @@ use tentaflow_sdk_spec::{
     StreamSubscribeOutput,
 };
 
+use super::abi_helpers::PayloadKind;
 use super::cbor_io::{read_input_cbor, write_cbor_capped};
 use super::{
     audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller,
@@ -158,7 +159,7 @@ pub fn stream_subscribe_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: StreamSubscribeInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+    let input: StreamSubscribeInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -268,7 +269,7 @@ pub fn stream_subscribe_v1(
         Some(&format!("stream_id={}", stream_id)),
     );
     let out = StreamSubscribeOutput { stream_id };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -297,7 +298,7 @@ pub fn stream_next_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: StreamNextInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+    let input: StreamNextInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -369,7 +370,7 @@ pub fn stream_next_v1(
                 "ok",
                 Some("frame"),
             );
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         NextOutcome::Message(StreamMessage::Drop { count }) => {
             let out = StreamNextOutput::drop(count);
@@ -380,7 +381,7 @@ pub fn stream_next_v1(
                 "ok",
                 Some(&format!("drop={}", count)),
             );
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         NextOutcome::Message(StreamMessage::CameraOffline { reason }) => {
             // Camera left the bus — evict the subscriber slot so future
@@ -394,7 +395,7 @@ pub fn stream_next_v1(
                 "ok",
                 Some("camera_offline"),
             );
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         NextOutcome::Closed => {
             // Channel closed without an explicit CameraOffline (subscriber
@@ -409,7 +410,7 @@ pub fn stream_next_v1(
                 "ok",
                 Some("stream_closed"),
             );
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
         NextOutcome::Timeout => {
             let out = StreamNextOutput::timeout();
@@ -420,7 +421,7 @@ pub fn stream_next_v1(
                 "ok",
                 Some("timeout"),
             );
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
         }
     }
 }
@@ -451,7 +452,7 @@ pub fn stream_close_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: StreamCloseInput = match read_input_cbor(&memory, &caller, input_ptr, input_len) {
+    let input: StreamCloseInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -494,7 +495,7 @@ pub fn stream_close_v1(
             None,
         );
         let out = StreamCloseOutput { closed: true };
-        return write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+        return write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall);
     }
     audit(
         caller.data(),

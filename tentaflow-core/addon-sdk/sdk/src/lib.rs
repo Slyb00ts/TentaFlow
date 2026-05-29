@@ -1725,11 +1725,6 @@ where
     Ok(value)
 }
 
-fn parse_toml<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, AbiError> {
-    let s = std::str::from_utf8(bytes).map_err(|_| AbiError::Operation)?;
-    toml::from_str::<T>(s).map_err(|_| AbiError::Operation)
-}
-
 fn call_host_no_input(
     host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32,
 ) -> Result<Vec<u8>, AbiError> {
@@ -2093,16 +2088,6 @@ pub struct MetadataFrame {
     pub items: Vec<MetadataItem>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct MetadataPollRaw {
-    #[serde(default)]
-    frames: Vec<MetadataFrame>,
-    #[serde(default)]
-    camera_offline: bool,
-    #[serde(default)]
-    dropped: u64,
-}
-
 /// Aggregate poll outcome — frames plus optional backpressure / offline
 /// signals.
 #[derive(Debug, Clone)]
@@ -2117,18 +2102,6 @@ pub struct MetadataPollResult {
     pub dropped: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct MetadataSubscribeOut {
-    subscription_id: String,
-    #[allow(dead_code)]
-    status: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MetadataUnsubscribeOut {
-    unsubscribed: bool,
-}
-
 /// Subscribe to a camera's ONVIF analytics-metadata stream. The host spawns
 /// (or refcounts) a per-camera PullPoint task; the first subscriber pays
 /// the cost of `CreatePullPointSubscription` against the camera. Errors:
@@ -2141,16 +2114,15 @@ struct MetadataUnsubscribeOut {
 ///                    are missing.
 ///   * `CameraUnreachable` — transport error talking to the events service.
 pub fn camera_metadata_subscribe(camera_id: &str) -> Result<String, AbiError> {
-    let payload = format!(
-        "camera_id = {}\n",
-        toml::Value::String(camera_id.to_string()),
-    );
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::MetadataSubscribeInput {
+        camera_id: camera_id.to_string(),
+    })?;
     let bytes = call_sql_with_one_input_capped(
         camera_metadata_subscribe_v1,
-        payload.as_bytes(),
+        &payload,
         MAX_OUT_CAP_STREAM,
     )?;
-    let out: MetadataSubscribeOut = parse_toml(&bytes)?;
+    let out: tentaflow_sdk_spec::MetadataSubscribeOutput = decode_cbor(&bytes)?;
     Ok(out.subscription_id)
 }
 
@@ -2161,20 +2133,33 @@ pub fn camera_metadata_poll(
     max_items: u32,
     timeout_ms: u32,
 ) -> Result<MetadataPollResult, AbiError> {
-    let payload = format!(
-        "subscription_id = {}\nmax_items = {}\ntimeout_ms = {}\n",
-        toml::Value::String(subscription_id.to_string()),
-        max_items,
-        timeout_ms,
-    );
-    let bytes = call_sql_with_one_input_capped(
-        camera_metadata_poll_v1,
-        payload.as_bytes(),
-        MAX_OUT_CAP_STREAM,
-    )?;
-    let raw: MetadataPollRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::MetadataPollInput {
+        subscription_id: subscription_id.to_string(),
+        max_items: Some(max_items),
+        timeout_ms: Some(timeout_ms),
+    })?;
+    let bytes =
+        call_sql_with_one_input_capped(camera_metadata_poll_v1, &payload, MAX_OUT_CAP_STREAM)?;
+    let raw: tentaflow_sdk_spec::MetadataPollOutput = decode_cbor(&bytes)?;
     Ok(MetadataPollResult {
-        frames: raw.frames,
+        frames: raw
+            .frames
+            .into_iter()
+            .map(|f| MetadataFrame {
+                camera_id: f.camera_id,
+                ts_unix_ms: f.ts_unix_ms,
+                items: f
+                    .items
+                    .into_iter()
+                    .map(|i| MetadataItem {
+                        class: i.class,
+                        confidence: i.confidence,
+                        bbox: i.bbox,
+                        track_id: i.track_id,
+                    })
+                    .collect(),
+            })
+            .collect(),
         camera_offline: raw.camera_offline,
         dropped: raw.dropped,
     })
@@ -2184,16 +2169,15 @@ pub fn camera_metadata_poll(
 /// (or one for an unknown id) returns `Ok(false)`. The supervisor pull
 /// task is cancelled when the last addon unsubscribes from the camera.
 pub fn camera_metadata_unsubscribe(subscription_id: &str) -> Result<bool, AbiError> {
-    let payload = format!(
-        "subscription_id = {}\n",
-        toml::Value::String(subscription_id.to_string()),
-    );
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::MetadataUnsubscribeInput {
+        subscription_id: subscription_id.to_string(),
+    })?;
     let bytes = call_sql_with_one_input_capped(
         camera_metadata_unsubscribe_v1,
-        payload.as_bytes(),
+        &payload,
         MAX_OUT_CAP_STREAM,
     )?;
-    let out: MetadataUnsubscribeOut = parse_toml(&bytes)?;
+    let out: tentaflow_sdk_spec::MetadataUnsubscribeOutput = decode_cbor(&bytes)?;
     Ok(out.unsubscribed)
 }
 
@@ -2257,10 +2241,6 @@ pub struct RecordingStream {
     pub bytes: Vec<u8>,
     pub file_size_bytes: u64,
     pub hash_sha256: String,
-}
-
-fn push_kv_str(s: &mut String, key: &str, value: &str) {
-    s.push_str(&format!("{} = {}\n", key, toml::Value::String(value.to_string())));
 }
 
 fn save_recording_info_from(out: tentaflow_sdk_spec::SaveRecordingOut) -> SavedRecordingInfo {
@@ -2419,28 +2399,6 @@ pub struct VectorHit {
     pub score: f32,
 }
 
-#[derive(Debug, Deserialize)]
-struct VectorUpsertResponse {
-    pub namespace: String,
-    pub ref_id: u64,
-    pub count: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct VectorSearchResponse {
-    pub namespace: String,
-    #[serde(default)]
-    pub hits: Vec<VectorHit>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VectorDeleteResponse {
-    pub namespace: String,
-    pub ref_id: u64,
-    pub removed: bool,
-    pub count: u64,
-}
-
 /// Encode a `&[f32]` slice as base64(little-endian f32 bytes) for the vector
 /// host functions. Exposed publicly so addons can pre-encode embeddings once
 /// and reuse the string across upsert/search calls.
@@ -2457,12 +2415,13 @@ pub fn encode_vector_b64(vector: &[f32]) -> String {
 /// and the namespace must be declared in the addon manifest under
 /// `[[vector_namespace]]`.
 pub fn vector_upsert(namespace: &str, ref_id: u64, vector: &[f32]) -> Result<u64, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "namespace", namespace);
-    s.push_str(&format!("ref_id = {}\n", ref_id));
-    push_kv_str(&mut s, "vector_b64", &encode_vector_b64(vector));
-    let bytes = call_sql_with_one_input(vector_upsert_v1, s.as_bytes())?;
-    let resp: VectorUpsertResponse = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorUpsertInput {
+        namespace: namespace.to_string(),
+        ref_id,
+        vector_b64: encode_vector_b64(vector),
+    })?;
+    let bytes = call_sql_with_one_input(vector_upsert_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::VectorUpsertOutput = decode_cbor(&bytes)?;
     Ok(resp.count)
 }
 
@@ -2475,25 +2434,32 @@ pub fn vector_search(
     k: u32,
     gate_claim_id: Option<&str>,
 ) -> Result<Vec<VectorHit>, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "namespace", namespace);
-    push_kv_str(&mut s, "query_b64", &encode_vector_b64(query));
-    s.push_str(&format!("k = {}\n", k));
-    if let Some(c) = gate_claim_id {
-        push_kv_str(&mut s, "gate_claim_id", c);
-    }
-    let bytes = call_sql_with_one_input(vector_search_v1, s.as_bytes())?;
-    let resp: VectorSearchResponse = parse_toml(&bytes)?;
-    Ok(resp.hits)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorSearchInput {
+        namespace: namespace.to_string(),
+        query_b64: encode_vector_b64(query),
+        k,
+        gate_claim_id: gate_claim_id.map(str::to_string),
+    })?;
+    let bytes = call_sql_with_one_input(vector_search_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::VectorSearchOutput = decode_cbor(&bytes)?;
+    Ok(resp
+        .hits
+        .into_iter()
+        .map(|h| VectorHit {
+            ref_id: h.ref_id,
+            score: h.score,
+        })
+        .collect())
 }
 
 /// Remove the vector under `ref_id`. Returns `true` if the key existed.
 pub fn vector_delete(namespace: &str, ref_id: u64) -> Result<bool, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "namespace", namespace);
-    s.push_str(&format!("ref_id = {}\n", ref_id));
-    let bytes = call_sql_with_one_input(vector_delete_v1, s.as_bytes())?;
-    let resp: VectorDeleteResponse = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorDeleteInput {
+        namespace: namespace.to_string(),
+        ref_id,
+    })?;
+    let bytes = call_sql_with_one_input(vector_delete_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::VectorDeleteOutput = decode_cbor(&bytes)?;
     Ok(resp.removed)
 }
 
@@ -2544,14 +2510,28 @@ pub fn gate_check_scoped(
     claim_id: &str,
     resource_scope: Option<&str>,
 ) -> Result<GateCheckResult, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "gate_id", gate_id);
-    push_kv_str(&mut s, "claim_id", claim_id);
-    if let Some(rs) = resource_scope {
-        push_kv_str(&mut s, "resource_scope", rs);
-    }
-    let bytes = call_sql_with_one_input(gate_check_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::GateCheckInput {
+        gate_id: gate_id.to_string(),
+        claim_id: claim_id.to_string(),
+        resource_scope: resource_scope.map(str::to_string),
+    })?;
+    let bytes = call_sql_with_one_input(gate_check_v1, &payload)?;
+    let out: tentaflow_sdk_spec::GateCheckOutput = decode_cbor(&bytes)?;
+    Ok(GateCheckResult {
+        valid: out.valid,
+        claim_id: out.claim_id,
+        claim_type: out.claim_type,
+        valid_until: out.valid_until,
+        signers: out
+            .signers
+            .into_iter()
+            .map(|s| GateSigner {
+                role: s.role,
+                user: s.user,
+            })
+            .collect(),
+        reason: out.reason,
+    })
 }
 
 // =============================================================================
@@ -2577,9 +2557,17 @@ pub struct FlowInvocation {
     pub result_toml: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct FlowCancelRaw {
-    cancelled: bool,
+fn flow_invocation_from(out: tentaflow_sdk_spec::FlowInvocationOutput) -> FlowInvocation {
+    FlowInvocation {
+        invocation_id: out.invocation_id,
+        status: out.status,
+        started_at: out.started_at,
+        finished_at: out.finished_at,
+        operators_completed: out.operators_completed,
+        operators_total: out.operators_total,
+        error: out.error,
+        result_toml: out.result_toml,
+    }
 }
 
 /// Invoke a manifest-declared flow. `wait_ms == 0` returns immediately with
@@ -2591,38 +2579,45 @@ pub fn flow_invoke(
     input_toml: &str,
     wait_ms: u32,
 ) -> Result<FlowInvocation, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "flow_id", flow_id);
-    s.push_str(&format!("wait_ms = {}\n", wait_ms));
-    // `input` is rendered as an inline TOML expression so callers can pass
-    // a nested table — push it last to avoid leaking the table header into
-    // subsequent scalar keys.
-    s.push_str("input = ");
-    s.push_str(input_toml.trim());
-    s.push('\n');
-    let bytes = call_sql_with_one_input(flow_invoke_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    // `input_toml` is the opaque operator payload — carried verbatim as a string
+    // inside the CBOR input and parsed back into a `toml::Value` host-side.
+    let trimmed = input_toml.trim();
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::FlowInvokeInput {
+        flow_id: flow_id.to_string(),
+        input_toml: if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        },
+        wait_ms,
+    })?;
+    let bytes = call_sql_with_one_input(flow_invoke_v1, &payload)?;
+    let out: tentaflow_sdk_spec::FlowInvocationOutput = decode_cbor(&bytes)?;
+    Ok(flow_invocation_from(out))
 }
 
 /// Read the authoritative DB row for an invocation. The host filters by
 /// the calling addon id, so an invocation owned by a different addon is
 /// reported as `AbiError::NotFound`.
 pub fn flow_status(invocation_id: &str) -> Result<FlowInvocation, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "invocation_id", invocation_id);
-    let bytes = call_sql_with_one_input(flow_status_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::FlowInvocationIdInput {
+        invocation_id: invocation_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(flow_status_v1, &payload)?;
+    let out: tentaflow_sdk_spec::FlowInvocationOutput = decode_cbor(&bytes)?;
+    Ok(flow_invocation_from(out))
 }
 
 /// Request cooperative cancellation of a running invocation. Idempotent:
 /// cancelling a finished invocation returns `cancelled = true` as long as
 /// the invocation belongs to the calling addon.
 pub fn flow_cancel(invocation_id: &str) -> Result<bool, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "invocation_id", invocation_id);
-    let bytes = call_sql_with_one_input(flow_cancel_v1, s.as_bytes())?;
-    let raw: FlowCancelRaw = parse_toml(&bytes)?;
-    Ok(raw.cancelled)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::FlowInvocationIdInput {
+        invocation_id: invocation_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(flow_cancel_v1, &payload)?;
+    let out: tentaflow_sdk_spec::FlowCancelOutput = decode_cbor(&bytes)?;
+    Ok(out.cancelled)
 }
 
 // =============================================================================
@@ -2646,12 +2641,6 @@ pub struct ServiceInfo {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ServiceListResponse {
-    #[serde(default)]
-    services: Vec<ServiceInfo>,
-}
-
 /// Filtered view of every service visible in the mesh (local node + every
 /// reachable peer). Pass `None` for any filter to include everything.
 /// Requires the `service.read` permission.
@@ -2660,19 +2649,27 @@ pub fn service_list(
     status: Option<&str>,
     node_id: Option<&str>,
 ) -> Result<Vec<ServiceInfo>, AbiError> {
-    let mut s = String::new();
-    if let Some(k) = kind {
-        push_kv_str(&mut s, "kind", k);
-    }
-    if let Some(st) = status {
-        push_kv_str(&mut s, "status", st);
-    }
-    if let Some(n) = node_id {
-        push_kv_str(&mut s, "node_id", n);
-    }
-    let bytes = call_sql_with_one_input(service_list_v1, s.as_bytes())?;
-    let resp: ServiceListResponse = parse_toml(&bytes)?;
-    Ok(resp.services)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::ServiceListInput {
+        kind: kind.map(str::to_string),
+        status: status.map(str::to_string),
+        node_id: node_id.map(str::to_string),
+    })?;
+    let bytes = call_sql_with_one_input(service_list_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::ServiceListOutput = decode_cbor(&bytes)?;
+    Ok(resp
+        .services
+        .into_iter()
+        .map(|s| ServiceInfo {
+            service_id: s.service_id,
+            service_local_id: s.service_local_id,
+            display_name: s.display_name,
+            kind: s.kind,
+            status: s.status,
+            node_id: s.node_id,
+            endpoint: s.endpoint,
+            capabilities: s.capabilities,
+        })
+        .collect())
 }
 
 /// Live hardware snapshot for one node. Local node only today — passing an
@@ -2699,10 +2696,25 @@ pub struct NodeGpu {
 }
 
 pub fn node_resources_get(node_id: &str) -> Result<NodeResources, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "node_id", node_id);
-    let bytes = call_sql_with_one_input(node_resources_get_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::NodeResourcesInput {
+        node_id: node_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(node_resources_get_v1, &payload)?;
+    let out: tentaflow_sdk_spec::NodeResourcesOut = decode_cbor(&bytes)?;
+    Ok(NodeResources {
+        node_id: out.node_id,
+        cpu_cores: out.cpu_cores,
+        cpu_load_pct: out.cpu_load_pct,
+        ram_total_mb: out.ram_total_mb,
+        ram_used_mb: out.ram_used_mb,
+        gpu: out.gpu.map(|g| NodeGpu {
+            name: g.name,
+            vram_total_mb: g.vram_total_mb,
+            vram_used_mb: g.vram_used_mb,
+            utilization_pct: g.utilization_pct,
+        }),
+        gpu_count: out.gpu_count,
+    })
 }
 
 // =============================================================================
