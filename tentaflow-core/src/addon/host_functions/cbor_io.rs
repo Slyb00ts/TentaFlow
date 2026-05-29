@@ -14,14 +14,16 @@ use super::super::runtime::WasmMemory;
 use super::{read_guest_bytes, AddonState, WasmCaller};
 
 /// Reads CBOR input from guest memory and decodes it into `T`, enforcing the
-/// `ServiceCall` payload ceiling BEFORE copying any bytes onto the host heap.
-/// An adversarial addon passing `input_len = i32::MAX` is rejected before a
-/// large allocation is attempted.
+/// `kind` payload ceiling BEFORE copying any bytes onto the host heap. An
+/// adversarial addon passing `input_len = i32::MAX` is rejected before a large
+/// allocation is attempted. Most modules pass `PayloadKind::ServiceCall`; the
+/// vector module passes `PayloadKind::VectorItem` to keep its tighter 1 MiB cap.
 pub fn read_input_cbor<T>(
     memory: &WasmMemory,
     caller: &WasmCaller<'_, AddonState>,
     input_ptr: i32,
     input_len: i32,
+    kind: PayloadKind,
 ) -> Result<T, AbiError>
 where
     T: for<'b> Decode<'b, ()>,
@@ -29,7 +31,7 @@ where
     if input_len < 0 {
         return Err(AbiError::Operation);
     }
-    if enforce_payload_size(input_len as usize, PayloadKind::ServiceCall).is_err() {
+    if enforce_payload_size(input_len as usize, kind).is_err() {
         return Err(AbiError::PayloadTooLarge);
     }
     let bytes =
@@ -54,8 +56,9 @@ where
 }
 
 /// Encodes `value` to CBOR and writes it through the retry helper, re-checking
-/// the absolute `ServiceCall` ceiling so a future large response shape cannot
-/// blow past the 8 MiB limit.
+/// the `kind` ceiling so a large response shape cannot blow past the limit. Most
+/// modules pass `PayloadKind::ServiceCall` (8 MiB); the vector module passes
+/// `PayloadKind::VectorItem` (1 MiB).
 pub fn write_cbor_capped<T: Encode<()>>(
     memory: &WasmMemory,
     caller: &mut WasmCaller<'_, AddonState>,
@@ -63,12 +66,13 @@ pub fn write_cbor_capped<T: Encode<()>>(
     out_ptr: i32,
     out_cap: i32,
     out_len_ptr: i32,
+    kind: PayloadKind,
 ) -> i32 {
     let mut serialized = Vec::new();
     if minicbor::encode(value, &mut serialized).is_err() {
         return AbiError::Operation.as_i32();
     }
-    if enforce_payload_size(serialized.len(), PayloadKind::ServiceCall).is_err() {
+    if enforce_payload_size(serialized.len(), kind).is_err() {
         return AbiError::PayloadTooLarge.as_i32();
     }
     write_output_with_retry_semantics(memory, caller, &serialized, out_ptr, out_cap, out_len_ptr)
