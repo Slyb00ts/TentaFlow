@@ -245,7 +245,30 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "compliance_core_foundation",
             MigrationStep::Rust(create_compliance_core_foundation),
         ),
+        (
+            51,
+            "cameras_restore_org_id",
+            MigrationStep::Rust(cameras_restore_org_id_column),
+        ),
     ]
+}
+
+// The v48 `cameras` rebuild (CAMERAS_VENDOR_CHECK_LOCAL_SOURCES) recreated the
+// table without the `org_id` column that v32 (setup_multi_tenant) had added,
+// so every database that ran v48 lost tenant scoping on `cameras` and every
+// camera_list/insert_camera query failed with "no such column: org_id". The
+// v48 rebuild is fixed in place for fresh installs; this migration repairs
+// databases already past v48. Idempotent: a fresh install (org_id present from
+// the fixed v48) finds the column and skips the ALTER, only enforcing the
+// backfill and index.
+fn cameras_restore_org_id_column(conn: &Connection) -> Result<()> {
+    add_org_id_column_if_missing(conn, "cameras")?;
+    conn.execute(
+        "UPDATE cameras SET org_id = 'org-default' WHERE org_id IS NULL",
+        [],
+    )?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_cameras_org_id ON cameras(org_id)")?;
+    Ok(())
 }
 
 fn create_compliance_core_foundation(conn: &Connection) -> Result<()> {
@@ -1413,7 +1436,8 @@ CREATE TABLE cameras_new (
     removed_at INTEGER NULL,
     onvif_url TEXT NULL,
     onvif_profile_token TEXT NULL,
-    metadata_supported INTEGER NOT NULL DEFAULT 0 CHECK(metadata_supported IN (0,1))
+    metadata_supported INTEGER NOT NULL DEFAULT 0 CHECK(metadata_supported IN (0,1)),
+    org_id TEXT NOT NULL DEFAULT 'org-default'
 );
 
 INSERT INTO cameras_new (
@@ -1421,14 +1445,15 @@ INSERT INTO cameras_new (
     credentials_encrypted, profile, target_fps, resolution_width,
     resolution_height, retention_class, status, status_message,
     fps_actual, last_frame_at, created_at, updated_at, removed_at,
-    onvif_url, onvif_profile_token, metadata_supported
+    onvif_url, onvif_profile_token, metadata_supported, org_id
 )
 SELECT
     id, camera_id, owner_addon_id, display_name, vendor, url,
     credentials_encrypted, profile, target_fps, resolution_width,
     resolution_height, retention_class, status, status_message,
     fps_actual, last_frame_at, created_at, updated_at, removed_at,
-    onvif_url, onvif_profile_token, metadata_supported
+    onvif_url, onvif_profile_token, metadata_supported,
+    COALESCE(org_id, 'org-default')
 FROM cameras;
 
 DROP TABLE cameras;
@@ -1437,6 +1462,7 @@ ALTER TABLE cameras_new RENAME TO cameras;
 CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
 CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
 CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+CREATE INDEX idx_cameras_org_id ON cameras(org_id);
 
 PRAGMA foreign_keys = ON;
 "#;
