@@ -1129,6 +1129,8 @@ struct PanelState {
     add_form_visible: bool,
     wizard_step: u8,
     cameras_filter: String,
+    // Camera selected via a table row click, pending a delete confirmation.
+    camera_pending_remove: Option<String>,
     form_name: String,
     form_url: String,
     error_message: Option<String>,
@@ -1432,6 +1434,7 @@ impl PanelState {
         Self {
             current_panel: String::new(),
             add_form_visible: false, wizard_step: 0, cameras_filter: String::new(),
+            camera_pending_remove: None,
             form_name: String::new(), form_url: String::new(),
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
@@ -1657,6 +1660,8 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "wizard-prev" => { with_state(|s| { if s.wizard_step > 0 { s.wizard_step -= 1; } }); json!({"ok":true}) }
         "cameras-filter-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.cameras_filter = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
         "camera-add-submit" => handle_camera_add_submit(params),
+        "camera-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
+        "camera-remove-cancel" => { with_state(|s| { s.camera_pending_remove = None; s.clear_messages(); }); json!({"ok":true}) }
         "camera-remove" => handle_camera_remove(params),
         "discover-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
         "discover-cancel" => { with_state(|s| { s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
@@ -1772,7 +1777,7 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     if camera_id.is_empty() { with_state(|s| { s.error_message = Some("Wybierz kamerę do usunięcia.".to_string()); }); return json!({"ok":false,"error":"empty camera_id"}); }
     if !is_valid_camera_id(&camera_id) { with_state(|s| { s.error_message = Some("Niepoprawny identyfikator kamery.".to_string()); }); return json!({"ok":false,"error":"invalid camera_id"}); }
     match camera_remove(&camera_id) {
-        Ok(()) => { with_state(|s| { s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
+        Ok(()) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
 }
@@ -2301,30 +2306,138 @@ fn build_cameras_content() -> Component {
         })
         .collect();
 
+    // A delete-confirmation bar appears above the table once a row is selected.
+    if let Some(pending) = with_state(|s| s.camera_pending_remove.clone()) {
+        if cameras.iter().any(|c| c.camera_id == pending) {
+            children.push(build_camera_remove_confirm(&pending, &cameras));
+        } else {
+            with_state(|s| s.camera_pending_remove = None);
+        }
+    }
+
     if cameras.is_empty() {
         children.push(card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras"))]));
-    } else if filtered.is_empty() {
-        children.push(card(None, vec![empty_state("Brak kamer dla filtra", Some("Zmień filtr, aby zobaczyć pozostałe kamery."), Some("cameras"))]));
     } else {
-        let mut table_rows: Vec<Component> = vec![build_cameras_table_header()];
-        for c in &filtered {
-            let fps = camera_fps_display(c);
-            let (diag, diag_tone) = camera_diagnostics(c);
-            table_rows.push(build_camera_row(
-                &c.display_name,
-                &c.vendor,
-                &redact_url_for_display(&c.url),
-                &c.status,
-                "\u{2014}",
-                &fps,
-                &diag,
-                diag_tone,
-            ));
-        }
-        children.push(card(None, vec![stack_v_gap("xs", table_rows)]));
+        // Push the filtered, host-derived rows into panel state under the
+        // Table's rows_path; the Table renderer reads them reactively. An empty
+        // filtered set renders the Table's own empty_state.
+        let rows: Vec<Value> = filtered.iter().map(|c| camera_table_row_value(c)).collect();
+        send_state_patch("cameras_rows", Value::Array(rows));
+        children.push(card(None, vec![build_cameras_table()]));
     }
 
     stack_v(children)
+}
+
+/// Builds one Table row as a `Value::Map` keyed by the column field paths.
+/// `camera_id` is the row key the Table uses to scope per-row actions.
+fn camera_table_row_value(c: &CameraInfoOut) -> Value {
+    let fps = camera_fps_display(c);
+    let (diag, _diag_tone) = camera_diagnostics(c);
+    let profile = if c.profile.trim().is_empty() { "\u{2014}".to_string() } else { c.profile.clone() };
+    let entries: Vec<(Value, Value)> = vec![
+        (Value::Text("camera_id".into()), Value::Text(c.camera_id.clone())),
+        (Value::Text("name".into()), Value::Text(c.display_name.clone())),
+        (Value::Text("vendor".into()), Value::Text(c.vendor.clone())),
+        (Value::Text("addr".into()), Value::Text(redact_url_for_display(&c.url))),
+        (Value::Text("status".into()), Value::Text(c.status.clone())),
+        (Value::Text("profile".into()), Value::Text(profile)),
+        (Value::Text("fps".into()), Value::Text(fps)),
+        (Value::Text("diag".into()), Value::Text(diag)),
+    ];
+    Value::Map(entries)
+}
+
+fn camera_table_column(id: &str, header: &str, render: ColumnRender) -> TableColumn {
+    TableColumn {
+        id: id.into(),
+        header: lit(header),
+        field_path: vec![PathSegment::Key(id.into())],
+        width: TableColumnWidth::Auto,
+        render,
+        format: None,
+        align: None,
+        sortable: true,
+        hidden_by_default: false,
+        sticky_left: false,
+    }
+}
+
+fn build_cameras_table() -> Component {
+    let columns = vec![
+        camera_table_column("name", "Nazwa", ColumnRender::Text),
+        camera_table_column("vendor", "Vendor / Protokół", ColumnRender::Text),
+        camera_table_column("addr", "Adres", ColumnRender::Text),
+        camera_table_column("status", "Status", ColumnRender::Chip),
+        camera_table_column("profile", "Profil", ColumnRender::Text),
+        camera_table_column("fps", "FPS", ColumnRender::Text),
+        camera_table_column("diag", "Diagnostyka", ColumnRender::Text),
+    ];
+
+    let empty = empty_state(
+        "Brak kamer dla filtra",
+        Some("Zmień filtr, aby zobaczyć pozostałe kamery."),
+        Some("cameras"),
+    );
+
+    let mut table = TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("cameras_rows".into())]),
+        row_key_field: "camera_id".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: Some(empty),
+        row_actions: vec![],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table");
+
+    // The stock Table renderer surfaces per-row identity only through
+    // `row_click`, emitting detail `{ row_id: <camera_id> }` (row_key_field).
+    // The dispatcher merges that detail into the action params, so
+    // `camera-row-select` receives the clicked camera_id and arms the delete
+    // confirmation instead of deleting on a single click.
+    table.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::RowClick,
+        Handler::Backend {
+            action_id: "camera-row-select".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    table
+}
+
+/// Confirmation bar for deleting the selected camera. Usuń dispatches
+/// `camera-remove` with the explicit `camera_id`; Anuluj clears the selection.
+fn build_camera_remove_confirm(camera_id: &str, cameras: &[CameraInfoOut]) -> Component {
+    let name = cameras
+        .iter()
+        .find(|c| c.camera_id == camera_id)
+        .map(|c| c.display_name.as_str())
+        .unwrap_or(camera_id);
+
+    let mut params = CborMap::default();
+    params.0.push(("camera_id".into(), Value::Text(camera_id.into())));
+
+    let confirm_btn = button_with_params("Usuń", "camera-remove", "destructive", params);
+    let cancel_btn = button("Anuluj", "camera-remove-cancel", "ghost");
+
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Usunąć kamerę \"{}\"?", name), "body_strong"),
+        text("Tej operacji nie można cofnąć."),
+        stack_h(vec![confirm_btn, cancel_btn]),
+    ])])
 }
 
 /// A camera is "warning" when it is not cleanly online or carries a
@@ -2359,75 +2472,6 @@ fn camera_diagnostics(c: &CameraInfoOut) -> (String, &'static str) {
     }
 }
 
-fn build_camera_status_chip(status: &str) -> Component {
-    let (label, tone) = match status {
-        "online" => ("online", "success"),
-        "offline" => ("offline", "critical"),
-        "degraded" => ("degraded", "warning"),
-        _ => (status, "muted"),
-    };
-    chip_toned(label, tone)
-}
-
-fn build_camera_row(name: &str, vendor: &str, addr: &str, status: &str, profile: &str, fps: &str, diag: &str, diag_tone: &str) -> Component {
-    let name_cell = text_styled(name, "body_strong");
-    let vendor_cell = text(vendor);
-    let addr_cell = text_styled(addr, "mono");
-    let status_cell = build_camera_status_chip(status);
-    let profile_cell = if profile == "\u{2014}" {
-        text("\u{2014}")
-    } else {
-        ChipComp {
-            variant: ChipVariant::Soft,
-            tone: Tone::Primary,
-            label: lit(profile),
-            icon: None,
-            avatar: None,
-            selected: None,
-            removable: false,
-        }.into_component(next_id()).expect("Chip")
-    };
-    let fps_cell = if fps == "\u{2014}" {
-        text("\u{2014}")
-    } else {
-        text_styled(fps, "body_strong")
-    };
-    let diag_cell = match diag_tone {
-        "success" => chip_toned_icon(diag, "success", "check"),
-        "warning" => chip_toned(diag, "warning"),
-        "critical" => chip_toned_icon(diag, "critical", "info"),
-        _ => chip_toned(diag, "muted"),
-    };
-    let action_cell = button("\u{22ef}", "camera-row-action", "ghost");
-
-    Flex {
-        direction: FlexDirection::Row,
-        gap: Spacing::Md,
-        justify: FlexJustify::Start,
-        align: FlexAlign::Center,
-        wrap: FlexWrap::NoWrap,
-        children: vec![name_cell, vendor_cell, addr_cell, status_cell, profile_cell, fps_cell, diag_cell, action_cell],
-        padding: None,
-        background: None,
-        radius: None,
-    }.into_component(next_id()).expect("Flex")
-}
-
-fn build_cameras_table_header() -> Component {
-    let headers: Vec<Component> = ["Nazwa", "Vendor / Protokół", "Adres", "Status", "Profil", "FPS", "Diagnostyka", ""]
-        .iter().map(|h| text_styled(h, "caption")).collect();
-    Flex {
-        direction: FlexDirection::Row,
-        gap: Spacing::Md,
-        justify: FlexJustify::Start,
-        align: FlexAlign::Center,
-        wrap: FlexWrap::NoWrap,
-        children: headers,
-        padding: None,
-        background: None,
-        radius: None,
-    }.into_component(next_id()).expect("Flex")
-}
 
 fn build_add_camera_wizard() -> Component {
     let (step, scanning, discovered_count, err) = with_state(|s| {
