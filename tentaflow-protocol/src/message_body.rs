@@ -4172,6 +4172,11 @@ pub enum MessageBody {
     // 256-variant limit + dashboard RODO surface (P8.d).
     LegalAdminBody(crate::legal::LegalAdminPayload),
 
+    // ---- Compliance Core admin RPCs ----
+    // Odczyt ROPA, retencji i AI audit w jednym slocie, bez przenoszenia
+    // treści promptów/odpowiedzi przez listę.
+    ComplianceAdminBody(crate::compliance::ComplianceAdminPayload),
+
     // ---- Role catalog (administrowany katalog rol biznesowych, multi-tenant, i18n) ----
     // Wzorzec „1 slot per feature" — wszystkie req/res w `RoleCatalogPayload`.
     RoleCatalogBody(crate::types::RoleCatalogPayload),

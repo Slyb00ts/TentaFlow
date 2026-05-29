@@ -27,6 +27,7 @@ pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
 #[cfg(feature = "camera")]
 pub mod camera_admin;
+pub mod compliance_admin;
 pub mod handlers;
 pub mod legal_admin;
 pub mod meeting_live_broadcast;
@@ -438,6 +439,26 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::LegalAdminPayload::RevokeRequest(_) => "LegalDocumentRevokeRequest",
             tentaflow_protocol::LegalAdminPayload::RevokeResponse(_) => {
                 "LegalDocumentRevokeResponse"
+            }
+        },
+        MessageBody::ComplianceAdminBody(p) => match p {
+            tentaflow_protocol::ComplianceAdminPayload::ListDataCategoriesRequest => {
+                "ComplianceDataCategoriesListRequest"
+            }
+            tentaflow_protocol::ComplianceAdminPayload::ListDataCategoriesResponse { .. } => {
+                "ComplianceDataCategoriesListResponse"
+            }
+            tentaflow_protocol::ComplianceAdminPayload::ListRetentionPoliciesRequest => {
+                "ComplianceRetentionPoliciesListRequest"
+            }
+            tentaflow_protocol::ComplianceAdminPayload::ListRetentionPoliciesResponse { .. } => {
+                "ComplianceRetentionPoliciesListResponse"
+            }
+            tentaflow_protocol::ComplianceAdminPayload::ListAiEventsRequest(_) => {
+                "ComplianceAiEventsListRequest"
+            }
+            tentaflow_protocol::ComplianceAdminPayload::ListAiEventsResponse { .. } => {
+                "ComplianceAiEventsListResponse"
             }
         },
         MessageBody::StreamBody(p) => match p {
