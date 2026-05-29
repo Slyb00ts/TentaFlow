@@ -51,6 +51,17 @@ client_cert_fingerprints = []        # SHA-256 hex of allowed client leaf certs
 
 Production must flip `pickup_required = true` and list at least one fingerprint.
 
+## Dashboard Settings
+
+Zakładka `Settings -> Dostępy zewnętrzne` grupuje sekrety do usług
+zewnętrznych: `hf_token` dla Hugging Face, `ngc_api_key` dla NVIDIA NGC oraz
+listę rejestrów kontenerów. Sekrety są zapisywane przez binary protocol jako
+settings z flagą `is_secret`; listing settings zwraca tylko marker
+`<redacted>` dla niepustych sekretów. Recommender vLLM i generyczny
+`EngineRecommendRequest` używają zapisanego `hf_token`, jeśli request z UI nie
+podaje tokena jawnie, więc wizard może pobierać `config.json` z gated repo bez
+utrwalania tokena w konfiguracji deploymentu.
+
 ## Bundled Addons
 
 `tentaflow-core/build.rs` osadza bundled addony z `tentaflow-core/addons/` w

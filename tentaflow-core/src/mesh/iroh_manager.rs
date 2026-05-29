@@ -1871,9 +1871,21 @@ impl IrohMeshManagerRef {
         let reason = close_reason.as_deref().unwrap_or("stream closed");
         if was_current {
             info!(peer = %remote_hex, reason, "iroh_mesh: polaczenie zamkniete");
-            let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
-                node_id: remote_hex,
-            });
+            if reason.contains("tie-break-loser") {
+                let connections = Arc::clone(&self.connections);
+                let event_tx = self.event_tx.clone();
+                let peer_hex = remote_hex.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    if !connections.contains_key(&peer_hex) {
+                        let _ = event_tx.send(IrohMeshEvent::PeerDisconnected { node_id: peer_hex });
+                    }
+                });
+            } else {
+                let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
+                    node_id: remote_hex,
+                });
+            }
         } else {
             debug!(
                 peer = %remote_hex,

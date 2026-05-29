@@ -159,13 +159,6 @@ const USER_NAV = [
     ],
   },
   {
-    headingKey: 'nav.section_network',
-    icon: 'network',
-    items: [
-      { id: 'mesh-user', labelKey: 'nav.mesh_user', icon: 'network', badge: 'soon' },
-    ],
-  },
-  {
     headingKey: 'nav.section_account',
     icon: 'user',
     items: [
@@ -514,7 +507,6 @@ async function renderApp() {
   Router.register('meeting-live', MeetingLiveScreen);
   Router.register('pose', PoseScreen);
   Router.register('translate',      TranslateScreen);
-  Router.register('mesh-user',      makeComingSoonScreen('mesh_user', 'network'));
   Router.register('profile-report', ProfileReportScreen);
   Router.register('profile-compare', ProfileCompareScreen);
   Router.register('profile-permissions', ProfilePermissionsScreen);

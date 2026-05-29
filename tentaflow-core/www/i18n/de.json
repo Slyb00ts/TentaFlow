@@ -40,7 +40,6 @@
     "section_integrations": "Integrationen",
     "section_management": "Verwaltung",
     "section_apps": "Meine Apps",
-    "section_network": "Netzwerk",
     "section_account": "Konto",
     "apps_home": "Alle Anwendungen",
     "images": "Bilder",
@@ -50,8 +49,6 @@
     "search_app": "Suchen",
     "flows_user": "Workflows",
     "prompts_user": "Prompts",
-    "mesh_user": "Mesh (Vorschau)",
-    "tailscale_user": "Tailscale",
     "profile": "Profil",
     "my_accounts": "Meine Konten",
     "settings_user": "Einstellungen"
@@ -400,9 +397,9 @@
     "tab_sso": "SSO / OIDC",
     "tab_oauth": "OAuth",
     "tab_tls": "TLS",
-    "tab_ngc": "NVIDIA NGC",
+    "tab_external_access": "Externe Zugänge",
     "general_title": "Globale Einstellungen",
-    "general_hint": "Rohe Key-Value-Paare aus der DB. Änderungen werden sofort übernommen. Spezielle Bereiche (TLS, NGC, OAuth) haben eigene Tabs.",
+    "general_hint": "Rohe Key-Value-Paare aus der DB. Änderungen werden sofort übernommen. Spezielle Bereiche (TLS, OAuth, externe Zugänge) haben eigene Tabs.",
     "general_empty": "Keine Einstellungen in der DB",
     "saved": "Gespeichert",
     "refresh": "Aktualisieren",
@@ -436,6 +433,12 @@
     "ngc_hint": "Erforderlich zum Abrufen von NVIDIA-NIM-Containern. Schlüssel auf build.nvidia.com holen.",
     "ngc_key_label": "API Key",
     "ngc_save_empty": "NGC-Schlüssel zum Speichern eingeben",
+    "external_hf_title": "Hugging Face",
+    "external_hf_hint": "Token zum Herunterladen von Modellen und config.json aus Repositorys, die Autorisierung erfordern.",
+    "external_hf_token": "Hugging-Face-Token",
+    "external_hf_save_empty": "Hugging-Face-Token zum Speichern eingeben",
+    "external_configured": "Konfiguriert",
+    "external_not_configured": "Nicht konfiguriert",
     "speakers": {
       "title": "Sprechererkennung",
       "conf_high": "Hohe Konfidenz (speaker_confidence_high)",
@@ -2411,9 +2414,7 @@
     "meeting": "Meeting-Bot benötigt das teams-bot Addon mit OAuth und einen binären Transkript-Handler. Auf der Roadmap.",
     "tts": "Sprachausgabe benötigt eine bereitgestellte TTS-Engine und einen Synthese-Handler. Die Admin-Regeln existieren bereits; die Nutzerseite ist auf der Roadmap.",
     "translate": "Übersetzen wird den Chat-LLM-Backend nutzen, sobald ein eigener Nutzer-Handler angebunden ist. Auf der Roadmap.",
-    "search": "Suche über deine Daten ist auf der Roadmap.",
-    "mesh_user": "Eine Nutzer-Mesh-Ansicht ist auf der Roadmap. Admins sehen den Mesh-Status unter Core → Mesh.",
-    "tailscale": "Nutzer-Tailscale-Ansicht ist auf der Roadmap."
+    "search": "Suche über deine Daten ist auf der Roadmap."
   },
   "profile": {
     "title": "Profil",
