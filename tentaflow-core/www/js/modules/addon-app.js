@@ -289,6 +289,10 @@ function handlePanelShell(decoded) {
     }
   }
 
+  // Tear down a previous SlotManager (and its MutationObserver) before
+  // rebuilding the shell — handlePanelShell can run again on panel-navigate.
+  if (s.slotManager) s.slotManager.destroy();
+
   // Create SlotManager and register declared slots
   s.slotManager = new SlotManager({
     store: s.store,
@@ -310,6 +314,11 @@ function handlePanelShell(decoded) {
       s.slotManager.registerSlot(slotDecl.id, slotEl, slotDecl);
     }
   }
+
+  // Observe the shell so dynamic data-slot-id containers created by overlay
+  // renderers (modal/drawer/sheet/popover body+footer) inside existing slots
+  // are auto-registered and can receive later SlotContent messages.
+  s.slotManager.observe(shell);
 }
 
 function handleSlotContent(decoded) {
