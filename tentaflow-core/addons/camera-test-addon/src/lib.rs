@@ -91,6 +91,8 @@ fn run_lifecycle(params: &Value) -> Value {
         resolution: None,
         retention_class: "C".to_string(),
         profile: "default".to_string(),
+        credentials_b64: None,
+        onvif_profile_token: None,
     };
     let added = match camera_add(&spec) {
         Ok(v) => v,
@@ -161,6 +163,8 @@ fn run_path_traversal(params: &Value) -> Value {
         resolution: None,
         retention_class: "C".to_string(),
         profile: "default".to_string(),
+        credentials_b64: None,
+        onvif_profile_token: None,
     };
 
     match camera_add(&spec) {
@@ -203,6 +207,8 @@ fn run_no_write_probe(params: &Value) -> Value {
         resolution: None,
         retention_class: "C".to_string(),
         profile: "default".to_string(),
+        credentials_b64: None,
+        onvif_profile_token: None,
     };
 
     match camera_add(&spec) {
@@ -280,6 +286,8 @@ fn run_recording_lifecycle(params: &Value) -> Value {
         resolution: None,
         retention_class: "C".to_string(),
         profile: "default".to_string(),
+        credentials_b64: None,
+        onvif_profile_token: None,
     };
     let added = match camera_add(&spec) {
         Ok(v) => v,
@@ -352,6 +360,8 @@ fn run_recording_save_segment(params: &Value) -> Value {
         resolution: None,
         retention_class: "C".to_string(),
         profile: "default".to_string(),
+        credentials_b64: None,
+        onvif_profile_token: None,
     };
     let added = match camera_add(&spec) {
         Ok(v) => v,
@@ -405,6 +415,8 @@ fn run_frame_url_basic(params: &Value) -> Value {
         resolution: None,
         retention_class: "C".to_string(),
         profile: "default".to_string(),
+        credentials_b64: None,
+        onvif_profile_token: None,
     };
     let added = match camera_add(&spec) {
         Ok(v) => v,

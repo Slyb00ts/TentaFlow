@@ -7,6 +7,7 @@
 
 pub mod abi_helpers;
 pub mod aliases;
+pub mod cbor_io;
 #[cfg(feature = "camera")]
 pub mod camera;
 #[cfg(feature = "camera")]
