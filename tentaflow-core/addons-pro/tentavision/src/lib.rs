@@ -23,6 +23,10 @@ use tentaflow_sdk_spec::{
     Value, PathSegment, StatePath, PatchOp, PatchOpKind,
 };
 use tentaflow_sdk_spec::protocol::control::CborMap;
+use tentaflow_sdk_spec::protocol::camera::{
+    CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput, CameraInfoOut,
+    CameraListOut, CameraRemoveOut, DiscoveredCameraOut,
+};
 use tentaflow_sdk_spec::protocol::ui::{
     bind::BindRef,
     a11y::Accessibility,
@@ -108,43 +112,25 @@ fn notify(title: &str, body: &str) {
 // Camera ABI wrappers
 // =============================================================================
 
-#[derive(Debug, Clone)]
-struct CameraInfo {
-    camera_id: String,
-    display_name: String,
-    url: String,
-    vendor: String,
-    status: String,
-}
-
-#[derive(Debug, Clone)]
-struct CameraAddSpec {
-    display_name: String,
-    vendor: String,
-    url: String,
-    target_fps: u32,
-    resolution: Option<String>,
-    retention_class: String,
-    profile: String,
-}
-
-#[derive(Debug, Clone)]
-struct CameraAddResult {
-    camera_id: String,
-}
-
+/// Canonical ABI error codes returned by the camera host functions. Values
+/// match `tentaflow_core::addon::errors::AbiError` (positive 1..24; `0` = Ok).
+/// The host returns these directly as the i32 host-function result, so an addon
+/// must NOT negate the return value when classifying an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 enum AbiError {
     Permission = 1,
     NotFound = 2,
-    Conflict = 3,
-    QuotaExceeded = 4,
-    CameraUnreachable = 5,
-    CameraAuthFailed = 6,
-    CameraVendorUnsupported = 7,
-    PayloadTooLarge = 8,
-    Timeout = 9,
+    NoAvailableTarget = 3,
+    Timeout = 4,
+    Operation = 5,
+    OutputBufferTooSmall = 6,
+    Conflict = 7,
+    QuotaExceeded = 11,
+    CameraUnreachable = 12,
+    CameraAuthFailed = 13,
+    CameraVendorUnsupported = 14,
+    PayloadTooLarge = 21,
     Unknown = 99,
 }
 
@@ -153,13 +139,16 @@ impl AbiError {
         match code {
             1 => Self::Permission,
             2 => Self::NotFound,
-            3 => Self::Conflict,
-            4 => Self::QuotaExceeded,
-            5 => Self::CameraUnreachable,
-            6 => Self::CameraAuthFailed,
-            7 => Self::CameraVendorUnsupported,
-            8 => Self::PayloadTooLarge,
-            9 => Self::Timeout,
+            3 => Self::NoAvailableTarget,
+            4 => Self::Timeout,
+            5 => Self::Operation,
+            6 => Self::OutputBufferTooSmall,
+            7 => Self::Conflict,
+            11 => Self::QuotaExceeded,
+            12 => Self::CameraUnreachable,
+            13 => Self::CameraAuthFailed,
+            14 => Self::CameraVendorUnsupported,
+            21 => Self::PayloadTooLarge,
             _ => Self::Unknown,
         }
     }
@@ -171,119 +160,94 @@ impl core::fmt::Display for AbiError {
     }
 }
 
-fn camera_list() -> Result<Vec<CameraInfo>, AbiError> {
-    let mut buf = vec![0u8; 16384];
-    let mut out_len: i32 = 0;
-    let ret = unsafe {
-        camera_list_v1(
-            buf.as_mut_ptr() as i32, buf.len() as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if ret < 0 {
-        return Err(AbiError::from_code(-ret));
+/// Encodes `input` to CBOR and decodes the CBOR response of a host function
+/// with the standard `(input_ptr, input_len, out_ptr, out_cap, out_len_ptr)`
+/// ABI shape. On `OutputBufferTooSmall` the host writes the required size into
+/// `out_len_ptr`; we grow once and retry so a large response is not lost.
+fn call_cbor_in_out<I, O>(
+    input: &I,
+    host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
+) -> Result<O, AbiError>
+where
+    I: minicbor::Encode<()>,
+    O: for<'b> minicbor::Decode<'b, ()>,
+{
+    let mut input_bytes = Vec::new();
+    minicbor::encode(input, &mut input_bytes).map_err(|_| AbiError::Operation)?;
+    let mut cap = 16384usize;
+    loop {
+        let mut out = vec![0u8; cap];
+        let mut out_len: i32 = 0;
+        let ret = unsafe {
+            host_fn(
+                input_bytes.as_ptr() as i32,
+                input_bytes.len() as i32,
+                out.as_mut_ptr() as i32,
+                out.len() as i32,
+                &mut out_len as *mut i32 as i32,
+            )
+        };
+        if ret == AbiError::OutputBufferTooSmall as i32 {
+            cap = (out_len as usize).max(cap.saturating_mul(2));
+            continue;
+        }
+        if ret != 0 {
+            return Err(AbiError::from_code(ret));
+        }
+        out.truncate(out_len as usize);
+        return minicbor::decode(&out).map_err(|_| AbiError::Operation);
     }
-    let len = out_len as usize;
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    buf.truncate(len);
-    let json_str = String::from_utf8(buf).map_err(|_| AbiError::Unknown)?;
-    let arr: Vec<serde_json::Value> =
-        serde_json::from_str(&json_str).map_err(|_| AbiError::Unknown)?;
-    let cameras = arr
-        .iter()
-        .map(|v| CameraInfo {
-            camera_id: v.get("camera_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            display_name: v.get("display_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            vendor: v.get("vendor").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            status: v.get("status").and_then(|x| x.as_str()).unwrap_or("offline").to_string(),
-        })
-        .collect();
-    Ok(cameras)
 }
 
-fn camera_add(spec: &CameraAddSpec) -> Result<CameraAddResult, AbiError> {
-    let spec_json = serde_json::json!({
-        "display_name": spec.display_name,
-        "vendor": spec.vendor,
-        "url": spec.url,
-        "target_fps": spec.target_fps,
-        "resolution": spec.resolution,
-        "retention_class": spec.retention_class,
-        "profile": spec.profile,
-    });
-    let spec_bytes = spec_json.to_string();
-    let mut out = vec![0u8; 4096];
-    let mut out_len: i32 = 0;
-    let ret = unsafe {
-        camera_add_v1(
-            spec_bytes.as_ptr() as i32, spec_bytes.len() as i32,
-            out.as_mut_ptr() as i32, out.len() as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if ret < 0 {
-        return Err(AbiError::from_code(-ret));
+/// Decodes the CBOR response of a host function with the read-only
+/// `(out_ptr, out_cap, out_len_ptr)` ABI shape (`camera_list` / `camera_discover`).
+fn call_cbor_out<O>(
+    host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32,
+) -> Result<O, AbiError>
+where
+    O: for<'b> minicbor::Decode<'b, ()>,
+{
+    let mut cap = 16384usize;
+    loop {
+        let mut out = vec![0u8; cap];
+        let mut out_len: i32 = 0;
+        let ret = unsafe {
+            host_fn(
+                out.as_mut_ptr() as i32,
+                out.len() as i32,
+                &mut out_len as *mut i32 as i32,
+            )
+        };
+        if ret == AbiError::OutputBufferTooSmall as i32 {
+            cap = (out_len as usize).max(cap.saturating_mul(2));
+            continue;
+        }
+        if ret != 0 {
+            return Err(AbiError::from_code(ret));
+        }
+        out.truncate(out_len as usize);
+        return minicbor::decode(&out).map_err(|_| AbiError::Operation);
     }
-    let len = out_len as usize;
-    out.truncate(len);
-    let json_str = String::from_utf8(out).map_err(|_| AbiError::Unknown)?;
-    let v: serde_json::Value = serde_json::from_str(&json_str).map_err(|_| AbiError::Unknown)?;
-    Ok(CameraAddResult {
-        camera_id: v.get("camera_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-    })
+}
+
+fn camera_list() -> Result<Vec<CameraInfoOut>, AbiError> {
+    let out: CameraListOut = call_cbor_out(camera_list_v1)?;
+    Ok(out.camera)
+}
+
+fn camera_add(spec: CameraAddInput) -> Result<CameraAddOutput, AbiError> {
+    call_cbor_in_out(&spec, camera_add_v1)
 }
 
 fn camera_remove(id: &str) -> Result<(), AbiError> {
-    let input = serde_json::json!({ "camera_id": id }).to_string();
-    let mut out = vec![0u8; 256];
-    let mut out_len: i32 = 0;
-    let ret = unsafe {
-        camera_remove_v1(
-            input.as_ptr() as i32, input.len() as i32,
-            out.as_mut_ptr() as i32, out.len() as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if ret < 0 {
-        return Err(AbiError::from_code(-ret));
-    }
+    let input = CameraIdInput { camera_id: id.to_string() };
+    let _: CameraRemoveOut = call_cbor_in_out(&input, camera_remove_v1)?;
     Ok(())
 }
 
-fn camera_discover() -> Result<Vec<CameraInfo>, AbiError> {
-    let mut buf = vec![0u8; 16384];
-    let mut out_len: i32 = 0;
-    let ret = unsafe {
-        camera_discover_v1(
-            buf.as_mut_ptr() as i32, buf.len() as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if ret < 0 {
-        return Err(AbiError::from_code(-ret));
-    }
-    let len = out_len as usize;
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    buf.truncate(len);
-    let json_str = String::from_utf8(buf).map_err(|_| AbiError::Unknown)?;
-    let arr: Vec<serde_json::Value> =
-        serde_json::from_str(&json_str).map_err(|_| AbiError::Unknown)?;
-    let cameras = arr
-        .iter()
-        .map(|v| CameraInfo {
-            camera_id: String::new(),
-            display_name: v.get("display_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            vendor: v.get("vendor").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            status: "discovered".to_string(),
-        })
-        .collect();
-    Ok(cameras)
+fn camera_discover() -> Result<Vec<DiscoveredCameraOut>, AbiError> {
+    let out: CameraDiscoverOut = call_cbor_out(camera_discover_v1)?;
+    Ok(out.discovered)
 }
 
 // =============================================================================
@@ -1446,15 +1410,20 @@ impl SearchState {
 struct DiscoverState {
     visible: bool, scanning: bool, cameras: Vec<DiscoveredCam>,
     selected_index: Option<usize>, custom_name: String, error_message: Option<String>,
+    // Discovered cameras default to vendor `onvif`, which the host requires
+    // credentials for; the discovery flow has no bound form, so these mirror the
+    // wizard's `camera_user`/`camera_password` inputs into addon state.
+    cred_user: String, cred_pass: String,
 }
 struct DiscoveredCam { vendor: String, url: String, suggested_name: String }
 impl DiscoverState {
     const fn new() -> Self {
-        Self { visible: false, scanning: false, cameras: Vec::new(), selected_index: None, custom_name: String::new(), error_message: None }
+        Self { visible: false, scanning: false, cameras: Vec::new(), selected_index: None, custom_name: String::new(), error_message: None, cred_user: String::new(), cred_pass: String::new() }
     }
     fn reset(&mut self) {
         self.visible = false; self.scanning = false; self.cameras.clear();
         self.selected_index = None; self.custom_name.clear(); self.error_message = None;
+        self.cred_user.clear(); self.cred_pass.clear();
     }
 }
 
@@ -1699,6 +1668,7 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
             handle_discover_select(&json!({"index": idx}))
         }
         "discover-name-change" => handle_discover_name_change(params),
+        "discover-cred-change" => handle_discover_cred_change(params),
         "discover-add" => handle_discover_add(),
         "cameras-refresh" | "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
         "panel-navigate" => {
@@ -1772,8 +1742,25 @@ fn handle_camera_add_submit(params: &JsonValue) -> JsonValue {
         Some(v) => v,
         None => { with_state(|s| { s.error_message = Some("Nieobsługiwany protokół (wspierane: rtsp://, rtsps://, http(s)://.../onvif).".to_string()); }); return json!({"ok":false,"error":"unsupported protocol"}); }
     };
-    let spec = CameraAddSpec { display_name: name, vendor: vendor.to_string(), url, target_fps: 15, resolution: None, retention_class: "C".to_string(), profile: "default".to_string() };
-    match camera_add(&spec) {
+    let user = values.and_then(|v| v.get("camera_user")).and_then(|v| v.as_str()).unwrap_or("");
+    let pass = values.and_then(|v| v.get("camera_password")).and_then(|v| v.as_str()).unwrap_or("");
+    let credentials_b64 = match build_credentials_b64(vendor, user, pass) {
+        Ok(c) => c,
+        Err(msg) => { with_state(|s| { s.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid credentials"}); }
+    };
+    let spec = CameraAddInput {
+        display_name: name,
+        vendor: vendor.to_string(),
+        url,
+        target_fps: Some(15),
+        resolution_width: None,
+        resolution_height: None,
+        retention_class: Some("C".to_string()),
+        profile: Some("default".to_string()),
+        credentials_b64,
+        onvif_profile_token: None,
+    };
+    match camera_add(spec) {
         Ok(result) => { with_state(|s| { s.add_form_visible = false; s.form_name.clear(); s.form_url.clear(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); }); json!({"ok":true,"camera_id":result.camera_id}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd dodawania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
@@ -1797,7 +1784,7 @@ fn handle_discover_scan() -> JsonValue {
         s.discover.scanning = false;
         match result {
             Ok(found) => {
-                s.discover.cameras = found.iter().map(|c| DiscoveredCam { vendor: c.vendor.clone(), url: c.url.clone(), suggested_name: default_name_for_discovered(c) }).collect();
+                s.discover.cameras = found.iter().map(discovered_to_cam).collect();
                 if !s.discover.cameras.is_empty() { s.discover.selected_index = Some(0); s.discover.custom_name = s.discover.cameras[0].suggested_name.clone(); }
             }
             Err(e) => { s.discover.error_message = Some(alloc::format!("Błąd skanowania: {}", abi_message(e))); }
@@ -1824,14 +1811,47 @@ fn handle_discover_name_change(params: &JsonValue) -> JsonValue {
     json!({"ok":true})
 }
 
+/// Updates the discovery-flow credential inputs (`camera_user` /
+/// `camera_password`) in addon state. The `field` selects which one; the value
+/// carries the raw input. Plaintext is held in state only until `handle_discover_add`
+/// encodes it and is never logged.
+fn handle_discover_cred_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).or_else(|| params.get("id").and_then(|v| v.as_str())).unwrap_or("");
+    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    with_state(|s| {
+        match field {
+            "camera_user" => s.discover.cred_user = value,
+            "camera_password" => s.discover.cred_pass = value,
+            _ => {}
+        }
+        s.discover.error_message = None;
+    });
+    json!({"ok":true})
+}
+
 fn handle_discover_add() -> JsonValue {
     let snapshot = with_state(|s| { s.clear_messages(); s.discover.error_message = None; (s.discover.selected_index, s.discover.custom_name.trim().to_string(), s.discover.cameras.len()) });
     let (selected_index, name, total) = snapshot;
     let index = match selected_index { Some(i) if i < total => i, _ => { with_state(|s| { s.discover.error_message = Some("Wybierz kamerę z listy.".to_string()); }); return json!({"ok":false,"error":"no selection"}); } };
     if name.is_empty() || name.chars().count() > 60 { with_state(|s| { s.discover.error_message = Some("Nazwa musi mieć 1–60 znaków.".to_string()); }); return json!({"ok":false,"error":"invalid name"}); }
-    let (vendor, url) = with_state(|s| { let cam = &s.discover.cameras[index]; (cam.vendor.clone(), cam.url.clone()) });
-    let spec = CameraAddSpec { display_name: name, vendor, url, target_fps: 15, resolution: None, retention_class: "C".to_string(), profile: "default".to_string() };
-    match camera_add(&spec) {
+    let (vendor, url, cred_user, cred_pass) = with_state(|s| { let cam = &s.discover.cameras[index]; (cam.vendor.clone(), cam.url.clone(), s.discover.cred_user.clone(), s.discover.cred_pass.clone()) });
+    let credentials_b64 = match build_credentials_b64(&vendor, &cred_user, &cred_pass) {
+        Ok(c) => c,
+        Err(msg) => { with_state(|s| { s.discover.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid credentials"}); }
+    };
+    let spec = CameraAddInput {
+        display_name: name,
+        vendor,
+        url,
+        target_fps: Some(15),
+        resolution_width: None,
+        resolution_height: None,
+        retention_class: Some("C".to_string()),
+        profile: Some("default".to_string()),
+        credentials_b64,
+        onvif_profile_token: None,
+    };
+    match camera_add(spec) {
         Ok(_) => { with_state(|s| { s.discover.reset(); s.success_message = Some("Kamera dodana z ONVIF.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.discover.error_message = Some(alloc::format!("Błąd dodawania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
@@ -1855,6 +1875,39 @@ fn handle_zone_canvas_pointer(params: &JsonValue) -> JsonValue {
 // Validation helpers
 // =============================================================================
 
+/// Resolves wizard credential inputs into the `credentials_b64` field the host
+/// expects on `camera_add`. The host decodes this as STANDARD base64 of a
+/// `user:pass` string and requires it for `vendor == "onvif"` while treating it
+/// as optional for `rtsp`. We enforce the same rule here so an ONVIF camera
+/// surfaces a readable wizard error instead of the host's raw
+/// `missing_credentials` rejection. Returning `Ok(None)` means "no credentials"
+/// (valid only for non-ONVIF vendors). The plaintext lives only for the span of
+/// this call and is never logged.
+fn build_credentials_b64(
+    vendor: &str,
+    user: &str,
+    pass: &str,
+) -> Result<Option<String>, &'static str> {
+    let user = user.trim();
+    let pass = pass.trim();
+    if user.is_empty() && pass.is_empty() {
+        if vendor == "onvif" {
+            return Err("Kamera ONVIF wymaga użytkownika i hasła.");
+        }
+        return Ok(None);
+    }
+    if user.is_empty() {
+        return Err("Podaj użytkownika kamery.");
+    }
+    if pass.is_empty() {
+        return Err("Podaj hasło kamery.");
+    }
+    let plain = alloc::format!("{user}:{pass}");
+    Ok(Some(
+        base64::engine::Engine::encode(&base64::engine::general_purpose::STANDARD, plain),
+    ))
+}
+
 fn detect_vendor(url: &str) -> Option<&'static str> {
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("rtsp://") || lower.starts_with("rtsps://") { return Some("rtsp"); }
@@ -1867,9 +1920,39 @@ fn is_valid_camera_id(id: &str) -> bool {
     id.chars().skip(4).all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-fn default_name_for_discovered(cam: &CameraInfo) -> String {
-    let host = extract_host_port(&cam.url).map(|(h, _)| h).unwrap_or_else(|| "ONVIF".to_string());
-    if !cam.display_name.trim().is_empty() { cam.display_name.clone() } else { alloc::format!("ONVIF — {}", host) }
+/// Maps a host-discovered ONVIF device into the wizard's working representation.
+/// ONVIF WS-Discovery reports `xaddrs` (device service endpoints) rather than a
+/// ready stream URL; the first `xaddr` is the canonical ONVIF service URL, and we
+/// fall back to the device-service path on the bare `address` when none is given.
+fn discovered_to_cam(d: &DiscoveredCameraOut) -> DiscoveredCam {
+    let url = d
+        .xaddrs
+        .first()
+        .cloned()
+        .filter(|x| !x.trim().is_empty())
+        .unwrap_or_else(|| alloc::format!("http://{}/onvif/device_service", d.address));
+    DiscoveredCam {
+        vendor: "onvif".to_string(),
+        url,
+        suggested_name: suggested_name_for_discovered(d),
+    }
+}
+
+fn suggested_name_for_discovered(d: &DiscoveredCameraOut) -> String {
+    let make = d.manufacturer.trim();
+    let model = d.model.trim();
+    match (make.is_empty(), model.is_empty()) {
+        (false, false) => alloc::format!("{} {}", make, model),
+        (false, true) => make.to_string(),
+        (true, false) => model.to_string(),
+        (true, true) => {
+            let host = extract_host_port(&alloc::format!("onvif://{}", d.address))
+                .map(|(h, _)| h)
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| d.address.clone());
+            alloc::format!("ONVIF — {}", host)
+        }
+    }
 }
 
 fn extract_host_port(url: &str) -> Option<(String, Option<u16>)> {
@@ -1902,6 +1985,7 @@ fn abi_message(e: AbiError) -> &'static str {
         AbiError::CameraVendorUnsupported => "nieobsługiwany typ kamery",
         AbiError::PayloadTooLarge => "zbyt duży payload",
         AbiError::Timeout => "przekroczono czas oczekiwania",
+        AbiError::NoAvailableTarget => "brak dostępnego targetu",
         _ => "błąd operacji",
     }
 }
@@ -2113,19 +2197,30 @@ fn build_messages_section() -> Component {
 }
 
 fn build_live_content() -> Component {
-    let cameras = camera_list().unwrap_or_default();
+    let messages = build_messages_section();
+    let cameras = match camera_list() {
+        Ok(c) => c,
+        Err(e) => {
+            return stack_v(vec![
+                messages,
+                alert(&alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e)), "critical"),
+            ]);
+        }
+    };
     if cameras.is_empty() {
-        return card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby zobaczyć podgląd na żywo."), Some("video"))]);
+        return stack_v(vec![
+            messages,
+            card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby zobaczyć podgląd na żywo."), Some("video"))]),
+        ]);
     }
     let streams: Vec<Component> = cameras.iter().take(4).map(|c| {
         card(Some(&c.display_name), vec![video_stream(&c.url)])
     }).collect();
-    let messages = build_messages_section();
     stack_v(core::iter::once(messages).chain(streams).collect())
 }
 
 fn build_cameras_content() -> Component {
-    let cameras = camera_list().unwrap_or_default();
+    let list_result = camera_list();
     let messages = build_messages_section();
     let (add_visible, filter) = with_state(|s| (s.add_form_visible, s.cameras_filter.clone()));
 
@@ -2163,34 +2258,22 @@ fn build_cameras_content() -> Component {
     ]);
     children.push(toolbar);
 
-    // Use demo data when no real cameras exist
-    let use_demo = cameras.is_empty();
-    struct CamRow { name: &'static str, vendor: &'static str, addr: &'static str, status: &'static str, profile: &'static str, fps: &'static str, diag: &'static str, diag_tone: &'static str }
-    let demo_rows: Vec<CamRow> = vec![
-        CamRow { name: "C-01 brama wjazdowa", vendor: "Hikvision \u{00b7} ISAPI + RTSP", addr: "192.168.40.11", status: "online", profile: "ADR-brama", fps: "5/5", diag: "OK", diag_tone: "success" },
-        CamRow { name: "C-04 wjazd-2", vendor: "Axis \u{00b7} VAPIX + ACAP", addr: "192.168.40.14", status: "online", profile: "Bezpieczeństwo-noc", fps: "12/15", diag: "backpressure", diag_tone: "warning" },
-        CamRow { name: "C-07 peron", vendor: "ONVIF Profile T+M", addr: "192.168.40.17", status: "online", profile: "Peron-publiczny", fps: "10/10", diag: "OK", diag_tone: "success" },
-        CamRow { name: "C-12 magazyn", vendor: "Dahua \u{00b7} CGI", addr: "192.168.40.22", status: "offline", profile: "\u{2014}", fps: "\u{2014}", diag: "brak heartbeat", diag_tone: "critical" },
-        CamRow { name: "C-15 parking", vendor: "UniFi Protect \u{00b7} v3.x", addr: "unifi://nvr-1/cam-15", status: "online", profile: "ANPR-parking", fps: "5/5", diag: "obraz przyciemniony", diag_tone: "warning" },
-        CamRow { name: "C-18 dok", vendor: "Hanwha \u{00b7} ONVIF S+T", addr: "192.168.40.28", status: "online", profile: "ADR-dok", fps: "5/5", diag: "OK", diag_tone: "success" },
-        CamRow { name: "C-22 wjazd ADR", vendor: "Bosch \u{00b7} ONVIF S", addr: "192.168.40.32", status: "degraded", profile: "ADR-brama", fps: "3/5", diag: "drift 38ms", diag_tone: "warning" },
-    ];
-
-    // Compute filter counts
-    let (total, online, offline, warnings, unlinked) = if use_demo {
-        let t = demo_rows.len();
-        let on = demo_rows.iter().filter(|r| r.status == "online").count();
-        let off = demo_rows.iter().filter(|r| r.status == "offline").count();
-        let warn = demo_rows.iter().filter(|r| r.diag_tone == "warning" || r.diag_tone == "critical").count();
-        (t, on, off, warn, 3usize)
-    } else {
-        let t = cameras.len();
-        let on = cameras.iter().filter(|c| c.status == "online").count();
-        let off = cameras.iter().filter(|c| c.status == "offline").count();
-        (t, on, off, 0usize, 0usize)
+    // A host error (permission/DB/supervisor) must never be masked as "no
+    // cameras"; surface the real reason and stop rendering the list.
+    let cameras = match list_result {
+        Ok(c) => c,
+        Err(e) => {
+            children.push(alert(&alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e)), "critical"));
+            return stack_v(children);
+        }
     };
 
-    // Sub-filter tabs
+    // Filter counts derived from live camera status.
+    let total = cameras.len();
+    let online = cameras.iter().filter(|c| c.status == "online").count();
+    let offline = cameras.iter().filter(|c| c.status == "offline").count();
+    let warnings = cameras.iter().filter(|c| camera_has_warning(c)).count();
+
     let active_filter = if filter.is_empty() { "all" } else { &filter };
     let sub_tabs = filter_chips(
         vec![
@@ -2198,7 +2281,6 @@ fn build_cameras_content() -> Component {
             FilterChipDef { id: "online".into(), label: lit(&alloc::format!("Online ({})", online)), icon: None, badge: None, count_path: None },
             FilterChipDef { id: "offline".into(), label: lit(&alloc::format!("Offline ({})", offline)), icon: None, badge: None, count_path: None },
             FilterChipDef { id: "warnings".into(), label: lit(&alloc::format!("Ostrzeżenia ({})", warnings)), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "unlinked".into(), label: lit(&alloc::format!("Niepowiązane ({})", unlinked)), icon: None, badge: None, count_path: None },
         ],
         active_filter,
     );
@@ -2209,24 +2291,72 @@ fn build_cameras_content() -> Component {
         children.push(build_add_camera_wizard());
     }
 
-    // Camera table
-    if use_demo {
-        let mut table_rows: Vec<Component> = vec![build_cameras_table_header()];
-        for r in &demo_rows {
-            table_rows.push(build_camera_row(r.name, r.vendor, r.addr, r.status, r.profile, r.fps, r.diag, r.diag_tone));
-        }
-        children.push(card(None, vec![stack_v_gap("xs", table_rows)]));
-    } else if cameras.is_empty() {
+    let filtered: Vec<&CameraInfoOut> = cameras
+        .iter()
+        .filter(|c| match active_filter {
+            "online" => c.status == "online",
+            "offline" => c.status == "offline",
+            "warnings" => camera_has_warning(c),
+            _ => true,
+        })
+        .collect();
+
+    if cameras.is_empty() {
         children.push(card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras"))]));
+    } else if filtered.is_empty() {
+        children.push(card(None, vec![empty_state("Brak kamer dla filtra", Some("Zmień filtr, aby zobaczyć pozostałe kamery."), Some("cameras"))]));
     } else {
         let mut table_rows: Vec<Component> = vec![build_cameras_table_header()];
-        for c in &cameras {
-            table_rows.push(build_camera_row(&c.display_name, &c.vendor, &redact_url_for_display(&c.url), &c.status, "\u{2014}", "\u{2014}", "\u{2014}", "muted"));
+        for c in &filtered {
+            let fps = camera_fps_display(c);
+            let (diag, diag_tone) = camera_diagnostics(c);
+            table_rows.push(build_camera_row(
+                &c.display_name,
+                &c.vendor,
+                &redact_url_for_display(&c.url),
+                &c.status,
+                "\u{2014}",
+                &fps,
+                &diag,
+                diag_tone,
+            ));
         }
         children.push(card(None, vec![stack_v_gap("xs", table_rows)]));
     }
 
     stack_v(children)
+}
+
+/// A camera is "warning" when it is not cleanly online or carries a
+/// status_message diagnostic from the supervisor.
+fn camera_has_warning(c: &CameraInfoOut) -> bool {
+    if c.status != "online" && c.status != "offline" {
+        return true;
+    }
+    c.status_message.as_deref().map(|m| !m.trim().is_empty()).unwrap_or(false)
+}
+
+/// Renders "<actual>/<target>" fps when a live measurement exists, otherwise the
+/// configured target only, or em-dash for offline cameras with no target.
+fn camera_fps_display(c: &CameraInfoOut) -> String {
+    match c.fps_actual {
+        Some(actual) if c.status == "online" => alloc::format!("{:.0}/{}", actual, c.target_fps),
+        _ if c.target_fps > 0 => alloc::format!("\u{2014}/{}", c.target_fps),
+        _ => "\u{2014}".to_string(),
+    }
+}
+
+/// Maps a camera into a diagnostics label + tone for the table cell.
+fn camera_diagnostics(c: &CameraInfoOut) -> (String, &'static str) {
+    if let Some(msg) = c.status_message.as_deref().filter(|m| !m.trim().is_empty()) {
+        let tone = if c.status == "online" { "warning" } else { "critical" };
+        return (msg.to_string(), tone);
+    }
+    match c.status.as_str() {
+        "online" => ("OK".to_string(), "success"),
+        "offline" => ("offline".to_string(), "critical"),
+        other => (other.to_string(), "warning"),
+    }
 }
 
 fn build_camera_status_chip(status: &str) -> Component {
