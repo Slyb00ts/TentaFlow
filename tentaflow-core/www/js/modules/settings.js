@@ -5,11 +5,11 @@
 //       2) SSO / OIDC   — CRUD providerow SSO
 //       3) OAuth        — oauth_redirect_base_url
 //       4) TLS          — tls_cert_pem, tls_key_pem
-//       5) NVIDIA NGC   — ngc_api_key, test polaczenia przez /api/nim/catalog
+//       5) Dostępy zewnętrzne — hf_token, ngc_api_key, rejestry kontenerów
 //      Wszystkie klucze bazy danych sa snake_case (tabela settings). Sekcja
 //      "Ogólne" filtruje klucze obslugiwane w dedykowanych zakladkach oraz
 //      klucze flow_*/speaker_*/voice_*/enrollment_* aby uniknac duplikacji.
-//      CRUD settings/SSO/TLS/NGC idzie przez binary WS (ApiBinary); REST
+//      CRUD settings/SSO/TLS/dostępów idzie przez binary WS (ApiBinary); REST
 //      pozostal tylko dla OAuth flow (/api/sso/login, /api/sso/callback) i
 //      testu NGC (/api/nim/catalog).
 // =============================================================================
@@ -27,6 +27,7 @@ import '/js/components/tf-table.js';
 
 // --- Klucze obslugiwane w dedykowanych zakladkach (ukryte w "Ogólne") ---
 const DEDICATED_KEYS = new Set([
+  'hf_token',
   'oauth_redirect_base_url',
   'tls_cert_pem',
   'tls_key_pem',
@@ -92,9 +93,8 @@ const SettingsScreen = {
         <tf-tab id="mesh" icon="network">${escapeHtml(I18n.t('settings.tab_mesh'))}</tf-tab>
         <tf-tab id="sync" icon="refresh">Sync</tf-tab>
         <tf-tab id="storage" icon="database">Storage</tf-tab>
-        <tf-tab id="ngc" icon="model">${escapeHtml(I18n.t('settings.tab_ngc'))}</tf-tab>
+        <tf-tab id="external" icon="key">${escapeHtml(I18n.t('settings.tab_external_access') || 'Dostępy zewnętrzne')}</tf-tab>
         <tf-tab id="apikeys" icon="key">${escapeHtml(I18n.t('nav.apikeys'))}</tf-tab>
-        <tf-tab id="registries" icon="registry">${escapeHtml(I18n.t('nav.registries'))}</tf-tab>
       </tf-tabs>
 
       <div id="settings-tab-body"></div>
@@ -144,6 +144,11 @@ function getSetting(key, dflt = '') {
   return v != null ? v : dflt;
 }
 
+function hasConfiguredSetting(key) {
+  const value = getSetting(key, '').trim();
+  return value.length > 0;
+}
+
 async function saveSettingKey(key, value) {
   const isSecret = /secret|key|password|token|master/i.test(key);
   await ApiBinary.action('settingsUpdateRequest', {
@@ -180,9 +185,8 @@ function renderTab() {
       break;
     case 'sync': host.innerHTML = renderSyncTab(); bindSyncTab(); void loadSyncConflicts(); break;
     case 'storage': host.innerHTML = renderStorageTab(); bindStorageTab(); void loadStorageReport(); break;
-    case 'ngc': host.innerHTML = renderNgcTab(); bindNgcTab(); break;
+    case 'external': host.innerHTML = renderExternalAccessTab(); bindExternalAccessTab(); break;
     case 'apikeys': host.innerHTML = renderApiKeysTab(); bindApiKeysTab(); break;
-    case 'registries': host.innerHTML = renderRegistriesTab(); bindRegistriesTab(); break;
   }
 }
 
@@ -805,15 +809,47 @@ function bindTlsTab() {
 }
 
 // ==========================================================================
-// Zakladka: NVIDIA NGC
+// Zakladka: Dostępy zewnętrzne
 // ==========================================================================
 
-function renderNgcTab() {
-  const placeholderChip = `<tf-chip status="info" id="ngc-status-chip">…</tf-chip>`;
+function renderRegistryRows() {
+  return registries.length === 0
+    ? `<tr><td colspan="3"><div class="empty-big" style="padding:24px;">${escapeHtml(I18n.t('registries.empty'))}</div></td></tr>`
+    : registries.map((r) => `
+      <tr>
+        <td><code>${escapeHtml(r.url)}</code></td>
+        <td><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
+        <td>${r.authRequired ? `<tf-chip status="warn">${escapeHtml(I18n.t('registries.auth_yes'))}</tf-chip>` : `<tf-chip status="ok">${escapeHtml(I18n.t('registries.auth_no'))}</tf-chip>`}</td>
+      </tr>
+    `).join('');
+}
+
+function renderExternalAccessTab() {
+  const hfConfigured = hasConfiguredSetting('hf_token');
+  const hfChip = hfConfigured
+    ? `<tf-chip status="ok">${escapeHtml(I18n.t('settings.external_configured'))}</tf-chip>`
+    : `<tf-chip status="warn">${escapeHtml(I18n.t('settings.external_not_configured'))}</tf-chip>`;
+  const ngcPlaceholderChip = `<tf-chip status="info" id="ngc-status-chip">…</tf-chip>`;
+
   return `
     <div class="card">
       <div class="card-header">
-        <h3>${escapeHtml(I18n.t('settings.ngc_title'))} ${placeholderChip}</h3>
+        <h3>${escapeHtml(I18n.t('settings.external_hf_title'))} ${hfChip}</h3>
+      </div>
+      <div class="card-body">
+        <p class="form-hint" style="margin:0 0 16px;">${escapeHtml(I18n.t('settings.external_hf_hint'))}</p>
+        <div class="form-row">
+          <tf-input id="hf-token" type="password" label="${escapeAttr(I18n.t('settings.external_hf_token'))}" placeholder="hf_..."></tf-input>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:16px;">
+          <tf-button variant="primary" icon="check" id="hf-save">${escapeHtml(I18n.t('common.save'))}</tf-button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>${escapeHtml(I18n.t('settings.ngc_title'))} ${ngcPlaceholderChip}</h3>
       </div>
       <div class="card-body">
         <p class="form-hint" style="margin:0 0 16px;">${escapeHtml(I18n.t('settings.ngc_hint'))}</p>
@@ -826,10 +862,29 @@ function renderNgcTab() {
         </div>
       </div>
     </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>${escapeHtml(I18n.t('registries.title'))}</h3>
+        <tf-button variant="ghost" size="sm" icon="refresh" id="registries-refresh">${escapeHtml(I18n.t('settings.refresh'))}</tf-button>
+      </div>
+      <div class="card-body">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>${escapeHtml(I18n.t('registries.col_url'))}</th>
+              <th>${escapeHtml(I18n.t('registries.col_type'))}</th>
+              <th>${escapeHtml(I18n.t('registries.col_auth'))}</th>
+            </tr>
+          </thead>
+          <tbody>${renderRegistryRows()}</tbody>
+        </table>
+      </div>
+    </div>
   `;
 }
 
-function bindNgcTab() {
+function bindExternalAccessTab() {
   (async () => {
     try {
       const { configured } = await ApiBinary.one('ngcStatusRequest');
@@ -846,6 +901,23 @@ function bindNgcTab() {
       // brak danych — placeholder zostaje
     }
   })();
+
+  byId('hf-save')?.addEventListener('click', async () => {
+    const value = byId('hf-token')?.value?.trim() || '';
+    if (!value) {
+      toast(I18n.t('settings.external_hf_save_empty'), 'error');
+      return;
+    }
+    try {
+      await saveSettingKey('hf_token', value);
+      byId('hf-token').value = '';
+      toast(I18n.t('settings.save_success', { key: 'hf_token' }), 'success');
+      await loadAll();
+      renderTab();
+    } catch (err) {
+      toast(I18n.t('settings.save_error', { error: err.message }), 'error');
+    }
+  });
 
   byId('ngc-save')?.addEventListener('click', async () => {
     const value = byId('ngc-key')?.value?.trim() || '';
@@ -880,6 +952,11 @@ function bindNgcTab() {
     } finally {
       if (btn) btn.removeAttribute('disabled');
     }
+  });
+
+  byId('registries-refresh')?.addEventListener('click', async () => {
+    registries = await ApiBinary.list('registryListRequest').catch(() => []);
+    renderTab();
   });
 }
 
@@ -1041,50 +1118,6 @@ function openCreateApiKeyModal() {
     } catch (err) {
       toast(`${I18n.t('apikeys.error_prefix')}: ${err.message}`, 'error');
     }
-  });
-}
-
-// ==========================================================================
-// Zakladka: Registries
-// ==========================================================================
-
-function renderRegistriesTab() {
-  const rows = registries.length === 0
-    ? `<tr><td colspan="3"><div class="empty-big" style="padding:24px;">${escapeHtml(I18n.t('registries.empty'))}</div></td></tr>`
-    : registries.map((r) => `
-      <tr>
-        <td><code>${escapeHtml(r.url)}</code></td>
-        <td><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
-        <td>${r.authRequired ? `<tf-chip status="warn">${escapeHtml(I18n.t('registries.auth_yes'))}</tf-chip>` : `<tf-chip status="ok">${escapeHtml(I18n.t('registries.auth_no'))}</tf-chip>`}</td>
-      </tr>
-    `).join('');
-
-  return `
-    <div class="card">
-      <div class="card-header">
-        <h3>${escapeHtml(I18n.t('registries.title'))}</h3>
-        <tf-button variant="ghost" size="sm" icon="refresh" id="registries-refresh">${escapeHtml(I18n.t('settings.refresh'))}</tf-button>
-      </div>
-      <div class="card-body">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>${escapeHtml(I18n.t('registries.col_url'))}</th>
-              <th>${escapeHtml(I18n.t('registries.col_type'))}</th>
-              <th>${escapeHtml(I18n.t('registries.col_auth'))}</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-    </div>
-  `;
-}
-
-function bindRegistriesTab() {
-  byId('registries-refresh')?.addEventListener('click', async () => {
-    registries = await ApiBinary.list('registryListRequest').catch(() => []);
-    renderTab();
   });
 }
 

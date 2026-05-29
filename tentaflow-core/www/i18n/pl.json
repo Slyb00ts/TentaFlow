@@ -41,7 +41,6 @@
     "section_integrations": "Integracje",
     "section_management": "Zarządzanie",
     "section_apps": "Moje aplikacje",
-    "section_network": "Sieć",
     "section_account": "Konto",
     "apps_home": "Wszystkie aplikacje",
     "images": "Obrazy",
@@ -51,8 +50,6 @@
     "search_app": "Wyszukaj",
     "flows_user": "Przepływy",
     "prompts_user": "Prompty",
-    "mesh_user": "Mesh (podgląd)",
-    "tailscale_user": "Tailscale",
     "profile": "Profil",
     "my_accounts": "Moje konta",
     "settings_user": "Ustawienia"
@@ -463,9 +460,9 @@
     "tab_oauth": "OAuth",
     "tab_tls": "TLS",
     "tab_mesh": "Mesh i Sieć",
-    "tab_ngc": "NVIDIA NGC",
+    "tab_external_access": "Dostępy zewnętrzne",
     "general_title": "Ustawienia globalne",
-    "general_hint": "Surowe pary klucz–wartość z bazy. Zmiany aplikują się natychmiast. Sekcje specjalne (TLS, NGC, OAuth) są obsługiwane na dedykowanych zakładkach.",
+    "general_hint": "Surowe pary klucz–wartość z bazy. Zmiany aplikują się natychmiast. Sekcje specjalne (TLS, OAuth, dostępy zewnętrzne) są obsługiwane na dedykowanych zakładkach.",
     "general_empty": "Brak ustawień w bazie",
     "saved": "Zapisano",
     "refresh": "Odśwież",
@@ -499,6 +496,12 @@
     "ngc_hint": "Wymagany do pobierania kontenerów NVIDIA NIM. Pobierz klucz z build.nvidia.com.",
     "ngc_key_label": "API Key",
     "ngc_save_empty": "Wpisz klucz NGC aby zapisać",
+    "external_hf_title": "Hugging Face",
+    "external_hf_hint": "Token używany do pobierania modeli i config.json z repozytoriów wymagających autoryzacji.",
+    "external_hf_token": "Token Hugging Face",
+    "external_hf_save_empty": "Wpisz token Hugging Face, aby go zapisać",
+    "external_configured": "Skonfigurowany",
+    "external_not_configured": "Nie skonfigurowany",
     "speakers": {
       "title": "Rozpoznawanie mówców",
       "conf_high": "Pewność wysoka (speaker_confidence_high)",
@@ -3447,9 +3450,7 @@
     "meeting": "Meeting Bot wymaga addona teams-bot z OAuth oraz binarnego handlera transkryptów. Pozycja na roadmapie.",
     "tts": "TTS wymaga wdrożonego silnika TTS i handlera syntezy. Panel reguł TTS dla admina istnieje; ścieżka użytkownika jest na roadmapie.",
     "translate": "Tłumacz użyje backendu czatu LLM po dodaniu dedykowanego handlera użytkownika. Pozycja na roadmapie.",
-    "search": "Wyszukiwanie po danych jest na roadmapie.",
-    "mesh_user": "Widok mesh dla użytkownika jest na roadmapie. Admini mają widok w Core → Mesh.",
-    "tailscale": "Widok Tailscale dla użytkownika jest na roadmapie."
+    "search": "Wyszukiwanie po danych jest na roadmapie."
   },
   "profile": {
     "title": "Profil",

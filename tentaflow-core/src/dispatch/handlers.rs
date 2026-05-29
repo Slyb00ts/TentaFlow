@@ -1800,14 +1800,15 @@ pub fn settings_list(
         .into_iter()
         .map(|s| {
             let is_secret = crate::crypto::SettingsCipher::should_encrypt(&s.key);
+            let value = if is_secret && !s.value.is_empty() {
+                "<redacted>".to_string()
+            } else {
+                s.value
+            };
             SettingEntry {
                 key: s.key,
                 // Klient nigdy nie powinien zobaczyc plaintext sekretu w listingu.
-                value: if is_secret {
-                    "<redacted>".to_string()
-                } else {
-                    s.value
-                },
+                value,
                 is_secret,
             }
         })
@@ -2029,9 +2030,10 @@ pub fn tls_status(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 #[policy(Admin)]
 #[observed]
 pub fn ngc_status(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let key = repository::get_setting(&ctx.state.db, "ngc_api_key")
-        .map_err(db_err)?
-        .unwrap_or_default();
+    let key =
+        repository::get_setting_secure(&ctx.state.db, "ngc_api_key", &ctx.state.settings_cipher)
+            .map_err(db_err)?
+            .unwrap_or_default();
     Ok(MessageBody::NgcStatusResponseBody(
         tentaflow_protocol::NgcStatusResponse {
             configured: !key.is_empty(),
@@ -3813,12 +3815,28 @@ fn resolve_deploy_method(
 // Reads HF config.json, runs auto-fit + VRAM estimator from vram_calculator.
 // =============================================================================
 
+fn setting_hf_token(ctx: &HandlerContext) -> Option<String> {
+    repository::get_setting_secure(&ctx.state.db, "hf_token", &ctx.state.settings_cipher)
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn effective_hf_token(ctx: &HandlerContext, request_token: Option<&str>) -> Option<String> {
+    request_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| setting_hf_token(ctx))
+}
+
 #[handler(variant = "DeployVllmRecommendRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
 pub async fn deploy_vllm_recommend(
     req: &MessageBody,
-    _ctx: &HandlerContext,
+    ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     use crate::deploy::vram_calculator::{
         AutoFitOutcome, AutoFitRequest, analyze_gpu_compatibility, auto_fit_config,
@@ -3847,14 +3865,14 @@ pub async fn deploy_vllm_recommend(
         .build()
         .map_err(|e| ProtocolError::internal(format!("reqwest client: {e}")))?;
 
-    let config_json =
-        fetch_hf_config(&client, &payload.model, payload.hf_token.as_deref())
-            .await
-            .map_err(|e| {
-                ProtocolError::not_found(format!(
-                    "Nie udalo sie pobrac config.json z HF: {e}. Sprawdz nazwe modelu i ewentualnie HF token (gated repo)."
-                ))
-            })?;
+    let hf_token = effective_hf_token(ctx, payload.hf_token.as_deref());
+    let config_json = fetch_hf_config(&client, &payload.model, hf_token.as_deref())
+        .await
+        .map_err(|e| {
+            ProtocolError::not_found(format!(
+                "Nie udalo sie pobrac config.json z HF: {e}. Sprawdz nazwe modelu i ewentualnie HF token (gated repo)."
+            ))
+        })?;
 
     let spec = parse_hf_config_with_override(
         &config_json,
@@ -4013,7 +4031,7 @@ pub async fn deploy_vllm_recommend(
 #[observed]
 pub async fn engine_recommend(
     req: &MessageBody,
-    _ctx: &HandlerContext,
+    ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::EngineRecommendRequestBody(p) => p,
@@ -4060,14 +4078,12 @@ pub async fn engine_recommend(
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .map_err(|e| ProtocolError::internal(format!("reqwest client: {e}")))?;
-            let config_json =
-                fetch_hf_config(&client, &payload.model_repo, payload.hf_token.as_deref())
-                    .await
-                    .map_err(|e| {
-                        ProtocolError::not_found(format!(
-                            "Nie udalo sie pobrac config.json z HF: {e}"
-                        ))
-                    })?;
+            let hf_token = effective_hf_token(ctx, payload.hf_token.as_deref());
+            let config_json = fetch_hf_config(&client, &payload.model_repo, hf_token.as_deref())
+                .await
+                .map_err(|e| {
+                    ProtocolError::not_found(format!("Nie udalo sie pobrac config.json z HF: {e}"))
+                })?;
             let spec = parse_hf_config_with_override(&config_json, &payload.model_repo, None)
                 .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
 
