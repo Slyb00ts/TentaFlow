@@ -2218,7 +2218,9 @@ fn build_live_content() -> Component {
     if cameras.is_empty() {
         return stack_v(vec![
             messages,
-            card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby zobaczyć podgląd na żywo."), Some("video"))]),
+            // No outer Outlined Card: matches the dashboard stack so the empty
+            // state does not get a stray white frame around it.
+            empty_state("Brak kamer", Some("Dodaj kamerę aby zobaczyć podgląd na żywo."), Some("video")),
         ]);
     }
     let streams: Vec<Component> = cameras.iter().take(4).map(|c| {
@@ -2322,14 +2324,19 @@ fn build_cameras_content() -> Component {
     }
 
     if cameras.is_empty() {
-        children.push(card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras"))]));
+        // No outer Outlined Card: the dashboard pushes its sections straight
+        // into the stack, so wrapping these in card(None, ...) would draw a
+        // double container (a stray white frame around the content).
+        children.push(empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras")));
     } else {
         // Push the filtered, host-derived rows into panel state under the
         // Table's rows_path; the Table renderer reads them reactively. An empty
         // filtered set renders the Table's own empty_state.
         let rows: Vec<Value> = filtered.iter().map(|c| camera_table_row_value(c)).collect();
         send_state_patch("cameras_rows", Value::Array(rows));
-        children.push(card(None, vec![build_cameras_table()]));
+        // Table carries its own surface styling; an extra Outlined Card here
+        // would nest a white frame around it, unlike the dashboard layout.
+        children.push(build_cameras_table());
     }
 
     stack_v(children)
