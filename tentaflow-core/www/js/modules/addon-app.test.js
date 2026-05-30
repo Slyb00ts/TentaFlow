@@ -45,7 +45,7 @@ register('data:text/javascript,' + encodeURIComponent(hookSource), import.meta.u
 globalThis.addEventListener?.('unhandledrejection', (e) => e.preventDefault?.());
 process.on('unhandledRejection', () => {});
 
-const { isOverlaySlot } = await import('./addon-app.js');
+const { isOverlaySlot, handleSlotContent, __setSessionForTest } = await import('./addon-app.js');
 await import('../protocol/codec.js')
   .then((m) => m.codecReady)
   .catch(() => {});
@@ -96,4 +96,44 @@ test('isOverlaySlot: missing/invalid decl is not overlay', () => {
   assert.equal(isOverlaySlot(undefined), false);
   assert.equal(isOverlaySlot('main'), false);
   assert.equal(isOverlaySlot({ id: 'only-id' }), false);
+});
+
+test('handleSlotContent forwards decoded.stateOverlay to SlotManager', () => {
+  const overlay = [{ path: { segments: [{ kind: 'key', value: 'visible' }] }, value: false }];
+  let captured = null;
+  __setSessionForTest({
+    slotManager: {
+      handleSlotContent(arg) {
+        captured = arg;
+      },
+    },
+  });
+  try {
+    handleSlotContent({ slotId: 'wizard', fragment: { foo: 1 }, stateOverlay: overlay });
+  } finally {
+    __setSessionForTest(null);
+  }
+  assert.deepEqual(captured, {
+    slot_id: 'wizard',
+    fragment: { foo: 1 },
+    state_overlay: overlay,
+  });
+});
+
+test('handleSlotContent: missing stateOverlay forwards undefined (not an error)', () => {
+  let captured = null;
+  __setSessionForTest({
+    slotManager: {
+      handleSlotContent(arg) {
+        captured = arg;
+      },
+    },
+  });
+  try {
+    handleSlotContent({ slotId: 's', fragment: { foo: 1 } });
+  } finally {
+    __setSessionForTest(null);
+  }
+  assert.equal(captured.slot_id, 's');
+  assert.equal(captured.state_overlay, undefined);
 });

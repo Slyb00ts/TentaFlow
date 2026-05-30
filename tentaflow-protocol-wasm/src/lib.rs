@@ -9431,6 +9431,11 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
                 "fragment",
                 component_to_js(&sc.fragment).map_err(|e| JsError::new(&e))?,
             );
+            // Atomic state seed shipped in the same wire frame as the fragment;
+            // forwarded to SlotManager so bindings see seeded values before render.
+            if let Some(overlay) = &sc.state_overlay {
+                set(&obj, "stateOverlay", state_entries_to_js(overlay)?);
+            }
         }
         UiPayload::SlotClear(c) => {
             set(&obj, "addonId", c.addon_id.into());
