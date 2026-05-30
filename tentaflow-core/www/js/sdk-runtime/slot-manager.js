@@ -13,6 +13,7 @@ import {
   readContainerChildren,
   shellEqualsExceptChildKey,
   componentDeepEqual,
+  validateFragmentTree,
 } from './component-renderer.js';
 
 const SLOT_SEMANTICS = new Set([
@@ -177,6 +178,14 @@ export class SlotManager {
       entry.currentFragment = null;
       return;
     }
+
+    // Validate the new fragment with the SAME rigor as ComponentRenderer.render
+    // BEFORE any DOM patching. The reconcile path reuses the wrapper and its
+    // helpers (fieldsToMap/readContainerChildren) silently tolerate malformed or
+    // duplicate-key FieldMap entries, so without this a bad fragment could be
+    // accepted (stale DOM + a wrong currentFragment). On throw we leave DOM and
+    // currentFragment untouched; handleSlotContent's caller logs it.
+    validateFragmentTree(fragment, 'SlotManager._applySlotContent');
 
     const existingRoot = entry.element.firstChild;
     const prev = entry.currentFragment;

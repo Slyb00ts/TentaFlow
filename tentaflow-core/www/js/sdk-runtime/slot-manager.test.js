@@ -827,6 +827,94 @@ test('reconcile: changed container shell replaces the whole subtree', () => {
   sm.destroy();
 });
 
+test('reconcile: rejects fragment with duplicate FieldMap key (no stale accept)', () => {
+  setupReconcile();
+  const { sm } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  // First a valid fragment so the reconcile path (reuse wrapper) is taken on
+  // the next push.
+  const good = stack([text(PATH('a'))]);
+  sm.handleSlotContent({ slot_id: 's', fragment: good });
+  const rootBefore = host.firstChild;
+  const childBefore = rootBefore.firstChild;
+
+  // Same tag (so canReconcile=true) but a duplicate FieldMap key. Without
+  // validation fieldsToMap would silently merge duplicates and patch ahead.
+  const dupKey = {
+    tag: STACK_TAG, id: 'stk',
+    fields: [[2, [text(PATH('a'))]], [2, [text(PATH('b'))]]],
+    handlers: null, bind: null, a11y: null, visibility: null, test_id: null,
+  };
+  assertThrows(
+    () => sm.handleSlotContent({ slot_id: 's', fragment: dupKey }),
+    'duplicate FieldMap key must be rejected'
+  );
+  // DOM untouched and currentFragment still the last GOOD fragment.
+  assert(host.firstChild === rootBefore, 'root not replaced on rejected fragment');
+  assert(rootBefore.firstChild === childBefore, 'child not patched on rejected fragment');
+  assert(sm._slots.get('s').currentFragment === good, 'currentFragment unchanged (still last good)');
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([text(PATH('a'))]) });
+  assert(host.firstChild === rootBefore, 'reconcile still works against last good fragment');
+  sm.destroy();
+});
+
+test('reconcile: rejects fragment with malformed FieldMap entry shape', () => {
+  setupReconcile();
+  const { sm } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([text(PATH('a'))]) });
+  const rootBefore = host.firstChild;
+
+  // Same tag, but a FieldMap entry is not a [u8, Value] pair.
+  const badShape = {
+    tag: STACK_TAG, id: 'stk',
+    fields: [[2, [text(PATH('a'))]], ['not-a-u8-key', 'x', 'extra']],
+    handlers: null, bind: null, a11y: null, visibility: null, test_id: null,
+  };
+  assertThrows(
+    () => sm.handleSlotContent({ slot_id: 's', fragment: badShape }),
+    'malformed FieldMap entry must be rejected'
+  );
+  assert(host.firstChild === rootBefore, 'root not replaced on rejected fragment');
+  sm.destroy();
+});
+
+test('reconcile: rejects nested child with duplicate FieldMap key', () => {
+  setupReconcile();
+  const { sm } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([text(PATH('a'))]) });
+  const rootBefore = host.firstChild;
+
+  // Valid container shell, but a CHILD has a duplicate FieldMap key. Validation
+  // must recurse into transparent-container children.
+  const badChild = {
+    tag: TEXT_TAG, id: 't',
+    fields: [[0, PATH('a')], [0, PATH('b')]],
+    handlers: null, bind: null, a11y: null, visibility: null, test_id: null,
+  };
+  const fragment = {
+    tag: STACK_TAG, id: 'stk',
+    fields: [[2, [badChild]]],
+    handlers: null, bind: null, a11y: null, visibility: null, test_id: null,
+  };
+  assertThrows(
+    () => sm.handleSlotContent({ slot_id: 's', fragment }),
+    'duplicate key in nested child must be rejected'
+  );
+  assert(host.firstChild === rootBefore, 'root not replaced on rejected nested child');
+  sm.destroy();
+});
+
 // =============================================================================
 // Report
 // =============================================================================

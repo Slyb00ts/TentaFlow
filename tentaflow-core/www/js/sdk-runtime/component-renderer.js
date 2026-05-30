@@ -110,6 +110,12 @@ export class ComponentRenderer {
       );
     }
     const cleanups = [];
+    // Dzieci wyrenderowane przez `renderChild` mają cleanup'y przypięte do
+    // SWOICH elementów (per-element ownership), nie do `cleanups` rodzica. Gdy
+    // render rodzica rzuci PO wyrenderowaniu dziecka, lokalna pętla cleanup'ów
+    // nie tknie subskrypcji dziecka — leak. Śledzimy je tu i w catch wołamy
+    // `destroy(childEl)`, żeby zwolnić całe poddrzewo dziecka.
+    const childElements = [];
     const ctx = {
       engine: this,
       store: this.store,
@@ -123,7 +129,9 @@ export class ComponentRenderer {
         // poddrzewie DOM i zwalnia je rekurencyjnie, a reconcile może wymienić
         // pojedyncze dziecko i zwolnić dokładnie jego subskrypcje bez tykania
         // rodzeństwa.
-        return this.render(child);
+        const childEl = this.render(child);
+        childElements.push(childEl);
+        return childEl;
       },
       readField: (fields, key) => readField(fields, key),
       formatValue: (value, fmt) => formatValue(value, fmt, this.locale),
@@ -146,6 +154,12 @@ export class ComponentRenderer {
         try {
           fn();
         } catch {}
+      }
+      // Dzieci wyrenderowane przed throw'em trzymają cleanup'y w WeakMap pod
+      // swoimi elementami — `destroy` schodzi rekurencyjnie i jest idempotentny
+      // (usuwa wpis z WeakMap), więc nie ma podwójnego zwolnienia.
+      for (const childEl of childElements) {
+        this.destroy(childEl);
       }
       throw err;
     }
@@ -356,6 +370,28 @@ function assertComponent(c, ctx) {
       throw new TypeError(`${ctx}: FieldMap duplicate key ${k}`);
     }
     seenKeys.add(k);
+  }
+}
+
+/// Waliduje fragment Component tym samym rygorem co `render()`
+/// (`assertComponent`: kształt FieldMap `[u8, Value]`, brak zdublowanych
+/// kluczy, kształt `bind`/`handlers`/`test_id`) i schodzi rekurencyjnie po
+/// dzieciach przezroczystych kontenerów. Reconcile NIE przechodzi przez
+/// `render()` (reużywa wrappera), więc bez tego malformed/zdublowany fragment
+/// zostałby cicho przyjęty przez `fieldsToMap`/`readContainerChildren` zamiast
+/// odrzucony — `_applySlotContent` woła to na wejściu, zanim cokolwiek
+/// zacznie patchować DOM.
+export function validateFragmentTree(component, ctx) {
+  assertComponent(component, ctx);
+  const childKey = TRANSPARENT_CONTAINER_CHILD_KEY.get(component.tag);
+  if (childKey === undefined) return;
+  const children = readField(component.fields, childKey);
+  if (children === undefined || children === null) return;
+  if (!Array.isArray(children)) {
+    throw new TypeError(`${ctx}: transparent container children must be Array<Component>`);
+  }
+  for (const child of children) {
+    validateFragmentTree(child, ctx);
   }
 }
 
