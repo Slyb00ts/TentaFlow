@@ -361,7 +361,7 @@ impl Default for AdapterRegistry {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     //! Stub dispatcherów + builder ExecutionContext dla testów adapterów.
     //! Każdy stub panickuje na call — testy które używają konkretnej

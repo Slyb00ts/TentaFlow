@@ -7,9 +7,14 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use futures::stream::{BoxStream, StreamExt};
 
-use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use crate::flow_engine::envelope::{
+    EnvelopeDelta, EnvelopeDeltaKind, FlowEnvelope, FlowValue, LlmStreamChunk, NodeInput,
+};
+use crate::flow_engine::node_adapter::{
+    ExecutionContext, NodeAdapter, PortSpec, StreamingNodeAdapter,
+};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct TtsCleanNodeAdapter;
@@ -37,7 +42,10 @@ impl NodeAdapter for TtsCleanNodeAdapter {
     }
 
     fn output_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("full", FlowDataType::Text)]
+        vec![
+            PortSpec::new("full", FlowDataType::Text),
+            PortSpec::new("stream", FlowDataType::Text),
+        ]
     }
 
     async fn execute(
@@ -60,6 +68,68 @@ impl NodeAdapter for TtsCleanNodeAdapter {
         let cleaned = ctx.tts_cleaning.clean(&text).await?;
         out.payload = FlowValue::Text(cleaned);
         Ok(out)
+    }
+}
+
+/// Streaming wariant — czyści każdą deltę tekstu (zazwyczaj całe zdanie, gdy
+/// node siedzi za `sentence_buffer`) przez `ctx.tts_cleaning.clean()` zanim
+/// trafi do TTS. Llm→Llm: nie zmienia kindu, tylko transformuje text_delta.
+/// Cancel sprawdzany przed każdym blocking clean.
+#[async_trait]
+impl StreamingNodeAdapter for TtsCleanNodeAdapter {
+    fn stream_input_kind(&self) -> EnvelopeDeltaKind {
+        EnvelopeDeltaKind::Llm
+    }
+    fn stream_output_kind(&self) -> EnvelopeDeltaKind {
+        EnvelopeDeltaKind::Llm
+    }
+
+    async fn process_stream(
+        &self,
+        _node: &FlowNode,
+        upstream: BoxStream<'static, Result<EnvelopeDelta>>,
+        _seed_envelope: std::sync::Arc<FlowEnvelope>,
+        ctx: &ExecutionContext,
+    ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+        let cancel = ctx.cancel_token.clone();
+        let cleaning = ctx.tts_cleaning.clone();
+
+        let stream = futures::stream::unfold(upstream, move |mut upstream| {
+            let cancel = cancel.clone();
+            let cleaning = cleaning.clone();
+            async move {
+                if cancel.is_cancelled() {
+                    return None;
+                }
+                match upstream.next().await {
+                    Some(Ok(EnvelopeDelta::Llm(chunk))) => {
+                        let cleaned = if chunk.text_delta.is_empty() {
+                            String::new()
+                        } else {
+                            match cleaning.clean(&chunk.text_delta).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    return Some((Err(anyhow!("tts_clean stream: {e}")), upstream))
+                                }
+                            }
+                        };
+                        Some((
+                            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                                choice_index: chunk.choice_index,
+                                text_delta: cleaned,
+                                finish_reason: chunk.finish_reason,
+                                ..Default::default()
+                            })),
+                            upstream,
+                        ))
+                    }
+                    Some(other) => Some((other, upstream)),
+                    None => None,
+                }
+            }
+        });
+
+        Ok(stream.boxed())
     }
 }
 
@@ -124,11 +194,63 @@ mod tests {
     }
 
     #[test]
-    fn tts_clean_advertises_full_ports() {
+    fn tts_clean_advertises_full_and_stream_ports() {
         let a = TtsCleanNodeAdapter;
         let in_names: Vec<String> = a.input_ports().iter().map(|p| p.name.clone()).collect();
         let out_names: Vec<String> = a.output_ports().iter().map(|p| p.name.clone()).collect();
         assert_eq!(in_names, vec!["in"]);
-        assert_eq!(out_names, vec!["full"]);
+        assert_eq!(out_names, vec!["full", "stream"]);
+    }
+
+    #[tokio::test]
+    async fn tts_clean_streaming_cleans_each_delta() {
+        let mut ctx = stub_ctx();
+        ctx.tts_cleaning = Arc::new(FakeCleaning);
+
+        let upstream = futures::stream::iter(vec![
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: " First 🎉 Sentence. ".into(),
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: " Second 🎉 One. ".into(),
+                finish_reason: Some(crate::flow_engine::envelope::FinishReason::Stop),
+                ..Default::default()
+            })),
+        ])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = TtsCleanNodeAdapter
+            .process_stream(
+                &FlowNode {
+                    id: "ttsc".into(),
+                    node_type: "tts_clean".into(),
+                    config: serde_json::Value::Null,
+                    position: None,
+                    label: None,
+                },
+                upstream,
+                seed,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let mut got = Vec::new();
+        while let Some(item) = out.next().await {
+            if let EnvelopeDelta::Llm(c) = item.unwrap() {
+                got.push((c.text_delta, c.finish_reason));
+            }
+        }
+        // FakeCleaning strip emoji + lowercase + trim — per delta.
+        assert_eq!(got[0].0, "first  sentence.");
+        assert_eq!(got[1].0, "second  one.");
+        assert_eq!(
+            got[1].1,
+            Some(crate::flow_engine::envelope::FinishReason::Stop)
+        );
     }
 }
