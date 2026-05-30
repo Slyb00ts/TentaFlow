@@ -342,6 +342,14 @@ fn send_panel_shell(layout: Component, slots: Vec<SlotDecl>, initial_state: Vec<
 }
 
 fn send_slot_content(slot_id: &str, fragment: Component) {
+    send_slot_content_with_overlay(slot_id, fragment, None);
+}
+
+/// Like `send_slot_content` but seeds store keys via `state_overlay` before the
+/// fragment renders. Used to seed the reactive wizard's initial state into the
+/// store the moment the `add_camera_body` fragment is delivered, so bound
+/// visibility flags resolve correctly on first paint.
+fn send_slot_content_with_overlay(slot_id: &str, fragment: Component, overlay: Option<Vec<StateEntry>>) {
     let epoch = PANEL_EPOCH.load(Ordering::Relaxed);
     let payload = UiPayload::SlotContent(SlotContent {
         addon_id: ADDON_ID.into(),
@@ -349,26 +357,41 @@ fn send_slot_content(slot_id: &str, fragment: Component) {
         panel_epoch: epoch,
         slot_id: slot_id.into(),
         fragment,
-        state_overlay: None,
+        state_overlay: overlay,
     });
     send_ui(&payload);
 }
 
 fn send_state_patch(key: &str, value: Value) {
+    send_state_patches(vec![(key.into(), value)]);
+}
+
+/// Applies several store keys in one atomic `StatePatch` (single revision bump).
+/// The reactive wizard uses this so that, e.g., advancing a step toggles the
+/// step visibility flags and footer-button flags together without the client
+/// observing a half-applied intermediate state.
+fn send_state_patches(pairs: Vec<(String, Value)>) {
+    if pairs.is_empty() {
+        return;
+    }
     let base = STATE_REVISION.load(Ordering::Relaxed);
     let new_rev = base + 1;
     STATE_REVISION.store(new_rev, Ordering::Relaxed);
     let epoch = PANEL_EPOCH.load(Ordering::Relaxed);
+    let ops = pairs
+        .into_iter()
+        .map(|(key, value)| PatchOp {
+            path: StatePath::new(vec![PathSegment::Key(key)]),
+            op: PatchOpKind::Set { value },
+        })
+        .collect();
     let payload = UiPayload::StatePatch(StatePatch {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
         panel_epoch: epoch,
         base_revision: base,
         new_revision: new_rev,
-        ops: vec![PatchOp {
-            path: StatePath::new(vec![PathSegment::Key(key.into())]),
-            op: PatchOpKind::Set { value },
-        }],
+        ops,
     });
     send_ui(&payload);
 }
@@ -379,6 +402,27 @@ fn send_state_patch(key: &str, value: Value) {
 
 fn lit(s: &str) -> BindRef {
     BindRef::Literal(Value::Text(s.into()))
+}
+
+/// A reactive `BindRef` pointing at a top-level store key. Lets text/alert
+/// content track wizard state without re-sending the fragment.
+fn bound(key: &str) -> BindRef {
+    BindRef::Bound(StatePath::new(vec![PathSegment::Key(key.into())]))
+}
+
+/// Wraps a component so the renderer hides it whenever the bound boolean store
+/// key is `false`. This is the core of the reactive wizard: every step and
+/// per-type config block stays in the DOM and only toggles `hidden` as the
+/// store changes, so interactions never rebuild the panel.
+fn with_visible(mut component: Component, key: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::a11y::Visibility;
+    component.visibility = Some(Visibility {
+        visible: Some(bound(key)),
+        display_above_breakpoint: None,
+        display_below_breakpoint: None,
+        hidden_for_assistive: false,
+    });
+    component
 }
 
 fn with_a11y_label(mut component: Component, label: &str) -> Component {
@@ -483,6 +527,20 @@ fn text_styled(content: &str, style: &str) -> Component {
     TextComp {
         content: lit(content),
         style: ts,
+        tone: None,
+        align: None,
+        wrap: None,
+        max_lines: None,
+        format: None,
+    }.into_component(next_id()).expect("Text")
+}
+
+/// Text whose content tracks a store key reactively (used for the live
+/// connection-test outcome line in the wizard).
+fn text_bound(key: &str) -> Component {
+    TextComp {
+        content: bound(key),
+        style: TextStyle::Body,
         tone: None,
         align: None,
         wrap: None,
@@ -979,6 +1037,21 @@ fn alert(message: &str, tone: &str) -> Component {
         icon: None,
         title: None,
         message: lit(message),
+        actions: None,
+        dismissible: false,
+    }.into_component(next_id()).expect("Alert")
+}
+
+/// Alert whose message tracks a store key reactively. Visibility is toggled by
+/// the caller via `with_visible` so the wizard can show/hide errors and test
+/// results purely through `StatePatch`.
+fn alert_bound(message_key: &str, tone: &str) -> Component {
+    AlertComp {
+        tone: parse_tone(tone),
+        variant: AlertVariant::Default,
+        icon: None,
+        title: None,
+        message: bound(message_key),
         actions: None,
         dismissible: false,
     }.into_component(next_id()).expect("Alert")
@@ -1705,12 +1778,6 @@ fn with_state<F, R>(f: F) -> R where F: FnOnce(&mut PanelState) -> R {
     f(&mut guard)
 }
 
-fn get_current_panel() -> String {
-    with_state(|s| {
-        if s.current_panel.is_empty() { "overview".to_string() } else { s.current_panel.clone() }
-    })
-}
-
 fn set_current_panel(panel: &str) {
     with_state(|s| { s.current_panel.clear(); s.current_panel.push_str(panel); });
 }
@@ -1805,8 +1872,11 @@ pub extern "C" fn on_request(
         None => json!({ "error": alloc::format!("unknown tool '{}'", tool) }),
     };
 
-    let current = get_current_panel();
-    render_panel(&current);
+    // Each handler owns its own UI side effects: panel/tab navigation and modal
+    // open re-send SlotContent, while reactive wizard actions emit StatePatch
+    // only. There is intentionally NO unconditional `render_panel` here — that
+    // global re-render was the source of the modal tearing down and inputs
+    // losing focus on every wizard interaction.
 
     let response_str = response.to_string();
     let written = write_guest_string(out_ptr, out_cap, &response_str);
@@ -1928,7 +1998,9 @@ fn render_panel(panel_id: &str) {
     // Modal's body/footer slots. These must be sent AFTER "content" so their
     // target data-slot-id containers already exist.
     if panel_id == "cameras" && with_state(|s| s.add_form_visible) {
-        send_slot_content("add_camera_body", build_add_camera_body());
+        // Seed the full wizard store state alongside the body so the bound
+        // visibility flags, StepProgress and inputs resolve on first paint.
+        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
         send_slot_content("add_camera_footer", build_add_camera_footer());
     }
 }
@@ -1940,13 +2012,13 @@ fn render_panel(panel_id: &str) {
 fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
     log::info(&alloc::format!("TentaVision UI action '{}'", action));
     match action {
-        "camera-add-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
-        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
+        "camera-add-show" => handle_camera_add_show(),
+        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
         "wizard-source-select" => handle_wizard_source_select(params),
         "wizard-field-change" => handle_wizard_field_change(params),
         "wizard-test" => handle_wizard_test(),
         "wizard-next" => handle_wizard_next(),
-        "wizard-prev" => { with_state(|s| { if s.wizard_step > 0 { s.wizard_step -= 1; } s.error_message = None; }); json!({"ok":true}) }
+        "wizard-prev" => handle_wizard_prev(),
         "cameras-filter-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.cameras_filter = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
         "camera-add-submit" => handle_camera_add_submit(params),
         "camera-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
@@ -2009,36 +2081,92 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
 // Camera action handlers
 // =============================================================================
 
-/// Commits the chosen source type (step 1) to backend state. Resetting the
-/// per-type fields here keeps a switched type from carrying stale values from a
-/// previous selection into step 2's validation.
+/// Opens the "Add camera" wizard. Resets backend wizard state, eagerly
+/// enumerates local USB/v4l2 devices (their Select options are static component
+/// fields baked into the body sent here, so they must be known before the body
+/// is built), then sends the cameras content (with the Modal) plus the wizard
+/// body and footer fragments exactly once, seeding all wizard store keys via the
+/// body's `state_overlay`. Every later interaction mutates the store, not the DOM.
+fn handle_camera_add_show() -> JsonValue {
+    with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); });
+    // Enumerate USB devices up front so the device Select can carry real options.
+    let devices = camera_local_devices();
+    with_state(|s| {
+        s.discover.usb_loaded = true;
+        if let Ok(list) = devices {
+            s.discover.usb_devices = list.into_iter()
+                .map(|d| LocalDevice { device_path: d.device_path, label: d.label, vendor: d.vendor })
+                .collect();
+        }
+    });
+    render_panel("cameras");
+    json!({"ok":true})
+}
+
+/// Steps back one wizard step. Pure `StatePatch`: flips the step visibility /
+/// footer flags and clears any error. No fragment is re-sent.
+fn handle_wizard_prev() -> JsonValue {
+    let step = with_state(|s| {
+        if s.wizard_step > 0 { s.wizard_step -= 1; }
+        s.error_message = None;
+        s.wizard_step
+    });
+    let mut pairs = wizard_step_pairs(step);
+    pairs.extend(wizard_error_pairs(None));
+    send_state_patches(pairs);
+    json!({"ok":true})
+}
+
+/// Commits the chosen source type (step 1) to backend state and patches the
+/// per-type config visibility flags. Resetting the per-type fields here keeps a
+/// switched type from carrying stale values into step 2's validation; the reset
+/// is mirrored into the store so the bound inputs clear too. Pure `StatePatch` —
+/// the RadioCardGroup highlight follows `wiz_src` and the config blocks toggle
+/// via `wiz_is_*` without rebuilding the body.
 fn handle_wizard_source_select(params: &JsonValue) -> JsonValue {
     let raw = params.get("source_type").and_then(|v| v.as_str())
         .or_else(|| params.get("value").and_then(|v| v.as_str()))
         .unwrap_or("");
-    match SourceType::from_str(raw) {
-        Some(t) => { with_state(|s| {
-            if s.discover.source_type != Some(t) {
-                s.discover.source_type = Some(t);
-                s.discover.cameras.clear();
-                s.discover.selected_index = None;
-                s.discover.usb_devices.clear();
-                s.discover.usb_loaded = false;
-                s.discover.usb_device_path.clear();
-                s.discover.onvif_url.clear();
-                s.discover.rtsp_url.clear();
-                s.discover.file_path.clear();
-                s.discover.test_result = None;
-            }
-            s.error_message = None;
-        }); json!({"ok":true}) }
-        None => json!({"ok":false,"error":"unknown source_type"}),
+    let t = match SourceType::from_str(raw) {
+        Some(t) => t,
+        None => return json!({"ok":false,"error":"unknown source_type"}),
+    };
+    let changed = with_state(|s| {
+        let changed = s.discover.source_type != Some(t);
+        if changed {
+            s.discover.source_type = Some(t);
+            s.discover.cameras.clear();
+            s.discover.selected_index = None;
+            s.discover.usb_device_path.clear();
+            s.discover.onvif_url.clear();
+            s.discover.rtsp_url.clear();
+            s.discover.file_path.clear();
+            s.discover.test_result = None;
+        }
+        s.error_message = None;
+        changed
+    });
+    let mut pairs = wizard_source_pairs(Some(t));
+    pairs.extend(wizard_error_pairs(None));
+    if changed {
+        // Mirror the per-type field reset into the bound store keys so any
+        // previously typed value disappears from the inputs as well.
+        for key in ["onvif_url", "rtsp_url", "usb_device_path", "file_path"] {
+            pairs.push((key.into(), Value::Text(String::new())));
+        }
+        pairs.extend(wizard_test_pairs(&DiscoverState::new()));
+        // Reset the ONVIF discovery sub-state (cameras were cleared above).
+        pairs.extend(wizard_onvif_pairs(&DiscoverState::new()));
     }
+    send_state_patches(pairs);
+    json!({"ok":true})
 }
 
 /// Commits a single typed wizard field to backend state on every input change,
 /// keyed by the `field` discriminator the renderer carries in `handler.params`.
-/// Backend-held values survive step navigation (the per-step DOM is rebuilt).
+/// The value already lives in the store via the input's two-way `bind_path`, so
+/// this emits no `StatePatch` and no re-render — it only mirrors the value into
+/// backend state for step-3 testing and submit validation.
 fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
     let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -2060,84 +2188,102 @@ fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
 }
 
 /// Runs a real `camera_test_connection` probe for the resolved per-type target
-/// and stores the outcome for the step-3 result panel. Never fabricates success.
+/// and patches the step-3 result flags + text. Never fabricates success. Pure
+/// `StatePatch`: the test block visibility and message follow the store.
 fn handle_wizard_test() -> JsonValue {
     let target = with_state(|s| { s.discover.testing = true; s.discover.test_result = None; s.error_message = None; s.discover.resolve_target() });
     let (vendor, url) = match target {
         Ok((v, u, _)) => (v, u),
-        Err(msg) => { with_state(|s| { s.discover.testing = false; s.discover.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid target"}); }
+        Err(msg) => {
+            // Surface the validation message in the step-3 result block (the
+            // dedicated error path), not the wizard-wide error alert.
+            let pairs = with_state(|s| {
+                s.discover.testing = false;
+                s.discover.test_result = Some(Err(msg.to_string()));
+                wizard_test_pairs(&s.discover)
+            });
+            send_state_patches(pairs);
+            return json!({"ok":false,"error":"invalid target"});
+        }
     };
     let result = camera_test_connection(&vendor, &url);
-    with_state(|s| {
+    let pairs = with_state(|s| {
         s.discover.testing = false;
         s.discover.test_result = Some(match result {
             Ok(out) if out.ok => Ok(out.message),
             Ok(out) => Err(out.message),
             Err(e) => Err(alloc::format!("Test nieudany: {}", abi_message(e))),
         });
+        wizard_test_pairs(&s.discover)
     });
+    send_state_patches(pairs);
     json!({"ok":true})
 }
 
 /// Advances the wizard, gating each transition on the current step's required
 /// state: a source type must be chosen on step 1, and step 2 must resolve a
-/// valid per-type target before moving on. Entering the USB config step lazily
-/// enumerates local devices via `camera_local_devices`.
+/// valid per-type target before moving on. Pure `StatePatch`: on success it
+/// flips the step visibility / footer flags; on failure it patches the error
+/// alert. The body is never re-sent.
 fn handle_wizard_next() -> JsonValue {
     let step = with_state(|s| s.wizard_step);
     match step {
         0 => {
             let chosen = with_state(|s| s.discover.source_type.is_some());
             if !chosen {
-                with_state(|s| s.error_message = Some("Wybierz typ źródła kamery.".to_string()));
+                send_state_patches(wizard_error_pairs(Some("Wybierz typ źródła kamery.")));
                 return json!({"ok":false,"error":"no source type"});
             }
-            // Lazily enumerate USB devices when entering the USB config step so
-            // the dropdown reflects what is currently attached.
-            let needs_usb = with_state(|s| s.discover.source_type == Some(SourceType::Usb) && !s.discover.usb_loaded);
-            if needs_usb {
-                let devices = camera_local_devices();
-                with_state(|s| {
-                    s.discover.usb_loaded = true;
-                    match devices {
-                        Ok(list) => {
-                            s.discover.usb_devices = list.into_iter()
-                                .map(|d| LocalDevice { device_path: d.device_path, label: d.label, vendor: d.vendor })
-                                .collect();
-                            if s.discover.usb_device_path.is_empty() {
-                                if let Some(first) = s.discover.usb_devices.first() {
-                                    s.discover.usb_device_path = first.device_path.clone();
-                                }
-                            }
-                        }
-                        Err(e) => { s.discover.error_message = Some(alloc::format!("Błąd wykrywania urządzeń: {}", abi_message(e))); }
-                    }
-                });
-            }
             with_state(|s| { s.wizard_step = 1; s.error_message = None; });
+            advance_patch(1);
             json!({"ok":true})
         }
         1 => {
             let resolved = with_state(|s| s.discover.resolve_target());
             match resolved {
-                Ok(_) => { with_state(|s| { s.wizard_step = 2; s.discover.test_result = None; s.error_message = None; }); json!({"ok":true}) }
-                Err(msg) => { with_state(|s| s.error_message = Some(msg.to_string())); json!({"ok":false,"error":"invalid target"}) }
+                Ok(_) => {
+                    with_state(|s| { s.wizard_step = 2; s.discover.test_result = None; s.error_message = None; });
+                    let mut pairs = wizard_step_pairs(2);
+                    pairs.extend(wizard_error_pairs(None));
+                    pairs.extend(with_state(|s| wizard_test_pairs(&s.discover)));
+                    send_state_patches(pairs);
+                    json!({"ok":true})
+                }
+                Err(msg) => { send_state_patches(wizard_error_pairs(Some(msg))); json!({"ok":false,"error":"invalid target"}) }
             }
         }
-        2 => { with_state(|s| {
+        2 => {
             // Pre-fill a metadata name from a discovered camera when the user has
             // not typed one yet, otherwise leave it empty (no fake placeholder).
-            if s.discover.name.trim().is_empty() {
-                if let Some(i) = s.discover.selected_index {
-                    if let Some(cam) = s.discover.cameras.get(i) {
-                        s.discover.name = cam.suggested_name.clone();
+            let prefill_name = with_state(|s| {
+                if s.discover.name.trim().is_empty() {
+                    if let Some(i) = s.discover.selected_index {
+                        if let Some(cam) = s.discover.cameras.get(i) {
+                            s.discover.name = cam.suggested_name.clone();
+                            return Some(s.discover.name.clone());
+                        }
                     }
                 }
+                None
+            });
+            with_state(|s| { s.wizard_step = 3; s.error_message = None; });
+            let mut pairs = wizard_step_pairs(3);
+            pairs.extend(wizard_error_pairs(None));
+            if let Some(name) = prefill_name {
+                pairs.push(("name".into(), Value::Text(name)));
             }
-            s.wizard_step = 3; s.error_message = None;
-        }); json!({"ok":true}) }
+            send_state_patches(pairs);
+            json!({"ok":true})
+        }
         _ => json!({"ok":true}),
     }
+}
+
+/// Helper: emit the step navigation patch + clear error for a forward move.
+fn advance_patch(step: u8) {
+    let mut pairs = wizard_step_pairs(step);
+    pairs.extend(wizard_error_pairs(None));
+    send_state_patches(pairs);
 }
 
 fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
@@ -2192,6 +2338,10 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     }
 }
 
+/// Runs ONVIF discovery. The discovered camera cards are a genuinely dynamic
+/// list (count + per-row click handlers), so this re-sends the `add_camera_body`
+/// fragment — the only wizard action besides modal open that does. The
+/// discovery-section visibility flags are patched to match the new results.
 fn handle_discover_scan() -> JsonValue {
     with_state(|s| { s.discover.scanning = true; s.discover.error_message = None; s.discover.cameras.clear(); s.discover.selected_index = None; s.error_message = None; });
     let result = camera_discover();
@@ -2199,16 +2349,23 @@ fn handle_discover_scan() -> JsonValue {
         s.discover.scanning = false;
         match result {
             Ok(found) => { s.discover.cameras = found.iter().map(discovered_to_cam).collect(); }
-            Err(e) => { s.discover.error_message = Some(alloc::format!("Błąd skanowania: {}", abi_message(e))); }
+            Err(e) => { s.error_message = Some(alloc::format!("Błąd skanowania: {}", abi_message(e))); }
         }
     });
+    if with_state(|s| s.add_form_visible) {
+        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
+    }
     json!({"ok":true})
 }
 
+/// Selects a discovered ONVIF camera. Mirrors the picked device URL into the
+/// manual ONVIF field and re-sends the body (the row highlight is part of the
+/// dynamic discovered-list fragment, not a store flag), seeding the full wizard
+/// overlay so `onvif_url` and the row selection both reflect the pick.
 fn handle_discover_select(params: &JsonValue) -> JsonValue {
     let index = params.get("index").and_then(|v| v.as_u64());
     with_state(|s| {
-        s.discover.error_message = None;
+        s.error_message = None;
         match index {
             Some(i) if (i as usize) < s.discover.cameras.len() => {
                 let i = i as usize;
@@ -2217,9 +2374,12 @@ fn handle_discover_select(params: &JsonValue) -> JsonValue {
                 // resolved target and submit credentials use one consistent value.
                 s.discover.onvif_url = s.discover.cameras[i].url.clone();
             }
-            _ => { s.discover.selected_index = None; s.discover.error_message = Some("Wybierz kamerę z listy.".to_string()); }
+            _ => { s.discover.selected_index = None; s.error_message = Some("Wybierz kamerę z listy.".to_string()); }
         }
     });
+    if with_state(|s| s.add_form_visible) {
+        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
+    }
     json!({"ok":true})
 }
 
@@ -2834,6 +2994,131 @@ fn camera_diagnostics(c: &CameraInfoOut) -> (String, &'static str) {
 /// Total number of wizard steps. The wizard is 0-indexed internally.
 const ADD_CAMERA_WIZARD_STEPS: u8 = 4;
 
+/// Store key carrying the active wizard step id (`"step0".."step3"`) consumed by
+/// `StepProgress.current_id_path`.
+fn wiz_step_id(step: u8) -> String {
+    alloc::format!("step{}", step)
+}
+
+/// Builds the per-step visibility / navigation patch pairs for `step`. Every
+/// step container and footer button reads one of these booleans through
+/// `with_visible`, so navigation is a pure `StatePatch` — no fragment rebuild.
+fn wizard_step_pairs(step: u8) -> Vec<(String, Value)> {
+    let last = ADD_CAMERA_WIZARD_STEPS - 1;
+    vec![
+        ("wiz_step".into(), Value::Text(wiz_step_id(step))),
+        ("wiz_show_0".into(), Value::Bool(step == 0)),
+        ("wiz_show_1".into(), Value::Bool(step == 1)),
+        ("wiz_show_2".into(), Value::Bool(step == 2)),
+        ("wiz_show_3".into(), Value::Bool(step == 3)),
+        ("wiz_show_back".into(), Value::Bool(step > 0)),
+        ("wiz_show_next".into(), Value::Bool(step < last)),
+        ("wiz_show_finish".into(), Value::Bool(step >= last)),
+    ]
+}
+
+/// Visibility pairs for the four per-type config blocks of step 2. Exactly one
+/// is `true` for the chosen source; switching type is a `StatePatch` that flips
+/// these, revealing the matching config without rebuilding the body.
+fn wizard_source_pairs(src: Option<SourceType>) -> Vec<(String, Value)> {
+    let s = src.map(SourceType::as_str).unwrap_or("");
+    vec![
+        ("wiz_src".into(), Value::Text(s.into())),
+        ("wiz_is_onvif".into(), Value::Bool(src == Some(SourceType::Onvif))),
+        ("wiz_is_rtsp".into(), Value::Bool(src == Some(SourceType::Rtsp))),
+        ("wiz_is_usb".into(), Value::Bool(src == Some(SourceType::Usb))),
+        ("wiz_is_file".into(), Value::Bool(src == Some(SourceType::File))),
+    ]
+}
+
+/// Patch pairs describing the step-2 ONVIF discovery sub-state (scan spinner,
+/// discovered-list visibility, count line, manual-entry visibility).
+fn wizard_onvif_pairs(s: &DiscoverState) -> Vec<(String, Value)> {
+    let count = s.cameras.len();
+    vec![
+        ("wiz_onvif_scanning".into(), Value::Bool(s.scanning)),
+        ("wiz_onvif_has_results".into(), Value::Bool(!s.scanning && count > 0)),
+        ("wiz_onvif_no_results".into(), Value::Bool(!s.scanning && count == 0)),
+        (
+            "wiz_onvif_count".into(),
+            Value::Text(alloc::format!(
+                "Znaleziono {} kamer. Wybierz jedną lub podaj URL ręcznie.",
+                count
+            )),
+        ),
+    ]
+}
+
+/// Patch pairs describing the step-3 connection-test sub-state (spinner, result
+/// alerts, result text). Mutually exclusive visibility flags drive which block
+/// is shown.
+fn wizard_test_pairs(s: &DiscoverState) -> Vec<(String, Value)> {
+    let (ok, err, text, idle) = match (&s.testing, &s.test_result) {
+        (true, _) => (false, false, String::new(), false),
+        (false, Some(Ok(m))) => {
+            let detail = if m.is_empty() { "Połączenie nawiązane.".to_string() } else { m.clone() };
+            (true, false, alloc::format!("Połączenie OK. {}", detail), false)
+        }
+        (false, Some(Err(m))) => (false, true, m.clone(), false),
+        (false, None) => (false, false, String::new(), true),
+    };
+    vec![
+        ("wiz_testing".into(), Value::Bool(s.testing)),
+        ("wiz_test_ok".into(), Value::Bool(ok)),
+        ("wiz_test_err".into(), Value::Bool(err)),
+        ("wiz_test_idle".into(), Value::Bool(idle)),
+        ("wiz_test_text".into(), Value::Text(text)),
+    ]
+}
+
+/// Error-alert patch pair. `wiz_has_error` toggles the alert's visibility while
+/// `wiz_error` carries its message.
+fn wizard_error_pairs(message: Option<&str>) -> Vec<(String, Value)> {
+    vec![
+        ("wiz_has_error".into(), Value::Bool(message.is_some())),
+        ("wiz_error".into(), Value::Text(message.unwrap_or("").into())),
+    ]
+}
+
+/// The full set of wizard store keys derived from the current backend wizard
+/// state, seeded into the `add_camera_body` SlotContent `state_overlay`. Sent
+/// whenever the body fragment is delivered (modal open or an ONVIF
+/// scan/select re-send) so every bound visibility flag, the StepProgress and
+/// the field inputs resolve to the authoritative backend state on first paint.
+fn wizard_full_overlay() -> Vec<StateEntry> {
+    let (step, src, err) = with_state(|s| (s.wizard_step, s.discover.source_type, s.error_message.clone()));
+    let mut pairs: Vec<(String, Value)> = Vec::new();
+    pairs.extend(wizard_step_pairs(step));
+    pairs.extend(wizard_source_pairs(src));
+    pairs.extend(with_state(|s| wizard_test_pairs(&s.discover)));
+    pairs.extend(with_state(|s| wizard_onvif_pairs(&s.discover)));
+    pairs.extend(wizard_error_pairs(err.as_deref()));
+    // Field bind paths reflect the committed backend values so the two-way-bound
+    // inputs show the right text without any further round-trip.
+    let fields = with_state(|s| [
+        ("onvif_url", s.discover.onvif_url.clone()),
+        ("rtsp_url", s.discover.rtsp_url.clone()),
+        ("usb_device_path", s.discover.usb_device_path.clone()),
+        ("file_path", s.discover.file_path.clone()),
+        ("cred_user", s.discover.cred_user.clone()),
+        ("cred_pass", s.discover.cred_pass.clone()),
+        ("name", s.discover.name.clone()),
+        ("retention", s.discover.retention.clone()),
+        ("fps", s.discover.fps.clone()),
+    ]);
+    for (key, value) in fields {
+        pairs.push((key.into(), Value::Text(value)));
+    }
+    pairs.push(("profile".into(), Value::Text("default".into())));
+    pairs
+        .into_iter()
+        .map(|(key, value)| StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(key)]),
+            value,
+        })
+        .collect()
+}
+
 /// The "Add camera" wizard lives in a Modal overlay. This builds the Modal
 /// shell that is placed in the "content" slot tree while `add_form_visible`.
 /// Its body/footer are filled separately via SlotContent on the dynamic slots
@@ -2867,189 +3152,207 @@ fn build_add_camera_modal() -> Component {
     modal
 }
 
-/// Builds the wizard body fragment for the `add_camera_body` slot: step
-/// progress, the current step's content, and an optional error alert.
+/// Builds the wizard body fragment for the `add_camera_body` slot ONCE, when the
+/// modal opens. Every step lives in the DOM simultaneously, wrapped in a
+/// `with_visible` container bound to a `wiz_show_N` store flag; the active step
+/// is revealed purely by `StatePatch`. The StepProgress, the per-type config
+/// blocks, the test-result block and the error alert are all store-bound, so no
+/// wizard interaction (source pick, Next/Back, typing) rebuilds this fragment.
 fn build_add_camera_body() -> Component {
-    let (step, err) = with_state(|s| (s.wizard_step, s.error_message.clone()));
+    let step_progress = build_wizard_step_progress();
 
+    let step0 = with_visible(build_wizard_step_source_type(), "wiz_show_0");
+    let step1 = with_visible(build_wizard_step_config(), "wiz_show_1");
+    let step2 = with_visible(build_wizard_step_test(), "wiz_show_2");
+    let step3 = with_visible(build_wizard_step_metadata(), "wiz_show_3");
+
+    let error_alert = with_visible(alert_bound("wiz_error", "critical"), "wiz_has_error");
+
+    stack_v(vec![step_progress, step0, step1, step2, step3, error_alert])
+}
+
+/// StepProgress bound to `wiz_step`. Status per step is derived by the renderer
+/// from `current_id_path` position, so advancing a step is a single patch.
+fn build_wizard_step_progress() -> Component {
     let step_labels = ["Typ źródła", "Konfiguracja", "Test połączenia", "Metadane"];
-    let step_indicator = step_progress(
-        step_labels.iter().enumerate().map(|(i, label)| StepDef {
-            id: alloc::format!("step{}", i),
+    StepProgressComp {
+        steps: step_labels.iter().enumerate().map(|(i, label)| StepDef {
+            id: wiz_step_id(i as u8),
             label: lit(label),
             optional: false,
-            status: if (i as u8) < step { Some(lit("done")) } else if i as u8 == step { Some(lit("active")) } else { None },
+            status: None,
             description: None,
         }).collect(),
-        &alloc::format!("step{}", step),
-    );
-
-    let body = match step {
-        0 => build_wizard_step_source_type(),
-        1 => build_wizard_step_config(),
-        2 => build_wizard_step_test(),
-        3 => build_wizard_step_metadata(),
-        _ => text("Nieznany krok."),
-    };
-
-    let mut body_children = vec![step_indicator, body];
-    if let Some(e) = err { body_children.push(alert(&e, "critical")); }
-    stack_v(body_children)
+        current_id_path: StatePath::new(vec![PathSegment::Key("wiz_step".into())]),
+        variant: StepProgressVariant::Horizontal,
+        clickable_completed: false,
+    }.into_component(next_id()).expect("StepProgress")
 }
 
-/// Builds the wizard navigation buttons for the `add_camera_footer` slot.
-/// Back is shown after the first step, Finish replaces Next on the last step.
+/// Builds the wizard navigation buttons for the `add_camera_footer` slot ONCE.
+/// All four buttons live in the DOM; Back/Next/Finish toggle visibility through
+/// store flags (`wiz_show_back/next/finish`) so navigation never rebuilds the
+/// footer. The Next label is intentionally generic — the step number lives in
+/// the StepProgress, not the button text, so it needs no per-step patching.
 fn build_add_camera_footer() -> Component {
-    let step = with_state(|s| s.wizard_step);
-    let last = ADD_CAMERA_WIZARD_STEPS - 1;
-
-    let mut footer = Vec::new();
-    if step > 0 {
-        footer.push(button_with_icon("Wstecz", "wizard-prev", "ghost", "info"));
-    }
-    footer.push(button("Anuluj", "camera-add-cancel", "ghost"));
-    if step < last {
-        let next_label = match step {
-            0 => "Dalej: Konfiguracja",
-            1 => "Dalej: Test",
-            2 => "Dalej: Metadane",
-            _ => "Dalej",
-        };
-        footer.push(button(next_label, "wizard-next", "primary"));
-    } else {
-        footer.push(button("Zakończ", "camera-add-submit", "primary"));
-    }
-    stack_h(footer)
+    let back = with_visible(button_with_icon("Wstecz", "wizard-prev", "ghost", "info"), "wiz_show_back");
+    let cancel = button("Anuluj", "camera-add-cancel", "ghost");
+    let next = with_visible(button("Dalej", "wizard-next", "primary"), "wiz_show_next");
+    let finish = with_visible(button("Zakończ", "camera-add-submit", "primary"), "wiz_show_finish");
+    stack_h(vec![back, cancel, next, finish])
 }
 
-/// Step 1 — source-type chooser. Renders the four supported source kinds as
-/// clickable selection cards; the pick is committed to backend state via
-/// `wizard-source-select`, which drives the per-type branch of step 2. A clickable
-/// Card carries the selection because the backend needs the value immediately to
-/// branch the next step (a store-bound RadioCardGroup would not reach the backend
-/// until submit).
+/// Step 1 — source-type chooser as a store-bound `RadioCardGroup`. The pick is
+/// written to `wiz_src` reactively (client highlight) and forwarded to the
+/// backend `wizard-source-select` action, which patches the per-type config
+/// visibility flags. No card is rebuilt on selection.
 fn build_wizard_step_source_type() -> Component {
-    let selected = with_state(|s| s.discover.source_type);
-    let options: [(SourceType, &str, &str, &str); 4] = [
-        (SourceType::Onvif, "Kamera sieciowa ONVIF", "Automatyczne wykrywanie kamer ONVIF w sieci lokalnej.", "search"),
-        (SourceType::Rtsp, "Strumień RTSP/RTSPS", "Ręczny adres strumienia rtsp:// lub rtsps://.", "video"),
-        (SourceType::Usb, "Kamera lokalna / USB", "Urządzenie wideo podłączone do tego hosta (v4l2).", "cameras"),
-        (SourceType::File, "Plik testowy", "Lokalny plik wideo używany jako źródło testowe.", "evidence"),
+    use tentaflow_sdk_spec::protocol::ui::form::RadioCardGroup;
+    let options = vec![
+        RadioCardOption {
+            value: SelectValue::Text(SourceType::Onvif.as_str().into()),
+            icon: icon_named(parse_icon_name("search")),
+            title: lit("Kamera sieciowa ONVIF"),
+            description: Some(lit("Automatyczne wykrywanie kamer ONVIF w sieci lokalnej.")),
+            badge: None,
+            disabled: false,
+        },
+        RadioCardOption {
+            value: SelectValue::Text(SourceType::Rtsp.as_str().into()),
+            icon: icon_named(parse_icon_name("video")),
+            title: lit("Strumień RTSP/RTSPS"),
+            description: Some(lit("Ręczny adres strumienia rtsp:// lub rtsps://.")),
+            badge: None,
+            disabled: false,
+        },
+        RadioCardOption {
+            value: SelectValue::Text(SourceType::Usb.as_str().into()),
+            icon: icon_named(parse_icon_name("cameras")),
+            title: lit("Kamera lokalna / USB"),
+            description: Some(lit("Urządzenie wideo podłączone do tego hosta (v4l2).")),
+            badge: None,
+            disabled: false,
+        },
+        RadioCardOption {
+            value: SelectValue::Text(SourceType::File.as_str().into()),
+            icon: icon_named(parse_icon_name("evidence")),
+            title: lit("Plik testowy"),
+            description: Some(lit("Lokalny plik wideo używany jako źródło testowe.")),
+            badge: None,
+            disabled: false,
+        },
     ];
 
-    let cards: Vec<Component> = options.iter().map(|(t, title, desc, icon)| {
-        let is_sel = selected == Some(*t);
-        let content = stack_h(vec![
-            chip_with_icon(title, "info", icon),
-            text_styled(desc, "caption"),
+    let mut group = RadioCardGroup {
+        bind_path: StatePath::new(vec![PathSegment::Key("wiz_src".into())]),
+        options,
+        columns: 2,
+        variant: RadioCardVariant::Default,
+    }.into_component(next_id()).expect("RadioCardGroup");
+    group = with_a11y_label(group, "Typ źródła kamery");
+    // The change carries the picked SelectValue as `{value, kind}` detail; the
+    // backend reads `value` to branch step 2 and patch the per-type flags.
+    group.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "wizard-source-select".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+
+    stack_v(vec![
+        text("Wybierz typ źródła kamery. Dalsze kroki dopasują się do wybranego typu."),
+        group,
+    ])
+}
+
+/// Step 2 — all four per-type config blocks present at once, each wrapped in a
+/// `with_visible` container bound to its `wiz_is_X` flag. Switching source type
+/// is a `StatePatch` that flips exactly one flag visible.
+fn build_wizard_step_config() -> Component {
+    stack_v(vec![
+        with_visible(build_config_onvif(), "wiz_is_onvif"),
+        with_visible(build_config_rtsp(), "wiz_is_rtsp"),
+        with_visible(build_config_usb(), "wiz_is_usb"),
+        with_visible(build_config_file(), "wiz_is_file"),
+    ])
+}
+
+/// ONVIF config block. The discovery list and selectable results are genuinely
+/// dynamic (populated by an explicit `discover-scan`), so their visibility is
+/// store-bound and the scan/select actions re-send this body; the manual URL +
+/// credential inputs are always-present, two-way-bound fields.
+fn build_config_onvif() -> Component {
+    let scanning = with_state(|s| s.discover.scanning);
+    let selected_idx = with_state(|s| s.discover.selected_index);
+
+    let scan_spinner = with_visible(
+        stack_v(vec![spinner("md"), text("Skanowanie sieci (ONVIF WS-Discovery)...")]),
+        "wiz_onvif_scanning",
+    );
+
+    let no_results = with_visible(
+        stack_v(vec![
+            text("Zeskanuj sieć w poszukiwaniu kamer ONVIF lub podaj adres URL urządzenia ręcznie."),
+            stack_h(vec![button_with_icon("Skanuj sieć", "discover-scan", "primary", "search")]),
+        ]),
+        "wiz_onvif_no_results",
+    );
+
+    let discovered = with_state(|s| s.discover.cameras.iter().enumerate()
+        .map(|(i, c)| (i, c.suggested_name.clone(), c.url.clone())).collect::<Vec<_>>());
+    let mut cam_rows: Vec<Component> = Vec::new();
+    for (i, name, url) in &discovered {
+        let is_sel = !scanning && selected_idx == Some(*i);
+        let row_content = stack_v_gap("xs", vec![
+            text_styled(name, "body_strong"),
+            text_styled(url, "caption"),
         ]);
-        let mut card = Card {
+        let mut row_card = Card {
             variant: if is_sel { CardVariant::Filled } else { CardVariant::Outlined },
-            padding: Spacing::Md,
+            padding: Spacing::Sm,
             gap: Spacing::Sm,
-            radius: RadiusToken::Md,
+            radius: RadiusToken::Sm,
             shadow: ShadowToken::None,
             border: BorderToken::Hairline,
             background: BackgroundToken::None,
             accent: if is_sel { Some(Tone::Primary) } else { None },
-            children: vec![content],
+            children: vec![row_content],
             interactive: true,
             clickable: true,
         }.into_component(next_id()).expect("Card");
         let mut params = CborMap::default();
-        params.0.push(("source_type".into(), Value::Text(t.as_str().into())));
-        card.handlers = Some(HandlerMap(vec![(
+        params.0.push(("index".into(), Value::U64(*i as u64)));
+        row_card.handlers = Some(HandlerMap(vec![(
             tentaflow_sdk_spec::EventKind::Click,
             Handler::Backend {
-                action_id: "wizard-source-select".into(),
+                action_id: "discover-select".into(),
                 params,
                 optimistic: None,
                 on_failure: FailurePolicy::Toast,
             },
         )]));
-        card
-    }).collect();
-
-    stack_v(vec![
-        text("Wybierz typ źródła kamery. Dalsze kroki dopasują się do wybranego typu."),
-        stack_v_gap("sm", cards),
-    ])
-}
-
-/// Step 2 — per-type configuration. Branches entirely on the chosen source type;
-/// there are no hardcoded sample values, location pickers, or firmware alerts.
-fn build_wizard_step_config() -> Component {
-    let source = with_state(|s| s.discover.source_type);
-    match source {
-        Some(SourceType::Onvif) => build_config_onvif(),
-        Some(SourceType::Rtsp) => build_config_rtsp(),
-        Some(SourceType::Usb) => build_config_usb(),
-        Some(SourceType::File) => build_config_file(),
-        None => stack_v(vec![text("Wróć do kroku 1 i wybierz typ źródła kamery.")]),
+        cam_rows.push(row_card);
     }
-}
-
-fn build_config_onvif() -> Component {
-    let scanning = with_state(|s| s.discover.scanning);
-    let discovered_count = with_state(|s| s.discover.cameras.len());
-    let selected_idx = with_state(|s| s.discover.selected_index);
-
-    let scan_section = if scanning {
-        stack_v(vec![spinner("md"), text("Skanowanie sieci (ONVIF WS-Discovery)...")])
-    } else if discovered_count == 0 {
+    let has_results = with_visible(
         stack_v(vec![
-            text("Zeskanuj sieć w poszukiwaniu kamer ONVIF lub podaj adres URL urządzenia ręcznie."),
-            stack_h(vec![button_with_icon("Skanuj sieć", "discover-scan", "primary", "search")]),
-        ])
-    } else {
-        let discovered = with_state(|s| s.discover.cameras.iter().enumerate()
-            .map(|(i, c)| (i, c.suggested_name.clone(), c.url.clone())).collect::<Vec<_>>());
-        let mut cam_rows: Vec<Component> = Vec::new();
-        for (i, name, url) in &discovered {
-            let is_sel = selected_idx == Some(*i);
-            let row_content = stack_v_gap("xs", vec![
-                text_styled(name, "body_strong"),
-                text_styled(url, "caption"),
-            ]);
-            let mut row_card = Card {
-                variant: if is_sel { CardVariant::Filled } else { CardVariant::Outlined },
-                padding: Spacing::Sm,
-                gap: Spacing::Sm,
-                radius: RadiusToken::Sm,
-                shadow: ShadowToken::None,
-                border: BorderToken::Hairline,
-                background: BackgroundToken::None,
-                accent: if is_sel { Some(Tone::Primary) } else { None },
-                children: vec![row_content],
-                interactive: true,
-                clickable: true,
-            }.into_component(next_id()).expect("Card");
-            let mut params = CborMap::default();
-            params.0.push(("index".into(), Value::U64(*i as u64)));
-            row_card.handlers = Some(HandlerMap(vec![(
-                tentaflow_sdk_spec::EventKind::Click,
-                Handler::Backend {
-                    action_id: "discover-select".into(),
-                    params,
-                    optimistic: None,
-                    on_failure: FailurePolicy::Toast,
-                },
-            )]));
-            cam_rows.push(row_card);
-        }
-        stack_v(vec![
-            text(&alloc::format!("Znaleziono {} kamer. Wybierz jedną lub podaj URL ręcznie.", discovered_count)),
+            text_bound("wiz_onvif_count"),
             stack_v_gap("xs", cam_rows),
             button_with_icon("Skanuj ponownie", "discover-scan", "ghost", "search"),
-        ])
-    };
+        ]),
+        "wiz_onvif_has_results",
+    );
 
     let url_input = wizard_input("URL urządzenia ONVIF", "http://10.0.0.5/onvif/device_service", "onvif_url", false);
     let user_input = wizard_input("Użytkownik", "", "cred_user", false);
     let pass_input = wizard_input("Hasło", "", "cred_pass", true);
 
     stack_v(vec![
-        scan_section,
+        scan_spinner,
+        no_results,
+        has_results,
         url_input,
         grid(2, vec![user_input, pass_input]),
         text_styled("Kamera ONVIF wymaga użytkownika i hasła.", "caption"),
@@ -3067,20 +3370,14 @@ fn build_config_rtsp() -> Component {
     ])
 }
 
+/// USB config block. Local devices are enumerated eagerly at modal open so the
+/// Select options can be baked into this fragment (Select options are static
+/// component fields, not store-bound). A manual path input is always present so
+/// the step is never a dead end when no device is detected. The device Select
+/// and the manual input both two-way bind `usb_device_path`.
 fn build_config_usb() -> Component {
-    let (loaded, devices) = with_state(|s| (
-        s.discover.usb_loaded,
-        s.discover.usb_devices.iter().map(|d| (d.device_path.clone(), d.label.clone())).collect::<Vec<_>>(),
-    ));
-
-    if !loaded {
-        // Reached only if enumeration has not run yet (the next-step transition
-        // triggers it); offer a manual path so the step is never a dead end.
-        return stack_v(vec![
-            text("Wykrywanie urządzeń lokalnych..."),
-            wizard_input("Ścieżka urządzenia", "/dev/video0", "usb_device_path", false),
-        ]);
-    }
+    let devices = with_state(|s| s.discover.usb_devices.iter()
+        .map(|d| (d.device_path.clone(), d.label.clone())).collect::<Vec<_>>());
 
     if devices.is_empty() {
         return stack_v(vec![
@@ -3112,37 +3409,36 @@ fn build_config_file() -> Component {
     ])
 }
 
-/// Step 3 — runs a real connection probe. There is no fabricated preview frame;
-/// the live preview is a later phase. We only surface the actual test outcome.
+/// Step 3 — connection probe. Spinner, success alert, error alert and idle
+/// empty-state all live in the DOM, toggled by `wiz_testing/test_ok/test_err/
+/// test_idle` flags; the result text is bound to `wiz_test_text`. Running the
+/// test is a `StatePatch`, never a rebuild. No fabricated preview frame.
 fn build_wizard_step_test() -> Component {
-    let (testing, result) = with_state(|s| (s.discover.testing, match &s.discover.test_result {
-        Some(Ok(m)) => Some(Ok(m.clone())),
-        Some(Err(m)) => Some(Err(m.clone())),
-        None => None,
-    }));
-
-    let result_block = if testing {
-        stack_v(vec![spinner("md"), text("Testowanie połączenia z kamerą...")])
-    } else {
-        match result {
-            Some(Ok(msg)) => {
-                let detail = if msg.is_empty() { "Połączenie nawiązane.".to_string() } else { msg };
-                stack_v(vec![alert(&alloc::format!("Połączenie OK. {}", detail), "success")])
-            }
-            Some(Err(msg)) => stack_v(vec![alert(&msg, "critical")]),
-            None => empty_state("Brak testu", Some("Uruchom test, aby sprawdzić połączenie z kamerą."), Some("info")),
-        }
-    };
+    let testing_block = with_visible(
+        stack_v(vec![spinner("md"), text("Testowanie połączenia z kamerą...")]),
+        "wiz_testing",
+    );
+    let ok_block = with_visible(alert_bound("wiz_test_text", "success"), "wiz_test_ok");
+    let err_block = with_visible(alert_bound("wiz_test_text", "critical"), "wiz_test_err");
+    let idle_block = with_visible(
+        empty_state("Brak testu", Some("Uruchom test, aby sprawdzić połączenie z kamerą."), Some("info")),
+        "wiz_test_idle",
+    );
 
     stack_v(vec![
         text("Sprawdź połączenie ze źródłem przed dodaniem kamery."),
         stack_h(vec![button_with_icon("Testuj połączenie", "wizard-test", "primary", "check")]),
-        result_block,
+        testing_block,
+        ok_block,
+        err_block,
+        idle_block,
         text_styled("Podgląd na żywo będzie dostępny po dodaniu kamery.", "caption"),
     ])
 }
 
-/// Step 4 — camera metadata. Name placeholder is neutral; no preset values.
+/// Step 4 — camera metadata. All fields two-way bind their store keys; no preset
+/// values. The metadata name is pre-filled from a discovered camera on the
+/// step-2→3 transition via a `StatePatch`, not by rebuilding this fragment.
 fn build_wizard_step_metadata() -> Component {
     let name_input = wizard_input("Nazwa kamery", "np. Brama wjazdowa", "name", false);
     let retention_select = wizard_select("Klasa retencji", vec![
