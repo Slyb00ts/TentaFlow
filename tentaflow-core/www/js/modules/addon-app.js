@@ -364,7 +364,11 @@ function handlePanelShell(decoded) {
 function handleSlotContent(decoded) {
   const s = _session;
   if (!s || !s.slotManager) return;
-  s.slotManager.handleSlotContent({ slot_id: decoded.slotId, fragment: decoded.fragment });
+  s.slotManager.handleSlotContent({
+    slot_id: decoded.slotId,
+    fragment: decoded.fragment,
+    state_overlay: decoded.stateOverlay,
+  });
 }
 
 function handleStateSnapshot(decoded) {
@@ -440,5 +444,11 @@ function showError(message) {
   }
 }
 
+// Test seam: inject the module-private session so unit tests can drive the
+// wire-message handlers without a live WS connection.
+function __setSessionForTest(session) {
+  _session = session;
+}
+
 export default AddonAppScreen;
-export { VIEW_ID, isOverlaySlot };
+export { VIEW_ID, isOverlaySlot, handleSlotContent, __setSessionForTest };
