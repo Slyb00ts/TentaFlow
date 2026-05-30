@@ -374,9 +374,11 @@ fn send_state_patches(pairs: Vec<(String, Value)>) {
     if pairs.is_empty() {
         return;
     }
-    let base = STATE_REVISION.load(Ordering::Relaxed);
+    // `fetch_add` reserves a revision atomically: `base` is the previous value
+    // and `new_rev = base + 1`. A plain load+store could hand two concurrent
+    // patches the same base/new revision, so one would be rejected by the host.
+    let base = STATE_REVISION.fetch_add(1, Ordering::Relaxed);
     let new_rev = base + 1;
-    STATE_REVISION.store(new_rev, Ordering::Relaxed);
     let epoch = PANEL_EPOCH.load(Ordering::Relaxed);
     let ops = pairs
         .into_iter()
@@ -1674,6 +1676,9 @@ struct DiscoverState {
     name: String,
     retention: String,
     fps: String,
+    // Analytics profile chosen in step 4. Committed from the profile select so
+    // the pick is authoritative on submit instead of a frontend-only value.
+    profile: String,
     error_message: Option<String>,
 }
 struct DiscoveredCam { vendor: String, url: String, suggested_name: String, profile_token: Option<String> }
@@ -1687,6 +1692,7 @@ impl DiscoverState {
             cred_user: String::new(), cred_pass: String::new(),
             test_result: None, testing: false,
             name: String::new(), retention: String::new(), fps: String::new(),
+            profile: String::new(),
             error_message: None,
         }
     }
@@ -1747,6 +1753,10 @@ impl DiscoverState {
     }
     fn retention_or_default(&self) -> &str {
         if self.retention.is_empty() { "C" } else { &self.retention }
+    }
+    fn profile_or_default(&self) -> &str {
+        let p = self.profile.trim();
+        if p.is_empty() { "default" } else { p }
     }
     fn fps_value(&self) -> u32 {
         self.fps.trim().parse::<u32>().ok().filter(|f| *f >= 1 && *f <= 60).unwrap_or(15)
@@ -1949,6 +1959,12 @@ fn send_initial_shell() {
             max_payload_bytes: Some(64 * 1024),
         },
     ];
+    // The frontend resets its reactive store revision to 0 whenever it receives
+    // a PanelShell (new shell/epoch). Reset the guest counter in lockstep so the
+    // first StatePatch after this shell carries base_revision = 0; otherwise a
+    // stale (higher) base from a previous shell would be rejected by the host
+    // and the UI would never update.
+    STATE_REVISION.store(0, Ordering::Relaxed);
     send_panel_shell(layout, slots, vec![]);
 }
 
@@ -2181,6 +2197,7 @@ fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
             "name" => s.discover.name = value,
             "retention" => s.discover.retention = value,
             "fps" => s.discover.fps = value,
+            "profile" => s.discover.profile = value,
             _ => {}
         }
     });
@@ -2192,6 +2209,10 @@ fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
 /// `StatePatch`: the test block visibility and message follow the store.
 fn handle_wizard_test() -> JsonValue {
     let target = with_state(|s| { s.discover.testing = true; s.discover.test_result = None; s.error_message = None; s.discover.resolve_target() });
+    // Emit the spinner state as its own patch BEFORE the blocking probe so the
+    // client paints the "testing" block; otherwise the only patch would arrive
+    // after the probe returns and the spinner would never be seen.
+    send_state_patches(with_state(|s| wizard_test_pairs(&s.discover)));
     let (vendor, url) = match target {
         Ok((v, u, _)) => (v, u),
         Err(msg) => {
@@ -2286,28 +2307,37 @@ fn advance_patch(step: u8) {
     send_state_patches(pairs);
 }
 
+/// Reports a submit failure: surfaces the message in the wizard-wide error alert
+/// (`wiz_error` + `wiz_has_error`) so it is visible inside the open modal, since
+/// the wizard no longer re-renders the body on each action.
+fn submit_fail(msg: &str, err_code: &str) -> JsonValue {
+    with_state(|s| { s.error_message = Some(msg.to_string()); });
+    send_state_patches(wizard_error_pairs(Some(msg)));
+    json!({"ok":false,"error":err_code})
+}
+
 fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
-    let (target, name, retention, fps, user, pass) = with_state(|s| (
+    let (target, name, retention, fps, profile, user, pass) = with_state(|s| (
         s.discover.resolve_target(),
         s.discover.name.trim().to_string(),
         s.discover.retention_or_default().to_string(),
         s.discover.fps_value(),
+        s.discover.profile_or_default().to_string(),
         s.discover.cred_user.clone(),
         s.discover.cred_pass.clone(),
     ));
     with_state(|s| s.clear_messages());
 
     if name.is_empty() || name.chars().count() > 60 {
-        with_state(|s| { s.error_message = Some("Nazwa musi mieć 1–60 znaków.".to_string()); });
-        return json!({"ok":false,"error":"invalid name"});
+        return submit_fail("Nazwa musi mieć 1–60 znaków.", "invalid name");
     }
     let (vendor, url, profile_token) = match target {
         Ok(t) => t,
-        Err(msg) => { with_state(|s| { s.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid target"}); }
+        Err(msg) => return submit_fail(msg, "invalid target"),
     };
     let credentials_b64 = match build_credentials_b64(&vendor, &user, &pass) {
         Ok(c) => c,
-        Err(msg) => { with_state(|s| { s.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid credentials"}); }
+        Err(msg) => return submit_fail(msg, "invalid credentials"),
     };
     let spec = CameraAddInput {
         display_name: name,
@@ -2317,13 +2347,20 @@ fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
         resolution_width: None,
         resolution_height: None,
         retention_class: Some(retention),
-        profile: Some("default".to_string()),
+        profile: Some(profile),
         credentials_b64,
         onvif_profile_token: profile_token,
     };
     match camera_add(spec) {
-        Ok(result) => { with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); }); json!({"ok":true,"camera_id":result.camera_id}) }
-        Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd dodawania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Ok(result) => {
+            with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); });
+            // Close the modal and refresh the camera list so the new camera
+            // appears. render_panel re-sends the "cameras" content fragment
+            // without the modal, which is the intended end state on success.
+            render_panel("cameras");
+            json!({"ok":true,"camera_id":result.camera_id})
+        }
+        Err(e) => submit_fail(&alloc::format!("Błąd dodawania: {}", abi_message(e)), &alloc::format!("{}", e)),
     }
 }
 
@@ -2344,6 +2381,9 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
 /// discovery-section visibility flags are patched to match the new results.
 fn handle_discover_scan() -> JsonValue {
     with_state(|s| { s.discover.scanning = true; s.discover.error_message = None; s.discover.cameras.clear(); s.discover.selected_index = None; s.error_message = None; });
+    // Patch the scanning flag BEFORE the blocking discovery call so the scan
+    // spinner becomes visible; the final fragment re-send below carries results.
+    send_state_patches(with_state(|s| wizard_onvif_pairs(&s.discover)));
     let result = camera_discover();
     with_state(|s| {
         s.discover.scanning = false;
@@ -3109,7 +3149,9 @@ fn wizard_full_overlay() -> Vec<StateEntry> {
     for (key, value) in fields {
         pairs.push((key.into(), Value::Text(value)));
     }
-    pairs.push(("profile".into(), Value::Text("default".into())));
+    // Reflect the committed profile (defaulting to "default") so the select
+    // shows the authoritative backend value rather than always resetting to it.
+    pairs.push(("profile".into(), Value::Text(with_state(|s| s.discover.profile_or_default().to_string()))));
     pairs
         .into_iter()
         .map(|(key, value)| StateEntry {
