@@ -25,7 +25,8 @@ use tentaflow_sdk_spec::{
 use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::protocol::camera::{
     CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput, CameraInfoOut,
-    CameraListOut, CameraRemoveOut, DiscoveredCameraOut,
+    CameraListOut, CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
+    DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
 };
 use tentaflow_sdk_spec::protocol::ui::{
     bind::BindRef,
@@ -79,6 +80,11 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
     fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_test_connection_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
 }
 
 // =============================================================================
@@ -201,7 +207,8 @@ where
 }
 
 /// Decodes the CBOR response of a host function with the read-only
-/// `(out_ptr, out_cap, out_len_ptr)` ABI shape (`camera_list` / `camera_discover`).
+/// `(out_ptr, out_cap, out_len_ptr)` ABI shape (`camera_list` / `camera_discover` /
+/// `camera_local_devices`).
 fn call_cbor_out<O>(
     host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32,
 ) -> Result<O, AbiError>
@@ -249,6 +256,16 @@ fn camera_remove(id: &str) -> Result<(), AbiError> {
 fn camera_discover() -> Result<Vec<DiscoveredCameraOut>, AbiError> {
     let out: CameraDiscoverOut = call_cbor_out(camera_discover_v1)?;
     Ok(out.discovered)
+}
+
+fn camera_local_devices() -> Result<Vec<LocalCameraDeviceOut>, AbiError> {
+    let out: LocalCameraDevicesOut = call_cbor_out(camera_local_devices_v1)?;
+    Ok(out.devices)
+}
+
+fn camera_test_connection(vendor: &str, url: &str) -> Result<CameraTestConnectionOut, AbiError> {
+    let input = CameraTestConnectionInput { vendor: vendor.to_string(), url: url.to_string() };
+    call_cbor_in_out(&input, camera_test_connection_v1)
 }
 
 // =============================================================================
@@ -1042,6 +1059,80 @@ fn select(label: &str, options: Vec<SelectOption>, field_id: &str) -> Component 
     }.into_component(field_id).expect("Select")
 }
 
+/// Text input that mirrors its value into backend wizard state on every change
+/// via the `wizard-field-change` action, tagged with `field`. Used by every
+/// per-type wizard field so step navigation never loses typed values.
+fn wizard_input(label: &str, placeholder: &str, field: &str, password: bool) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        r#type: if password { InputType::Password } else { InputType::Text },
+        bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
+        placeholder: Some(lit(placeholder)),
+        label: Some(lit(label)),
+        hint: None,
+        leading_icon: None,
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }.into_component(field).expect("Input");
+    // The renderer two-way binds bind_path against the frontend store, which
+    // persists across SlotContent re-renders, so the typed value survives step
+    // navigation on the client; the change handler additionally commits it to
+    // backend wizard state for the test step and submit validation.
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "wizard-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Select that commits its picked value to backend wizard state on change,
+/// tagged with `field` (used for the USB device dropdown).
+fn wizard_select(label: &str, options: Vec<SelectOption>, field: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Select;
+    let mut comp = Select {
+        bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
+        options,
+        placeholder: None,
+        label: Some(lit(label)),
+        searchable: false,
+        clearable: false,
+        virtualize: false,
+        disabled: None,
+        size: InputSize::Md,
+        groups: None,
+    }.into_component(field).expect("Select");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "wizard-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
 fn toggle(label: &str, field_id: &str) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Toggle;
     Toggle {
@@ -1132,8 +1223,6 @@ struct PanelState {
     cameras_filter: String,
     // Camera selected via a table row click, pending a delete confirmation.
     camera_pending_remove: Option<String>,
-    form_name: String,
-    form_url: String,
     error_message: Option<String>,
     success_message: Option<String>,
     discover: DiscoverState,
@@ -1410,18 +1499,138 @@ impl SearchState {
     }
 }
 
-struct DiscoverState {
-    visible: bool, scanning: bool, cameras: Vec<DiscoveredCam>,
-    selected_index: Option<usize>, custom_name: String, error_message: Option<String>,
+/// The four camera source types the backend supports. Drives every per-step
+/// branch of the add-camera wizard. `vendor()` maps each type to the stable
+/// TentaFlow vendor string the `camera_add` host function expects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceType { Onvif, Rtsp, Usb, File }
+
+impl SourceType {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "onvif" => Some(Self::Onvif),
+            "rtsp" => Some(Self::Rtsp),
+            "usb" => Some(Self::Usb),
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Usb => "usb", Self::File => "file" }
+    }
+    fn vendor(self) -> &'static str {
+        // USB enumeration reports `v4l2` on Linux; the local-device list carries
+        // the authoritative vendor, but the manual-path fallback uses this.
+        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Usb => "v4l2", Self::File => "fake_file" }
+    }
 }
-struct DiscoveredCam { vendor: String, url: String, suggested_name: String }
+
+/// One locally enumerated USB/v4l2 device offered in the wizard's device select.
+struct LocalDevice { device_path: String, label: String, vendor: String }
+
+/// Working state of the source-type-driven "Add camera" wizard. Each per-type
+/// field is committed to the backend on input change (`wizard-field-change`) so
+/// the test step and submit read consistent values across step navigation
+/// instead of relying on a single live form snapshot.
+struct DiscoverState {
+    source_type: Option<SourceType>,
+    // ONVIF discovery results.
+    scanning: bool,
+    cameras: Vec<DiscoveredCam>,
+    selected_index: Option<usize>,
+    // USB/v4l2 enumeration results and the picked device path.
+    usb_devices: Vec<LocalDevice>,
+    usb_loaded: bool,
+    usb_device_path: String,
+    // Per-type manual entry fields.
+    onvif_url: String,
+    rtsp_url: String,
+    file_path: String,
+    cred_user: String,
+    cred_pass: String,
+    // Step 3 connection test outcome (real probe, never faked).
+    test_result: Option<Result<String, String>>,
+    testing: bool,
+    // Step 4 metadata.
+    name: String,
+    retention: String,
+    fps: String,
+    error_message: Option<String>,
+}
+struct DiscoveredCam { vendor: String, url: String, suggested_name: String, profile_token: Option<String> }
 impl DiscoverState {
     const fn new() -> Self {
-        Self { visible: false, scanning: false, cameras: Vec::new(), selected_index: None, custom_name: String::new(), error_message: None }
+        Self {
+            source_type: None,
+            scanning: false, cameras: Vec::new(), selected_index: None,
+            usb_devices: Vec::new(), usb_loaded: false, usb_device_path: String::new(),
+            onvif_url: String::new(), rtsp_url: String::new(), file_path: String::new(),
+            cred_user: String::new(), cred_pass: String::new(),
+            test_result: None, testing: false,
+            name: String::new(), retention: String::new(), fps: String::new(),
+            error_message: None,
+        }
     }
     fn reset(&mut self) {
-        self.visible = false; self.scanning = false; self.cameras.clear();
-        self.selected_index = None; self.custom_name.clear(); self.error_message = None;
+        *self = Self::new();
+    }
+    /// Resolves the effective (vendor, url) for the current source type from the
+    /// committed wizard fields. Returns `Err` with a user-facing message when the
+    /// required field for the chosen type is missing or malformed.
+    fn resolve_target(&self) -> Result<(String, String, Option<String>), &'static str> {
+        match self.source_type {
+            Some(SourceType::Onvif) => {
+                if let Some(i) = self.selected_index {
+                    if let Some(cam) = self.cameras.get(i) {
+                        return Ok((cam.vendor.clone(), cam.url.clone(), cam.profile_token.clone()));
+                    }
+                }
+                let url = self.onvif_url.trim();
+                if url.is_empty() {
+                    return Err("Wybierz wykrytą kamerę ONVIF lub podaj adres URL urządzenia.");
+                }
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err("Adres ONVIF musi zaczynać się od http:// lub https://.");
+                }
+                Ok(("onvif".to_string(), url.to_string(), None))
+            }
+            Some(SourceType::Rtsp) => {
+                let url = self.rtsp_url.trim();
+                if url.is_empty() {
+                    return Err("Podaj adres strumienia RTSP.");
+                }
+                let lower = url.to_ascii_lowercase();
+                if !(lower.starts_with("rtsp://") || lower.starts_with("rtsps://")) {
+                    return Err("Adres RTSP musi zaczynać się od rtsp:// lub rtsps://.");
+                }
+                Ok(("rtsp".to_string(), url.to_string(), None))
+            }
+            Some(SourceType::Usb) => {
+                let path = self.usb_device_path.trim();
+                if path.is_empty() {
+                    return Err("Wybierz lub podaj ścieżkę urządzenia (np. /dev/video0).");
+                }
+                let vendor = self.usb_devices.iter()
+                    .find(|d| d.device_path == path)
+                    .map(|d| d.vendor.clone())
+                    .unwrap_or_else(|| SourceType::Usb.vendor().to_string());
+                Ok((vendor, path.to_string(), None))
+            }
+            Some(SourceType::File) => {
+                let path = self.file_path.trim();
+                if path.is_empty() {
+                    return Err("Podaj ścieżkę pliku wideo.");
+                }
+                Ok(("fake_file".to_string(), path.to_string(), None))
+            }
+            None => Err("Wybierz typ źródła kamery."),
+        }
+    }
+    fn retention_or_default(&self) -> &str {
+        if self.retention.is_empty() { "C" } else { &self.retention }
+    }
+    fn fps_value(&self) -> u32 {
+        self.fps.trim().parse::<u32>().ok().filter(|f| *f >= 1 && *f <= 60).unwrap_or(15)
     }
 }
 
@@ -1431,7 +1640,6 @@ impl PanelState {
             current_panel: String::new(),
             add_form_visible: false, wizard_step: 0, cameras_filter: String::new(),
             camera_pending_remove: None,
-            form_name: String::new(), form_url: String::new(),
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
             alarms: AlarmsState::new(), search: SearchState::new(),
@@ -1684,24 +1892,20 @@ fn render_panel(panel_id: &str) {
 fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
     log::info(&alloc::format!("TentaVision UI action '{}'", action));
     match action {
-        "camera-add-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.discover.visible = false; s.clear_messages(); s.form_name.clear(); s.form_url.clear(); }); json!({"ok":true}) }
-        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); s.form_name.clear(); s.form_url.clear(); }); json!({"ok":true}) }
-        "wizard-next" => { with_state(|s| { if s.wizard_step < 3 { s.wizard_step += 1; } }); json!({"ok":true}) }
-        "wizard-prev" => { with_state(|s| { if s.wizard_step > 0 { s.wizard_step -= 1; } }); json!({"ok":true}) }
+        "camera-add-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
+        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
+        "wizard-source-select" => handle_wizard_source_select(params),
+        "wizard-field-change" => handle_wizard_field_change(params),
+        "wizard-test" => handle_wizard_test(),
+        "wizard-next" => handle_wizard_next(),
+        "wizard-prev" => { with_state(|s| { if s.wizard_step > 0 { s.wizard_step -= 1; } s.error_message = None; }); json!({"ok":true}) }
         "cameras-filter-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.cameras_filter = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
         "camera-add-submit" => handle_camera_add_submit(params),
         "camera-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
         "camera-remove-cancel" => { with_state(|s| { s.camera_pending_remove = None; s.clear_messages(); }); json!({"ok":true}) }
         "camera-remove" => handle_camera_remove(params),
-        "discover-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
-        "discover-cancel" => { with_state(|s| { s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
-        "discover-select-by-index" => {
-            let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("");
-            let idx = v.parse::<u64>().ok();
-            handle_discover_select(&json!({"index": idx}))
-        }
         "cameras-refresh" | "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
         "panel-navigate" => {
             let target = params.get("panel_id")
@@ -1757,54 +1961,157 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
 // Camera action handlers
 // =============================================================================
 
-fn handle_camera_add_submit(params: &JsonValue) -> JsonValue {
-    let values = params.get("values");
-    let form_name = values.and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let form_url = values.and_then(|v| v.get("url")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let form_user = values.and_then(|v| v.get("camera_user")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let form_pass = values.and_then(|v| v.get("camera_password")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+/// Commits the chosen source type (step 1) to backend state. Resetting the
+/// per-type fields here keeps a switched type from carrying stale values from a
+/// previous selection into step 2's validation.
+fn handle_wizard_source_select(params: &JsonValue) -> JsonValue {
+    let raw = params.get("source_type").and_then(|v| v.as_str())
+        .or_else(|| params.get("value").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    match SourceType::from_str(raw) {
+        Some(t) => { with_state(|s| {
+            if s.discover.source_type != Some(t) {
+                s.discover.source_type = Some(t);
+                s.discover.cameras.clear();
+                s.discover.selected_index = None;
+                s.discover.usb_devices.clear();
+                s.discover.usb_loaded = false;
+                s.discover.usb_device_path.clear();
+                s.discover.onvif_url.clear();
+                s.discover.rtsp_url.clear();
+                s.discover.file_path.clear();
+                s.discover.test_result = None;
+            }
+            s.error_message = None;
+        }); json!({"ok":true}) }
+        None => json!({"ok":false,"error":"unknown source_type"}),
+    }
+}
 
-    // A camera picked in the discovery step (step 0/1) carries its url+vendor in
-    // discover state, not in the form (the selection cards have no url field).
-    // Resolve the effective spec from discovery when a row is selected, falling
-    // back to the form for the manual rtsp/onvif entry path. Form values still
-    // win for fields the user typed (name, credentials).
-    let discovery = with_state(|s| match s.discover.selected_index {
-        Some(i) if i < s.discover.cameras.len() => {
-            let cam = &s.discover.cameras[i];
-            Some((cam.url.clone(), cam.vendor.clone(), s.discover.custom_name.trim().to_string()))
+/// Commits a single typed wizard field to backend state on every input change,
+/// keyed by the `field` discriminator the renderer carries in `handler.params`.
+/// Backend-held values survive step navigation (the per-step DOM is rebuilt).
+fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    with_state(|s| {
+        match field {
+            "onvif_url" => s.discover.onvif_url = value,
+            "rtsp_url" => s.discover.rtsp_url = value,
+            "usb_device_path" => s.discover.usb_device_path = value,
+            "file_path" => s.discover.file_path = value,
+            "cred_user" => s.discover.cred_user = value,
+            "cred_pass" => s.discover.cred_pass = value,
+            "name" => s.discover.name = value,
+            "retention" => s.discover.retention = value,
+            "fps" => s.discover.fps = value,
+            _ => {}
         }
-        _ => None,
     });
+    json!({"ok":true})
+}
 
-    let (name, url, vendor_hint) = match discovery {
-        Some((d_url, d_vendor, d_name)) => {
-            let name = if form_name.is_empty() { d_name } else { form_name };
-            (name, d_url, Some(d_vendor))
-        }
-        None => (form_name, form_url, None),
+/// Runs a real `camera_test_connection` probe for the resolved per-type target
+/// and stores the outcome for the step-3 result panel. Never fabricates success.
+fn handle_wizard_test() -> JsonValue {
+    let target = with_state(|s| { s.discover.testing = true; s.discover.test_result = None; s.error_message = None; s.discover.resolve_target() });
+    let (vendor, url) = match target {
+        Ok((v, u, _)) => (v, u),
+        Err(msg) => { with_state(|s| { s.discover.testing = false; s.discover.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid target"}); }
     };
+    let result = camera_test_connection(&vendor, &url);
+    with_state(|s| {
+        s.discover.testing = false;
+        s.discover.test_result = Some(match result {
+            Ok(out) if out.ok => Ok(out.message),
+            Ok(out) => Err(out.message),
+            Err(e) => Err(alloc::format!("Test nieudany: {}", abi_message(e))),
+        });
+    });
+    json!({"ok":true})
+}
 
-    with_state(|s| { s.form_name = name.clone(); s.form_url = url.clone(); s.clear_messages(); });
+/// Advances the wizard, gating each transition on the current step's required
+/// state: a source type must be chosen on step 1, and step 2 must resolve a
+/// valid per-type target before moving on. Entering the USB config step lazily
+/// enumerates local devices via `camera_local_devices`.
+fn handle_wizard_next() -> JsonValue {
+    let step = with_state(|s| s.wizard_step);
+    match step {
+        0 => {
+            let chosen = with_state(|s| s.discover.source_type.is_some());
+            if !chosen {
+                with_state(|s| s.error_message = Some("Wybierz typ źródła kamery.".to_string()));
+                return json!({"ok":false,"error":"no source type"});
+            }
+            // Lazily enumerate USB devices when entering the USB config step so
+            // the dropdown reflects what is currently attached.
+            let needs_usb = with_state(|s| s.discover.source_type == Some(SourceType::Usb) && !s.discover.usb_loaded);
+            if needs_usb {
+                let devices = camera_local_devices();
+                with_state(|s| {
+                    s.discover.usb_loaded = true;
+                    match devices {
+                        Ok(list) => {
+                            s.discover.usb_devices = list.into_iter()
+                                .map(|d| LocalDevice { device_path: d.device_path, label: d.label, vendor: d.vendor })
+                                .collect();
+                            if s.discover.usb_device_path.is_empty() {
+                                if let Some(first) = s.discover.usb_devices.first() {
+                                    s.discover.usb_device_path = first.device_path.clone();
+                                }
+                            }
+                        }
+                        Err(e) => { s.discover.error_message = Some(alloc::format!("Błąd wykrywania urządzeń: {}", abi_message(e))); }
+                    }
+                });
+            }
+            with_state(|s| { s.wizard_step = 1; s.error_message = None; });
+            json!({"ok":true})
+        }
+        1 => {
+            let resolved = with_state(|s| s.discover.resolve_target());
+            match resolved {
+                Ok(_) => { with_state(|s| { s.wizard_step = 2; s.discover.test_result = None; s.error_message = None; }); json!({"ok":true}) }
+                Err(msg) => { with_state(|s| s.error_message = Some(msg.to_string())); json!({"ok":false,"error":"invalid target"}) }
+            }
+        }
+        2 => { with_state(|s| {
+            // Pre-fill a metadata name from a discovered camera when the user has
+            // not typed one yet, otherwise leave it empty (no fake placeholder).
+            if s.discover.name.trim().is_empty() {
+                if let Some(i) = s.discover.selected_index {
+                    if let Some(cam) = s.discover.cameras.get(i) {
+                        s.discover.name = cam.suggested_name.clone();
+                    }
+                }
+            }
+            s.wizard_step = 3; s.error_message = None;
+        }); json!({"ok":true}) }
+        _ => json!({"ok":true}),
+    }
+}
+
+fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
+    let (target, name, retention, fps, user, pass) = with_state(|s| (
+        s.discover.resolve_target(),
+        s.discover.name.trim().to_string(),
+        s.discover.retention_or_default().to_string(),
+        s.discover.fps_value(),
+        s.discover.cred_user.clone(),
+        s.discover.cred_pass.clone(),
+    ));
+    with_state(|s| s.clear_messages());
+
     if name.is_empty() || name.chars().count() > 60 {
         with_state(|s| { s.error_message = Some("Nazwa musi mieć 1–60 znaków.".to_string()); });
         return json!({"ok":false,"error":"invalid name"});
     }
-    if url.is_empty() {
-        with_state(|s| { s.error_message = Some("URL nie może być pusty.".to_string()); });
-        return json!({"ok":false,"error":"invalid url"});
-    }
-    // Trust the discovery vendor for discovered cameras (ONVIF service xaddr
-    // URLs do not always contain `/onvif`); detect from the URL only for the
-    // manual entry path.
-    let vendor = match vendor_hint {
-        Some(v) => v,
-        None => match detect_vendor(&url) {
-            Some(v) => v.to_string(),
-            None => { with_state(|s| { s.error_message = Some("Nieobsługiwany protokół (wspierane: rtsp://, rtsps://, http(s)://.../onvif).".to_string()); }); return json!({"ok":false,"error":"unsupported protocol"}); }
-        },
+    let (vendor, url, profile_token) = match target {
+        Ok(t) => t,
+        Err(msg) => { with_state(|s| { s.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid target"}); }
     };
-    let credentials_b64 = match build_credentials_b64(&vendor, &form_user, &form_pass) {
+    let credentials_b64 = match build_credentials_b64(&vendor, &user, &pass) {
         Ok(c) => c,
         Err(msg) => { with_state(|s| { s.error_message = Some(msg.to_string()); }); return json!({"ok":false,"error":"invalid credentials"}); }
     };
@@ -1812,16 +2119,16 @@ fn handle_camera_add_submit(params: &JsonValue) -> JsonValue {
         display_name: name,
         vendor,
         url,
-        target_fps: Some(15),
+        target_fps: Some(fps),
         resolution_width: None,
         resolution_height: None,
-        retention_class: Some("C".to_string()),
+        retention_class: Some(retention),
         profile: Some("default".to_string()),
         credentials_b64,
-        onvif_profile_token: None,
+        onvif_profile_token: profile_token,
     };
     match camera_add(spec) {
-        Ok(result) => { with_state(|s| { s.add_form_visible = false; s.form_name.clear(); s.form_url.clear(); s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); }); json!({"ok":true,"camera_id":result.camera_id}) }
+        Ok(result) => { with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); }); json!({"ok":true,"camera_id":result.camera_id}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd dodawania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
 }
@@ -1838,15 +2145,12 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
 }
 
 fn handle_discover_scan() -> JsonValue {
-    with_state(|s| { s.discover.scanning = true; s.discover.error_message = None; s.discover.cameras.clear(); s.discover.selected_index = None; s.clear_messages(); });
+    with_state(|s| { s.discover.scanning = true; s.discover.error_message = None; s.discover.cameras.clear(); s.discover.selected_index = None; s.error_message = None; });
     let result = camera_discover();
     with_state(|s| {
         s.discover.scanning = false;
         match result {
-            Ok(found) => {
-                s.discover.cameras = found.iter().map(discovered_to_cam).collect();
-                if !s.discover.cameras.is_empty() { s.discover.selected_index = Some(0); s.discover.custom_name = s.discover.cameras[0].suggested_name.clone(); }
-            }
+            Ok(found) => { s.discover.cameras = found.iter().map(discovered_to_cam).collect(); }
             Err(e) => { s.discover.error_message = Some(alloc::format!("Błąd skanowania: {}", abi_message(e))); }
         }
     });
@@ -1858,7 +2162,13 @@ fn handle_discover_select(params: &JsonValue) -> JsonValue {
     with_state(|s| {
         s.discover.error_message = None;
         match index {
-            Some(i) if (i as usize) < s.discover.cameras.len() => { let i = i as usize; s.discover.selected_index = Some(i); if s.discover.custom_name.trim().is_empty() { s.discover.custom_name = s.discover.cameras[i].suggested_name.clone(); } }
+            Some(i) if (i as usize) < s.discover.cameras.len() => {
+                let i = i as usize;
+                s.discover.selected_index = Some(i);
+                // Mirror the picked device URL into the manual ONVIF field so the
+                // resolved target and submit credentials use one consistent value.
+                s.discover.onvif_url = s.discover.cameras[i].url.clone();
+            }
             _ => { s.discover.selected_index = None; s.discover.error_message = Some("Wybierz kamerę z listy.".to_string()); }
         }
     });
@@ -1916,13 +2226,6 @@ fn build_credentials_b64(
     ))
 }
 
-fn detect_vendor(url: &str) -> Option<&'static str> {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("rtsp://") || lower.starts_with("rtsps://") { return Some("rtsp"); }
-    if (lower.starts_with("http://") || lower.starts_with("https://")) && lower.contains("/onvif") { return Some("onvif"); }
-    None
-}
-
 fn is_valid_camera_id(id: &str) -> bool {
     if id.len() != 40 || !id.starts_with("cam_") { return false; }
     id.chars().skip(4).all(|c| c.is_ascii_hexdigit() || c == '-')
@@ -1943,6 +2246,7 @@ fn discovered_to_cam(d: &DiscoveredCameraOut) -> DiscoveredCam {
         vendor: "onvif".to_string(),
         url,
         suggested_name: suggested_name_for_discovered(d),
+        profile_token: None,
     }
 }
 
@@ -2518,11 +2822,9 @@ fn build_add_camera_modal() -> Component {
 /// Builds the wizard body fragment for the `add_camera_body` slot: step
 /// progress, the current step's content, and an optional error alert.
 fn build_add_camera_body() -> Component {
-    let (step, scanning, discovered_count, err) = with_state(|s| {
-        (s.wizard_step, s.discover.scanning, s.discover.cameras.len(), s.error_message.clone())
-    });
+    let (step, err) = with_state(|s| (s.wizard_step, s.error_message.clone()));
 
-    let step_labels = ["Odkrywanie", "Wybór & poświadczenia", "Podgląd & kalibracja", "Profil analityczny"];
+    let step_labels = ["Typ źródła", "Konfiguracja", "Test połączenia", "Metadane"];
     let step_indicator = step_progress(
         step_labels.iter().enumerate().map(|(i, label)| StepDef {
             id: alloc::format!("step{}", i),
@@ -2535,10 +2837,10 @@ fn build_add_camera_body() -> Component {
     );
 
     let body = match step {
-        0 => build_wizard_step_discovery(scanning, discovered_count),
-        1 => build_wizard_step_selection(),
-        2 => build_wizard_step_preview(),
-        3 => build_wizard_step_profile(),
+        0 => build_wizard_step_source_type(),
+        1 => build_wizard_step_config(),
+        2 => build_wizard_step_test(),
+        3 => build_wizard_step_metadata(),
         _ => text("Nieznany krok."),
     };
 
@@ -2560,9 +2862,9 @@ fn build_add_camera_footer() -> Component {
     footer.push(button("Anuluj", "camera-add-cancel", "ghost"));
     if step < last {
         let next_label = match step {
-            0 => "Dalej: Wybór",
-            1 => "Dalej: Podgląd",
-            2 => "Dalej: Profil",
+            0 => "Dalej: Konfiguracja",
+            1 => "Dalej: Test",
+            2 => "Dalej: Metadane",
             _ => "Dalej",
         };
         footer.push(button(next_label, "wizard-next", "primary"));
@@ -2572,147 +2874,243 @@ fn build_add_camera_footer() -> Component {
     stack_h(footer)
 }
 
-fn build_wizard_step_discovery(scanning: bool, discovered_count: usize) -> Component {
-    if scanning {
-        return stack_v(vec![
-            spinner("lg"),
-            text("Skanowanie sieci kamerowej (ONVIF WS-Discovery + mDNS + ARP)..."),
-        ]);
-    }
-    if discovered_count == 0 {
-        return stack_v(vec![
-            text("Automatyczne wyszukiwanie kamer w sieci lokalnej."),
-            stack_h(vec![
-                button_with_icon("Skanuj sieć", "discover-scan", "primary", "search"),
-            ]),
-        ]);
-    }
-    let discovered = with_state(|s| s.discover.cameras.iter().enumerate().map(|(i, c)| {
-        (i, c.suggested_name.clone(), c.url.clone(), c.vendor.clone())
-    }).collect::<Vec<_>>());
-    let selected_idx = with_state(|s| s.discover.selected_index);
+/// Step 1 — source-type chooser. Renders the four supported source kinds as
+/// clickable selection cards; the pick is committed to backend state via
+/// `wizard-source-select`, which drives the per-type branch of step 2. A clickable
+/// Card carries the selection because the backend needs the value immediately to
+/// branch the next step (a store-bound RadioCardGroup would not reach the backend
+/// until submit).
+fn build_wizard_step_source_type() -> Component {
+    let selected = with_state(|s| s.discover.source_type);
+    let options: [(SourceType, &str, &str, &str); 4] = [
+        (SourceType::Onvif, "Kamera sieciowa ONVIF", "Automatyczne wykrywanie kamer ONVIF w sieci lokalnej.", "search"),
+        (SourceType::Rtsp, "Strumień RTSP/RTSPS", "Ręczny adres strumienia rtsp:// lub rtsps://.", "video"),
+        (SourceType::Usb, "Kamera lokalna / USB", "Urządzenie wideo podłączone do tego hosta (v4l2).", "cameras"),
+        (SourceType::File, "Plik testowy", "Lokalny plik wideo używany jako źródło testowe.", "evidence"),
+    ];
 
-    let mut cam_rows: Vec<Component> = Vec::new();
-    for (i, name, url, vendor) in &discovered {
-        let is_sel = selected_idx == Some(*i);
-        let label = text_styled(name, "body_strong");
-        let meta = text_styled(&alloc::format!("{} \u{00b7} {}", url, vendor), "caption");
-        let capability = if vendor.contains("ONVIF") {
-            chip_toned_icon("ONVIF OK", "success", "check")
-        } else if vendor.contains("ACAP") || vendor.contains("edge") {
-            chip_toned("edge analytics", "info")
-        } else if vendor.contains("RTSP") || vendor.to_ascii_lowercase().contains("rtsp") {
-            chip_toned("tylko RTSP", "warning")
-        } else {
-            chip_toned("standard", "muted")
-        };
-        let row_content = stack_h(vec![
-            stack_v_gap("xs", vec![label, meta]),
-            capability,
+    let cards: Vec<Component> = options.iter().map(|(t, title, desc, icon)| {
+        let is_sel = selected == Some(*t);
+        let content = stack_h(vec![
+            chip_with_icon(title, "info", icon),
+            text_styled(desc, "caption"),
         ]);
-        let tone = if is_sel { Tone::Primary } else { Tone::Neutral };
-        let mut row_card = Card {
+        let mut card = Card {
             variant: if is_sel { CardVariant::Filled } else { CardVariant::Outlined },
-            padding: Spacing::Sm,
+            padding: Spacing::Md,
             gap: Spacing::Sm,
-            radius: RadiusToken::Sm,
+            radius: RadiusToken::Md,
             shadow: ShadowToken::None,
             border: BorderToken::Hairline,
             background: BackgroundToken::None,
-            accent: if is_sel { Some(tone) } else { None },
-            children: vec![row_content],
+            accent: if is_sel { Some(Tone::Primary) } else { None },
+            children: vec![content],
             interactive: true,
             clickable: true,
         }.into_component(next_id()).expect("Card");
         let mut params = CborMap::default();
-        params.0.push(("index".into(), Value::U64(*i as u64)));
-        row_card.handlers = Some(HandlerMap(vec![(
+        params.0.push(("source_type".into(), Value::Text(t.as_str().into())));
+        card.handlers = Some(HandlerMap(vec![(
             tentaflow_sdk_spec::EventKind::Click,
             Handler::Backend {
-                action_id: "discover-select".into(),
+                action_id: "wizard-source-select".into(),
                 params,
                 optimistic: None,
                 on_failure: FailurePolicy::Toast,
             },
         )]));
-        cam_rows.push(row_card);
+        card
+    }).collect();
+
+    stack_v(vec![
+        text("Wybierz typ źródła kamery. Dalsze kroki dopasują się do wybranego typu."),
+        stack_v_gap("sm", cards),
+    ])
+}
+
+/// Step 2 — per-type configuration. Branches entirely on the chosen source type;
+/// there are no hardcoded sample values, location pickers, or firmware alerts.
+fn build_wizard_step_config() -> Component {
+    let source = with_state(|s| s.discover.source_type);
+    match source {
+        Some(SourceType::Onvif) => build_config_onvif(),
+        Some(SourceType::Rtsp) => build_config_rtsp(),
+        Some(SourceType::Usb) => build_config_usb(),
+        Some(SourceType::File) => build_config_file(),
+        None => stack_v(vec![text("Wróć do kroku 1 i wybierz typ źródła kamery.")]),
+    }
+}
+
+fn build_config_onvif() -> Component {
+    let scanning = with_state(|s| s.discover.scanning);
+    let discovered_count = with_state(|s| s.discover.cameras.len());
+    let selected_idx = with_state(|s| s.discover.selected_index);
+
+    let scan_section = if scanning {
+        stack_v(vec![spinner("md"), text("Skanowanie sieci (ONVIF WS-Discovery)...")])
+    } else if discovered_count == 0 {
+        stack_v(vec![
+            text("Zeskanuj sieć w poszukiwaniu kamer ONVIF lub podaj adres URL urządzenia ręcznie."),
+            stack_h(vec![button_with_icon("Skanuj sieć", "discover-scan", "primary", "search")]),
+        ])
+    } else {
+        let discovered = with_state(|s| s.discover.cameras.iter().enumerate()
+            .map(|(i, c)| (i, c.suggested_name.clone(), c.url.clone())).collect::<Vec<_>>());
+        let mut cam_rows: Vec<Component> = Vec::new();
+        for (i, name, url) in &discovered {
+            let is_sel = selected_idx == Some(*i);
+            let row_content = stack_v_gap("xs", vec![
+                text_styled(name, "body_strong"),
+                text_styled(url, "caption"),
+            ]);
+            let mut row_card = Card {
+                variant: if is_sel { CardVariant::Filled } else { CardVariant::Outlined },
+                padding: Spacing::Sm,
+                gap: Spacing::Sm,
+                radius: RadiusToken::Sm,
+                shadow: ShadowToken::None,
+                border: BorderToken::Hairline,
+                background: BackgroundToken::None,
+                accent: if is_sel { Some(Tone::Primary) } else { None },
+                children: vec![row_content],
+                interactive: true,
+                clickable: true,
+            }.into_component(next_id()).expect("Card");
+            let mut params = CborMap::default();
+            params.0.push(("index".into(), Value::U64(*i as u64)));
+            row_card.handlers = Some(HandlerMap(vec![(
+                tentaflow_sdk_spec::EventKind::Click,
+                Handler::Backend {
+                    action_id: "discover-select".into(),
+                    params,
+                    optimistic: None,
+                    on_failure: FailurePolicy::Toast,
+                },
+            )]));
+            cam_rows.push(row_card);
+        }
+        stack_v(vec![
+            text(&alloc::format!("Znaleziono {} kamer. Wybierz jedną lub podaj URL ręcznie.", discovered_count)),
+            stack_v_gap("xs", cam_rows),
+            button_with_icon("Skanuj ponownie", "discover-scan", "ghost", "search"),
+        ])
+    };
+
+    let url_input = wizard_input("URL urządzenia ONVIF", "http://10.0.0.5/onvif/device_service", "onvif_url", false);
+    let user_input = wizard_input("Użytkownik", "", "cred_user", false);
+    let pass_input = wizard_input("Hasło", "", "cred_pass", true);
+
+    stack_v(vec![
+        scan_section,
+        url_input,
+        grid(2, vec![user_input, pass_input]),
+        text_styled("Kamera ONVIF wymaga użytkownika i hasła.", "caption"),
+    ])
+}
+
+fn build_config_rtsp() -> Component {
+    let url_input = wizard_input("URL strumienia RTSP", "rtsp://host:554/stream", "rtsp_url", false);
+    let user_input = wizard_input("Użytkownik (opcjonalnie)", "", "cred_user", false);
+    let pass_input = wizard_input("Hasło (opcjonalnie)", "", "cred_pass", true);
+    stack_v(vec![
+        text("Podaj adres strumienia RTSP/RTSPS. Poświadczenia są opcjonalne."),
+        url_input,
+        grid(2, vec![user_input, pass_input]),
+    ])
+}
+
+fn build_config_usb() -> Component {
+    let (loaded, devices) = with_state(|s| (
+        s.discover.usb_loaded,
+        s.discover.usb_devices.iter().map(|d| (d.device_path.clone(), d.label.clone())).collect::<Vec<_>>(),
+    ));
+
+    if !loaded {
+        // Reached only if enumeration has not run yet (the next-step transition
+        // triggers it); offer a manual path so the step is never a dead end.
+        return stack_v(vec![
+            text("Wykrywanie urządzeń lokalnych..."),
+            wizard_input("Ścieżka urządzenia", "/dev/video0", "usb_device_path", false),
+        ]);
     }
 
+    if devices.is_empty() {
+        return stack_v(vec![
+            alert("Nie wykryto lokalnych urządzeń wideo (v4l2). Podaj ścieżkę ręcznie.", "info"),
+            wizard_input("Ścieżka urządzenia", "/dev/video0", "usb_device_path", false),
+        ]);
+    }
+
+    let options: Vec<SelectOption> = devices.iter().map(|(path, label)| SelectOption {
+        value: SelectValue::Text(path.clone()),
+        label: lit(&alloc::format!("{} ({})", label, path)),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    }).collect();
+    let device_select = wizard_select("Wykryte urządzenie", options, "usb_device_path");
+
     stack_v(vec![
-        text(&alloc::format!("Znaleziono {} kamer w sieci kamerowej.", discovered_count)),
-        stack_v_gap("xs", cam_rows),
-        button_with_icon("Skanuj ponownie", "discover-scan", "ghost", "search"),
+        text(&alloc::format!("Wykryto {} urządzeń lokalnych. Wybierz źródło wideo.", devices.len())),
+        device_select,
     ])
 }
 
-fn build_wizard_step_selection() -> Component {
-    let discovered_count = with_state(|s| s.discover.cameras.len());
+fn build_config_file() -> Component {
+    stack_v(vec![
+        text("Podaj ścieżkę lokalnego pliku wideo używanego jako źródło testowe."),
+        wizard_input("Ścieżka pliku wideo", "/var/lib/tentaflow/sample.mp4", "file_path", false),
+    ])
+}
 
-    let discovery_summary = if discovered_count > 0 {
-        text(&alloc::format!("Znaleziono {} nowe kamery w sieci kamerowej (VLAN 40). Wybierz tę, którą chcesz dodać.", discovered_count))
+/// Step 3 — runs a real connection probe. There is no fabricated preview frame;
+/// the live preview is a later phase. We only surface the actual test outcome.
+fn build_wizard_step_test() -> Component {
+    let (testing, result) = with_state(|s| (s.discover.testing, match &s.discover.test_result {
+        Some(Ok(m)) => Some(Ok(m.clone())),
+        Some(Err(m)) => Some(Err(m.clone())),
+        None => None,
+    }));
+
+    let result_block = if testing {
+        stack_v(vec![spinner("md"), text("Testowanie połączenia z kamerą...")])
     } else {
-        text("Brak wyników skanowania. Wróć do kroku 1 aby skanować lub wprowadź dane ręcznie.")
+        match result {
+            Some(Ok(msg)) => {
+                let detail = if msg.is_empty() { "Połączenie nawiązane.".to_string() } else { msg };
+                stack_v(vec![alert(&alloc::format!("Połączenie OK. {}", detail), "success")])
+            }
+            Some(Err(msg)) => stack_v(vec![alert(&msg, "critical")]),
+            None => empty_state("Brak testu", Some("Uruchom test, aby sprawdzić połączenie z kamerą."), Some("info")),
+        }
     };
 
-    // Credential form fields
-    let name_input = input("Nazwa kamery", "C-23 wjazd-ADR-2", "name");
-    let location_select = select("Lokalizacja / strefa", vec![
-        SelectOption { value: SelectValue::Text("brama".into()), label: lit("Brama wjazdowa"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("parking".into()), label: lit("Parking"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("hala".into()), label: lit("Hala"), icon: None, disabled: false, group_id: None, description: None },
-    ], "camera_location");
-    let user_input = input("Użytkownik", "admin", "camera_user");
-    let password_input = {
-        use tentaflow_sdk_spec::protocol::ui::form::Input;
-        Input {
-            r#type: InputType::Password,
-            bind_path: StatePath::new(vec![PathSegment::Key("camera_password".into())]),
-            placeholder: Some(lit("zapisz w vault TentaFlow")),
-            label: Some(lit("Hasło")),
-            hint: Some(lit("Poświadczenia w secret store. Rotacja co 90 dni.")),
-            leading_icon: None,
-            trailing_icon: None,
-            prefix: None,
-            suffix: None,
-            validators: vec![],
-            max_length: None,
-            min_length: None,
-            pattern: None,
-            autocomplete: None,
-            input_mode: None,
-            disabled: None,
-            readonly: None,
-            error: None,
-            size: InputSize::Md,
-        }.into_component("camera_password").expect("Input")
-    };
-    let form_grid = grid(2, vec![name_input, location_select, user_input, password_input]);
-
-    // Firmware warning alert
-    let firmware_alert = AlertComp {
-        tone: parse_tone("warning"),
-        variant: AlertVariant::Default,
-        icon: Some(icon_named(parse_icon_name("info"))),
-        title: Some(lit("Wykryto wariancje firmware")),
-        message: lit("Hikvision firmware 5.7.x ma wyłączony ONVIF domyślnie. Po podaniu poświadczeń włączymy go automatycznie (wymaga uprawnień admin). Alternatywnie: RTSP fallback."),
-        actions: None,
-        dismissible: false,
-    }.into_component(next_id()).expect("Alert");
-
-    stack_v(vec![discovery_summary, form_grid, firmware_alert])
-}
-
-fn build_wizard_step_preview() -> Component {
     stack_v(vec![
-        text("Podgląd strumienia i kalibracja kamery."),
-        empty_state("Oczekiwanie na podgląd", Some("Wprowadź poświadczenia w kroku 2, aby uzyskać podgląd strumienia."), Some("video")),
+        text("Sprawdź połączenie ze źródłem przed dodaniem kamery."),
+        stack_h(vec![button_with_icon("Testuj połączenie", "wizard-test", "primary", "check")]),
+        result_block,
+        text_styled("Podgląd na żywo będzie dostępny po dodaniu kamery.", "caption"),
     ])
 }
 
-fn build_wizard_step_profile() -> Component {
+/// Step 4 — camera metadata. Name placeholder is neutral; no preset values.
+fn build_wizard_step_metadata() -> Component {
+    let name_input = wizard_input("Nazwa kamery", "np. Brama wjazdowa", "name", false);
+    let retention_select = wizard_select("Klasa retencji", vec![
+        SelectOption { value: SelectValue::Text("A".into()), label: lit("A — długa retencja"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("B".into()), label: lit("B — średnia retencja"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("C".into()), label: lit("C — krótka retencja"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("Unclassified".into()), label: lit("Niesklasyfikowana"), icon: None, disabled: false, group_id: None, description: None },
+    ], "retention");
+    let fps_input = wizard_input("Docelowe FPS", "15", "fps", false);
+    let profile_select = wizard_select("Profil analityczny", vec![
+        SelectOption { value: SelectValue::Text("default".into()), label: lit("default"), icon: None, disabled: false, group_id: None, description: None },
+    ], "profile");
+
     stack_v(vec![
-        text("Przypisz profil analityczny do kamery."),
-        empty_state("Wybierz profil", Some("Wybierz istniejący profil lub utwórz nowy."), Some("brain")),
+        text("Uzupełnij metadane kamery przed jej dodaniem."),
+        grid(2, vec![name_input, retention_select, fps_input, profile_select]),
     ])
 }
 
