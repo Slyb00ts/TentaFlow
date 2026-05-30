@@ -118,15 +118,12 @@ export class ComponentRenderer {
       cleanups,
       registerCleanup: (fn) => cleanups.push(fn),
       renderChild: (child) => {
-        const childEl = this.render(child);
-        // Propagujemy cleanup'y dziecka do rodzica — destroy(rootEl)
-        // zwolni również dzieci.
-        const childCleanups = this._cleanups.get(childEl);
-        if (childCleanups) {
-          for (const fn of childCleanups) cleanups.push(fn);
-          this._cleanups.delete(childEl);
-        }
-        return childEl;
+        // Cleanup'y dziecka ZOSTAJĄ przypięte do elementu dziecka (per-element
+        // ownership), a nie spłaszczane do rodzica. `destroy(root)` schodzi po
+        // poddrzewie DOM i zwalnia je rekurencyjnie, a reconcile może wymienić
+        // pojedyncze dziecko i zwolnić dokładnie jego subskrypcje bez tykania
+        // rodzeństwa.
+        return this.render(child);
       },
       readField: (fields, key) => readField(fields, key),
       formatValue: (value, fmt) => formatValue(value, fmt, this.locale),
@@ -156,10 +153,17 @@ export class ComponentRenderer {
     return element;
   }
 
-  /// Zwalnia subskrypcje store'a i listenery DOM przypięte do elementu.
-  /// Cleanup propaguje się z elementu na dzieci (zostały zarejestrowane
-  /// w trakcie `render`).
+  /// Zwalnia subskrypcje store'a i listenery DOM przypięte do `element` ORAZ
+  /// całego jego poddrzewa DOM (cleanup'y są przypięte per-element, więc
+  /// schodzimy rekurencyjnie po dzieciach). Bezpieczne dla detached nodes.
   destroy(element) {
+    if (element instanceof globalThis.Element) {
+      // Najpierw dzieci — porządek nie ma znaczenia dla niezależnych
+      // subskrypcji, ale trzymamy go deterministycznie (bottom-up).
+      for (const child of Array.from(element.children)) {
+        this.destroy(child);
+      }
+    }
     const cleanups = this._cleanups.get(element);
     if (!cleanups) return;
     for (const fn of cleanups) {
@@ -172,6 +176,126 @@ export class ComponentRenderer {
     }
     this._cleanups.delete(element);
   }
+}
+
+// =============================================================================
+// Reconcile support — transparent container introspection
+// =============================================================================
+//
+// Reconcile (SlotManager) musi wiedzieć, dla których tagów root element to
+// "przezroczysty kontener": plain <div>, którego dzieci DOM odpowiadają 1:1
+// (po kolejności) dzieciom-komponentom z FieldMap, BEZ przeplatanych
+// wewnętrznych węzłów reaktywnych. Tylko dla takich tagów wolno reużyć
+// wrapper i zdiffować dzieci pozycyjnie — w przeciwnym razie field→DOM nie
+// jest 1:1 i diff rozjechałby strukturę.
+//
+// Wartość mapy to u8 key FieldMap, pod którym leży `Array<Component>` dzieci.
+// Świadomie wykluczamy:
+//   - Grid (0x0102)        — dzieci są w GridChild FieldMap + per-dziecko
+//                             inline style (nie 1:1 Component),
+//   - SectionCard/Collapsible/Accordion/Tooltip — header/divider/footer i
+//                             wewnętrzne węzły reaktywne psują 1:1,
+//   - wszystkie leafy interaktywne (Input/Textarea/Select/...) — własne
+//                             closures i wewnętrzny stan, których nie da się
+//                             odświeżyć bez ponownego uruchomienia renderera.
+const TRANSPARENT_CONTAINER_CHILD_KEY = Object.freeze(new Map([
+  [0x0101, 5], // Flex.children
+  [0x0103, 2], // Stack.children
+  [0x0104, 3], // Cluster.children
+  [0x0106, 8], // Card.children
+]));
+
+/// Zwraca u8 key dzieci dla przezroczystego kontenera, albo `undefined`
+/// jeśli tag nie jest reconcile'owalny po dzieciach. SlotManager używa tego
+/// żeby zdecydować, czy schodzić w dół (reuse wrappera) czy zrobić replace.
+export function transparentContainerChildKey(tag) {
+  return TRANSPARENT_CONTAINER_CHILD_KEY.get(tag);
+}
+
+/// Wyciąga uporządkowaną listę dzieci-komponentów z FieldMap kontenera.
+/// Zwraca `[]` gdy pole nieobecne. Zakłada, że `tag` jest przezroczystym
+/// kontenerem (caller sprawdził `transparentContainerChildKey`).
+export function readContainerChildren(component) {
+  const key = TRANSPARENT_CONTAINER_CHILD_KEY.get(component.tag);
+  if (key === undefined) return null;
+  const raw = readField(component.fields, key);
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) return null;
+  return raw;
+}
+
+/// Strukturalne porównanie dwóch komponentów Z POMINIĘCIEM jednego field
+/// key (zwykle children) — reszta opisuje "shell" kontenera (klasy, padding,
+/// handlery, bind, a11y, visibility). Jeśli shell się różni, renderer
+/// ustawiłby inne klasy/atrybuty na wrapperze, a tego nie da się odświeżyć
+/// bez ponownego renderu — wtedy reconcile robi pełny replace tego węzła.
+export function shellEqualsExceptChildKey(oldComp, newComp, exceptKey) {
+  if (oldComp.tag !== newComp.tag) return false;
+  if (oldComp.id !== newComp.id) return false;
+  if (!deepEqual(oldComp.handlers ?? null, newComp.handlers ?? null)) return false;
+  if (!deepEqual(oldComp.bind ?? null, newComp.bind ?? null)) return false;
+  if (!deepEqual(oldComp.a11y ?? null, newComp.a11y ?? null)) return false;
+  if (!deepEqual(oldComp.visibility ?? null, newComp.visibility ?? null)) return false;
+  if ((oldComp.test_id ?? null) !== (newComp.test_id ?? null)) return false;
+  return fieldMapEqualExcept(oldComp.fields, newComp.fields, exceptKey);
+}
+
+/// Pełne strukturalne porównanie dwóch komponentów (łącznie z dziećmi).
+/// Używane przez reconcile dla leafów: identyczny komponent → DOM node i jego
+/// żywe subskrypcje zostają nietknięte (zero re-renderu, zero utraty focusu).
+export function componentDeepEqual(a, b) {
+  return deepEqual(a, b);
+}
+
+function fieldMapEqualExcept(aFields, bFields, exceptKey) {
+  const a = fieldsToMap(aFields, exceptKey);
+  const b = fieldsToMap(bFields, exceptKey);
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) {
+    if (!b.has(k)) return false;
+    if (!deepEqual(v, b.get(k))) return false;
+  }
+  return true;
+}
+
+function fieldsToMap(fields, exceptKey) {
+  const m = new Map();
+  if (!Array.isArray(fields)) return m;
+  for (const entry of fields) {
+    if (!Array.isArray(entry) || entry.length !== 2) continue;
+    if (entry[0] === exceptKey) continue;
+    m.set(entry[0], entry[1]);
+  }
+  return m;
+}
+
+/// Strukturalna równość wartości wire'owych: prymitywy (w tym BigInt),
+/// tablice i zwykłe obiekty. Wystarcza dla zdekodowanych Component/Value —
+/// nie ma tu cyklicznych grafów ani funkcji.
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null) return a === b;
+  const ta = typeof a;
+  if (ta !== typeof b) return false;
+  if (ta !== 'object') return false;
+  const aArr = Array.isArray(a);
+  const bArr = Array.isArray(b);
+  if (aArr !== bArr) return false;
+  if (aArr) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!deepEqual(a[k], b[k])) return false;
+  }
+  return true;
 }
 
 // =============================================================================
