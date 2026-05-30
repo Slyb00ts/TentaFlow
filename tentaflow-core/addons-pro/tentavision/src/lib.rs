@@ -278,6 +278,37 @@ const PANEL_ID: &str = "overview";
 static PANEL_EPOCH: AtomicU64 = AtomicU64::new(1);
 static STATE_REVISION: AtomicU64 = AtomicU64::new(0);
 
+/// Installs a process-wide panic hook exactly once. Without it a guest panic
+/// surfaces on the host only as a bare wasm trap with numeric `fnNNN` frames,
+/// which is unusable for diagnosis. The hook forwards the panic payload and its
+/// `file:line` source location to the host log so the actual cause of any
+/// future addon panic is recorded verbatim instead of being lost in the trap.
+fn install_panic_hook() {
+    use core::sync::atomic::AtomicBool;
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    // `swap` makes installation atomic and idempotent across on_start /
+    // on_panel_open and any later re-entry.
+    if INSTALLED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    std::panic::set_hook(alloc::boxed::Box::new(|info: &std::panic::PanicHookInfo| {
+        let location = info
+            .location()
+            .map(|l| alloc::format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        log::error(&alloc::format!(
+            "TentaVision PANIC at {}: {}",
+            location, message
+        ));
+    }));
+}
+
 fn next_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -904,14 +935,25 @@ fn avatar(initials: &str, size: &str) -> Component {
 }
 
 fn empty_state(title: &str, message: Option<&str>, icon: Option<&str>) -> Component {
-    EmptyStateComp {
+    let built = EmptyStateComp {
         icon: icon_named(parse_icon_name(icon.unwrap_or("info"))),
         heading: lit(title),
         message: message.map(lit),
         primary_action: None,
         secondary_action: None,
         variant: EmptyStateVariant::Default,
-    }.into_component(next_id()).expect("EmptyState")
+    }.into_component(next_id());
+    // EmptyState sits on hot wizard/empty-list render paths. A validation
+    // failure here must degrade to a readable text node, never trap the whole
+    // on_request and corrupt guest memory; the real reason is logged so the
+    // panic hook / host log still pinpoints it.
+    match built {
+        Ok(c) => c,
+        Err(e) => {
+            log::error(&alloc::format!("TentaVision: EmptyState into_component failed: {:?}", e));
+            text(title)
+        }
+    }
 }
 
 fn spinner(size: &str) -> Component {
@@ -1064,10 +1106,14 @@ fn select(label: &str, options: Vec<SelectOption>, field_id: &str) -> Component 
 /// per-type wizard field so step navigation never loses typed values.
 fn wizard_input(label: &str, placeholder: &str, field: &str, password: bool) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Input;
+    // An empty placeholder literal (`Some(Text("")))`) is meaningless and some
+    // optional credential fields pass "" — encode it as absent rather than a
+    // zero-length literal so the field stays canonical.
+    let placeholder_ref = if placeholder.is_empty() { None } else { Some(lit(placeholder)) };
     let mut comp = Input {
         r#type: if password { InputType::Password } else { InputType::Text },
         bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
-        placeholder: Some(lit(placeholder)),
+        placeholder: placeholder_ref,
         label: Some(lit(label)),
         hint: None,
         leading_icon: None,
@@ -1691,6 +1737,7 @@ pub extern "C" fn on_install() -> i32 { 0 }
 
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
+    install_panic_hook();
     log::info("TentaVision: on_start (CBOR SDK)");
     send_initial_shell();
     render_panel("overview");
@@ -1710,6 +1757,7 @@ pub extern "C" fn on_event(_input_ptr: i32, _input_len: i32) -> i32 { 0 }
 /// Re-emits PanelShell + SlotContent without restarting the addon.
 #[no_mangle]
 pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64) -> i32 {
+    install_panic_hook();
     let panel_id = read_guest_string(panel_id_ptr, panel_id_len);
     PANEL_EPOCH.store(epoch as u64, core::sync::atomic::Ordering::Relaxed);
     log::info(&alloc::format!("TentaVision: on_panel_open panel='{}' epoch={}", panel_id, epoch));
