@@ -85,15 +85,6 @@ pub enum FlowValidationError {
         to_port: String,
         to_type: FlowDataType,
     },
-    /// R-SAFETY: flow ma node `llm` i istnieje ścieżka od tego LLM do
-    /// `output` która nie przechodzi przez `pii_filter`. Egzekwowane
-    /// tylko dla `ValidationSource::UserDefined` — synthetic flowy
-    /// budowane przez runtime mają swoje gwarancje (synthetic_chat
-    /// wstrzykuje pii_filter).
-    MissingPiiFilter {
-        llm_node: String,
-        output_node: String,
-    },
 }
 
 impl fmt::Display for FlowValidationError {
@@ -176,41 +167,15 @@ impl fmt::Display for FlowValidationError {
                 f,
                 "edge {from_node}.{from_port} (type {from_type:?}) -> {to_node}.{to_port} (type {to_type:?}): incompatible types"
             ),
-            Self::MissingPiiFilter {
-                llm_node,
-                output_node,
-            } => write!(
-                f,
-                "R-SAFETY: LLM node '{llm_node}' has a path to output '{output_node}' \
-                 without `pii_filter` — user-defined flows must scrub PII before \
-                 surfacing LLM text"
-            ),
         }
     }
 }
 
 impl std::error::Error for FlowValidationError {}
 
-/// Źródło flow definition — decyduje czy mandatoryjne reguły jak R-SAFETY
-/// (pii_filter na chain LLM) są egzekwowane.
-///
-/// `UserDefined` — flow zapisany przez admina w DB (handlers save path,
-/// seedy). Pełna walidacja, R-SAFETY enforce.
-///
-/// `Synthetic` — ad-hoc flow zbudowany w runtime (FlowDispatcher fallback
-/// gdy resolver zwraca None dla danego modelu). R-SAFETY skip — synthetic
-/// ma trivial topology trigger→capability→output, bez chain'a, R-SAFETY
-/// nieaplikowalny. Admin który nie zdefiniował flow akceptuje raw output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidationSource {
-    UserDefined,
-    Synthetic,
-}
-
 pub fn validate(
     def: &FlowDefinition,
     registry: &AdapterRegistry,
-    source: ValidationSource,
 ) -> Result<(), FlowValidationError> {
     let nodes_by_id: HashMap<&str, &crate::flow_engine::types::FlowNode> =
         def.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
@@ -480,52 +445,6 @@ pub fn validate(
         }
     }
 
-    // R-SAFETY (UserDefined only): każda ścieżka od node'a `llm` do
-    // jakiegokolwiek `output` MUSI przechodzić przez `pii_filter`. BFS
-    // z LLM downstream — pii_filter jest absorbujący (nie kontynuujemy
-    // przeszukiwania); jeśli output reachable bez przejścia przez
-    // pii_filter, to flow surface'uje raw LLM text, blokujemy compile.
-    //
-    // Synthetic skip: synthetic_chat wstrzykuje pii_filter; synthetic_tts
-    // / stt / embeddings nie mają LLM, więc R-SAFETY by się nie wywołało.
-    if source == ValidationSource::UserDefined {
-        let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
-        for edge in &def.edges {
-            outgoing
-                .entry(edge.from.as_str())
-                .or_default()
-                .push(edge.to.as_str());
-        }
-
-        for llm in def.nodes.iter().filter(|n| n.node_type == "llm") {
-            let mut stack: Vec<&str> = vec![llm.id.as_str()];
-            let mut seen: HashSet<&str> = HashSet::new();
-            seen.insert(llm.id.as_str());
-            while let Some(cur) = stack.pop() {
-                let Some(targets) = outgoing.get(cur) else {
-                    continue;
-                };
-                for &next in targets {
-                    if !seen.insert(next) {
-                        continue;
-                    }
-                    let next_node = nodes_by_id[next];
-                    if next_node.node_type == "pii_filter" {
-                        // Absorbujący — ścieżka oczyszczona, nie szukamy dalej.
-                        continue;
-                    }
-                    if next_node.node_type == "output" {
-                        return Err(FlowValidationError::MissingPiiFilter {
-                            llm_node: llm.id.clone(),
-                            output_node: next.to_string(),
-                        });
-                    }
-                    stack.push(next);
-                }
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -558,7 +477,6 @@ mod tests {
         validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap();
     }
@@ -569,7 +487,6 @@ mod tests {
         let err = validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(
@@ -586,7 +503,6 @@ mod tests {
         let err = validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(
@@ -618,7 +534,6 @@ mod tests {
         let err = validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(err, FlowValidationError::MultipleInputs { .. }));
@@ -632,15 +547,13 @@ mod tests {
         let err = validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(err, FlowValidationError::UnknownAdapter { .. }));
     }
 
     /// Streaming shape sanity — LLM bezpośrednio do `output(stream)`.
-    /// Walidacja przez `Synthetic` bo `UserDefined` egzekwuje R-SAFETY,
-    /// a ten test sprawdza wyłącznie R7 streaming end-shape.
+    /// Sprawdza R7 streaming end-shape.
     #[test]
     fn ok_streaming_shape() {
         let def = parse(
@@ -659,7 +572,6 @@ mod tests {
         validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::Synthetic,
         )
         .unwrap();
     }
@@ -682,7 +594,6 @@ mod tests {
         let err = validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(
@@ -709,7 +620,6 @@ mod tests {
         let err = validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(
@@ -750,7 +660,6 @@ mod tests {
         let err = validate(
             &def,
             &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(
@@ -786,7 +695,6 @@ mod tests {
         validate(
             &def,
             &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap();
     }
@@ -817,7 +725,6 @@ mod tests {
         let err = validate(
             &def,
             &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(
@@ -859,7 +766,6 @@ mod tests {
         let res = validate(
             &def,
             &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         );
         assert!(
             res.is_ok(),
@@ -898,7 +804,6 @@ mod tests {
         let err = validate(
             &def,
             &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(
@@ -950,7 +855,6 @@ mod tests {
         validate(
             &def,
             &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .expect("multi-producer streaming should validate");
     }
@@ -981,171 +885,12 @@ mod tests {
         let err = validate(
             &def,
             &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::StreamingNotToOutput { .. }
         ));
-    }
-
-    /// R-SAFETY: user-defined flow z LLM bezpośrednio do output (bez
-    /// pii_filter w drodze) jest odrzucony. Synthetic skipuje tę regułę.
-    #[test]
-    fn r_safety_rejects_flow_without_pii_filter() {
-        let mut r = AdapterRegistry::new();
-        r.register(Arc::new(TriggerNodeAdapter::new()));
-        r.register(Arc::new(OutputNodeAdapter::new()));
-        r.register(Arc::new(
-            crate::flow_engine::node_adapters::PiiFilterNodeAdapter::new(),
-        ));
-        r.register_llm(Arc::new(LlmNodeAdapter::new()));
-
-        let def = parse(
-            r#"{
-                "nodes":[
-                    {"id":"t","type":"trigger","config":{}},
-                    {"id":"l","type":"llm","config":{}},
-                    {"id":"o","type":"output","config":{}}
-                ],
-                "edges":[
-                    {"from":"t","to":"l","from_port":"text"},
-                    {"from":"l","to":"o","to_port":"text"}
-                ]
-            }"#,
-        );
-        let err = validate(
-            &def,
-            &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, FlowValidationError::MissingPiiFilter { .. }),
-            "expected MissingPiiFilter, got {err:?}"
-        );
-
-        // Synthetic: ten sam topology przechodzi (synthetic ma swoje
-        // gwarancje budowane w runtime).
-        validate(
-            &def,
-            &r,
-            crate::flow_engine::validation::ValidationSource::Synthetic,
-        )
-        .expect("synthetic skip");
-    }
-
-    /// R-SAFETY: blocking chain trigger → llm → pii_filter → output
-    /// przechodzi (pii_filter na drodze do output).
-    #[test]
-    fn r_safety_accepts_flow_with_pii_filter_blocking() {
-        let mut r = AdapterRegistry::new();
-        r.register(Arc::new(TriggerNodeAdapter::new()));
-        r.register(Arc::new(OutputNodeAdapter::new()));
-        r.register(Arc::new(
-            crate::flow_engine::node_adapters::PiiFilterNodeAdapter::new(),
-        ));
-        r.register_llm(Arc::new(LlmNodeAdapter::new()));
-
-        let def = parse(
-            r#"{
-                "nodes":[
-                    {"id":"t","type":"trigger","config":{}},
-                    {"id":"l","type":"llm","config":{}},
-                    {"id":"p","type":"pii_filter","config":{}},
-                    {"id":"o","type":"output","config":{}}
-                ],
-                "edges":[
-                    {"from":"t","to":"l","from_port":"text"},
-                    {"from":"l","to":"p"},
-                    {"from":"p","to":"o","to_port":"text"}
-                ]
-            }"#,
-        );
-        validate(
-            &def,
-            &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
-        )
-        .expect("R-SAFETY pass");
-    }
-
-    /// R-SAFETY: streaming chain LLM.stream → pii_filter.stream →
-    /// output(stream) przechodzi — pii_filter dalej jest absorbujący
-    /// niezależnie od portu.
-    #[test]
-    fn r_safety_accepts_flow_with_pii_filter_streaming() {
-        let mut r = AdapterRegistry::new();
-        r.register(Arc::new(TriggerNodeAdapter::new()));
-        r.register(Arc::new(OutputNodeAdapter::new()));
-        r.register_streaming(Arc::new(
-            crate::flow_engine::node_adapters::PiiFilterNodeAdapter::new(),
-        ));
-        r.register_llm(Arc::new(LlmNodeAdapter::new()));
-
-        let def = parse(
-            r#"{
-                "nodes":[
-                    {"id":"t","type":"trigger","config":{}},
-                    {"id":"l","type":"llm","config":{}},
-                    {"id":"p","type":"pii_filter","config":{}},
-                    {"id":"o","type":"output","config":{"mode":"stream"}}
-                ],
-                "edges":[
-                    {"from":"t","to":"l","from_port":"text"},
-                    {"from":"l","to":"p","from_port":"stream"},
-                    {"from":"p","to":"o","from_port":"stream","to_port":"text"}
-                ]
-            }"#,
-        );
-        validate(
-            &def,
-            &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
-        )
-        .expect("R-SAFETY streaming pass");
-    }
-
-    /// R-SAFETY: condition fan-out — jedna gałąź ma pii_filter, druga
-    /// goła do output. Walidator wykrywa drugą i odrzuca.
-    #[test]
-    fn r_safety_rejects_when_condition_branch_bypasses_pii_filter() {
-        let mut r = AdapterRegistry::new();
-        r.register(Arc::new(TriggerNodeAdapter::new()));
-        r.register(Arc::new(OutputNodeAdapter::new()));
-        r.register(Arc::new(ConditionNodeAdapter::new()));
-        r.register(Arc::new(
-            crate::flow_engine::node_adapters::PiiFilterNodeAdapter::new(),
-        ));
-        r.register_llm(Arc::new(LlmNodeAdapter::new()));
-
-        let def = parse(
-            r#"{
-                "nodes":[
-                    {"id":"t","type":"trigger","config":{}},
-                    {"id":"l","type":"llm","config":{}},
-                    {"id":"c","type":"condition","config":{}},
-                    {"id":"p","type":"pii_filter","config":{}},
-                    {"id":"o1","type":"output","config":{}},
-                    {"id":"o2","type":"output","config":{}}
-                ],
-                "edges":[
-                    {"from":"t","to":"l","from_port":"text"},
-                    {"from":"l","to":"c"},
-                    {"from":"c","to":"p","from_port":"true"},
-                    {"from":"p","to":"o1","to_port":"text"},
-                    {"from":"c","to":"o2","from_port":"false","to_port":"text"}
-                ]
-            }"#,
-        );
-        let err = validate(
-            &def,
-            &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
-        )
-        .unwrap_err();
-        assert!(matches!(err, FlowValidationError::MissingPiiFilter { .. }));
     }
 
     #[test]
@@ -1164,7 +909,6 @@ mod tests {
         let err = validate(
             &def,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(
