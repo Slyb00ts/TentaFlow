@@ -349,7 +349,6 @@ impl FlowDispatcher {
             flow.id,
             &flow.flow_json,
             &self.registry,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         ) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -490,7 +489,6 @@ impl FlowDispatcher {
                     flow.id,
                     &flow.flow_json,
                     &self.registry,
-                    crate::flow_engine::validation::ValidationSource::UserDefined,
                 ) {
                     Ok(c) => Arc::new(c),
                     Err(e) => {
@@ -573,7 +571,6 @@ impl FlowDispatcher {
             0,
             definition,
             &self.registry,
-            crate::flow_engine::validation::ValidationSource::Synthetic,
         ) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -673,7 +670,7 @@ fn wrap_blocking_as_stream(
 /// (blocking + streaming). Czysta NodeAdapter rejestracja przez
 /// `register` dla nodów które nie mają stream variant'a.
 fn build_registry() -> AdapterRegistry {
-    use crate::flow_engine::node_adapters::TtsStreamBridgeNodeAdapter;
+    use crate::flow_engine::node_adapters::{SentenceBufferNodeAdapter, TtsStreamBridgeNodeAdapter};
 
     let mut r = AdapterRegistry::new();
     let arcs: Vec<Arc<dyn NodeAdapter>> = vec![
@@ -681,7 +678,6 @@ fn build_registry() -> AdapterRegistry {
         Arc::new(OutputNodeAdapter::new()),
         Arc::new(ConditionNodeAdapter::new()),
         Arc::new(CombineNodeAdapter::new()),
-        Arc::new(TtsCleanNodeAdapter::new()),
         Arc::new(SttNodeAdapter::new()),
         Arc::new(TtsNodeAdapter::new()),
         Arc::new(EmbeddingsNodeAdapter::new()),
@@ -699,6 +695,8 @@ fn build_registry() -> AdapterRegistry {
     // + StreamingNodeAdapter) trafiają do obu slotów przez register_streaming.
     r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
     r.register_streaming(Arc::new(TtsStreamBridgeNodeAdapter::new()));
+    r.register_streaming(Arc::new(TtsCleanNodeAdapter::new()));
+    r.register_streaming(Arc::new(SentenceBufferNodeAdapter::new()));
     r
 }
 
@@ -725,20 +723,24 @@ mod tests {
             "speaker_context",
             "llm",
             "tts_stream_bridge",
+            "sentence_buffer",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }
         assert!(r.llm().is_some(), "LLM typed accessor must be wired");
         // Stage 3d Krok 2c: streaming-aware adaptery dostępne też w
         // streaming slot rejestru.
-        assert!(
-            r.streaming_adapter("pii_filter").is_some(),
-            "pii_filter must be registered in streaming slot"
-        );
-        assert!(
-            r.streaming_adapter("tts_stream_bridge").is_some(),
-            "tts_stream_bridge must be registered in streaming slot"
-        );
+        for streaming in [
+            "pii_filter",
+            "tts_stream_bridge",
+            "tts_clean",
+            "sentence_buffer",
+        ] {
+            assert!(
+                r.streaming_adapter(streaming).is_some(),
+                "{streaming} must be registered in streaming slot"
+            );
+        }
     }
 
     #[test]
