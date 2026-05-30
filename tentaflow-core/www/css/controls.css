@@ -4610,9 +4610,9 @@ tf-skeleton {
 .tf-card--bg-accent  { background: var(--tf-bg-accent); }
 .tf-card--bg-inverse { background: var(--tf-bg-inverse); }
 .tf-card--border-none     { border: 0; }
-.tf-card--border-hairline { border: 0.5px solid currentColor; }
-.tf-card--border-thin     { border: 1px solid currentColor; }
-.tf-card--border-strong   { border: 2px solid currentColor; }
+.tf-card--border-hairline { border: 1px solid var(--tf-border); }
+.tf-card--border-thin     { border: 1px solid var(--tf-border); }
+.tf-card--border-strong   { border: 2px solid var(--tf-border-hover); }
 .tf-card--border-accent   { border: 1px solid var(--tf-accent-1); }
 .tf-card--border-tone-neutral  { border-color: var(--tf-text-3); }
 .tf-card--border-tone-primary  { border-color: var(--tf-accent-1); }
@@ -4628,10 +4628,21 @@ tf-skeleton {
 .tf-card--accent-critical { --tf-card-accent: var(--tf-danger); }
 .tf-card--accent-info     { --tf-card-accent: var(--tf-info); }
 .tf-card--accent-muted    { --tf-card-accent: var(--tf-text-3); }
-.tf-card--clickable { cursor: pointer; }
+.tf-card--clickable { cursor: pointer; transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease; }
 .tf-card--clickable:focus-visible { outline: 2px solid var(--tf-accent-1); outline-offset: 2px; }
+.tf-card--clickable:hover { border-color: var(--tf-border-hover); }
 .tf-card--interactive { transition: transform 0.15s ease, box-shadow 0.15s ease; }
 .tf-card--interactive:hover { transform: translateY(-1px); }
+
+/* Selected clickable card: Filled + accent primary marks the chosen option. */
+.tf-card--clickable.tf-card--variant-filled.tf-card--accent-primary {
+  border-color: var(--tf-accent-1);
+  background: var(--tf-accent-glow);
+  box-shadow: 0 0 0 1px var(--tf-accent-1) inset;
+}
+.tf-card--clickable.tf-card--variant-filled.tf-card--accent-primary:hover {
+  border-color: var(--tf-accent-2);
+}
 
 /* tf-section-card */
 .tf-section-card__header  { display: flex; align-items: center; gap: var(--tf-space-md); }
@@ -4639,9 +4650,9 @@ tf-skeleton {
 .tf-section-card__title   { margin: 0; font-size: 1rem; font-weight: 600; }
 .tf-section-card__subtitle{ color: var(--tf-text-3); font-size: 0.85em; }
 .tf-section-card__actions { display: flex; gap: var(--tf-space-xs); flex: 0 0 auto; }
-.tf-section-card__header-divider { height: 1px; background: currentColor; opacity: 0.15; }
+.tf-section-card__header-divider { height: 1px; background: var(--tf-border); }
 .tf-section-card__body    { display: flex; flex-direction: column; gap: var(--tf-space-md); }
-.tf-section-card__footer  { display: flex; gap: var(--tf-space-sm); border-top: 1px solid currentColor; padding-top: var(--tf-space-md); }
+.tf-section-card__footer  { display: flex; gap: var(--tf-space-sm); border-top: 1px solid var(--tf-border); padding-top: var(--tf-space-md); }
 
 /* tf-collapsible */
 .tf-collapsible { display: flex; flex-direction: column; min-width: 0; }
