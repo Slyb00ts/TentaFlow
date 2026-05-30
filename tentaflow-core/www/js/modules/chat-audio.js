@@ -189,6 +189,9 @@ export class AudioPipeline {
     this.conv = opts.conv || null;
     this.faceHandle = opts.faceHandle;
     this.onUserUtterance = opts.onUserUtterance || (() => {});
+    // Binarny most: emituje całą wypowiedź (WAV Uint8Array + sampleRate) do
+    // callera, który odpala flow przez FlowInvoke. Flow robi STT→LLM→TTS.
+    this.onUtteranceAudio = opts.onUtteranceAudio || (() => {});
     this.onStateChange = opts.onStateChange || (() => {});
     this.onError = opts.onError || (() => {});
     this.bargeInAbort = opts.bargeInAbort || (() => {});
@@ -434,27 +437,23 @@ export class AudioPipeline {
     }
   }
 
-  // ---- Caller-driven LLM stream feed ------------------------------------
+  // ---- Caller-driven flow response feed ---------------------------------
+  // Flow (przez binary FlowInvoke) odsyła gotowe audio + tekst. chat.js woła
+  // playAudioChunk dla każdego audio chunka i finishResponse na końcu stream'u.
+  // Tekst trafia do bąbla po stronie chat.js, nie tutaj.
 
-  feedAssistantDelta(delta) {
-    if (this.state !== STATES.THINKING && this.state !== STATES.SPEAKING) {
-      // Pierwsza chunk po _onSpeechEnd — przeskoczylismy z TRANSCRIBING.
-      // Akceptuj tylko jesli aktualnie czekamy na bota (nie po abort()).
-      if (this.state !== STATES.TRANSCRIBING) return;
+  playAudioChunk(bytes, mime) {
+    if (!bytes || bytes.length === 0) return;
+    if (this.state === STATES.THINKING || this.state === STATES.TRANSCRIBING) {
+      this._setState(STATES.SPEAKING);
     }
-    if (this.state === STATES.TRANSCRIBING) {
-      this._setState(STATES.THINKING);
-    }
-    const sentences = this.sentenceBuf.push(delta);
-    for (const s of sentences) this._enqueueTts(s);
+    this._enqueueAudio({ bytes, mime: mime || 'audio/wav' });
   }
 
-  feedAssistantEnd() {
+  finishResponse() {
     this.streamComplete = true;
-    const rest = this.sentenceBuf.drain();
-    for (const s of rest) this._enqueueTts(s);
     if (!this.ttsPlaying && this.ttsQueue.length === 0) {
-      // Pusty stream (LLM zwrocil 0 tokenow) — wracamy do listen od razu.
+      // Pusta odpowiedź albo całe audio już odtworzone — wracamy do listen.
       this._setState(STATES.LISTENING);
     }
   }
@@ -462,7 +461,6 @@ export class AudioPipeline {
   feedAssistantError(_err) {
     // Caller juz zatoastowal blad — my tylko sprzatamy lokalny stan.
     this.streamComplete = true;
-    this.sentenceBuf.reset();
     this.ttsQueue = [];
     this._stopActiveTts(true);
     this._setState(STATES.LISTENING);
@@ -634,52 +632,14 @@ export class AudioPipeline {
 
     this._setState(STATES.TRANSCRIBING);
 
-    // STT call — multipart upload do /v1/audio/transcriptions.
-    let text = '';
-    try {
-      const wav = floatToWav(merged, this.frameSampleRate, 16000);
-      const blob = new Blob([wav], { type: 'audio/wav' });
-      const fd = new FormData();
-      fd.append('file', blob, 'utterance.wav');
-      const cfg = this.conv?.audioConfig || {};
-      fd.append('model', cfg.sttModel || 'whisper-1');
-      if (cfg.language) fd.append('language', cfg.language);
-      fd.append('response_format', 'json');
-      this.sttAbortController = new AbortController();
-      const resp = await fetch('/v1/audio/transcriptions', {
-        method: 'POST',
-        body: fd,
-        signal: this.sttAbortController.signal,
-        credentials: 'same-origin',
-      });
-      this.sttAbortController = null;
-      if (!resp.ok) throw new Error(`STT HTTP ${resp.status}`);
-      const json = await resp.json();
-      text = (json && typeof json.text === 'string') ? json.text.trim() : '';
-    } catch (err) {
-      this.sttAbortController = null;
-      if (err.name === 'AbortError') {
-        this._setState(STATES.LISTENING);
-        return;
-      }
-      this.onError(err);
-      this._setState(STATES.LISTENING);
-      return;
-    }
-
-    if (!text) {
-      // Pusta transkrypcja — caller pokaze toast i wroci do listen.
-      this.onUserUtterance('');
-      this._setState(STATES.LISTENING);
-      return;
-    }
-
-    // Mark thinking i emit do callera. Caller pushuje user msg + startuje
-    // LLM stream subscription, a deltas wracaja przez feedAssistantDelta.
+    // Binarny most: NIE robimy STT po REST. Emitujemy całą wypowiedź (WAV) do
+    // callera, który odpala flow przez binary FlowInvoke. Flow robi
+    // STT→LLM→TTS i odsyła przeplatane tekst+audio (playAudioChunk +
+    // onUserUtterance dla transkryptu).
+    const wav = floatToWav(merged, this.frameSampleRate, 16000);
     this._setState(STATES.THINKING);
     this.streamComplete = false;
-    this.sentenceBuf.reset();
-    this.onUserUtterance(text);
+    this.onUtteranceAudio(wav, this.frameSampleRate >= 16000 ? 16000 : this.frameSampleRate);
   }
 
   _abortStt() {
@@ -729,11 +689,13 @@ export class AudioPipeline {
     this.bargeInSpeechMs = 0;
   }
 
-  // ---- TTS queue --------------------------------------------------------
+  // ---- Audio playback queue ---------------------------------------------
+  // Kolejka GOTOWYCH chunków audio z flow ({bytes, mime}). Bez REST/TTS — flow
+  // syntezuje audio serwerowo i odsyła bajty binarnym FlowInvoke.
 
-  _enqueueTts(sentence) {
-    if (!sentence) return;
-    this.ttsQueue.push(sentence);
+  _enqueueAudio(item) {
+    if (!item || !item.bytes || item.bytes.length === 0) return;
+    this.ttsQueue.push(item);
     if (!this.ttsPlaying) this._playNextTts();
   }
 
@@ -741,40 +703,21 @@ export class AudioPipeline {
     if (this.ttsQueue.length === 0) {
       this.ttsPlaying = false;
       if (this.streamComplete) {
-        // Caly stream + queue wyemitowane — wracamy do listen.
+        // Cała odpowiedź odtworzona — wracamy do listen.
         this._setState(STATES.LISTENING);
       }
       return;
     }
-    const sentence = this.ttsQueue.shift();
+    const item = this.ttsQueue.shift();
     this.ttsPlaying = true;
 
     let url;
     try {
-      const cfg = this.conv?.audioConfig || {};
-      this.ttsAbortController = new AbortController();
-      const resp = await fetch('/v1/audio/speech', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        signal: this.ttsAbortController.signal,
-        body: JSON.stringify({
-          model: cfg.ttsModel || 'tts-1',
-          input: sentence,
-          voice: cfg.voice || 'nova',
-          language: cfg.language || 'pl',
-          response_format: 'mp3',
-        }),
-      });
-      this.ttsAbortController = null;
-      if (!resp.ok) throw new Error(`TTS HTTP ${resp.status}`);
-      const blob = await resp.blob();
+      const blob = new Blob([item.bytes], { type: item.mime || 'audio/wav' });
       url = URL.createObjectURL(blob);
     } catch (err) {
-      this.ttsAbortController = null;
-      if (err.name !== 'AbortError') this.onError(err);
+      this.onError(err);
       this.ttsPlaying = false;
-      // Po blędzie TTS zostanmy w aktualnym state — nastepne zdanie sprobuje.
       if (this.ttsQueue.length > 0) {
         this._playNextTts();
       } else if (this.streamComplete) {

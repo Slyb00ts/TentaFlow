@@ -215,6 +215,33 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::FlowInvokeRequest — uniwersalny most do flow engine
+   * (audio-only wariant dla chat audio). `audio` to Uint8Array WAV.
+   */
+  flowInvokeRequest(
+    correlationId,
+    { model, serviceType, mime, sampleRate, audio, language, sessionId },
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeFlowInvokeAudio(
+      model,
+      serviceType,
+      mime || 'audio/wav',
+      sampleRate ?? undefined,
+      audio,
+      language ?? undefined,
+      sessionId ?? undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::MeshNodeListRequest (unit). */
   meshNodeListRequest(correlationId, sequence = 1) {
     assertReady();
