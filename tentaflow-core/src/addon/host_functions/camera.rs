@@ -32,7 +32,7 @@ use tentaflow_sdk_spec::{
     CameraAddInput, CameraAddOutput, CameraCredentialsRotateInput, CameraCredentialsRotateOut,
     CameraDiscoverOut, CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut,
     CameraRemoveOut, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
-    CameraUpdateInput, DiscoveredCameraOut,
+    CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
 };
 
 use super::abi_helpers::{enforce_payload_size, PayloadKind};
@@ -47,8 +47,8 @@ use crate::db::repository::{
     set_camera_onvif_resolved, soft_delete_camera, update_camera, CameraPatch, CameraRow,
 };
 use crate::services::camera_ingest::{
-    credentials::credentials_cipher, start_supervisor, CameraConfig, CameraIngestError,
-    CameraIngestSupervisor,
+    credentials::credentials_cipher, list_local_devices, start_supervisor, CameraConfig,
+    CameraIngestError, CameraIngestSupervisor,
 };
 
 // =============================================================================
@@ -999,6 +999,56 @@ pub fn camera_list_v1(
         }
     };
     audit(caller.data(), "camera.list", None, RiskClass::B, "ok", None);
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+}
+
+// =============================================================================
+// Host function: camera_local_devices_v1
+// =============================================================================
+//
+// Enumerates locally attached camera devices (USB / v4l2) so a wizard can offer
+// a device dropdown instead of a free-text path. Read-only discovery, so it
+// reuses `cameras.read` rather than introducing a new permission. Enumeration
+// is Linux/v4l2 today; other platforms return an empty list (not an error).
+
+pub fn camera_local_devices_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
+        audit(
+            caller.data(),
+            "camera.local_devices",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let devices = list_local_devices()
+        .into_iter()
+        .map(|d| LocalCameraDeviceOut {
+            device_path: d.device_path,
+            label: d.label,
+            vendor: d.vendor,
+        })
+        .collect();
+    let out = LocalCameraDevicesOut { devices };
+    audit(
+        caller.data(),
+        "camera.local_devices",
+        None,
+        RiskClass::B,
+        "ok",
+        None,
+    );
     write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 

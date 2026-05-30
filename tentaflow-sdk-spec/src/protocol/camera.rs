@@ -273,6 +273,30 @@ pub struct CameraCredentialsRotateOut {
     pub reason: String,
 }
 
+/// A single locally attached camera device enumerated by
+/// `camera_local_devices_v1`. `device_path` is the value to pass back as the
+/// camera `url` (e.g. `/dev/video0` on Linux), `vendor` is the matching stable
+/// TentaFlow vendor (`v4l2` on Linux, `local_camera` elsewhere).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct LocalCameraDeviceOut {
+    #[n(0)]
+    pub device_path: String,
+    #[n(1)]
+    pub label: String,
+    #[n(2)]
+    pub vendor: String,
+}
+
+/// Output of `camera_local_devices_v1`. An empty list is a valid result on
+/// platforms without enumeration support — it is not an error.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct LocalCameraDevicesOut {
+    #[n(0)]
+    pub devices: Vec<LocalCameraDeviceOut>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +387,18 @@ mod tests {
     #[test]
     fn roundtrip_list_out() {
         roundtrip(&CameraListOut { camera: vec![] });
+    }
+
+    #[test]
+    fn roundtrip_local_devices_out() {
+        roundtrip(&LocalCameraDevicesOut { devices: vec![] });
+        roundtrip(&LocalCameraDevicesOut {
+            devices: vec![LocalCameraDeviceOut {
+                device_path: "/dev/video0".into(),
+                label: "HD Webcam".into(),
+                vendor: "v4l2".into(),
+            }],
+        });
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub mod supervisor;
 
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
 pub use error::{CameraIngestError, Result};
+pub use local::{list_local_devices, LocalCameraDevice};
 pub use session::{
     spawn_session, CameraConfig, CameraHandle, CameraHealth, CameraStatus, PixelFormat,
     SessionCommand, SnapshotData,
