@@ -9285,60 +9285,66 @@ fn patch_ops_to_js(
             path_arr.push(&seg_obj.into());
         }
         set(&obj, "path", path_arr.into());
+        // StateStore.applyOpInPlace expects `op` as an object `{ kind, ... }`
+        // (PatchOpKind tagged union) with the variant payload nested inside
+        // `op`. Emitting `op` as a string with sibling fields is rejected
+        // client-side, which silently drops every StatePatch.
+        let op_obj = js_sys::Object::new();
         match &op.op {
             PatchOpKind::Set { value } => {
-                set(&obj, "op", "set".into());
+                set(&op_obj, "kind", "set".into());
                 set(
-                    &obj,
+                    &op_obj,
                     "value",
                     value_to_js(value).map_err(|e| JsError::new(&e))?,
                 );
             }
             PatchOpKind::Delete => {
-                set(&obj, "op", "delete".into());
+                set(&op_obj, "kind", "delete".into());
             }
             PatchOpKind::AppendArray { value } => {
-                set(&obj, "op", "append_array".into());
+                set(&op_obj, "kind", "append_array".into());
                 set(
-                    &obj,
+                    &op_obj,
                     "value",
                     value_to_js(value).map_err(|e| JsError::new(&e))?,
                 );
             }
             PatchOpKind::PrependArray { value } => {
-                set(&obj, "op", "prepend_array".into());
+                set(&op_obj, "kind", "prepend_array".into());
                 set(
-                    &obj,
+                    &op_obj,
                     "value",
                     value_to_js(value).map_err(|e| JsError::new(&e))?,
                 );
             }
             PatchOpKind::InsertArray { index, value } => {
-                set(&obj, "op", "insert_array".into());
-                set(&obj, "index", (*index as f64).into());
+                set(&op_obj, "kind", "insert_array".into());
+                set(&op_obj, "index", (*index as f64).into());
                 set(
-                    &obj,
+                    &op_obj,
                     "value",
                     value_to_js(value).map_err(|e| JsError::new(&e))?,
                 );
             }
             PatchOpKind::RemoveArray { index } => {
-                set(&obj, "op", "remove_array".into());
-                set(&obj, "index", (*index as f64).into());
+                set(&op_obj, "kind", "remove_array".into());
+                set(&op_obj, "index", (*index as f64).into());
             }
             PatchOpKind::MergeMap { value } => {
-                set(&obj, "op", "merge_map".into());
+                set(&op_obj, "kind", "merge_map".into());
                 let m_obj = js_sys::Object::new();
                 for (k, v) in &value.0 {
                     set(&m_obj, k, value_to_js(v).map_err(|e| JsError::new(&e))?);
                 }
-                set(&obj, "value", m_obj.into());
+                set(&op_obj, "value", m_obj.into());
             }
             PatchOpKind::Increment { delta } => {
-                set(&obj, "op", "increment".into());
-                set(&obj, "delta", (*delta as f64).into());
+                set(&op_obj, "kind", "increment".into());
+                set(&op_obj, "delta", (*delta as f64).into());
             }
         }
+        set(&obj, "op", op_obj.into());
         arr.push(&obj.into());
     }
     Ok(arr.into())
