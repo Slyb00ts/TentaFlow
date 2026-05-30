@@ -9,9 +9,11 @@
 
 use anyhow::{anyhow, Result};
 use futures::stream::{BoxStream, StreamExt};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{repository, DbPool};
@@ -29,9 +31,13 @@ pub struct StreamingExecution {
     pub outcome: oneshot::Receiver<FlowExecutionOutcome>,
 }
 
-/// Blocking execution. Toposort, każdy node wywołany przez adapter z mapy,
-/// outputs trzymane w `Arc<FlowEnvelope>` per pos. continue_on_error z
-/// trigger.config kontroluje czy błąd przerywa flow.
+/// Blocking execution. Dataflow scheduler: node startuje gdy wszystkie jego
+/// poprzedniki dały output; gotowe nody lecą równolegle (`tokio::JoinSet`).
+/// Fan-out z dowolnego noda wykonuje gałęzie współbieżnie, a node z N
+/// wejściami (`combine`/`output`) jest naturalną barierą — scheduler odpala
+/// go dopiero gdy wszystkie N gałęzi skończą. Flow liniowy degeneruje się do
+/// jednego gotowego noda naraz (zachowanie jak topo loop). continue_on_error
+/// z trigger.config kontroluje czy błąd przerywa flow.
 pub async fn execute_blocking(
     db: DbPool,
     compiled: Arc<CompiledFlow>,
@@ -55,84 +61,99 @@ pub async fn execute_blocking(
             n
         ));
     }
+
+    let (mut pending_deps, succs) = build_dependency_graph(&compiled, n);
+    let ctx = Arc::new(ctx);
     let mut outputs: Vec<Option<Arc<FlowEnvelope>>> = vec![None; n];
     let mut trace: Vec<TraceStep> = Vec::with_capacity(n);
     let mut error: Option<String> = None;
     let mut last_finish_reason: Option<FinishReason> = None;
 
-    for (run_idx, &def_idx) in compiled.execution_order.iter().enumerate() {
-        // Cancel + deadline gate między node'ami: klient disconnect /
-        // operator timeout abortuje flow zanim wystartuje kolejny adapter.
-        // Per-adapter cancel/deadline propaguje się przez ExecutionContext
-        // wewnątrz LLM dispatcher; tu pilnujemy granicy topo-loopa.
+    let mut join_set: JoinSet<NodeRun> = JoinSet::new();
+    // Seed: wszystkie nody bez poprzedników (trigger) gotowe od razu.
+    for pos in 0..n {
+        if pending_deps[pos] == 0 {
+            spawn_node(&mut join_set, &compiled, &adapters, &ctx, &outputs, pos)?;
+        }
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let run = joined.map_err(|e| anyhow!("flow node task failed to join: {e}"))?;
+        match run.result {
+            Ok(envelope) => {
+                trace.push(TraceStep {
+                    node_id: run.node_id,
+                    node_type: run.node_type,
+                    started_at_ms: run.step_started_ms,
+                    duration_ms: run.duration_ms,
+                    status: TraceStatus::Ok,
+                    usage: None,
+                });
+                outputs[run.pos] = Some(Arc::new(envelope));
+            }
+            Err(msg) => {
+                trace.push(TraceStep {
+                    node_id: run.node_id,
+                    node_type: run.node_type,
+                    started_at_ms: run.step_started_ms,
+                    duration_ms: run.duration_ms,
+                    status: TraceStatus::Error {
+                        message: msg.clone(),
+                    },
+                    usage: None,
+                });
+                if continue_on_error {
+                    // Propaguj envelope sprzed błędu — następniki dostaną
+                    // pierwsze dostępne wejście tego noda, fallback initial.
+                    let propagated = build_inputs(&compiled, run.pos, &outputs)
+                        .into_iter()
+                        .next()
+                        .map(|i| i.envelope)
+                        .unwrap_or_else(|| initial_arc.clone());
+                    outputs[run.pos] = Some(propagated);
+                } else {
+                    error = Some(msg);
+                    last_finish_reason = Some(FinishReason::Error);
+                    abort_join_set(&mut join_set).await;
+                    break;
+                }
+            }
+        }
+
+        // Cancel/deadline gate po każdym ukończonym node'ie — klient
+        // disconnect / operator timeout abortuje resztę in-flight gałęzi.
         if ctx.cancel_token.is_cancelled() {
             error = Some("cancelled".into());
             last_finish_reason = Some(FinishReason::Cancelled);
+            abort_join_set(&mut join_set).await;
             break;
         }
         if let Some(dl) = ctx.deadline {
             if Instant::now() >= dl {
                 error = Some("deadline exceeded".into());
                 last_finish_reason = Some(FinishReason::Error);
+                abort_join_set(&mut join_set).await;
                 break;
             }
         }
-        let node = &compiled.definition.nodes[def_idx];
-        let inputs = build_inputs(&compiled, run_idx, &outputs);
-        let adapter = adapters.get(&node.node_type).ok_or_else(|| {
-            anyhow!(
-                "no adapter for node '{}' (type '{}')",
-                node.id,
-                node.node_type
-            )
-        })?;
 
-        let step_started = ctx.clock.now_ms();
-        let attempt_started = Instant::now();
-        match adapter.execute(node, &inputs, &ctx).await {
-            Ok(envelope) => {
-                let duration_ms = attempt_started.elapsed().as_millis() as u64;
-                let usage = take_node_usage(&ctx, &node.id);
-                trace.push(TraceStep {
-                    node_id: node.id.clone(),
-                    node_type: node.node_type.clone(),
-                    started_at_ms: step_started,
-                    duration_ms,
-                    status: TraceStatus::Ok,
-                    usage,
-                });
-                outputs[run_idx] = Some(Arc::new(envelope));
-            }
-            Err(e) => {
-                let duration_ms = attempt_started.elapsed().as_millis() as u64;
-                trace.push(TraceStep {
-                    node_id: node.id.clone(),
-                    node_type: node.node_type.clone(),
-                    started_at_ms: step_started,
-                    duration_ms,
-                    status: TraceStatus::Error {
-                        message: e.to_string(),
-                    },
-                    usage: None,
-                });
-                if continue_on_error {
-                    // Propaguj envelope sprzed błędu — kolejny node dostanie
-                    // ostatni dostępny output. Brak ustalonego producenta →
-                    // initial.
-                    let propagated = inputs
-                        .first()
-                        .map(|i| i.envelope.clone())
-                        .unwrap_or_else(|| initial_arc.clone());
-                    outputs[run_idx] = Some(propagated);
-                    continue;
-                } else {
-                    error = Some(e.to_string());
-                    last_finish_reason = Some(FinishReason::Error);
-                    break;
-                }
+        // Zwolnij następniki: każdy traci jedną zależność; ten który osiągnął
+        // zero (wszystkie poprzedniki gotowe) startuje teraz.
+        for &succ in &succs[run.pos] {
+            pending_deps[succ] -= 1;
+            if pending_deps[succ] == 0 {
+                spawn_node(&mut join_set, &compiled, &adapters, &ctx, &outputs, succ)?;
             }
         }
     }
+
+    // Usage attribution post-pass: per-node `usage_sink` drain raz, bucket po
+    // node_id. Drain-per-node nie nadaje się przy współbieżności (drain zbiera
+    // cały sink — wyścig o cudze wpisy).
+    attribute_usage(&ctx, &mut trace);
+    // Trace kończy się w kolejności ukończenia (out-of-order przy
+    // równoległości) — sortujemy po starcie dla stabilnego widoku.
+    trace.sort_by_key(|s| s.started_at_ms);
 
     let final_envelope = pick_final_envelope(&outputs, &initial_arc);
     let aggregate_usage = aggregate_usage(&trace);
@@ -153,6 +174,115 @@ pub async fn execute_blocking(
 
     persist_execution(&db, execution_id, &outcome).await;
     Ok(outcome)
+}
+
+/// Wynik wykonania pojedynczego node'a w schedulerze dataflow — wraca z taska
+/// `JoinSet` do pętli koordynującej.
+struct NodeRun {
+    pos: usize,
+    node_id: String,
+    node_type: String,
+    step_started_ms: u64,
+    duration_ms: u64,
+    result: std::result::Result<FlowEnvelope, String>,
+}
+
+/// Buduje (pending_deps, succs) z compiled flow. `pending_deps[pos]` = liczba
+/// odrębnych poprzedników node'a (in-degree liczone po node'ach, nie krawędziach
+/// — combine z dwiema krawędziami od tego samego noda liczy 1). `succs[from]` =
+/// pozycje zależne od `from`. Toposort w compile gwarantuje brak cykli, więc
+/// scheduler zawsze osusza JoinSet.
+fn build_dependency_graph(compiled: &CompiledFlow, n: usize) -> (Vec<usize>, Vec<Vec<usize>>) {
+    // Jeden globalny HashSet par (from,pos) zamiast N HashSetów per node —
+    // dedupy podwójnych krawędzi tej samej pary (rzadkie, np. dwie krawędzie do
+    // jednego combine z tego samego noda) bez alokacji setu na każdy węzeł.
+    let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
+    let mut pending_deps = vec![0usize; n];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for pos in 0..n {
+        for &edge_idx in &compiled.incoming_edges_per_pos[pos] {
+            let edge = &compiled.definition.edges[edge_idx];
+            if let Some(&from_pos) = compiled.run_idx_by_id.get(edge.from.as_str()) {
+                if from_pos != pos && seen_pairs.insert((from_pos, pos)) {
+                    pending_deps[pos] += 1;
+                    succs[from_pos].push(pos);
+                }
+            }
+        }
+    }
+    (pending_deps, succs)
+}
+
+/// Buduje inputs z ukończonych poprzedników i spawnuje adapter node'a jako task.
+/// Wołane tylko gdy `pending_deps[pos]==0`, więc wszystkie poprzedniki mają już
+/// `Some(output)`.
+fn spawn_node(
+    join_set: &mut JoinSet<NodeRun>,
+    compiled: &Arc<CompiledFlow>,
+    adapters: &Arc<AdapterRegistry>,
+    ctx: &Arc<ExecutionContext>,
+    outputs: &[Option<Arc<FlowEnvelope>>],
+    pos: usize,
+) -> Result<()> {
+    let def_idx = compiled.execution_order[pos];
+    // Borrow node tylko do lookupu adaptera — NIE klonujemy FlowNode (config to
+    // potencjalnie duży serde_json::Value). Task dostaje `Arc<CompiledFlow>`
+    // (refcount bump) i czyta node przez indeks.
+    let node = &compiled.definition.nodes[def_idx];
+    let adapter = adapters.get(&node.node_type).ok_or_else(|| {
+        anyhow!(
+            "no adapter for node '{}' (type '{}')",
+            node.id,
+            node.node_type
+        )
+    })?;
+    let inputs = build_inputs(compiled, pos, outputs);
+    let compiled = compiled.clone();
+    let ctx = ctx.clone();
+    let step_started_ms = ctx.clock.now_ms();
+    join_set.spawn(async move {
+        let node = &compiled.definition.nodes[def_idx];
+        let attempt = Instant::now();
+        let result = adapter.execute(node, &inputs, &ctx).await;
+        let duration_ms = attempt.elapsed().as_millis() as u64;
+        NodeRun {
+            pos,
+            node_id: node.id.clone(),
+            node_type: node.node_type.clone(),
+            step_started_ms,
+            duration_ms,
+            result: result.map_err(|e| e.to_string()),
+        }
+    });
+    Ok(())
+}
+
+/// Abortuje i osusza pozostałe taski po fatalnym błędzie/cancel/deadline, żeby
+/// żaden in-flight adapter nie pisał do `usage_sink` po `attribute_usage`.
+async fn abort_join_set(join_set: &mut JoinSet<NodeRun>) {
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
+}
+
+/// Rozdziela usage z `usage_sink` na TraceStep wg node_id. Drain raz na koniec
+/// (po osuszeniu JoinSet) — bezpieczne przy współbieżności, w przeciwieństwie do
+/// drain-per-node w trakcie.
+fn attribute_usage(ctx: &ExecutionContext, trace: &mut [TraceStep]) {
+    let drained = ctx.usage_sink.drain();
+    if drained.is_empty() {
+        return;
+    }
+    let mut by_node: HashMap<String, TokenUsage> = HashMap::new();
+    for (id, u) in drained {
+        by_node.entry(id).or_default().add(&u);
+    }
+    for step in trace.iter_mut() {
+        if let Some(u) = by_node.get(&step.node_id) {
+            if *u != TokenUsage::default() {
+                step.usage = Some(u.clone());
+            }
+        }
+    }
 }
 
 /// Streaming execution. Wykonuje pre-LLM nody w toposorcie, na node'ie LLM
@@ -616,7 +746,6 @@ mod chain_integration_tests {
         LlmNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, TriggerNodeAdapter,
         TtsStreamBridgeNodeAdapter,
     };
-    use crate::flow_engine::validation::ValidationSource;
     use anyhow::Result;
     use async_trait::async_trait;
     use futures::stream::{BoxStream, StreamExt};
@@ -727,7 +856,6 @@ mod chain_integration_tests {
                 0,
                 flow_json,
                 &registry,
-                ValidationSource::UserDefined,
             )
             .expect("compile"),
         );
@@ -810,7 +938,6 @@ mod chain_integration_tests {
                 0,
                 flow_json,
                 &registry,
-                ValidationSource::UserDefined,
             )
             .expect("compile"),
         );
@@ -883,5 +1010,216 @@ mod chain_integration_tests {
 
         let outcome = exec.outcome.await.expect("outcome");
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+}
+
+#[cfg(test)]
+mod concurrent_executor_tests {
+    //! Dataflow scheduler: fan-out z dowolnego noda lecą równolegle, a node z
+    //! N wejściami (`combine`/`output`) jest naturalną barierą.
+    use super::execute_blocking;
+    use crate::db::DbPool;
+    use crate::flow_engine::cache::CompiledFlow;
+    use crate::flow_engine::envelope::{
+        FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue, NodeInput,
+    };
+    use crate::flow_engine::node_adapter::{
+        test_support::stub_ctx, AdapterRegistry, ExecutionContext, NodeAdapter, PortSpec,
+    };
+    use crate::flow_engine::node_adapters::{
+        CombineNodeAdapter, OutputNodeAdapter, TriggerNodeAdapter,
+    };
+    use crate::flow_engine::types::{FlowDataType, FlowNode};
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Adapter który śpi `config.sleep_ms` (timer, nie blocking) i zwraca
+    /// Text(node.id). `config.fail=true` → błąd (test fail-fast). Sleepy z
+    /// równolegle odpalonych gałęzi nakładają się czasowo, więc wall-clock
+    /// dowodzi współbieżności nawet na single-thread runtime.
+    struct SleepAdapter;
+    #[async_trait]
+    impl NodeAdapter for SleepAdapter {
+        fn node_type(&self) -> &str {
+            "sleep"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Any)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("full", FlowDataType::Text)]
+        }
+        async fn execute(
+            &self,
+            node: &FlowNode,
+            _inputs: &[NodeInput],
+            _ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            if node
+                .config
+                .get("fail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return Err(anyhow!("boom from {}", node.id));
+            }
+            let ms = node
+                .config
+                .get("sleep_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok(FlowEnvelope::with_payload(FlowValue::Text(node.id.clone())))
+        }
+    }
+
+    fn registry() -> Arc<AdapterRegistry> {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(CombineNodeAdapter::new()));
+        r.register(Arc::new(SleepAdapter));
+        Arc::new(r)
+    }
+
+    fn db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("in-memory db")
+    }
+
+    async fn run(json: &str) -> FlowExecutionOutcome {
+        let reg = registry();
+        let compiled = Arc::new(CompiledFlow::from_json(0, json, &reg).expect("compile"));
+        execute_blocking(db(), compiled, FlowEnvelope::empty(), stub_ctx(), reg)
+            .await
+            .expect("exec")
+    }
+
+    #[tokio::test]
+    async fn fanout_branches_run_concurrently_and_combine_waits() {
+        // trigger → a(150ms) + b(150ms) → combine → output.
+        // Sekwencyjnie ~300ms; równolegle ~150ms. Combine widzi oba wyniki
+        // (dowód że czekał na wolniejszą gałąź = bariera).
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"a","type":"sleep","config":{"sleep_ms":150}},
+                {"id":"b","type":"sleep","config":{"sleep_ms":150}},
+                {"id":"c","type":"combine","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"a","from_port":"text","to_port":"in"},
+                {"from":"t","to":"b","from_port":"text","to_port":"in"},
+                {"from":"a","to":"c","from_port":"full","to_port":"in"},
+                {"from":"b","to":"c","from_port":"full","to_port":"in"},
+                {"from":"c","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let start = Instant::now();
+        let outcome = run(json).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(280),
+            "branches must run concurrently, took {elapsed:?}"
+        );
+        let text = outcome.final_envelope.payload.as_text().unwrap_or("");
+        assert!(text.contains("a"), "combine missing branch a: {text:?}");
+        assert!(text.contains("b"), "combine missing branch b: {text:?}");
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn five_way_fanout_from_one_node_recombines() {
+        // src → 5 niezależnych gałęzi (80ms) → combine. Dowolny fan-out z
+        // dowolnego noda + zbiórka na końcu.
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"src","type":"sleep","config":{}},
+                {"id":"n1","type":"sleep","config":{"sleep_ms":80}},
+                {"id":"n2","type":"sleep","config":{"sleep_ms":80}},
+                {"id":"n3","type":"sleep","config":{"sleep_ms":80}},
+                {"id":"n4","type":"sleep","config":{"sleep_ms":80}},
+                {"id":"n5","type":"sleep","config":{"sleep_ms":80}},
+                {"id":"c","type":"combine","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"src","from_port":"text","to_port":"in"},
+                {"from":"src","to":"n1","from_port":"full","to_port":"in"},
+                {"from":"src","to":"n2","from_port":"full","to_port":"in"},
+                {"from":"src","to":"n3","from_port":"full","to_port":"in"},
+                {"from":"src","to":"n4","from_port":"full","to_port":"in"},
+                {"from":"src","to":"n5","from_port":"full","to_port":"in"},
+                {"from":"n1","to":"c","from_port":"full","to_port":"in"},
+                {"from":"n2","to":"c","from_port":"full","to_port":"in"},
+                {"from":"n3","to":"c","from_port":"full","to_port":"in"},
+                {"from":"n4","to":"c","from_port":"full","to_port":"in"},
+                {"from":"n5","to":"c","from_port":"full","to_port":"in"},
+                {"from":"c","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let start = Instant::now();
+        let outcome = run(json).await;
+        let elapsed = start.elapsed();
+        // Sekwencyjnie 5×80=400ms; równolegle ~80ms.
+        assert!(
+            elapsed < Duration::from_millis(280),
+            "5 branches must run concurrently, took {elapsed:?}"
+        );
+        let text = outcome.final_envelope.payload.as_text().unwrap_or("");
+        for id in ["n1", "n2", "n3", "n4", "n5"] {
+            assert!(text.contains(id), "combine missing {id}: {text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn linear_flow_unchanged() {
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"a","type":"sleep","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"a","from_port":"text","to_port":"in"},
+                {"from":"a","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run(json).await;
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("a"));
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn branch_error_fails_fast() {
+        // Gałąź b zwraca błąd; continue_on_error=false (default) → flow error,
+        // siostrzane in-flight taski abortowane.
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"a","type":"sleep","config":{"sleep_ms":200}},
+                {"id":"b","type":"sleep","config":{"fail":true}},
+                {"id":"c","type":"combine","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"a","from_port":"text","to_port":"in"},
+                {"from":"t","to":"b","from_port":"text","to_port":"in"},
+                {"from":"a","to":"c","from_port":"full","to_port":"in"},
+                {"from":"b","to":"c","from_port":"full","to_port":"in"},
+                {"from":"c","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run(json).await;
+        assert_eq!(outcome.finish_reason, FinishReason::Error);
+        assert!(
+            outcome.error.as_deref().unwrap_or("").contains("boom"),
+            "expected boom error, got {:?}",
+            outcome.error
+        );
     }
 }

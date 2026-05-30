@@ -60,18 +60,16 @@ impl CompiledFlow {
         flow_id: i64,
         flow_json: &str,
         registry: &AdapterRegistry,
-        source: crate::flow_engine::validation::ValidationSource,
     ) -> Result<Self, CompileError> {
         let definition: FlowDefinition =
             serde_json::from_str(flow_json).map_err(|e| CompileError::Json(e.to_string()))?;
-        Self::compile(flow_id, definition, registry, source)
+        Self::compile(flow_id, definition, registry)
     }
 
     pub fn compile(
         flow_id: i64,
         definition: FlowDefinition,
         registry: &AdapterRegistry,
-        source: crate::flow_engine::validation::ValidationSource,
     ) -> Result<Self, CompileError> {
         if definition.nodes.is_empty() {
             return Err(CompileError::Empty);
@@ -88,7 +86,7 @@ impl CompiledFlow {
                 actual: definition.edges.len(),
             });
         }
-        validate(&definition, registry, source)?;
+        validate(&definition, registry)?;
 
         let order_ids = topological_sort(&definition)?;
         let node_idx_in_def: HashMap<&str, usize> = definition
@@ -446,7 +444,6 @@ mod tests {
             1,
             json,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap();
         assert_eq!(cf.execution_order.len(), 2);
@@ -467,12 +464,11 @@ mod tests {
                 {"from":"l","to":"o","from_port":"stream","to_port":"text"}
             ]
         }"#;
-        // Synthetic source — testujemy R7 streaming end-shape, nie R-SAFETY.
+        // R7 streaming end-shape: llm.stream → output(stream).
         let cf = CompiledFlow::from_json(
             1,
             json,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::Synthetic,
         )
         .unwrap();
         assert!(cf.is_streaming);
@@ -512,7 +508,6 @@ mod tests {
             1,
             json,
             &r,
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap();
         let chain = cf.streaming_chain_run_idxs();
@@ -543,7 +538,6 @@ mod tests {
             1,
             json,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(err, CompileError::Cycle { .. }));
@@ -556,7 +550,6 @@ mod tests {
             1,
             json,
             &registry(),
-            crate::flow_engine::validation::ValidationSource::UserDefined,
         )
         .unwrap_err();
         assert!(matches!(err, CompileError::Empty));
@@ -590,7 +583,6 @@ mod tests {
                 42,
                 json,
                 &registry(),
-                crate::flow_engine::validation::ValidationSource::Synthetic,
             )
             .expect("compile"),
         )

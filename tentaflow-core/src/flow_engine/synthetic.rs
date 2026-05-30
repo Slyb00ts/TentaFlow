@@ -5,8 +5,7 @@
 //       zwraca None — admin nie skonfigurował flow dla danego modelu, runtime
 //       buduje minimalny trigger→capability→output, model wstawiany z requestu.
 //
-//       Synthetic flow nie idzie do DB, żyje wyłącznie w runtime, kompilowany
-//       z `ValidationSource::Synthetic` (R-SAFETY skip).
+//       Synthetic flow nie idzie do DB, żyje wyłącznie w runtime.
 // =============================================================================
 
 use serde_json::json;
@@ -168,7 +167,6 @@ mod tests {
     use crate::flow_engine::node_adapters::{
         LlmNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, TriggerNodeAdapter,
     };
-    use crate::flow_engine::validation::ValidationSource;
     use std::sync::Arc;
 
     fn min_registry() -> AdapterRegistry {
@@ -183,14 +181,14 @@ mod tests {
     #[test]
     fn synthetic_chat_compiles_with_synthetic_source() {
         let def = synthetic_chat("qwen3.5-0.8b");
-        let compiled = CompiledFlow::compile(0, def, &min_registry(), ValidationSource::Synthetic);
+        let compiled = CompiledFlow::compile(0, def, &min_registry());
         assert!(compiled.is_ok(), "synthetic chat: {:?}", compiled.err());
     }
 
     #[test]
     fn synthetic_chat_stream_marks_streaming() {
         let def = synthetic_chat_stream("qwen3.5-0.8b");
-        let compiled = CompiledFlow::compile(0, def, &min_registry(), ValidationSource::Synthetic)
+        let compiled = CompiledFlow::compile(0, def, &min_registry())
             .expect("compile");
         assert!(
             compiled.is_streaming,
