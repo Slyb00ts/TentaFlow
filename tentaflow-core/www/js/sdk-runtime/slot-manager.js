@@ -8,6 +8,13 @@
 // elements with data-slot-id as they enter/leave the DOM.
 // =============================================================================
 
+import {
+  transparentContainerChildKey,
+  readContainerChildren,
+  shellEqualsExceptChildKey,
+  componentDeepEqual,
+} from './component-renderer.js';
+
 const SLOT_SEMANTICS = new Set([
   'main_content', 'modal', 'drawer', 'toast', 'side_panel',
   'tab_pane', 'popover', 'custom',
@@ -132,6 +139,9 @@ export class SlotManager {
     this._pendingContent.delete(slotId);
     const entry = this._slots.get(slotId);
     if (!entry) return;
+    // Tear down rendered content too, otherwise the fragment's live store
+    // subscriptions outlive the slot and leak.
+    this._clearContainerContent(entry);
     this._runCleanups(entry);
     this._slots.delete(slotId);
   }
@@ -155,17 +165,137 @@ export class SlotManager {
   }
 
   _applySlotContent(entry, fragment, state_overlay) {
-    // Apply state overlay before rendering so bindings see updated values
+    // Apply state overlay before rendering so bindings (and reconcile, which
+    // leaves unchanged reactive nodes alone) see the updated store values.
     if (state_overlay != null && Array.isArray(state_overlay) && state_overlay.length > 0) {
       this._store.applyOverlay(state_overlay);
     }
 
-    this._clearContainerContent(entry);
+    if (fragment == null) {
+      // Explicit empty fragment — tear the slot down (mirrors clear).
+      this._clearContainerContent(entry);
+      entry.currentFragment = null;
+      return;
+    }
 
-    if (fragment != null) {
-      const el = this._renderer.render(fragment);
-      entry.element.appendChild(el);
+    const existingRoot = entry.element.firstChild;
+    const prev = entry.currentFragment;
+
+    // Reconcile in place only when we already have a rendered tree, the slot
+    // currently holds exactly that one root element, and the root tag matches.
+    // Otherwise fall back to clear+render (first render, structural mismatch,
+    // or a slot that default-state put extra nodes into).
+    const canReconcile =
+      prev != null &&
+      existingRoot instanceof globalThis.Element &&
+      entry.element.childNodes.length === 1 &&
+      prev.tag === fragment.tag;
+
+    if (canReconcile) {
+      this._reconcile(existingRoot, prev, fragment);
       entry.currentFragment = fragment;
+      return;
+    }
+
+    this._clearContainerContent(entry);
+    const el = this._renderer.render(fragment);
+    entry.element.appendChild(el);
+    entry.currentFragment = fragment;
+  }
+
+  /// Patch `domNode` (currently representing `oldComp`) toward `newComp`,
+  /// reusing DOM nodes wherever it is provably safe so focus, scroll and
+  /// in-progress input values survive an addon re-pushing the same SlotContent.
+  ///
+  /// Strategy (intentionally conservative — see component-renderer for why a
+  /// generic per-element attribute re-apply is not possible with tag handlers
+  /// that own their internal DOM and closures):
+  ///   1. tag changed             → render new + replace + destroy old.
+  ///   2. transparent container,
+  ///      shell unchanged          → REUSE the wrapper element, recurse into
+  ///                                 children 1:1 (this is what keeps a focused
+  ///                                 input alive across re-pushes).
+  ///   3. anything else            → if the component is byte-identical, leave
+  ///                                 the node and its live subscriptions
+  ///                                 untouched; otherwise render new + replace.
+  _reconcile(domNode, oldComp, newComp) {
+    if (oldComp.tag !== newComp.tag) {
+      this._replaceNode(domNode, newComp);
+      return;
+    }
+
+    const childKey = transparentContainerChildKey(newComp.tag);
+    const isContainer = childKey !== undefined;
+
+    // For a transparent container we can only reuse the wrapper when its own
+    // shell (classes/padding/handlers/bind/a11y) is unchanged — those are set
+    // by the tag handler from non-child fields and cannot be re-applied to an
+    // existing element without re-running the renderer.
+    if (isContainer && shellEqualsExceptChildKey(oldComp, newComp, childKey)) {
+      this._reconcileChildren(domNode, oldComp, newComp, childKey);
+      return;
+    }
+
+    // Leaf node (or container whose shell changed): if nothing changed at all,
+    // keep the node and its live store subscriptions exactly as-is. This is the
+    // common case for inputs that merely re-arrive in an unchanged fragment —
+    // zero DOM churn, focus and value preserved by definition.
+    if (componentDeepEqual(oldComp, newComp)) return;
+
+    // Something in this subtree changed and we cannot patch it in place safely
+    // → render fresh and swap just this node.
+    this._replaceNode(domNode, newComp);
+  }
+
+  _reconcileChildren(parentEl, oldComp, newComp, childKey) {
+    const oldChildren = readContainerChildren(oldComp);
+    const newChildren = readContainerChildren(newComp);
+    // If either side is not a clean Array<Component> the 1:1 assumption breaks
+    // — fall back to replacing the whole container subtree.
+    if (oldChildren == null || newChildren == null) {
+      this._replaceNode(parentEl, newComp);
+      return;
+    }
+
+    const domChildren = parentEl.childNodes;
+    const common = Math.min(oldChildren.length, newChildren.length);
+
+    // Common prefix — recurse pairwise on the DOM child elements.
+    for (let i = 0; i < common; i++) {
+      const childDom = domChildren[i];
+      if (!(childDom instanceof globalThis.Element)) {
+        // DOM/child-array desync (should not happen for transparent
+        // containers) — bail out to a safe full replace of the container.
+        this._replaceNode(parentEl, newComp);
+        return;
+      }
+      this._reconcile(childDom, oldChildren[i], newChildren[i]);
+    }
+
+    // Surplus old children removed from the tail.
+    for (let i = oldChildren.length - 1; i >= newChildren.length; i--) {
+      const childDom = domChildren[i];
+      if (childDom instanceof globalThis.Element) {
+        this._renderer.destroy(childDom);
+      }
+      if (childDom) parentEl.removeChild(childDom);
+    }
+
+    // Surplus new children appended to the tail.
+    for (let i = oldChildren.length; i < newChildren.length; i++) {
+      const childEl = this._renderer.render(newChildren[i]);
+      parentEl.appendChild(childEl);
+    }
+  }
+
+  /// Render `newComp` fresh and swap it in for `domNode`, freeing the old
+  /// subtree's store subscriptions / DOM listeners. Used whenever in-place
+  /// patching is unsafe (tag change, changed container shell, changed leaf).
+  _replaceNode(domNode, newComp) {
+    const fresh = this._renderer.render(newComp);
+    domNode.replaceWith(fresh);
+    if (domNode instanceof globalThis.Element) {
+      this._renderer.destroy(domNode);
     }
   }
 
@@ -262,6 +392,9 @@ export class SlotManager {
       this._observer = null;
     }
     for (const entry of this._slots.values()) {
+      // Free both the slot-level subscriptions and the rendered fragment's
+      // store subscriptions — otherwise a panel rebuild leaks the old tree.
+      this._clearContainerContent(entry);
       this._runCleanups(entry);
     }
     this._slots.clear();

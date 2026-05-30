@@ -571,6 +571,263 @@ test('unregisterSlot drops pending content so a removed overlay does not replay'
 });
 
 // =============================================================================
+// Reconcile (in-place patch on repeated SlotContent)
+// =============================================================================
+//
+// These tests prove the slot manager patches the existing DOM in place instead
+// of tearing it down on every SlotContent, so focus/scroll/typed values and
+// live store subscriptions survive an addon re-pushing a near-identical
+// fragment.
+
+const STACK_TAG = 0x0103;
+const TEXT_TAG = 0xFFF1; // leaf renderer that reflects field[0] as textContent
+const LEAF_INPUT_TAG = 0xFFF2; // leaf renderer that subscribes to a store path
+
+// Count live subscriptions so we can assert no leak / no double-register.
+let leafSubCount = 0;
+
+function registerReconcileRenderers() {
+  // Real Stack renderer would import layout-containers; we register a minimal
+  // transparent-container stand-in under the SAME tag (0x0103) so
+  // transparentContainerChildKey(0x0103)===2 applies. Children live in field 2.
+  try {
+    registerComponentRenderer(STACK_TAG, (component, ctx) => {
+      const el = document.createElement('div');
+      el.classList.add('tf-stack');
+      // Reflect padding (field 3) into a class so a shell change is observable.
+      const padding = ctx.readField(component.fields, 3);
+      if (padding != null) el.classList.add(`tf-stack--padding-${padding}`);
+      const children = ctx.readField(component.fields, 2) || [];
+      for (const child of children) el.appendChild(ctx.renderChild(child));
+      return el;
+    });
+  } catch { /* already registered */ }
+
+  try {
+    // Text leaf whose content is bound to a store path (field 0). This mirrors
+    // the production path: declarative text reacts to the store, so re-pushing
+    // an unchanged fragment leaves the node alone and the text updates in place.
+    registerComponentRenderer(TEXT_TAG, (component, ctx) => {
+      const el = document.createElement('span');
+      const path = ctx.readField(component.fields, 0);
+      const apply = () => {
+        let v;
+        try { v = ctx.store.read(path); } catch { v = undefined; }
+        el.textContent = v == null ? '' : String(v);
+      };
+      apply();
+      ctx.registerCleanup(ctx.store.subscribe(path, apply));
+      return el;
+    });
+  } catch { /* already registered */ }
+
+  try {
+    registerComponentRenderer(LEAF_INPUT_TAG, (component, ctx) => {
+      const el = document.createElement('input');
+      const path = ctx.readField(component.fields, 0);
+      const apply = () => {
+        let v;
+        try { v = ctx.store.read(path); } catch { v = undefined; }
+        const next = v == null ? '' : String(v);
+        // Mirror the real input contract: do not clobber a focused field.
+        if (el.value !== next && document.activeElement !== el) el.value = next;
+      };
+      apply();
+      const off = ctx.store.subscribe(path, apply);
+      leafSubCount += 1;
+      ctx.registerCleanup(() => { leafSubCount -= 1; off(); });
+      return el;
+    });
+  } catch { /* already registered */ }
+}
+
+function setupReconcile() {
+  _clearComponentRendererRegistry();
+  leafSubCount = 0;
+  registerReconcileRenderers();
+  document.body.innerHTML = '';
+}
+
+// Text leaf bound to a store path (field 0). Same path → structurally
+// identical component → reconcile reuses the node and content tracks the store.
+const text = (path) => ({
+  tag: TEXT_TAG, id: 't',
+  fields: [[0, path]],
+  handlers: null, bind: null, a11y: null, visibility: null, test_id: null,
+});
+
+const leafInput = (path) => ({
+  tag: LEAF_INPUT_TAG, id: 'in',
+  fields: [[0, path]],
+  handlers: null, bind: null, a11y: null, visibility: null, test_id: null,
+});
+
+const stack = (children, padding) => ({
+  tag: STACK_TAG, id: 'stk',
+  fields: padding != null ? [[2, children], [3, padding]] : [[2, children]],
+  handlers: null, bind: null, a11y: null, visibility: null, test_id: null,
+});
+
+test('reconcile: bound text patch reuses the same DOM node (no rebuild)', () => {
+  setupReconcile();
+  const { sm, store } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  sm.handleSlotContent({
+    slot_id: 's',
+    fragment: stack([text(PATH('label'))]),
+    state_overlay: [{ path: PATH('label'), value: 'A' }],
+  });
+  const rootBefore = host.firstChild;
+  const childBefore = rootBefore.firstChild;
+  assertEq(childBefore.textContent, 'A', 'initial bound text');
+
+  // Re-push the SAME fragment with a new store value via overlay. The
+  // component is structurally identical, so reconcile leaves the node alone
+  // and its live subscription patches the text in place.
+  sm.handleSlotContent({
+    slot_id: 's',
+    fragment: stack([text(PATH('label'))]),
+    state_overlay: [{ path: PATH('label'), value: 'B' }],
+  });
+  assert(host.firstChild === rootBefore, 'container element reused');
+  assert(rootBefore.firstChild === childBefore, 'child element reused (not replaced)');
+  assertEq(childBefore.textContent, 'B', 'bound text patched in place');
+  sm.destroy();
+});
+
+test('reconcile: focused input keeps focus and value across re-push', () => {
+  setupReconcile();
+  const { sm, store } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  const frag = stack([leafInput(PATH('q'))]);
+  sm.handleSlotContent({ slot_id: 's', fragment: frag });
+  const input = host.firstChild.firstChild;
+  assert(input.tagName === 'INPUT', 'input rendered');
+
+  // User focuses and types — simulate the in-progress value + focus.
+  input.focus();
+  input.value = 'typed-by-user';
+  assert(document.activeElement === input, 'input is focused');
+
+  // Addon re-pushes the SAME fragment (structurally identical leaf).
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([leafInput(PATH('q'))]) });
+
+  assert(host.firstChild.firstChild === input, 'input DOM node reused');
+  assert(document.activeElement === input, 'focus preserved');
+  assertEq(input.value, 'typed-by-user', 'typed value preserved');
+  // Still exactly one live subscription — no leak, no double-register.
+  assertEq(leafSubCount, 1, 'subscription not duplicated for unchanged leaf');
+  sm.destroy();
+});
+
+test('reconcile: tag change at a position replaces that element', () => {
+  setupReconcile();
+  const { sm } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([text(PATH('x'))]) });
+  const childBefore = host.firstChild.firstChild;
+  assertEq(childBefore.tagName, 'SPAN', 'first child is span');
+
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([leafInput(PATH('q'))]) });
+  const childAfter = host.firstChild.firstChild;
+  assert(childAfter !== childBefore, 'changed-tag child was replaced');
+  assertEq(childAfter.tagName, 'INPUT', 'replacement is input');
+  assertEq(leafSubCount, 1, 'new leaf subscription registered exactly once');
+  sm.destroy();
+});
+
+test('reconcile: appending/removing a tail child keeps the surviving nodes', () => {
+  setupReconcile();
+  const { sm } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  const two = () => [text(PATH('one')), text(PATH('two'))];
+  sm.handleSlotContent({ slot_id: 's', fragment: stack(two()) });
+  const root = host.firstChild;
+  const c0 = root.children[0];
+  const c1 = root.children[1];
+
+  // Add a third child at the tail.
+  sm.handleSlotContent({
+    slot_id: 's',
+    fragment: stack([text(PATH('one')), text(PATH('two')), text(PATH('three'))]),
+    state_overlay: [{ path: PATH('three'), value: 'three' }],
+  });
+  assert(root.children[0] === c0, 'first child unchanged');
+  assert(root.children[1] === c1, 'second child unchanged');
+  assertEq(root.children.length, 3, 'third child appended');
+  assertEq(root.children[2].textContent, 'three', 'appended text');
+
+  // Remove the tail child again.
+  sm.handleSlotContent({ slot_id: 's', fragment: stack(two()) });
+  assert(root.children[0] === c0, 'first child still unchanged after removal');
+  assert(root.children[1] === c1, 'second child still unchanged after removal');
+  assertEq(root.children.length, 2, 'tail child removed');
+  sm.destroy();
+});
+
+test('reconcile: removed-child subscription is freed (no leak)', () => {
+  setupReconcile();
+  const { sm } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  // Two inputs on distinct paths → two live subscriptions.
+  sm.handleSlotContent({
+    slot_id: 's',
+    fragment: stack([leafInput(PATH('a')), leafInput(PATH('b'))]),
+  });
+  assertEq(leafSubCount, 2, 'two subscriptions live');
+
+  // Drop the second input — its subscription must be released.
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([leafInput(PATH('a'))]) });
+  assertEq(leafSubCount, 1, 'removed child subscription freed');
+
+  // Re-adding it registers exactly one more (no stale double from the prior).
+  sm.handleSlotContent({
+    slot_id: 's',
+    fragment: stack([leafInput(PATH('a')), leafInput(PATH('b'))]),
+  });
+  assertEq(leafSubCount, 2, 'no double-register after re-add');
+  sm.destroy();
+  assertEq(leafSubCount, 0, 'destroy frees all subscriptions');
+});
+
+test('reconcile: changed container shell replaces the whole subtree', () => {
+  setupReconcile();
+  const { sm } = makeSlotManager();
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  sm.registerSlot('s', host);
+
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([leafInput(PATH('a'))]) });
+  const rootBefore = host.firstChild;
+  assert(!rootBefore.classList.contains('tf-stack--padding-lg'), 'no padding yet');
+  assertEq(leafSubCount, 1, 'one live sub');
+
+  // Padding (shell field) changed → wrapper class differs → full replace,
+  // old subtree destroyed, fresh one rendered.
+  sm.handleSlotContent({ slot_id: 's', fragment: stack([leafInput(PATH('a'))], 'lg') });
+  const rootAfter = host.firstChild;
+  assert(rootAfter !== rootBefore, 'container replaced on shell change');
+  assert(rootAfter.classList.contains('tf-stack--padding-lg'), 'new shell class applied');
+  assertEq(leafSubCount, 1, 'old sub freed, new sub registered (net one)');
+  sm.destroy();
+});
+
+// =============================================================================
 // Report
 // =============================================================================
 
