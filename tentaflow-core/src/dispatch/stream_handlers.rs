@@ -10,7 +10,11 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use tentaflow_protocol::{ChatStreamChunk, ChatStreamEnd, MessageBody, SessionAuth};
+use tentaflow_protocol::{
+    ChatStreamChunk, ChatStreamEnd, FlowInputValue, FlowInvokeChunk, FlowInvokeEnd, MessageBody,
+    SessionAuth,
+};
+use tokio_util::sync::CancellationToken;
 
 use super::recorder;
 use super::resume_token::{self, ResumeError};
@@ -200,6 +204,239 @@ inventory::submit! {
         variant_name: "ChatStreamRequest",
         required_auth: SessionAuthKind::UserSession,
         handler_fn: chat_stream_handler,
+    }
+}
+
+// =============================================================================
+// FlowInvokeRequest — uniwersalny multimodalny most do flow engine. Zapisuje
+// bajty wejść do blob store, buduje FlowEnvelope, woła FlowDispatcher::
+// try_dispatch_streaming i mapuje EnvelopeDelta → FlowInvokeChunk. Zastępuje
+// REST /v1/audio/* dla powierzchni dashboardu (chat audio).
+// =============================================================================
+
+fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::envelope::EnvelopeDelta;
+
+    let invoke = match req {
+        MessageBody::FlowInvokeRequestBody(r) => r,
+        _ => {
+            let _ = push_end(
+                &sub,
+                Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
+                    finish_reason: "error".into(),
+                    error: Some("bad request body".into()),
+                })),
+            );
+            return;
+        }
+    };
+
+    let router = ctx.state.router.clone();
+    let correlation_id = ctx.correlation_id;
+
+    tokio::spawn(async move {
+        let Some(fd) = router.flow_dispatcher().cloned() else {
+            let _ = push_end(
+                &sub,
+                Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
+                    finish_reason: "error".into(),
+                    error: Some("flow dispatcher unavailable".into()),
+                })),
+            );
+            return;
+        };
+
+        let blobs = fd.blobs();
+        let envelope =
+            match flow_envelope_from_inputs(invoke.inputs, invoke.language.clone(), &blobs).await {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = push_end(
+                        &sub,
+                        Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
+                            finish_reason: "error".into(),
+                            error: Some(format!("input build failed: {e}")),
+                        })),
+                    );
+                    return;
+                }
+            };
+
+        // Cancel wiązany z subskrypcją: rozłączenie klienta / barge-in anuluje flow.
+        let cancel = CancellationToken::new();
+        let mut meta = FlowRequestMeta::new(format!("flowinvoke-{correlation_id}"));
+        meta.session_id = invoke.session_id.clone();
+        meta.cancel_token = cancel.clone();
+
+        let exec = match fd
+            .try_dispatch_streaming(&invoke.model, &invoke.service_type, envelope, meta)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
+                        finish_reason: "error".into(),
+                        error: Some(format!("dispatch failed: {e}")),
+                    })),
+                );
+                return;
+            }
+        };
+
+        let mut stream = exec.stream;
+        while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(EnvelopeDelta::Llm(c)) => {
+                    if c.text_delta.is_empty() {
+                        continue;
+                    }
+                    FlowInvokeChunk::Text {
+                        choice_index: c.choice_index,
+                        delta: c.text_delta,
+                    }
+                }
+                Ok(EnvelopeDelta::Audio(a)) => {
+                    if a.bytes_delta.is_empty() {
+                        continue;
+                    }
+                    FlowInvokeChunk::Audio {
+                        choice_index: a.choice_index,
+                        mime: a.mime,
+                        sample_rate: a.sample_rate,
+                        bytes: a.bytes_delta,
+                    }
+                }
+                Err(e) => {
+                    let _ = push_end_async(
+                        &sub,
+                        Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
+                            finish_reason: "error".into(),
+                            error: Some(format!("stream error: {e}")),
+                        })),
+                    )
+                    .await;
+                    cancel.cancel();
+                    return;
+                }
+            };
+            if push_chunk_async(&sub, MessageBody::FlowInvokeChunkBody(chunk))
+                .await
+                .is_err()
+            {
+                cancel.cancel();
+                return;
+            }
+        }
+
+        let (finish_reason, error) = match exec.outcome.await {
+            Ok(outcome) => (
+                format!("{:?}", outcome.finish_reason).to_lowercase(),
+                outcome.error,
+            ),
+            Err(_) => ("stop".into(), None),
+        };
+        let _ = push_end_async(
+            &sub,
+            Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
+                finish_reason,
+                error,
+            })),
+        )
+        .await;
+    });
+}
+
+/// Buduje FlowEnvelope z multimodalnych wejść: pierwsze → payload, kolejne →
+/// artefakty `input_{n}`. Bajty media trafiają do blob store jako BlobRef.
+async fn flow_envelope_from_inputs(
+    inputs: Vec<FlowInputValue>,
+    language: Option<String>,
+    blobs: &Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> anyhow::Result<crate::flow_engine::envelope::FlowEnvelope> {
+    use crate::flow_engine::blob_store::BlobStore;
+    use crate::flow_engine::envelope::{ArtifactProvenance, FlowEnvelope, FlowValue};
+
+    let mut env: Option<FlowEnvelope> = None;
+    let mut artifact_idx = 0usize;
+    for input in inputs {
+        let value = match input {
+            FlowInputValue::Text(t) => FlowValue::Text(t),
+            FlowInputValue::Json(j) => {
+                FlowValue::Json(serde_json::from_str(&j).unwrap_or(serde_json::Value::String(j)))
+            }
+            FlowInputValue::Audio {
+                mime,
+                sample_rate,
+                bytes,
+            } => {
+                let r = blobs.put(bytes, &mime).await?;
+                FlowValue::Audio {
+                    blob_ref: r,
+                    mime,
+                    sample_rate,
+                }
+            }
+            FlowInputValue::Image { mime, bytes } => {
+                let r = blobs.put(bytes, &mime).await?;
+                FlowValue::Image {
+                    blob_ref: r,
+                    mime,
+                    dims: None,
+                }
+            }
+            FlowInputValue::Video { mime, bytes } => {
+                let r = blobs.put(bytes, &mime).await?;
+                FlowValue::Video {
+                    blob_ref: r,
+                    mime,
+                    duration_ms: None,
+                }
+            }
+            FlowInputValue::File {
+                mime,
+                filename,
+                bytes,
+            } => {
+                let r = blobs.put(bytes, &mime).await?;
+                FlowValue::Other {
+                    blob_ref: r,
+                    mime,
+                    filename,
+                }
+            }
+        };
+        match env {
+            None => env = Some(FlowEnvelope::with_payload(value)),
+            Some(ref mut e) => {
+                let _ = e.put_artifact(
+                    format!("input_{artifact_idx}"),
+                    value,
+                    ArtifactProvenance {
+                        producer_node_id: "flow_invoke".into(),
+                        producer_node_type: "transport".into(),
+                        timestamp_ms: 0,
+                    },
+                );
+                artifact_idx += 1;
+            }
+        }
+    }
+    let mut env = env.unwrap_or_else(FlowEnvelope::empty);
+    if let Some(lang) = language {
+        env.meta
+            .insert("language".into(), serde_json::Value::String(lang));
+    }
+    Ok(env)
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "FlowInvokeRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: flow_invoke_handler,
     }
 }
 

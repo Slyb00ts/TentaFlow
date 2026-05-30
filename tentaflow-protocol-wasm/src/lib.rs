@@ -336,6 +336,34 @@ pub fn encode_chat_stream_request_simple(
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::FlowInvokeRequest — uniwersalny most do flow engine. Wariant
+/// audio-only dla chat audio (jedno wejście Audio). Multi-input dojdzie później.
+#[wasm_bindgen(js_name = encodeFlowInvokeAudio)]
+pub fn encode_flow_invoke_audio(
+    model: String,
+    service_type: String,
+    mime: String,
+    sample_rate: Option<u32>,
+    audio: Vec<u8>,
+    language: Option<String>,
+    session_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::FlowInvokeRequestBody(
+        tentaflow_protocol::FlowInvokeRequest {
+            model,
+            service_type,
+            inputs: vec![tentaflow_protocol::FlowInputValue::Audio {
+                mime,
+                sample_rate,
+                bytes: audio,
+            }],
+            language,
+            session_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 /// MessageBody::TranslateRequest — synchroniczne tlumaczenie przez LLM.
 /// `source_lang` = "auto" dla auto-detekcji; `tone` opcjonalny
 /// ("formal"/"casual"/"neutral").
@@ -2587,6 +2615,66 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 "completionTokens",
                 (end.completion_tokens as u32).into(),
             );
+        }
+        MessageBody::FlowInvokeRequestBody(_) => {
+            // Serwer nie odsyła requestu do klienta; arm dla wyczerpalności.
+            set(&obj, "variant", "FlowInvokeRequest".into());
+        }
+        MessageBody::FlowInvokeChunkBody(chunk) => {
+            set(&obj, "variant", "FlowInvokeChunk".into());
+            match chunk {
+                tentaflow_protocol::FlowInvokeChunk::Text {
+                    choice_index,
+                    delta,
+                } => {
+                    set(&obj, "kind", "text".into());
+                    set(&obj, "choiceIndex", choice_index.into());
+                    set(&obj, "delta", delta.into());
+                }
+                tentaflow_protocol::FlowInvokeChunk::Audio {
+                    choice_index,
+                    mime,
+                    sample_rate,
+                    bytes,
+                } => {
+                    set(&obj, "kind", "audio".into());
+                    set(&obj, "choiceIndex", choice_index.into());
+                    set(&obj, "mime", mime.into());
+                    if let Some(sr) = sample_rate {
+                        set(&obj, "sampleRate", sr.into());
+                    }
+                    set(&obj, "bytes", js_sys::Uint8Array::from(&bytes[..]).into());
+                }
+                tentaflow_protocol::FlowInvokeChunk::Image { mime, bytes } => {
+                    set(&obj, "kind", "image".into());
+                    set(&obj, "mime", mime.into());
+                    set(&obj, "bytes", js_sys::Uint8Array::from(&bytes[..]).into());
+                }
+                tentaflow_protocol::FlowInvokeChunk::Video { mime, bytes } => {
+                    set(&obj, "kind", "video".into());
+                    set(&obj, "mime", mime.into());
+                    set(&obj, "bytes", js_sys::Uint8Array::from(&bytes[..]).into());
+                }
+                tentaflow_protocol::FlowInvokeChunk::File {
+                    mime,
+                    filename,
+                    bytes,
+                } => {
+                    set(&obj, "kind", "file".into());
+                    set(&obj, "mime", mime.into());
+                    if let Some(fname) = filename {
+                        set(&obj, "filename", fname.into());
+                    }
+                    set(&obj, "bytes", js_sys::Uint8Array::from(&bytes[..]).into());
+                }
+            }
+        }
+        MessageBody::FlowInvokeEndBody(end) => {
+            set(&obj, "variant", "FlowInvokeEnd".into());
+            set(&obj, "finishReason", end.finish_reason.into());
+            if let Some(err) = end.error {
+                set(&obj, "error", err.into());
+            }
         }
         MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Req(req)) => {
             set(&obj, "variant", "TranslateRequest".into());
