@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::flow_engine::dispatchers::TtsRequest;
@@ -230,6 +231,16 @@ impl StreamingNodeAdapter for TtsStreamBridgeNodeAdapter {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_MAX_BUFFER_CHARS);
 
+        // forward_text: oprócz audio przepuść też oryginalny tekst (delty Llm)
+        // do downstreamu, żeby Wyjście dostało tekst (do bąbla) I audio (do
+        // odtwarzania) z jednego łańcucha. Cleaning dla TTS dzieje się wewnątrz
+        // — forwardowany tekst jest nieoczyszczony (taki jak wpadł do bridge'a).
+        let forward_text = node
+            .config
+            .get("forward_text")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Snapshot TTS parametrów raz na start streamu (admin nie zmienia
         // mid-stream voice/model/format).
         let model = Self::pick_model(node, &seed_envelope)?;
@@ -243,6 +254,60 @@ impl StreamingNodeAdapter for TtsStreamBridgeNodeAdapter {
         let tts = ctx.tts.clone();
         let cleaning = ctx.tts_cleaning.clone();
         let blobs = ctx.blobs.clone();
+
+        // Gdy forward_text: tee upstream na dwie gałęzie — text passthrough
+        // (Llm delty) + audio source dla istniejącego unfold poniżej. Bez
+        // forward_text unfold czyta upstream bezpośrednio (zachowanie bez zmian).
+        let (upstream, text_stream): (
+            BoxStream<'static, Result<EnvelopeDelta>>,
+            Option<BoxStream<'static, Result<EnvelopeDelta>>>,
+        ) = if forward_text {
+            let (text_tx, text_rx) = mpsc::channel::<Result<EnvelopeDelta>>(64);
+            let (audio_tx, audio_rx) = mpsc::channel::<Result<EnvelopeDelta>>(64);
+            let cancel_tee = cancel.clone();
+            tokio::spawn(async move {
+                let mut up = upstream;
+                while let Some(item) = up.next().await {
+                    if cancel_tee.is_cancelled() {
+                        break;
+                    }
+                    match item {
+                        Ok(EnvelopeDelta::Llm(chunk)) => {
+                            if text_tx
+                                .send(Ok(EnvelopeDelta::Llm(chunk.clone())))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if audio_tx.send(Ok(EnvelopeDelta::Llm(chunk))).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(other) => {
+                            if audio_tx.send(Ok(other)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = audio_tx.send(Err(anyhow!("{e}"))).await;
+                            break;
+                        }
+                    }
+                }
+            });
+            let audio_src = futures::stream::unfold(audio_rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            })
+            .boxed();
+            let text_src = futures::stream::unfold(text_rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            })
+            .boxed();
+            (audio_src, Some(text_src))
+        } else {
+            (upstream, None)
+        };
 
         let stream = futures::stream::unfold(
             (
@@ -413,7 +478,12 @@ impl StreamingNodeAdapter for TtsStreamBridgeNodeAdapter {
             },
         );
 
-        Ok(stream.boxed())
+        match text_stream {
+            // Przeplot tekst+audio: select pollu obie gałęzie, kończy gdy obie
+            // się wyczerpią (text gdy tee zamknie kanał, audio gdy unfold da EOF).
+            Some(text) => Ok(futures::stream::select(text, stream.boxed()).boxed()),
+            None => Ok(stream.boxed()),
+        }
     }
 }
 
@@ -789,6 +859,68 @@ mod tests {
             synthesized.iter().all(|s| s.starts_with("[clean] ")),
             "synthesize widziało tekst nie-cleaned: {synthesized:?}"
         );
+    }
+
+    /// forward_text=true: Wyjście dostaje PRZEPLOT — oryginalne delty tekstu
+    /// (do bąbla) ORAZ audio (do odtwarzania) z jednego łańcucha.
+    #[tokio::test]
+    async fn bridge_forward_text_emits_text_and_audio() {
+        let mut ctx = stub_ctx();
+        let fake = Arc::new(FakeTts {
+            synthesized: Mutex::new(Vec::new()),
+            bytes: vec![0xAA],
+        });
+        ctx.tts = fake.clone();
+        ctx.blobs = Arc::new(StaticBytesBlob(vec![0xAA]));
+
+        let upstream = futures::stream::iter(vec![
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "First sentence.".into(),
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: " Second!".into(),
+                ..Default::default()
+            })),
+        ])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = TtsStreamBridgeNodeAdapter
+            .process_stream(
+                &node(json!({"model": "voxcpm", "forward_text": true})),
+                upstream,
+                seed,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let mut text_deltas: Vec<String> = Vec::new();
+        let mut audio_count = 0;
+        while let Some(item) = out.next().await {
+            match item.unwrap() {
+                EnvelopeDelta::Llm(c) => {
+                    if !c.text_delta.is_empty() {
+                        text_deltas.push(c.text_delta);
+                    }
+                }
+                EnvelopeDelta::Audio(_) => audio_count += 1,
+            }
+        }
+
+        assert!(
+            text_deltas.iter().any(|t| t.contains("First sentence.")),
+            "brak przepuszczonego tekstu: {text_deltas:?}"
+        );
+        assert!(
+            text_deltas.iter().any(|t| t.contains("Second!")),
+            "brak przepuszczonego tekstu: {text_deltas:?}"
+        );
+        assert!(audio_count >= 1, "spodziewano się audio, got {audio_count}");
+        assert!(!fake.synthesized.lock().unwrap().is_empty());
     }
 
     /// Pomocniczy BlobStore dla testów — zawsze zwraca te same bajty.

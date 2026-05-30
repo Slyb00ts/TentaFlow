@@ -843,8 +843,8 @@ function sendMessageInternal(text, opts = {}) {
   const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: opts.source || 'text' };
   pushMessage(conv, assistantMsg);
 
-  const feedAudio = audioPipeline && conv.mode === 'audio';
-
+  // Wpisana wiadomość zawsze idzie tekstowym chatStreamRequest (bez TTS).
+  // Głosowe wypowiedzi idą osobno przez sendVoiceUtterance (FlowInvoke).
   ApiBinary.subscribe(
     'chatStreamRequest',
     { modelId, userMessage: text },
@@ -854,7 +854,6 @@ function sendMessageInternal(text, opts = {}) {
           assistantMsg.text += body.delta;
           conv.updatedAt = Date.now();
           onStreamTick();
-          if (feedAudio) audioPipeline.feedAssistantDelta(body.delta);
         }
       },
       onEnd: () => {
@@ -868,7 +867,6 @@ function sendMessageInternal(text, opts = {}) {
         onStreamTick();
         renderConvList();
         updateHeaderTitle();
-        if (feedAudio) audioPipeline.feedAssistantEnd();
         if (conv.mode === 'audio' && conv.id === activeConvId) renderRail();
       },
       onError: (err) => {
@@ -878,18 +876,88 @@ function sendMessageInternal(text, opts = {}) {
         saveConversations();
         onStreamTick();
         unsubscribe = null;
-        if (feedAudio) audioPipeline.feedAssistantError(err);
       },
     },
   ).then((unsub) => {
     unsubscribe = unsub;
   }).catch((err) => {
     toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
-    if (feedAudio) audioPipeline.feedAssistantError(err);
   });
 }
 
 // ---- AudioPipeline plumbing ---------------------------------------------
+
+// sendVoiceUtterance — głosowa wypowiedź idzie binarnym FlowInvoke do flow
+// engine: audio → STT → LLM → TTS, a flow odsyła przeplatane tekst+audio.
+// Tekst dopisujemy do bąbla asystenta, audio podajemy do AudioPipeline.
+function sendVoiceUtterance(wav, sampleRate) {
+  const modelSel = byId('chat-model');
+  const modelId = modelSel?.value || (modelOptions[0]?.id ?? 'default');
+  const conv = ensureActiveConv();
+  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+
+  // User bubble — wiadomość głosowa (transkrypt powstaje w flow po stronie STT).
+  pushMessage(conv, { id: nextMsgId++, role: 'user', text: '🎤', ts: Date.now(), via: 'voice' });
+
+  const modelLabel = currentModelLabel();
+  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: 'voice' };
+  pushMessage(conv, assistantMsg);
+
+  const lang = conv.audioConfig?.language || (I18n.getLanguage && I18n.getLanguage()) || 'pl';
+
+  ApiBinary.subscribe(
+    'flowInvokeRequest',
+    {
+      model: modelId,
+      serviceType: 'voice',
+      mime: 'audio/wav',
+      sampleRate,
+      audio: wav,
+      language: lang,
+      sessionId: conv.id,
+    },
+    {
+      onChunk: (body) => {
+        if (body.variant !== 'FlowInvokeChunk') return;
+        if (body.kind === 'text') {
+          assistantMsg.text += body.delta || '';
+          conv.updatedAt = Date.now();
+          onStreamTick();
+        } else if (body.kind === 'audio') {
+          if (audioPipeline) audioPipeline.playAudioChunk(body.bytes, body.mime);
+        }
+      },
+      onEnd: () => {
+        unsubscribe = null;
+        assistantMsg.streaming = false;
+        if (assistantMsg.text === '') {
+          assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
+        }
+        conv.updatedAt = Date.now();
+        saveConversations();
+        onStreamTick();
+        renderConvList();
+        updateHeaderTitle();
+        if (audioPipeline) audioPipeline.finishResponse();
+        if (conv.mode === 'audio' && conv.id === activeConvId) renderRail();
+      },
+      onError: (err) => {
+        assistantMsg.streaming = false;
+        assistantMsg.text = `[error] ${err.message ?? 'flow error'}`;
+        toast(`${I18n.t('common.error')}: ${err.message ?? 'flow error'}`, 'error');
+        saveConversations();
+        onStreamTick();
+        unsubscribe = null;
+        if (audioPipeline) audioPipeline.feedAssistantError(err);
+      },
+    },
+  ).then((unsub) => {
+    unsubscribe = unsub;
+  }).catch((err) => {
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+    if (audioPipeline) audioPipeline.feedAssistantError(err);
+  });
+}
 
 async function startAudioPipeline() {
   if (audioPipeline) return;
@@ -908,12 +976,12 @@ async function startAudioPipeline() {
       conv,
       faceHandle,
       i18n: I18n,
-      onUserUtterance: (text) => {
-        if (!text || text.trim().length === 0) {
+      onUtteranceAudio: (wav, sampleRate) => {
+        if (!wav || wav.length === 0) {
           toast(I18n.t('chat.audio_empty_transcript'), 'info');
           return;
         }
-        sendMessageInternal(text, { source: 'voice' });
+        sendVoiceUtterance(wav, sampleRate);
       },
       onStateChange: (state) => {
         // FSM AudioPipeline → state stage'u 'idle'/'listen'/'think'/'speak'.
