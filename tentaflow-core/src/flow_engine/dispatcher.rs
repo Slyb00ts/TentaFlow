@@ -364,6 +364,62 @@ impl FlowDispatcher {
             .map_err(DispatchError::from)
     }
 
+    /// Streaming wariant `dispatch_by_flow_id` — odpala KONKRETNY flow po ID
+    /// (np. wybrany przez usera w trybie audio chatu), bez rozwiązywania przez
+    /// model/service_type. Blocking-only flow opakowany w single-chunk stream.
+    pub async fn dispatch_by_flow_id_streaming(
+        &self,
+        flow_id: i64,
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> std::result::Result<StreamingExecution, DispatchError> {
+        let pool = self.db.clone();
+        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, flow_id))
+            .await
+            .map_err(|e| DispatchError::Internal(e.to_string()))?
+            .map_err(|e| DispatchError::Internal(e.to_string()))?;
+        let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
+            flow_id,
+            msg: "flow id nie istnieje w DB".to_string(),
+        })?;
+        if flow.status != "active" {
+            return Err(DispatchError::CompileFailed {
+                flow_id,
+                msg: format!("flow status='{}' (nie active)", flow.status),
+            });
+        }
+        if !self.acl_allow(flow_id, &meta) {
+            return Err(DispatchError::Denied { flow_id });
+        }
+        let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                return Err(DispatchError::CompileFailed {
+                    flow_id,
+                    msg: e.to_string(),
+                });
+            }
+        };
+        if !compiled.is_streaming {
+            let outcome = self
+                .run_blocking(compiled, initial, meta)
+                .await
+                .map_err(DispatchError::from)?;
+            return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
+        }
+        let ctx = self.ctx_factory.make_context(&meta);
+        let stream_exec = execute_streaming(
+            self.db.clone(),
+            compiled,
+            initial,
+            ctx,
+            self.registry.clone(),
+        )
+        .await
+        .map_err(DispatchError::from)?;
+        Ok(stream_exec)
+    }
+
     pub async fn try_dispatch_streaming(
         &self,
         model_name: &str,
@@ -670,7 +726,7 @@ fn wrap_blocking_as_stream(
 /// (blocking + streaming). Czysta NodeAdapter rejestracja przez
 /// `register` dla nodów które nie mają stream variant'a.
 fn build_registry() -> AdapterRegistry {
-    use crate::flow_engine::node_adapters::{SentenceBufferNodeAdapter, TtsStreamBridgeNodeAdapter};
+    use crate::flow_engine::node_adapters::SentenceBufferNodeAdapter;
 
     let mut r = AdapterRegistry::new();
     let arcs: Vec<Arc<dyn NodeAdapter>> = vec![
@@ -679,7 +735,6 @@ fn build_registry() -> AdapterRegistry {
         Arc::new(ConditionNodeAdapter::new()),
         Arc::new(CombineNodeAdapter::new()),
         Arc::new(SttNodeAdapter::new()),
-        Arc::new(TtsNodeAdapter::new()),
         Arc::new(EmbeddingsNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
         Arc::new(ConversationHistoryNodeAdapter::new()),
@@ -691,10 +746,11 @@ fn build_registry() -> AdapterRegistry {
         r.register(a);
     }
     r.register_llm(Arc::new(LlmNodeAdapter::new()));
-    // Stage 3d Krok 2c: streaming-aware adaptery (dual-trait NodeAdapter
-    // + StreamingNodeAdapter) trafiają do obu slotów przez register_streaming.
+    // Streaming-aware adaptery (dual-trait NodeAdapter + StreamingNodeAdapter)
+    // trafiają do obu slotów. `tts` jest dual: blocking (całość) + streaming
+    // (buforowanie zdań + synteza per zdanie) — jeden node na oba tryby.
     r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
-    r.register_streaming(Arc::new(TtsStreamBridgeNodeAdapter::new()));
+    r.register_streaming(Arc::new(TtsNodeAdapter::new()));
     r.register_streaming(Arc::new(TtsCleanNodeAdapter::new()));
     r.register_streaming(Arc::new(SentenceBufferNodeAdapter::new()));
     r
@@ -722,20 +778,13 @@ mod tests {
             "session_context",
             "speaker_context",
             "llm",
-            "tts_stream_bridge",
             "sentence_buffer",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }
         assert!(r.llm().is_some(), "LLM typed accessor must be wired");
-        // Stage 3d Krok 2c: streaming-aware adaptery dostępne też w
-        // streaming slot rejestru.
-        for streaming in [
-            "pii_filter",
-            "tts_stream_bridge",
-            "tts_clean",
-            "sentence_buffer",
-        ] {
+        // Streaming-aware adaptery dostępne też w streaming slot rejestru.
+        for streaming in ["pii_filter", "tts", "tts_clean", "sentence_buffer"] {
             assert!(
                 r.streaming_adapter(streaming).is_some(),
                 "{streaming} must be registered in streaming slot"
