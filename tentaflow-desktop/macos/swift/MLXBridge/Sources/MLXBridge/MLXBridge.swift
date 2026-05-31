@@ -13,12 +13,17 @@
 // =============================================================================
 
 import Foundation
+import HuggingFace
 import MLX
+import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
+import Tokenizers
 
 /// Silnik MLX na macOS — singleton zarzadzajacy modelem MLX i FFI callbacks.
-public final class MLXBridgeEngine {
+/// @unchecked Sendable: dostep z watkow FFI Rusta jest serializowany przez
+/// DispatchSemaphore w kazdej metodzie (Swift 6 nie widzi tego sam).
+public final class MLXBridgeEngine: @unchecked Sendable {
     /// Globalny singleton — Swift gwarantuje thread-safe lazy init.
     public static let shared = MLXBridgeEngine()
 
@@ -48,7 +53,11 @@ public final class MLXBridgeEngine {
         Task {
             do {
                 let config = ModelConfiguration(directory: url)
+                // 3.x odpial tokenizer/downloader: makra MLXHuggingFace wstrzykuja
+                // HubApi (HuggingFace) i loader tokenizera (Tokenizers).
                 self.modelContainer = try await LLMModelFactory.shared.loadContainer(
+                    from: #hubDownloader(),
+                    using: #huggingFaceTokenizerLoader(),
                     configuration: config
                 ) { progress in
                     let pct = Int(progress.fractionCompleted * 100)
@@ -78,30 +87,39 @@ public final class MLXBridgeEngine {
     }
 
     /// Generuje tekst z callbackiem na każdy token. Synchroniczne.
+    /// Zwraca kod: 0=OK, -1=blad generyczny, -10=brak pamieci/przekroczony
+    /// kontekst (guard przerwal zanim doszlo do OOM). maxContextTokens=0 i
+    /// memoryBudgetMB=0 wylaczaja odpowiednie limity (zachowanie jak wczesniej).
     public func generate(
         prompt: String,
         maxTokens: Int,
         temperature: Float,
         topP: Float,
+        maxContextTokens: Int,
+        memoryBudgetMB: Int,
         tokenCallback: @escaping (String, Bool) -> Void
-    ) -> Bool {
+    ) -> Int32 {
         guard let container = modelContainer else {
             print("[MLXBridge] Brak zaladowanego modelu")
-            return false
+            return -1
         }
 
-        print("[MLXBridge] Generowanie: max_tokens=\(maxTokens), temp=\(temperature), topP=\(topP)")
+        print("[MLXBridge] Generowanie: max_tokens=\(maxTokens), temp=\(temperature), topP=\(topP), maxCtx=\(maxContextTokens), budgetMB=\(memoryBudgetMB)")
         print("[MLXBridge] Prompt (\(prompt.count) znakow): \(prompt.prefix(200))")
 
+        // Twardy limit pamieci MLX: relaxed:false sprawia, ze MLX rzuca blad
+        // zamiast swapowac poza budzet — surfacujemy czysty blad zamiast OOM-kill.
+        let budgetBytes = memoryBudgetMB > 0 ? memoryBudgetMB * 1024 * 1024 : 0
+        if budgetBytes > 0 {
+            MLX.GPU.set(memoryLimit: budgetBytes, relaxed: false)
+        }
+
         let semaphore = DispatchSemaphore(value: 0)
-        var success = false
+        var resultCode: Int32 = -1
 
         // Bielik 4-bit (i ogolnie male instruct modele) bez `repetitionPenalty`
-        // wpadaja w pętle po 200+ tokenach: ten sam fragment ("Krotki Wiersz...")
-        // generowany w nieskonczonosc. Conservative default 1.1 z context size
-        // 20 jest standardem dla mlx-swift LLMEval i nie psuje koherencji.
-        // (Default w `GenerateParameters` to nil = wyłączone, tylko iOS dziala
-        // przy KROTKICH odpowiedziach gdzie pętla nie zdąży się zaczać.)
+        // wpadaja w pętle po 200+ tokenach. Conservative default 1.1 z context
+        // size 20 jest standardem dla mlx-swift LLMEval i nie psuje koherencji.
         let parameters = GenerateParameters(
             temperature: temperature,
             topP: topP,
@@ -113,24 +131,37 @@ public final class MLXBridgeEngine {
             do {
                 let _ = try await container.perform { context in
                     // Prompt juz jest sformatowany przez Rust (ChatML lub Mistral).
-                    // Tokenizujemy bezposrednio — bez processor.prepare.
                     let tokenIds = context.tokenizer.encode(text: prompt)
+                    // Sam prompt przekracza budzet kontekstu -> odmow zadania
+                    // czysto, zanim cokolwiek policzymy.
+                    if maxContextTokens > 0 && tokenIds.count > maxContextTokens {
+                        throw MLXContextBudgetExceeded()
+                    }
+                    let promptCount = tokenIds.count
                     let inputTokens = MLXArray(tokenIds)
                     let input = LMInput(tokens: inputTokens)
 
-                    // Stop tokeny ChatML (zgodnie z iOS).
                     let stopStrings = ["<|im_end|>", "<|endoftext|>", "</s>"]
 
+                    // Flaga OOM w scope `perform` (jak `lastOutput`) — unika
+                    // mutacji zmiennej func-scope w @Sendable token-closure.
                     var lastOutput = ""
-                    return try MLXLMCommon.generate(
+                    var memExceeded = false
+                    let info = try MLXLMCommon.generate(
                         input: input,
                         parameters: parameters,
                         context: context
                     ) { tokens in
+                        // Guard pamieci: przerwij czysto zanim MLX zrobi OOM.
+                        if budgetBytes > 0 {
+                            let snap = MLX.GPU.snapshot()
+                            if snap.activeMemory + snap.cacheMemory > budgetBytes {
+                                memExceeded = true
+                                return .stop
+                            }
+                        }
                         // Inkrementalny dekod — emituj tylko nowy fragment.
-                        // chars-based diff (Swift String.count == char count) eliminuje
-                        // problemy z UTF-8 boundary z polskimi znakami.
-                        let fullText = context.tokenizer.decode(tokens: tokens)
+                        let fullText = context.tokenizer.decode(tokenIds: tokens)
                         if fullText.count > lastOutput.count {
                             let newPart = String(fullText.dropFirst(lastOutput.count))
                             tokenCallback(newPart, false)
@@ -142,23 +173,35 @@ public final class MLXBridgeEngine {
                                 return .stop
                             }
                         }
+                        // Cap kontekstu wyliczony z budzetu pamieci (prompt+gen).
+                        if maxContextTokens > 0 && promptCount + tokens.count >= maxContextTokens {
+                            return .stop
+                        }
                         return tokens.count >= maxTokens ? .stop : .more
                     }
+                    if memExceeded { throw MLXContextBudgetExceeded() }
+                    return info
                 }
 
                 tokenCallback("", true)
-                success = true
-                print("[MLXBridge] Generowanie zakonczone")
+                resultCode = 0
+                print("[MLXBridge] Generowanie zakonczone (kod \(resultCode))")
             } catch {
                 print("[MLXBridge] Blad generowania: \(error)")
                 tokenCallback("", true)
-                success = false
+                // Przekroczony kontekst albo blad alokacji pod twardym budzetem
+                // -> raportuj jako brak pamieci; inne bledy jako generyczne.
+                if error is MLXContextBudgetExceeded || budgetBytes > 0 {
+                    resultCode = -10
+                } else {
+                    resultCode = -1
+                }
             }
             semaphore.signal()
         }
 
         semaphore.wait()
-        return success
+        return resultCode
     }
 
     /// Zwraca JSON z info o zaladowanym modelu.
@@ -178,6 +221,10 @@ public final class MLXBridgeEngine {
         return nil
     }
 }
+
+/// Sygnalizuje, ze sam prompt nie miesci sie w limicie kontekstu — mapowane na
+/// kod -10 (brak pamieci) przez @_cdecl, zeby Rust dal czysty komunikat.
+private struct MLXContextBudgetExceeded: Error {}
 
 // =============================================================================
 // C-ABI exports — Rust uzywa ich przez FFI w tentaflow_register_mlx_swift.
@@ -216,6 +263,8 @@ public func MLXBridge_generate(
     maxTokens: Int32,
     temperature: Float,
     topP: Float,
+    maxContextTokens: Int32,
+    memoryBudgetMB: Int32,
     tokenCallback: (@convention(c) (UnsafePointer<CChar>?, Bool, UnsafeMutableRawPointer?) -> Void)?,
     callbackContext: UnsafeMutableRawPointer?,
     context: UnsafeMutableRawPointer?
@@ -226,17 +275,18 @@ public func MLXBridge_generate(
 
     let engine = Unmanaged<MLXBridgeEngine>.fromOpaque(ctx).takeUnretainedValue()
 
-    let success = engine.generate(
+    return engine.generate(
         prompt: promptStr,
         maxTokens: Int(maxTokens),
         temperature: temperature,
-        topP: topP
+        topP: topP,
+        maxContextTokens: Int(maxContextTokens),
+        memoryBudgetMB: Int(memoryBudgetMB)
     ) { text, isFinal in
         text.withCString { cstr in
             tokenCb(cstr, isFinal, callbackContext)
         }
     }
-    return success ? 0 : -1
 }
 
 @_cdecl("MLXBridge_modelInfo")

@@ -1789,6 +1789,7 @@ mod tests {
                 repo: "x/y".into(),
                 quantization: None,
                 recommended: true,
+                featured: false,
                 service_surfaces: None,
                 input_modalities: None,
                 output_modalities: None,

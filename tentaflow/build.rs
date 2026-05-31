@@ -200,6 +200,27 @@ fn build_mlx_bridge() {
         other => other,
     };
 
+    // Metal Toolchain guard. Na macOS 26 / Xcode 26 kompilator Metala jest
+    // osobnym, doinstalowywanym komponentem. Bez niego xcodebuild "buduje"
+    // mlx-swift, ale metallib (skompilowane kernele GPU) jest zepsuty/niepelny
+    // -> kazdy model MLX zwraca belkot (zle logity), bez zadnego bledu builda.
+    // Failujemy glosno z dokladna komenda naprawy zamiast wysylac zepsute GPU.
+    let metal_ok = Command::new("xcrun")
+        .args(["--sdk", "macosx", "metal", "--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !metal_ok {
+        panic!(
+            "Brak Metal Toolchain — mlx-swift nie skompiluje kerneli GPU i kazdy \
+             model MLX bedzie zwracal belkot. Zainstaluj komponent i przebuduj:\n\
+             \n    xcodebuild -downloadComponent MetalToolchain\n\
+             \nPotem wyczysc cache metalliba:\n\
+             \n    rm -rf {}/build-xcode\n",
+            package_dir.display()
+        );
+    }
+
     let xcode_build_dir = package_dir.join("build-xcode");
     let xcode_status = Command::new("xcodebuild")
         .args([
@@ -209,6 +230,12 @@ fn build_mlx_bridge() {
             &format!("platform=macOS,arch={}", xcode_arch),
             "-configuration",
             "Release",
+            // mlx-swift-lm 3.x uzywa makr Swift (#hubDownloader,
+            // #huggingFaceTokenizerLoader). xcodebuild domyslnie blokuje
+            // niezatwierdzone makra ("Macro must be enabled before use") i
+            // wtedy dylib NIE powstaje -> backend mlx niedostepny. Flaga
+            // pomija ten gate dla buildow z linii polecen.
+            "-skipMacroValidation",
             "-derivedDataPath",
         ])
         .arg(&xcode_build_dir)
@@ -315,6 +342,7 @@ fn build_kokoro_bridge() {
             &format!("platform=macOS,arch={}", xcode_arch),
             "-configuration",
             "Release",
+            "-skipMacroValidation",
             "-derivedDataPath",
         ])
         .arg(&xcode_build_dir)

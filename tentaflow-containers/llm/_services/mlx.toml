@@ -18,12 +18,47 @@ platforms = ["macos", "ios"]
 runtime = "embedded"
 feature_flag = "inference-mlx"
 
+# Limity pamieci dla Apple unified memory. Wizard liczy "ile tokenow kontekstu
+# zmiesci sie w budzecie", a runtime guard (Swift) przerywa z czystym bledem
+# zamiast OOM. Bindowane jako MlxField -> persistuja w config_json i wracaja po
+# restarcie (apply_parameters_deploy -> DeployParamsSnapshot.mlx).
+[[parameter]]
+key = "max_context_tokens"
+label_pl = "Maksymalny kontekst (tokeny)"
+label_en = "Max context (tokens)"
+kind = "int"
+default = 0
+# min = 0 bo 0 to sentinel "natywny kontekst / bez capa" (zgodny z GenerateParams
+# i runtime guardem). Wizard wysyla 0 gdy budzet nie zostal skonfigurowany.
+range = { min = 0.0, max = 131072.0, step = 512.0 }
+bindings = [ { when = "native_embedded", type = "mlx_field", field = "max_context_tokens", request_override = false } ]
+
+[[parameter]]
+key = "memory_budget_mb"
+label_pl = "Limit pamieci (MB)"
+label_en = "Memory budget (MB)"
+kind = "int"
+default = 0
+range = { min = 0.0, max = 524288.0, step = 256.0 }
+bindings = [ { when = "native_embedded", type = "mlx_field", field = "memory_budget_mb", request_override = false } ]
+
 [[model_preset]]
 id = "qwen3-5-0-8b-mlx-4bit"
 display_name = "Qwen 3.5 0.8B (MLX 4-bit)"
 repo = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
 quantization = "int4"
 recommended = true
+
+# Bielik PL Minitron 7B (agentGreg) — pruned Minitron 7B w MLX 4-bit, polski.
+# featured = osobny kafelek w katalogu LLM (mlx-swift, tylko macOS/iOS).
+# Bez speculative: na Apple Silicon draft/ngram sa net-negative dla tego modelu
+# (benchmark: /Users/critix/repos/mlx-bielik-spec-bench).
+[[model_preset]]
+id = "bielik-minitron-7b-v3-instruct-mlx-4bit"
+display_name = "Bielik Minitron 7B v3.0 Instruct (MLX 4-bit)"
+repo = "agentGreg/Bielik-Minitron-7B-v3.0-Instruct-MLX-4bit"
+quantization = "int4"
+featured = true
 
 # Bielik 4.5B Instruct (vqstudio) — polski model, czysta rozmowa po polsku.
 # 4-bit MLX — startowo dobry rozmiar dla iPhone 15 Pro / iPad Pro / Mac

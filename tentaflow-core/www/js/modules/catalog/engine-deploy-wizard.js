@@ -107,6 +107,9 @@ export async function openDeployWizard(engineId, opts = {}) {
       kv_cache_dtype: 'auto',
       gpu_memory_utilization: 0.9,
       gpu_memory_touched: false,
+      // MLX-only: budzet pamieci (MB) dla Apple unified memory. Kalkulator
+      // przelicza go na "max kontekst (tokeny)" client-side z model_spec.
+      mlx_max_memory_mb: 8192,
       lockedParam: null,           // 'max_model_len' | 'max_num_seqs' | 'tensor_parallel' | 'gpu_memory_utilization' | null
       // Speculative decoding via vLLM `--speculative-config`. Pre-fillsuje
       // sie z presetu (model_preset.speculator_*) jezeli wybrany preset go
@@ -157,7 +160,10 @@ export async function openDeployWizard(engineId, opts = {}) {
 
   const presets = Manifest.modelPresets(engineEntry);
   if (presets.length > 0) {
-    const rec = presets.find((p) => p && p.recommended) || presets[0];
+    // A featured-tile click passes opts.presetId to open straight on that model.
+    const rec = (opts.presetId && presets.find((p) => p && p.id === opts.presetId))
+      || presets.find((p) => p && p.recommended)
+      || presets[0];
     if (rec) {
       selection.modelPresetId = rec.id;
       applySpeculatorPreset(rec);
@@ -342,11 +348,14 @@ function renderStepBody() {
 function shouldSkipAdvancedStep() {
   const eng = engineEntry?.engine || {};
   const id = String(eng.id || '').toLowerCase();
-  if (!['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm'].includes(id)) return true;
-  // Bez wybranego modelu nie ma jak liczyc VRAM
+  // MLX (embedded, Apple unified memory) reuzywa ten sam krok, ale liczy
+  // "ile tokenow kontekstu zmiesci sie w budzecie pamieci" zamiast vLLM args.
+  if (!['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm', 'mlx'].includes(id)) return true;
+  // Bez wybranego modelu nie ma jak liczyc VRAM/KV
   if (!selection.modelRepo && !selection.modelPresetId) return true;
-  // Bez wybranych GPU tez nie - kalkulator wymaga at least 1 GPU
-  if (selection.gpuSelectMode === 'none') return true;
+  // Bez wybranych GPU tez nie — ale MLX nie ma dyskretnego GPU (unified memory),
+  // tam krok dziala z samego budzetu pamieci.
+  if (id !== 'mlx' && selection.gpuSelectMode === 'none') return true;
   return false;
 }
 
@@ -535,6 +544,13 @@ function getAdvancedModelName() {
 }
 
 function getAdvancedGpus() {
+  // MLX nie ma dyskretnego GPU — budzet unified memory wysylamy jako jedno
+  // syntetyczne "urzadzenie", zeby istniejacy recommend zwrocil model_spec +
+  // wagi. Max-context liczymy potem client-side (bez workspace'u vLLM).
+  if (String(engineEntry?.engine?.id || '').toLowerCase() === 'mlx') {
+    const mb = Number(selection.advanced?.mlx_max_memory_mb) || 0;
+    return mb > 0 ? [{ index: 0, name: 'Apple unified memory', memory_gb: mb / 1024 }] : [];
+  }
   const node = nodes.find((n) => (n.node_id || n.id) === selection.nodeId);
   if (!node) return [];
   const allGpus = (node.gpus || []).map((g, i) => ({
@@ -581,7 +597,86 @@ async function fetchVllmRecommendation(overrides = {}) {
   }
 }
 
+// MLX: ile tokenow kontekstu zmiesci sie w budzecie pamieci. Closed-form na
+// podstawie model_spec (z recommend round-tripu) + wag — bez workspace'u vLLM.
+// KV jest fp16 (mlx-swift nie ma kwantyzacji KV cache).
+function computeMlxMaxContext() {
+  const ms = cachedModelSpec;
+  const rec = advancedRecommendation;
+  const budgetMb = Number(selection.advanced?.mlx_max_memory_mb) || 0;
+  if (!ms || !ms.num_layers || !ms.num_kv_heads || !ms.head_dim || budgetMb <= 0) return null;
+  const weightsGb = (rec && rec.vram_estimate && rec.vram_estimate.model_weights_gb) || 0;
+  const kvPerTokGb = estimateKvGb({
+    num_layers: ms.num_layers,
+    num_kv_heads: ms.num_kv_heads,
+    head_dim: ms.head_dim,
+    max_model_len: 1,
+    max_num_seqs: 1,
+    kv_dtype_bytes: 2,
+  });
+  if (!kvPerTokGb) return null;
+  const availGb = budgetMb / 1024 - weightsGb;
+  if (availGb <= 0) return { tokens: 0, weightsGb, kvGb: 0, overflow: true };
+  let tokens = Math.floor(availGb / kvPerTokGb);
+  const maxPos = (rec && rec.model_spec && rec.model_spec.max_position_embeddings) || 0;
+  if (maxPos > 0) tokens = Math.min(tokens, maxPos);
+  tokens = Math.max(0, Math.floor(tokens / 512) * 512);
+  const kvGb = estimateKvGb({
+    num_layers: ms.num_layers, num_kv_heads: ms.num_kv_heads, head_dim: ms.head_dim,
+    max_model_len: tokens || 1, max_num_seqs: 1, kv_dtype_bytes: 2,
+  }) || 0;
+  return { tokens, weightsGb, kvGb };
+}
+
+// Readout "max kontekst" — wydzielony, zeby handler inputa odswiezal tylko go
+// (bez re-renderu calego body, co gubiloby focus na polu).
+function mlxReadoutHtml() {
+  const rec = advancedRecommendation;
+  const calc = computeMlxMaxContext();
+  const maxPos = (rec && rec.model_spec && rec.model_spec.max_position_embeddings) || 0;
+  if (!rec) return '<div class="adv-loading">Liczenie z konfiguracji modelu…</div>';
+  if (rec.error) return `<div class="adv-error">${escapeHtml(rec.error)}</div>`;
+  if (!calc) return '<div class="adv-loading">Podaj limit pamięci, aby policzyć kontekst.</div>';
+  if (calc.overflow) return `<div class="adv-error">Same wagi modelu (${calc.weightsGb.toFixed(1)} GB) przekraczają budżet — zwiększ limit pamięci.</div>`;
+  return `
+    <div class="adv-cell-value" style="font-size:1.4em;"><strong>${calc.tokens.toLocaleString()}</strong> tokenów</div>
+    <div class="adv-cell-sub">KV cache ${calc.kvGb.toFixed(2)} GB + wagi ${calc.weightsGb.toFixed(1)} GB${maxPos ? ` · natywny limit modelu ${maxPos.toLocaleString()}` : ''}</div>`;
+}
+
+// MLX advanced step — reuzywa ten sam krok co vLLM, ale liczy budzet pamieci
+// -> max kontekst zamiast vLLM args (zadnych TP/PP/seqs/speculative).
+function renderMlxAdvanced() {
+  const model = getAdvancedModelName() || '?';
+  const adv = selection.advanced;
+
+  return `
+    <h4 class="wizard-step-title">Limit pamięci i kontekst (MLX)</h4>
+    <p class="form-hint" style="margin-bottom:14px;">
+      Apple unified memory — ustaw, ile maksymalnie pamięci model może użyć.
+      Runtime przerwie zadanie czystym błędem zamiast OOM, gdy kontekst tego nie zmieści.
+    </p>
+    <div class="adv-section">
+      <div class="adv-summary-cell">
+        <div class="adv-cell-label">Model</div>
+        <div class="adv-cell-value"><code>${escapeHtml(model)}</code></div>
+      </div>
+    </div>
+    <div class="adv-section">
+      <div class="adv-sec-title">Limit pamięci (MB)</div>
+      <tf-input id="edw-mlx-mem" type="number" min="512" step="256"
+        value="${escapeAttr(String(adv.mlx_max_memory_mb || ''))}" style="max-width:220px;"></tf-input>
+      <div style="margin-top:14px;">
+        <div class="adv-cell-label">Maksymalny kontekst, który się zmieści</div>
+        <div id="edw-mlx-readout">${mlxReadoutHtml()}</div>
+      </div>
+    </div>
+  `;
+}
+
 function renderStepAdvanced() {
+  if (String(engineEntry?.engine?.id || '').toLowerCase() === 'mlx') {
+    return renderMlxAdvanced();
+  }
   const model = getAdvancedModelName() || '?';
   const gpus = getAdvancedGpus();
   const totalVramGb = gpus.reduce((acc, g) => acc + g.memory_gb, 0);
@@ -1012,6 +1107,20 @@ function renderAdvancedManualControls(adv, rec) {
 }
 
 function bindAdvancedHandlers() {
+  // MLX: budzet pamieci -> przelicz max kontekst client-side i odswiez tylko
+  // readout (bez re-renderu body, zeby nie gubic focusu na polu).
+  const mlxMem = document.getElementById('edw-mlx-mem');
+  if (mlxMem) {
+    const onMlxMem = () => {
+      const v = Math.max(0, Math.floor(Number(mlxMem.value) || 0));
+      selection.advanced.mlx_max_memory_mb = v;
+      const out = document.getElementById('edw-mlx-readout');
+      if (out) out.innerHTML = mlxReadoutHtml();
+    };
+    mlxMem.addEventListener('input', onMlxMem);
+    mlxMem.addEventListener('change', onMlxMem);
+  }
+
   // Auto/manual mode — tf-segmented emits "change" with detail.value.
   const modeSeg = document.getElementById('edw-adv-mode');
   if (modeSeg) {
@@ -1734,7 +1843,19 @@ async function startDeploy() {
   // ale wtedy `shouldSkipAdvancedStep()` jest prawdziwe i wartosc nie ma
   // znaczenia — wysylamy mimo to bo to tylko hint, backend zdecyduje.
   const advActive = !shouldSkipAdvancedStep();
+  // MLX: budzet pamieci + max kontekst ida do config_json.parameters{} po
+  // kluczach manifestowych [[parameter]] (mlx_field) — apply_parameters_deploy
+  // je persistuje, a runtime guard egzekwuje. NIE uzywamy vllm_args dla MLX.
+  let mlxParameters = null;
+  if (advActive && String(eng.id || '').toLowerCase() === 'mlx') {
+    const calc = computeMlxMaxContext();
+    mlxParameters = {
+      memory_budget_mb: Number(selection.advanced.mlx_max_memory_mb) || 0,
+      max_context_tokens: (calc && calc.tokens) || 0,
+    };
+  }
   const configJson = JSON.stringify({
+    parameters: mlxParameters,
     model_preset_id: selection.modelPresetId || null,
     model_repo: selection.modelRepo || null,
     // Native (python-bundle / binary / embedded) zawsze dostaje port z
