@@ -105,7 +105,7 @@ public enum MLXWhisperPrepare {
     }
 }
 
-public final class MLXWhisperEngine {
+public final class MLXWhisperEngine: @unchecked Sendable {
     public static let shared = MLXWhisperEngine()
 
     private var model: Whisper?

@@ -48,6 +48,8 @@ typedef int (*tentaflow_generate_fn_t)(
     int max_tokens,
     float temperature,
     float top_p,
+    int max_context_tokens,
+    int memory_budget_mb,
     tentaflow_token_callback_t token_callback,
     void* callback_context,
     void* context

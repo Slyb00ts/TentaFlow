@@ -19,7 +19,9 @@ platforms = ["linux", "windows"]
 transport = "sidecar-quic"
 
 [deploy.native]
-platforms = ["linux", "macos", "windows", "ios", "android"]
+# iOS pominiete — apka mobilna ma natywny silnik Whisper po stronie Swift
+# (TentaFlowAI/Whisper/*), Rust whisper-rs nie jest tam kompilowany.
+platforms = ["linux", "macos", "windows", "android"]
 runtime = "embedded"
 feature_flag = "inference-whisper"
 

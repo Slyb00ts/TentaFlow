@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.1
 // =============================================================================
 // Plik: Package.swift
 // Opis: Swift Package — biblioteka dynamiczna libMLXBridge.dylib mostkujaca
@@ -27,23 +27,22 @@ let package = Package(
         // CLI test runner — laduje model + transkrybuje WAV. Uzywany do
         // weryfikacji portu Whispera bez uruchamiania calego tentaflow stack'u.
         .executable(name: "WhisperTest", targets: ["WhisperTest"]),
+        // CLI diag — laduje LLM przez nasz MLXBridgeEngine i generuje, zeby
+        // weryfikowac tokenizacje/output naszego mlx-swift bez calego stacku.
     ],
     dependencies: [
-        // Core MLX bindings (Array, GPU, etc.). Pin do <0.27 — wieksze wersje
-        // wprowadzily zmiany w protokole `Quantizable` ktore wywalaja
-        // `SwitchLayers.swift` w mlx-swift-examples 2.21.x. Range trzymamy
-        // ciasno zeby SPM nie podbil sam.
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", "0.21.2" ..< "0.26.0"),
-        // MLXLLM, MLXLMCommon, LLMModelFactory — high-level LLM runtime.
-        // Ta sama wersja co iOS uzywa.
-        .package(url: "https://github.com/ml-explore/mlx-swift-examples.git", from: "2.21.0"),
-        // swift-transformers — tokenizer HF + AutoTokenizer.from(modelFolder:).
-        // mlx-swift-examples sam wciagnie ta zaleznosc, dodajemy ja jawnie
-        // zeby `import Tokenizers` w naszym kodzie nie zalezalo od kolejnosci.
-        // Pin do dokladnej wersji 0.1.20 — nowsze swift-transformers (0.1.21+)
-        // zmienily Config API i mlx-swift-examples 2.21.0 sie nie kompiluje
-        // (ambiguous `Config.dictionary` w MLXLMCommon/Tokenizer.swift).
-        .package(url: "https://github.com/huggingface/swift-transformers.git", exact: "0.1.20"),
+        // Core MLX bindings (Array, GPU, etc.). mlx-swift-lm 3.x wymaga 0.31.x
+        // (QuantizedKVCache + kvBits/kvGroupSize/quantizedKVStart).
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.3"),
+        // MLXLLM, MLXLMCommon, MLXHuggingFace — high-level LLM runtime.
+        // Repo przemianowane z mlx-swift-examples; 3.x ma kwantyzacje KV cache.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
+        // swift-transformers 1.x — tokenizer HF (`Tokenizers`) dla portu Whispera
+        // i dla bridge tokenizera LLM przez makra MLXHuggingFace.
+        .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.3"),
+        // swift-huggingface — `HuggingFace` (HubApi). 3.x przenioslo Hub tu;
+        // makra #hubDownloader()/#huggingFaceTokenizerLoader() tego wymagaja.
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
     ],
     targets: [
         .target(
@@ -58,20 +57,25 @@ let package = Package(
                 .product(name: "MLXFFT", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
-                .product(name: "MLXLLM", package: "mlx-swift-examples"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-examples"),
-                // swift-transformers wciagniete tranzytywnie przez mlx-swift-examples,
-                // uzywamy go do tokenizera Whispera (parsowanie tokenizer.json HF).
-                // Wersja 0.1.13 eksportuje tylko `Transformers` (umbrella),
-                // ktory wciaga i `Tokenizers` i `Models`.
-                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                // Tokenizer HF dla portu Whispera (parsowanie tokenizer.json) oraz
+                // HubApi dla makr MLXHuggingFace (loadContainer from/using).
+                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
             ],
-            path: "Sources/MLXBridge"
+            path: "Sources/MLXBridge",
+            // Tools 6.1 (wymagane przez mlx-swift-lm 3.x), ale kod jest pisany pod
+            // semantyke Swift 5 (DispatchSemaphore, FFI). Pelna migracja na Swift 6
+            // strict concurrency to osobny temat — zostajemy w trybie 5.
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .executableTarget(
             name: "WhisperTest",
             dependencies: ["MLXBridge"],
-            path: "Sources/WhisperTest"
+            path: "Sources/WhisperTest",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
 )

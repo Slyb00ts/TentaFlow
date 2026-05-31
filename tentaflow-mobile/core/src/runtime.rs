@@ -18,7 +18,6 @@ use tentaflow_core::mesh::pipeline::{
 use tentaflow_core::mesh::security::MeshSecurity;
 use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
 use tentaflow_core::routing::Router;
-use tentaflow_ui::state::SharedAppState;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -33,7 +32,7 @@ pub struct ServiceHandles {
 }
 
 /// Uruchamia wszystkie serwisy Core w tle (wzor Desktop)
-pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Result<ServiceHandles> {
+pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
     info!("Uruchamianie serwisow Core (tryb mobilny)...");
@@ -283,6 +282,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
         quic_mesh_for_server,
         local_node_id,
         mesh_security_for_server,
+        None, // addon_manager — mobile zarzadza addonami przez supervisor
         mesh_relay_health_for_server,
         services_port_allocator.clone(),
         mesh_services_registry.clone(),

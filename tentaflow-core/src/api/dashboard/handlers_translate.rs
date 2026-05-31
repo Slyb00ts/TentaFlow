@@ -235,7 +235,7 @@ text, with no explanations, quotes, preface or meta-commentary.",
     let route_result = ctx
         .state
         .router
-        .route_chat_completion(completion_req, None)
+        .route_chat_completion(completion_req, None, None)
         .await
         .map_err(|e| {
             ProtocolError::new(

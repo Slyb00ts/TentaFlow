@@ -106,6 +106,36 @@ fn main() {
         dest.display()
     );
 
+    // 4b. MLX (mlx-swift 0.31+) szuka swojej Metal biblioteki przez
+    //     `current_binary_dir()/mlx.metallib` (dladdr na dylib). SwiftPM trzyma
+    //     ja w `mlx-swift_Cmlx.bundle`, ktorego mlx-c NIE znajduje gdy dylib jest
+    //     dlopen'owany z binarki Rust (Bundle.mainBundle != app bundle). Kopiujemy
+    //     `default.metallib` -> `mlx.metallib` obok dylib (i obok cargo binary),
+    //     zeby attempt #1 `load_colocated_library(device, "mlx")` trafil.
+    let metallib_src = dylib_dir
+        .join("mlx-swift_Cmlx.bundle")
+        .join("Contents")
+        .join("Resources")
+        .join("default.metallib");
+    if metallib_src.exists() {
+        for metallib_dest in [dylib_dir.join("mlx.metallib"), target_dir.join("mlx.metallib")] {
+            if let Err(e) = std::fs::copy(&metallib_src, &metallib_dest) {
+                panic!(
+                    "Nie udalo sie skopiowac metalliba {} -> {}: {}",
+                    metallib_src.display(),
+                    metallib_dest.display(),
+                    e
+                );
+            }
+        }
+        println!("cargo:warning=MLXBridge: skopiowano mlx.metallib obok dylib + binarki");
+    } else {
+        println!(
+            "cargo:warning=MLXBridge: BRAK metalliba {} — MLX nie znajdzie Metal biblioteki (sprawdz mlx-swift_Cmlx.bundle)",
+            metallib_src.display()
+        );
+    }
+
     // 5. Linker hints — Rust binary linkowany dynamically z MLXBridge.
     //    @loader_path = katalog bin po install. Przy `cargo run` rpath
     //    pokazuje target/release/.

@@ -20,6 +20,17 @@
 pub mod protocol;
 
 pub use protocol::{
+    camera::{
+        CameraAddInput, CameraAddOutput, CameraCredentialsRotateInput, CameraCredentialsRotateOut,
+        CameraDiscoverOut, CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut,
+        CameraRemoveOut, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
+        CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+    },
+    camera_metadata::{
+        MetadataFrameOut, MetadataItemOut, MetadataPollInput, MetadataPollOutput,
+        MetadataSubscribeInput, MetadataSubscribeOutput, MetadataUnsubscribeInput,
+        MetadataUnsubscribeOutput,
+    },
     canonical::{validate_canonical, CanonicalError, CanonicalErrorKind},
     control::{
         AuthContext, Backpressure, BackpressureSeverity, Capability, CapabilityRejection,
@@ -29,10 +40,25 @@ pub use protocol::{
         ServerLimits, SessionEnd, SessionEndCode,
     },
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
+    flow::{FlowCancelOutput, FlowInvocationIdInput, FlowInvocationOutput, FlowInvokeInput},
+    gate::{GateCheckInput, GateCheckOutput, GateSignerOut},
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
+    recording::{
+        FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingRefInput,
+        RecordingSaveSegmentInput, RecordingSaveSnapshotInput, RecordingStatsInput,
+        SaveRecordingOut, StatsOut, StatsPerCamera, StatsTotals, UrlOut,
+    },
+    services::{
+        GpuOut, NodeResourcesInput, NodeResourcesOut, ServiceInfoOut, ServiceListInput,
+        ServiceListOutput,
+    },
     stream::{
         StreamAccepted, StreamCancel, StreamChunk, StreamEnd, StreamError, StreamKind,
         StreamOpen, StreamPayload, StreamProgress, StreamRejected, StreamTag,
+    },
+    streaming::{
+        StreamCloseInput, StreamCloseOutput, StreamNextInput, StreamNextOutput,
+        StreamSubscribeFilter, StreamSubscribeInput, StreamSubscribeOutput,
     },
     ui::{
         a11y::{Accessibility, EventKind, Visibility},
@@ -144,4 +170,8 @@ pub use protocol::{
         },
     },
     value::Value,
+    vector::{
+        VectorDeleteInput, VectorDeleteOutput, VectorSearchHit, VectorSearchInput,
+        VectorSearchOutput, VectorUpsertInput, VectorUpsertOutput,
+    },
 };

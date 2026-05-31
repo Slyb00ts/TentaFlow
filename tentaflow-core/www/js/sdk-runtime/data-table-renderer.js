@@ -286,6 +286,59 @@ function fieldPathToKey(fieldPath) {
   return '';
 }
 
+/// Read a FieldMap value by u8 key from a decoded Component.fields array.
+function readComponentField(fields, key) {
+  if (!Array.isArray(fields)) return undefined;
+  for (const entry of fields) {
+    if (Array.isArray(entry) && entry.length === 2 && entry[0] === key) return entry[1];
+  }
+  return undefined;
+}
+
+/// Extract the first backend (or both) Handler from a Button's handlers map.
+/// Row actions are backend-dispatched buttons; a row action without a backend
+/// handler is a no-op and is skipped.
+function extractBackendHandler(handlers) {
+  if (!Array.isArray(handlers)) return null;
+  for (const entry of handlers) {
+    if (!Array.isArray(entry) || entry.length !== 2) continue;
+    const handler = entry[1];
+    if (handler && (handler.kind === 'backend' || handler.kind === 'both')) {
+      return handler;
+    }
+  }
+  return null;
+}
+
+/// Pre-parse row_actions Button components into renderable descriptors:
+/// stable item id, reactive label BindRef and the backend handler. Parsing
+/// once (not per row) keeps per-row menu construction cheap.
+function parseRowActions(rowActions) {
+  const descriptors = [];
+  for (let i = 0; i < rowActions.length; i++) {
+    const btn = rowActions[i];
+    const labelBind = readComponentField(btn.fields, 2);
+    if (labelBind == null) {
+      throw new TypeError(`Table.row_actions[${i}]: Button.label (field 2) required`);
+    }
+    const handler = extractBackendHandler(btn.handlers);
+    if (handler == null) {
+      throw new TypeError(`Table.row_actions[${i}]: Button needs a backend/both handler`);
+    }
+    const iconRaw = readComponentField(btn.fields, 3);
+    const iconName = (iconRaw && iconRaw.kind === 'named') ? iconRaw.name : null;
+    const destructive = readComponentField(btn.fields, 0) === 'destructive';
+    descriptors.push({
+      itemId: btn.id || `row-action-${i}`,
+      labelBind,
+      handler,
+      iconName,
+      danger: destructive,
+    });
+  }
+  return descriptors;
+}
+
 // =============================================================================
 // Table (0x0211) — uses <tf-table> + <tf-column> web components
 // =============================================================================
@@ -335,6 +388,7 @@ function renderTable(component, ctx) {
     }
     return rowActionsRaw;
   })();
+  const rowActionDescriptors = rowActions.length > 0 ? parseRowActions(rowActions) : [];
   const bulkActionsRaw = ctx.readField(component.fields, 14);
   const bulkActions = bulkActionsRaw == null ? [] : (() => {
     if (!Array.isArray(bulkActionsRaw)) throw new TypeError('Table.bulk_actions: expected Array<Component>');
@@ -444,6 +498,78 @@ function renderTable(component, ctx) {
     }
     return id;
   };
+
+  // Build the per-row kebab menu for row_actions. Each menu item dispatches
+  // its Button's backend handler enriched with the row key, reusing the
+  // same eventDispatcher merge path as native handlers
+  // (params <- {...handler.params, ...dom_event.detail}).
+  const buildRowActionsElement = (row) => {
+    if (rowActionDescriptors.length === 0) return null;
+    const rowId = extractRowId(row);
+
+    const menu = document.createElement('tf-menu');
+    menu.setAttribute('placement', 'bottom-end');
+
+    const trigger = document.createElement('tf-button');
+    trigger.setAttribute('variant', 'ghost');
+    trigger.setAttribute('size', 'sm');
+    // The sprite has no "more-horizontal" symbol, so an icon trigger rendered as
+    // an empty (invisible) button — the row actions menu looked absent. Use a
+    // literal ellipsis glyph so the trigger is always visible without a sprite.
+    trigger.textContent = '⋯';
+    trigger.setAttribute('aria-label', 'Akcje wiersza');
+
+    const onTriggerClick = (e) => {
+      e.stopPropagation();
+      menu.toggle();
+    };
+    trigger.addEventListener('click', onTriggerClick);
+
+    for (const desc of rowActionDescriptors) {
+      const item = document.createElement('tf-menu-item');
+      item.setAttribute('action', desc.itemId);
+      if (desc.iconName) item.setAttribute('icon', desc.iconName);
+      if (desc.danger) item.setAttribute('danger', '');
+      const label = resolveBindRef(desc.labelBind, ctx.store);
+      // Set the label as an attribute (timing-safe in tf-menu-item) and as
+      // textContent (fallback). Without the attribute the menu opened blank.
+      item.setAttribute('label', label == null ? '' : String(label));
+      item.textContent = label == null ? '' : String(label);
+
+      const onSelect = () => {
+        // Do NOT stop tf-menu-select here: it must bubble to <tf-menu> so the
+        // menu closes via its own _onSelect. Row-click/selection is already
+        // suppressed by tf-table's .tf-table__actions-cell guard, not by this
+        // listener. Row key is injected via dom_event.detail so the backend
+        // handler's params end up carrying both `row_id` and the concrete key
+        // field (e.g. `camera_id`).
+        const syntheticEvent = {
+          detail: { row_id: rowId, [rowKeyField]: rowId },
+        };
+        ctx.eventDispatcher.emit({
+          addon_id: ctx.store.addon_id,
+          panel_id: ctx.store.panel_id,
+          panel_epoch: ctx.store.panel_epoch,
+          source_id: desc.itemId,
+          event_kind: 'click',
+          handler: desc.handler,
+          dom_event: syntheticEvent,
+        });
+      };
+      item.addEventListener('tf-menu-select', onSelect);
+      menu.appendChild(item);
+    }
+
+    const wrapper = document.createElement('div');
+    wrapper.classList.add('tf-table__row-actions');
+    wrapper.appendChild(trigger);
+    wrapper.appendChild(menu);
+    return wrapper;
+  };
+
+  if (rowActionDescriptors.length > 0) {
+    tfTable.rowActions = (row) => buildRowActionsElement(row);
+  }
 
   const readAllRows = () => {
     let rows;
