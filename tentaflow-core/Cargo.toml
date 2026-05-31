@@ -34,6 +34,10 @@ inference-mlx-kokoro = ["dep:libloading"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = []
 rdma-probe = []
+# Udostępnia `flow_engine::node_adapter::test_support` (stub dispatcherów +
+# stub_ctx) poza testami, żeby benchmarki mogły konstruować ExecutionContext
+# bez powielania no-op implów. Włączane tylko przez `[[bench]] required-features`.
+test-support = []
 # Camera ingest (M1.W6) — GStreamer 1.x based pipeline for RTSP/file/V4L2/MIPI
 # inputs. Optional because GStreamer pulls a large dynamic-library surface
 # (gst-plugins-base, -good, -bad). Default builds stay slim; enable
@@ -334,6 +338,11 @@ harness = false
 [[bench]]
 name = "manifest_perf"
 harness = false
+
+[[bench]]
+name = "flow_executor_perf"
+harness = false
+required-features = ["test-support"]
 
 [patch.crates-io]
 ed25519-dalek = { path = "../vendor/ed25519-dalek" }
