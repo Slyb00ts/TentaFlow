@@ -252,6 +252,12 @@ pub fn descriptor_for_table(table_name: &str) -> Option<&'static CoreSyncDescrip
         .find(|descriptor| descriptor.table_name.eq_ignore_ascii_case(table_name))
 }
 
+pub fn descriptor_for_resource_type(resource_type: &str) -> Option<&'static CoreSyncDescriptor> {
+    CORE_SYNC_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.resource_type == resource_type)
+}
+
 pub fn is_core_sync_table(table_name: &str) -> bool {
     descriptor_for_table(table_name).is_some()
 }

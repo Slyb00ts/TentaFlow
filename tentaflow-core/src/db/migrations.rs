@@ -240,7 +240,97 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "deployment_jobs_as_services",
             MigrationStep::Sql(DEPLOYMENT_JOBS_AS_SERVICES),
         ),
+        (
+            50,
+            "compliance_core_foundation",
+            MigrationStep::Rust(create_compliance_core_foundation),
+        ),
+        (
+            51,
+            "cameras_restore_org_id",
+            MigrationStep::Rust(cameras_restore_org_id_column),
+        ),
     ]
+}
+
+// The v48 `cameras` rebuild (CAMERAS_VENDOR_CHECK_LOCAL_SOURCES) recreated the
+// table without the `org_id` column that v32 (setup_multi_tenant) had added,
+// so every database that ran v48 lost tenant scoping on `cameras` and every
+// camera_list/insert_camera query failed with "no such column: org_id". The
+// v48 rebuild is fixed in place for fresh installs; this migration repairs
+// databases already past v48. Idempotent: a fresh install (org_id present from
+// the fixed v48) finds the column and skips the ALTER, only enforcing the
+// backfill and index.
+fn cameras_restore_org_id_column(conn: &Connection) -> Result<()> {
+    add_org_id_column_if_missing(conn, "cameras")?;
+    conn.execute(
+        "UPDATE cameras SET org_id = 'org-default' WHERE org_id IS NULL",
+        [],
+    )?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_cameras_org_id ON cameras(org_id)")?;
+    Ok(())
+}
+
+fn create_compliance_core_foundation(conn: &Connection) -> Result<()> {
+    conn.execute_batch(COMPLIANCE_CORE_FOUNDATION)?;
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["compliance.read", "compliance.write"],
+    )?;
+
+    let mut stmt = conn.prepare("SELECT org_id FROM organizations WHERE status <> 'deleted'")?;
+    let org_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for org_id in org_ids {
+        crate::compliance::repository::ensure_org_defaults(conn, &org_id)?;
+    }
+
+    Ok(())
+}
+
+fn roles_add_permissions(
+    conn: &Connection,
+    role_names: &[&str],
+    permissions: &[&str],
+) -> Result<()> {
+    for role_name in role_names {
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT role_id, permissions_json FROM roles WHERE name = ?1",
+                rusqlite::params![role_name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        let Some((role_id, perms_json)) = row else {
+            continue;
+        };
+        let mut existing: Vec<String> = match serde_json::from_str(&perms_json) {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!("rola '{role_name}' ma niepoprawne permissions_json");
+                continue;
+            }
+        };
+        let mut changed = false;
+        for permission in permissions {
+            if !existing.iter().any(|value| value == permission) {
+                existing.push((*permission).to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            let updated = serde_json::to_string(&existing).unwrap_or(perms_json);
+            conn.execute(
+                "UPDATE roles SET permissions_json = ?1 WHERE role_id = ?2",
+                rusqlite::params![updated, role_id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 // F2 P1.a follow-up — v32 (setup_multi_tenant) created the org_memberships
@@ -349,45 +439,7 @@ fn create_legal_documents_table(conn: &Connection) -> Result<()> {
 // missing. Safe to run on a fresh DB (`org_operator` already exists from v32)
 // and on an old DB where an admin manually edited the row.
 fn roles_add_camera_metadata_permission(conn: &Connection) -> Result<()> {
-    const TARGET_ROLES: &[&str] = &["org_admin", "org_operator"];
-    const NEW_PERM: &str = "camera.metadata";
-
-    for role_name in TARGET_ROLES {
-        let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT role_id, permissions_json FROM roles WHERE name = ?1",
-                rusqlite::params![role_name],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .ok();
-        let Some((role_id, perms_json)) = row else {
-            // Role missing — possible on test DBs that skipped v32 seeding. A
-            // missing role is harmless here; the role will be created with the
-            // correct permission set when v32 runs.
-            continue;
-        };
-        let mut perms: Vec<String> = match serde_json::from_str(&perms_json) {
-            Ok(v) => v,
-            Err(_) => {
-                // Corrupt JSON should not abort the whole migration — log and
-                // skip so a single bad row does not block startup.
-                tracing::warn!(
-                    "roles_add_camera_metadata: role '{role_name}' has non-JSON permissions; skipping"
-                );
-                continue;
-            }
-        };
-        if perms.iter().any(|p| p == NEW_PERM) {
-            continue;
-        }
-        perms.push(NEW_PERM.to_string());
-        let updated = serde_json::to_string(&perms).unwrap_or(perms_json);
-        conn.execute(
-            "UPDATE roles SET permissions_json = ?1 WHERE role_id = ?2",
-            rusqlite::params![updated, role_id],
-        )?;
-    }
-    Ok(())
+    roles_add_permissions(conn, &["org_admin", "org_operator"], &["camera.metadata"])
 }
 
 // F2 P6.a — ONVIF metadata (Media2 + PullPoint events). The `cameras` table
@@ -1384,7 +1436,8 @@ CREATE TABLE cameras_new (
     removed_at INTEGER NULL,
     onvif_url TEXT NULL,
     onvif_profile_token TEXT NULL,
-    metadata_supported INTEGER NOT NULL DEFAULT 0 CHECK(metadata_supported IN (0,1))
+    metadata_supported INTEGER NOT NULL DEFAULT 0 CHECK(metadata_supported IN (0,1)),
+    org_id TEXT NOT NULL DEFAULT 'org-default'
 );
 
 INSERT INTO cameras_new (
@@ -1392,14 +1445,15 @@ INSERT INTO cameras_new (
     credentials_encrypted, profile, target_fps, resolution_width,
     resolution_height, retention_class, status, status_message,
     fps_actual, last_frame_at, created_at, updated_at, removed_at,
-    onvif_url, onvif_profile_token, metadata_supported
+    onvif_url, onvif_profile_token, metadata_supported, org_id
 )
 SELECT
     id, camera_id, owner_addon_id, display_name, vendor, url,
     credentials_encrypted, profile, target_fps, resolution_width,
     resolution_height, retention_class, status, status_message,
     fps_actual, last_frame_at, created_at, updated_at, removed_at,
-    onvif_url, onvif_profile_token, metadata_supported
+    onvif_url, onvif_profile_token, metadata_supported,
+    COALESCE(org_id, 'org-default')
 FROM cameras;
 
 DROP TABLE cameras;
@@ -1408,6 +1462,7 @@ ALTER TABLE cameras_new RENAME TO cameras;
 CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
 CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
 CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+CREATE INDEX idx_cameras_org_id ON cameras(org_id);
 
 PRAGMA foreign_keys = ON;
 "#;
@@ -2761,6 +2816,428 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_runs_job
     ON scheduled_runs(job_id, scheduled_for DESC);
 CREATE INDEX IF NOT EXISTS idx_scheduled_runs_status
     ON scheduled_runs(status);
+"#;
+
+const COMPLIANCE_CORE_FOUNDATION: &str = r#"
+CREATE TABLE IF NOT EXISTS compliance_data_categories (
+    category_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    slug TEXT NOT NULL,
+    name_translations TEXT NOT NULL DEFAULT '{}',
+    description_translations TEXT NOT NULL DEFAULT '{}',
+    personal_data INTEGER NOT NULL DEFAULT 1 CHECK(personal_data IN (0,1)),
+    sensitive_data INTEGER NOT NULL DEFAULT 0 CHECK(sensitive_data IN (0,1)),
+    risk_class TEXT NOT NULL DEFAULT 'standard' CHECK(risk_class IN ('low','standard','high','critical')),
+    source_scope TEXT NOT NULL DEFAULT 'core' CHECK(source_scope IN ('core','addon','external')),
+    addon_id TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(org_id, slug),
+    CHECK(json_valid(name_translations)),
+    CHECK(json_valid(description_translations))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_data_categories_org
+    ON compliance_data_categories(org_id, risk_class, personal_data);
+
+CREATE TRIGGER IF NOT EXISTS compliance_data_categories_updated_at
+AFTER UPDATE ON compliance_data_categories
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_data_categories
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE category_id = NEW.category_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_processing_activities (
+    activity_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    slug TEXT NOT NULL,
+    name_translations TEXT NOT NULL DEFAULT '{}',
+    purpose_translations TEXT NOT NULL DEFAULT '{}',
+    controller_role TEXT NOT NULL DEFAULT 'controller'
+        CHECK(controller_role IN ('controller','processor','joint_controller')),
+    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    system_scope TEXT NOT NULL DEFAULT 'core' CHECK(system_scope IN ('core','addon','external')),
+    addon_id TEXT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('draft','active','retired')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(org_id, slug),
+    CHECK(json_valid(name_translations)),
+    CHECK(json_valid(purpose_translations))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_processing_activities_org
+    ON compliance_processing_activities(org_id, status, system_scope);
+
+CREATE TRIGGER IF NOT EXISTS compliance_processing_activities_updated_at
+AFTER UPDATE ON compliance_processing_activities
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_processing_activities
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE activity_id = NEW.activity_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_activity_categories (
+    activity_id TEXT NOT NULL REFERENCES compliance_processing_activities(activity_id) ON DELETE CASCADE,
+    category_id TEXT NOT NULL REFERENCES compliance_data_categories(category_id) ON DELETE CASCADE,
+    PRIMARY KEY(activity_id, category_id)
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_activity_categories_category
+    ON compliance_activity_categories(category_id);
+
+CREATE TABLE IF NOT EXISTS compliance_legal_basis (
+    legal_basis_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    activity_id TEXT NULL REFERENCES compliance_processing_activities(activity_id) ON DELETE CASCADE,
+    category_id TEXT NULL REFERENCES compliance_data_categories(category_id) ON DELETE CASCADE,
+    basis_kind TEXT NOT NULL
+        CHECK(basis_kind IN ('consent','contract','legal_obligation','vital_interests','public_task','legitimate_interest')),
+    basis_reference TEXT NOT NULL DEFAULT '',
+    description_translations TEXT NOT NULL DEFAULT '{}',
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    CHECK(activity_id IS NOT NULL OR category_id IS NOT NULL),
+    CHECK(json_valid(description_translations))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_legal_basis_lookup
+    ON compliance_legal_basis(org_id, activity_id, category_id, is_active);
+
+CREATE TRIGGER IF NOT EXISTS compliance_legal_basis_updated_at
+AFTER UPDATE ON compliance_legal_basis
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_legal_basis
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE legal_basis_id = NEW.legal_basis_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_retention_policies (
+    retention_policy_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    slug TEXT NOT NULL,
+    name_translations TEXT NOT NULL DEFAULT '{}',
+    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('audit','ai_audit','data_category','document','dsar','breach','general')),
+    category_id TEXT NULL REFERENCES compliance_data_categories(category_id) ON DELETE SET NULL,
+    retention_days INTEGER NOT NULL,
+    minimum_days INTEGER NOT NULL DEFAULT 0,
+    action_after_retention TEXT NOT NULL DEFAULT 'delete'
+        CHECK(action_after_retention IN ('delete','anonymize','archive')),
+    is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    CHECK(retention_days >= minimum_days),
+    UNIQUE(org_id, slug),
+    CHECK(json_valid(name_translations))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_retention_policies_lookup
+    ON compliance_retention_policies(org_id, scope_kind, category_id, is_active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_compliance_retention_one_default
+    ON compliance_retention_policies(org_id, scope_kind)
+    WHERE is_default = 1 AND category_id IS NULL AND is_active = 1;
+
+CREATE TRIGGER IF NOT EXISTS compliance_retention_policies_updated_at
+AFTER UPDATE ON compliance_retention_policies
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_retention_policies
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE retention_policy_id = NEW.retention_policy_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_legal_holds (
+    legal_hold_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('audit','ai_audit','data_category','document','dsar','breach','resource','general')),
+    scope_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL,
+    created_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    released_at TEXT NULL,
+    released_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    release_reason TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_legal_holds_active
+    ON compliance_legal_holds(org_id, scope_kind, scope_id, released_at);
+
+CREATE TABLE IF NOT EXISTS compliance_documents (
+    compliance_document_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    source_legal_document_id TEXT NULL REFERENCES legal_documents(id) ON DELETE SET NULL,
+    document_type TEXT NOT NULL,
+    title_translations TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','active','archived')),
+    version INTEGER NOT NULL DEFAULT 1,
+    artifact_path TEXT NOT NULL DEFAULT '',
+    artifact_hash TEXT NOT NULL DEFAULT '',
+    created_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(org_id, document_type, version),
+    CHECK(json_valid(title_translations))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_documents_org
+    ON compliance_documents(org_id, document_type, status);
+
+CREATE TRIGGER IF NOT EXISTS compliance_documents_updated_at
+AFTER UPDATE ON compliance_documents
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_documents
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE compliance_document_id = NEW.compliance_document_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_ai_events (
+    event_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    node_id TEXT NOT NULL DEFAULT '',
+    addon_id TEXT NULL,
+    instance_id TEXT NULL,
+    flow_id INTEGER NULL REFERENCES flows(id) ON DELETE SET NULL,
+    flow_node_id TEXT NULL,
+    request_id TEXT NOT NULL,
+    model_id TEXT NOT NULL DEFAULT '',
+    backend TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    finished_at TEXT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','success','failed','cancelled')),
+    risk_class TEXT NOT NULL DEFAULT 'standard' CHECK(risk_class IN ('low','standard','high','critical')),
+    legal_basis_id TEXT NULL REFERENCES compliance_legal_basis(legal_basis_id) ON DELETE SET NULL,
+    retention_policy_id TEXT NOT NULL REFERENCES compliance_retention_policies(retention_policy_id) ON DELETE RESTRICT,
+    prompt_hash TEXT NOT NULL DEFAULT '',
+    response_hash TEXT NOT NULL DEFAULT '',
+    audit_log_id INTEGER NULL REFERENCES audit_log(id) ON DELETE SET NULL,
+    error_message TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(org_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_org_started
+    ON compliance_ai_events(org_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_user
+    ON compliance_ai_events(org_id, user_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_addon
+    ON compliance_ai_events(org_id, addon_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_status
+    ON compliance_ai_events(org_id, status, started_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS compliance_ai_events_updated_at
+AFTER UPDATE ON compliance_ai_events
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_ai_events
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE event_id = NEW.event_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_ai_payloads (
+    payload_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES compliance_ai_events(event_id) ON DELETE CASCADE,
+    payload_kind TEXT NOT NULL CHECK(payload_kind IN ('prompt','response','system','tool_input','tool_output')),
+    content_hash TEXT NOT NULL,
+    content_text TEXT NOT NULL,
+    content_redacted INTEGER NOT NULL DEFAULT 0 CHECK(content_redacted IN (0,1)),
+    token_count INTEGER NULL CHECK(token_count IS NULL OR token_count >= 0),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_payloads_event
+    ON compliance_ai_payloads(event_id, payload_kind);
+
+CREATE TABLE IF NOT EXISTS compliance_ai_sources (
+    source_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES compliance_ai_events(event_id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL CHECK(source_kind IN ('rag','file','url','database','addon','memory','vector','other')),
+    source_ref TEXT NOT NULL,
+    source_hash TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    excerpt_hash TEXT NOT NULL DEFAULT '',
+    excerpt_text TEXT NOT NULL DEFAULT '',
+    score REAL NULL,
+    metadata_cbor BLOB NOT NULL DEFAULT X'',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_sources_event
+    ON compliance_ai_sources(event_id, source_kind);
+
+CREATE TABLE IF NOT EXISTS compliance_ai_tool_calls (
+    tool_call_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES compliance_ai_events(event_id) ON DELETE CASCADE,
+    addon_id TEXT NULL,
+    tool_name TEXT NOT NULL,
+    input_hash TEXT NOT NULL DEFAULT '',
+    output_hash TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK(status IN ('running','success','failed')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT NULL,
+    error_message TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_tool_calls_event
+    ON compliance_ai_tool_calls(event_id, status);
+
+CREATE TABLE IF NOT EXISTS compliance_ai_policy_decisions (
+    decision_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES compliance_ai_events(event_id) ON DELETE CASCADE,
+    decision_kind TEXT NOT NULL CHECK(decision_kind IN ('allow','deny','redact','retain','legal_hold','risk_class')),
+    decision_value TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_policy_decisions_event
+    ON compliance_ai_policy_decisions(event_id, decision_kind);
+
+CREATE TABLE IF NOT EXISTS compliance_data_subjects (
+    subject_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('user','contact','customer','employee','external_person','unknown')),
+    display_name_translations TEXT NOT NULL DEFAULT '{}',
+    email_hash TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    CHECK(json_valid(display_name_translations))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_data_subjects_org
+    ON compliance_data_subjects(org_id, subject_type, email_hash);
+
+CREATE TRIGGER IF NOT EXISTS compliance_data_subjects_updated_at
+AFTER UPDATE ON compliance_data_subjects
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_data_subjects
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE subject_id = NEW.subject_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_data_subject_links (
+    link_id TEXT PRIMARY KEY,
+    subject_id TEXT NOT NULL REFERENCES compliance_data_subjects(subject_id) ON DELETE CASCADE,
+    resource_kind TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    addon_id TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_compliance_data_subject_links_unique
+    ON compliance_data_subject_links(subject_id, resource_kind, resource_id, COALESCE(addon_id, ''));
+CREATE INDEX IF NOT EXISTS idx_compliance_data_subject_links_resource
+    ON compliance_data_subject_links(resource_kind, resource_id, addon_id);
+
+CREATE TABLE IF NOT EXISTS compliance_dsar_requests (
+    dsar_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    subject_id TEXT NOT NULL REFERENCES compliance_data_subjects(subject_id) ON DELETE CASCADE,
+    request_type TEXT NOT NULL CHECK(request_type IN ('access','rectification','erasure','restriction','portability','objection')),
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','in_progress','completed','rejected','cancelled')),
+    requested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    due_at TEXT NOT NULL,
+    completed_at TEXT NULL,
+    handled_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    notes TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_dsar_requests_org
+    ON compliance_dsar_requests(org_id, status, due_at);
+
+CREATE TABLE IF NOT EXISTS compliance_dsar_exports (
+    export_id TEXT PRIMARY KEY,
+    dsar_id TEXT NOT NULL REFERENCES compliance_dsar_requests(dsar_id) ON DELETE CASCADE,
+    artifact_path TEXT NOT NULL,
+    artifact_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS compliance_consent_records (
+    consent_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    subject_id TEXT NOT NULL REFERENCES compliance_data_subjects(subject_id) ON DELETE CASCADE,
+    activity_id TEXT NOT NULL REFERENCES compliance_processing_activities(activity_id) ON DELETE CASCADE,
+    consent_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('granted','withdrawn','expired')),
+    granted_at TEXT NULL,
+    withdrawn_at TEXT NULL,
+    evidence_hash TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_consent_records_subject
+    ON compliance_consent_records(org_id, subject_id, activity_id, status);
+
+CREATE TABLE IF NOT EXISTS compliance_dpia_records (
+    dpia_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    activity_id TEXT NOT NULL REFERENCES compliance_processing_activities(activity_id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','review','approved','rejected','retired')),
+    risk_class TEXT NOT NULL DEFAULT 'standard' CHECK(risk_class IN ('low','standard','high','critical')),
+    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    reviewed_at TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_dpia_records_org
+    ON compliance_dpia_records(org_id, status, risk_class);
+
+CREATE TRIGGER IF NOT EXISTS compliance_dpia_records_updated_at
+AFTER UPDATE ON compliance_dpia_records
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_dpia_records
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE dpia_id = NEW.dpia_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_breach_incidents (
+    breach_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    detected_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','investigating','notified','closed')),
+    severity TEXT NOT NULL DEFAULT 'medium' CHECK(severity IN ('low','medium','high','critical')),
+    title_translations TEXT NOT NULL DEFAULT '{}',
+    summary_translations TEXT NOT NULL DEFAULT '{}',
+    dpa_notified_at TEXT NULL,
+    subjects_notified_at TEXT NULL,
+    created_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    CHECK(json_valid(title_translations)),
+    CHECK(json_valid(summary_translations))
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_breach_incidents_org
+    ON compliance_breach_incidents(org_id, status, detected_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS compliance_breach_incidents_updated_at
+AFTER UPDATE ON compliance_breach_incidents
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_breach_incidents
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE breach_id = NEW.breach_id;
+END;
+
+CREATE TABLE IF NOT EXISTS compliance_processors (
+    processor_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('processor','subprocessor','joint_controller')),
+    country TEXT NOT NULL DEFAULT '',
+    transfer_mechanism TEXT NOT NULL DEFAULT '',
+    dpa_reference TEXT NOT NULL DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(org_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_processors_org
+    ON compliance_processors(org_id, is_active);
+
+CREATE TRIGGER IF NOT EXISTS compliance_processors_updated_at
+AFTER UPDATE ON compliance_processors
+FOR EACH ROW
+BEGIN
+    UPDATE compliance_processors
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE processor_id = NEW.processor_id;
+END;
 "#;
 
 // v40 — `platform_locales`: katalog jezykow interfejsu per organizacja.

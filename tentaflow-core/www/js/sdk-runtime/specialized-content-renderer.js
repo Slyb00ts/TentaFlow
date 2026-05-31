@@ -341,27 +341,20 @@ function renderStepProgress(component, ctx) {
   const variant = requireEnum(ctx.readField(component.fields, 2), SP_VARIANTS, 'StepProgress.variant');
   const clickableCompleted = requireBool(ctx.readField(component.fields, 3), 'StepProgress.clickable_completed');
 
-  // Parse steps: each is {0: id, 1: label BindRef, 2: optional bool, 3?: status BindRef, 4?: description BindRef}.
+  // Each StepDef is a FieldMap (array of [u8, Value] pairs), read via ctx.readField
+  // like every other inline-struct: 0=id, 1=label BindRef, 2=optional bool,
+  // 3?=status BindRef, 4?=description BindRef.
   const steps = [];
   for (let i = 0; i < stepsRaw.length; i++) {
     const raw = stepsRaw[i];
-    if (raw == null || typeof raw !== 'object') throw new TypeError(`StepProgress.steps[${i}] must be object`);
+    if (raw == null || typeof raw !== 'object') throw new TypeError(`StepProgress.steps[${i}] must be FieldMap`);
 
-    let id, label, optional, statusBind, descBind;
-    // Support both map-key (0,1,2,3,4) and named-key (id,label,...) formats.
-    if ('0' in raw || 0 in raw) {
-      id = raw[0] ?? raw['0'];
-      label = raw[1] ?? raw['1'];
-      optional = raw[2] ?? raw['2'] ?? false;
-      statusBind = raw[3] ?? raw['3'] ?? null;
-      descBind = raw[4] ?? raw['4'] ?? null;
-    } else {
-      id = raw.id;
-      label = raw.label;
-      optional = raw.optional ?? false;
-      statusBind = raw.status ?? null;
-      descBind = raw.description ?? null;
-    }
+    const id = ctx.readField(raw, 0);
+    const label = ctx.readField(raw, 1);
+    const optional = ctx.readField(raw, 2) ?? false;
+    const statusBind = ctx.readField(raw, 3) ?? null;
+    const descBind = ctx.readField(raw, 4) ?? null;
+
     if (typeof id !== 'string') throw new TypeError(`StepProgress.steps[${i}].id must be string`);
     if (label == null) throw new TypeError(`StepProgress.steps[${i}].label is required`);
     assertBindRef(label, `StepProgress.steps[${i}].label`);

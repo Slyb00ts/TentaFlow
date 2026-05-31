@@ -617,6 +617,137 @@ test('Table sticky_columns=N dodaje klasę dla pierwszych N kolumn', () => {
   assert(!ths[1].classList.contains('tf-table__th--sticky-left'));
 });
 
+// ============================================================================
+// Row actions (kebab menu)
+// ============================================================================
+
+const BUTTON_TAG = 0x0401;
+
+/// Build a row-action Button component with a backend handler.
+function rowActionButton({ id, label, actionId, params = {}, icon = null, variant = 'secondary' }) {
+  const fields = [
+    [0, variant], [1, 'neutral'],
+    [2, { kind: 'literal', value: label }],
+    [5, 'sm'], [6, false], [9, 'default'],
+  ];
+  if (icon) fields.push([3, { kind: 'named', name: icon }]);
+  return {
+    tag: BUTTON_TAG, id, fields,
+    handlers: [['click', { kind: 'backend', action_id: actionId, params }]],
+    bind: null, a11y: null, visibility: null, test_id: null,
+  };
+}
+
+/// Mirror of addon-app.js dispatcher merge: params <- {...handler.params,
+/// ...dom_event.detail}. Proves the row key reaches the backend params.
+function dispatcherWithCapture(captured) {
+  return {
+    emit({ handler, dom_event, action_id, ...rest }) {
+      if (!handler || (handler.kind !== 'backend' && handler.kind !== 'both')) return;
+      const params = { ...(handler.params || {}) };
+      if (dom_event && dom_event.detail && typeof dom_event.detail === 'object') {
+        Object.assign(params, dom_event.detail);
+      }
+      captured.push({ action_id: handler.action_id, params });
+    },
+  };
+}
+
+test('Table row_actions ustawia builder akcji na tf-table', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ camera_id: 'cam-1', name: 'A' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name' })],
+    rowKeyField: 'camera_id',
+    rowActions: [rowActionButton({ id: 'act-edit', label: 'Edytuj', actionId: 'edit_camera' })],
+  })));
+  const tfTable = el.querySelector('tf-table');
+  assert(tfTable != null, 'tf-table musi istnieć');
+  assertEq(typeof tfTable.rowActions, 'function');
+});
+
+test('Table row_actions builder renderuje tf-menu z pozycjami', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ camera_id: 'cam-1', name: 'A' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name' })],
+    rowKeyField: 'camera_id',
+    rowActions: [
+      rowActionButton({ id: 'act-edit', label: 'Edytuj', actionId: 'edit_camera' }),
+      rowActionButton({ id: 'act-del', label: 'Usuń', actionId: 'delete_camera', variant: 'destructive' }),
+    ],
+  })));
+  const tfTable = el.querySelector('tf-table');
+  const menuEl = tfTable.rowActions({ camera_id: 'cam-1', name: 'A' }, 0);
+  const items = menuEl.querySelectorAll('tf-menu-item');
+  assertEq(items.length, 2);
+  assertEq(items[0].getAttribute('action'), 'act-edit');
+  assertEq(items[0].textContent, 'Edytuj');
+  assert(items[1].hasAttribute('danger'), 'akcja destructive musi mieć danger');
+});
+
+test('Table row_action klik niesie row_id i klucz wiersza do backend params', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ camera_id: 'cam-42', name: 'A' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const captured = [];
+  const engine = new ComponentRenderer({
+    store, eventDispatcher: dispatcherWithCapture(captured), locale: 'en-US',
+  });
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name' })],
+    rowKeyField: 'camera_id',
+    rowActions: [rowActionButton({
+      id: 'act-edit', label: 'Edytuj', actionId: 'edit_camera', params: { mode: 'inline' },
+    })],
+  })));
+  const tfTable = el.querySelector('tf-table');
+  const menuEl = tfTable.rowActions({ camera_id: 'cam-42', name: 'A' }, 0);
+  // tf-menu zamyka się we własnym listenerze na zbubblowanym tf-menu-select,
+  // więc listener pozycji nie może zatrzymać propagacji.
+  let reachedMenu = 0;
+  menuEl.addEventListener('tf-menu-select', () => { reachedMenu += 1; });
+  // Symulacja wyboru pozycji menu — emituje tf-menu-select jak tf-menu-item.
+  const item = menuEl.querySelector('tf-menu-item');
+  item.dispatchEvent(new (globalThis.CustomEvent)('tf-menu-select', {
+    bubbles: true, detail: { action: 'act-edit' },
+  }));
+  assertEq(captured.length, 1);
+  assertEq(captured[0].action_id, 'edit_camera');
+  // Statyczne params zachowane + wzbogacone o klucz wiersza.
+  assertEq(captured[0].params, { mode: 'inline', row_id: 'cam-42', camera_id: 'cam-42' });
+  // Event musi dotrzeć do <tf-menu>, żeby menu się zamknęło — dokładnie raz.
+  assertEq(reachedMenu, 1, 'tf-menu-select musi bubblować do tf-menu (brak stopPropagation)');
+});
+
+test('Table bez row_actions nie ustawia buildera akcji', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', name: 'A' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name' })],
+  })));
+  const tfTable = el.querySelector('tf-table');
+  assertEq(tfTable.rowActions, undefined);
+});
+
 // ---- report ----
 function reportResults() {
   let pass = 0, fail = 0;
