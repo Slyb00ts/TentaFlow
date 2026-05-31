@@ -28,6 +28,19 @@ cargo install wasm-bindgen-cli --version 0.2.108 --locked
 # Or one-shot: ./scripts/setup.sh (Linux + macOS)
 ```
 
+macOS 26+ (Xcode 26) split the Metal compiler into a separate component. Without
+it, `xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model returns
+gibberish (wrong GPU logits) with no build error. `setup.sh` installs it; the
+guard in `tentaflow/build.rs` fails loudly with the command if it is missing:
+
+```bash
+xcodebuild -downloadComponent MetalToolchain
+rm -rf tentaflow-desktop/macos/swift/MLXBridge/build-xcode   # drop stale metallib
+```
+
+The MLXBridge build runs `xcodebuild` (SwiftPM CLI cannot compile Metal shaders)
+with `-skipMacroValidation` (mlx-swift-lm 3.x uses Swift macros).
+
 Feature flags on `tentaflow-core`:
 
 | Flag | Purpose |

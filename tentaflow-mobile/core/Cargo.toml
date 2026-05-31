@@ -9,10 +9,14 @@ name = "tentaflow_mobile"
 crate-type = ["staticlib"]
 
 [dependencies]
-tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "dashboard-api"] }
-tentaflow-ui = { path = "../../tentaflow-ui" }
-eframe = { version = "0.34.2", default-features = false, features = ["wgpu", "default_fonts"] }
-egui = "0.34.2"
+# default-features = false wycina `inference-whisper` (whisper-rs) z builda
+# mobilnego. Whisper na iOS leci natywnym Swift (TentaFlowAI/Whisper/*).
+# `camera` (GStreamer) zostawiamy — apka mobilna uczestniczy w pipeline video
+# i wymaga GStreamer iOS SDK podpietego w Xcode.
+tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "dashboard-api"] }
+# tentaflow-ui (egui/wgpu) usuniete z mobile — UI idzie przez webview (SwiftUI),
+# egui app (run_gui) byl martwym kodem (nigdy nie wolany). To wycina tez
+# eframe/egui/wgpu z buildu iOS.
 
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
@@ -24,7 +28,7 @@ hex = "0.4"
 data-encoding = "2"
 
 [target.'cfg(target_os = "ios")'.dependencies]
-tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "inference-mlx", "dashboard-api"] }
+tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "dashboard-api"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15.1"

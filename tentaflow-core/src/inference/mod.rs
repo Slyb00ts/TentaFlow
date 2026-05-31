@@ -62,6 +62,13 @@ pub struct GenerateParams {
     pub repeat_penalty: f32,
     pub stop_sequences: Vec<String>,
     pub system_prompt: Option<String>,
+    /// Hard cap on total context (prompt + generated) for the MLX runtime guard.
+    /// 0 = use the model's native max. The Swift runner aborts with a clean
+    /// "insufficient memory" error instead of OOMing when this is exceeded.
+    pub max_context_tokens: u32,
+    /// Upper bound (MB) on how much memory the MLX model may use. 0 = no cap.
+    /// Enforced via `GPU.set(memoryLimit:)` + a per-token memory snapshot check.
+    pub memory_budget_mb: u32,
 }
 
 impl Default for GenerateParams {
@@ -80,6 +87,10 @@ impl Default for GenerateParams {
             repeat_penalty: 1.0,
             stop_sequences: vec![],
             system_prompt: None,
+            // 0 = native max / no cap; the deploy wizard pins real values that
+            // persist via the mlx `[[parameter]]` bindings.
+            max_context_tokens: 0,
+            memory_budget_mb: 0,
         }
     }
 }
@@ -112,6 +123,14 @@ impl GenerateParams {
             .and_then(|v| v.as_f64())
         {
             p.repeat_penalty = v as f32;
+        }
+        // Keys match the `mlx_field` bindings in mlx.toml; they are re-derived
+        // from the persisted config_json on every (re)deploy and restart.
+        if let Some(v) = defaults.get("max_context_tokens").and_then(|v| v.as_u64()) {
+            p.max_context_tokens = v as u32;
+        }
+        if let Some(v) = defaults.get("memory_budget_mb").and_then(|v| v.as_u64()) {
+            p.memory_budget_mb = v as u32;
         }
         p
     }

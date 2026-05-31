@@ -338,6 +338,15 @@ impl Supervisor {
         // gave up on, so the user must press Start manually after a permanent
         // failure. Health-check restart logic in run_loop handles the
         // already-up-but-then-crashed case via its own backoff state.
+        // Embedded services lose their in-process runtime (loaded model) on a
+        // process restart while the DB still reads `Running`. Reload them so a
+        // green row actually serves requests instead of lying. Runs BEFORE
+        // auto_start_pinned so the two never respawn the same row: reload marks
+        // its targets `Starting`, which auto_start_pinned then skips.
+        if let Err(e) = self.reload_embedded_on_boot().await {
+            tracing::warn!("supervisor: reload_embedded_on_boot failed: {}", e);
+        }
+
         if let Err(e) = self.auto_start_pinned().await {
             tracing::warn!("supervisor: auto_start_pinned failed: {}", e);
         }
@@ -396,108 +405,143 @@ impl Supervisor {
                 svc.id,
                 svc.engine_id
             );
-            self.mark_status(svc.id, ServiceStatus::Starting, None)
-                .await;
+            self.spawn_detached_respawn(&svc, "pinned auto-start").await;
+        }
+        Ok(())
+    }
 
-            let svc_id = svc.id;
-            let engine_id = svc.engine_id.clone();
-            let deploy_method = svc.deploy_method;
-            let config_json = svc.config_json.clone();
-            let preserved_port = svc.runtime_port;
-            let db_for_task = self.db.clone();
-            let ports_for_task = self.ports.clone();
+    /// Embedded services keep their runtime state in THIS process — a loaded
+    /// model inside `InferenceManager`, in-memory TTS/STT. A process restart
+    /// wipes that state, yet the DB row still reads `Running`, so the boot
+    /// tick would leave a green-but-dead service that answers no requests
+    /// (model never reloaded). Subprocess services survive via PID liveness;
+    /// embedded ones have nothing to reattach to, so the only honest recovery
+    /// is to re-run the deploy and reload the model. Respawn every non-paused
+    /// embedded service the DB believed was up, regardless of `pinned`.
+    async fn reload_embedded_on_boot(&self) -> Result<(), SupervisorError> {
+        let services = self.read_supervised().await?;
+        for svc in &services {
+            if svc.paused || svc.transport != Transport::Embedded {
+                continue;
+            }
+            // Only services the user expected to be up. Stopped/Failed/Interrupted
+            // are left alone (pinned ones are handled by auto_start_pinned).
+            if !matches!(
+                svc.status,
+                ServiceStatus::Running
+                    | ServiceStatus::Degraded
+                    | ServiceStatus::Starting
+                    | ServiceStatus::Deploying
+            ) {
+                continue;
+            }
+            tracing::info!(
+                "supervisor: reloading embedded service {} ({}) on boot — \
+                 in-process state lost on restart [detached]",
+                svc.id,
+                svc.engine_id
+            );
+            self.spawn_detached_respawn(svc, "embedded boot-reload").await;
+        }
+        Ok(())
+    }
 
-            tokio::spawn(async move {
-                // Heartbeat progress: co 5s update progress_message
-                // ("warming up — alive Xs") zeby GUI snapshot pokazywal
-                // user'owi PROGRES startu (cold start vLLM ~3 min).
-                // tokio::select! z deploy::respawn() future i interval
-                // tick — pierwszy deploy result wins, interval jest
-                // anulowany.
-                update_progress_detached(&db_for_task, svc_id, Some("starting — bootstrap+spawn"))
-                    .await;
-                let respawn_fut = deploy::respawn(
-                    &engine_id,
-                    deploy_method,
-                    &config_json,
-                    ports_for_task,
-                    preserved_port,
-                );
-                tokio::pin!(respawn_fut);
-                let started = std::time::Instant::now();
-                let mut tick = tokio::time::interval(Duration::from_secs(5));
-                tick.tick().await; // skip immediate first tick
-                let outcome: Result<deploy::RuntimeHandle, deploy::DeployError> = loop {
-                    tokio::select! {
-                        biased;
-                        res = &mut respawn_fut => break res,
-                        _ = tick.tick() => {
-                            let secs = started.elapsed().as_secs();
-                            update_progress_detached(
-                                &db_for_task,
-                                svc_id,
-                                Some(&format!("warming up — alive {}s, waiting for ready", secs)),
-                            )
-                            .await;
-                        }
-                    }
-                };
-                match outcome {
-                    Ok(handle) => {
-                        if let Err(e) = update_runtime_detached(&db_for_task, svc_id, &handle).await
-                        {
-                            tracing::warn!(
-                                "supervisor: write_runtime failed for pinned {} ({}): {}",
-                                svc_id,
-                                engine_id,
-                                e
-                            );
-                        }
-                        update_status_detached(&db_for_task, svc_id, ServiceStatus::Running, None)
-                            .await;
-                        update_progress_detached(&db_for_task, svc_id, None).await;
-                        tracing::info!(
-                            "supervisor: pinned service {} ({}) up after detached deploy ({}s)",
-                            svc_id,
-                            engine_id,
-                            started.elapsed().as_secs()
-                        );
-                    }
-                    Err(e) => {
-                        let msg = format!("pinned auto-start: {}", e);
-                        tracing::warn!(
-                            "supervisor: pinned auto-start failed for {} ({}): {}",
-                            svc_id,
-                            engine_id,
-                            e
-                        );
-                        update_status_detached(
-                            &db_for_task,
-                            svc_id,
-                            ServiceStatus::Failed,
-                            Some(&msg),
-                        )
-                        .await;
-                        // Wyczyść runtime_pid/runtime_port/endpoint_url po
-                        // failu — bez tego DB wlokła stary endpoint przez
-                        // restart, a `LiveHandlesCache` budował handle
-                        // wskazujacy na zwolniony port (zombie endpoint).
-                        clear_runtime_detached(&db_for_task, svc_id).await;
-                        // Progress message: pokazujemy ostatni stan +
-                        // ze padlo, zeby GUI mialo wskazowke (bezpiecznie
-                        // duplikuje error_message ale GUI moze inaczej
-                        // renderowac progress vs error).
+    /// Marks the service `Starting` and launches a detached task that re-runs
+    /// the deploy (process spawn or in-process model load), then flips the DB
+    /// row to `Running` / `Failed`. Shared by pinned auto-start and embedded
+    /// boot-reload; `label` prefixes log + error messages.
+    async fn spawn_detached_respawn(&self, svc: &ServiceRow, label: &'static str) {
+        self.mark_status(svc.id, ServiceStatus::Starting, None)
+            .await;
+
+        let svc_id = svc.id;
+        let engine_id = svc.engine_id.clone();
+        let deploy_method = svc.deploy_method;
+        let config_json = svc.config_json.clone();
+        let preserved_port = svc.runtime_port;
+        let db_for_task = self.db.clone();
+        let ports_for_task = self.ports.clone();
+
+        tokio::spawn(async move {
+            // Heartbeat progress: co 5s update progress_message
+            // ("warming up — alive Xs") zeby GUI snapshot pokazywal
+            // user'owi PROGRES startu (cold start vLLM ~3 min).
+            // tokio::select! z deploy::respawn() future i interval
+            // tick — pierwszy deploy result wins, interval jest
+            // anulowany.
+            update_progress_detached(&db_for_task, svc_id, Some("starting — bootstrap+spawn")).await;
+            let respawn_fut = deploy::respawn(
+                &engine_id,
+                deploy_method,
+                &config_json,
+                ports_for_task,
+                preserved_port,
+            );
+            tokio::pin!(respawn_fut);
+            let started = std::time::Instant::now();
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.tick().await; // skip immediate first tick
+            let outcome: Result<deploy::RuntimeHandle, deploy::DeployError> = loop {
+                tokio::select! {
+                    biased;
+                    res = &mut respawn_fut => break res,
+                    _ = tick.tick() => {
+                        let secs = started.elapsed().as_secs();
                         update_progress_detached(
                             &db_for_task,
                             svc_id,
-                            Some(&format!("failed after {}s", started.elapsed().as_secs())),
+                            Some(&format!("warming up — alive {}s, waiting for ready", secs)),
                         )
                         .await;
                     }
                 }
-            });
-        }
-        Ok(())
+            };
+            match outcome {
+                Ok(handle) => {
+                    if let Err(e) = update_runtime_detached(&db_for_task, svc_id, &handle).await {
+                        tracing::warn!(
+                            "supervisor: write_runtime failed for {} {} ({}): {}",
+                            label,
+                            svc_id,
+                            engine_id,
+                            e
+                        );
+                    }
+                    update_status_detached(&db_for_task, svc_id, ServiceStatus::Running, None).await;
+                    update_progress_detached(&db_for_task, svc_id, None).await;
+                    tracing::info!(
+                        "supervisor: {} service {} ({}) up after detached deploy ({}s)",
+                        label,
+                        svc_id,
+                        engine_id,
+                        started.elapsed().as_secs()
+                    );
+                }
+                Err(e) => {
+                    let msg = format!("{}: {}", label, e);
+                    tracing::warn!(
+                        "supervisor: {} failed for {} ({}): {}",
+                        label,
+                        svc_id,
+                        engine_id,
+                        e
+                    );
+                    update_status_detached(&db_for_task, svc_id, ServiceStatus::Failed, Some(&msg))
+                        .await;
+                    // Wyczyść runtime_pid/runtime_port/endpoint_url po failu —
+                    // bez tego DB wlokła stary endpoint przez restart, a
+                    // `LiveHandlesCache` budował handle wskazujacy na zwolniony
+                    // port (zombie endpoint).
+                    clear_runtime_detached(&db_for_task, svc_id).await;
+                    update_progress_detached(
+                        &db_for_task,
+                        svc_id,
+                        Some(&format!("failed after {}s", started.elapsed().as_secs())),
+                    )
+                    .await;
+                }
+            }
+        });
     }
 
     /// Spawns the detached supervisor loop. The returned handle joins to `()`

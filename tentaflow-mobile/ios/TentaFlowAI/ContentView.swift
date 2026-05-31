@@ -273,6 +273,22 @@ struct TentaFlowWebView: UIViewRepresentable {
                 self.pollServer(webView: webView)
             }
         }
+
+        /// iOS jettisonuje proces WebContent WKWebView po suspendzie albo pod
+        /// presja pamieci — strona robi sie biala i NIC nie przeladuje sie samo,
+        /// bo nie leci zaden navigation event (proces po prostu zniknal). Bez
+        /// tego handlera jedynym wyjsciem byl twardy restart apki. Respawnujemy
+        /// proces przez pollServer (czeka az serwer odpowie i robi webView.load).
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            NSLog("[TentaFlow] WebContent proces zabity (suspend/pamiec) — odtwarzam polaczenie")
+            DispatchQueue.main.async {
+                self.parent.isLoading = true
+                self.parent.statusText = "Odnawianie polaczenia..."
+                self.parent.retryCount = 0
+                self.attempts = 0
+                self.pollServer(webView: webView)
+            }
+        }
     }
 }
 #endif

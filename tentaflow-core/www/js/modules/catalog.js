@@ -327,17 +327,28 @@ function renderTentaflowTab() {
         Manifest.isEngineCompatible(e, targetOs, target) && Manifest.resourceKind(e) === group.id
       );
       if (engines.length === 0) continue;
-      rendered += engines.length;
-      groupCount += engines.length;
+
+      // Featured model presets render as their own deployable tiles next to the
+      // engine cards; they reuse the parent engine's deploy path.
+      const featured = [];
+      for (const e of engines) {
+        for (const p of Manifest.modelPresets(e)) {
+          if (p && p.featured) featured.push({ engine: e, preset: p });
+        }
+      }
+      const cardCount = engines.length + featured.length;
+      rendered += cardCount;
+      groupCount += cardCount;
 
       const categoryLabel = I18n.t(`category.${cat}`) !== `category.${cat}`
         ? I18n.t(`category.${cat}`)
         : cat.toUpperCase();
 
       groupHtml += `
-        <h3 class="catalog-section-title">${escapeHtml(categoryLabel)} <span class="section-count">${engines.length}</span></h3>
+        <h3 class="catalog-section-title">${escapeHtml(categoryLabel)} <span class="section-count">${cardCount}</span></h3>
         <div class="catalog-grid">
           ${engines.map((e) => renderEngineCard(e, targetOs, target)).join('')}
+          ${featured.map((f) => renderFeaturedCard(f.engine, f.preset, targetOs, target)).join('')}
         </div>
       `;
     }
@@ -397,17 +408,48 @@ function renderEngineCard(service, targetOs, host) {
   `;
 }
 
+function renderFeaturedCard(service, preset, targetOs, host) {
+  const e = service?.engine || {};
+  const iconKey = e.icon || categoryIconKey[e.category] || 'cpu';
+  const iconHtml = renderIcon(iconKey, 28);
+  const deployMethods = Manifest.availableDeployMethods(service, targetOs, host);
+  const methodsLabel = deployMethods.map((m) => escapeHtml(I18n.t(`catalog.method_${m}`))).join(' · ') || '—';
+  const presetId = preset?.id || '';
+
+  return `
+    <div class="catalog-card" data-engine-id="${escapeAttr(e.id || '')}" data-preset-id="${escapeAttr(presetId)}">
+      <div class="catalog-card-head">
+        <div class="catalog-card-ico">${iconHtml}</div>
+        <div class="catalog-card-title">
+          <div class="name-t">${escapeHtml(preset?.display_name || presetId || '—')}</div>
+          <div class="details">${escapeHtml(e.name || e.id || '')}</div>
+        </div>
+      </div>
+      <div class="catalog-card-meta">
+        <div class="meta-row"><span class="platform-badge ai">${escapeHtml(I18n.t('catalog.badge_ai'))}</span></div>
+        <div class="meta-row methods">${escapeHtml(I18n.t('catalog.deploy_as'))}: ${methodsLabel}</div>
+      </div>
+      <div class="catalog-card-foot">
+        <tf-button variant="primary" size="sm" icon="plus" data-engine-deploy="${escapeAttr(e.id || '')}" data-preset-id="${escapeAttr(presetId)}">
+          ${escapeHtml(I18n.t('catalog.deploy'))}
+        </tf-button>
+      </div>
+    </div>
+  `;
+}
+
 function bindCards(host) {
   host.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-engine-deploy]');
     const card = e.target.closest('[data-engine-id]');
     const engineId = btn?.dataset.engineDeploy || card?.dataset.engineId;
+    const presetId = btn?.dataset.presetId || card?.dataset.presetId || null;
     if (!engineId || !target) return;
     if (target.kind === 'cluster') {
       toast(I18n.t('catalog.cluster_not_supported'), 'warning');
       return;
     }
-    openDeployWizard(engineId, { nodeId: target.id, hostOs: target.os });
+    openDeployWizard(engineId, { nodeId: target.id, hostOs: target.os, presetId });
   });
 }
 
