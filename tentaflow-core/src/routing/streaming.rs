@@ -485,8 +485,8 @@ impl Router {
     /// jest opakowywany w single-chunk stream (wrapper sync→stream w
     /// FlowDispatcher::try_dispatch_streaming). PII cleaning idzie przez
     /// `pii_filter` StreamingNodeAdapter wewnątrz flow_engine — synthetic
-    /// chat-stream wstrzykuje node domyślnie; user-defined flow musi mieć
-    /// node explicite (R-SAFETY w Krok 7).
+    /// chat-stream wstrzykuje node domyślnie; user-defined flow dodaje
+    /// `pii_filter` opcjonalnie (PII jest opt-in).
     pub async fn route_chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
@@ -616,7 +616,7 @@ impl Router {
                     // StreamingNodeAdapter wewnątrz flow_engine — wire
                     // layer już nie filtruje. Synthetic chat-stream
                     // automatycznie wpina pii_filter; user-defined flowy
-                    // muszą deklarować node explicite (R-SAFETY w Krok 7).
+                    // dodają pii_filter opcjonalnie (PII jest opt-in).
                     let filtered = chunk_stream;
                     let cancel_wrapped: std::pin::Pin<
                         Box<
