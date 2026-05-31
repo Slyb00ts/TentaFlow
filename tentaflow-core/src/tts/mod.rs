@@ -146,3 +146,88 @@ impl Default for TtsManager {
         Self::new()
     }
 }
+
+/// Laduje embedded silnik TTS do `shared_tts_manager()` pod kluczem
+/// `engine_id` (== manifest `engine.id`) — tego samego klucza uzywa
+/// `ModelRuntimeExecutor::execute_tts` w `synthesize`. Idempotentne: gdy
+/// silnik juz zarejestrowany, no-op (tani read-check przed pobraniem modelu).
+///
+/// Wolane przy deploy (`EmbeddedDeploy::prepare_embedded_tts`) oraz leniwie
+/// przez executor, gdy po restarcie procesu `TtsManager` startuje pusty mimo
+/// `status=running` uslugi. `model_repo` to HF repo (sherpa/kokoro); dla
+/// apple-tts to logiczny voice id (glosy systemowe, bez pobierania).
+// Gdy build nie ma zadnego embedded TTS engine (brak inference-sherpa /
+// inference-mlx-kokoro i nie macOS/iOS), `match` ma tylko arm `other =>
+// bail!`, ktory diverguje — caly load-body jest wtedy legalnie martwy, a
+// `model_repo` nieuzywany. Allow zawezony dokladnie do tego configu.
+#[cfg_attr(
+    not(any(
+        feature = "inference-sherpa",
+        feature = "inference-mlx-kokoro",
+        target_os = "macos",
+        target_os = "ios"
+    )),
+    allow(unreachable_code, unused_variables)
+)]
+pub async fn ensure_embedded_engine_loaded(
+    engine_id: &str,
+    model_repo: &str,
+    // Uzywany tylko przez arm sherpa-onnx (wybor voice z wielogłosowego repo).
+    #[cfg_attr(not(feature = "inference-sherpa"), allow(unused_variables))] voice_hint: Option<&str>,
+) -> anyhow::Result<()> {
+    if shared_tts_manager().read().await.has(engine_id) {
+        return Ok(());
+    }
+
+    let engine: Box<dyn TtsEngine> = match engine_id {
+        #[cfg(feature = "inference-sherpa")]
+        "sherpa-onnx" => {
+            use anyhow::Context;
+            let dir = sherpa::prepare_model(model_repo)
+                .await
+                .with_context(|| format!("prepare sherpa model '{model_repo}'"))?;
+            let mut e = sherpa::SherpaTtsEngine::new();
+            // Wielogłosowe repo (np. WitoldG/polish_piper_models) — wybierz voice
+            // pasujacy do presetu, inaczej `load_model` bierze pierwszy z dysku.
+            e.set_voice_hint(voice_hint);
+            <sherpa::SherpaTtsEngine as TtsEngine>::load_model(&mut e, &dir)
+                .context("load sherpa-onnx VITS model")?;
+            Box::new(e)
+        }
+        #[cfg(feature = "inference-mlx-kokoro")]
+        "kokoro" => {
+            use anyhow::Context;
+            let dir = mlx_kokoro::prepare_model(model_repo)
+                .await
+                .with_context(|| format!("prepare kokoro model '{model_repo}'"))?;
+            let mut e = mlx_kokoro::MlxKokoroEngine::new();
+            <mlx_kokoro::MlxKokoroEngine as TtsEngine>::load_model(&mut e, &dir)
+                .context("load kokoro")?;
+            Box::new(e)
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        "apple-tts" => {
+            use anyhow::Context;
+            let mut e = apple_tts::AppleTtsEngine::new();
+            <apple_tts::AppleTtsEngine as TtsEngine>::load_model(
+                &mut e,
+                std::path::Path::new("apple-tts"),
+            )
+            .context("init apple-tts (brak libMLXBridge.dylib?)")?;
+            Box::new(e)
+        }
+        other => anyhow::bail!(
+            "embedded TTS engine '{other}' nie jest dostepny w tym buildzie \
+             (brak loadera lub wymaganego feature flag — np. inference-sherpa)"
+        ),
+    };
+
+    let mgr = shared_tts_manager();
+    let mut guard = mgr.write().await;
+    // Double-check pod write lockiem — inny task mogl zarejestrowac w trakcie
+    // pobierania/ladowania modelu.
+    if !guard.has(engine_id) {
+        guard.register(engine_id.to_string(), engine);
+    }
+    Ok(())
+}

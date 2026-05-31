@@ -744,7 +744,7 @@ mod chain_integration_tests {
     use crate::flow_engine::node_adapter::{test_support::stub_ctx, AdapterRegistry};
     use crate::flow_engine::node_adapters::{
         LlmNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, TriggerNodeAdapter,
-        TtsStreamBridgeNodeAdapter,
+        TtsNodeAdapter,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -820,7 +820,7 @@ mod chain_integration_tests {
         r.register(Arc::new(TriggerNodeAdapter::new()));
         r.register(Arc::new(OutputNodeAdapter::new()));
         r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
-        r.register_streaming(Arc::new(TtsStreamBridgeNodeAdapter::new()));
+        r.register_streaming(Arc::new(TtsNodeAdapter::new()));
         r.register_llm(Arc::new(LlmNodeAdapter::new()));
         r
     }
@@ -911,9 +911,9 @@ mod chain_integration_tests {
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
     }
 
-    /// Krok 8 item 34: chain LLM → pii_filter → tts_stream_bridge →
-    /// output(stream). LLM emit 1 zdanie kończące się kropką → pii_filter
-    /// flush → tts_bridge syntetyzuje audio → output stream zawiera
+    /// Krok 8 item 34: chain LLM → pii_filter → tts(stream) → output(stream).
+    /// LLM emit 1 zdanie kończące się kropką → pii_filter flush → tts node w
+    /// trybie streaming syntetyzuje audio → output stream zawiera
     /// EnvelopeDelta::Audio z prawdziwymi bajtami z BlobStore.
     #[tokio::test]
     async fn streaming_chain_llm_pii_tts_audio_output() {
@@ -923,7 +923,7 @@ mod chain_integration_tests {
                 {"id":"t1","type":"trigger","config":{}},
                 {"id":"l1","type":"llm","config":{"model":"qwen3.5-0.8b"}},
                 {"id":"p1","type":"pii_filter","config":{}},
-                {"id":"b1","type":"tts_stream_bridge","config":{"model":"voxcpm"}},
+                {"id":"b1","type":"tts","config":{"model":"voxcpm"}},
                 {"id":"o1","type":"output","config":{"mode":"stream"}}
             ],
             "edges":[

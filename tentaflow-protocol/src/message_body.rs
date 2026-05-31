@@ -572,6 +572,91 @@ pub struct ChatStreamEnd {
 }
 
 // =============================================================================
+// Universal multimodal flow invoke — most binarny klient → flow engine. Niesie
+// ZBIÓR typowanych wejść (audio, tekst, pliki…); flow odpowiada strumieniem
+// przeplatanych chunków (tekst + audio + …). Zastępuje REST /v1/audio/* dla
+// dashboardu. Bajty inline (hybryda: małe inline, duże przez blob upload — TODO).
+// =============================================================================
+
+/// Jedno typowane wejście do flow. Pierwsze niepuste staje się payloadem
+/// FlowEnvelope, kolejne artefaktami `input_{n}`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub enum FlowInputValue {
+    Text(String),
+    /// Serializowany JSON (string).
+    Json(String),
+    Audio {
+        mime: String,
+        sample_rate: Option<u32>,
+        bytes: Vec<u8>,
+    },
+    Image {
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    Video {
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    File {
+        mime: String,
+        filename: Option<String>,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct FlowInvokeRequest {
+    /// Gdy ustawione — odpal KONKRETNY flow po ID (wybrany przez usera). Ma
+    /// priorytet nad model/service_type (np. audio chat uruchamia wybrany flow).
+    pub flow_id: Option<i64>,
+    /// Nazwa modelu — używana do rozwiązania flow przez model/service_type gdy
+    /// `flow_id` nie jest podany.
+    pub model: String,
+    /// Service type dla rozwiązania flow gdy brak `flow_id`: "chat"/"tts"/"stt".
+    pub service_type: String,
+    pub inputs: Vec<FlowInputValue>,
+    /// Język (transkrypcja/TTS) → envelope.meta.
+    pub language: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// Pojedynczy chunk odpowiedzi flow — odwzorowanie `EnvelopeDelta`. Klient
+/// składa tekst do bąbla, audio do kolejki odtwarzania, media do renderu.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub enum FlowInvokeChunk {
+    Text {
+        choice_index: u32,
+        delta: String,
+    },
+    Audio {
+        choice_index: u32,
+        mime: String,
+        sample_rate: Option<u32>,
+        bytes: Vec<u8>,
+    },
+    Image {
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    Video {
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    File {
+        mime: String,
+        filename: Option<String>,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct FlowInvokeEnd {
+    pub finish_reason: String,
+    pub error: Option<String>,
+}
+
+// =============================================================================
 // Models — szczegoly modelu (R-ONE), instalacja/odinstalacja (W-ACTION)
 // migration-map #218-#227
 // =============================================================================
@@ -3761,6 +3846,11 @@ pub enum MessageBody {
     ChatStreamRequestBody(ChatStreamRequest),
     ChatStreamChunkBody(ChatStreamChunk),
     ChatStreamEndBody(ChatStreamEnd),
+
+    // ---- Universal multimodal flow invoke (R-STREAM) ----
+    FlowInvokeRequestBody(FlowInvokeRequest),
+    FlowInvokeChunkBody(FlowInvokeChunk),
+    FlowInvokeEndBody(FlowInvokeEnd),
 
     // ---- Clusters (full CRUD + member ops + probe streaming) ----
     ClusterListRequest,

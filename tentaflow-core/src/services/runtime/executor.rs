@@ -1375,6 +1375,27 @@ impl ModelRuntimeExecutor {
                     // voice preset and would miss the manager registration.
                     let engine_id_owned = engine_id.clone();
                     let model_name_owned = model_name.clone();
+
+                    // Self-heal: po restarcie procesu `TtsManager` startuje pusty
+                    // mimo `status=running` uslugi (deploy laduje przy prepare,
+                    // nie ma boot-reloadu). Leniwie laduje + rejestruje silnik
+                    // zanim siegniemy po `synthesize`, zeby nie zwracac "engine
+                    // nie zarejestrowany".
+                    if !crate::tts::shared_tts_manager()
+                        .read()
+                        .await
+                        .has(&engine_id_owned)
+                    {
+                        let repo =
+                            resolve_embedded_tts_repo(&engine_id_owned, &model_name_owned);
+                        crate::tts::ensure_embedded_engine_loaded(
+                            &engine_id_owned,
+                            &repo,
+                            Some(model_name_owned.as_str()),
+                        )
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("embedded TTS load: {e}")))?;
+                    }
                     let text = request.input.clone();
                     let speed = request.speed.unwrap_or(1.0);
                     let res =
@@ -1553,6 +1574,8 @@ impl ModelRuntimeExecutor {
         request: TranscriptionRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<TranscriptionResponse, ExecutorError> {
+        use tentaflow_protocol::*;
+
         let runtime = self
             .stt_runtime
             .read()
@@ -1577,14 +1600,21 @@ impl ModelRuntimeExecutor {
             | Err(crate::services::runtime::resolver::ResolveError::CapabilityUnsupported {
                 ..
             }) => {
-                // Legacy single-node bez catalog STT entries: client wysyla
-                // `model="whisper-1"` (default), katalog nie ma takiego
-                // wpisu — fallback do default local whisper zamiast hard
-                // error. Inne resolver errors (np. AclDenied) propagujemy.
-                return runtime
-                    .transcribe(request)
-                    .await
-                    .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+                // Model nie zmatchował żadnej usługi STT w katalogu → fallback
+                // do default local whisper (legacy single-node z "whisper-1").
+                // Gdy lokalnego też nie ma — błąd musi nazwać model, żeby user
+                // widział że nazwa w node'ie nie pasuje do wdrożonej usługi STT.
+                let model = request.model.clone();
+                tracing::warn!(
+                    requested_model = %model,
+                    "STT: model nie rozwiązał się do usługi w katalogu — fallback na lokalny whisper"
+                );
+                return runtime.transcribe(request).await.map_err(|e| {
+                    ExecutorError::SttBackend(format!(
+                        "model STT '{model}' nie pasuje do żadnej uruchomionej usługi STT \
+                         w katalogu, a lokalny silnik whisper nie jest załadowany ({e})"
+                    ))
+                });
             }
             Err(e) => return Err(ExecutorError::SttBackend(format!("resolver: {}", e))),
         };
@@ -1592,13 +1622,13 @@ impl ModelRuntimeExecutor {
         let state = self.strategy_state_for(&request.model);
         let ranked = rank(&outcome.candidates, outcome.strategy, &state);
         if ranked.is_empty() {
-            // Resolver nie zwrocil zadnego kandydata mimo OK — fallback
-            // do default local zeby legacy single-node node bez STT services
-            // w katalogu nadal dzialal.
-            return runtime
-                .transcribe(request)
-                .await
-                .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+            let model = request.model.clone();
+            return runtime.transcribe(request).await.map_err(|e| {
+                ExecutorError::SttBackend(format!(
+                    "model STT '{model}' rozwiązany ale bez kandydatów do wykonania, \
+                     a lokalny silnik whisper nie jest załadowany ({e})"
+                ))
+            });
         }
 
         for target in ranked {
@@ -1609,11 +1639,82 @@ impl ModelRuntimeExecutor {
                         .await
                         .map_err(|e| ExecutorError::SttBackend(e.to_string()));
                 }
-                ResolvedExecutionTarget::MeshForward { node_id, .. } => {
-                    return Err(ExecutorError::SttBackend(format!(
-                        "mesh forward STT (node {}) not implemented yet",
-                        node_id
-                    )));
+                ResolvedExecutionTarget::MeshForward {
+                    node_id,
+                    service_id,
+                    model_name,
+                } => {
+                    // Usługa "mesh" wskazująca na NASZ własny node (albo gdy mesh
+                    // w ogóle nie jest podłączony = single-node lokalnie) jest de
+                    // facto lokalna — odpalamy ją przez service zamiast forwardować
+                    // sam do siebie po mesh.
+                    let is_local = match self.mesh_manager.read().clone() {
+                        Some(m) => m.node_id() == node_id,
+                        None => true,
+                    };
+                    if is_local {
+                        return runtime
+                            .transcribe_for_service(service_id, request)
+                            .await
+                            .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+                    }
+                    let model_request = ModelRequest {
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        payload: ModelPayload::Audio(AudioPayload {
+                            operation: AudioOperation::STT {
+                                model: model_name.clone(),
+                                audio_data: request.file.to_vec(),
+                                language: request.language.clone(),
+                                response_format: request.response_format.clone(),
+                                prompt: request.prompt.clone(),
+                                temperature: None,
+                                timestamp_granularities: None,
+                                no_speech_threshold: None,
+                                avg_logprob_threshold: None,
+                                compression_ratio_threshold: None,
+                                extra_params: None,
+                            },
+                        }),
+                        stream: false,
+                        metadata: None,
+                        session_id: None,
+                    };
+                    let response = self.forward_via_mesh(&node_id, model_request, ctx).await?;
+                    return match response.result {
+                        ModelResult::Audio(audio_result) => match audio_result.data {
+                            AudioResultData::Text(text) => Ok(TranscriptionResponse {
+                                text,
+                                task: None,
+                                language: request.language.clone(),
+                                duration: None,
+                                segments: None,
+                                speakers: None,
+                            }),
+                            AudioResultData::Detailed {
+                                text,
+                                language,
+                                duration,
+                                ..
+                            } => Ok(TranscriptionResponse {
+                                text,
+                                task: None,
+                                language: Some(language),
+                                duration: Some(duration),
+                                segments: None,
+                                speakers: None,
+                            }),
+                            _ => Err(ExecutorError::SttBackend(
+                                "mesh STT returned non-text result".into(),
+                            )),
+                        },
+                        ModelResult::Error(err) => Err(ExecutorError::SttBackend(format!(
+                            "mesh STT error: {}",
+                            err.message
+                        ))),
+                        _ => Err(ExecutorError::SttBackend(
+                            "mesh STT returned unexpected result type".into(),
+                        )),
+                    };
                 }
                 ResolvedExecutionTarget::Flow { .. } => {
                     return Err(ExecutorError::SttBackend(
@@ -2003,6 +2104,24 @@ fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {
         ResolvedExecutionTarget::MeshForward { node_id, .. } => Some(node_id.clone()),
         ResolvedExecutionTarget::Flow { .. } => None,
     }
+}
+
+/// HF repo dla embedded TTS na podstawie `engine_id` + `model_name` (preset id
+/// z katalogu). Mapowanie preset→repo zyje w manifescie silnika; gdy go nie ma,
+/// `model_name` traktujemy jako bezposrednie repo (single-voice deploy).
+fn resolve_embedded_tts_repo(engine_id: &str, model_name: &str) -> String {
+    if let Some(manifest) = crate::services::manifest::registry().by_id(engine_id) {
+        if let Some(preset) = manifest
+            .model_presets
+            .iter()
+            .find(|p| p.id == model_name)
+            .or_else(|| manifest.model_presets.iter().find(|p| p.recommended))
+            .or_else(|| manifest.model_presets.first())
+        {
+            return preset.repo.clone();
+        }
+    }
+    model_name.to_string()
 }
 
 #[cfg(test)]
