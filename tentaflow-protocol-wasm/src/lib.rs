@@ -9828,6 +9828,21 @@ fn inline_value_to_js(
     Ok(arr.into())
 }
 
+/// True when a wire type denotes an embedded Component: the bare `Component`,
+/// any `ComponentRef<...>` (incl. unions) and those wrapped in a single
+/// `Option<...>`. Fields like Table.empty_state (`Option<ComponentRef<EmptyState>>`)
+/// and row_actions inner (`ComponentRef<Button>`) encode the full child Component,
+/// so they must be decoded to a `{tag, id, fields}` object, not a numeric-keyed map.
+fn wire_is_component(wire: &str) -> bool {
+    let w = wire.trim();
+    let w = w
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+        .map(str::trim)
+        .unwrap_or(w);
+    w == "Component" || w.starts_with("ComponentRef<") || w.starts_with("Component<")
+}
+
 /// Like value_to_js but with wire-type context for inline struct resolution.
 fn value_to_js_with_wire(
     v: &tentaflow_sdk_spec::protocol::value::Value,
@@ -9835,9 +9850,9 @@ fn value_to_js_with_wire(
 ) -> Result<JsValue, String> {
     use tentaflow_sdk_spec::protocol::value::Value;
     match v {
-        // Bytes with "Component" wire → decode child Component.
+        // Bytes with a Component wire → decode child Component.
         // Without wire context bytes stay as Uint8Array (no speculative decode).
-        Value::Bytes(b) if wire == "Component" => {
+        Value::Bytes(b) if wire_is_component(wire) => {
             if let Ok(comp) = minicbor::decode::<tentaflow_sdk_spec::Component>(b) {
                 return component_to_js(&comp);
             }
@@ -9867,7 +9882,7 @@ fn value_to_js_with_wire(
                 }
             }
             // Only attempt Component decode when wire context says so
-            if wire == "Component" {
+            if wire_is_component(wire) {
                 if let Some(comp) = try_decode_component_from_value(v) {
                     return component_to_js(&comp);
                 }

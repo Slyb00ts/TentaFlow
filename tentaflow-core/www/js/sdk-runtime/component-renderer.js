@@ -476,15 +476,26 @@ function applyVisibility(element, visibility, ctx) {
     element.dataset.hiddenForAssistive = 'true';
   }
   if (visibility.visible != null) {
+    // Preserve any pre-existing inline display (some renderers set
+    // inline-flex/grid directly) so showing again restores it exactly.
+    const originalDisplay = element.style.display;
     const apply = () => {
       const v = resolveBindRef(visibility.visible, ctx.store);
       if (v === false) {
         element.setAttribute('hidden', '');
+        // The bare `[hidden]` attribute (UA `display:none`) loses to any class
+        // or `:host` rule that sets `display:flex/grid/inline-flex` — which the
+        // tf-* components and stack containers all do. Force it with an inline
+        // `display:none` (inline beats class specificity) so the element is
+        // actually hidden, not just attribute-marked.
+        element.style.display = 'none';
         // aria-hidden ustawiamy też przy visible=false, ale tylko jeśli
         // nie był wymuszony przez hidden_for_assistive (zachowujemy go).
         element.setAttribute('aria-hidden', 'true');
       } else {
         element.removeAttribute('hidden');
+        // Restore the original inline display (usually empty → CSS class wins).
+        if (element.style.display === 'none') element.style.display = originalDisplay;
         if (!hiddenForAssistive) element.removeAttribute('aria-hidden');
       }
     };

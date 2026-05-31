@@ -32,7 +32,7 @@ function safeIconName(value) {
 
 class TfMenuItem extends HTMLElement {
   static get observedAttributes() {
-    return ['icon', 'danger', 'action', 'disabled', 'shortcut'];
+    return ['icon', 'danger', 'action', 'disabled', 'shortcut', 'label'];
   }
 
   constructor() {
@@ -52,7 +52,10 @@ class TfMenuItem extends HTMLElement {
   }
 
   _build() {
-    this._label = this.textContent;
+    // A `label` attribute (set programmatically, e.g. by the SDK table row-actions
+    // renderer) is authoritative and timing-safe; textContent is the fallback for
+    // plain HTML usage like `<tf-menu-item>Edytuj</tf-menu-item>`.
+    this._label = this.getAttribute('label') ?? this.textContent;
     this.innerHTML = '';
     // w Shadow DOM rodzica — tu budujemy w light DOM itemu,
     // rodzic przeniesie go do shadow slot gdy otwiera
@@ -66,6 +69,9 @@ class TfMenuItem extends HTMLElement {
   }
 
   _update() {
+    // Keep the label in sync when the attribute is updated after build.
+    const labelAttr = this.getAttribute('label');
+    if (labelAttr != null) this._label = labelAttr;
     const icon = safeIconName(this.getAttribute('icon'));
     const shortcut = this.getAttribute('shortcut');
     const danger = this.hasAttribute('danger');

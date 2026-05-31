@@ -6280,11 +6280,28 @@ tf-skeleton {
   right: 0.5em;
   accent-color: var(--tf-accent-1);
 }
-.tf-radio-card-group__icon { flex: 0 0 auto; }
+.tf-radio-card-group__card > .tf-radio-card-group__icon { flex: 0 0 auto; width: 1.5rem; height: 1.5rem; }
 .tf-radio-card-group__body { flex: 1 1 auto; display: flex; flex-direction: column; gap: 0.25em; }
 .tf-radio-card-group__title { font-weight: 500; color: var(--tf-text); }
 .tf-radio-card-group__description { font-size: 0.9em; color: var(--tf-text-3); }
 .tf-radio-card-group__badge { position: absolute; bottom: 0.5em; right: 0.5em; }
+
+/* SDK named/asset icons (icon-renderer.js). Without a base size a bare <svg>
+   with a <use> falls back to the replaced-element default 300x150, blowing out
+   any flex layout. Size is text-relative so icons scale with their context;
+   the size modifiers map to the spec's xs/sm/md/lg/xl tokens. */
+.tf-icon {
+  flex: 0 0 auto;
+  width: 1.25em;
+  height: 1.25em;
+  fill: currentColor;
+  color: currentColor;
+}
+.tf-icon--size-xs { width: 0.875em; height: 0.875em; }
+.tf-icon--size-sm { width: 1em; height: 1em; }
+.tf-icon--size-md { width: 1.25em; height: 1.25em; }
+.tf-icon--size-lg { width: 1.5em; height: 1.5em; }
+.tf-icon--size-xl { width: 2em; height: 2em; }
 
 .tf-inline-badge {
   display: inline-flex;

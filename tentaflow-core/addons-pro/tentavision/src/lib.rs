@@ -1206,14 +1206,14 @@ fn wizard_input(label: &str, placeholder: &str, field: &str, password: bool) -> 
         error: None,
         size: InputSize::Md,
     }.into_component(field).expect("Input");
-    // The renderer two-way binds bind_path against the frontend store, which
-    // persists across SlotContent re-renders, so the typed value survives step
-    // navigation on the client; the change handler additionally commits it to
-    // backend wizard state for the test step and submit validation.
+    // Backend wizard state is the source of truth for validation (resolve_target
+    // on Next/Test/Submit), so every keystroke must commit. Using `Input` rather
+    // than `Change` avoids the lost-update race where the user types and clicks
+    // "Dalej" before the blur-fired `change` ever reaches the backend.
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
-        tentaflow_sdk_spec::EventKind::Change,
+        tentaflow_sdk_spec::EventKind::Input,
         Handler::Backend {
             action_id: "wizard-field-change".into(),
             params,
@@ -2775,8 +2775,11 @@ fn build_live_content() -> Component {
             empty_state("Brak kamer", Some("Dodaj kamerę aby zobaczyć podgląd na żywo."), Some("video")),
         ]);
     }
+    // Live tiles subscribe to the core's per-camera fMP4 publisher over the
+    // binary protocol (`camera:<id>` → streamSubscribeRequest). The raw camera
+    // URL is never handed to the browser — it cannot play rtsp(s):// directly.
     let streams: Vec<Component> = cameras.iter().take(4).map(|c| {
-        card(Some(&c.display_name), vec![video_stream(&c.url)])
+        card(Some(&c.display_name), vec![video_stream(&alloc::format!("camera:{}", c.camera_id))])
     }).collect();
     stack_v(core::iter::once(messages).chain(streams).collect())
 }

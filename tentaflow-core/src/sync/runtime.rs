@@ -2628,6 +2628,39 @@ mod tests {
     }
 
     #[test]
+    fn core_flow_capture_queues_for_trusted_mesh_node_with_default_policy() {
+        with_tmp_home(|| {
+            let source = make_runtime(121);
+            let receiver = make_runtime(122);
+            source
+                .runtime
+                .signer
+                .security
+                .add_trusted_key(
+                    &receiver.runtime.local_node_id,
+                    &receiver.runtime.signer.security.public_key_hex(),
+                    "receiver",
+                )
+                .expect("trust receiver");
+
+            let result = source
+                .runtime
+                .record_core_capture(core_flow_capture("flow-default-policy", "Flow"))
+                .expect("record core capture");
+            let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
+            let outbox = source
+                .runtime
+                .ledger
+                .list_pending_outbox(target, 10)
+                .expect("outbox");
+
+            assert_eq!(result.queued_targets, 1);
+            assert_eq!(outbox.len(), 1);
+            assert_eq!(outbox[0].op_id, result.op_id);
+        });
+    }
+
+    #[test]
     fn core_inbox_materializer_applies_flow_insert() {
         with_tmp_home(|| {
             let source = make_runtime(23);
