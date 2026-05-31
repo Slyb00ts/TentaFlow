@@ -230,10 +230,10 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "tts",
             "service",
             "Synteza mowy",
-            "Zamiana tekstu na mowę (TTS)",
-            r#"{"language":"pl","voice":"","speed":1.0}"#,
+            "Tekst na mowę. Blocking (całość naraz) lub streaming z portu stream (buforuje zdania, syntetyzuje per zdanie). forward_text przepuszcza też tekst.",
+            r#"{"language":"pl","voice":"","speed":1.0,"forward_text":false}"#,
             "volume-2",
-            r#"{"properties":{"model":{"type":"string","title":"Model TTS / alias","dynamic_enum":{"source":"models","category":"tts"}},"voice":{"type":"string","title":"Głos","placeholder":"jarvis"},"format":{"type":"string","title":"Format","enum":[{"value":"mp3","label":"MP3"},{"value":"opus","label":"Opus (low-latency)"},{"value":"wav","label":"WAV"}],"default":"opus"},"speed":{"type":"number","title":"Tempo","minimum":0.25,"maximum":4,"step":0.05,"default":1}},"required":["model"],"order":["model","voice","format","speed"]}"#,
+            r#"{"properties":{"model":{"type":"string","title":"Model TTS / alias","dynamic_enum":{"source":"models","category":"tts"}},"voice":{"type":"string","title":"Głos","placeholder":"jarvis"},"format":{"type":"string","title":"Format","enum":[{"value":"mp3","label":"MP3"},{"value":"opus","label":"Opus (low-latency)"},{"value":"wav","label":"WAV"}],"default":"opus"},"speed":{"type":"number","title":"Tempo","minimum":0.25,"maximum":4,"step":0.05,"default":1},"forward_text":{"type":"boolean","title":"Przepuść tekst (streaming)","description":"W trybie streaming wyślij też tekst (do bąbla) obok audio","default":false}},"required":["model"],"order":["model","voice","format","speed","forward_text"]}"#,
         ),
         (
             "embeddings",
@@ -270,6 +270,15 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "{}",
             "eraser",
             "",
+        ),
+        (
+            "sentence_buffer",
+            "transform",
+            "Buforuj zdania",
+            "Skleja streaming LLM (tokeny) w całe zdania przed TTS",
+            r#"{"max_buffer_chars":1000}"#,
+            "align-left",
+            r#"{"properties":{"max_buffer_chars":{"type":"integer","title":"Maks. znaków bufora","minimum":1,"maximum":8192,"default":1000,"description":"Wymuś flush gdy zdanie nie ma terminatora"}},"order":["max_buffer_chars"]}"#,
         ),
         (
             "condition",
@@ -358,6 +367,20 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             icon,
             params_schema_opt,
         ])?;
+    }
+    drop(stmt);
+
+    // Prune: paleta jest backend-owned, więc usuwamy wiersze dla typów których
+    // już nie ma w seedzie (np. po scaleniu node'ów). Bez tego upsert zostawiał
+    // martwe bloki w palecie (np. usunięty `tts_stream_bridge`).
+    let kept: Vec<&str> = templates.iter().map(|t| t.0).collect();
+    let placeholders = kept.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let removed = conn.execute(
+        &format!("DELETE FROM flow_node_templates WHERE node_type NOT IN ({placeholders})"),
+        rusqlite::params_from_iter(kept.iter()),
+    )?;
+    if removed > 0 {
+        info!("Usunieto {removed} obsolete szablonow flow z palety");
     }
 
     info!("Zaladowano szablony wezlow flow (upsert z params_schema)");

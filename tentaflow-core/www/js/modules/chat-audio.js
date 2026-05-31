@@ -99,6 +99,11 @@ const DEFAULTS = {
   minSilenceBeforeSpeechMs: 200,
   prePadMs: 200,
   bargeInMs: 250,
+  // Barge-in podczas TTS: mic lapie wlasny glos AI mimo echoCancellation. Próg
+  // = rmsThreshold*mult + poziom_wyjscia_TTS*echoFactor. Dzieki temu echo NIE
+  // przerywa odpowiedzi (urywany tekst!), a wyrazna mowa usera z bliska — tak.
+  bargeInThresholdMult: 3.0,
+  bargeInEchoFactor: 0.6,
   maxRecordSec: 30,
   tailKeepSec: 2,
 };
@@ -233,12 +238,16 @@ export class AudioPipeline {
 
     // LLM stream + TTS queue
     this.sentenceBuf = new SentenceBuffer();
+    // Surowe chunki audio (WAV bytes) z flow. Planujemy je na osi czasu
+    // AudioContext (gapless) zamiast <audio>+onended (zawodne: latencja grafu,
+    // niepewny onended -> nakladanie + leak RAF).
     this.ttsQueue = [];
     this.streamComplete = false;
-    this.activeAudioEl = null;
-    this.activeAudioUrl = null;
-    this.activeAudioCleanup = null;
-    this.ttsPlaying = false;
+    this.ttsSources = new Set(); // aktywne AudioBufferSourceNode
+    this.ttsNextStartTime = 0; // kursor planowania na audioCtx.currentTime
+    this.ttsPumping = false; // serializacja decode'u kolejki
+    this.ttsGen = 0; // bump przy stop/barge-in — porzuca chunk dekodowany w locie
+    this.ttsGain = null; // master gain (mute speakera) -> analyser -> destination
     this.ttsAbortController = null;
     this.sttAbortController = null;
 
@@ -249,6 +258,7 @@ export class AudioPipeline {
     // TTS amplitude monitoring (osobny analyser dla audio output).
     this.ttsAnalyser = null;
     this.ttsAmpRafId = null;
+    this.lastTtsRms = 0; // poziom wyjscia TTS — echo-guard dla barge-in
   }
 
   getState() {
@@ -355,6 +365,11 @@ export class AudioPipeline {
       try { this.audioCtx.close(); } catch { /* ignore */ }
       this.audioCtx = null;
     }
+    // audioCtx zamkniety — persistent graf TTS (gain/analyser) jest martwy.
+    // Zerujemy, zeby `_ensureTtsGraph` odtworzyl go po kolejnym start().
+    this.ttsGain = null;
+    this.ttsAnalyser = null;
+    this.ttsNextStartTime = 0;
     if (this.mediaStream) {
       for (const t of this.mediaStream.getTracks()) {
         try { t.stop(); } catch { /* ignore */ }
@@ -405,13 +420,19 @@ export class AudioPipeline {
       // z dawno nagromadzonej "ciszy".
       this._resetVad();
       this.faceHandle.setListenAmplitude(0);
+      // Mic OFF = twarz biala (idle) + brak zielonych paskow. FSM zostaje w
+      // LISTENING, ale wizualnie pokazujemy ze nie nasluchujemy.
+      this.faceHandle.setMode('idle');
+    } else {
+      // Mic ON — wroc do trybu zgodnego z aktualnym stanem FSM.
+      this.faceHandle.setMode(FACE_MODE[this.state] || 'idle');
     }
   }
 
   toggleSpeaker() {
     this.speakerMuted = !this.speakerMuted;
-    if (this.activeAudioEl) {
-      this.activeAudioEl.muted = this.speakerMuted;
+    if (this.ttsGain) {
+      this.ttsGain.gain.value = this.speakerMuted ? 0 : 1;
     }
     return this.speakerMuted;
   }
@@ -452,7 +473,7 @@ export class AudioPipeline {
 
   finishResponse() {
     this.streamComplete = true;
-    if (!this.ttsPlaying && this.ttsQueue.length === 0) {
+    if (this.ttsSources.size === 0 && this.ttsQueue.length === 0 && !this.ttsPumping) {
       // Pusta odpowiedź albo całe audio już odtworzone — wracamy do listen.
       this._setState(STATES.LISTENING);
     }
@@ -553,15 +574,19 @@ export class AudioPipeline {
     const isSpeech = this.pttActive || rms >= threshold;
 
     if (isSpeech) {
-      this.silenceSinceSpeechEnd = 0;
       if (!this.vadInSpeech) {
         this.speechMsAccumulated += dtMs;
         if (this.speechMsAccumulated >= this.opts.minSpeechMs) {
-          // Ignoruj jesli tuz po poprzednim end-of-utterance — debounce.
-          if (this.silenceSinceSpeechEnd < this.opts.minSilenceBeforeSpeechMs && this.lastSpeechAt > 0) {
+          // Debounce: wymagaj minSilenceBeforeSpeechMs ciszy od konca poprzedniej
+          // wypowiedzi, zeby ogon poprzedniej mowy nie retriggerowal nowej.
+          // UWAGA: `silenceSinceSpeechEnd` sprawdzamy PRZED wyzerowaniem — zeruje
+          // sie dopiero gdy faktycznie startujemy wypowiedz, inaczej kazda
+          // kolejna mowa po pierwszej widzialaby 0 i byla blokowana na zawsze.
+          if (this.lastSpeechAt > 0 && this.silenceSinceSpeechEnd < this.opts.minSilenceBeforeSpeechMs) {
             this.speechMsAccumulated = 0;
             return;
           }
+          this.silenceSinceSpeechEnd = 0;
           this._onSpeechStart();
         }
       } else {
@@ -652,7 +677,13 @@ export class AudioPipeline {
   // ---- Barge-in ---------------------------------------------------------
 
   _bargeInStep(rms, dtMs) {
-    if (rms >= this.adaptiveThreshold) {
+    // Echo-guard: mic lapie wlasny glos AI (echo) mimo echoCancellation. Próg
+    // barge-in podnosimy o czesc poziomu wyjscia TTS — echo nie przerywa
+    // odpowiedzi (urywany tekst), a wyrazna mowa usera z bliska przekracza próg.
+    const guard =
+      this.adaptiveThreshold * this.opts.bargeInThresholdMult +
+      this.lastTtsRms * this.opts.bargeInEchoFactor;
+    if (rms >= guard) {
       this.bargeInSpeechMs += dtMs;
       if (this.bargeInSpeechMs >= this.opts.bargeInMs) {
         this.bargeInSpeechMs = 0;
@@ -689,127 +720,142 @@ export class AudioPipeline {
     this.bargeInSpeechMs = 0;
   }
 
-  // ---- Audio playback queue ---------------------------------------------
-  // Kolejka GOTOWYCH chunków audio z flow ({bytes, mime}). Bez REST/TTS — flow
-  // syntezuje audio serwerowo i odsyła bajty binarnym FlowInvoke.
+  // ---- Audio playback (gapless scheduling) ------------------------------
+  // Chunki audio (WAV bytes) z flow planujemy na osi czasu AudioContext: kazdy
+  // start = max(now, kursor); kursor += dlugosc bufora. Daje brak nakladania i
+  // luk. <audio>+createMediaElementSource+onended bylo zawodne (latencja grafu,
+  // niepewny onended) — stad nakladajace sie zdania i spinning RAF (100% CPU).
+
+  // Persistent graf wyjsciowy: master gain (mute speakera) -> analyser (RMS dla
+  // twarzy) -> destination. Tworzony raz, kazdy BufferSource sie do niego pina.
+  _ensureTtsGraph() {
+    if (!this.audioCtx || this.audioCtx.state === 'closed') return null;
+    if (!this.ttsGain) {
+      this.ttsGain = this.audioCtx.createGain();
+      this.ttsGain.gain.value = this.speakerMuted ? 0 : 1;
+      this.ttsAnalyser = this.audioCtx.createAnalyser();
+      this.ttsAnalyser.fftSize = 1024;
+      this.ttsAnalyser.smoothingTimeConstant = 0.5;
+      this.ttsGain.connect(this.ttsAnalyser);
+      this.ttsAnalyser.connect(this.audioCtx.destination);
+    }
+    return this.ttsGain;
+  }
 
   _enqueueAudio(item) {
     if (!item || !item.bytes || item.bytes.length === 0) return;
     this.ttsQueue.push(item);
-    if (!this.ttsPlaying) this._playNextTts();
+    this._pumpTtsQueue();
   }
 
-  async _playNextTts() {
-    if (this.ttsQueue.length === 0) {
-      this.ttsPlaying = false;
-      if (this.streamComplete) {
-        // Cała odpowiedź odtworzona — wracamy do listen.
-        this._setState(STATES.LISTENING);
-      }
-      return;
-    }
-    const item = this.ttsQueue.shift();
-    this.ttsPlaying = true;
-
-    let url;
+  // Dekoduje i planuje chunki po kolei. Serializowany flagą `ttsPumping`, bo
+  // `decodeAudioData` jest async — bez tego dwa wywolania scigalyby sie o kursor.
+  async _pumpTtsQueue() {
+    if (this.ttsPumping) return;
+    this.ttsPumping = true;
     try {
-      const blob = new Blob([item.bytes], { type: item.mime || 'audio/wav' });
-      url = URL.createObjectURL(blob);
-    } catch (err) {
-      this.onError(err);
-      this.ttsPlaying = false;
-      if (this.ttsQueue.length > 0) {
-        this._playNextTts();
-      } else if (this.streamComplete) {
-        this._setState(STATES.LISTENING);
-      }
-      return;
-    }
+      while (this.ttsQueue.length > 0) {
+        if (!this.audioCtx || this.audioCtx.state === 'closed') {
+          this.ttsQueue = [];
+          break;
+        }
+        const item = this.ttsQueue.shift();
+        const gen = this.ttsGen;
+        if (this.audioCtx.state === 'suspended') {
+          try { await this.audioCtx.resume(); } catch { /* ignore */ }
+        }
+        let audioBuffer;
+        try {
+          // decodeAudioData chce ArrayBuffer i go „odbiera" — dajemy zawsze
+          // swieza kopie. `bytes` moze byc Uint8Array (widok) lub ArrayBuffer.
+          const b = item.bytes;
+          const ab = b instanceof ArrayBuffer
+            ? b.slice(0)
+            : b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+          audioBuffer = await this.audioCtx.decodeAudioData(ab);
+        } catch (err) {
+          this.onError(err);
+          continue;
+        }
+        // Stan mogl sie zmienic w trakcie await (stop/barge-in zamknal ctx
+        // albo wyczyscil kolejke) — porzuc ten chunk zamiast grac po przerwaniu.
+        if (gen !== this.ttsGen) continue;
+        if (!this.audioCtx || this.audioCtx.state === 'closed') break;
+        const gain = this._ensureTtsGraph();
+        if (!gain) break;
 
-    this._setState(STATES.SPEAKING);
+        const src = this.audioCtx.createBufferSource();
+        src.buffer = audioBuffer;
+        src.connect(gain);
 
-    const audio = new Audio();
-    audio.src = url;
-    audio.muted = this.speakerMuted;
-    audio.crossOrigin = 'anonymous';
-    this.activeAudioEl = audio;
-    this.activeAudioUrl = url;
+        const now = this.audioCtx.currentTime;
+        const startAt = Math.max(now, this.ttsNextStartTime);
+        src.start(startAt);
+        this.ttsNextStartTime = startAt + audioBuffer.duration;
+        this.ttsSources.add(src);
 
-    // Podlaczamy do AudioContext zeby dostac amplitude dla setSpeechAmplitude.
-    // MediaElementAudioSourceNode jest jednorazowy per <audio> element — nie
-    // mozna go reuse'owac, wiec kazde zdanie = nowy element + nowy source.
-    let mediaSource = null;
-    let ttsAnalyser = null;
-    if (this.audioCtx && this.audioCtx.state !== 'closed') {
-      try {
-        mediaSource = this.audioCtx.createMediaElementSource(audio);
-        ttsAnalyser = this.audioCtx.createAnalyser();
-        ttsAnalyser.fftSize = 1024;
-        ttsAnalyser.smoothingTimeConstant = 0.5;
-        mediaSource.connect(ttsAnalyser);
-        mediaSource.connect(this.audioCtx.destination);
-        this.ttsAnalyser = ttsAnalyser;
+        this._setState(STATES.SPEAKING);
         this._startTtsAmpRaf();
-      } catch {
-        // Fallback — bez analyser. Twarz zostanie w speak ale bez RMS.
+
+        src.onended = () => {
+          this.ttsSources.delete(src);
+          try { src.disconnect(); } catch { /* ignore */ }
+          // Cala odpowiedz odtworzona — zaden source nie gra i nic nie czeka.
+          if (
+            this.ttsSources.size === 0 &&
+            this.ttsQueue.length === 0 &&
+            !this.ttsPumping &&
+            this.streamComplete
+          ) {
+            this._setState(STATES.LISTENING);
+          }
+        };
       }
-    }
-
-    const cleanup = () => {
-      this._stopTtsAmpRaf();
-      try { mediaSource && mediaSource.disconnect(); } catch { /* ignore */ }
-      try { ttsAnalyser && ttsAnalyser.disconnect(); } catch { /* ignore */ }
-      this.ttsAnalyser = null;
-      try { audio.pause(); } catch { /* ignore */ }
-      audio.src = '';
-      try { URL.revokeObjectURL(url); } catch { /* ignore */ }
-      if (this.activeAudioEl === audio) {
-        this.activeAudioEl = null;
-        this.activeAudioUrl = null;
-        this.activeAudioCleanup = null;
+    } finally {
+      this.ttsPumping = false;
+      // Jesli kolejka pusta, nic nie gra, a stream skonczony — wroc do listen
+      // (gdy ostatni `onended` wyscignal `ttsPumping=false`).
+      if (
+        this.ttsSources.size === 0 &&
+        this.ttsQueue.length === 0 &&
+        this.streamComplete &&
+        this.state === STATES.SPEAKING
+      ) {
+        this._setState(STATES.LISTENING);
       }
-    };
-    this.activeAudioCleanup = cleanup;
-
-    audio.onended = () => {
-      cleanup();
-      this._playNextTts();
-    };
-    audio.onerror = () => {
-      cleanup();
-      this._playNextTts();
-    };
-
-    try {
-      await audio.play();
-    } catch (err) {
-      // Autoplay block jest nieosiagalny — user juz kliknal mic, mamy gesture.
-      // Ale jesli z innego powodu fail — cleanup + idz dalej.
-      this.onError(err);
-      cleanup();
-      this._playNextTts();
     }
   }
 
   _stopActiveTts(_drop) {
+    this.ttsGen = (this.ttsGen + 1) | 0;
     if (this.ttsAbortController) {
       try { this.ttsAbortController.abort(); } catch { /* ignore */ }
       this.ttsAbortController = null;
     }
-    if (this.activeAudioCleanup) {
-      this.activeAudioCleanup();
+    for (const src of this.ttsSources) {
+      try { src.onended = null; src.stop(); src.disconnect(); } catch { /* ignore */ }
     }
-    this.ttsPlaying = false;
+    this.ttsSources.clear();
+    this.ttsNextStartTime = 0;
+    this._stopTtsAmpRaf();
   }
 
   _startTtsAmpRaf() {
     if (this.ttsAmpRafId !== null) return;
     const tick = () => {
+      // Zyje tylko dopoki cos faktycznie gra. Brak aktywnych source'ow albo
+      // analysera = stop (NIE reschedule przed sprawdzeniem) — to gwarantuje ze
+      // RAF nie kreci sie w nieskonczonosc po zakonczeniu audio.
+      if (!this.ttsAnalyser || this.ttsSources.size === 0) {
+        this.ttsAmpRafId = null;
+        this.faceHandle.setSpeechAmplitude(0);
+        return;
+      }
       this.ttsAmpRafId = requestAnimationFrame(tick);
-      if (!this.ttsAnalyser) return;
       const buf = new Float32Array(this.ttsAnalyser.fftSize);
       this.ttsAnalyser.getFloatTimeDomainData(buf);
       const rms = rmsOf(buf);
+      this.lastTtsRms = rms; // echo-guard dla barge-in
       this.faceHandle.setSpeechAmplitude(Math.min(1, rms * 4));
     };
     this.ttsAmpRafId = requestAnimationFrame(tick);
@@ -820,6 +866,7 @@ export class AudioPipeline {
       cancelAnimationFrame(this.ttsAmpRafId);
       this.ttsAmpRafId = null;
     }
+    this.lastTtsRms = 0;
     this.faceHandle.setSpeechAmplitude(0);
   }
 
@@ -827,6 +874,12 @@ export class AudioPipeline {
 
   _setState(next) {
     if (this.state === next) return;
+    // Amplituda TTS (osobny RAF) ma zyc TYLKO w SPEAKING. Wychodzac z tego
+    // stanu twardo go ubijamy — gwarancja ze zaden RAF nie przezyje konca
+    // odpowiedzi (zabezpieczenie przed 100% CPU gdy `onended` nie odpali).
+    if (this.state === STATES.SPEAKING && next !== STATES.SPEAKING) {
+      this._stopTtsAmpRaf();
+    }
     this.state = next;
     this.faceHandle.setMode(FACE_MODE[next] || 'idle');
     this.onStateChange(next);

@@ -80,6 +80,33 @@ impl SttRuntime {
         }
     }
 
+    /// Gwarantuje, ze embedded whisper jest zaladowany w `default_local`.
+    /// Deploy embedded STT laduje model przy `prepare`, ale po restarcie
+    /// procesu `SttManager` startuje pusty (nie ma boot-redeploy embedded
+    /// modeli), a uslugi STT pozostaja `running` w bazie. Ta leniwa sciezka
+    /// laduje model przy pierwszym uzyciu, zeby transkrypcja dzialala bez
+    /// wymuszania redeploy. Idempotentna — double-check pod write lockiem
+    /// chroni przed podwojnym load przy rownoleglych zadaniach.
+    async fn ensure_default_local_loaded(&self) -> Result<()> {
+        {
+            let mgr = self.default_local.read().await;
+            if mgr.active_engine().map(|e| e.is_loaded()).unwrap_or(false) {
+                return Ok(());
+            }
+        }
+        let mut mgr = self.default_local.write().await;
+        if mgr.active_engine().map(|e| e.is_loaded()).unwrap_or(false) {
+            return Ok(());
+        }
+        mgr.ensure_and_load(None)
+            .await
+            .map_err(|e| CoreError::InternalError {
+                message: format!("nie udalo sie zaladowac embedded whisper: {e}"),
+                source: None,
+            })?;
+        Ok(())
+    }
+
     /// Transkrypcja pliku audio. Pusty `request.file` jest tu twardo
     /// odrzucany — to lustro guard'u w `routing/stt.rs` (R6.P3) zeby
     /// blad sygnalizowal sie jak najwczesniej.
@@ -93,6 +120,11 @@ impl SttRuntime {
             }
             .into());
         }
+
+        // Self-heal: embedded whisper musi byc zaladowany zanim siegniemy po
+        // `active_engine()`. Po restarcie procesu (lub gdy usluga STT zostala
+        // oznaczona running bez warm-load) `default_local` jest pusty.
+        self.ensure_default_local_loaded().await?;
 
         // Brak language => Whisper auto-detection. Resolver w
         // `api/openai/server.rs` probuje user preference przed wpadnieciem
@@ -235,8 +267,20 @@ impl SttRuntime {
                 .into()
             });
         }
-        // Local fallback (embedded whisper przez default_local).
-        self.transcribe(request).await
+        // Brak zarejestrowanego backendu HTTP dla tej usługi → próba lokalnego
+        // embedded whisper. Gdy i jego nie ma — błąd musi powiedzieć WPROST, że
+        // usługa STT nie jest podłączona jako działający backend (a nie kryptyczne
+        // "no STT engine loaded").
+        self.transcribe(request).await.map_err(|e| {
+            CoreError::InternalError {
+                message: format!(
+                    "usługa STT #{service_id} nie ma zarejestrowanego backendu (nie jest \
+                     uruchomiona/podłączona), a lokalny embedded whisper: {e}"
+                ),
+                source: None,
+            }
+            .into()
+        })
     }
 }
 

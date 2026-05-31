@@ -269,10 +269,15 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         meta.session_id = invoke.session_id.clone();
         meta.cancel_token = cancel.clone();
 
-        let exec = match fd
-            .try_dispatch_streaming(&invoke.model, &invoke.service_type, envelope, meta)
-            .await
-        {
+        // flow_id ma priorytet — odpala dokładnie ten flow który user wybrał
+        // (np. w trybie audio). Bez niego rozwiązanie przez model/service_type.
+        let dispatch = if let Some(fid) = invoke.flow_id {
+            fd.dispatch_by_flow_id_streaming(fid, envelope, meta).await
+        } else {
+            fd.try_dispatch_streaming(&invoke.model, &invoke.service_type, envelope, meta)
+                .await
+        };
+        let exec = match dispatch {
             Ok(e) => e,
             Err(e) => {
                 let _ = push_end(
@@ -356,7 +361,6 @@ async fn flow_envelope_from_inputs(
     language: Option<String>,
     blobs: &Arc<dyn crate::flow_engine::blob_store::BlobStore>,
 ) -> anyhow::Result<crate::flow_engine::envelope::FlowEnvelope> {
-    use crate::flow_engine::blob_store::BlobStore;
     use crate::flow_engine::envelope::{ArtifactProvenance, FlowEnvelope, FlowValue};
 
     let mut env: Option<FlowEnvelope> = None;
