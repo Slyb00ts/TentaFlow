@@ -117,6 +117,7 @@ export class SlotManager {
     }
     const decl = parseSlotDecl(slotDeclRaw);
     const entry = {
+      slotId,
       element,
       decl,
       currentFragment: null,
