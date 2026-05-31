@@ -448,6 +448,12 @@ pub struct ModelPreset {
     pub quantization: Option<String>,
     #[serde(default)]
     pub recommended: bool,
+    /// When true the catalog renders this preset as its own deployable tile in
+    /// its engine's category (a "featured model"), in addition to appearing in
+    /// the engine's deploy wizard. Deploy reuses the parent engine's path, so no
+    /// engine-id-keyed routing changes are needed.
+    #[serde(default)]
+    pub featured: bool,
     #[serde(default)]
     pub service_surfaces: Option<Vec<String>>,
     #[serde(default)]

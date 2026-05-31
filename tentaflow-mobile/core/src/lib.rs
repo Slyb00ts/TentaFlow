@@ -13,12 +13,7 @@ mod diagnostics;
 
 use anyhow::Result;
 use tentaflow_core::config::NodeConfig;
-use tentaflow_ui::app::TentaFlowApp;
-use tentaflow_ui::state::{new_shared_state, SharedAppState};
 use tracing::{info, error};
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // =============================================================================
 // Punkt wejscia iOS — wywolywany z Obj-C/Swift bridge
@@ -134,11 +129,7 @@ fn start_app() -> Result<()> {
     // Konfiguracja dla trybu mobilnego
     let config = create_mobile_config(&data_dir);
 
-    // Wspoldzielony stan miedzy Core i UI
-    let state = new_shared_state();
-
     // Uruchom serwisy w osobnym watku — NIE blokuj main thread iOS
-    let state_for_runtime = state.clone();
     std::thread::spawn(move || {
         info!("Tworzenie tokio runtime...");
         let runtime = match tokio::runtime::Runtime::new() {
@@ -151,7 +142,7 @@ fn start_app() -> Result<()> {
 
         runtime.block_on(async {
             info!("Uruchamianie serwisow Core...");
-            match runtime::start_services(config, state_for_runtime).await {
+            match runtime::start_services(config).await {
                 Ok(_handles) => {
                     info!("Serwisy Core uruchomione — HTTPS na porcie 8090");
                     // Nie upuszczaj handles — serwisy dzialaja w tle
@@ -172,53 +163,6 @@ fn start_app() -> Result<()> {
     Ok(())
 }
 
-/// Uruchamia GUI egui/wgpu — blokuje do zamkniecia
-fn run_gui(state: SharedAppState, should_quit: Arc<AtomicBool>) -> Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("TentaFlow")
-            .with_inner_size([1024.0, 768.0])
-            .with_min_inner_size([320.0, 480.0]),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "TentaFlow",
-        options,
-        Box::new(move |_cc| {
-            Ok(Box::new(MobileApp {
-                inner: TentaFlowApp::new(state),
-                should_quit,
-            }))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("Blad uruchomienia eframe: {}", e))?;
-
-    Ok(())
-}
-
-/// Wrapper na TentaFlowApp z obsluga should_quit
-struct MobileApp {
-    inner: TentaFlowApp,
-    should_quit: Arc<AtomicBool>,
-}
-
-impl eframe::App for MobileApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // Sprawdz czy powinno sie zamknac
-        if self.should_quit.load(Ordering::SeqCst) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-
-        // Render glownej aplikacji (identyczne UI jak Desktop)
-        self.inner.update(ctx, frame);
-
-        // Odswiezaj co 100ms
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    }
-}
-
 /// Tworzy konfiguracje dostosowana do urzadzenia mobilnego
 fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
     use tentaflow_core::config::*;
@@ -236,6 +180,7 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
             cpu_affinity: false,
             log_level: "info".to_string(),
             log_format: "compact".to_string(),
+            mtls: None,
         },
         protocols: ProtocolsConfig {
             openai_api: ProtocolConfig {
@@ -281,6 +226,7 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
             peer_timeout_ms: 3000,
             cluster_name: "tentaflow".to_string(),
             iroh_relay_url: "https://use.iroh.network/".to_string(),
+            dht_enabled: false,
         }),
         inference: Some(InferenceConfig {
             enabled: true,

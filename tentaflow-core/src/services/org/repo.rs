@@ -10,7 +10,7 @@
 // single hard-coded id (matches `DEFAULT_ORG_ID` in mod.rs) so migration
 // backfills can target it.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
 
 use super::error::{OrgError, Result};
@@ -171,6 +171,7 @@ pub fn create_organization(
     );
     match res {
         Ok(_) => {
+            crate::compliance::repository::ensure_org_defaults(&tx, &org_id).map_err(map_db)?;
             record_core_capture_tx(
                 &tx,
                 &org_id,

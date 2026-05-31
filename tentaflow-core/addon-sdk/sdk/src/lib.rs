@@ -344,7 +344,7 @@ extern "C" {
     ) -> i32;
 
     /// Camera API (F1a M1.W6) — camera ingest layer (fake_file vendor only
-    /// in F1a). Payload format is TOML for all inputs/outputs. Requires
+    /// in F1a). Payload format is CBOR for all inputs/outputs. Requires
     /// `cameras.read` / `cameras.write` / `cameras.snapshot` permissions.
     fn camera_add_v1(
         input_ptr: i32, input_len: i32,
@@ -1581,7 +1581,7 @@ pub fn alias_list_owned() -> Result<Vec<AliasInfo>, AbiError> {
 // Camera API (F1a M1.W6) — TentaVision camera ingest
 // =============================================================================
 //
-// Wrapper-y woke host functions camera_*_v1. Payload to TOML; bledy mapowane na
+// Wrapper-y woke host functions camera_*_v1. Payload to CBOR; bledy mapowane na
 // `AbiError`. Pelna specyfikacja: `docs/ADDON_HOST_FUNCTIONS.md` sekcja 13.
 //
 // **All `camera_*` wrappers require TentaFlow core built with
@@ -1600,6 +1600,13 @@ pub struct CameraAddSpec {
     pub resolution: Option<(u32, u32)>,
     pub retention_class: String,
     pub profile: String,
+    /// Base64-encoded `user:pass` for vendors requiring auth (RTSP/ONVIF).
+    /// Required for `vendor = "onvif"`; the host also uses it for the SOAP
+    /// UsernameToken digest. `None` for credential-less vendors (`fake_file`).
+    pub credentials_b64: Option<String>,
+    /// `vendor = "onvif"` only: pins a specific media profile. `None` selects
+    /// the first profile returned by `GetProfiles`.
+    pub onvif_profile_token: Option<String>,
 }
 
 impl Default for CameraAddSpec {
@@ -1612,17 +1619,19 @@ impl Default for CameraAddSpec {
             resolution: None,
             retention_class: "C".to_string(),
             profile: "default".to_string(),
+            credentials_b64: None,
+            onvif_profile_token: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CameraAddResult {
     pub camera_id: String,
     pub status: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CameraInfo {
     pub camera_id: String,
     pub display_name: String,
@@ -1639,10 +1648,24 @@ pub struct CameraInfo {
     pub profile: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct CameraListResponse {
-    #[serde(default)]
-    camera: Vec<CameraInfo>,
+impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
+    fn from(o: tentaflow_sdk_spec::CameraInfoOut) -> Self {
+        Self {
+            camera_id: o.camera_id,
+            display_name: o.display_name,
+            vendor: o.vendor,
+            url: o.url,
+            target_fps: o.target_fps,
+            resolution_width: o.resolution_width,
+            resolution_height: o.resolution_height,
+            status: o.status,
+            status_message: o.status_message,
+            fps_actual: o.fps_actual,
+            last_frame_at: o.last_frame_at,
+            retention_class: o.retention_class,
+            profile: o.profile,
+        }
+    }
 }
 
 /// Partial update for `camera_update`. URL i vendor sa nie do zmiany w F1a —
@@ -1658,7 +1681,7 @@ pub struct CameraUpdateSpec {
     pub profile: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CameraHealthInfo {
     pub camera_id: String,
     pub status: String,
@@ -1680,43 +1703,26 @@ pub struct SnapshotInfo {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct SnapshotRaw {
-    camera_id: String,
-    width: u32,
-    height: u32,
-    pixel_format: String,
-    timestamp_unix_ms: u64,
-    data_b64: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CameraTestResult {
     pub ok: bool,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct CameraRemoveOutRaw {
-    #[allow(dead_code)]
-    removed: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct CameraDiscoverRaw {
-    #[serde(default)]
-    discovered: Vec<CameraInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct CameraCredentialsRotateRaw {
-    rotated: bool,
-    reason: String,
-}
-
-fn parse_toml<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, AbiError> {
-    let s = std::str::from_utf8(bytes).map_err(|_| AbiError::Operation)?;
-    toml::from_str::<T>(s).map_err(|_| AbiError::Operation)
+/// Decodes a CBOR host response into a shared `tentaflow-sdk-spec` ABI struct.
+/// `minicbor::decode` stops at the first complete value, so a valid prefix
+/// followed by trailing bytes would otherwise be accepted; this requires the
+/// whole response to be consumed.
+fn decode_cbor<T>(bytes: &[u8]) -> Result<T, AbiError>
+where
+    T: for<'b> minicbor::Decode<'b, ()>,
+{
+    let mut decoder = minicbor::Decoder::new(bytes);
+    let value = decoder.decode::<T>().map_err(|_| AbiError::Operation)?;
+    if decoder.position() != bytes.len() {
+        return Err(AbiError::Operation);
+    }
+    Ok(value)
 }
 
 fn call_host_no_input(
@@ -1757,26 +1763,42 @@ fn call_host_no_input(
     }
 }
 
-fn camera_add_payload(spec: &CameraAddSpec) -> String {
-    let mut s = String::new();
-    s.push_str(&format!("display_name = {}\n", toml::Value::String(spec.display_name.clone())));
-    s.push_str(&format!("vendor = {}\n", toml::Value::String(spec.vendor.clone())));
-    s.push_str(&format!("url = {}\n", toml::Value::String(spec.url.clone())));
-    s.push_str(&format!("target_fps = {}\n", spec.target_fps));
-    if let Some((w, h)) = spec.resolution {
-        s.push_str(&format!("resolution_width = {}\n", w));
-        s.push_str(&format!("resolution_height = {}\n", h));
+/// Encodes a shared `tentaflow-sdk-spec` ABI input struct to CBOR for the
+/// host call.
+fn encode_cbor_input<T: minicbor::Encode<()>>(value: &T) -> Result<Vec<u8>, AbiError> {
+    let mut buf = Vec::new();
+    minicbor::encode(value, &mut buf).map_err(|_| AbiError::Operation)?;
+    Ok(buf)
+}
+
+fn camera_add_payload(spec: &CameraAddSpec) -> tentaflow_sdk_spec::CameraAddInput {
+    let (resolution_width, resolution_height) = match spec.resolution {
+        Some((w, h)) => (Some(w), Some(h)),
+        None => (None, None),
+    };
+    tentaflow_sdk_spec::CameraAddInput {
+        display_name: spec.display_name.clone(),
+        vendor: spec.vendor.clone(),
+        url: spec.url.clone(),
+        target_fps: Some(spec.target_fps),
+        resolution_width,
+        resolution_height,
+        retention_class: Some(spec.retention_class.clone()),
+        profile: Some(spec.profile.clone()),
+        credentials_b64: spec.credentials_b64.clone(),
+        onvif_profile_token: spec.onvif_profile_token.clone(),
     }
-    s.push_str(&format!("retention_class = {}\n", toml::Value::String(spec.retention_class.clone())));
-    s.push_str(&format!("profile = {}\n", toml::Value::String(spec.profile.clone())));
-    s
 }
 
 /// Rejestruje nowa kamere w supervisor + DB. F1a vendor whitelist: `fake_file`.
 pub fn camera_add(spec: &CameraAddSpec) -> Result<CameraAddResult, AbiError> {
-    let payload = camera_add_payload(spec);
-    let bytes = call_sql_with_one_input(camera_add_v1, payload.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&camera_add_payload(spec))?;
+    let bytes = call_sql_with_one_input(camera_add_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraAddOutput = decode_cbor(&bytes)?;
+    Ok(CameraAddResult {
+        camera_id: out.camera_id,
+        status: out.status,
+    })
 }
 
 /// Zwraca wszystkie kamery nalezace do wywolujacego addona. Kazdy wpis zawiera
@@ -1784,51 +1806,46 @@ pub fn camera_add(spec: &CameraAddSpec) -> Result<CameraAddResult, AbiError> {
 /// aktywna; w przeciwnym razie wartosci z DB (po restarcie hosta).
 pub fn camera_list() -> Result<Vec<CameraInfo>, AbiError> {
     let bytes = call_host_no_input(camera_list_v1)?;
-    let resp: CameraListResponse = parse_toml(&bytes)?;
-    Ok(resp.camera)
+    let resp: tentaflow_sdk_spec::CameraListOut = decode_cbor(&bytes)?;
+    Ok(resp.camera.into_iter().map(CameraInfo::from).collect())
 }
 
 /// Pobiera pojedynczy `CameraInfo`. Zwraca `NotFound` gdy kamera nie istnieje
 /// lub nalezy do innego addona (kanalu bocznego nie ma — nie da sie wnioskowac
 /// o istnieniu cudzych camera_id).
 pub fn camera_get(camera_id: &str) -> Result<CameraInfo, AbiError> {
-    let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
-    let bytes = call_sql_with_one_input(camera_get_v1, payload.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraIdInput {
+        camera_id: camera_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_get_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraInfoOut = decode_cbor(&bytes)?;
+    Ok(CameraInfo::from(out))
 }
 
 /// Patch on-the-fly. Vendor + URL sa niezmienne — change them by remove + add.
 pub fn camera_update(spec: &CameraUpdateSpec) -> Result<CameraInfo, AbiError> {
-    let mut s = String::new();
-    s.push_str(&format!("camera_id = {}\n", toml::Value::String(spec.camera_id.clone())));
-    if let Some(v) = &spec.display_name {
-        s.push_str(&format!("display_name = {}\n", toml::Value::String(v.clone())));
-    }
-    if let Some(v) = spec.target_fps {
-        s.push_str(&format!("target_fps = {}\n", v));
-    }
-    if let Some(v) = spec.resolution_width {
-        s.push_str(&format!("resolution_width = {}\n", v));
-    }
-    if let Some(v) = spec.resolution_height {
-        s.push_str(&format!("resolution_height = {}\n", v));
-    }
-    if let Some(v) = &spec.retention_class {
-        s.push_str(&format!("retention_class = {}\n", toml::Value::String(v.clone())));
-    }
-    if let Some(v) = &spec.profile {
-        s.push_str(&format!("profile = {}\n", toml::Value::String(v.clone())));
-    }
-    let bytes = call_sql_with_one_input(camera_update_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraUpdateInput {
+        camera_id: spec.camera_id.clone(),
+        display_name: spec.display_name.clone(),
+        target_fps: spec.target_fps,
+        resolution_width: spec.resolution_width,
+        resolution_height: spec.resolution_height,
+        retention_class: spec.retention_class.clone(),
+        profile: spec.profile.clone(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_update_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraInfoOut = decode_cbor(&bytes)?;
+    Ok(CameraInfo::from(out))
 }
 
 /// Soft-delete (stamps `removed_at`). Idempotent w sensie ABI: druga proba na
 /// tym samym camera_id zwraca `NotFound`.
 pub fn camera_remove(camera_id: &str) -> Result<(), AbiError> {
-    let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
-    let bytes = call_sql_with_one_input(camera_remove_v1, payload.as_bytes())?;
-    let _: CameraRemoveOutRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraIdInput {
+        camera_id: camera_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_remove_v1, &payload)?;
+    let _: tentaflow_sdk_spec::CameraRemoveOut = decode_cbor(&bytes)?;
     Ok(())
 }
 
@@ -1839,13 +1856,15 @@ pub fn camera_remove(camera_id: &str) -> Result<(), AbiError> {
 /// Requires TentaFlow core built with `--features camera`. Without it
 /// addon instantiation fails at module-link time with "missing import".
 pub fn camera_snapshot(camera_id: &str) -> Result<SnapshotInfo, AbiError> {
-    let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraIdInput {
+        camera_id: camera_id.to_string(),
+    })?;
     let bytes = call_sql_with_one_input_capped(
         camera_snapshot_v1,
-        payload.as_bytes(),
+        &payload,
         MAX_OUT_CAP_SNAPSHOT,
     )?;
-    let raw: SnapshotRaw = parse_toml(&bytes)?;
+    let raw: tentaflow_sdk_spec::CameraSnapshotOut = decode_cbor(&bytes)?;
     let data = base64::engine::general_purpose::STANDARD
         .decode(raw.data_b64.as_bytes())
         .map_err(|_| AbiError::Operation)?;
@@ -1863,44 +1882,77 @@ pub fn camera_snapshot(camera_id: &str) -> Result<SnapshotInfo, AbiError> {
 /// hosta przed Issue #8 fix), zwraca `status_message = "session missing"` +
 /// metryki = 0.
 pub fn camera_health(camera_id: &str) -> Result<CameraHealthInfo, AbiError> {
-    let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
-    let bytes = call_sql_with_one_input(camera_health_v1, payload.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraIdInput {
+        camera_id: camera_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_health_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraHealthOut = decode_cbor(&bytes)?;
+    Ok(CameraHealthInfo {
+        camera_id: out.camera_id,
+        status: out.status,
+        status_message: out.status_message,
+        fps_actual: out.fps_actual,
+        last_frame_at: out.last_frame_at,
+        frames_total: out.frames_total,
+        frames_dropped: out.frames_dropped,
+    })
 }
 
-/// F1a stub — zawsze zwraca pusty vector. F1b doda RTSP/ONVIF scan.
+/// WS-Discovery na lokalnej sieci LAN — zwraca wykryte urzadzenia ONVIF
+/// zmapowane na `CameraInfo` (jeszcze bez `camera_id`).
 pub fn camera_discover() -> Result<Vec<CameraInfo>, AbiError> {
     let bytes = call_host_no_input(camera_discover_v1)?;
-    let resp: CameraDiscoverRaw = parse_toml(&bytes)?;
-    Ok(resp.discovered)
+    let resp: tentaflow_sdk_spec::CameraDiscoverOut = decode_cbor(&bytes)?;
+    Ok(resp
+        .discovered
+        .into_iter()
+        .map(|d| CameraInfo {
+            camera_id: String::new(),
+            display_name: d.model.clone(),
+            vendor: "onvif".to_string(),
+            url: d.xaddrs.first().cloned().unwrap_or_default(),
+            target_fps: 0,
+            resolution_width: None,
+            resolution_height: None,
+            status: "discovered".to_string(),
+            status_message: Some(format!("{} {}", d.manufacturer, d.model)),
+            fps_actual: None,
+            last_frame_at: None,
+            retention_class: String::new(),
+            profile: String::new(),
+        })
+        .collect())
 }
 
 /// Lightweight probe — sprawdza czy URL kamery jest osiagalny dla danego
 /// vendora. Dla `fake_file` sprawdza ze plik istnieje, jest plikiem regularnym
 /// i nie zawiera symlinkow w sciezce.
 pub fn camera_test_connection(vendor: &str, url: &str) -> Result<CameraTestResult, AbiError> {
-    let payload = format!(
-        "vendor = {}\nurl = {}\n",
-        toml::Value::String(vendor.to_string()),
-        toml::Value::String(url.to_string())
-    );
-    let bytes = call_sql_with_one_input(camera_test_connection_v1, payload.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraTestConnectionInput {
+        vendor: vendor.to_string(),
+        url: url.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_test_connection_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraTestConnectionOut = decode_cbor(&bytes)?;
+    Ok(CameraTestResult {
+        ok: out.ok,
+        message: out.message,
+    })
 }
 
-/// F1a stub dla credentialow vendorow wymagajacych auth (RTSP/ONVIF w F1b).
-/// `fake_file` nie ma credentiali — zwraca `(false, "f1a_noop_...")`.
+/// Rotacja credentiali dla vendorow wymagajacych auth (RTSP/ONVIF).
+/// `new_credentials_b64 = None` czysci credential. Zwraca `(rotated, reason)`.
 pub fn camera_credentials_rotate(
     camera_id: &str,
     new_credentials_b64: Option<&str>,
 ) -> Result<(bool, String), AbiError> {
-    let mut s = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
-    if let Some(c) = new_credentials_b64 {
-        s.push_str(&format!("new_credentials_b64 = {}\n", toml::Value::String(c.to_string())));
-    }
-    let bytes = call_sql_with_one_input(camera_credentials_rotate_v1, s.as_bytes())?;
-    let raw: CameraCredentialsRotateRaw = parse_toml(&bytes)?;
-    Ok((raw.rotated, raw.reason))
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraCredentialsRotateInput {
+        camera_id: camera_id.to_string(),
+        new_credentials_b64: new_credentials_b64.map(|s| s.to_string()),
+    })?;
+    let bytes = call_sql_with_one_input(camera_credentials_rotate_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraCredentialsRotateOut = decode_cbor(&bytes)?;
+    Ok((out.rotated, out.reason))
 }
 
 // =============================================================================
@@ -1914,7 +1966,7 @@ pub fn camera_credentials_rotate(
 /// Payload metadata for a Frame message returned by `stream_next`. Bytes live
 /// in the core LRU and travel to a service via `service_call` + PickupToken —
 /// the addon never receives them inline.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StreamFrameMeta {
     pub frame_ref: String,
     pub camera_id: String,
@@ -1934,90 +1986,66 @@ pub enum StreamNextMessage {
     Timeout,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum StreamNextRaw {
-    Frame {
-        frame_ref: String,
-        camera_id: String,
-        width: u32,
-        height: u32,
-        pixel_format: String,
-        timestamp_unix_ms: u64,
-    },
-    Drop {
-        count: u64,
-    },
-    CameraOffline {
-        reason: String,
-    },
-    StreamClosed,
-    Timeout,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct StreamSubscribeOut {
-    stream_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct StreamCloseOut {
-    #[allow(dead_code)]
-    closed: bool,
-}
-
 /// Subscribe to a camera's frame bus. F1a target format: `camera:<camera_id>`.
 /// Ownership is enforced — addons cannot subscribe to cameras owned by other
 /// addons (returns `NotFound`).
 pub fn stream_subscribe(target: &str, max_fps: Option<u32>) -> Result<String, AbiError> {
-    let mut s = format!("target = {}\n", toml::Value::String(target.to_string()));
-    if let Some(fps) = max_fps {
-        s.push_str(&format!("[filter]\nmax_fps = {}\nskip_frames = 0\n", fps));
-    }
-    let bytes = call_sql_with_one_input_capped(stream_subscribe_v1, s.as_bytes(), MAX_OUT_CAP_STREAM)?;
-    let out: StreamSubscribeOut = parse_toml(&bytes)?;
+    let input = tentaflow_sdk_spec::StreamSubscribeInput {
+        target: target.to_string(),
+        filter: max_fps.map(|fps| tentaflow_sdk_spec::StreamSubscribeFilter {
+            max_fps: Some(fps),
+            skip_frames: Some(0),
+        }),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(stream_subscribe_v1, &payload, MAX_OUT_CAP_STREAM)?;
+    let out: tentaflow_sdk_spec::StreamSubscribeOutput = decode_cbor(&bytes)?;
     Ok(out.stream_id)
 }
 
 /// Bounded-await poll for the next stream message. `timeout_ms` is clamped to
 /// 5000 ms by the host.
 pub fn stream_next(stream_id: &str, timeout_ms: u64) -> Result<StreamNextMessage, AbiError> {
-    let payload = format!(
-        "stream_id = {}\ntimeout_ms = {}\n",
-        toml::Value::String(stream_id.to_string()),
+    let input = tentaflow_sdk_spec::StreamNextInput {
+        stream_id: stream_id.to_string(),
         timeout_ms,
-    );
-    let bytes = call_sql_with_one_input_capped(stream_next_v1, payload.as_bytes(), MAX_OUT_CAP_STREAM)?;
-    let raw: StreamNextRaw = parse_toml(&bytes)?;
-    Ok(match raw {
-        StreamNextRaw::Frame {
-            frame_ref,
-            camera_id,
-            width,
-            height,
-            pixel_format,
-            timestamp_unix_ms,
-        } => StreamNextMessage::Frame(StreamFrameMeta {
-            frame_ref,
-            camera_id,
-            width,
-            height,
-            pixel_format,
-            timestamp_unix_ms,
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(stream_next_v1, &payload, MAX_OUT_CAP_STREAM)?;
+    let out: tentaflow_sdk_spec::StreamNextOutput = decode_cbor(&bytes)?;
+    // Map the host's tagged output onto the SDK enum. A missing field for the
+    // declared `kind` means the host produced a malformed frame, which we
+    // surface as `Operation` rather than silently dropping it.
+    match out.kind.as_str() {
+        "frame" => Ok(StreamNextMessage::Frame(StreamFrameMeta {
+            frame_ref: out.frame_ref.ok_or(AbiError::Operation)?,
+            camera_id: out.camera_id.ok_or(AbiError::Operation)?,
+            width: out.width.ok_or(AbiError::Operation)?,
+            height: out.height.ok_or(AbiError::Operation)?,
+            pixel_format: out.pixel_format.ok_or(AbiError::Operation)?,
+            timestamp_unix_ms: out.timestamp_unix_ms.ok_or(AbiError::Operation)?,
+        })),
+        "drop" => Ok(StreamNextMessage::Drop {
+            count: out.count.ok_or(AbiError::Operation)?,
         }),
-        StreamNextRaw::Drop { count } => StreamNextMessage::Drop { count },
-        StreamNextRaw::CameraOffline { reason } => StreamNextMessage::CameraOffline { reason },
-        StreamNextRaw::StreamClosed => StreamNextMessage::StreamClosed,
-        StreamNextRaw::Timeout => StreamNextMessage::Timeout,
-    })
+        "camera_offline" => Ok(StreamNextMessage::CameraOffline {
+            reason: out.reason.ok_or(AbiError::Operation)?,
+        }),
+        "stream_closed" => Ok(StreamNextMessage::StreamClosed),
+        "timeout" => Ok(StreamNextMessage::Timeout),
+        _ => Err(AbiError::Operation),
+    }
 }
 
 /// Drop the subscription. Subsequent `stream_next` calls for the same id
 /// return `StreamNotFound`.
 pub fn stream_close(stream_id: &str) -> Result<(), AbiError> {
-    let payload = format!("stream_id = {}\n", toml::Value::String(stream_id.to_string()));
-    let bytes = call_sql_with_one_input_capped(stream_close_v1, payload.as_bytes(), MAX_OUT_CAP_STREAM)?;
-    let _: StreamCloseOut = parse_toml(&bytes)?;
+    let input = tentaflow_sdk_spec::StreamCloseInput {
+        stream_id: stream_id.to_string(),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(stream_close_v1, &payload, MAX_OUT_CAP_STREAM)?;
+    let _: tentaflow_sdk_spec::StreamCloseOutput = decode_cbor(&bytes)?;
     Ok(())
 }
 
@@ -2060,16 +2088,6 @@ pub struct MetadataFrame {
     pub items: Vec<MetadataItem>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct MetadataPollRaw {
-    #[serde(default)]
-    frames: Vec<MetadataFrame>,
-    #[serde(default)]
-    camera_offline: bool,
-    #[serde(default)]
-    dropped: u64,
-}
-
 /// Aggregate poll outcome — frames plus optional backpressure / offline
 /// signals.
 #[derive(Debug, Clone)]
@@ -2084,18 +2102,6 @@ pub struct MetadataPollResult {
     pub dropped: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct MetadataSubscribeOut {
-    subscription_id: String,
-    #[allow(dead_code)]
-    status: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MetadataUnsubscribeOut {
-    unsubscribed: bool,
-}
-
 /// Subscribe to a camera's ONVIF analytics-metadata stream. The host spawns
 /// (or refcounts) a per-camera PullPoint task; the first subscriber pays
 /// the cost of `CreatePullPointSubscription` against the camera. Errors:
@@ -2108,16 +2114,15 @@ struct MetadataUnsubscribeOut {
 ///                    are missing.
 ///   * `CameraUnreachable` — transport error talking to the events service.
 pub fn camera_metadata_subscribe(camera_id: &str) -> Result<String, AbiError> {
-    let payload = format!(
-        "camera_id = {}\n",
-        toml::Value::String(camera_id.to_string()),
-    );
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::MetadataSubscribeInput {
+        camera_id: camera_id.to_string(),
+    })?;
     let bytes = call_sql_with_one_input_capped(
         camera_metadata_subscribe_v1,
-        payload.as_bytes(),
+        &payload,
         MAX_OUT_CAP_STREAM,
     )?;
-    let out: MetadataSubscribeOut = parse_toml(&bytes)?;
+    let out: tentaflow_sdk_spec::MetadataSubscribeOutput = decode_cbor(&bytes)?;
     Ok(out.subscription_id)
 }
 
@@ -2128,20 +2133,33 @@ pub fn camera_metadata_poll(
     max_items: u32,
     timeout_ms: u32,
 ) -> Result<MetadataPollResult, AbiError> {
-    let payload = format!(
-        "subscription_id = {}\nmax_items = {}\ntimeout_ms = {}\n",
-        toml::Value::String(subscription_id.to_string()),
-        max_items,
-        timeout_ms,
-    );
-    let bytes = call_sql_with_one_input_capped(
-        camera_metadata_poll_v1,
-        payload.as_bytes(),
-        MAX_OUT_CAP_STREAM,
-    )?;
-    let raw: MetadataPollRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::MetadataPollInput {
+        subscription_id: subscription_id.to_string(),
+        max_items: Some(max_items),
+        timeout_ms: Some(timeout_ms),
+    })?;
+    let bytes =
+        call_sql_with_one_input_capped(camera_metadata_poll_v1, &payload, MAX_OUT_CAP_STREAM)?;
+    let raw: tentaflow_sdk_spec::MetadataPollOutput = decode_cbor(&bytes)?;
     Ok(MetadataPollResult {
-        frames: raw.frames,
+        frames: raw
+            .frames
+            .into_iter()
+            .map(|f| MetadataFrame {
+                camera_id: f.camera_id,
+                ts_unix_ms: f.ts_unix_ms,
+                items: f
+                    .items
+                    .into_iter()
+                    .map(|i| MetadataItem {
+                        class: i.class,
+                        confidence: i.confidence,
+                        bbox: i.bbox,
+                        track_id: i.track_id,
+                    })
+                    .collect(),
+            })
+            .collect(),
         camera_offline: raw.camera_offline,
         dropped: raw.dropped,
     })
@@ -2151,16 +2169,15 @@ pub fn camera_metadata_poll(
 /// (or one for an unknown id) returns `Ok(false)`. The supervisor pull
 /// task is cancelled when the last addon unsubscribes from the camera.
 pub fn camera_metadata_unsubscribe(subscription_id: &str) -> Result<bool, AbiError> {
-    let payload = format!(
-        "subscription_id = {}\n",
-        toml::Value::String(subscription_id.to_string()),
-    );
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::MetadataUnsubscribeInput {
+        subscription_id: subscription_id.to_string(),
+    })?;
     let bytes = call_sql_with_one_input_capped(
         camera_metadata_unsubscribe_v1,
-        payload.as_bytes(),
+        &payload,
         MAX_OUT_CAP_STREAM,
     )?;
-    let out: MetadataUnsubscribeOut = parse_toml(&bytes)?;
+    let out: tentaflow_sdk_spec::MetadataUnsubscribeOutput = decode_cbor(&bytes)?;
     Ok(out.unsubscribed)
 }
 
@@ -2173,23 +2190,20 @@ pub fn camera_metadata_unsubscribe(subscription_id: &str) -> Result<bool, AbiErr
 /// Metadata for a recording artifact persisted on the host (PNG snapshot or
 /// MP4 segment). `recording_ref` is the public handle (`snap_<uuid>` /
 /// `clip_<uuid>`) used by the other recording APIs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SavedRecordingInfo {
     pub recording_ref: String,
     pub file_path: String,
     pub file_size_bytes: u64,
-    #[serde(default)]
     pub duration_ms: Option<u32>,
-    #[serde(default)]
     pub width: Option<u32>,
-    #[serde(default)]
     pub height: Option<u32>,
     pub hash_sha256: String,
     pub created_at: u64,
 }
 
 /// Signed URL for a stored recording or a raw frame. Multi-use until expiry.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecordingUrl {
     pub url: String,
     pub expires_unix_ms: u64,
@@ -2198,13 +2212,13 @@ pub struct RecordingUrl {
 /// Signed URL for a raw frame in the LRU. Shape mirrors `RecordingUrl` so the
 /// SDK surface stays symmetric; lives as its own type for self-documenting
 /// call sites.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FrameUrl {
     pub url: String,
     pub expires_unix_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecordingStatsPerCamera {
     pub camera_id: String,
     pub snapshots: u64,
@@ -2212,27 +2226,12 @@ pub struct RecordingStatsPerCamera {
     pub size_bytes: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecordingStats {
     pub total_snapshots: u64,
     pub total_segments: u64,
     pub total_size_bytes: u64,
-    #[serde(default)]
     pub per_camera: Vec<RecordingStatsPerCamera>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RecordingStatsRaw {
-    stats: RecordingStatsTotalsRaw,
-    #[serde(default)]
-    per_camera: Vec<RecordingStatsPerCamera>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RecordingStatsTotalsRaw {
-    total_snapshots: u64,
-    total_segments: u64,
-    total_size_bytes: u64,
 }
 
 /// Inline raw bytes of a stored recording plus integrity metadata so the addon
@@ -2244,21 +2243,17 @@ pub struct RecordingStream {
     pub hash_sha256: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct RecordingGetStreamRaw {
-    data_b64: String,
-    file_size_bytes: u64,
-    hash_sha256: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RecordingPurgeRaw {
-    #[allow(dead_code)]
-    purged: bool,
-}
-
-fn push_kv_str(s: &mut String, key: &str, value: &str) {
-    s.push_str(&format!("{} = {}\n", key, toml::Value::String(value.to_string())));
+fn save_recording_info_from(out: tentaflow_sdk_spec::SaveRecordingOut) -> SavedRecordingInfo {
+    SavedRecordingInfo {
+        recording_ref: out.recording_ref,
+        file_path: out.file_path,
+        file_size_bytes: out.file_size_bytes,
+        duration_ms: out.duration_ms,
+        width: out.width,
+        height: out.height,
+        hash_sha256: out.hash_sha256,
+        created_at: out.created_at,
+    }
 }
 
 /// Persist a PNG snapshot for a frame already living in the host's LRU.
@@ -2268,14 +2263,14 @@ pub fn recording_save_snapshot(
     frame_ref: &str,
     retention_class: Option<&str>,
 ) -> Result<SavedRecordingInfo, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "camera_id", camera_id);
-    push_kv_str(&mut s, "frame_ref", frame_ref);
-    if let Some(rc) = retention_class {
-        push_kv_str(&mut s, "retention_class", rc);
-    }
-    let bytes = call_sql_with_one_input(recording_save_snapshot_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingSaveSnapshotInput {
+        camera_id: camera_id.to_string(),
+        frame_ref: frame_ref.to_string(),
+        retention_class: retention_class.map(|s| s.to_string()),
+    })?;
+    let bytes = call_sql_with_one_input(recording_save_snapshot_v1, &payload)?;
+    let out: tentaflow_sdk_spec::SaveRecordingOut = decode_cbor(&bytes)?;
+    Ok(save_recording_info_from(out))
 }
 
 /// Capture `duration_secs` of the camera's bound source into an MP4 segment.
@@ -2288,41 +2283,44 @@ pub fn recording_save_segment(
     duration_secs: u32,
     retention_class: Option<&str>,
 ) -> Result<SavedRecordingInfo, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "camera_id", camera_id);
-    s.push_str(&format!("duration_secs = {}\n", duration_secs));
-    if let Some(rc) = retention_class {
-        push_kv_str(&mut s, "retention_class", rc);
-    }
-    let bytes = call_sql_with_one_input(recording_save_segment_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingSaveSegmentInput {
+        camera_id: camera_id.to_string(),
+        duration_secs,
+        retention_class: retention_class.map(|s| s.to_string()),
+    })?;
+    let bytes = call_sql_with_one_input(recording_save_segment_v1, &payload)?;
+    let out: tentaflow_sdk_spec::SaveRecordingOut = decode_cbor(&bytes)?;
+    Ok(save_recording_info_from(out))
 }
 
 /// Issue a multi-use signed URL for a stored recording. TTL must be in
 /// `60..=3600` seconds.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_get_url(recording_ref: &str, ttl_secs: u64) -> Result<RecordingUrl, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "recording_ref", recording_ref);
-    s.push_str(&format!("ttl_secs = {}\n", ttl_secs));
-    let bytes = call_sql_with_one_input(recording_get_url_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingGetUrlInput {
+        recording_ref: recording_ref.to_string(),
+        ttl_secs,
+    })?;
+    let bytes = call_sql_with_one_input(recording_get_url_v1, &payload)?;
+    let out: tentaflow_sdk_spec::UrlOut = decode_cbor(&bytes)?;
+    Ok(RecordingUrl {
+        url: out.url,
+        expires_unix_ms: out.expires_unix_ms,
+    })
 }
 
 /// Fetch the raw bytes (PNG or MP4) of a stored recording inline together with
-/// the host's reported size and SHA-256 hash. The TOML envelope is hard-capped
+/// the host's reported size and SHA-256 hash. The CBOR envelope is hard-capped
 /// at 8 MiB; after base64 expansion this admits files up to ~6 MiB raw. Larger
 /// artifacts must be fetched via the signed URL + HTTP handler.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_get_stream(recording_ref: &str) -> Result<RecordingStream, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "recording_ref", recording_ref);
-    let bytes = call_sql_with_one_input_capped(
-        recording_get_stream_v1,
-        s.as_bytes(),
-        MAX_OUT_CAP_SNAPSHOT,
-    )?;
-    let raw: RecordingGetStreamRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingRefInput {
+        recording_ref: recording_ref.to_string(),
+    })?;
+    let bytes =
+        call_sql_with_one_input_capped(recording_get_stream_v1, &payload, MAX_OUT_CAP_SNAPSHOT)?;
+    let raw: tentaflow_sdk_spec::GetStreamOut = decode_cbor(&bytes)?;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw.data_b64.as_bytes())
         .map_err(|_| AbiError::Operation)?;
@@ -2337,10 +2335,11 @@ pub fn recording_get_stream(recording_ref: &str) -> Result<RecordingStream, AbiE
 /// returns `NotFound`.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_purge(recording_ref: &str) -> Result<(), AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "recording_ref", recording_ref);
-    let bytes = call_sql_with_one_input(recording_purge_v1, s.as_bytes())?;
-    let _: RecordingPurgeRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingRefInput {
+        recording_ref: recording_ref.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(recording_purge_v1, &payload)?;
+    let _: tentaflow_sdk_spec::PurgeOut = decode_cbor(&bytes)?;
     Ok(())
 }
 
@@ -2348,17 +2347,25 @@ pub fn recording_purge(recording_ref: &str) -> Result<(), AbiError> {
 /// single camera).
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_stats(camera_id: Option<&str>) -> Result<RecordingStats, AbiError> {
-    let mut s = String::new();
-    if let Some(cam) = camera_id {
-        push_kv_str(&mut s, "camera_id", cam);
-    }
-    let bytes = call_sql_with_one_input(recording_stats_v1, s.as_bytes())?;
-    let raw: RecordingStatsRaw = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::RecordingStatsInput {
+        camera_id: camera_id.map(|s| s.to_string()),
+    })?;
+    let bytes = call_sql_with_one_input(recording_stats_v1, &payload)?;
+    let raw: tentaflow_sdk_spec::StatsOut = decode_cbor(&bytes)?;
     Ok(RecordingStats {
         total_snapshots: raw.stats.total_snapshots,
         total_segments: raw.stats.total_segments,
         total_size_bytes: raw.stats.total_size_bytes,
-        per_camera: raw.per_camera,
+        per_camera: raw
+            .per_camera
+            .into_iter()
+            .map(|c| RecordingStatsPerCamera {
+                camera_id: c.camera_id,
+                snapshots: c.snapshots,
+                segments: c.segments,
+                size_bytes: c.size_bytes,
+            })
+            .collect(),
     })
 }
 
@@ -2367,11 +2374,16 @@ pub fn recording_stats(camera_id: Option<&str>) -> Result<RecordingStats, AbiErr
 /// addon.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn frame_url(frame_ref: &str, ttl_secs: u64) -> Result<FrameUrl, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "frame_ref", frame_ref);
-    s.push_str(&format!("ttl_secs = {}\n", ttl_secs));
-    let bytes = call_sql_with_one_input(frame_url_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::FrameUrlInput {
+        frame_ref: frame_ref.to_string(),
+        ttl_secs,
+    })?;
+    let bytes = call_sql_with_one_input(frame_url_v1, &payload)?;
+    let out: tentaflow_sdk_spec::UrlOut = decode_cbor(&bytes)?;
+    Ok(FrameUrl {
+        url: out.url,
+        expires_unix_ms: out.expires_unix_ms,
+    })
 }
 
 // =============================================================================
@@ -2385,28 +2397,6 @@ pub fn frame_url(frame_ref: &str, ttl_secs: u64) -> Result<FrameUrl, AbiError> {
 pub struct VectorHit {
     pub ref_id: u64,
     pub score: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct VectorUpsertResponse {
-    pub namespace: String,
-    pub ref_id: u64,
-    pub count: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct VectorSearchResponse {
-    pub namespace: String,
-    #[serde(default)]
-    pub hits: Vec<VectorHit>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VectorDeleteResponse {
-    pub namespace: String,
-    pub ref_id: u64,
-    pub removed: bool,
-    pub count: u64,
 }
 
 /// Encode a `&[f32]` slice as base64(little-endian f32 bytes) for the vector
@@ -2425,12 +2415,13 @@ pub fn encode_vector_b64(vector: &[f32]) -> String {
 /// and the namespace must be declared in the addon manifest under
 /// `[[vector_namespace]]`.
 pub fn vector_upsert(namespace: &str, ref_id: u64, vector: &[f32]) -> Result<u64, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "namespace", namespace);
-    s.push_str(&format!("ref_id = {}\n", ref_id));
-    push_kv_str(&mut s, "vector_b64", &encode_vector_b64(vector));
-    let bytes = call_sql_with_one_input(vector_upsert_v1, s.as_bytes())?;
-    let resp: VectorUpsertResponse = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorUpsertInput {
+        namespace: namespace.to_string(),
+        ref_id,
+        vector_b64: encode_vector_b64(vector),
+    })?;
+    let bytes = call_sql_with_one_input(vector_upsert_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::VectorUpsertOutput = decode_cbor(&bytes)?;
     Ok(resp.count)
 }
 
@@ -2443,25 +2434,32 @@ pub fn vector_search(
     k: u32,
     gate_claim_id: Option<&str>,
 ) -> Result<Vec<VectorHit>, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "namespace", namespace);
-    push_kv_str(&mut s, "query_b64", &encode_vector_b64(query));
-    s.push_str(&format!("k = {}\n", k));
-    if let Some(c) = gate_claim_id {
-        push_kv_str(&mut s, "gate_claim_id", c);
-    }
-    let bytes = call_sql_with_one_input(vector_search_v1, s.as_bytes())?;
-    let resp: VectorSearchResponse = parse_toml(&bytes)?;
-    Ok(resp.hits)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorSearchInput {
+        namespace: namespace.to_string(),
+        query_b64: encode_vector_b64(query),
+        k,
+        gate_claim_id: gate_claim_id.map(str::to_string),
+    })?;
+    let bytes = call_sql_with_one_input(vector_search_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::VectorSearchOutput = decode_cbor(&bytes)?;
+    Ok(resp
+        .hits
+        .into_iter()
+        .map(|h| VectorHit {
+            ref_id: h.ref_id,
+            score: h.score,
+        })
+        .collect())
 }
 
 /// Remove the vector under `ref_id`. Returns `true` if the key existed.
 pub fn vector_delete(namespace: &str, ref_id: u64) -> Result<bool, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "namespace", namespace);
-    s.push_str(&format!("ref_id = {}\n", ref_id));
-    let bytes = call_sql_with_one_input(vector_delete_v1, s.as_bytes())?;
-    let resp: VectorDeleteResponse = parse_toml(&bytes)?;
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorDeleteInput {
+        namespace: namespace.to_string(),
+        ref_id,
+    })?;
+    let bytes = call_sql_with_one_input(vector_delete_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::VectorDeleteOutput = decode_cbor(&bytes)?;
     Ok(resp.removed)
 }
 
@@ -2512,14 +2510,28 @@ pub fn gate_check_scoped(
     claim_id: &str,
     resource_scope: Option<&str>,
 ) -> Result<GateCheckResult, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "gate_id", gate_id);
-    push_kv_str(&mut s, "claim_id", claim_id);
-    if let Some(rs) = resource_scope {
-        push_kv_str(&mut s, "resource_scope", rs);
-    }
-    let bytes = call_sql_with_one_input(gate_check_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::GateCheckInput {
+        gate_id: gate_id.to_string(),
+        claim_id: claim_id.to_string(),
+        resource_scope: resource_scope.map(str::to_string),
+    })?;
+    let bytes = call_sql_with_one_input(gate_check_v1, &payload)?;
+    let out: tentaflow_sdk_spec::GateCheckOutput = decode_cbor(&bytes)?;
+    Ok(GateCheckResult {
+        valid: out.valid,
+        claim_id: out.claim_id,
+        claim_type: out.claim_type,
+        valid_until: out.valid_until,
+        signers: out
+            .signers
+            .into_iter()
+            .map(|s| GateSigner {
+                role: s.role,
+                user: s.user,
+            })
+            .collect(),
+        reason: out.reason,
+    })
 }
 
 // =============================================================================
@@ -2545,9 +2557,17 @@ pub struct FlowInvocation {
     pub result_toml: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct FlowCancelRaw {
-    cancelled: bool,
+fn flow_invocation_from(out: tentaflow_sdk_spec::FlowInvocationOutput) -> FlowInvocation {
+    FlowInvocation {
+        invocation_id: out.invocation_id,
+        status: out.status,
+        started_at: out.started_at,
+        finished_at: out.finished_at,
+        operators_completed: out.operators_completed,
+        operators_total: out.operators_total,
+        error: out.error,
+        result_toml: out.result_toml,
+    }
 }
 
 /// Invoke a manifest-declared flow. `wait_ms == 0` returns immediately with
@@ -2559,38 +2579,45 @@ pub fn flow_invoke(
     input_toml: &str,
     wait_ms: u32,
 ) -> Result<FlowInvocation, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "flow_id", flow_id);
-    s.push_str(&format!("wait_ms = {}\n", wait_ms));
-    // `input` is rendered as an inline TOML expression so callers can pass
-    // a nested table — push it last to avoid leaking the table header into
-    // subsequent scalar keys.
-    s.push_str("input = ");
-    s.push_str(input_toml.trim());
-    s.push('\n');
-    let bytes = call_sql_with_one_input(flow_invoke_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    // `input_toml` is the opaque operator payload — carried verbatim as a string
+    // inside the CBOR input and parsed back into a `toml::Value` host-side.
+    let trimmed = input_toml.trim();
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::FlowInvokeInput {
+        flow_id: flow_id.to_string(),
+        input_toml: if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        },
+        wait_ms,
+    })?;
+    let bytes = call_sql_with_one_input(flow_invoke_v1, &payload)?;
+    let out: tentaflow_sdk_spec::FlowInvocationOutput = decode_cbor(&bytes)?;
+    Ok(flow_invocation_from(out))
 }
 
 /// Read the authoritative DB row for an invocation. The host filters by
 /// the calling addon id, so an invocation owned by a different addon is
 /// reported as `AbiError::NotFound`.
 pub fn flow_status(invocation_id: &str) -> Result<FlowInvocation, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "invocation_id", invocation_id);
-    let bytes = call_sql_with_one_input(flow_status_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::FlowInvocationIdInput {
+        invocation_id: invocation_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(flow_status_v1, &payload)?;
+    let out: tentaflow_sdk_spec::FlowInvocationOutput = decode_cbor(&bytes)?;
+    Ok(flow_invocation_from(out))
 }
 
 /// Request cooperative cancellation of a running invocation. Idempotent:
 /// cancelling a finished invocation returns `cancelled = true` as long as
 /// the invocation belongs to the calling addon.
 pub fn flow_cancel(invocation_id: &str) -> Result<bool, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "invocation_id", invocation_id);
-    let bytes = call_sql_with_one_input(flow_cancel_v1, s.as_bytes())?;
-    let raw: FlowCancelRaw = parse_toml(&bytes)?;
-    Ok(raw.cancelled)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::FlowInvocationIdInput {
+        invocation_id: invocation_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(flow_cancel_v1, &payload)?;
+    let out: tentaflow_sdk_spec::FlowCancelOutput = decode_cbor(&bytes)?;
+    Ok(out.cancelled)
 }
 
 // =============================================================================
@@ -2614,12 +2641,6 @@ pub struct ServiceInfo {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ServiceListResponse {
-    #[serde(default)]
-    services: Vec<ServiceInfo>,
-}
-
 /// Filtered view of every service visible in the mesh (local node + every
 /// reachable peer). Pass `None` for any filter to include everything.
 /// Requires the `service.read` permission.
@@ -2628,19 +2649,27 @@ pub fn service_list(
     status: Option<&str>,
     node_id: Option<&str>,
 ) -> Result<Vec<ServiceInfo>, AbiError> {
-    let mut s = String::new();
-    if let Some(k) = kind {
-        push_kv_str(&mut s, "kind", k);
-    }
-    if let Some(st) = status {
-        push_kv_str(&mut s, "status", st);
-    }
-    if let Some(n) = node_id {
-        push_kv_str(&mut s, "node_id", n);
-    }
-    let bytes = call_sql_with_one_input(service_list_v1, s.as_bytes())?;
-    let resp: ServiceListResponse = parse_toml(&bytes)?;
-    Ok(resp.services)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::ServiceListInput {
+        kind: kind.map(str::to_string),
+        status: status.map(str::to_string),
+        node_id: node_id.map(str::to_string),
+    })?;
+    let bytes = call_sql_with_one_input(service_list_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::ServiceListOutput = decode_cbor(&bytes)?;
+    Ok(resp
+        .services
+        .into_iter()
+        .map(|s| ServiceInfo {
+            service_id: s.service_id,
+            service_local_id: s.service_local_id,
+            display_name: s.display_name,
+            kind: s.kind,
+            status: s.status,
+            node_id: s.node_id,
+            endpoint: s.endpoint,
+            capabilities: s.capabilities,
+        })
+        .collect())
 }
 
 /// Live hardware snapshot for one node. Local node only today — passing an
@@ -2667,10 +2696,25 @@ pub struct NodeGpu {
 }
 
 pub fn node_resources_get(node_id: &str) -> Result<NodeResources, AbiError> {
-    let mut s = String::new();
-    push_kv_str(&mut s, "node_id", node_id);
-    let bytes = call_sql_with_one_input(node_resources_get_v1, s.as_bytes())?;
-    parse_toml(&bytes)
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::NodeResourcesInput {
+        node_id: node_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(node_resources_get_v1, &payload)?;
+    let out: tentaflow_sdk_spec::NodeResourcesOut = decode_cbor(&bytes)?;
+    Ok(NodeResources {
+        node_id: out.node_id,
+        cpu_cores: out.cpu_cores,
+        cpu_load_pct: out.cpu_load_pct,
+        ram_total_mb: out.ram_total_mb,
+        ram_used_mb: out.ram_used_mb,
+        gpu: out.gpu.map(|g| NodeGpu {
+            name: g.name,
+            vram_total_mb: g.vram_total_mb,
+            vram_used_mb: g.vram_used_mb,
+            utilization_pct: g.utilization_pct,
+        }),
+        gpu_count: out.gpu_count,
+    })
 }
 
 // =============================================================================

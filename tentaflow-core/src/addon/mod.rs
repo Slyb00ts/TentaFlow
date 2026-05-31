@@ -1383,8 +1383,13 @@ impl AddonManager {
         // UWAGA: wasmtime epoch jest engine-global — trap dotyczy wszystkich
         // stores z deadline ≤ current. Per-store isolated cancellation
         // wymaga epoch_deadline_callback (follow-up).
+        // Epoch-based time cancellation jest wasmtime-only (Desktop/Router).
+        // Mobile (wasmi) nie ma epoch — limit zasobow idzie przez fuel
+        // (refuel_store powyzej), wiec watchdog jest pomijany.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         addon_instance.store.set_epoch_deadline(1);
 
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         let watchdog = timeout_ms.map(|t| {
             let engine = engine.clone();
             let dur = std::time::Duration::from_millis(t);
@@ -1414,12 +1419,14 @@ impl AddonManager {
 
         // Watchdog cleanup — niezaleznie od wyniku ticka, watek detached
         // i tak sie skonczy po sleep. Drop nie blokuje na join.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         drop(watchdog);
 
         // Reset epoch deadline — store wraca do mapy i moze byc uzyty
         // przez handle_event lub call_tool. Set_epoch_deadline jest DELTA,
         // wiec u64::MAX/4 zachowuje sie jak "nigdy nie wytrap" (current+
         // delta nie osiagniete normalnymi incrementami).
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         addon_instance.store.set_epoch_deadline(u64::MAX / 4);
 
         // Wloz z powrotem nawet przy bledzie — pojedyncza nieudana tura nie
@@ -1959,8 +1966,11 @@ impl AddonManager {
         // trapuje WSZYSTKIE stores z deadline ≤ current. Per-store
         // isolated cancellation wymaga epoch_deadline_callback z
         // per-store atomic flag; odlozone jako follow-up.
+        // Epoch = wasmtime-only; mobile (wasmi) idzie przez fuel.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         store.set_epoch_deadline(1);
 
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         let watchdog = deadline.map(|d| {
             let engine = self.engine.clone();
             std::thread::spawn(move || {
@@ -2101,7 +2111,8 @@ impl AddonManager {
             Ok(mem_data[out_ptr as usize..result_end].to_vec())
         })();
 
-        // Watchdog cleanup — niezaleznie od wyniku.
+        // Watchdog cleanup — niezaleznie od wyniku (wasmtime-only).
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         if let Some(handle) = watchdog {
             // Nie joinujemy — watek i tak sie skonczy po sleep+increment_epoch.
             // Drop join handle = detach.

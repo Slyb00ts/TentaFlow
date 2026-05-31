@@ -297,8 +297,24 @@ function renderSelect(component, ctx) {
     return () => active;
   })();
 
-  // a11y label
-  if (labelBind == null) {
+  // Label: when the Select carries a visible label, render it (tf-select now
+  // shows it above the control, matching tf-input) and use it as the accessible
+  // name. Otherwise fall back to the required a11y.label as aria-label only.
+  if (labelBind != null) {
+    const applyLabel = () => {
+      const v = resolveBindRef(labelBind, ctx.store);
+      const text = typeof v === 'string' ? v : (v == null ? '' : String(v));
+      if (text) {
+        el.setAttribute('label', text);
+        el.setAttribute('aria-label', text);
+      } else {
+        el.removeAttribute('label');
+        el.removeAttribute('aria-label');
+      }
+    };
+    applyLabel();
+    ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
+  } else {
     if (component.a11y == null || component.a11y.label == null) {
       throw new TypeError(
         'Select without `label` field requires Component.a11y.label for accessible name'
@@ -324,32 +340,33 @@ function renderSelect(component, ctx) {
     );
   }
 
-  // tf-select emits change with detail.value (string). Intercept and convert
-  // back to SDK SelectValue format with kind tag.
+  // tf-select emits change with detail.value = the serialized option string
+  // (e.g. "tstr:Unclassified"). We must convert it back to the SDK SelectValue
+  // {value, kind} before it reaches the dispatcher — and block the raw event so
+  // the dispatcher never sees the serialized string (which would be stored
+  // verbatim and fail backend validation). Mirror the tf-input fix: the raw
+  // event is stopImmediatePropagation'd and a single synthetic event tagged
+  // `__tfReemit` carries the converted value through to the dispatcher.
   const onChange = (e) => {
-    e.stopPropagation();
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
     if (isDisabledFn()) return;
     const selectedStr = e.detail?.value ?? el.value;
+    let ce;
     if (!selectedStr) {
       // Clear / placeholder selected
-      if (clearable) {
-        el.dispatchEvent(
-          new CustomEvent('change', {
-            bubbles: false,
-            detail: { value: null, kind: null },
-          })
-        );
-      }
-      return;
-    }
-    const opt = valueMap.get(selectedStr);
-    if (!opt) return;
-    el.dispatchEvent(
-      new CustomEvent('change', {
+      if (!clearable) return;
+      ce = new CustomEvent('change', { bubbles: false, detail: { value: null, kind: null } });
+    } else {
+      const opt = valueMap.get(selectedStr);
+      if (!opt) return;
+      ce = new CustomEvent('change', {
         bubbles: false,
         detail: { value: opt.value.value, kind: opt.value.tag },
-      })
-    );
+      });
+    }
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
   };
   el.addEventListener('change', onChange);
   ctx.registerCleanup(() => el.removeEventListener('change', onChange));

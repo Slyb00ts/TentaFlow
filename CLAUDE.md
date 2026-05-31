@@ -22,6 +22,13 @@ rustup target add wasm32-wasip1                               # WASM addons
 
 Run: `./tentaflow/target/release/tentaflow --config <your.toml>` (config is user-provided).
 
+macOS 26+ (Xcode 26) split the Metal compiler into a separate component. Without it,
+`xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model returns gibberish (wrong
+GPU logits) with no build error. `setup.sh` installs it; `tentaflow/build.rs` fails loudly
+if missing. Fix: `xcodebuild -downloadComponent MetalToolchain` + drop the stale metallib
+(`rm -rf tentaflow-desktop/macos/swift/MLXBridge/build-xcode`). MLXBridge builds via
+`xcodebuild -skipMacroValidation` (SwiftPM CLI can't compile Metal shaders).
+
 `tentaflow-core` features — default = `inference-whisper` + `camera`. Key opt-ins:
 
 | Flag | Purpose |
@@ -71,8 +78,9 @@ tokens in `/recordings/<ref>?token=...` URLs would leak to logs via the request 
 `tentaflow-core/src/flow_engine/`. DAG of typed nodes; `FlowEnvelope` carries a `FlowValue`
 payload (Text/Json/Audio/Image/Video/Embedding/Other) + named artifacts. Entry points:
 `execute_blocking` (full DAG) and `execute_streaming` (LLM streaming). Node adapters under
-`node_adapters/`: trigger, llm, stt, tts, tts_clean, tts_stream_bridge, sentence_buffer,
-combine, condition, pii_filter, memory, embeddings, conversation_history, output, plus
+`node_adapters/`: trigger, llm, stt, tts (blocking + streaming, one node), tts_clean,
+sentence_buffer, combine, condition, pii_filter, memory, embeddings, conversation_history,
+output, plus
 dynamic `addon.*` blocks. User-defined flows are validated (R1–R8) on save in
 `dispatch/handlers.rs`. `FlowDispatcher` resolves a flow per `{model}:{service_type}:{modality}`
 or falls back to a synthetic flow (`synthetic.rs`).
@@ -86,7 +94,11 @@ snapshots, compaction). The old CRDT mechanism is removed. The only active sync 
 (not JSON). Platform tables synced per `sync/core_registry.rs`; runtime tables
 (`flow_executions`, `audit_log`) are not. External secrets sync only via the allowlist
 (`hf_token`, `ngc_api_key`), re-encrypted per node. Permission Engine + Sync Policy gate
-which nodes receive which resources.
+which nodes receive which resources. Startup runs `ensure_default_core_sync_policies` +
+`ensure_trusted_nodes_in_sync_identity`: global core resources get a default
+`replicated_by_permission` policy and active `trusted_nodes` are materialized into
+`sync_nodes`, so Flow Builder, shared settings, identity and RBAC reach the outbox without
+hand-seeding policies.
 
 ## Mesh
 
@@ -122,6 +134,21 @@ daily `cron` (`minute hour * * *`). UI in `www/js/modules/scheduler.js` (admin-o
 registries) saved via the binary protocol with `is_secret`; listing returns `<redacted>` for
 non-empty secrets. The vLLM recommender uses the stored `hf_token` to fetch `config.json`
 from gated repos without persisting the token in the deployment config.
+
+## Compliance Core
+
+`tentaflow-core/src/compliance/` — shared core layer for GDPR/RODO, AI audit, retention,
+ROPA, DSAR, consents, DPIA, breach register. Migration `compliance_core_foundation` creates
+the canonical tables and seeds per-org defaults; UI-visible text uses `*_translations` fields
+validated by `json_valid` (seed must include at least `pl` + `en`). `compliance_ai_events`
+holds one AI call/session and links to the `audit_log` chain via `audit_log_id` (prompts,
+responses, sources, tool calls stay in dedicated compliance AI tables). `AiGateway` is the
+central entry for blocking + streaming chat and addon `llm_generate`: it starts the event,
+records prompt/response/tool calls and the final `audit_log` entry. AI-audit retention is
+resolved via `compliance_retention_policies` and cannot be shorter than 183 days. Admin
+protocol uses `MessageBody::ComplianceAdminBody` + `tentaflow-protocol/src/compliance.rs`
+(CBOR carries category/retention/AI-event summaries, never prompt/response bodies). Admin
+access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write`.
 
 ## Conventions
 
