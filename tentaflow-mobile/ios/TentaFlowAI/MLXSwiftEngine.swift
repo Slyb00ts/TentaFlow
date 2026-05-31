@@ -5,12 +5,15 @@
 // =============================================================================
 
 import Foundation
+import HuggingFace
 import MLX
+import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
+import Tokenizers
 
 /// Silnik MLX na iOS — ladowanie modeli i generowanie tekstu
-class MLXSwiftEngine {
+class MLXSwiftEngine: @unchecked Sendable {
     static let shared = MLXSwiftEngine()
 
     private var modelContainer: ModelContainer?
@@ -56,7 +59,11 @@ class MLXSwiftEngine {
         Task {
             do {
                 let config = ModelConfiguration(directory: url)
+                // 3.x odpial tokenizer/downloader: makra MLXHuggingFace wstrzykuja
+                // HubApi (HuggingFace) i loader tokenizera (Tokenizers).
                 self.modelContainer = try await LLMModelFactory.shared.loadContainer(
+                    from: #hubDownloader(),
+                    using: #huggingFaceTokenizerLoader(),
                     configuration: config
                 ) { progress in
                     if Int(progress.fractionCompleted * 100) % 25 == 0 {
@@ -84,79 +91,105 @@ class MLXSwiftEngine {
         modelPath = nil
     }
 
-    /// Generuje tekst z callbackiem na kazdy token
+    /// Generuje tekst z callbackiem na kazdy token. Zwraca kod: 0=OK,
+    /// -1=blad generyczny, -10=brak pamieci/przekroczony kontekst (guard
+    /// przerwal przed OOM). maxContextTokens=0 / memoryBudgetMB=0 wylaczaja limity.
     func generate(
         prompt: String,
         maxTokens: Int,
         temperature: Float,
         topP: Float,
+        maxContextTokens: Int,
+        memoryBudgetMB: Int,
         tokenCallback: @escaping (String, Bool) -> Void
-    ) -> Bool {
+    ) -> Int32 {
         guard let container = modelContainer else {
             print("[MLXSwift] Brak zaladowanego modelu")
-            return false
+            return -1
         }
 
-        print("[MLXSwift] Generowanie: max_tokens=\(maxTokens), temp=\(temperature)")
+        print("[MLXSwift] Generowanie: max_tokens=\(maxTokens), temp=\(temperature), maxCtx=\(maxContextTokens), budgetMB=\(memoryBudgetMB)")
         print("[MLXSwift] Prompt (\(prompt.count) znakow): \(prompt.prefix(200))")
 
+        // Twardy limit pamieci (relaxed:false -> blad zamiast OOM). Na iOS budzet
+        // jest znacznie mniejszy niz na Macu.
+        let budgetBytes = memoryBudgetMB > 0 ? memoryBudgetMB * 1024 * 1024 : 0
+        if budgetBytes > 0 {
+            MLX.GPU.set(memoryLimit: budgetBytes, relaxed: false)
+        }
+
         let semaphore = DispatchSemaphore(value: 0)
-        var success = false
+        var resultCode: Int32 = -1
 
         let parameters = GenerateParameters(temperature: temperature, topP: topP)
 
         Task {
             do {
-                let result = try await container.perform { context in
-                    // Prompt juz jest sformatowany przez Rust (ChatML z <|im_start|> tokenami)
-                    // Tokenizujemy bezposrednio — bez processor.prepare ktory probuje formatowac
+                let _ = try await container.perform { context in
+                    // Prompt juz jest sformatowany przez Rust (ChatML).
                     let tokenIds = context.tokenizer.encode(text: prompt)
+                    if maxContextTokens > 0 && tokenIds.count > maxContextTokens {
+                        throw MLXContextBudgetExceeded()
+                    }
+                    let promptCount = tokenIds.count
                     let inputTokens = MLXArray(tokenIds)
                     let input = LMInput(tokens: inputTokens)
 
-                    // Stop tokeny — ChatML format
                     let stopStrings = ["<|im_end|>", "<|endoftext|>", "</s>"]
 
+                    // Flaga OOM w scope `perform` (jak `lastOutput`).
                     var lastOutput = ""
-                    return try MLXLMCommon.generate(
+                    var memExceeded = false
+                    let info = try MLXLMCommon.generate(
                         input: input,
                         parameters: parameters,
                         context: context
                     ) { tokens in
-                        // Dekoduj CALY tekst i wyslij roznice (inkrementalnie)
-                        let fullText = context.tokenizer.decode(tokens: tokens)
+                        if budgetBytes > 0 {
+                            let snap = MLX.GPU.snapshot()
+                            if snap.activeMemory + snap.cacheMemory > budgetBytes {
+                                memExceeded = true
+                                return .stop
+                            }
+                        }
+                        let fullText = context.tokenizer.decode(tokenIds: tokens)
                         if fullText.count > lastOutput.count {
                             let newPart = String(fullText.dropFirst(lastOutput.count))
                             tokenCallback(newPart, false)
                         }
                         lastOutput = fullText
 
-                        // Sprawdz stop tokeny
                         for stop in stopStrings {
                             if fullText.contains(stop) {
                                 return .stop
                             }
                         }
-
+                        if maxContextTokens > 0 && promptCount + tokens.count >= maxContextTokens {
+                            return .stop
+                        }
                         return tokens.count >= maxTokens ? .stop : .more
                     }
+                    if memExceeded { throw MLXContextBudgetExceeded() }
+                    return info
                 }
 
-                // Finalny callback
                 tokenCallback("", true)
-                success = true
-                print("[MLXSwift] Generowanie zakonczone: \(result.output.count) znakow")
-                print("[MLXSwift] Output: \(result.output.prefix(300))")
+                resultCode = 0
+                print("[MLXSwift] Generowanie zakonczone (kod \(resultCode))")
             } catch {
                 print("[MLXSwift] Blad generowania: \(error)")
                 tokenCallback("", true)
-                success = false
+                if error is MLXContextBudgetExceeded || budgetBytes > 0 {
+                    resultCode = -10
+                } else {
+                    resultCode = -1
+                }
             }
             semaphore.signal()
         }
 
         semaphore.wait()
-        return success
+        return resultCode
     }
 
     /// Zwraca JSON z info o modelu
@@ -199,12 +232,17 @@ private func swiftUnloadModel(context: UnsafeMutableRawPointer?) {
     engine.unloadModel()
 }
 
+/// Sygnalizuje prompt przekraczajacy limit kontekstu -> kod -10.
+private struct MLXContextBudgetExceeded: Error {}
+
 /// C callback: generuj tekst
 private func swiftGenerate(
     prompt: UnsafePointer<CChar>?,
     maxTokens: Int32,
     temperature: Float,
     topP: Float,
+    maxContextTokens: Int32,
+    memoryBudgetMB: Int32,
     tokenCallback: (@convention(c) (UnsafePointer<CChar>?, Bool, UnsafeMutableRawPointer?) -> Void)?,
     callbackContext: UnsafeMutableRawPointer?,
     context: UnsafeMutableRawPointer?
@@ -215,19 +253,19 @@ private func swiftGenerate(
 
     let engine = Unmanaged<MLXSwiftEngine>.fromOpaque(ctx).takeUnretainedValue()
 
-    let success = engine.generate(
+    return engine.generate(
         prompt: promptStr,
         maxTokens: Int(maxTokens),
         temperature: temperature,
-        topP: topP
+        topP: topP,
+        maxContextTokens: Int(maxContextTokens),
+        memoryBudgetMB: Int(memoryBudgetMB)
     ) { text, isFinal in
         // Wywolaj Rust token callback
         text.withCString { cstr in
             tokenCb(cstr, isFinal, callbackContext)
         }
     }
-
-    return success ? 0 : -1
 }
 
 /// C callback: info o modelu

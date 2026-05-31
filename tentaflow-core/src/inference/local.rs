@@ -183,12 +183,35 @@ impl LocalInferenceHandler {
     /// Pobiera wykryty szablon chatu z aktywnego silnika inferencji.
     /// Jesli model nie jest zaladowany lub brak info — zwraca Plain.
     async fn get_chat_template(&self) -> ChatTemplate {
-        let manager = self.inference_manager.read().await;
-        manager
-            .active_engine()
-            .and_then(|e| e.model_info())
-            .and_then(|info| info.chat_template)
-            .map(|name| match name.as_str() {
+        let info = {
+            let manager = self.inference_manager.read().await;
+            manager.active_engine().and_then(|e| e.model_info())
+        };
+        let Some(info) = info else {
+            warn!("get_chat_template: brak aktywnego silnika/model_info — Plain");
+            return ChatTemplate::Plain;
+        };
+
+        // Source of truth dla MLX (katalog safetensors): szablon czytany z
+        // tokenizer_config.json przy KAZDYM requescie, niezalezny od ewentualnie
+        // pustego pola chat_template w cache silnika. llama.cpp ma plik .gguf
+        // (nie-katalog) i osadzony template — wtedy ufamy polu model_info.
+        let model_dir = std::path::Path::new(&info.path);
+        let is_dir = model_dir.is_dir();
+        if is_dir {
+            let detected = crate::routing::chat_template::detect_chat_template(model_dir);
+            debug!(
+                "get_chat_template: backend={} path={:?} re-detekcja={:?}",
+                info.backend,
+                info.path,
+                detected.name()
+            );
+            return detected;
+        }
+
+        info.chat_template
+            .as_deref()
+            .map(|name| match name {
                 "chatml" => ChatTemplate::ChatML,
                 "llama3" => ChatTemplate::Llama3,
                 "mistral" => ChatTemplate::Mistral,
@@ -275,6 +298,10 @@ impl LocalInferenceHandler {
             repeat_penalty,
             stop_sequences,
             system_prompt: None, // system prompt jest juz wbudowany w sformatowany prompt
+            // Deploy-time caps (request_override=false) — pinned by the wizard,
+            // enforced by the MLX runtime guard. Not overridable per request.
+            max_context_tokens: defaults.max_context_tokens,
+            memory_budget_mb: defaults.memory_budget_mb,
         }
     }
 

@@ -982,6 +982,7 @@ mod capability_axes {
             repo: "x/y".into(),
             quantization: None,
             recommended: false,
+            featured: false,
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
