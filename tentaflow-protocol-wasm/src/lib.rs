@@ -339,7 +339,9 @@ pub fn encode_chat_stream_request_simple(
 /// MessageBody::FlowInvokeRequest — uniwersalny most do flow engine. Wariant
 /// audio-only dla chat audio (jedno wejście Audio). Multi-input dojdzie później.
 #[wasm_bindgen(js_name = encodeFlowInvokeAudio)]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_flow_invoke_audio(
+    flow_id: Option<i64>,
     model: String,
     service_type: String,
     mime: String,
@@ -350,6 +352,7 @@ pub fn encode_flow_invoke_audio(
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::FlowInvokeRequestBody(
         tentaflow_protocol::FlowInvokeRequest {
+            flow_id,
             model,
             service_type,
             inputs: vec![tentaflow_protocol::FlowInputValue::Audio {

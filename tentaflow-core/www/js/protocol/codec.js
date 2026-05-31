@@ -221,13 +221,14 @@ export const encode = {
    */
   flowInvokeRequest(
     correlationId,
-    { model, serviceType, mime, sampleRate, audio, language, sessionId },
+    { flowId, model, serviceType, mime, sampleRate, audio, language, sessionId },
     sequence = 1,
   ) {
     assertReady();
     const body = _wasm.encodeFlowInvokeAudio(
-      model,
-      serviceType,
+      flowId != null ? BigInt(flowId) : undefined,
+      model || '',
+      serviceType || 'chat',
       mime || 'audio/wav',
       sampleRate ?? undefined,
       audio,

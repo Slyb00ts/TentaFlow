@@ -607,9 +607,13 @@ pub enum FlowInputValue {
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowInvokeRequest {
-    /// Nazwa flow/modelu (np. "default-voice").
+    /// Gdy ustawione — odpal KONKRETNY flow po ID (wybrany przez usera). Ma
+    /// priorytet nad model/service_type (np. audio chat uruchamia wybrany flow).
+    pub flow_id: Option<i64>,
+    /// Nazwa modelu — używana do rozwiązania flow przez model/service_type gdy
+    /// `flow_id` nie jest podany.
     pub model: String,
-    /// Service type rozwiązywany przez FlowDispatcher: "voice"/"chat"/"tts"/"stt".
+    /// Service type dla rozwiązania flow gdy brak `flow_id`: "chat"/"tts"/"stt".
     pub service_type: String,
     pub inputs: Vec<FlowInputValue>,
     /// Język (transkrypcja/TTS) → envelope.meta.

@@ -286,6 +286,10 @@ export class FlowCanvas {
       this._pushHistory();
     }
     this.render();
+    // Po załadowaniu flow dopasuj widok do nodów (wyśrodkuj + zoom-to-fit),
+    // żeby nie startować z pustego rogu canvasa i nie szukać nodów panem.
+    // reset=false to undo/redo — wtedy zachowujemy bieżący widok użytkownika.
+    if (reset) this.fitToContent();
   }
 
   getData() {
@@ -771,12 +775,13 @@ export class FlowCanvas {
       const isSelected = this.selectedEdgeId === e.id;
       if (isSelected) p.classList.add('selected');
       this.svg.appendChild(p);
-      // Animowane kropki na krawedziach byly niedeterministyczne — animacja
-      // SVG `animateMotion` zostawiala duchy podczas pan/zoom (svg.innerHTML
-      // = '' nie zawsze konczyl trwajace animacje natychmiast, browser
-      // trzymal ostatnia pozycje ducha jako wolny <circle>). Wizualnie
-      // edge'e maja juz cyan glow + selected red — kropki przeplywu byly
-      // ozdoba bez wartosci diagnostycznej, wycinamy.
+      // Przepływ energii: nakładka path z animowanym stroke-dashoffset (CSS).
+      // Pokazuje kierunek from→to. Czysty CSS — znika z innerHTML='' bez duchów
+      // (w przeciwieństwie do starego SVG animateMotion).
+      const flow = document.createElementNS(svgNs, 'path');
+      flow.setAttribute('class', isSelected ? 'fb-edge-flow selected' : 'fb-edge-flow');
+      flow.setAttribute('d', d);
+      this.svg.appendChild(flow);
       // Przycisk delete (X) na srodku krawedzi gdy selected — kazda
       // krawedz ma takze hover-interaktywny target przez .fb-edge-hit:hover
       // w CSS, ale realny przycisk jest renderowany dopiero po selekcji
@@ -926,6 +931,7 @@ export class FlowCanvas {
         this._connecting = {
           fromNode: node,
           fromPort: portOut.dataset.port || 'full',
+          fromType: portOut.dataset.portType || 'any',
           currentX: pt.x,
           currentY: pt.y,
           pointerId: ev.pointerId,
@@ -1044,11 +1050,21 @@ export class FlowCanvas {
       this._connecting.currentX = pt.x;
       this._connecting.currentY = pt.y;
       this._renderEdges();
-      // Hover target port
+      // Hover target port — zielone gdy typy kompatybilne (lustrzana R8),
+      // czerwone gdy nie, żeby user widział ZANIM puści, że się nie połączy.
       const under = document.elementFromPoint(clientX, clientY);
-      document.querySelectorAll('.fb-port.drop-target').forEach((p) => p.classList.remove('drop-target'));
+      document.querySelectorAll('.fb-port.drop-target, .fb-port.drop-incompatible')
+        .forEach((p) => p.classList.remove('drop-target', 'drop-incompatible'));
       const targetPort = under?.closest('.fb-port-in');
-      if (targetPort) targetPort.classList.add('drop-target');
+      if (targetPort) {
+        const toType = targetPort.dataset.portType || 'any';
+        const toNodeId = targetPort.dataset.nodeId;
+        const sameNode = toNodeId && this._connecting.fromNode
+          && toNodeId === this._connecting.fromNode.id;
+        const compatible = !sameNode
+          && arePortTypesCompatible(this._connecting.fromType || 'any', toType);
+        targetPort.classList.add(compatible ? 'drop-target' : 'drop-incompatible');
+      }
       return;
     }
 
@@ -1138,7 +1154,8 @@ export class FlowCanvas {
           }
         }
       }
-      document.querySelectorAll('.fb-port.drop-target').forEach((p) => p.classList.remove('drop-target'));
+      document.querySelectorAll('.fb-port.drop-target, .fb-port.drop-incompatible')
+        .forEach((p) => p.classList.remove('drop-target', 'drop-incompatible'));
       this._connecting = null;
       this._renderEdges();
     }
