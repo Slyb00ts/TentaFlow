@@ -346,6 +346,51 @@ test('Render cleanups are released if applyBindings throws', () => {
   assertEq(after, before);
 });
 
+test('Render error-path frees already-rendered child subscriptions (no leak)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: [{ kind: 'key', value: 'lbl' }], value: 'A' }],
+    state_revision: 0,
+    truncated: false,
+  });
+  const engine = makeEngine(store);
+  // Parent renderer renders a child via ctx.renderChild (whose subscription
+  // lives on the CHILD element in the WeakMap, not on the parent's local
+  // cleanups), then throws. The catch must recursively destroy the rendered
+  // child so its subscription is released — otherwise the store leaks it.
+  const PARENT_TAG = 0xFEE0;
+  registerComponentRenderer(PARENT_TAG, (component, ctx) => {
+    const el = document.createElement('div');
+    const child = ctx.readField(component.fields, 0);
+    el.appendChild(ctx.renderChild(child));
+    throw new Error('parent render blows up after child rendered');
+  });
+
+  const before = store._subscribers.size;
+  const childComp = comp(SPACER_TAG, [[0, 'md'], [1, 'x']], {
+    a11y: { label: { kind: 'bound', path: [{ kind: 'key', value: 'lbl' }] } },
+  });
+  childComp.id = 'child1';
+  const parentComp = comp(PARENT_TAG, [[0, childComp]]);
+  parentComp.id = 'parent1';
+
+  assertThrows(() => engine.render(parentComp), 'parent render must throw');
+  const after = store._subscribers.size;
+  assertEq(after, before, 'child subscription freed on parent render error');
+
+  // The freed subscription must not react to later patches.
+  store.applyPatch({
+    base_revision: 0,
+    new_revision: 1,
+    ops: [
+      { path: [{ kind: 'key', value: 'lbl' }], op: { kind: 'set', value: 'B' } },
+    ],
+  });
+  // No assertion on DOM (detached) — the subscriber-count check above is the
+  // hard leak guard.
+});
+
 test('Tooltip wraps child and exposes aria-describedby', () => {
   setup();
   const engine = makeEngine();

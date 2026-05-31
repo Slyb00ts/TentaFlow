@@ -3,7 +3,7 @@
 // Implements the 10 host functions that bridge addon-side WASM calls to the
 // `services::camera_ingest::CameraIngestSupervisor`. Each call:
 //   1. enforces input payload size BEFORE materializing a String,
-//   2. parses TOML, validates ownership / vendor / lengths / format,
+//   2. decodes CBOR, validates ownership / vendor / lengths / format,
 //   3. enforces permission,
 //   4. mutates the supervisor registry and/or persists the change in DB,
 //   5. records an audit-log entry on every exit path (ok / denied / error),
@@ -25,13 +25,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use tracing::warn;
 
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
+use tentaflow_sdk_spec::{
+    CameraAddInput, CameraAddOutput, CameraCredentialsRotateInput, CameraCredentialsRotateOut,
+    CameraDiscoverOut, CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut,
+    CameraRemoveOut, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
+    CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+};
+
+use super::abi_helpers::{enforce_payload_size, PayloadKind};
+use super::cbor_io::{decode_cbor_exact, read_input_cbor, write_cbor_capped};
 use super::{
-    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
+    audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller,
 };
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
@@ -40,8 +47,8 @@ use crate::db::repository::{
     set_camera_onvif_resolved, soft_delete_camera, update_camera, CameraPatch, CameraRow,
 };
 use crate::services::camera_ingest::{
-    credentials::credentials_cipher, start_supervisor, CameraConfig, CameraIngestError,
-    CameraIngestSupervisor,
+    credentials::credentials_cipher, list_local_devices, start_supervisor, CameraConfig,
+    CameraIngestError, CameraIngestSupervisor,
 };
 
 // =============================================================================
@@ -257,175 +264,18 @@ fn map_ingest_error(e: &CameraIngestError) -> AbiError {
 }
 
 // =============================================================================
-// Payload structs — input
+// Camera ABI payload structs (input/output) live in `tentaflow-sdk-spec`
+// (`protocol::camera`) as the single CBOR source of truth shared with the
+// addon SDK. Imported at the top of this module.
 // =============================================================================
-
-#[derive(Debug, Deserialize)]
-struct CameraAddInput {
-    display_name: String,
-    vendor: String,
-    url: String,
-    #[serde(default = "default_target_fps")]
-    target_fps: u32,
-    resolution_width: Option<u32>,
-    resolution_height: Option<u32>,
-    #[serde(default = "default_retention_class")]
-    retention_class: String,
-    #[serde(default = "default_profile")]
-    profile: String,
-    /// Optional base64-encoded `user:pass` for the RTSP connector. When
-    /// present, decoded, validated, encrypted with the cameras master key,
-    /// and stored in `cameras.credentials_encrypted`. The plaintext never
-    /// touches the DB and is never logged. For `vendor='onvif'` the same
-    /// field carries the operator credentials used for the SOAP
-    /// UsernameToken digest; it is REQUIRED in that mode.
-    #[serde(default)]
-    credentials_b64: Option<String>,
-    /// `vendor='onvif'` only: optional profile token to pin a specific
-    /// media profile. When absent, the first profile returned by
-    /// `GetProfiles` is used. Validated against the same character set as
-    /// `profile` to keep XML-injection out of the SOAP envelope (the token
-    /// is XML-escaped on the way out as a second line of defense).
-    #[serde(default)]
-    onvif_profile_token: Option<String>,
-}
 
 /// Hard upper bound on the SOAP-resolve timeout (10 s default, 30 s ceiling
 /// — same as `onvif_media::MAX_TIMEOUT_MS`). Cameras that take longer than
 /// this on discovery are not usable in the wizard flow.
 const ONVIF_RESOLVE_TIMEOUT_MS: u32 = 10_000;
 
-fn default_target_fps() -> u32 {
-    30
-}
-fn default_retention_class() -> String {
-    "C".to_string()
-}
-fn default_profile() -> String {
-    "default".to_string()
-}
-
-#[derive(Debug, Deserialize)]
-struct CameraIdInput {
-    camera_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CameraUpdateInput {
-    camera_id: String,
-    display_name: Option<String>,
-    target_fps: Option<u32>,
-    resolution_width: Option<u32>,
-    resolution_height: Option<u32>,
-    retention_class: Option<String>,
-    profile: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CameraTestConnectionInput {
-    vendor: String,
-    url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CameraCredentialsRotateInput {
-    camera_id: String,
-    /// Base64-encoded new `user:pass` string. `None` clears the field,
-    /// turning the camera into an open-stream endpoint (URL must then
-    /// already work without auth).
-    #[serde(default)]
-    new_credentials_b64: Option<String>,
-}
-
 // =============================================================================
-// Payload structs — output
-// =============================================================================
-
-#[derive(Debug, Serialize)]
-struct CameraAddOutput {
-    camera_id: String,
-    status: String,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraInfoOut {
-    camera_id: String,
-    display_name: String,
-    vendor: String,
-    url: String,
-    target_fps: i64,
-    resolution_width: Option<i64>,
-    resolution_height: Option<i64>,
-    status: String,
-    status_message: Option<String>,
-    fps_actual: Option<f64>,
-    last_frame_at: Option<i64>,
-    retention_class: String,
-    profile: String,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraListOut {
-    camera: Vec<CameraInfoOut>,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraSnapshotOut {
-    camera_id: String,
-    width: u32,
-    height: u32,
-    pixel_format: String,
-    timestamp_unix_ms: u64,
-    data_b64: String,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraHealthOut {
-    camera_id: String,
-    status: String,
-    status_message: String,
-    fps_actual: f64,
-    last_frame_at: i64,
-    frames_total: u64,
-    frames_dropped: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraRemoveOut {
-    removed: bool,
-}
-
-/// Single entry in the `camera_discover_v1` response. Discovered devices
-/// are not yet persisted (no `camera_id`), so this is a leaner shape than
-/// `CameraInfoOut`.
-#[derive(Debug, Serialize)]
-struct DiscoveredCameraOut {
-    address: String,
-    xaddrs: Vec<String>,
-    types: Vec<String>,
-    manufacturer: String,
-    model: String,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraDiscoverOut {
-    discovered: Vec<DiscoveredCameraOut>,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraTestConnectionOut {
-    ok: bool,
-    message: String,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraCredentialsRotateOut {
-    rotated: bool,
-    reason: String,
-}
-
-// =============================================================================
-// Helpers — encoding + status mapping + audit + io
+// Helpers — status mapping + audit + io
 // =============================================================================
 
 fn status_to_str(s: crate::services::camera_ingest::CameraStatus) -> &'static str {
@@ -465,57 +315,6 @@ async fn build_camera_info(sup: &CameraIngestSupervisor, row: CameraRow) -> Came
         retention_class: row.retention_class,
         profile: row.profile,
     }
-}
-
-/// Reads a TOML input from guest memory while enforcing the payload size
-/// limit BEFORE materializing a `String` on the host heap. Prevents an
-/// adversarial addon from forcing GB allocations with `input_len = i32::MAX`.
-fn read_input_toml(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &WasmCaller<'_, AddonState>,
-    input_ptr: i32,
-    input_len: i32,
-) -> Result<String, AbiError> {
-    if input_len < 0 {
-        return Err(AbiError::Operation);
-    }
-    if enforce_payload_size(input_len as usize, PayloadKind::ServiceCall).is_err() {
-        return Err(AbiError::PayloadTooLarge);
-    }
-    let bytes =
-        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| AbiError::Operation)
-}
-
-/// Serializes `value` to TOML and writes through the retry helper, but only
-/// after re-checking the absolute PayloadKind::ServiceCall ceiling. Without
-/// the absolute check a buggy or malicious state could blow past the 8 MiB
-/// limit (e.g. very large blob lists from a future schema).
-fn write_toml_capped<T: Serialize>(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &mut WasmCaller<'_, AddonState>,
-    value: &T,
-    out_ptr: i32,
-    out_cap: i32,
-    out_len_ptr: i32,
-) -> i32 {
-    let serialized = match toml::to_string(value) {
-        Ok(s) => s,
-        Err(_) => return AbiError::Operation.as_i32(),
-    };
-    if enforce_payload_size(serialized.len(), PayloadKind::ServiceCall).is_err() {
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-    write_output_with_retry_semantics(
-        memory,
-        caller,
-        serialized.as_bytes(),
-        out_ptr,
-        out_cap,
-        out_len_ptr,
-    )
 }
 
 fn audit(
@@ -851,24 +650,6 @@ pub fn camera_add_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.add",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
         audit(
             caller.data(),
@@ -880,20 +661,30 @@ pub fn camera_add_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let mut input: CameraAddInput = match toml::from_str(&raw) {
+    let mut input: CameraAddInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             audit(
                 caller.data(),
                 "camera.add",
                 None,
                 RiskClass::A,
                 "error",
-                Some("invalid_toml"),
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
+    // Resolve the legacy TOML defaults for the optional-on-wire fields so a
+    // minimal payload behaves exactly like the old TOML path (30 / "C" /
+    // "default").
+    let target_fps = input.target_fps_or_default();
+    let retention_class = input.retention_class_or_default();
+    let profile = input.profile_or_default();
     if let Err(reason) = validate_vendor(&input.vendor) {
         let err = if reason == "unsupported_vendor" {
             AbiError::CameraVendorUnsupported
@@ -921,7 +712,7 @@ pub fn camera_add_v1(
         );
         return AbiError::Operation.as_i32();
     }
-    if !(1..=60).contains(&input.target_fps) {
+    if !(1..=60).contains(&target_fps) {
         audit(
             caller.data(),
             "camera.add",
@@ -932,7 +723,7 @@ pub fn camera_add_v1(
         );
         return AbiError::Operation.as_i32();
     }
-    if let Err(reason) = validate_retention(&input.retention_class) {
+    if let Err(reason) = validate_retention(&retention_class) {
         audit(
             caller.data(),
             "camera.add",
@@ -954,7 +745,7 @@ pub fn camera_add_v1(
         );
         return AbiError::Operation.as_i32();
     }
-    if let Err(reason) = validate_profile(&input.profile) {
+    if let Err(reason) = validate_profile(&profile) {
         audit(
             caller.data(),
             "camera.add",
@@ -1059,7 +850,7 @@ pub fn camera_add_v1(
         camera_id: camera_id.clone(),
         vendor: session_vendor.to_string(),
         url: input.url.clone(),
-        target_fps: input.target_fps,
+        target_fps,
         resolution: match (input.resolution_width, input.resolution_height) {
             (Some(w), Some(h)) => Some((w, h)),
             _ => None,
@@ -1101,11 +892,11 @@ pub fn camera_add_v1(
         &input.display_name,
         &input.vendor,
         &input.url,
-        input.target_fps as i64,
+        target_fps as i64,
         res_w,
         res_h,
-        &input.retention_class,
-        &input.profile,
+        &retention_class,
+        &profile,
         credentials_blob.as_deref(),
         onvif_url_to_persist.as_deref(),
         onvif_token_to_persist.as_deref(),
@@ -1137,7 +928,7 @@ pub fn camera_add_v1(
         camera_id: camera_id.clone(),
         status: "starting".to_string(),
     };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -1208,7 +999,57 @@ pub fn camera_list_v1(
         }
     };
     audit(caller.data(), "camera.list", None, RiskClass::B, "ok", None);
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+}
+
+// =============================================================================
+// Host function: camera_local_devices_v1
+// =============================================================================
+//
+// Enumerates locally attached camera devices (USB / v4l2) so a wizard can offer
+// a device dropdown instead of a free-text path. Read-only discovery, so it
+// reuses `cameras.read` rather than introducing a new permission. Enumeration
+// is Linux/v4l2 today; other platforms return an empty list (not an error).
+
+pub fn camera_local_devices_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
+        audit(
+            caller.data(),
+            "camera.local_devices",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let devices = list_local_devices()
+        .into_iter()
+        .map(|d| LocalCameraDeviceOut {
+            device_path: d.device_path,
+            label: d.label,
+            vendor: d.vendor,
+        })
+        .collect();
+    let out = LocalCameraDevicesOut { devices };
+    audit(
+        caller.data(),
+        "camera.local_devices",
+        None,
+        RiskClass::B,
+        "ok",
+        None,
+    );
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -1227,24 +1068,6 @@ pub fn camera_get_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.get",
-                None,
-                RiskClass::B,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
         audit(
             caller.data(),
@@ -1256,18 +1079,22 @@ pub fn camera_get_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraIdInput = match toml::from_str(&raw) {
+    let input: CameraIdInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             audit(
                 caller.data(),
                 "camera.get",
                 None,
                 RiskClass::B,
                 "error",
-                Some("invalid_toml"),
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
@@ -1345,7 +1172,7 @@ pub fn camera_get_v1(
         "ok",
         None,
     );
-    write_toml_capped(&memory, &mut caller, &info, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &info, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -1364,24 +1191,6 @@ pub fn camera_update_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.update",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
         audit(
             caller.data(),
@@ -1393,18 +1202,22 @@ pub fn camera_update_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraUpdateInput = match toml::from_str(&raw) {
+    let input: CameraUpdateInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             audit(
                 caller.data(),
                 "camera.update",
                 None,
                 RiskClass::A,
                 "error",
-                Some("invalid_toml"),
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
@@ -1615,7 +1428,7 @@ pub fn camera_update_v1(
         "ok",
         Some(&reason),
     );
-    write_toml_capped(&memory, &mut caller, &info, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &info, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -1634,24 +1447,6 @@ pub fn camera_remove_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.remove",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
         audit(
             caller.data(),
@@ -1663,18 +1458,22 @@ pub fn camera_remove_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraIdInput = match toml::from_str(&raw) {
+    let input: CameraIdInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             audit(
                 caller.data(),
                 "camera.remove",
                 None,
                 RiskClass::A,
                 "error",
-                Some("invalid_toml"),
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
@@ -1779,7 +1578,7 @@ pub fn camera_remove_v1(
         None,
     );
     let out = CameraRemoveOut { removed: true };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -1798,24 +1597,6 @@ pub fn camera_snapshot_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.snapshot",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERAS_SNAPSHOT, None) {
         audit(
             caller.data(),
@@ -1827,18 +1608,22 @@ pub fn camera_snapshot_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraIdInput = match toml::from_str(&raw) {
+    let input: CameraIdInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             audit(
                 caller.data(),
                 "camera.snapshot",
                 None,
                 RiskClass::A,
                 "error",
-                Some("invalid_toml"),
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
@@ -1928,7 +1713,7 @@ pub fn camera_snapshot_v1(
             out.width, out.height, bytes_size
         )),
     );
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -1947,24 +1732,6 @@ pub fn camera_health_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.health",
-                None,
-                RiskClass::B,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
         audit(
             caller.data(),
@@ -1976,18 +1743,22 @@ pub fn camera_health_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraIdInput = match toml::from_str(&raw) {
+    let input: CameraIdInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             audit(
                 caller.data(),
                 "camera.health",
                 None,
                 RiskClass::B,
                 "error",
-                Some("invalid_toml"),
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
@@ -2077,7 +1848,7 @@ pub fn camera_health_v1(
         "ok",
         None,
     );
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -2144,7 +1915,7 @@ pub fn camera_discover_v1(
         Some(&format!("count={}", discovered.len())),
     );
     let out = CameraDiscoverOut { discovered };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -2163,24 +1934,6 @@ pub fn camera_test_connection_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.test_connection",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
         audit(
             caller.data(),
@@ -2192,20 +1945,25 @@ pub fn camera_test_connection_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraTestConnectionInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "camera.test_connection",
-                None,
-                RiskClass::A,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
+    let input: CameraTestConnectionInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "camera.test_connection",
+                    None,
+                    RiskClass::A,
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
     if input.vendor.is_empty() || input.vendor.len() > MAX_VENDOR {
         audit(
             caller.data(),
@@ -2241,7 +1999,7 @@ pub fn camera_test_connection_v1(
             ok: false,
             message: format!("vendor '{}' not supported", input.vendor),
         };
-        return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+        return write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall);
     }
     let out = match input.vendor.as_str() {
         "fake_file" => match crate::services::camera_ingest::fakefile::resolve_file_url(&input.url)
@@ -2312,7 +2070,7 @@ pub fn camera_test_connection_v1(
         "ok",
         Some(&format!("ok={}", out.ok)),
     );
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -2331,24 +2089,6 @@ pub fn camera_credentials_rotate_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.credentials_rotate",
-                None,
-                RiskClass::A,
-                "error",
-                Some(if e == AbiError::PayloadTooLarge {
-                    "payload_too_large"
-                } else {
-                    "input_read_failed"
-                }),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
         audit(
             caller.data(),
@@ -2360,20 +2100,25 @@ pub fn camera_credentials_rotate_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraCredentialsRotateInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "camera.credentials_rotate",
-                None,
-                RiskClass::A,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
+    let input: CameraCredentialsRotateInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "camera.credentials_rotate",
+                    None,
+                    RiskClass::A,
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
     if !camera_id_valid(&input.camera_id) {
         audit(
             caller.data(),
@@ -2447,7 +2192,7 @@ pub fn camera_credentials_rotate_v1(
             rotated: false,
             reason: format!("vendor '{}' has no credentials field", row.vendor),
         };
-        return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+        return write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall);
     }
     let blob_ref = new_blob.as_deref();
     let blob_len = blob_ref.map(|b| b.len()).unwrap_or(0);
@@ -2607,7 +2352,7 @@ pub fn camera_credentials_rotate_v1(
             "credentials cleared".to_string()
         },
     };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
 }
 
 // =============================================================================
@@ -2615,10 +2360,10 @@ pub fn camera_credentials_rotate_v1(
 // integration tests that do not spin up a wasmtime Store.
 // =============================================================================
 
-/// Pure-Rust core of `camera_add_v1` that operates on raw input bytes and
+/// Pure-Rust core of `camera_add_v1` that operates on raw CBOR input bytes and
 /// an explicit `AddonState`, with no wasmtime caller. Production code goes
 /// through `camera_add_v1`; tests use this entry point to inject malformed
-/// TOML and oversized payloads without standing up an InstancePool.
+/// CBOR and oversized payloads without standing up an InstancePool.
 pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     if enforce_payload_size(raw_input.len(), PayloadKind::ServiceCall).is_err() {
         audit(
@@ -2631,20 +2376,6 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         );
         return AbiError::PayloadTooLarge.as_i32();
     }
-    let raw = match std::str::from_utf8(raw_input) {
-        Ok(s) => s,
-        Err(_) => {
-            audit(
-                state,
-                "camera.add",
-                None,
-                RiskClass::A,
-                "error",
-                Some("input_read_failed"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
     if !check_permission(state, PERM_CAMERAS_WRITE, None) {
         audit(
             state,
@@ -2656,7 +2387,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         );
         return AbiError::Permission.as_i32();
     }
-    let mut input: CameraAddInput = match toml::from_str(raw) {
+    let mut input: CameraAddInput = match decode_cbor_exact(raw_input) {
         Ok(v) => v,
         Err(_) => {
             audit(
@@ -2665,11 +2396,17 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
                 None,
                 RiskClass::A,
                 "error",
-                Some("invalid_toml"),
+                Some("invalid_payload"),
             );
             return AbiError::Operation.as_i32();
         }
     };
+    // Resolve the legacy TOML defaults for the optional-on-wire fields so a
+    // minimal payload behaves exactly like the old TOML path (30 / "C" /
+    // "default").
+    let target_fps = input.target_fps_or_default();
+    let retention_class = input.retention_class_or_default();
+    let profile = input.profile_or_default();
     if let Err(reason) = validate_vendor(&input.vendor) {
         let err = if reason == "unsupported_vendor" {
             AbiError::CameraVendorUnsupported
@@ -2697,7 +2434,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         );
         return AbiError::Operation.as_i32();
     }
-    if !(1..=60).contains(&input.target_fps) {
+    if !(1..=60).contains(&target_fps) {
         audit(
             state,
             "camera.add",
@@ -2708,7 +2445,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         );
         return AbiError::Operation.as_i32();
     }
-    if let Err(reason) = validate_retention(&input.retention_class) {
+    if let Err(reason) = validate_retention(&retention_class) {
         audit(
             state,
             "camera.add",
@@ -2730,7 +2467,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         );
         return AbiError::Operation.as_i32();
     }
-    if let Err(reason) = validate_profile(&input.profile) {
+    if let Err(reason) = validate_profile(&profile) {
         audit(
             state,
             "camera.add",
@@ -2825,7 +2562,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         camera_id: camera_id.clone(),
         vendor: session_vendor.to_string(),
         url: input.url.clone(),
-        target_fps: input.target_fps,
+        target_fps,
         resolution: match (input.resolution_width, input.resolution_height) {
             (Some(w), Some(h)) => Some((w, h)),
             _ => None,
@@ -2871,11 +2608,11 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         &input.display_name,
         &input.vendor,
         &input.url,
-        input.target_fps as i64,
+        target_fps as i64,
         res_w,
         res_h,
-        &input.retention_class,
-        &input.profile,
+        &retention_class,
+        &profile,
         credentials_blob.as_deref(),
         onvif_url_to_persist.as_deref(),
         onvif_token_to_persist.as_deref(),
@@ -2915,7 +2652,7 @@ pub mod test_api {
     }
 
     /// Direct entry point that skips the wasmtime caller so tests can
-    /// inject malformed TOML, oversized payloads, and exercise the quota
+    /// inject malformed CBOR, oversized payloads, and exercise the quota
     /// path with full audit-log coverage. Returns the ABI return code that
     /// `camera_add_v1` would have produced.
     #[doc(hidden)]

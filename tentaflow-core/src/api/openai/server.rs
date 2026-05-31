@@ -290,7 +290,7 @@ async fn handle_chat_completions(
     if is_streaming {
         // === STREAMING MODE: SSE ===
         match router
-            .route_chat_completion_stream(request, user_ctx.clone())
+            .route_chat_completion_stream(request, user_ctx.clone(), None)
             .await
         {
             Ok(route_result) => {
@@ -362,7 +362,7 @@ async fn handle_chat_completions(
         }
     } else {
         // === NON-STREAMING MODE: JSON ===
-        match router.route_chat_completion(request, user_ctx).await {
+        match router.route_chat_completion(request, user_ctx, None).await {
             Ok(route_result) => {
                 let body = serde_json::to_vec(&route_result.response).unwrap();
                 let mut resp = json_response(StatusCode::OK, body);
@@ -1265,7 +1265,7 @@ async fn handle_models_list(
     };
 
     let body = serde_json::to_vec(&response).unwrap();
-    Ok(json_response(StatusCode::OK, body))
+Ok(json_response(StatusCode::OK, body))
 }
 
 

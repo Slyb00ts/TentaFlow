@@ -236,9 +236,9 @@ test('StepProgress renders steps with current marker', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(STEP_PROGRESS_TAG, [
     [0, [
-      { id: 's1', label: LIT('Step 1'), optional: false },
-      { id: 's2', label: LIT('Step 2'), optional: false },
-      { id: 's3', label: LIT('Step 3'), optional: true },
+      [[0, 's1'], [1, LIT('Step 1')], [2, false]],
+      [[0, 's2'], [1, LIT('Step 2')], [2, false]],
+      [[0, 's3'], [1, LIT('Step 3')], [2, true]],
     ]],
     [1, PATH('current')],
     [2, 'horizontal'],
@@ -255,6 +255,37 @@ test('StepProgress renders steps with current marker', () => {
   assert(steps[2].classList.contains('tf-step-progress__step--optional'), 'optional step');
 });
 
+test('StepProgress reads StepDef as FieldMap with status BindRef', () => {
+  setup();
+  const store = makeStore();
+  storeSetMulti(store,
+    PATH('current'), 'step0',
+    PATH('st1'), 'complete',
+  );
+  const engine = makeEngine(store);
+  const el = engine.render(comp(STEP_PROGRESS_TAG, [
+    [0, [
+      [[0, 'step0'], [1, LIT('First')], [2, false], [3, BOUND('current')]],
+      [[0, 'step1'], [1, LIT('Second')], [2, false], [3, BOUND('st1')]],
+    ]],
+    [1, PATH('current')],
+    [2, 'horizontal'],
+    [3, false],
+  ]));
+  document.body.appendChild(el);
+  const steps = el.querySelectorAll('.tf-step-progress__step');
+  assertEq(steps.length, 2, '2 steps from FieldMap');
+  assertEq(steps[0].getAttribute('data-step-id'), 'step0');
+  assertEq(steps[1].getAttribute('data-step-id'), 'step1');
+  // step0 id matches current id -> status current.
+  assertEq(steps[0].getAttribute('data-status'), 'current');
+  // step1 status BindRef resolves to 'complete'.
+  assertEq(steps[1].getAttribute('data-status'), 'complete');
+  const labels = el.querySelectorAll('.tf-step-progress__label');
+  assertEq(labels[0].textContent, 'First');
+  assertEq(labels[1].textContent, 'Second');
+});
+
 test('StepProgress clickable_completed allows clicking completed steps', () => {
   setup();
   const store = makeStore();
@@ -262,8 +293,8 @@ test('StepProgress clickable_completed allows clicking completed steps', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(STEP_PROGRESS_TAG, [
     [0, [
-      { id: 's1', label: LIT('Done'), optional: false, status: LIT('complete') },
-      { id: 's2', label: LIT('Now'), optional: false },
+      [[0, 's1'], [1, LIT('Done')], [2, false], [3, LIT('complete')]],
+      [[0, 's2'], [1, LIT('Now')], [2, false]],
     ]],
     [1, PATH('cur')],
     [2, 'vertical'],

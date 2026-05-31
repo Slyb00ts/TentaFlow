@@ -5,7 +5,7 @@
 // expensive ML pipeline (face re-id, attribute search) without first
 // kicking off a vector_search that would itself reject on the same claim.
 //
-// Wire format (TOML in/out):
+// Wire format (CBOR in/out, structs in `tentaflow-sdk-spec`):
 //   Input:  gate_id = "<id from manifest [[gate]]>", claim_id = "<claim>"
 //   Output: { valid = bool, claim_type = "...", valid_until = "...",
 //             signers = [{role, user}, ...], reason = "..." (when invalid) }
@@ -13,39 +13,17 @@
 // Requires `policy.read` permission.
 // Risk class B — read-only inspection of a regulated policy artifact.
 
-use serde::{Deserialize, Serialize};
+use tentaflow_sdk_spec::{GateCheckInput, GateCheckOutput, GateSignerOut};
 
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
-use super::{
-    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
-};
+use super::abi_helpers::PayloadKind;
+use super::cbor_io::{read_input_cbor, write_cbor_capped};
+use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller};
 use crate::addon::errors::AbiError;
 use crate::addon::manifest::{ClaimRequirement, GateSpec};
 use crate::audit::RiskClass;
-use crate::services::policy::{verify_claim, ClaimContext, PolicyError, SignerEntry};
+use crate::services::policy::{verify_claim, ClaimContext, PolicyError};
 
 const PERM_POLICY_READ: &str = "policy.read";
-
-#[derive(Debug, Deserialize)]
-struct GateCheckInput {
-    gate_id: String,
-    claim_id: String,
-    /// Optional resource scope hint — when the gated namespace narrowing is
-    /// pinned to a specific resource (e.g. `faces` vector namespace).
-    #[serde(default)]
-    resource_scope: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct GateCheckOutput {
-    valid: bool,
-    claim_id: String,
-    claim_type: String,
-    valid_until: String,
-    signers: Vec<SignerEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-}
 
 fn audit(
     state: &AddonState,
@@ -140,7 +118,7 @@ pub fn lookup_gate<'a>(state: &'a AddonState, gate_id: &str) -> Option<&'a GateS
 
 /// Maps a `PolicyError` to a short, audit-friendly reason code and an
 /// addon-facing message. Reason code drives audit `details`; message goes
-/// into the TOML output so the addon can surface it to the user.
+/// into the CBOR output so the addon can surface it to the user.
 pub fn policy_error_to_reason(err: &PolicyError) -> (&'static str, String) {
     match err {
         PolicyError::ClaimNotFound(_) => ("claim_not_found", err.to_string()),
@@ -153,55 +131,9 @@ pub fn policy_error_to_reason(err: &PolicyError) -> (&'static str, String) {
     }
 }
 
-fn read_toml(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &WasmCaller<'_, AddonState>,
-    input_ptr: i32,
-    input_len: i32,
-) -> Result<String, AbiError> {
-    if input_len < 0 {
-        return Err(AbiError::Operation);
-    }
-    // Gate payloads are tiny — reuse the small KV bucket to stay well
-    // under the generic 64 KiB ceiling.
-    if enforce_payload_size(input_len as usize, PayloadKind::Secret).is_err() {
-        return Err(AbiError::PayloadTooLarge);
-    }
-    let bytes =
-        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| AbiError::Operation)
-}
-
-fn write_toml<T: Serialize>(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &mut WasmCaller<'_, AddonState>,
-    value: &T,
-    out_ptr: i32,
-    out_cap: i32,
-    out_len_ptr: i32,
-) -> i32 {
-    let serialized = match toml::to_string(value) {
-        Ok(s) => s,
-        Err(_) => return AbiError::Operation.as_i32(),
-    };
-    if enforce_payload_size(serialized.len(), PayloadKind::Secret).is_err() {
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-    write_output_with_retry_semantics(
-        memory,
-        caller,
-        serialized.as_bytes(),
-        out_ptr,
-        out_cap,
-        out_len_ptr,
-    )
-}
-
 /// ABI: (input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
 ///
-/// Returns AbiError::Ok on success. The TOML body always carries `valid`
+/// Returns AbiError::Ok on success. The CBOR body always carries `valid`
 /// (true / false) — a false outcome is NOT mapped to AbiError::GateNotSatisfied
 /// because the addon explicitly asked for an inspection. Hard ABI errors
 /// (permission missing, gate id not in manifest, payload malformed) still
@@ -220,38 +152,35 @@ pub fn gate_check_v1(
         None => return AbiError::Operation.as_i32(),
     };
 
-    let toml_str = match read_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(caller.data(), None, None, "denied", Some("payload_invalid"));
-            return e.as_i32();
-        }
-    };
-
-    let input: GateCheckInput = match toml::from_str(&toml_str) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                None,
-                None,
-                "denied",
-                Some("toml_parse_error"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
-
     if !check_permission(caller.data(), PERM_POLICY_READ, None) {
         audit(
             caller.data(),
-            Some(&input.gate_id),
-            Some(&input.claim_id),
+            None,
+            None,
             "denied",
             Some("missing_permission"),
         );
         return AbiError::Permission.as_i32();
     }
+
+    let input: GateCheckInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::Secret) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    None,
+                    None,
+                    "denied",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
 
     let gate_id = input.gate_id.clone();
     let claim_id = input.claim_id.clone();
@@ -296,10 +225,25 @@ pub fn gate_check_v1(
                 claim_id: verified.claim_id,
                 claim_type: verified.claim_type,
                 valid_until: verified.valid_until,
-                signers: verified.signers,
+                signers: verified
+                    .signers
+                    .into_iter()
+                    .map(|s| GateSignerOut {
+                        role: s.role,
+                        user: s.user,
+                    })
+                    .collect(),
                 reason: None,
             };
-            write_toml(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(
+                &memory,
+                &mut caller,
+                &out,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
+                PayloadKind::Secret,
+            )
         }
         Err(e) => {
             let (reason_code, message) = policy_error_to_reason(&e);
@@ -318,7 +262,15 @@ pub fn gate_check_v1(
                 signers: Vec::new(),
                 reason: Some(message),
             };
-            write_toml(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+            write_cbor_capped(
+                &memory,
+                &mut caller,
+                &out,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
+                PayloadKind::Secret,
+            )
         }
     }
 }
