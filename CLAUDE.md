@@ -252,6 +252,11 @@ CBOR z `addon_id=core`, partycjami `core/org/...` i domenowymi
 pending/error do ledgera. `sync::core_materializer` aplikuje incoming `core.*`
 przez allowlist tabel i pol oraz parametryzowane zapytania; `apply_unapplied_inbox`
 rozdziela operacje core od addonowych, bez wykonywania dowolnego SQL z payloadu.
+Startup binarki wywołuje `ensure_default_core_sync_policies` i
+`ensure_trusted_nodes_in_sync_identity`: globalne zasoby core dostają domyślną
+politykę `replicated_by_permission`, a aktywne `trusted_nodes` są materializowane
+do `sync_nodes`, żeby Flow Builder, ustawienia współdzielone, identity i RBAC
+trafiały do outboxa bez ręcznego zasiewania polityk testowych.
 Duplicate `INSERT` po primary key jest scalany field-level przez
 `ON CONFLICT ... DO UPDATE` na allowlistowanych polach, a test
 `core_push_materializes_flow_on_receiver` sprawdza przeplyw source runtime ->
@@ -677,6 +682,7 @@ Key routing rules:
 - `tentaflow-core/src/compliance/` to wspólna warstwa core dla RODO/GDPR, AI audit, retencji, ROPA, DSAR, zgód, DPIA i rejestru naruszeń.
 - Migracja `compliance_core_foundation` tworzy kanoniczne tabele compliance i provisionuje domyślne rekordy dla każdej organizacji. Teksty widoczne w UI używają pól `*_translations` walidowanych przez `json_valid`; seed musi zawierać co najmniej `pl` i `en`.
 - `compliance_ai_events` przechowuje jedno wywołanie/sesję AI i łączy się z istniejącym chainem `audit_log` przez `audit_log_id`; prompty, odpowiedzi, źródła i tool calls zostają w dedykowanych tabelach compliance AI.
+- `AiGateway` jest centralnym wejściem dla blokującego i streamingowego chatu oraz addonowego `llm_generate`: startuje event, zapisuje prompt, odpowiedź, tool calls oraz końcowy wpis w `audit_log`.
 - Retencja AI audit jest rozwiązywana przez `compliance_retention_policies` i nie może być krótsza niż 183 dni.
 - Protokół administracyjny używa `MessageBody::ComplianceAdminBody` i `tentaflow-protocol/src/compliance.rs`; przez CBOR przechodzą skróty kategorii, retencji i eventów AI, bez treści promptów/odpowiedzi.
 - Dostęp administracyjny wymaga `compliance.read`; role `org_admin` i `dpo` dostają także `compliance.write` na potrzeby dalszych operacji zarządzania.

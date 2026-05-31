@@ -3,6 +3,7 @@
 // Opis: Compliance Core scala RODO, AI audit, retencje i rejestry zgodności.
 // =============================================================================
 
+pub mod ai_gateway;
 pub mod models;
 pub mod repository;
 

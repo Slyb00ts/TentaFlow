@@ -7,11 +7,13 @@
 
 class TfSelect extends HTMLElement {
   static get observedAttributes() {
-    return ['value', 'disabled', 'name'];
+    return ['value', 'disabled', 'name', 'label'];
   }
 
   constructor() {
     super();
+    this._group = null;
+    this._labelEl = null;
     this._wrap = null;
     this._select = null;
     this._onChange = this._onChange.bind(this);
@@ -39,6 +41,15 @@ class TfSelect extends HTMLElement {
     const options = Array.from(this.querySelectorAll('option'));
     this.innerHTML = '';
 
+    // Reuse the tf-input group/label structure so an optional label looks and
+    // aligns identically to tf-input (same `.tf-input-group` + `.tf-label` CSS).
+    const group = document.createElement('div');
+    group.className = 'tf-input-group';
+
+    const label = document.createElement('span');
+    label.className = 'tf-label';
+    group.appendChild(label);
+
     const wrap = document.createElement('div');
     wrap.className = 'tf-select-wrap';
 
@@ -48,8 +59,11 @@ class TfSelect extends HTMLElement {
     select.addEventListener('change', this._onChange);
 
     wrap.appendChild(select);
-    this.appendChild(wrap);
+    group.appendChild(wrap);
+    this.appendChild(group);
 
+    this._group = group;
+    this._labelEl = label;
     this._wrap = wrap;
     this._select = select;
   }
@@ -61,6 +75,9 @@ class TfSelect extends HTMLElement {
     this._select.disabled = this.hasAttribute('disabled');
     const name = this.getAttribute('name');
     if (name) this._select.name = name;
+    const labelText = this.getAttribute('label') || '';
+    this._labelEl.textContent = labelText;
+    this._labelEl.style.display = labelText ? '' : 'none';
   }
 
   _onChange(e) {

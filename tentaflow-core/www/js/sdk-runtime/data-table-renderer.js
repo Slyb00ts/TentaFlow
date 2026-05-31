@@ -513,7 +513,10 @@ function renderTable(component, ctx) {
     const trigger = document.createElement('tf-button');
     trigger.setAttribute('variant', 'ghost');
     trigger.setAttribute('size', 'sm');
-    trigger.setAttribute('icon', 'more-horizontal');
+    // The sprite has no "more-horizontal" symbol, so an icon trigger rendered as
+    // an empty (invisible) button — the row actions menu looked absent. Use a
+    // literal ellipsis glyph so the trigger is always visible without a sprite.
+    trigger.textContent = '⋯';
     trigger.setAttribute('aria-label', 'Akcje wiersza');
 
     const onTriggerClick = (e) => {
@@ -528,6 +531,9 @@ function renderTable(component, ctx) {
       if (desc.iconName) item.setAttribute('icon', desc.iconName);
       if (desc.danger) item.setAttribute('danger', '');
       const label = resolveBindRef(desc.labelBind, ctx.store);
+      // Set the label as an attribute (timing-safe in tf-menu-item) and as
+      // textContent (fallback). Without the attribute the menu opened blank.
+      item.setAttribute('label', label == null ? '' : String(label));
       item.textContent = label == null ? '' : String(label);
 
       const onSelect = () => {

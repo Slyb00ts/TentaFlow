@@ -182,6 +182,16 @@ async fn run_server(args: Args) -> Result<()> {
         error!("Blad inicjalizacji bazy danych: {}", e);
         e
     })?;
+    match tentaflow_core::db::repository::ensure_default_core_sync_policies(&db) {
+        Ok(n) if n > 0 => info!("Sync Ledger zasiał {} domyślnych polityk core", n),
+        Err(e) => error!("Sync Ledger nie zasiał domyślnych polityk core: {}", e),
+        _ => {}
+    }
+    match tentaflow_core::db::repository::ensure_trusted_nodes_in_sync_identity(&db) {
+        Ok(n) if n > 0 => info!("Sync Ledger zarejestrował {} zaufanych nodów mesh", n),
+        Err(e) => error!("Sync Ledger nie zarejestrował zaufanych nodów mesh: {}", e),
+        _ => {}
+    }
 
     // Czyszczenie osieroconego settings.node_id (legacy UUID) — zastapiony
     // iroh EndpointId z MeshSecurity.public_key_hex().
