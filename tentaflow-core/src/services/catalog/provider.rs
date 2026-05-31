@@ -411,6 +411,7 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "combine",
     "pii_filter",
     "tts_clean",
+    "sentence_buffer",
     "session_context",
     "speaker_context",
 ];

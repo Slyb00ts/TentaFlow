@@ -100,6 +100,92 @@ impl EmbeddedDeploy {
         Ok(())
     }
 
+    async fn prepare_embedded_stt(&self) -> DeployResult<()> {
+        if self.manifest.engine.category != Category::Stt {
+            return Ok(());
+        }
+
+        // Embedded STT = whisper.cpp (jedyny embedded silnik STT w
+        // engine_registry; faster-whisper jest dockerowy). Model trafia do
+        // `shared_stt_manager()`, ten sam singleton z ktorego czyta
+        // `SttRuntime::transcribe`. Bez tego kroku usluga jest oznaczona
+        // `running`, ale `active_engine()` zostaje None i kazda transkrypcja
+        // konczy sie "no STT engine loaded".
+        if let Some(s) = &self.log_sink {
+            s.phase("load-model", "[stt] loading embedded whisper model");
+        }
+        let shared = crate::stt::shared_stt_manager();
+        let info = {
+            let mut mgr = shared.write().await;
+            mgr.ensure_and_load(None).await
+        }
+        .map_err(|e| DeployError::Other(format!("load embedded whisper model: {e}")))?;
+        if let Some(s) = &self.log_sink {
+            s.info(&format!("[stt] whisper model loaded from {}", info.path));
+        }
+        Ok(())
+    }
+
+    async fn prepare_embedded_tts(&self) -> DeployResult<()> {
+        if self.manifest.engine.category != Category::Tts {
+            return Ok(());
+        }
+
+        // Embedded TTS (sherpa-onnx VITS / kokoro / apple-tts). Silnik trafia
+        // do `shared_tts_manager()` pod kluczem `engine.id` — tym samym, ktory
+        // `execute_tts` przekazuje do `synthesize`. Bez tego kroku usluga jest
+        // `running`, ale `synthesize` zwraca "TTS engine '...' nie
+        // zarejestrowany".
+        let engine_id = self.manifest.engine.id.clone();
+        let model_repo = self.selected_tts_model_repo();
+        // Preset id (np. `vits-piper-pl_PL-jarvis_wg_glos-medium`) jako voice
+        // hint — wielogłosowe repo musi zaladowac wlasciwy voice.
+        let voice_hint = self
+            .user_config
+            .get("model_preset_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(s) = &self.log_sink {
+            s.phase(
+                "load-model",
+                &format!("[tts] loading embedded {engine_id} ({model_repo})"),
+            );
+        }
+        crate::tts::ensure_embedded_engine_loaded(&engine_id, &model_repo, voice_hint)
+            .await
+            .map_err(|e| DeployError::Other(format!("load embedded TTS '{engine_id}': {e}")))?;
+        if let Some(s) = &self.log_sink {
+            s.info(&format!("[tts] {engine_id} engine registered"));
+        }
+        Ok(())
+    }
+
+    /// HF repo (lub voice id dla apple-tts) dla embedded TTS: jawny
+    /// `model_repo` z configu ma priorytet, inaczej preset po
+    /// `model_preset_id`, potem rekomendowany / pierwszy z manifestu.
+    fn selected_tts_model_repo(&self) -> String {
+        if let Some(repo) = self
+            .user_config
+            .get("model_repo")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return repo.to_string();
+        }
+        self.user_config
+            .get("model_preset_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|id| self.manifest.model_presets.iter().find(|p| p.id == id))
+            .or_else(|| self.manifest.model_presets.iter().find(|p| p.recommended))
+            .or_else(|| self.manifest.model_presets.first())
+            .map(|p| p.repo.clone())
+            .unwrap_or_default()
+    }
+
     fn selected_llm_model(&self) -> Option<EmbeddedLlmSelection> {
         if self.manifest.engine.category != Category::Llm {
             return None;
@@ -353,6 +439,8 @@ impl DeployStrategy for EmbeddedDeploy {
         // Future work (Phase 5+): plumb a feature-availability map from build.rs.
 
         self.prepare_embedded_vision().await?;
+        self.prepare_embedded_stt().await?;
+        self.prepare_embedded_tts().await?;
         let loaded_model_path = self.prepare_embedded_llm().await?;
 
         let runtime = RuntimeHandle::default();

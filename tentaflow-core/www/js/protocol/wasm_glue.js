@@ -1578,6 +1578,41 @@ export function encodeFlowExecutionsListRequest(flow_id) {
 }
 
 /**
+ * MessageBody::FlowInvokeRequest — uniwersalny most do flow engine. Wariant
+ * audio-only dla chat audio (jedno wejście Audio). Multi-input dojdzie później.
+ * @param {bigint | null | undefined} flow_id
+ * @param {string} model
+ * @param {string} service_type
+ * @param {string} mime
+ * @param {number | null | undefined} sample_rate
+ * @param {Uint8Array} audio
+ * @param {string | null} [language]
+ * @param {string | null} [session_id]
+ * @returns {Uint8Array}
+ */
+export function encodeFlowInvokeAudio(flow_id, model, service_type, mime, sample_rate, audio, language, session_id) {
+    const ptr0 = passStringToWasm0(model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(service_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(mime, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArray8ToWasm0(audio, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(language) ? 0 : passStringToWasm0(language, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    var ptr5 = isLikeNone(session_id) ? 0 : passStringToWasm0(session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeFlowInvokeAudio(!isLikeNone(flow_id), isLikeNone(flow_id) ? BigInt(0) : flow_id, ptr0, len0, ptr1, len1, ptr2, len2, isLikeNone(sample_rate) ? Number.MAX_SAFE_INTEGER : (sample_rate) >>> 0, ptr3, len3, ptr4, len4, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
  * MessageBody::FlowListRequest (unit).
  * @returns {Uint8Array}
  */

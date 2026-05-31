@@ -47,6 +47,8 @@ let searchFilter = '';
 // audio. engineCache wypelniany raz przy mount() z ApiBinary modelListRequest.
 let faceHandle = null;
 let engineCache = { stt: [], tts: [] };
+// Lista flow usera — tryb audio odpala wybrany flow po ID (z jego blokami).
+let flowCache = [];
 let escKeyHandler = null;
 
 // AudioPipeline (Etap 2) — zywy obiekt tylko gdy aktywna konwersacja jest w
@@ -441,9 +443,8 @@ function renderWaveBars() {
 }
 
 function renderAudioStage(conv) {
-  const cfg = conv.audioConfig;
-  const sttName = cfg.sttEngine || I18n.t('chat.audio_no_engine');
-  const ttsName = cfg.ttsEngine || I18n.t('chat.audio_no_engine');
+  // Tryb audio odpala WYBRANY flow (z jego blokami STT/LLM/TTS i modelami) —
+  // nie ma osobnego wyboru silników, bo flow już je ma. Wybór = tf-select niżej.
   const pendingTip = escapeHtml(I18n.t('chat.audio_pipeline_pending'));
   return `
     <div class="audio-stage" id="audio-stage" data-state="idle">
@@ -453,16 +454,8 @@ function renderAudioStage(conv) {
         <span class="engine" id="audio-engine-name">—</span>
       </div>
       <div class="engine-pills">
-        <button class="engine-pill" id="stt-pill" type="button" title="STT engine">
-          <span class="lab">STT</span>
-          <span class="name">${escapeHtml(sttName)}</span>
-          <svg class="icon chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
-        </button>
-        <button class="engine-pill" id="tts-pill" type="button" title="TTS engine">
-          <span class="lab">TTS</span>
-          <span class="name">${escapeHtml(ttsName)}</span>
-          <svg class="icon chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
-        </button>
+        <span class="lab">Flow</span>
+        <tf-select class="chat-model-select" id="flow-select" title="Flow"></tf-select>
       </div>
       <aside class="rail" id="audio-rail">
         <div class="rail-title">${escapeHtml(I18n.t('chat.audio_recent_entries'))}</div>
@@ -500,31 +493,16 @@ function engineId(engine) {
 }
 
 function ensureAudioConfigDefaults(conv) {
-  // Wybiera deployed (stt|tts) engine zgodny z aktualnie zapisanym
-  // sttEngine/ttsEngine, fallback na pierwszy z engineCache. Wartosci sa
-  // walidowane wzgledem rzeczywistego registry — sztywne defaulty
-  // 'whisper-1' / 'tts-1' (OpenAI compat) z newConversation() ZAWSZE
-  // zamieniamy na real model_name, bo backend route_audio_transcription
-  // /_speech rezolwuje przez `services_repo` i nie zna tych aliasow.
-  const pickEngine = (kind) => {
-    const cache = engineCache[kind];
-    if (!cache.length) return null;
-    const wanted = kind === 'stt' ? conv.audioConfig.sttEngine : conv.audioConfig.ttsEngine;
-    if (wanted) {
-      const found = cache.find((e) => engineId(e) === wanted);
-      if (found) return found;
-    }
-    return cache[0];
-  };
-  const stt = pickEngine('stt');
-  if (stt) {
-    conv.audioConfig.sttEngine = engineId(stt);
-    conv.audioConfig.sttModel = stt.model_name || stt.id || conv.audioConfig.sttModel;
-  }
-  const tts = pickEngine('tts');
-  if (tts) {
-    conv.audioConfig.ttsEngine = engineId(tts);
-    conv.audioConfig.ttsModel = tts.model_name || tts.id || conv.audioConfig.ttsModel;
+  // Tryb audio odpala wybrany flow po ID. Jeśli zapisany flowId nie istnieje
+  // (skasowany) albo go brak — domyślamy się pierwszego dostępnego flow.
+  const cfg = conv.audioConfig;
+  const valid = cfg.flowId != null && flowCache.some((f) => f.id === cfg.flowId);
+  if (!valid && flowCache.length > 0) {
+    // Domyślnie flow o nazwie "Default Chat", inaczej pierwszy dostępny.
+    const def = flowCache.find((f) => (f.name || '').toLowerCase() === 'default chat')
+      || flowCache[0];
+    cfg.flowId = def.id;
+    cfg.flowName = def.name || `Flow #${def.id}`;
   }
 }
 
@@ -603,63 +581,33 @@ function destroyFace() {
 // kontekscie pill'a. tf-menu wymaga ze dzieci sa staticznie zadeklarowane,
 // wiec zamiast tego budujemy ad-hoc menu w light DOM przy pillu. Wybor
 // utrwala sie w conv.audioConfig i odswieza pill label.
-function openEnginePicker(kind) {
-  const list = engineCache[kind];
-  if (!list || list.length === 0) {
-    toast(I18n.t('chat.audio_engine_missing'), 'warning');
-    return;
-  }
-  const conv = activeConv();
-  if (!conv) return;
-  const pill = byId(`${kind}-pill`);
-  if (!pill) return;
-
-  // Usun ewentualnie poprzednie ad-hoc menu (np. drugi klik w ten sam pill).
-  pill.querySelector('.engine-pill-menu')?.remove();
-
-  const menu = document.createElement('div');
-  menu.className = 'engine-pill-menu';
-  menu.setAttribute('role', 'menu');
-  menu.innerHTML = list.map((e) => {
-    const id = engineId(e);
-    const label = engineLabel(e);
-    return `<button type="button" role="menuitem" data-engine-id="${escapeHtml(id)}">${escapeHtml(label)}</button>`;
-  }).join('');
-  pill.appendChild(menu);
-
-  const closeMenu = () => {
-    menu.remove();
-    document.removeEventListener('pointerdown', onDocDown, true);
-  };
-  function onDocDown(ev) {
-    if (!menu.contains(ev.target) && ev.target !== pill && !pill.contains(ev.target)) {
-      closeMenu();
-    }
-  }
-  document.addEventListener('pointerdown', onDocDown, true);
-  menu.addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-engine-id]');
-    if (!btn) return;
-    const id = btn.dataset.engineId;
-    const cache = engineCache[kind] || [];
-    const picked = cache.find((e) => engineId(e) === id);
-    if (kind === 'stt') {
-      conv.audioConfig.sttEngine = id;
-      if (picked) conv.audioConfig.sttModel = picked.model_name || picked.id || conv.audioConfig.sttModel;
-    } else {
-      conv.audioConfig.ttsEngine = id;
-      if (picked) conv.audioConfig.ttsModel = picked.model_name || picked.id || conv.audioConfig.ttsModel;
-    }
-    saveConversations();
-    updateEngineLabels();
-    closeMenu();
-  });
+// Wypełnia tf-select trybu audio listą flow usera i ustawia bieżący wybór.
+// Audio odpala wybrany flow po ID (z jego blokami STT/LLM/TTS i modelami).
+function populateFlowSelect(conv) {
+  const sel = byId('flow-select');
+  if (!sel || !conv) return;
+  const inner = sel.querySelector('select');
+  if (!inner) return;
+  inner.innerHTML = flowCache.length === 0
+    ? `<option value="">— brak flow —</option>`
+    : flowCache
+        .map((f) => `<option value="${escapeHtml(String(f.id))}">${escapeHtml(f.name || ('Flow #' + f.id))}</option>`)
+        .join('');
+  const cur = conv.audioConfig.flowId != null ? String(conv.audioConfig.flowId) : '';
+  inner.value = cur;
+  sel.setAttribute('value', inner.value);
 }
 
 function bindAudioStageHandlers() {
   byId('audio-exit')?.addEventListener('click', () => switchMode('text'));
-  byId('stt-pill')?.addEventListener('click', () => openEnginePicker('stt'));
-  byId('tts-pill')?.addEventListener('click', () => openEnginePicker('tts'));
+  populateFlowSelect(activeConv());
+  byId('flow-select')?.addEventListener('change', () => {
+    const conv = activeConv();
+    if (!conv) return;
+    const v = byId('flow-select')?.value;
+    conv.audioConfig.flowId = v ? Number(v) : null;
+    saveConversations();
+  });
 
   byId('audio-mic')?.addEventListener('click', async () => {
     if (!audioPipeline) {
@@ -707,8 +655,8 @@ function switchMode(targetMode) {
   if (conv.mode === targetMode) return;
 
   if (targetMode === 'audio') {
-    if (engineCache.stt.length === 0 || engineCache.tts.length === 0) {
-      toast(I18n.t('chat.audio_engine_missing'), 'warning');
+    if (flowCache.length === 0) {
+      toast(I18n.t('chat.audio_no_flows') || 'Brak zapisanych flow — zbuduj flow w Flow Builderze', 'warning');
       return;
     }
     ensureAudioConfigDefaults(conv);
@@ -737,7 +685,6 @@ function applyMode(conv) {
     mountFace();
     renderRail();
     updateAudioStatus('idle');
-    updateEngineLabels();
     // Mic enabled w trybie pre-gesture — czeka na klik aby uruchomic
     // AudioPipeline (getUserMedia wymaga user-gesture). Volume/Pause zostaja
     // disabled do momentu gdy pipeline ruszy.
@@ -905,11 +852,20 @@ function sendVoiceUtterance(wav, sampleRate) {
 
   const lang = conv.audioConfig?.language || (I18n.getLanguage && I18n.getLanguage()) || 'pl';
 
+  // Źródło prawdy dla wyboru flow = aktualna wartość selecta (fallback config).
+  const flowSelEl = byId('flow-select');
+  const flowId = (flowSelEl && flowSelEl.value)
+    ? Number(flowSelEl.value)
+    : (conv.audioConfig?.flowId ?? null);
+
   ApiBinary.subscribe(
     'flowInvokeRequest',
     {
+      // Tryb audio odpala WYBRANY przez usera flow (po ID) — z jego blokami
+      // STT/LLM/TTS i modelami. Bez flowId fallback na rozwiązanie model+chat.
+      flowId,
       model: modelId,
-      serviceType: 'voice',
+      serviceType: 'chat',
       mime: 'audio/wav',
       sampleRate,
       audio: wav,
@@ -927,10 +883,15 @@ function sendVoiceUtterance(wav, sampleRate) {
           if (audioPipeline) audioPipeline.playAudioChunk(body.bytes, body.mime);
         }
       },
-      onEnd: () => {
+      onEnd: (endBody) => {
         unsubscribe = null;
         assistantMsg.streaming = false;
-        if (assistantMsg.text === '') {
+        // FlowInvokeEnd niesie error gdy flow padł (np. brak flow 'voice',
+        // STT/LLM error). Bez tego pusty wynik wyglądał jak '(pusta odpowiedź)'.
+        if (endBody && endBody.error) {
+          assistantMsg.text = `[error] ${endBody.error}`;
+          toast(`${I18n.t('common.error')}: ${endBody.error}`, 'error');
+        } else if (assistantMsg.text === '') {
           assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
         }
         conv.updatedAt = Date.now();
@@ -1386,6 +1347,13 @@ const ChatScreen = {
       modelOptions = [];
       engineCache.stt = [];
       engineCache.tts = [];
+    }
+
+    // Lista flow do pickera trybu audio (user wybiera swój flow z blokami).
+    try {
+      flowCache = (await ApiBinary.list('flowListRequest')) || [];
+    } catch {
+      flowCache = [];
     }
 
     const sel = byId('chat-model');
