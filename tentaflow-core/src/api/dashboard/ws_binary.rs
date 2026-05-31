@@ -316,22 +316,20 @@ pub async fn handle_ws_connection<S>(
                     );
                     last_client_sequence = 0;
                 }
+                // Dashboard WS runs over TLS+JWT, but the client can legitimately
+                // deliver frames out of order (WebTransport datagrams, async send
+                // races). Replay protection is a mesh-peer concern; here it is only
+                // an ordering sanity check, so an out-of-order/duplicate frame is
+                // LOGGED but still processed. Dropping it (the old behavior) silently
+                // killed stream subscribes — e.g. a live-view tile stuck on
+                // "connecting" because its SubscribeRequest frame was discarded.
                 if envelope.sequence <= last_client_sequence {
-                    warn!(
-                        "binary-WS: sequence {} <= {} — odrzucam (replay)",
+                    tracing::debug!(
+                        "binary-WS: sequence {} <= {} (out-of-order, przetwarzam mimo to)",
                         envelope.sequence, last_client_sequence
                     );
-                    let _ = send_protocol_error(
-                        &sink,
-                        envelope.correlation_id,
-                        next_seq(&next_server_sequence),
-                        ProtocolErrorCode::InvalidFrame,
-                        "sequence not monotonically increasing",
-                    )
-                    .await;
-                    continue;
                 }
-                last_client_sequence = envelope.sequence;
+                last_client_sequence = last_client_sequence.max(envelope.sequence);
 
                 let body =
                     match tentaflow_protocol::cbor::decode::<MessageBody>(&envelope.body) {
