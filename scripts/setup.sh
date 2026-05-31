@@ -108,6 +108,30 @@ run_privileged() {
     fi
 }
 
+ensure_macos_metal_toolchain() {
+    # macOS 26 / Xcode 26 wydzielil kompilator Metala jako osobny komponent.
+    # Bez niego mlx-swift buduje zepsuty metallib i KAZDY model MLX zwraca
+    # belkot (zle logity), bez bledu builda. Instalujemy go raz na maszyne.
+    if [[ "$DISTRO" != "macos" ]]; then
+        return
+    fi
+    if xcrun --sdk macosx metal --version &>/dev/null; then
+        log_ok "Metal Toolchain juz dostepny"
+        return
+    fi
+    log_warn "Brak Metal Toolchain (macOS 26+) — bez niego modele MLX beda belkotac"
+    log_info "Pobieranie Metal Toolchain (~688 MB)..."
+    if xcodebuild -downloadComponent MetalToolchain; then
+        log_ok "Metal Toolchain zainstalowany"
+        INSTALLED+=("Metal Toolchain")
+        # Wyczysc stary, zepsuty metallib zeby xcodebuild zbudowal poprawny.
+        rm -rf "$(dirname "$0")/../tentaflow-desktop/macos/swift/MLXBridge/build-xcode" 2>/dev/null || true
+    else
+        log_error "Nie udalo sie pobrac Metal Toolchain — uruchom recznie:"
+        log_error "  xcodebuild -downloadComponent MetalToolchain"
+    fi
+}
+
 configure_macos_gstreamer_pkg_config() {
     if [[ "$DISTRO" != "macos" ]]; then
         return
@@ -385,6 +409,7 @@ install_base() {
             log_info "Instalacja: ${pkgs[*]}"
             brew install "${pkgs[@]}"
             configure_macos_gstreamer_pkg_config
+            ensure_macos_metal_toolchain
             INSTALLED+=("cmake" "llvm (clang+lld)" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
             ;;
     esac

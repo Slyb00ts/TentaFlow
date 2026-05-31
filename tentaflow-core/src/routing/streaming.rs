@@ -5,11 +5,13 @@
 //       buffering.
 // =============================================================================
 
-use crate::api::openai::types::{ChatCompletionChunk, ChatCompletionRequest};
+use crate::api::openai::types::{ChatCompletionChunk, ChatCompletionRequest, ToolCall};
+use crate::compliance::ai_gateway::{AiEventHandle, AiGateway, AiGatewayContext};
 use crate::error::Result;
 use crate::routing::router::Router;
 
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use futures::Stream;
 
@@ -156,6 +158,100 @@ enum SplitState {
         model: String,
     },
     Done,
+}
+
+struct ComplianceAuditStream {
+    inner: Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>,
+    event: Option<AiEventHandle>,
+    response_text: String,
+    usage: Option<crate::api::openai::types::Usage>,
+    tool_calls: Vec<ToolCall>,
+    finished: bool,
+}
+
+impl ComplianceAuditStream {
+    fn new(
+        inner: Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>,
+        event: AiEventHandle,
+    ) -> Self {
+        Self {
+            inner,
+            event: Some(event),
+            response_text: String::new(),
+            usage: None,
+            tool_calls: Vec::new(),
+            finished: false,
+        }
+    }
+
+    fn finish_success(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(event) = self.event.take() {
+            if let Err(error) = event.finish_stream_success(
+                &self.response_text,
+                self.usage.as_ref(),
+                &self.tool_calls,
+            ) {
+                tracing::warn!(error = %error, "compliance AI audit stream finish failed");
+            }
+        }
+    }
+
+    fn finish_failed(&mut self, error_message: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(event) = self.event.take() {
+            if let Err(error) = event.finish_failed(error_message) {
+                tracing::warn!(error = %error, "compliance AI audit stream failure capture failed");
+            }
+        }
+    }
+}
+
+impl Stream for ComplianceAuditStream {
+    type Item = Result<ChatCompletionChunk>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                for choice in &chunk.choices {
+                    if let Some(content) = choice.delta.content.as_deref() {
+                        self.response_text.push_str(content);
+                    }
+                    if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
+                        self.tool_calls.extend(tool_calls.iter().cloned());
+                    }
+                }
+                if let Some(usage) = chunk.usage.as_ref() {
+                    self.usage = Some(usage.clone());
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                let error_message = error.to_string();
+                self.finish_failed(&error_message);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.finish_success();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ComplianceAuditStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish_failed("stream dropped before completion");
+        }
+    }
 }
 
 fn make_chunk(
@@ -395,6 +491,7 @@ impl Router {
         &self,
         request: ChatCompletionRequest,
         user: Option<crate::auth::acl::UserContext>,
+        compliance_context: Option<AiGatewayContext>,
     ) -> Result<
         crate::routing::RouteResult<
             Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>,
@@ -473,6 +570,20 @@ impl Router {
             false
         };
 
+        let compliance_event = if let Some(db) = self.db.as_ref() {
+            let gateway = AiGateway::new(db.clone(), self.local_node_id());
+            Some(
+                gateway
+                    .start_chat_event(&request, user.as_ref(), compliance_context.as_ref())
+                    .map_err(|e| crate::error::CoreError::InternalError {
+                        message: "compliance AI audit stream start failed".to_string(),
+                        source: Some(e),
+                    })?,
+            )
+        } else {
+            None
+        };
+
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
@@ -520,6 +631,19 @@ impl Router {
                         stream_cancel,
                     ));
                     let filtered = cancel_wrapped;
+                    let filtered: std::pin::Pin<
+                        Box<
+                            dyn futures::Stream<
+                                    Item = crate::error::Result<
+                                        crate::api::openai::types::ChatCompletionChunk,
+                                    >,
+                                > + Send,
+                        >,
+                    > = if let Some(event) = compliance_event {
+                        Box::pin(ComplianceAuditStream::new(filtered, event))
+                    } else {
+                        filtered
+                    };
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: stream_node_name.clone(),
                         backend_type: "flow_engine_stream".to_string(),
@@ -536,6 +660,14 @@ impl Router {
                     });
                 }
                 Err(e) => {
+                    if let Some(event) = compliance_event.as_ref() {
+                        if let Err(audit_error) = event.finish_failed(&e.to_string()) {
+                            tracing::warn!(
+                                error = %audit_error,
+                                "compliance AI audit stream failure capture failed"
+                            );
+                        }
+                    }
                     return Err(crate::routing::dispatch_error_to_core(e, &request.model).into());
                 }
             }
@@ -549,6 +681,14 @@ impl Router {
         let _ = target_accepts_audio;
         let _ = stream_start;
         let _ = stream_node_name;
+        if let Some(event) = compliance_event.as_ref() {
+            if let Err(audit_error) = event.finish_failed("flow_dispatcher_not_wired") {
+                tracing::warn!(
+                    error = %audit_error,
+                    "compliance AI audit stream failure capture failed"
+                );
+            }
+        }
         Err(crate::error::CoreError::InternalError {
             message: "flow_dispatcher not wired (DB-less router) — chat streaming \
                       path requires Universal Flow Gateway"
@@ -660,5 +800,125 @@ mod include_usage_tests {
             .collect::<Vec<_>>()
             .await;
         assert_eq!(collected.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod compliance_stream_tests {
+    use super::*;
+    use crate::api::openai::types::{
+        ChatCompletionChunk, ChunkChoice, Delta, Message, MessageContent, Usage,
+    };
+    use crate::compliance::ai_gateway::AiGateway;
+    use crate::db::migrations;
+    use futures::StreamExt;
+    use rusqlite::{params, Connection};
+    use std::sync::{Arc, Mutex};
+
+    fn db() -> crate::db::DbPool {
+        let conn = Connection::open_in_memory().expect("baza testowa");
+        migrations::run(&conn).expect("migracje");
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn chunk(text: &str, usage: Option<Usage>) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "stream-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1,
+            model: "bielik".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: if text.is_empty() {
+                        None
+                    } else {
+                        Some(text.to_string())
+                    },
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            system_fingerprint: None,
+            audio: None,
+            detected_intent: None,
+            detected_tools: None,
+            transcribed_text: None,
+            speaker_id: None,
+            speaker_name: None,
+            usage,
+        }
+    }
+
+    #[tokio::test]
+    async fn compliance_stream_zapisuje_scalona_odpowiedz() {
+        let db = db();
+        let gateway = AiGateway::new(db.clone(), "node-test");
+        let request = ChatCompletionRequest {
+            model: "bielik".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Daj odpowiedź".to_string())),
+                ..Default::default()
+            }],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: true,
+            stream_options: None,
+            user: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            memory_options: None,
+            audio_input: None,
+        };
+        let handle = gateway
+            .start_chat_event(&request, None, None)
+            .expect("start event");
+        let event_id = handle.event_id().to_string();
+        let usage = Usage {
+            prompt_tokens: 4,
+            completion_tokens: 6,
+            total_tokens: 10,
+        };
+        let inner = futures::stream::iter(vec![
+            Ok(chunk("pierwsza ", None)),
+            Ok(chunk("druga", Some(usage))),
+        ]);
+        let mut stream = ComplianceAuditStream::new(Box::pin(inner), handle);
+        while stream
+            .next()
+            .await
+            .transpose()
+            .expect("stream chunk")
+            .is_some()
+        {}
+
+        let conn = db.lock().expect("db lock");
+        let response_payload: String = conn
+            .query_row(
+                "SELECT content_text FROM compliance_ai_payloads WHERE event_id = ?1 AND payload_kind = 'response'",
+                params![&event_id],
+                |row| row.get(0),
+            )
+            .expect("response payload");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM compliance_ai_events WHERE event_id = ?1",
+                params![&event_id],
+                |row| row.get(0),
+            )
+            .expect("event status");
+
+        assert_eq!(response_payload, "pierwsza druga");
+        assert_eq!(status, "success");
     }
 }

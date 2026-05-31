@@ -225,8 +225,19 @@ pub fn llm_generate(
 
     // Most async→sync: host function jest synchroniczna, router jest async.
     // Uzywamy tokio::task::block_in_place aby uniknac deadlocka w wielowatkowym runtime.
+    let compliance_context = crate::compliance::ai_gateway::AiGatewayContext {
+        org_id: caller.data().org_id.clone(),
+        addon_id: Some(addon_id.clone()),
+        instance_id: Some(caller.data().instance_id.clone()),
+        flow_id: None,
+        flow_node_id: None,
+    };
     let result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(router.route_chat_completion(request, None))
+        tokio::runtime::Handle::current().block_on(router.route_chat_completion(
+            request,
+            None,
+            Some(compliance_context),
+        ))
     });
 
     let result_text = match result {

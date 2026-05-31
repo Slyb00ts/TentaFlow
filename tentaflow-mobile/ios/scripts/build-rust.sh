@@ -7,6 +7,21 @@ CORE_DIR="$PROJECT_ROOT/core"
 
 echo "=== Building TentaFlow Mobile (Rust core) ==="
 
+# Metal Toolchain check. Ten skrypt buduje TYLKO rdzen Rust; Swift/MLX (shadery
+# Metal) kompiluje Xcode przy Cmd+R. Na macOS 26+ kompilator Metala jest osobnym
+# komponentem — bez niego Xcode zbuduje zepsuty metallib i KAZDY model MLX bedzie
+# belkotac (zle logity), bez bledu builda. Ostrzegamy tu wczesnie, zanim trafisz
+# do Xcode i zmarnujesz czas na zagadke.
+if ! xcrun --sdk iphoneos metal --version &>/dev/null; then
+    echo ""
+    echo "!!! UWAGA: brak Metal Toolchain (macOS 26+) !!!"
+    echo "    Xcode zbuduje zepsuty metallib -> modele MLX beda zwracac belkot."
+    echo "    Zainstaluj raz na maszyne PRZED buildem w Xcode:"
+    echo ""
+    echo "        xcodebuild -downloadComponent MetalToolchain"
+    echo ""
+fi
+
 # Pre-flight: vision modele musza byc na dysku zanim build.rs odpali
 # embed_vision_models. Bez tego embedded blob'y sa puste i deploy yolov8n-pose
 # / movenet-lightning na iOS wybucha na "vision model is not available after
@@ -60,7 +75,9 @@ rustup target add "$DEVICE_TARGET" 2>/dev/null || true
 rustup target add "$SIMULATOR_TARGET" 2>/dev/null || true
 
 find_gstreamer_pkg_config_dir() {
-    local root="${GSTREAMER_IOS_ROOT:-}"
+    # Domyslna sciezka do syntetycznego pkgconfig (xcframework GStreamer 1.28.3).
+    # Mozna nadpisac eksportujac GSTREAMER_IOS_ROOT przed uruchomieniem.
+    local root="${GSTREAMER_IOS_ROOT:-$HOME/Downloads/gst-ios-root}"
     local candidates=()
     if [ -n "$root" ]; then
         candidates+=(
@@ -163,9 +180,20 @@ echo "Building for simulator ($SIMULATOR_TARGET)..."
 echo "UWAGA: Simulator build moze sie nie powiesc (MLX wymaga Metal na fizycznym urzadzeniu)"
 cargo build --target "$SIMULATOR_TARGET" $CARGO_FLAGS || echo "Simulator build pominity (oczekiwane — MLX nie obsluguje symulatora)"
 
-# Output paths — target dir jest w katalogu Mobile (workspace member)
-DEVICE_LIB="$PROJECT_ROOT/target/$DEVICE_TARGET/$OUTPUT_DIR/libtentaflow_mobile.a"
-SIMULATOR_LIB="$PROJECT_ROOT/target/$SIMULATOR_TARGET/$OUTPUT_DIR/libtentaflow_mobile.a"
+# Output paths. NIE hardcodujemy $PROJECT_ROOT/target — repo ma
+# `.cargo/config.toml` z `target-dir = "target_shared"`, wiec cargo pisze .a
+# gdzie indziej. Hardcoded sciezka kopiowala STARY .a (sprzed zmiany target-dir),
+# przez co zadna zmiana Rusta nie docierala na iOS. Pytamy cargo o realny
+# target dir.
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['target_directory'])" 2>/dev/null)
+if [ -z "$TARGET_DIR" ]; then
+    TARGET_DIR="$PROJECT_ROOT/target"
+    echo "WARN: cargo metadata nie zwrocilo target_directory — fallback $TARGET_DIR"
+fi
+echo "Cargo target dir: $TARGET_DIR"
+DEVICE_LIB="$TARGET_DIR/$DEVICE_TARGET/$OUTPUT_DIR/libtentaflow_mobile.a"
+SIMULATOR_LIB="$TARGET_DIR/$SIMULATOR_TARGET/$OUTPUT_DIR/libtentaflow_mobile.a"
 OUTPUT_FAT="$SCRIPT_DIR/../libtentaflow_mobile.a"
 
 echo ""

@@ -32,6 +32,37 @@ const TAG_STATE_RESET    = 0x0122;
 const TAG_PATCH_REJECTED = 0x0123;
 const TAG_ACTION_ACK     = 0x0131;
 
+// SlotSemantics values whose content is rendered into a dynamic overlay
+// container (Modal/Drawer/Sheet/Popover) created by the overlay renderer
+// *inside* the host slot, not into a static slot container. The SlotDecl spec
+// (tentaflow-sdk-spec) defines `modal`, `drawer`, `popover`; `sheet` is kept
+// here for forward compatibility with an SDK-level sheet variant.
+const OVERLAY_SEMANTICS = new Set(['modal', 'drawer', 'sheet', 'popover']);
+
+// A slot is overlay-owned when its semantics is an overlay kind OR its
+// visibility is Hidden. The intended pattern (host ownership test
+// addon/host_functions/ui.rs) is: an overlay slot is declared in PanelShell
+// with overlay semantics + Hidden visibility so it passes Rust slot-ownership,
+// but its real DOM container is produced dynamically by the overlay renderer.
+// Such slots MUST NOT get a static container nor a static registerSlot — the
+// dynamic container is auto-registered by SlotManager.observe() and SlotContent
+// is buffered until then.
+//
+// `slotDecl.semantics` decodes to a string enum (e.g. 'modal').
+// `slotDecl.visibility` decodes to an object `{ kind: 'always'|'hidden'|... }`
+// per SlotVisibility; a bare string is tolerated defensively.
+function isOverlaySlot(slotDecl) {
+  if (!slotDecl || typeof slotDecl !== 'object') return false;
+  if (typeof slotDecl.semantics === 'string'
+      && OVERLAY_SEMANTICS.has(slotDecl.semantics)) {
+    return true;
+  }
+  const vis = slotDecl.visibility;
+  if (typeof vis === 'string') return vis === 'hidden';
+  if (vis && typeof vis === 'object') return vis.kind === 'hidden';
+  return false;
+}
+
 const AddonAppScreen = {
   async show(params = {}) {
     teardown();
@@ -289,6 +320,10 @@ function handlePanelShell(decoded) {
     }
   }
 
+  // Tear down a previous SlotManager (and its MutationObserver) before
+  // rebuilding the shell — handlePanelShell can run again on panel-navigate.
+  if (s.slotManager) s.slotManager.destroy();
+
   // Create SlotManager and register declared slots
   s.slotManager = new SlotManager({
     store: s.store,
@@ -297,6 +332,15 @@ function handlePanelShell(decoded) {
 
   if (decoded.slots && decoded.slots.length > 0) {
     for (const slotDecl of decoded.slots) {
+      // Overlay slots (modal/drawer/sheet/popover or Hidden) are filled by an
+      // overlay renderer that creates its own dynamic data-slot-id container
+      // inside the host slot. Creating a static container here would shadow
+      // that dynamic one (same id) and SlotManager would ignore the real one,
+      // dropping the overlay body/footer outside the dialog. Skip both the
+      // static container and registerSlot; observe() picks up the dynamic
+      // container and handleSlotContent buffers until it is registered.
+      if (isOverlaySlot(slotDecl)) continue;
+
       let slotEl = shell.querySelector(`[data-slot-id="${slotDecl.id}"]`);
       // If layout didn't render a slot placeholder, create one and append
       // to the shell. This is the normal case — the layout contains nav
@@ -310,12 +354,21 @@ function handlePanelShell(decoded) {
       s.slotManager.registerSlot(slotDecl.id, slotEl, slotDecl);
     }
   }
+
+  // Observe the shell so dynamic data-slot-id containers created by overlay
+  // renderers (modal/drawer/sheet/popover body+footer) inside existing slots
+  // are auto-registered and can receive later SlotContent messages.
+  s.slotManager.observe(shell);
 }
 
 function handleSlotContent(decoded) {
   const s = _session;
   if (!s || !s.slotManager) return;
-  s.slotManager.handleSlotContent({ slot_id: decoded.slotId, fragment: decoded.fragment });
+  s.slotManager.handleSlotContent({
+    slot_id: decoded.slotId,
+    fragment: decoded.fragment,
+    state_overlay: decoded.stateOverlay,
+  });
 }
 
 function handleStateSnapshot(decoded) {
@@ -391,5 +444,11 @@ function showError(message) {
   }
 }
 
+// Test seam: inject the module-private session so unit tests can drive the
+// wire-message handlers without a live WS connection.
+function __setSessionForTest(session) {
+  _session = session;
+}
+
 export default AddonAppScreen;
-export { VIEW_ID };
+export { VIEW_ID, isOverlaySlot, handleSlotContent, __setSessionForTest };

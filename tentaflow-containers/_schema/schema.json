@@ -179,6 +179,11 @@
         "repo": { "type": "string", "minLength": 1 },
         "quantization": { "type": "string" },
         "recommended": { "type": "boolean", "default": false },
+        "featured": {
+          "type": "boolean",
+          "default": false,
+          "description": "Renderuj preset jako osobny kafelek w katalogu LLM (featured model), reuzywajac sciezki deploy silnika rodzica."
+        },
         "speculator_repo": {
           "type": "string",
           "description": "HF repo dla speculatora vLLM (np. 'RedHatAI/gemma-4-31B-it-speculator.dflash'). Wizard pre-fillsule panel Speculative Decoding."

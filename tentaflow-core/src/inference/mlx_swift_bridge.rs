@@ -37,10 +37,17 @@ type GenerateFn = extern "C" fn(
     max_tokens: i32,
     temperature: f32,
     top_p: f32,
+    max_context_tokens: i32,
+    memory_budget_mb: i32,
     token_callback: TokenCallbackFn,
     callback_context: *mut c_void,
     context: *mut c_void,
 ) -> i32;
+
+/// Sentinel zwracany przez Swift gdy kontekst/model przekracza limit pamieci —
+/// guard przerywa generacje zamiast OOM. Rust mapuje to na czysty blad zamiast
+/// generycznego "blad generowania". Musi byc zgodny ze strona Swift (@_cdecl).
+const MLX_ERR_OUT_OF_MEMORY: i32 = -10;
 
 /// Callback wolany przez Swift dla kazdego wygenerowanego tokena
 type TokenCallbackFn =
@@ -307,6 +314,8 @@ impl InferenceEngine for MlxSwiftEngine {
         let max_tokens = params.max_tokens as i32;
         let temperature = params.temperature;
         let top_p = params.top_p;
+        let max_context_tokens = params.max_context_tokens as i32;
+        let memory_budget_mb = params.memory_budget_mb as i32;
 
         // Kanal do zbierania tokenow — bufor wystarczajacy na caly wynik
         let (tx, mut rx) = mpsc::channel::<StreamToken>(4096);
@@ -323,6 +332,8 @@ impl InferenceEngine for MlxSwiftEngine {
                 max_tokens,
                 temperature,
                 top_p,
+                max_context_tokens,
+                memory_budget_mb,
                 rust_token_callback,
                 tx_ptr,
                 ctx.as_ptr(),
@@ -335,6 +346,13 @@ impl InferenceEngine for MlxSwiftEngine {
         .await
         .context("Blad watku generowania")?;
 
+        if gen_result == MLX_ERR_OUT_OF_MEMORY {
+            anyhow::bail!(
+                "Brak pamieci: kontekst lub model przekracza limit (max_context_tokens={}, memory_budget_mb={}). Zadanie nie zostalo wykonane.",
+                params.max_context_tokens,
+                params.memory_budget_mb
+            );
+        }
         if gen_result < 0 {
             anyhow::bail!("Swift MLX: blad generowania (kod: {})", gen_result);
         }
@@ -387,6 +405,8 @@ impl InferenceEngine for MlxSwiftEngine {
         let max_tokens = params.max_tokens as i32;
         let temperature = params.temperature;
         let top_p = params.top_p;
+        let max_context_tokens = params.max_context_tokens as i32;
+        let memory_budget_mb = params.memory_budget_mb as i32;
 
         // Kanal do streamowania tokenow do callera
         let (tx, rx) = mpsc::channel::<StreamToken>(256);
@@ -401,6 +421,8 @@ impl InferenceEngine for MlxSwiftEngine {
                 max_tokens,
                 temperature,
                 top_p,
+                max_context_tokens,
+                memory_budget_mb,
                 rust_token_callback,
                 tx_ptr,
                 ctx.as_ptr(),
@@ -408,8 +430,14 @@ impl InferenceEngine for MlxSwiftEngine {
 
             if result < 0 {
                 // Wyslij token bledu jesli generowanie sie nie powiodlo
+                let msg = if result == MLX_ERR_OUT_OF_MEMORY {
+                    "[BLAD: brak pamieci — kontekst/model przekracza limit, zadanie przerwane]"
+                        .to_string()
+                } else {
+                    format!("[BLAD: Swift MLX zwrocil kod {}]", result)
+                };
                 let _ = tx.blocking_send(StreamToken {
-                    text: format!("[BLAD: Swift MLX zwrocil kod {}]", result),
+                    text: msg,
                     is_final: true,
                 });
             }

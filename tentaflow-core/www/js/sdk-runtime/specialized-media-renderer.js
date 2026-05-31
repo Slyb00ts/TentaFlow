@@ -18,6 +18,18 @@ import {
 } from './data-chart-shared.js';
 import { parseDimensionToken, parseAspectRatio } from './data-specialised-renderer.js';
 
+// tf-video-stream is registered globally by the app component bundle; the
+// renderer creates it via document.createElement (same pattern as tf-input in
+// form-text-renderer) — no import here so the node test harness can load.
+
+// A `camera:<id>` stream_id is a live subscribe ref served over the binary
+// protocol via tf-video-stream (MSE) — NOT a media URL. It's the only subscribe
+// scheme the core wires today (dispatch/stream.rs CAMERA_PREFIX); every other
+// value stays on the plain <video src> path.
+function isSubscribeStreamId(v) {
+  return typeof v === 'string' && v.startsWith('camera:');
+}
+
 // =============================================================================
 // VideoStream (0x0604)
 // =============================================================================
@@ -49,6 +61,26 @@ function renderVideoStream(component, ctx) {
   wrapper.classList.add('tf-video-stream');
   if (widthPx != null) wrapper.style.width = `${widthPx}px`;
   if (aspectRatio != null) wrapper.style.aspectRatio = aspectRatio;
+
+  // Live subscribe stream (camera:…) → tf-video-stream (MediaSource over the
+  // binary streamSubscribeRequest). A raw rtsp(s):// URL is NOT browser-playable;
+  // forcing it into <video src> is what produced ERR_UNKNOWN_URL_SCHEME.
+  if (isSubscribeStreamId(resolveBindRef(streamIdBind, ctx.store))) {
+    const tile = document.createElement('tf-video-stream');
+    tile.style.display = 'block';
+    tile.style.width = '100%';
+    tile.style.height = '100%';
+    tile.style.setProperty('--tf-video-stream-height', '100%');
+    const applyId = () => {
+      const v = resolveBindRef(streamIdBind, ctx.store);
+      if (typeof v === 'string' && v.length > 0) tile.setAttribute('stream-id', v);
+      else tile.removeAttribute('stream-id');
+    };
+    applyId();
+    ctx.registerCleanup(subscribeBindRef(streamIdBind, ctx.store, applyId));
+    wrapper.appendChild(tile);
+    return wrapper;
+  }
 
   const video = document.createElement('video');
   video.classList.add('tf-video-stream__video');

@@ -444,7 +444,7 @@ pub async fn dispatch_reverse_stream_request(
     chat_request.stream = true;
 
     let route_result = match router
-        .route_chat_completion_stream(chat_request, None)
+        .route_chat_completion_stream(chat_request, None, None)
         .await
     {
         Ok(result) => result,

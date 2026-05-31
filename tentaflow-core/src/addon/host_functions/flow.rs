@@ -18,14 +18,19 @@
 // `B` for status/cancel as well (the operations expose RODO-tracked DAG
 // state).
 //
-// Wire format: TOML on both sides. The output of invoke/status mirrors
-// the `InvocationStatus` shape returned by `FlowScheduler` so the addon
-// SDK can deserialize a single struct regardless of which call produced
-// the row.
+// Wire format: CBOR on both sides (structs in `tentaflow-sdk-spec`). The opaque
+// flow-operator payload still rides inside the CBOR input/output as TOML text
+// (`input_toml` / `result_toml`) — that is the flow runtime's own data-plane
+// contract, not the host-fn ABI format. The output of invoke/status mirrors the
+// `InvocationStatus` shape returned by `FlowScheduler` so the addon SDK can
+// decode a single struct regardless of which call produced the row.
 
-use serde::{Deserialize, Serialize};
+use tentaflow_sdk_spec::{
+    FlowCancelOutput, FlowInvocationIdInput, FlowInvocationOutput, FlowInvokeInput,
+};
 
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
+use super::abi_helpers::PayloadKind;
+use super::cbor_io::{decode_cbor_exact, write_cbor_capped};
 use super::{
     audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
 };
@@ -46,65 +51,24 @@ const ACTION_STATUS: &str = "flow.status";
 const ACTION_CANCEL: &str = "flow.cancel";
 
 // =============================================================================
-// Wire payloads
+// Wire payloads — defined in `tentaflow-sdk-spec` (CBOR). The flow-operator
+// data plane (`input_toml` / `result_toml`) crosses inside those structs as
+// opaque TOML text; it is the flow runtime's own contract, not the host-fn ABI
+// serialization format. The conversion to the scheduler's `toml::Value`
+// happens at this boundary only.
 // =============================================================================
 
-#[derive(Debug, Deserialize)]
-struct FlowInvokeInput {
-    flow_id: String,
-    /// Opaque payload forwarded to operators as `OperatorContext.input_toml`.
-    /// Defaults to an empty TOML table when omitted so an addon can fire a
-    /// trigger-only flow with `{ flow_id = "..." }`.
-    #[serde(default = "empty_toml_table")]
-    input: toml::Value,
-    /// 0 = async (returns immediately with `status='running'`).
-    /// >0 = sync up to `MAX_SYNC_WAIT_MS` (clamped silently).
-    #[serde(default)]
-    wait_ms: u32,
-}
-
-fn empty_toml_table() -> toml::Value {
-    toml::Value::Table(toml::value::Table::new())
-}
-
-#[derive(Debug, Deserialize)]
-struct FlowIdInput {
-    invocation_id: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct FlowInvocationOutput {
-    pub invocation_id: String,
-    pub status: String,
-    pub started_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<String>,
-    pub operators_completed: i64,
-    pub operators_total: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_toml: Option<String>,
-}
-
-impl From<InvocationStatus> for FlowInvocationOutput {
-    fn from(s: InvocationStatus) -> Self {
-        Self {
-            invocation_id: s.invocation_id,
-            status: s.status,
-            started_at: s.started_at,
-            finished_at: s.finished_at,
-            operators_completed: s.operators_completed,
-            operators_total: s.operators_total,
-            error: s.error,
-            result_toml: s.result_toml,
-        }
+fn invocation_output_from_status(s: InvocationStatus) -> FlowInvocationOutput {
+    FlowInvocationOutput {
+        invocation_id: s.invocation_id,
+        status: s.status,
+        started_at: s.started_at,
+        finished_at: s.finished_at,
+        operators_completed: s.operators_completed,
+        operators_total: s.operators_total,
+        error: s.error,
+        result_toml: s.result_toml,
     }
-}
-
-#[derive(Debug, Serialize)]
-pub struct FlowCancelOutput {
-    pub cancelled: bool,
 }
 
 // =============================================================================
@@ -133,53 +97,32 @@ fn audit(
 
 // =============================================================================
 // Wire framing — payloads are typically a few hundred bytes (invocation ids
-// + status text); the Secret bucket's 64 KiB ceiling is the right default.
-// Input is read once into a string; output is encoded via the standard
-// out_cap retry helper so the SDK can resize on `OutputBufferTooSmall`.
+// + status text); the Secret bucket's 64 KiB ceiling is the right input cap.
+// Input is read + decoded from CBOR by the size-checking shared helper; output
+// is encoded via the standard out_cap retry helper so the SDK can resize on
+// `OutputBufferTooSmall`. The Secret-bucket input check is applied here before
+// decoding because the shared `read_input_cbor` ServiceCall ceiling would be
+// looser than the historical 64 KiB flow input cap.
 // =============================================================================
 
-fn read_toml_input(
+fn read_flow_input<T>(
     memory: &super::super::runtime::WasmMemory,
     caller: &WasmCaller<'_, AddonState>,
     input_ptr: i32,
     input_len: i32,
-) -> Result<String, AbiError> {
+) -> Result<T, AbiError>
+where
+    T: for<'b> minicbor::Decode<'b, ()>,
+{
     if input_len < 0 {
         return Err(AbiError::Operation);
     }
-    if enforce_payload_size(input_len as usize, PayloadKind::Secret).is_err() {
+    if super::abi_helpers::enforce_payload_size(input_len as usize, PayloadKind::Secret).is_err() {
         return Err(AbiError::PayloadTooLarge);
     }
     let bytes =
         read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| AbiError::Operation)
-}
-
-fn write_toml_output<T: Serialize>(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &mut WasmCaller<'_, AddonState>,
-    value: &T,
-    out_ptr: i32,
-    out_cap: i32,
-    out_len_ptr: i32,
-) -> i32 {
-    let serialized = match toml::to_string(value) {
-        Ok(s) => s,
-        Err(_) => return AbiError::Operation.as_i32(),
-    };
-    if enforce_payload_size(serialized.len(), PayloadKind::Secret).is_err() {
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-    write_output_with_retry_semantics(
-        memory,
-        caller,
-        serialized.as_bytes(),
-        out_ptr,
-        out_cap,
-        out_len_ptr,
-    )
+    decode_cbor_exact(bytes)
 }
 
 // =============================================================================
@@ -192,11 +135,11 @@ fn write_toml_output<T: Serialize>(
 // tests exercise the full flow path without needing a real WasmCaller (see
 // `tests/flow_host_functions.rs`).
 //
-// The host-fn shells reduce to: get memory → read TOML → dispatch → write
-// TOML → return ABI code.
+// The host-fn shells reduce to: get memory → permission → decode CBOR →
+// dispatch → write CBOR → return ABI code.
 
 /// Outcome of a dispatch: either a typed AbiError (already audited) or a
-/// concrete output struct ready to be serialized to TOML.
+/// concrete output struct ready to be encoded to CBOR.
 pub enum DispatchOutcome<T> {
     Ok(T),
     Err(AbiError),
@@ -228,16 +171,8 @@ where
 pub fn dispatch_invoke(
     state: &AddonState,
     scheduler: &std::sync::Arc<FlowScheduler>,
-    toml_str: &str,
+    input: &FlowInvokeInput,
 ) -> DispatchOutcome<FlowInvocationOutput> {
-    let input: FlowInvokeInput = match toml::from_str(toml_str) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(state, ACTION_INVOKE, None, "denied", Some("bad_input"));
-            return DispatchOutcome::Err(AbiError::Operation);
-        }
-    };
-
     if !check_permission(state, PERM_FLOW_INVOKE, None) {
         audit(
             state,
@@ -249,6 +184,28 @@ pub fn dispatch_invoke(
         return DispatchOutcome::Err(AbiError::Permission);
     }
 
+    // The opaque operator payload arrives as TOML text inside the CBOR input;
+    // parse it into the scheduler's `toml::Value` here at the ABI boundary. An
+    // empty/absent blob collapses to an empty TOML table (trigger-only flow).
+    let input_text = input.input_toml_or_empty().trim();
+    let operator_input = if input_text.is_empty() {
+        toml::Value::Table(toml::value::Table::new())
+    } else {
+        match toml::from_str::<toml::Value>(input_text) {
+            Ok(v) => v,
+            Err(_) => {
+                audit(
+                    state,
+                    ACTION_INVOKE,
+                    Some(&input.flow_id),
+                    "denied",
+                    Some("bad_input"),
+                );
+                return DispatchOutcome::Err(AbiError::Operation);
+            }
+        }
+    };
+
     // P7: per-user audit attribution — propagate the operator's user_id from
     // AddonState into flow_invocations so DoD-9 / DoD-10 reports can attribute
     // the invocation to the human actor instead of `actor=system`. System
@@ -259,7 +216,7 @@ pub fn dispatch_invoke(
         scheduler,
         &state.addon_id,
         &input.flow_id,
-        input.input.clone(),
+        operator_input,
         input.wait_ms,
         actor_user_id,
         org_id,
@@ -309,7 +266,7 @@ pub fn run_invoke(
         org_id,
     ));
     match res {
-        Ok(status) => Ok(FlowInvocationOutput::from(status)),
+        Ok(status) => Ok(invocation_output_from_status(status)),
         Err(e) => Err(map_invoke_error(&e)),
     }
 }
@@ -322,7 +279,7 @@ pub fn run_status(
 ) -> Result<FlowInvocationOutput, (AbiError, &'static str)> {
     let res = block_on_runtime(scheduler.status(invocation_id, addon_id));
     match res {
-        Ok(status) => Ok(FlowInvocationOutput::from(status)),
+        Ok(status) => Ok(invocation_output_from_status(status)),
         Err(e) => Err(map_invoke_error(&e)),
     }
 }
@@ -343,16 +300,8 @@ pub fn run_cancel(
 pub fn dispatch_status(
     state: &AddonState,
     scheduler: &std::sync::Arc<FlowScheduler>,
-    toml_str: &str,
+    input: &FlowInvocationIdInput,
 ) -> DispatchOutcome<FlowInvocationOutput> {
-    let input: FlowIdInput = match toml::from_str(toml_str) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(state, ACTION_STATUS, None, "denied", Some("bad_input"));
-            return DispatchOutcome::Err(AbiError::Operation);
-        }
-    };
-
     if !check_permission(state, PERM_FLOW_INVOKE, None) {
         audit(
             state,
@@ -385,16 +334,8 @@ pub fn dispatch_status(
 pub fn dispatch_cancel(
     state: &AddonState,
     scheduler: &std::sync::Arc<FlowScheduler>,
-    toml_str: &str,
+    input: &FlowInvocationIdInput,
 ) -> DispatchOutcome<FlowCancelOutput> {
-    let input: FlowIdInput = match toml::from_str(toml_str) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(state, ACTION_CANCEL, None, "denied", Some("bad_input"));
-            return DispatchOutcome::Err(AbiError::Operation);
-        }
-    };
-
     if !check_permission(state, PERM_FLOW_INVOKE, None) {
         audit(
             state,
@@ -442,8 +383,27 @@ pub fn flow_invoke_v1(
         None => return AbiError::Operation.as_i32(),
     };
 
-    let toml_str = match read_toml_input(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
+    // Capability check is decode-independent (it never inspects the flow id),
+    // so run it before reading/decoding the guest CBOR. This keeps the
+    // permission boundary ahead of attacker-controlled payload parsing, matching
+    // camera/streaming/recording/vector host fns. The decode-dependent ownership
+    // checks (flow_id resolution, invocation ownership) still run later inside
+    // dispatch_invoke. dispatch_invoke re-checks the same permission because it
+    // is also called directly from integration tests; the early return here
+    // means the denied path never reaches that second check, so no double audit.
+    if !check_permission(caller.data(), PERM_FLOW_INVOKE, None) {
+        audit(
+            caller.data(),
+            ACTION_INVOKE,
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+
+    let input: FlowInvokeInput = match read_flow_input(&memory, &caller, input_ptr, input_len) {
+        Ok(v) => v,
         Err(e) => {
             audit(
                 caller.data(),
@@ -457,10 +417,16 @@ pub fn flow_invoke_v1(
     };
 
     let scheduler = FlowScheduler::global();
-    match dispatch_invoke(caller.data(), &scheduler, &toml_str) {
-        DispatchOutcome::Ok(out) => {
-            write_toml_output(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
-        }
+    match dispatch_invoke(caller.data(), &scheduler, &input) {
+        DispatchOutcome::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::Secret,
+        ),
         DispatchOutcome::Err(e) => e.as_i32(),
     }
 }
@@ -479,8 +445,24 @@ pub fn flow_status_v1(
         None => return AbiError::Operation.as_i32(),
     };
 
-    let toml_str = match read_toml_input(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
+    // Permission boundary ahead of CBOR decode (see flow_invoke_v1). The
+    // decode-dependent ownership filter (per-addon invocation lookup) stays in
+    // dispatch_status. The early return prevents the denied path from reaching
+    // dispatch_status's own check, so there is no double audit.
+    if !check_permission(caller.data(), PERM_FLOW_INVOKE, None) {
+        audit(
+            caller.data(),
+            ACTION_STATUS,
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+
+    let input: FlowInvocationIdInput = match read_flow_input(&memory, &caller, input_ptr, input_len)
+    {
+        Ok(v) => v,
         Err(e) => {
             audit(
                 caller.data(),
@@ -494,10 +476,16 @@ pub fn flow_status_v1(
     };
 
     let scheduler = FlowScheduler::global();
-    match dispatch_status(caller.data(), &scheduler, &toml_str) {
-        DispatchOutcome::Ok(out) => {
-            write_toml_output(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
-        }
+    match dispatch_status(caller.data(), &scheduler, &input) {
+        DispatchOutcome::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::Secret,
+        ),
         DispatchOutcome::Err(e) => e.as_i32(),
     }
 }
@@ -516,8 +504,24 @@ pub fn flow_cancel_v1(
         None => return AbiError::Operation.as_i32(),
     };
 
-    let toml_str = match read_toml_input(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
+    // Permission boundary ahead of CBOR decode (see flow_invoke_v1). The
+    // decode-dependent ownership filter (per-addon invocation lookup) stays in
+    // dispatch_cancel. The early return prevents the denied path from reaching
+    // dispatch_cancel's own check, so there is no double audit.
+    if !check_permission(caller.data(), PERM_FLOW_INVOKE, None) {
+        audit(
+            caller.data(),
+            ACTION_CANCEL,
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+
+    let input: FlowInvocationIdInput = match read_flow_input(&memory, &caller, input_ptr, input_len)
+    {
+        Ok(v) => v,
         Err(e) => {
             audit(
                 caller.data(),
@@ -531,10 +535,16 @@ pub fn flow_cancel_v1(
     };
 
     let scheduler = FlowScheduler::global();
-    match dispatch_cancel(caller.data(), &scheduler, &toml_str) {
-        DispatchOutcome::Ok(out) => {
-            write_toml_output(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
-        }
+    match dispatch_cancel(caller.data(), &scheduler, &input) {
+        DispatchOutcome::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::Secret,
+        ),
         DispatchOutcome::Err(e) => e.as_i32(),
     }
 }
@@ -548,7 +558,9 @@ pub fn flow_cancel_v1(
 pub mod test_api {
     pub use super::{
         dispatch_cancel, dispatch_invoke, dispatch_status, map_invoke_error, run_cancel,
-        run_invoke, run_status, DispatchOutcome, FlowCancelOutput, FlowInvocationOutput,
-        PERM_FLOW_INVOKE,
+        run_invoke, run_status, DispatchOutcome, PERM_FLOW_INVOKE,
+    };
+    pub use tentaflow_sdk_spec::{
+        FlowCancelOutput, FlowInvocationIdInput, FlowInvocationOutput, FlowInvokeInput,
     };
 }

@@ -4851,6 +4851,9 @@ pub fn add_trusted_node(
          VALUES (?1, ?2, ?3, ?4, datetime('now'), 1)",
         rusqlite::params![node_id, public_key_hex, hostname, approved_by],
     )?;
+    drop(conn);
+    ensure_default_core_sync_policies(pool)?;
+    ensure_trusted_nodes_in_sync_identity(pool)?;
     Ok(())
 }
 
@@ -4920,6 +4923,63 @@ pub fn get_trusted_node_public_key(pool: &DbPool, node_id: &str) -> Result<Optio
         )
         .optional()?;
     Ok(result)
+}
+
+/// Upewnia się, że globalne zasoby core mają domyślne polityki synchronizacji.
+pub fn ensure_default_core_sync_policies(pool: &DbPool) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let mut inserted = 0usize;
+    for descriptor in crate::sync::core_registry::CORE_SYNC_DESCRIPTORS {
+        let policy_id = format!(
+            "policy-core-{}",
+            descriptor.resource_type.replace('.', "-")
+        );
+        inserted += conn.execute(
+            "INSERT OR IGNORE INTO sync_policies \
+             (policy_id, org_id, addon_id, resource_type, resource_id, mode, authority_node_id, retention_days, is_enabled) \
+             VALUES (?1, ?2, ?3, ?4, '', 'replicated_by_permission', NULL, NULL, 1)",
+            rusqlite::params![
+                policy_id,
+                crate::services::org::DEFAULT_ORG_ID,
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                descriptor.resource_type,
+            ],
+        )?;
+    }
+    Ok(inserted)
+}
+
+/// Przenosi aktywne zaufanie mesh do identity registry używanego przez sync.
+pub fn ensure_trusted_nodes_in_sync_identity(pool: &DbPool) -> Result<usize> {
+    let trusted_nodes = list_trusted_nodes(pool)?;
+    let conn = acquire(pool)?;
+    let mut changed = 0usize;
+    for node in trusted_nodes {
+        let display_name = if node.hostname.trim().is_empty() {
+            node.node_id.as_str()
+        } else {
+            node.hostname.as_str()
+        };
+        changed += conn.execute(
+            "INSERT INTO sync_nodes \
+             (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile) \
+             VALUES (?1, ?2, 'ed25519', ?3, 'unknown', 'trusted', NULL, 'standard') \
+             ON CONFLICT(node_id) DO UPDATE SET \
+                 public_key = excluded.public_key, \
+                 public_key_type = excluded.public_key_type, \
+                 display_name = CASE \
+                     WHEN sync_nodes.display_name = '' THEN excluded.display_name \
+                     ELSE sync_nodes.display_name \
+                 END, \
+                 trust_status = 'trusted' \
+             WHERE sync_nodes.public_key <> excluded.public_key \
+                OR sync_nodes.public_key_type <> excluded.public_key_type \
+                OR sync_nodes.trust_status <> 'trusted' \
+                OR sync_nodes.display_name = ''",
+            rusqlite::params![node.node_id, node.public_key, display_name],
+        )?;
+    }
+    Ok(changed)
 }
 
 // =============================================================================
@@ -5749,6 +5809,9 @@ fn can_node_receive_sync_resource_with_conn(
     if node.sync_profile == "authority" {
         return Ok(allow("authority_node"));
     }
+    if is_default_core_sync_resource(addon_id, resource_type) {
+        return Ok(allow("core_trusted_node"));
+    }
     if has_explicit_share_with_conn(
         conn,
         org_id,
@@ -5787,6 +5850,18 @@ fn can_node_receive_sync_resource_with_conn(
     }
 
     Ok(deny("no_assigned_user_access"))
+}
+
+fn is_default_core_sync_resource(addon_id: &str, resource_type: &str) -> bool {
+    if addon_id != crate::sync::core_registry::CORE_SYNC_ADDON_ID {
+        return false;
+    }
+    crate::sync::core_registry::descriptor_for_resource_type(resource_type)
+        .map(|descriptor| {
+            descriptor.scope == crate::sync::core_registry::CoreSyncScope::Organization
+                && descriptor.retention == crate::sync::core_registry::CoreSyncRetention::Durable
+        })
+        .unwrap_or(false)
 }
 
 fn load_sync_resource_acl_with_conn(
@@ -14477,6 +14552,35 @@ mod chunk_c_visibility_consumer_tests {
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].node_id, "node-target");
+    }
+
+    #[test]
+    fn default_core_sync_policy_targets_trusted_mesh_node() {
+        let db = make_db();
+        add_trusted_node(
+            &db,
+            "node-flow-target",
+            "pub-flow-target",
+            "Flow Target",
+            "test",
+        )
+        .expect("trusted node");
+
+        let targets = list_sync_targets_for_resource(
+            &db,
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.flow",
+            "flow-1",
+        )
+        .expect("targets");
+        let addon_targets =
+            list_sync_targets_for_resource(&db, "org-default", "contacts", "person", "person-1")
+                .expect("addon targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].node_id, "node-flow-target");
+        assert!(addon_targets.is_empty());
     }
 
     #[test]

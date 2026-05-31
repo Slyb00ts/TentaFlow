@@ -31,6 +31,79 @@ pub fn validate_local_source(vendor: &str, url: &str) -> Result<()> {
     local_source_description(vendor, url).map(|_| ())
 }
 
+/// A locally attached camera device suitable for a wizard dropdown:
+/// `device_path` is the value to feed back as the camera `url`, `label` is a
+/// human-readable name, `vendor` is the matching stable TentaFlow vendor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalCameraDevice {
+    pub device_path: String,
+    pub label: String,
+    pub vendor: String,
+}
+
+/// Enumerate locally attached camera devices.
+///
+/// Enumeration is platform-specific and currently implemented only for Linux
+/// via the v4l2 sysfs tree (`/sys/class/video4linux`). On every other platform
+/// there is no dependency-free way to list devices, so the result is an empty
+/// list rather than a fabricated one — callers treat that as "no enumeration on
+/// this platform", not as an error.
+pub fn list_local_devices() -> Vec<LocalCameraDevice> {
+    #[cfg(target_os = "linux")]
+    {
+        list_v4l2_devices()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Read the v4l2 sysfs tree and return one entry per `videoN` node that exposes
+/// a readable `name`. Nodes are sorted by their numeric index so the dropdown is
+/// stable across calls. Missing or unreadable `name` files are skipped — a v4l2
+/// node without a name is typically a metadata-only sub-device we cannot ingest.
+#[cfg(target_os = "linux")]
+fn list_v4l2_devices() -> Vec<LocalCameraDevice> {
+    let mut indexed: Vec<(u32, LocalCameraDevice)> = Vec::new();
+    let entries = match std::fs::read_dir("/sys/class/video4linux") {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let node = match file_name.to_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        let index: u32 = match node.strip_prefix("video").and_then(|n| n.parse().ok()) {
+            Some(i) => i,
+            None => continue,
+        };
+        let name_path = entry.path().join("name");
+        let label = match std::fs::read_to_string(&name_path) {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                trimmed.to_string()
+            }
+            Err(_) => continue,
+        };
+        indexed.push((
+            index,
+            LocalCameraDevice {
+                device_path: format!("/dev/video{index}"),
+                label,
+                vendor: "v4l2".to_string(),
+            },
+        ));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    indexed.into_iter().map(|(_, device)| device).collect()
+}
+
 fn local_caps_description(config: &CameraConfig) -> String {
     let mut caps = String::from("video/x-raw,format=RGB");
     if let Some((width, height)) = config.resolution {
@@ -121,6 +194,24 @@ mod tests {
     fn v4l2_rejects_non_device_path() {
         let err = v4l2_source("/tmp/video0").unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn list_local_devices_does_not_panic_without_hardware() {
+        // On a machine with no cameras (or non-Linux) this must return cleanly
+        // with an empty list rather than panicking. Every entry it does return
+        // must be a well-formed device path.
+        let devices = list_local_devices();
+        for device in &devices {
+            assert!(!device.device_path.is_empty());
+            assert!(!device.label.is_empty());
+            assert!(!device.vendor.is_empty());
+        }
+        #[cfg(target_os = "linux")]
+        for device in &devices {
+            assert!(device.device_path.starts_with("/dev/video"));
+            assert_eq!(device.vendor, "v4l2");
+        }
     }
 
     #[test]

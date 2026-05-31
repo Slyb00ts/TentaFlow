@@ -305,12 +305,18 @@
    :focus-visible — ring tylko przy keyboard, nie przy mouse click
    ============================================================================= */
 
+/* tf-* components own their own focus appearance (border + glow). The shell
+   must not stack a second ring on their internal controls — that produced the
+   "double border" on addon inputs that raw demo inputs never show. So this
+   a11y ring applies only to focusables that are NOT inside a tf-* component. */
 :where(.addon-app-shell button,
        .addon-app-shell a,
        .addon-app-shell input,
        .addon-app-shell textarea,
        .addon-app-shell select,
-       .addon-app-shell [tabindex]):focus-visible {
+       .addon-app-shell [tabindex]):not(:is(tf-input, tf-textarea, tf-select,
+       tf-searchbox, tf-pin-input, tf-color-input, tf-file-input, tf-slider,
+       tf-button, tf-toggle, tf-tabs, tf-menu, tf-chip) *):focus-visible {
   outline: 2px solid var(--sdk-color-primary);
   outline-offset: 2px;
   border-radius: var(--sdk-radius-sm);

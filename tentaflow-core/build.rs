@@ -948,6 +948,10 @@ mod services_manifest_build {
         pub quantization: Option<String>,
         #[serde(default)]
         pub recommended: bool,
+        /// Renders this preset as its own deployable catalog tile (featured
+        /// model) while reusing the parent engine's deploy path.
+        #[serde(default)]
+        pub featured: bool,
         /// Per-preset overrides for the three capability axes. Same
         /// semantics as on `Engine` — `None` falls through to engine
         /// then category defaults; explicit empty list is rejected.
@@ -1570,7 +1574,11 @@ fn generate_services_manifest(out_dir: &Path) {
         if !services_dir.is_dir() {
             continue;
         }
-        // Rerun-if-changed dla calego katalogu kategorii _services.
+        // Rerun-if-changed dla katalogu (lapie dodanie/usuniecie pliku) ORAZ
+        // dla kazdego pliku .toml osobno. Na APFS mtime katalogu NIE zmienia
+        // sie przy edycji zawartosci pliku, wiec sam katalog nie wystarcza —
+        // bez per-plik watch edycja manifestu nie przebudowuje binarki i
+        // zostaje stary baked manifest (np. brak featured preset).
         println!("cargo:rerun-if-changed={}", services_dir.display());
 
         let svc_entries = match std::fs::read_dir(&services_dir) {
@@ -1580,6 +1588,7 @@ fn generate_services_manifest(out_dir: &Path) {
         for svc in svc_entries.flatten() {
             let p = svc.path();
             if p.extension().and_then(|s| s.to_str()) == Some("toml") {
+                println!("cargo:rerun-if-changed={}", p.display());
                 manifest_files.push(p);
             }
         }
