@@ -231,13 +231,13 @@ Admin/DPO tworzy DSAR
 
 | ID | Zadanie | Złożoność | Zależności | Agent | Status |
 |----|---------|-----------|------------|-------|--------|
-| C3.1 | Dodać `AiGateway` start/finish/fail event | L | C1.3 | programista-rust | TODO |
-| C3.2 | Wpiąć `routing/chat.rs` blocking chat | M | C3.1 | programista-rust | TODO |
-| C3.3 | Wpiąć `routing/streaming.rs` streaming chat | L | C3.1 | programista-rust | TODO |
+| C3.1 | Dodać `AiGateway` start/finish/fail event | L | C1.3 | programista-rust | DONE |
+| C3.2 | Wpiąć `routing/chat.rs` blocking chat | M | C3.1 | programista-rust | DONE |
+| C3.3 | Wpiąć `routing/streaming.rs` streaming chat | L | C3.1 | programista-rust | DONE |
 | C3.4 | Wpiąć `flow_engine/node_adapters/llm.rs` | L | C3.1 | programista-rust | TODO |
-| C3.5 | Wpiąć addonowe `llm_generate` i streaming start | M | C3.1 | programista-rust | TODO |
+| C3.5 | Wpiąć addonowe `llm_generate` i streaming start | M | C3.1 | programista-rust | PARTIAL: `llm_generate` |
 | C3.6 | Wpiąć `vector_search_v1` jako źródła RAG | L | C3.1 | programista-rust | TODO |
-| C3.7 | Dodać testy prompt/response/source/tool capture | L | C3.2-C3.6 | tester-jednostkowy | TODO |
+| C3.7 | Dodać testy prompt/response/source/tool capture | L | C3.2-C3.6 | tester-jednostkowy | PARTIAL: prompt/response/tool |
 
 ### Faza 4: Data Inventory I ROPA
 

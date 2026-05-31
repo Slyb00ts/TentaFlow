@@ -6,6 +6,7 @@
 // =============================================================================
 
 use crate::api::openai::types::{ChatCompletionRequest, ChatCompletionResponse};
+use crate::compliance::ai_gateway::{AiGateway, AiGatewayContext};
 use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
 use crate::flow_engine::envelope::FlowExecutionOutcome;
@@ -32,6 +33,7 @@ impl Router {
         &self,
         request: ChatCompletionRequest,
         user: Option<crate::auth::acl::UserContext>,
+        compliance_context: Option<AiGatewayContext>,
     ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
@@ -107,6 +109,20 @@ impl Router {
             false
         };
 
+        let compliance_event = if let Some(db) = self.db.as_ref() {
+            let gateway = AiGateway::new(db.clone(), self.local_node_id());
+            Some(
+                gateway
+                    .start_chat_event(&request, user.as_ref(), compliance_context.as_ref())
+                    .map_err(|e| CoreError::InternalError {
+                        message: "compliance AI audit start failed".to_string(),
+                        source: Some(e),
+                    })?,
+            )
+        } else {
+            None
+        };
+
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
@@ -139,9 +155,25 @@ impl Router {
                         usage: Some(usage),
                         finish_reason,
                     };
+                    if let Some(event) = compliance_event.as_ref() {
+                        event
+                            .finish_success(&response)
+                            .map_err(|e| CoreError::InternalError {
+                                message: "compliance AI audit finish failed".to_string(),
+                                source: Some(e),
+                            })?;
+                    }
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }
                 Err(e) => {
+                    if let Some(event) = compliance_event.as_ref() {
+                        if let Err(audit_error) = event.finish_failed(&e.to_string()) {
+                            tracing::warn!(
+                                error = %audit_error,
+                                "compliance AI audit failure capture failed"
+                            );
+                        }
+                    }
                     // Stage 3d-0b-final: typed DispatchError → CoreError.
                     // Denied → 404, pozostałe → 500.
                     return Err(crate::routing::dispatch_error_to_core(e, &request.model).into());
@@ -153,6 +185,14 @@ impl Router {
         // Plan v1.5 wymaga że KAŻDY chat request przechodzi przez flow_engine
         // (synthetic albo user-defined). Direct executor.execute_chat fallback
         // wycięty.
+        if let Some(event) = compliance_event.as_ref() {
+            if let Err(audit_error) = event.finish_failed("flow_dispatcher_not_wired") {
+                tracing::warn!(
+                    error = %audit_error,
+                    "compliance AI audit failure capture failed"
+                );
+            }
+        }
         Err(crate::error::CoreError::InternalError {
             message: "flow_dispatcher not wired (DB-less router) — chat path \
                       requires Universal Flow Gateway"
@@ -160,6 +200,15 @@ impl Router {
             source: None,
         }
         .into())
+    }
+
+    pub(crate) fn local_node_id(&self) -> String {
+        let registry = self.service_manager.mesh_services_registry.read();
+        registry
+            .as_ref()
+            .map(|r| r.local().node_id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| "local".to_string())
     }
 
     pub async fn route_memory_via_quic(
@@ -269,7 +318,7 @@ impl Router {
             audio_input: None,
         };
 
-        match self.route_chat_completion(request, None).await {
+        match self.route_chat_completion(request, None, None).await {
             Ok(route_result) => {
                 let response = route_result.response;
                 let content = crate::routing::extract_response_text(&response);

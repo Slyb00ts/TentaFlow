@@ -392,6 +392,54 @@ test('observe auto-registers dynamic slot so later handleSlotContent renders int
   sm.destroy();
 });
 
+test('observer re-registers dynamic slot on replaceWith (removals before additions)', () => {
+  setup();
+  const { sm } = makeSlotManager();
+
+  // Capture the MutationObserver callback so we can feed it the exact mutation
+  // batch a reconcile _replaceNode (element.replaceWith) produces: ONE record
+  // carrying both removedNodes=[old] and addedNodes=[new] for the same slot_id.
+  let observerCb = null;
+  const RealMO = globalThis.MutationObserver;
+  globalThis.MutationObserver = class extends RealMO {
+    constructor(cb) { super(cb); observerCb = cb; }
+  };
+  try {
+    sm.observe(document.body);
+  } finally {
+    globalThis.MutationObserver = RealMO;
+  }
+  assert(observerCb, 'observer callback captured');
+
+  // Old dynamic slot container (e.g. modal body) registered on element A.
+  const a = document.createElement('div');
+  a.setAttribute('data-slot-id', 'x');
+  document.body.appendChild(a);
+  sm.registerSlot('x', a);
+  assert(sm.getSlotElement('x') === a, 'slot x initially on A');
+
+  // Reconcile replaces A with B in the DOM; B carries the same data-slot-id.
+  const b = document.createElement('div');
+  b.setAttribute('data-slot-id', 'x');
+  a.replaceWith(b);
+
+  // The browser delivers a single mutation record with BOTH lists set. Feed it
+  // through the real callback: removals must be processed before additions so
+  // the stale entry for A is dropped and B registers cleanly.
+  observerCb([{ addedNodes: [b], removedNodes: [a] }]);
+
+  assert(sm.hasSlot('x'), 'slot x must remain registered after replaceWith');
+  assert(sm.getSlotElement('x') === b, 'slot x must now point at the new element B');
+
+  // Content for the dynamic slot must render into the visible new element B.
+  sm.handleSlotContent({ slot_id: 'x', fragment: comp('Modal body') });
+  assertEq(b.children.length, 1, 'content rendered into B');
+  assertEq(b.children[0].textContent, 'Modal body', 'B holds the rendered content');
+  assertEq(a.children.length, 0, 'stale old element A receives nothing');
+
+  sm.destroy();
+});
+
 test('observe picks up existing data-slot-id elements', () => {
   setup();
   const { sm } = makeSlotManager();

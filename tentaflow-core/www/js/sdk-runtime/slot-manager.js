@@ -374,14 +374,25 @@ export class SlotManager {
     }
 
     this._observer = new MutationObserver((mutations) => {
+      // Process ALL removals across the whole batch BEFORE ANY additions.
+      // A reconcile _replaceNode (element.replaceWith(newEl)) on a component that
+      // carries a dynamic data-slot-id (e.g. modal body/footer) yields a single
+      // mutation record with removedNodes=[old] AND addedNodes=[new] for the same
+      // slot_id. If we registered the new node first, the guard `!_slots.has(id)`
+      // would skip it because the stale entry still exists, and the subsequent
+      // removal would then unregister the slot entirely — leaving the visible new
+      // div unregistered. Unregistering first frees the id so the new div
+      // registers cleanly and replays its buffered/current content.
+      for (const mutation of mutations) {
+        for (const node of mutation.removedNodes) {
+          if (node.nodeType !== ELEMENT_NODE) continue;
+          this._autoUnregisterTree(node);
+        }
+      }
       for (const mutation of mutations) {
         for (const node of mutation.addedNodes) {
           if (node.nodeType !== ELEMENT_NODE) continue;
           this._autoRegisterTree(node);
-        }
-        for (const node of mutation.removedNodes) {
-          if (node.nodeType !== ELEMENT_NODE) continue;
-          this._autoUnregisterTree(node);
         }
       }
     });
