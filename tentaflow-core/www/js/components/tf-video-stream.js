@@ -52,12 +52,31 @@ class TfVideoStream extends HTMLElement {
     this._disposed = false;
     if (!this._video) this._build();
     this._applyAttributes();
+    // The SDK reconciler can rip this element out of the DOM and re-insert it in
+    // the same tick (disconnect→connect churn). If a deferred stop is pending
+    // from such a disconnect, cancel it and KEEP the live subscription — do not
+    // restart it (restarting would tear down + rebuild the backend mux branch,
+    // which is exactly what left the tile stuck on "connecting").
+    if (this._stopTimer) {
+      clearTimeout(this._stopTimer);
+      this._stopTimer = null;
+      return;
+    }
     this._startSubscription();
   }
 
   disconnectedCallback() {
     this._disposed = true;
-    this._stopSubscription('detached');
+    // Defer the unsubscribe: a reconcile-driven disconnect is usually followed by
+    // an immediate reconnect (same element) or a replacement tile subscribing to
+    // the same stream. Holding the subscription open for a short grace period
+    // keeps the backend mux branch attached across the churn, so frames keep
+    // flowing instead of the branch detaching and re-attaching empty.
+    if (this._stopTimer) return;
+    this._stopTimer = setTimeout(() => {
+      this._stopTimer = null;
+      this._stopSubscription('detached (deferred)');
+    }, 1000);
   }
 
   attributeChangedCallback(name, oldValue, newValue) {
@@ -399,6 +418,10 @@ class TfVideoStream extends HTMLElement {
   }
 
   _stopSubscription(_reason) {
+    if (this._stopTimer) {
+      clearTimeout(this._stopTimer);
+      this._stopTimer = null;
+    }
     if (this._resubscribeTimer != null) {
       clearTimeout(this._resubscribeTimer);
       this._resubscribeTimer = null;
