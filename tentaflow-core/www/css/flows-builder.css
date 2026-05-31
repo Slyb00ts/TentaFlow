@@ -432,11 +432,24 @@
   transform: scale(1.15);
 }
 
-.fb-edge-flow {
-  fill: #a78bfa;
-  r: 3;
-  filter: drop-shadow(0 0 6px rgba(167,139,250,0.8));
+/* Animowany "przepływ energii" po krawędzi — pokazuje kierunek from→to.
+   Czysty CSS (animacja stroke-dashoffset na nakładce path), nie SVG
+   animateMotion — dzięki temu znika czysto przy `svg.innerHTML=''` (pan/zoom)
+   i nie zostawia duchów. Krótki jasny segment biegnie cyklicznie wzdłuż linii. */
+@keyframes fb-edge-flow-dash {
+  to { stroke-dashoffset: -16; }
 }
+.fb-edge-flow {
+  fill: none;
+  stroke: #a78bfa;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 2 14;
+  filter: drop-shadow(0 0 6px rgba(167,139,250,0.85));
+  pointer-events: none;
+  animation: fb-edge-flow-dash 0.9s linear infinite;
+}
+.fb-edge-flow.selected { stroke: #fca5a5; }
 
 /* Nody na canvas */
 .fb-node {
@@ -606,6 +619,18 @@
 .fb-port[class*="fb-port-type-"].drop-target {
   background: var(--port-color);
   box-shadow: 0 0 12px color-mix(in srgb, var(--port-color) 70%, transparent);
+}
+
+/* Hover nad NIEKOMPATYBILNYM portem podczas łączenia — czerwony, żeby user
+   widział, że typy się nie zgadzają, zanim puści (połączenie i tak odrzuci
+   walidacja typed na drop). Nadpisuje typed/accent kolory. */
+.fb-port.drop-incompatible,
+.fb-port[class*="fb-port-type-"].drop-incompatible {
+  background: var(--tf-danger, #ef4444) !important;
+  border-color: var(--tf-danger, #ef4444) !important;
+  transform: scale(1.3);
+  box-shadow: 0 0 12px color-mix(in srgb, #ef4444 75%, transparent);
+  cursor: not-allowed;
 }
 
 /* Etykieta portu (widoczna gdy node ma >=2 porty) dziedziczy kolor typu

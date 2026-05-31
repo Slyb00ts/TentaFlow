@@ -64,8 +64,8 @@ pub fn envelope_stream_to_audio_chunks(
             // serwera (`tracing::warn!`) i w SSE error event po stronie klienta.
             Ok(EnvelopeDelta::Llm(_)) => {
                 tracing::warn!(
-                    "audio sink received Llm delta — flow musi mieć tts_stream_bridge \
-                     albo blocking output FlowValue::Audio"
+                    "audio sink received Llm delta — flow musi mieć tts node w trybie \
+                     streaming albo blocking output FlowValue::Audio"
                 );
                 let json = serde_json::json!({
                     "error": "audio sink received Llm delta — flow misconfig"

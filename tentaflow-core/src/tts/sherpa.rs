@@ -71,6 +71,12 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
             "[sherpa-onnx] uzywam istniejacego cache: {}",
             target.display()
         );
+        // Cache z wczesniejszej wersji moze nie miec wstrzyknietych metadanych
+        // ONNX dla raw Piper voices — domykamy idempotentnie.
+        let t = target.clone();
+        tokio::task::spawn_blocking(move || ensure_piper_onnx_metadata(&t))
+            .await
+            .context("blocking task panic")??;
         return Ok(target);
     }
 
@@ -79,7 +85,8 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
     info!("[sherpa-onnx] pobieranie {} -> {}", repo, target.display());
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        download_and_prepare(&repo, &target_clone)
+        download_and_prepare(&repo, &target_clone)?;
+        ensure_piper_onnx_metadata(&target_clone)
     })
     .await
     .context("blocking task panic")??;
@@ -278,6 +285,145 @@ fn generate_tokens_from_piper_json(json_path: &Path, out_path: &Path) -> Result<
     Ok(())
 }
 
+/// Raw Piper voices (`<voice>.onnx` + `<voice>.onnx.json`) nie maja metadanych
+/// ONNX, ktorych wymaga loader VITS w sherpa-onnx (`sample_rate`, `n_speakers`,
+/// `language`, `comment`). Bez nich `OfflineTtsVitsModel::Init` rzuca
+/// "'sample_rate' does not exist in the metadata". Wstrzykujemy je raz, czytajac
+/// wartosci z `<voice>.onnx.json` (Piper config) i dopisujac `metadata_props` do
+/// protobuf modelu. Idempotentne (marker per voice). Voices z formatu
+/// sherpa-bundle (bez `.onnx.json`) pomijamy — maja juz metadane.
+fn ensure_piper_onnx_metadata(dir: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let onnx = entry.path();
+        let Some(name) = onnx.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".onnx") || name.ends_with(".onnx.json") {
+            continue;
+        }
+        let json = dir.join(format!("{name}.json"));
+        if !json.exists() {
+            continue;
+        }
+        let marker = dir.join(format!("{name}.sherpa-meta"));
+        if marker.exists() {
+            continue;
+        }
+        let meta = piper_metadata_from_json(&json)?;
+        append_onnx_metadata(&onnx, &meta)
+            .with_context(|| format!("wstrzykiwanie metadanych VITS do {}", onnx.display()))?;
+        std::fs::write(&marker, b"1").ok();
+        info!(
+            "[sherpa-onnx] wstrzyknieto metadane VITS do {}",
+            onnx.display()
+        );
+    }
+    Ok(())
+}
+
+/// Buduje wpisy metadanych VITS z Piper `<voice>.onnx.json`. Wszystkie wartosci
+/// sa stringami — ONNX `metadata_props` to mapa string→string, sherpa parsuje
+/// inty z napisow.
+fn piper_metadata_from_json(json_path: &Path) -> Result<Vec<(String, String)>> {
+    let bytes =
+        std::fs::read(json_path).with_context(|| format!("read {}", json_path.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse json {}", json_path.display()))?;
+
+    let sample_rate = v
+        .get("audio")
+        .and_then(|a| a.get("sample_rate"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(22050);
+    let n_speakers = v
+        .get("num_speakers")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(1)
+        .max(1);
+    let voice = v
+        .get("espeak")
+        .and_then(|e| e.get("voice"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    // `language` jest wymagane przez sherpa (brak defaultu); spadamy na espeak
+    // voice gdy Piper json nie ma `language.code`.
+    let language = v
+        .get("language")
+        .and_then(|l| l.get("code"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if voice.is_empty() {
+                "unknown".to_string()
+            } else {
+                voice.clone()
+            }
+        });
+
+    Ok(vec![
+        ("model_type".to_string(), "vits".to_string()),
+        // `comment` musi zawierac "piper" — sherpa po tym wykrywa is_piper i
+        // wlacza espeak phonemizer + interspersed blanks.
+        ("comment".to_string(), "piper".to_string()),
+        ("language".to_string(), language),
+        ("voice".to_string(), voice),
+        ("sample_rate".to_string(), sample_rate.to_string()),
+        ("n_speakers".to_string(), n_speakers.to_string()),
+        // Piper trenuje z blank tokenami; sherpa default 0 dalby zly prozodyjnie
+        // / niezrozumialy dzwiek.
+        ("add_blank".to_string(), "1".to_string()),
+    ])
+}
+
+/// Dopisuje wpisy `metadata_props` (ModelProto field 14) na koniec
+/// zserializowanego ONNX. Protobuf scala powtarzalne pola dopisane na koncu
+/// wiadomosci, wiec nie musimy parsowac/przepisywac calego ModelProto. Raw Piper
+/// `.onnx` nie ma `metadata_props`, wiec nie powstaja duplikaty kluczy.
+fn append_onnx_metadata(onnx_path: &Path, entries: &[(String, String)]) -> Result<()> {
+    let mut bytes =
+        std::fs::read(onnx_path).with_context(|| format!("read {}", onnx_path.display()))?;
+    for (key, value) in entries {
+        // StringStringEntryProto { key = field 1, value = field 2 }
+        let mut entry = Vec::new();
+        pb_string_field(&mut entry, 1, key);
+        pb_string_field(&mut entry, 2, value);
+        // ModelProto.metadata_props = field 14 (length-delimited message)
+        pb_len_field(&mut bytes, 14, &entry);
+    }
+    std::fs::write(onnx_path, &bytes).with_context(|| format!("write {}", onnx_path.display()))?;
+    Ok(())
+}
+
+fn pb_varint(buf: &mut Vec<u8>, mut n: u64) {
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n != 0 {
+            buf.push(byte | 0x80);
+        } else {
+            buf.push(byte);
+            break;
+        }
+    }
+}
+
+fn pb_string_field(buf: &mut Vec<u8>, field: u64, s: &str) {
+    pb_varint(buf, (field << 3) | 2);
+    pb_varint(buf, s.len() as u64);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn pb_len_field(buf: &mut Vec<u8>, field: u64, data: &[u8]) {
+    pb_varint(buf, (field << 3) | 2);
+    pb_varint(buf, data.len() as u64);
+    buf.extend_from_slice(data);
+}
+
 /// Pobiera (raz, idempotentnie) `espeak-ng-data/` ze znanego sherpa-compatible
 /// repo i zwraca sciezke do lokalnego shared cache. Kolejne wywolania zwracaja
 /// istniejacy katalog bez ruchu sieciowego.
@@ -363,6 +509,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 pub struct SherpaTtsEngine {
     inner: Mutex<Option<VitsTts>>,
     model_info: Mutex<Option<TtsModelInfo>>,
+    /// Podpowiedz ktory voice wybrac z wielogłosowego repo (np. preset
+    /// `vits-piper-pl_PL-jarvis_wg_glos-medium`). `load_model` preferuje
+    /// `<voice>.onnx`, ktorego stem jest zawarty w tej podpowiedzi; bez niej
+    /// (lub gdy brak dopasowania) bierze pierwszy `.onnx` w katalogu.
+    voice_hint: Mutex<Option<String>>,
 }
 
 impl Default for SherpaTtsEngine {
@@ -376,8 +527,44 @@ impl SherpaTtsEngine {
         Self {
             inner: Mutex::new(None),
             model_info: Mutex::new(None),
+            voice_hint: Mutex::new(None),
         }
     }
+
+    /// Ustawia podpowiedz voice (preset/model_name) przed `load_model`.
+    pub fn set_voice_hint(&self, hint: Option<&str>) {
+        *self.voice_hint.lock().unwrap() = hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+}
+
+/// Wybiera `<voice>.onnx` z katalogu pasujacy do podpowiedzi voice (stem pliku
+/// zawarty w `hint`, np. `pl_PL-jarvis_wg_glos-medium` w
+/// `vits-piper-pl_PL-jarvis_wg_glos-medium`). Bez dopasowania spada na pierwszy
+/// `.onnx` — zachowanie dla single-voice repo.
+fn pick_onnx_for_voice(dir: &Path, hint: Option<&str>) -> Option<PathBuf> {
+    if let Some(hint) = hint {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".onnx") || name.ends_with(".onnx.json") {
+                continue;
+            }
+            let stem = name.trim_end_matches(".onnx");
+            if !stem.is_empty() && hint.contains(stem) {
+                return Some(path);
+            }
+        }
+    }
+    find_file_with_ext(dir, ".onnx")
 }
 
 /// Znajduje pierwszy plik o danym suffix w katalogu (przyklad: `.onnx` /
@@ -409,7 +596,8 @@ impl TtsEngine for SherpaTtsEngine {
     }
 
     fn load_model(&mut self, model_dir: &Path) -> Result<TtsModelInfo> {
-        let model_path = find_file_with_ext(model_dir, ".onnx")
+        let hint = self.voice_hint.lock().unwrap().clone();
+        let model_path = pick_onnx_for_voice(model_dir, hint.as_deref())
             .ok_or_else(|| anyhow!("brak pliku .onnx w {}", model_dir.display()))?;
         let tokens_path = model_dir.join("tokens.txt");
         if !tokens_path.exists() {
@@ -480,5 +668,46 @@ impl TtsEngine for SherpaTtsEngine {
         // Zwracamy None zeby nie naruszac borrow rules; w praktyce caller
         // trzyma zwrocony info z load_model.
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"\x08\x07").unwrap();
+    }
+
+    #[test]
+    fn pick_onnx_for_voice_prefers_matching_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        // Wielogłosowe repo — kilka voices obok siebie.
+        touch(dir.path(), "pl_PL-jarvis_wg_glos-medium.onnx");
+        touch(dir.path(), "pl_PL-justyna_wg_glos-medium.onnx");
+        touch(dir.path(), "pl_PL-zenski_wg_glos-medium.onnx");
+        // Piper config sibling — picker musi go pomijac (to nie model).
+        touch(dir.path(), "pl_PL-jarvis_wg_glos-medium.onnx.json");
+
+        let picked = pick_onnx_for_voice(
+            dir.path(),
+            Some("vits-piper-pl_PL-jarvis_wg_glos-medium"),
+        )
+        .expect("powinien znalezc voice");
+        assert_eq!(
+            picked.file_name().and_then(|s| s.to_str()),
+            Some("pl_PL-jarvis_wg_glos-medium.onnx"),
+            "voice hint musi wybrac Jarvisa, nie pierwszy z dysku"
+        );
+    }
+
+    #[test]
+    fn pick_onnx_for_voice_falls_back_without_hint_or_match() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "only-voice.onnx");
+        // Brak hinta → pierwszy .onnx.
+        assert!(pick_onnx_for_voice(dir.path(), None).is_some());
+        // Hint bez dopasowania → tez fallback na pierwszy (single-voice repo).
+        assert!(pick_onnx_for_voice(dir.path(), Some("nieistniejacy-voice")).is_some());
     }
 }
