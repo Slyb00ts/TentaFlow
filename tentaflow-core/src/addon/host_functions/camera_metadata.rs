@@ -28,13 +28,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use tentaflow_sdk_spec::{
+    MetadataFrameOut, MetadataItemOut, MetadataPollInput, MetadataPollOutput,
+    MetadataSubscribeInput, MetadataSubscribeOutput, MetadataUnsubscribeInput,
+    MetadataUnsubscribeOutput,
+};
 use tracing::warn;
 
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
-use super::{
-    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
-};
+use super::abi_helpers::PayloadKind;
+use super::cbor_io::{read_input_cbor, write_cbor_capped};
+use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller};
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::get_camera_for_addon;
@@ -101,83 +104,6 @@ fn active_registry() -> &'static DashMap<String, Arc<ActiveSubscription>> {
 }
 
 // =============================================================================
-// Wire payloads (TOML)
-// =============================================================================
-
-#[derive(Debug, Deserialize)]
-struct SubscribeInput {
-    camera_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SubscribeOutput {
-    subscription_id: String,
-    status: &'static str,
-}
-
-#[derive(Debug, Deserialize)]
-struct UnsubscribeInput {
-    subscription_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct UnsubscribeOutput {
-    unsubscribed: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct PollInput {
-    subscription_id: String,
-    #[serde(default = "default_max_items")]
-    max_items: u32,
-    #[serde(default = "default_timeout_ms")]
-    timeout_ms: u32,
-}
-
-fn default_max_items() -> u32 {
-    10
-}
-
-fn default_timeout_ms() -> u32 {
-    5_000
-}
-
-#[derive(Debug, Serialize)]
-struct PollOutput {
-    frames: Vec<MetadataFrameOut>,
-    /// Set when the bus signalled `CameraOffline` mid-poll. The addon should
-    /// stop polling and treat the subscription as terminated.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    camera_offline: bool,
-    /// Set when the bus reported dropped frames (backpressure). The count
-    /// accumulates across polls until the addon catches up.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    dropped: u64,
-}
-
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-
-#[derive(Debug, Serialize)]
-struct MetadataFrameOut {
-    camera_id: String,
-    ts_unix_ms: i64,
-    items: Vec<MetadataItemOut>,
-}
-
-#[derive(Debug, Serialize)]
-struct MetadataItemOut {
-    class: String,
-    confidence: f64,
-    /// `[left, top, right, bottom]` in normalised 0..1 device coords.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bbox: Option<[f64; 4]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    track_id: Option<String>,
-}
-
-// =============================================================================
 // Host functions
 // =============================================================================
 
@@ -193,19 +119,6 @@ pub fn camera_metadata_subscribe_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.metadata.subscribe",
-                None,
-                "error",
-                Some("input_read_failed"),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERA_METADATA, None) {
         audit(
             caller.data(),
@@ -216,19 +129,24 @@ pub fn camera_metadata_subscribe_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: SubscribeInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "camera.metadata.subscribe",
-                None,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
+    let input: MetadataSubscribeInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "camera.metadata.subscribe",
+                    None,
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
 
     let addon_id = caller.data().addon_id.clone();
     let org_id = caller.data().org_id.clone();
@@ -380,11 +298,19 @@ pub fn camera_metadata_subscribe_v1(
         None,
     );
 
-    let out = SubscribeOutput {
+    let out = MetadataSubscribeOutput {
         subscription_id: stream_id.as_str().to_string(),
-        status: "subscribed",
+        status: "subscribed".to_string(),
     };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 pub fn camera_metadata_unsubscribe_v1(
@@ -399,19 +325,6 @@ pub fn camera_metadata_unsubscribe_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit(
-                caller.data(),
-                "camera.metadata.unsubscribe",
-                None,
-                "error",
-                Some("input_read_failed"),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERA_METADATA, None) {
         audit(
             caller.data(),
@@ -422,19 +335,24 @@ pub fn camera_metadata_unsubscribe_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: UnsubscribeInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit(
-                caller.data(),
-                "camera.metadata.unsubscribe",
-                None,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
+    let input: MetadataUnsubscribeInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "camera.metadata.unsubscribe",
+                    None,
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
 
     // Peek the active entry to enforce addon ownership BEFORE we atomically
     // remove it. The ownership check must precede the remove so a foreign
@@ -466,16 +384,17 @@ pub fn camera_metadata_unsubscribe_v1(
                     "denied",
                     Some("subscription_not_found"),
                 );
-                let out = UnsubscribeOutput {
+                let out = MetadataUnsubscribeOutput {
                     unsubscribed: false,
                 };
-                return write_toml_capped(
+                return write_cbor_capped(
                     &memory,
                     &mut caller,
                     &out,
                     out_ptr,
                     out_cap,
                     out_len_ptr,
+                    PayloadKind::ServiceCall,
                 );
             }
         }
@@ -497,10 +416,18 @@ pub fn camera_metadata_unsubscribe_v1(
                 "ok",
                 Some("already_unsubscribed"),
             );
-            let out = UnsubscribeOutput {
+            let out = MetadataUnsubscribeOutput {
                 unsubscribed: false,
             };
-            return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+            return write_cbor_capped(
+                &memory,
+                &mut caller,
+                &out,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
+                PayloadKind::ServiceCall,
+            );
         }
     };
 
@@ -526,8 +453,16 @@ pub fn camera_metadata_unsubscribe_v1(
         None,
     );
 
-    let out = UnsubscribeOutput { unsubscribed: true };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    let out = MetadataUnsubscribeOutput { unsubscribed: true };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 pub fn camera_metadata_poll_v1(
@@ -542,20 +477,6 @@ pub fn camera_metadata_poll_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit_with_risk(
-                caller.data(),
-                "camera.metadata.poll",
-                None,
-                RiskClass::C,
-                "error",
-                Some("input_read_failed"),
-            );
-            return e.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_CAMERA_METADATA, None) {
         audit_with_risk(
             caller.data(),
@@ -567,23 +488,28 @@ pub fn camera_metadata_poll_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: PollInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit_with_risk(
-                caller.data(),
-                "camera.metadata.poll",
-                None,
-                RiskClass::C,
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
+    let input: MetadataPollInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+            Ok(v) => v,
+            Err(e) => {
+                audit_with_risk(
+                    caller.data(),
+                    "camera.metadata.poll",
+                    None,
+                    RiskClass::C,
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
 
-    let timeout_ms = input.timeout_ms.min(MAX_POLL_TIMEOUT_MS);
-    let max_items = input.max_items.clamp(1, MAX_POLL_ITEMS) as usize;
+    let timeout_ms = input.timeout_ms_or_default().min(MAX_POLL_TIMEOUT_MS);
+    let max_items = input.max_items_or_default().clamp(1, MAX_POLL_ITEMS) as usize;
 
     let active = match active_registry().get(&input.subscription_id) {
         Some(e) => e.value().clone(),
@@ -660,12 +586,20 @@ pub fn camera_metadata_poll_v1(
         None,
     );
 
-    let out = PollOutput {
+    let out = MetadataPollOutput {
         frames,
         camera_offline,
         dropped,
     };
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -731,50 +665,6 @@ fn derive_events_service_url(device_service_url: &str) -> Option<String> {
     };
     new_url.set_path(&new_path);
     Some(new_url.to_string())
-}
-
-fn read_input_toml(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &WasmCaller<'_, AddonState>,
-    input_ptr: i32,
-    input_len: i32,
-) -> Result<String, AbiError> {
-    if input_len < 0 {
-        return Err(AbiError::Operation);
-    }
-    if enforce_payload_size(input_len as usize, PayloadKind::ServiceCall).is_err() {
-        return Err(AbiError::PayloadTooLarge);
-    }
-    let bytes =
-        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| AbiError::Operation)
-}
-
-fn write_toml_capped<T: Serialize>(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &mut WasmCaller<'_, AddonState>,
-    value: &T,
-    out_ptr: i32,
-    out_cap: i32,
-    out_len_ptr: i32,
-) -> i32 {
-    let serialized = match toml::to_string(value) {
-        Ok(s) => s,
-        Err(_) => return AbiError::Operation.as_i32(),
-    };
-    if enforce_payload_size(serialized.len(), PayloadKind::ServiceCall).is_err() {
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-    write_output_with_retry_semantics(
-        memory,
-        caller,
-        serialized.as_bytes(),
-        out_ptr,
-        out_cap,
-        out_len_ptr,
-    )
 }
 
 fn audit(

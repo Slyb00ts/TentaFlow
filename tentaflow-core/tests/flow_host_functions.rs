@@ -108,7 +108,11 @@ async fn flow_invoke_denied_without_permission() {
 
     // No permissions declared → dispatch must return Permission.
     let state = make_state(db, &addon, vec![]);
-    let payload = format!("flow_id = \"{flow_id}\"\nwait_ms = 100\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: flow_id.clone(),
+        input_toml: None,
+        wait_ms: 100,
+    };
     let out =
         tokio::task::spawn_blocking(move || flow_api::dispatch_invoke(&state, &sched, &payload))
             .await
@@ -116,6 +120,38 @@ async fn flow_invoke_denied_without_permission() {
     match out {
         flow_api::DispatchOutcome::Err(AbiError::Permission) => {}
         other => panic!("expected Permission, got {:?}", abi_label(&other)),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flow_invoke_permission_check_precedes_payload_parse() {
+    // A caller without `flow.invoke` must be rejected with Permission even when
+    // the operator payload is malformed. If the capability check did not run
+    // first, dispatch_invoke would parse `input_toml`, hit the bad-input branch
+    // and return Operation instead — proving the permission boundary sits ahead
+    // of attacker-controlled payload parsing.
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("perm-precedes");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    registry::global().register(&addon, make_flow(&flow_id));
+
+    let state = make_state(db, &addon, vec![]);
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: flow_id.clone(),
+        input_toml: Some("this = is = not = valid = toml".to_string()),
+        wait_ms: 100,
+    };
+    let out =
+        tokio::task::spawn_blocking(move || flow_api::dispatch_invoke(&state, &sched, &payload))
+            .await
+            .expect("join");
+    match out {
+        flow_api::DispatchOutcome::Err(AbiError::Permission) => {}
+        other => panic!(
+            "expected Permission (capability before payload parse), got {:?}",
+            abi_label(&other)
+        ),
     }
 }
 
@@ -128,7 +164,11 @@ async fn flow_invoke_ok_with_permission_returns_completed() {
     registry::global().register(&addon, make_flow(&flow_id));
 
     let state = make_state(db, &addon, vec![flow_api::PERM_FLOW_INVOKE.to_string()]);
-    let payload = format!("flow_id = \"{flow_id}\"\nwait_ms = 5000\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: flow_id.clone(),
+        input_toml: None,
+        wait_ms: 5000,
+    };
     let out =
         tokio::task::spawn_blocking(move || flow_api::dispatch_invoke(&state, &sched, &payload))
             .await

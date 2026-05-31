@@ -23,6 +23,11 @@ use tentaflow_sdk_spec::{
     Value, PathSegment, StatePath, PatchOp, PatchOpKind,
 };
 use tentaflow_sdk_spec::protocol::control::CborMap;
+use tentaflow_sdk_spec::protocol::camera::{
+    CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput, CameraInfoOut,
+    CameraListOut, CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
+    DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+};
 use tentaflow_sdk_spec::protocol::ui::{
     bind::BindRef,
     a11y::Accessibility,
@@ -36,6 +41,7 @@ use tentaflow_sdk_spec::protocol::ui::{
     actions::{Button as ButtonComp, IconButton as IconButtonComp, Link as LinkComp,
               FilterChips as FilterChipsComp},
     feedback::{Alert as AlertComp, Spinner as SpinnerComp, GateScreen as GateScreenComp},
+    feedback::overlays::Modal as ModalComp,
     molecules::EmptyState as EmptyStateComp,
     specialized::{VideoStream as VideoStreamComp, StepProgress as StepProgressComp},
     tokens::*,
@@ -74,6 +80,11 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
     fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_test_connection_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
 }
 
 // =============================================================================
@@ -108,43 +119,25 @@ fn notify(title: &str, body: &str) {
 // Camera ABI wrappers
 // =============================================================================
 
-#[derive(Debug, Clone)]
-struct CameraInfo {
-    camera_id: String,
-    display_name: String,
-    url: String,
-    vendor: String,
-    status: String,
-}
-
-#[derive(Debug, Clone)]
-struct CameraAddSpec {
-    display_name: String,
-    vendor: String,
-    url: String,
-    target_fps: u32,
-    resolution: Option<String>,
-    retention_class: String,
-    profile: String,
-}
-
-#[derive(Debug, Clone)]
-struct CameraAddResult {
-    camera_id: String,
-}
-
+/// Canonical ABI error codes returned by the camera host functions. Values
+/// match `tentaflow_core::addon::errors::AbiError` (positive 1..24; `0` = Ok).
+/// The host returns these directly as the i32 host-function result, so an addon
+/// must NOT negate the return value when classifying an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 enum AbiError {
     Permission = 1,
     NotFound = 2,
-    Conflict = 3,
-    QuotaExceeded = 4,
-    CameraUnreachable = 5,
-    CameraAuthFailed = 6,
-    CameraVendorUnsupported = 7,
-    PayloadTooLarge = 8,
-    Timeout = 9,
+    NoAvailableTarget = 3,
+    Timeout = 4,
+    Operation = 5,
+    OutputBufferTooSmall = 6,
+    Conflict = 7,
+    QuotaExceeded = 11,
+    CameraUnreachable = 12,
+    CameraAuthFailed = 13,
+    CameraVendorUnsupported = 14,
+    PayloadTooLarge = 21,
     Unknown = 99,
 }
 
@@ -153,13 +146,16 @@ impl AbiError {
         match code {
             1 => Self::Permission,
             2 => Self::NotFound,
-            3 => Self::Conflict,
-            4 => Self::QuotaExceeded,
-            5 => Self::CameraUnreachable,
-            6 => Self::CameraAuthFailed,
-            7 => Self::CameraVendorUnsupported,
-            8 => Self::PayloadTooLarge,
-            9 => Self::Timeout,
+            3 => Self::NoAvailableTarget,
+            4 => Self::Timeout,
+            5 => Self::Operation,
+            6 => Self::OutputBufferTooSmall,
+            7 => Self::Conflict,
+            11 => Self::QuotaExceeded,
+            12 => Self::CameraUnreachable,
+            13 => Self::CameraAuthFailed,
+            14 => Self::CameraVendorUnsupported,
+            21 => Self::PayloadTooLarge,
             _ => Self::Unknown,
         }
     }
@@ -171,119 +167,105 @@ impl core::fmt::Display for AbiError {
     }
 }
 
-fn camera_list() -> Result<Vec<CameraInfo>, AbiError> {
-    let mut buf = vec![0u8; 16384];
-    let mut out_len: i32 = 0;
-    let ret = unsafe {
-        camera_list_v1(
-            buf.as_mut_ptr() as i32, buf.len() as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if ret < 0 {
-        return Err(AbiError::from_code(-ret));
+/// Encodes `input` to CBOR and decodes the CBOR response of a host function
+/// with the standard `(input_ptr, input_len, out_ptr, out_cap, out_len_ptr)`
+/// ABI shape. On `OutputBufferTooSmall` the host writes the required size into
+/// `out_len_ptr`; we grow once and retry so a large response is not lost.
+fn call_cbor_in_out<I, O>(
+    input: &I,
+    host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
+) -> Result<O, AbiError>
+where
+    I: minicbor::Encode<()>,
+    O: for<'b> minicbor::Decode<'b, ()>,
+{
+    let mut input_bytes = Vec::new();
+    minicbor::encode(input, &mut input_bytes).map_err(|_| AbiError::Operation)?;
+    let mut cap = 16384usize;
+    loop {
+        let mut out = vec![0u8; cap];
+        let mut out_len: i32 = 0;
+        let ret = unsafe {
+            host_fn(
+                input_bytes.as_ptr() as i32,
+                input_bytes.len() as i32,
+                out.as_mut_ptr() as i32,
+                out.len() as i32,
+                &mut out_len as *mut i32 as i32,
+            )
+        };
+        if ret == AbiError::OutputBufferTooSmall as i32 {
+            cap = (out_len as usize).max(cap.saturating_mul(2));
+            continue;
+        }
+        if ret != 0 {
+            return Err(AbiError::from_code(ret));
+        }
+        out.truncate(out_len as usize);
+        return minicbor::decode(&out).map_err(|_| AbiError::Operation);
     }
-    let len = out_len as usize;
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    buf.truncate(len);
-    let json_str = String::from_utf8(buf).map_err(|_| AbiError::Unknown)?;
-    let arr: Vec<serde_json::Value> =
-        serde_json::from_str(&json_str).map_err(|_| AbiError::Unknown)?;
-    let cameras = arr
-        .iter()
-        .map(|v| CameraInfo {
-            camera_id: v.get("camera_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            display_name: v.get("display_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            vendor: v.get("vendor").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            status: v.get("status").and_then(|x| x.as_str()).unwrap_or("offline").to_string(),
-        })
-        .collect();
-    Ok(cameras)
 }
 
-fn camera_add(spec: &CameraAddSpec) -> Result<CameraAddResult, AbiError> {
-    let spec_json = serde_json::json!({
-        "display_name": spec.display_name,
-        "vendor": spec.vendor,
-        "url": spec.url,
-        "target_fps": spec.target_fps,
-        "resolution": spec.resolution,
-        "retention_class": spec.retention_class,
-        "profile": spec.profile,
-    });
-    let spec_bytes = spec_json.to_string();
-    let mut out = vec![0u8; 4096];
-    let mut out_len: i32 = 0;
-    let ret = unsafe {
-        camera_add_v1(
-            spec_bytes.as_ptr() as i32, spec_bytes.len() as i32,
-            out.as_mut_ptr() as i32, out.len() as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if ret < 0 {
-        return Err(AbiError::from_code(-ret));
+/// Decodes the CBOR response of a host function with the read-only
+/// `(out_ptr, out_cap, out_len_ptr)` ABI shape (`camera_list` / `camera_discover` /
+/// `camera_local_devices`).
+fn call_cbor_out<O>(
+    host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32,
+) -> Result<O, AbiError>
+where
+    O: for<'b> minicbor::Decode<'b, ()>,
+{
+    let mut cap = 16384usize;
+    loop {
+        let mut out = vec![0u8; cap];
+        let mut out_len: i32 = 0;
+        let ret = unsafe {
+            host_fn(
+                out.as_mut_ptr() as i32,
+                out.len() as i32,
+                &mut out_len as *mut i32 as i32,
+            )
+        };
+        if ret == AbiError::OutputBufferTooSmall as i32 {
+            cap = (out_len as usize).max(cap.saturating_mul(2));
+            continue;
+        }
+        if ret != 0 {
+            return Err(AbiError::from_code(ret));
+        }
+        out.truncate(out_len as usize);
+        return minicbor::decode(&out).map_err(|_| AbiError::Operation);
     }
-    let len = out_len as usize;
-    out.truncate(len);
-    let json_str = String::from_utf8(out).map_err(|_| AbiError::Unknown)?;
-    let v: serde_json::Value = serde_json::from_str(&json_str).map_err(|_| AbiError::Unknown)?;
-    Ok(CameraAddResult {
-        camera_id: v.get("camera_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-    })
+}
+
+fn camera_list() -> Result<Vec<CameraInfoOut>, AbiError> {
+    let out: CameraListOut = call_cbor_out(camera_list_v1)?;
+    Ok(out.camera)
+}
+
+fn camera_add(spec: CameraAddInput) -> Result<CameraAddOutput, AbiError> {
+    call_cbor_in_out(&spec, camera_add_v1)
 }
 
 fn camera_remove(id: &str) -> Result<(), AbiError> {
-    let input = serde_json::json!({ "camera_id": id }).to_string();
-    let mut out = vec![0u8; 256];
-    let mut out_len: i32 = 0;
-    let ret = unsafe {
-        camera_remove_v1(
-            input.as_ptr() as i32, input.len() as i32,
-            out.as_mut_ptr() as i32, out.len() as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if ret < 0 {
-        return Err(AbiError::from_code(-ret));
-    }
+    let input = CameraIdInput { camera_id: id.to_string() };
+    let _: CameraRemoveOut = call_cbor_in_out(&input, camera_remove_v1)?;
     Ok(())
 }
 
-fn camera_discover() -> Result<Vec<CameraInfo>, AbiError> {
-    let mut buf = vec![0u8; 16384];
-    let mut out_len: i32 = 0;
-    let ret = unsafe {
-        camera_discover_v1(
-            buf.as_mut_ptr() as i32, buf.len() as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if ret < 0 {
-        return Err(AbiError::from_code(-ret));
-    }
-    let len = out_len as usize;
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    buf.truncate(len);
-    let json_str = String::from_utf8(buf).map_err(|_| AbiError::Unknown)?;
-    let arr: Vec<serde_json::Value> =
-        serde_json::from_str(&json_str).map_err(|_| AbiError::Unknown)?;
-    let cameras = arr
-        .iter()
-        .map(|v| CameraInfo {
-            camera_id: String::new(),
-            display_name: v.get("display_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            vendor: v.get("vendor").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            status: "discovered".to_string(),
-        })
-        .collect();
-    Ok(cameras)
+fn camera_discover() -> Result<Vec<DiscoveredCameraOut>, AbiError> {
+    let out: CameraDiscoverOut = call_cbor_out(camera_discover_v1)?;
+    Ok(out.discovered)
+}
+
+fn camera_local_devices() -> Result<Vec<LocalCameraDeviceOut>, AbiError> {
+    let out: LocalCameraDevicesOut = call_cbor_out(camera_local_devices_v1)?;
+    Ok(out.devices)
+}
+
+fn camera_test_connection(vendor: &str, url: &str) -> Result<CameraTestConnectionOut, AbiError> {
+    let input = CameraTestConnectionInput { vendor: vendor.to_string(), url: url.to_string() };
+    call_cbor_in_out(&input, camera_test_connection_v1)
 }
 
 // =============================================================================
@@ -295,6 +277,37 @@ const PANEL_ID: &str = "overview";
 
 static PANEL_EPOCH: AtomicU64 = AtomicU64::new(1);
 static STATE_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Installs a process-wide panic hook exactly once. Without it a guest panic
+/// surfaces on the host only as a bare wasm trap with numeric `fnNNN` frames,
+/// which is unusable for diagnosis. The hook forwards the panic payload and its
+/// `file:line` source location to the host log so the actual cause of any
+/// future addon panic is recorded verbatim instead of being lost in the trap.
+fn install_panic_hook() {
+    use core::sync::atomic::AtomicBool;
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    // `swap` makes installation atomic and idempotent across on_start /
+    // on_panel_open and any later re-entry.
+    if INSTALLED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    std::panic::set_hook(alloc::boxed::Box::new(|info: &std::panic::PanicHookInfo| {
+        let location = info
+            .location()
+            .map(|l| alloc::format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        log::error(&alloc::format!(
+            "TentaVision PANIC at {}: {}",
+            location, message
+        ));
+    }));
+}
 
 fn next_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -329,6 +342,14 @@ fn send_panel_shell(layout: Component, slots: Vec<SlotDecl>, initial_state: Vec<
 }
 
 fn send_slot_content(slot_id: &str, fragment: Component) {
+    send_slot_content_with_overlay(slot_id, fragment, None);
+}
+
+/// Like `send_slot_content` but seeds store keys via `state_overlay` before the
+/// fragment renders. Used to seed the reactive wizard's initial state into the
+/// store the moment the `add_camera_body` fragment is delivered, so bound
+/// visibility flags resolve correctly on first paint.
+fn send_slot_content_with_overlay(slot_id: &str, fragment: Component, overlay: Option<Vec<StateEntry>>) {
     let epoch = PANEL_EPOCH.load(Ordering::Relaxed);
     let payload = UiPayload::SlotContent(SlotContent {
         addon_id: ADDON_ID.into(),
@@ -336,26 +357,43 @@ fn send_slot_content(slot_id: &str, fragment: Component) {
         panel_epoch: epoch,
         slot_id: slot_id.into(),
         fragment,
-        state_overlay: None,
+        state_overlay: overlay,
     });
     send_ui(&payload);
 }
 
 fn send_state_patch(key: &str, value: Value) {
-    let base = STATE_REVISION.load(Ordering::Relaxed);
+    send_state_patches(vec![(key.into(), value)]);
+}
+
+/// Applies several store keys in one atomic `StatePatch` (single revision bump).
+/// The reactive wizard uses this so that, e.g., advancing a step toggles the
+/// step visibility flags and footer-button flags together without the client
+/// observing a half-applied intermediate state.
+fn send_state_patches(pairs: Vec<(String, Value)>) {
+    if pairs.is_empty() {
+        return;
+    }
+    // `fetch_add` reserves a revision atomically: `base` is the previous value
+    // and `new_rev = base + 1`. A plain load+store could hand two concurrent
+    // patches the same base/new revision, so one would be rejected by the host.
+    let base = STATE_REVISION.fetch_add(1, Ordering::Relaxed);
     let new_rev = base + 1;
-    STATE_REVISION.store(new_rev, Ordering::Relaxed);
     let epoch = PANEL_EPOCH.load(Ordering::Relaxed);
+    let ops = pairs
+        .into_iter()
+        .map(|(key, value)| PatchOp {
+            path: StatePath::new(vec![PathSegment::Key(key)]),
+            op: PatchOpKind::Set { value },
+        })
+        .collect();
     let payload = UiPayload::StatePatch(StatePatch {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
         panel_epoch: epoch,
         base_revision: base,
         new_revision: new_rev,
-        ops: vec![PatchOp {
-            path: StatePath::new(vec![PathSegment::Key(key.into())]),
-            op: PatchOpKind::Set { value },
-        }],
+        ops,
     });
     send_ui(&payload);
 }
@@ -366,6 +404,27 @@ fn send_state_patch(key: &str, value: Value) {
 
 fn lit(s: &str) -> BindRef {
     BindRef::Literal(Value::Text(s.into()))
+}
+
+/// A reactive `BindRef` pointing at a top-level store key. Lets text/alert
+/// content track wizard state without re-sending the fragment.
+fn bound(key: &str) -> BindRef {
+    BindRef::Bound(StatePath::new(vec![PathSegment::Key(key.into())]))
+}
+
+/// Wraps a component so the renderer hides it whenever the bound boolean store
+/// key is `false`. This is the core of the reactive wizard: every step and
+/// per-type config block stays in the DOM and only toggles `hidden` as the
+/// store changes, so interactions never rebuild the panel.
+fn with_visible(mut component: Component, key: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::a11y::Visibility;
+    component.visibility = Some(Visibility {
+        visible: Some(bound(key)),
+        display_above_breakpoint: None,
+        display_below_breakpoint: None,
+        hidden_for_assistive: false,
+    });
+    component
 }
 
 fn with_a11y_label(mut component: Component, label: &str) -> Component {
@@ -470,6 +529,20 @@ fn text_styled(content: &str, style: &str) -> Component {
     TextComp {
         content: lit(content),
         style: ts,
+        tone: None,
+        align: None,
+        wrap: None,
+        max_lines: None,
+        format: None,
+    }.into_component(next_id()).expect("Text")
+}
+
+/// Text whose content tracks a store key reactively (used for the live
+/// connection-test outcome line in the wizard).
+fn text_bound(key: &str) -> Component {
+    TextComp {
+        content: bound(key),
+        style: TextStyle::Body,
         tone: None,
         align: None,
         wrap: None,
@@ -922,14 +995,25 @@ fn avatar(initials: &str, size: &str) -> Component {
 }
 
 fn empty_state(title: &str, message: Option<&str>, icon: Option<&str>) -> Component {
-    EmptyStateComp {
+    let built = EmptyStateComp {
         icon: icon_named(parse_icon_name(icon.unwrap_or("info"))),
         heading: lit(title),
         message: message.map(lit),
         primary_action: None,
         secondary_action: None,
         variant: EmptyStateVariant::Default,
-    }.into_component(next_id()).expect("EmptyState")
+    }.into_component(next_id());
+    // EmptyState sits on hot wizard/empty-list render paths. A validation
+    // failure here must degrade to a readable text node, never trap the whole
+    // on_request and corrupt guest memory; the real reason is logged so the
+    // panic hook / host log still pinpoints it.
+    match built {
+        Ok(c) => c,
+        Err(e) => {
+            log::error(&alloc::format!("TentaVision: EmptyState into_component failed: {:?}", e));
+            text(title)
+        }
+    }
 }
 
 fn spinner(size: &str) -> Component {
@@ -955,6 +1039,21 @@ fn alert(message: &str, tone: &str) -> Component {
         icon: None,
         title: None,
         message: lit(message),
+        actions: None,
+        dismissible: false,
+    }.into_component(next_id()).expect("Alert")
+}
+
+/// Alert whose message tracks a store key reactively. Visibility is toggled by
+/// the caller via `with_visible` so the wizard can show/hide errors and test
+/// results purely through `StatePatch`.
+fn alert_bound(message_key: &str, tone: &str) -> Component {
+    AlertComp {
+        tone: parse_tone(tone),
+        variant: AlertVariant::Default,
+        icon: None,
+        title: None,
+        message: bound(message_key),
         actions: None,
         dismissible: false,
     }.into_component(next_id()).expect("Alert")
@@ -1077,6 +1176,84 @@ fn select(label: &str, options: Vec<SelectOption>, field_id: &str) -> Component 
     }.into_component(field_id).expect("Select")
 }
 
+/// Text input that mirrors its value into backend wizard state on every change
+/// via the `wizard-field-change` action, tagged with `field`. Used by every
+/// per-type wizard field so step navigation never loses typed values.
+fn wizard_input(label: &str, placeholder: &str, field: &str, password: bool) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    // An empty placeholder literal (`Some(Text("")))`) is meaningless and some
+    // optional credential fields pass "" — encode it as absent rather than a
+    // zero-length literal so the field stays canonical.
+    let placeholder_ref = if placeholder.is_empty() { None } else { Some(lit(placeholder)) };
+    let mut comp = Input {
+        r#type: if password { InputType::Password } else { InputType::Text },
+        bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
+        placeholder: placeholder_ref,
+        label: Some(lit(label)),
+        hint: None,
+        leading_icon: None,
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }.into_component(field).expect("Input");
+    // Backend wizard state is the source of truth for validation (resolve_target
+    // on Next/Test/Submit), so every keystroke must commit. Using `Input` rather
+    // than `Change` avoids the lost-update race where the user types and clicks
+    // "Dalej" before the blur-fired `change` ever reaches the backend.
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "wizard-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Select that commits its picked value to backend wizard state on change,
+/// tagged with `field` (used for the USB device dropdown).
+fn wizard_select(label: &str, options: Vec<SelectOption>, field: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Select;
+    let mut comp = Select {
+        bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
+        options,
+        placeholder: None,
+        label: Some(lit(label)),
+        searchable: false,
+        clearable: false,
+        virtualize: false,
+        disabled: None,
+        size: InputSize::Md,
+        groups: None,
+    }.into_component(field).expect("Select");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "wizard-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
 fn toggle(label: &str, field_id: &str) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Toggle;
     Toggle {
@@ -1165,8 +1342,8 @@ struct PanelState {
     add_form_visible: bool,
     wizard_step: u8,
     cameras_filter: String,
-    form_name: String,
-    form_url: String,
+    // Camera selected via a table row click, pending a delete confirmation.
+    camera_pending_remove: Option<String>,
     error_message: Option<String>,
     success_message: Option<String>,
     discover: DiscoverState,
@@ -1443,18 +1620,146 @@ impl SearchState {
     }
 }
 
-struct DiscoverState {
-    visible: bool, scanning: bool, cameras: Vec<DiscoveredCam>,
-    selected_index: Option<usize>, custom_name: String, error_message: Option<String>,
+/// The four camera source types the backend supports. Drives every per-step
+/// branch of the add-camera wizard. `vendor()` maps each type to the stable
+/// TentaFlow vendor string the `camera_add` host function expects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceType { Onvif, Rtsp, Usb, File }
+
+impl SourceType {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "onvif" => Some(Self::Onvif),
+            "rtsp" => Some(Self::Rtsp),
+            "usb" => Some(Self::Usb),
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Usb => "usb", Self::File => "file" }
+    }
+    fn vendor(self) -> &'static str {
+        // USB enumeration reports `v4l2` on Linux; the local-device list carries
+        // the authoritative vendor, but the manual-path fallback uses this.
+        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Usb => "v4l2", Self::File => "fake_file" }
+    }
 }
-struct DiscoveredCam { vendor: String, url: String, suggested_name: String }
+
+/// One locally enumerated USB/v4l2 device offered in the wizard's device select.
+struct LocalDevice { device_path: String, label: String, vendor: String }
+
+/// Working state of the source-type-driven "Add camera" wizard. Each per-type
+/// field is committed to the backend on input change (`wizard-field-change`) so
+/// the test step and submit read consistent values across step navigation
+/// instead of relying on a single live form snapshot.
+struct DiscoverState {
+    source_type: Option<SourceType>,
+    // ONVIF discovery results.
+    scanning: bool,
+    cameras: Vec<DiscoveredCam>,
+    selected_index: Option<usize>,
+    // USB/v4l2 enumeration results and the picked device path.
+    usb_devices: Vec<LocalDevice>,
+    usb_loaded: bool,
+    usb_device_path: String,
+    // Per-type manual entry fields.
+    onvif_url: String,
+    rtsp_url: String,
+    file_path: String,
+    cred_user: String,
+    cred_pass: String,
+    // Step 3 connection test outcome (real probe, never faked).
+    test_result: Option<Result<String, String>>,
+    testing: bool,
+    // Step 4 metadata.
+    name: String,
+    retention: String,
+    fps: String,
+    // Analytics profile chosen in step 4. Committed from the profile select so
+    // the pick is authoritative on submit instead of a frontend-only value.
+    profile: String,
+    error_message: Option<String>,
+}
+struct DiscoveredCam { vendor: String, url: String, suggested_name: String, profile_token: Option<String> }
 impl DiscoverState {
     const fn new() -> Self {
-        Self { visible: false, scanning: false, cameras: Vec::new(), selected_index: None, custom_name: String::new(), error_message: None }
+        Self {
+            source_type: None,
+            scanning: false, cameras: Vec::new(), selected_index: None,
+            usb_devices: Vec::new(), usb_loaded: false, usb_device_path: String::new(),
+            onvif_url: String::new(), rtsp_url: String::new(), file_path: String::new(),
+            cred_user: String::new(), cred_pass: String::new(),
+            test_result: None, testing: false,
+            name: String::new(), retention: String::new(), fps: String::new(),
+            profile: String::new(),
+            error_message: None,
+        }
     }
     fn reset(&mut self) {
-        self.visible = false; self.scanning = false; self.cameras.clear();
-        self.selected_index = None; self.custom_name.clear(); self.error_message = None;
+        *self = Self::new();
+    }
+    /// Resolves the effective (vendor, url) for the current source type from the
+    /// committed wizard fields. Returns `Err` with a user-facing message when the
+    /// required field for the chosen type is missing or malformed.
+    fn resolve_target(&self) -> Result<(String, String, Option<String>), &'static str> {
+        match self.source_type {
+            Some(SourceType::Onvif) => {
+                if let Some(i) = self.selected_index {
+                    if let Some(cam) = self.cameras.get(i) {
+                        return Ok((cam.vendor.clone(), cam.url.clone(), cam.profile_token.clone()));
+                    }
+                }
+                let url = self.onvif_url.trim();
+                if url.is_empty() {
+                    return Err("Wybierz wykrytą kamerę ONVIF lub podaj adres URL urządzenia.");
+                }
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err("Adres ONVIF musi zaczynać się od http:// lub https://.");
+                }
+                Ok(("onvif".to_string(), url.to_string(), None))
+            }
+            Some(SourceType::Rtsp) => {
+                let url = self.rtsp_url.trim();
+                if url.is_empty() {
+                    return Err("Podaj adres strumienia RTSP.");
+                }
+                let lower = url.to_ascii_lowercase();
+                if !(lower.starts_with("rtsp://") || lower.starts_with("rtsps://")) {
+                    return Err("Adres RTSP musi zaczynać się od rtsp:// lub rtsps://.");
+                }
+                Ok(("rtsp".to_string(), url.to_string(), None))
+            }
+            Some(SourceType::Usb) => {
+                let path = self.usb_device_path.trim();
+                if path.is_empty() {
+                    return Err("Wybierz lub podaj ścieżkę urządzenia (np. /dev/video0).");
+                }
+                let vendor = self.usb_devices.iter()
+                    .find(|d| d.device_path == path)
+                    .map(|d| d.vendor.clone())
+                    .unwrap_or_else(|| SourceType::Usb.vendor().to_string());
+                Ok((vendor, path.to_string(), None))
+            }
+            Some(SourceType::File) => {
+                let path = self.file_path.trim();
+                if path.is_empty() {
+                    return Err("Podaj ścieżkę pliku wideo.");
+                }
+                Ok(("fake_file".to_string(), path.to_string(), None))
+            }
+            None => Err("Wybierz typ źródła kamery."),
+        }
+    }
+    fn retention_or_default(&self) -> &str {
+        if self.retention.is_empty() { "C" } else { &self.retention }
+    }
+    fn profile_or_default(&self) -> &str {
+        let p = self.profile.trim();
+        if p.is_empty() { "default" } else { p }
+    }
+    fn fps_value(&self) -> u32 {
+        self.fps.trim().parse::<u32>().ok().filter(|f| *f >= 1 && *f <= 60).unwrap_or(15)
     }
 }
 
@@ -1463,7 +1768,7 @@ impl PanelState {
         Self {
             current_panel: String::new(),
             add_form_visible: false, wizard_step: 0, cameras_filter: String::new(),
-            form_name: String::new(), form_url: String::new(),
+            camera_pending_remove: None,
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
             alarms: AlarmsState::new(), search: SearchState::new(),
@@ -1481,12 +1786,6 @@ static STATE: Mutex<PanelState> = Mutex::new(PanelState::new());
 fn with_state<F, R>(f: F) -> R where F: FnOnce(&mut PanelState) -> R {
     let mut guard = match STATE.lock() { Ok(g) => g, Err(p) => p.into_inner() };
     f(&mut guard)
-}
-
-fn get_current_panel() -> String {
-    with_state(|s| {
-        if s.current_panel.is_empty() { "overview".to_string() } else { s.current_panel.clone() }
-    })
 }
 
 fn set_current_panel(panel: &str) {
@@ -1515,6 +1814,7 @@ pub extern "C" fn on_install() -> i32 { 0 }
 
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
+    install_panic_hook();
     log::info("TentaVision: on_start (CBOR SDK)");
     send_initial_shell();
     render_panel("overview");
@@ -1534,6 +1834,7 @@ pub extern "C" fn on_event(_input_ptr: i32, _input_len: i32) -> i32 { 0 }
 /// Re-emits PanelShell + SlotContent without restarting the addon.
 #[no_mangle]
 pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64) -> i32 {
+    install_panic_hook();
     let panel_id = read_guest_string(panel_id_ptr, panel_id_len);
     PANEL_EPOCH.store(epoch as u64, core::sync::atomic::Ordering::Relaxed);
     log::info(&alloc::format!("TentaVision: on_panel_open panel='{}' epoch={}", panel_id, epoch));
@@ -1581,8 +1882,11 @@ pub extern "C" fn on_request(
         None => json!({ "error": alloc::format!("unknown tool '{}'", tool) }),
     };
 
-    let current = get_current_panel();
-    render_panel(&current);
+    // Each handler owns its own UI side effects: panel/tab navigation and modal
+    // open re-send SlotContent, while reactive wizard actions emit StatePatch
+    // only. There is intentionally NO unconditional `render_panel` here — that
+    // global re-render was the source of the modal tearing down and inputs
+    // losing focus on every wizard interaction.
 
     let response_str = response.to_string();
     let written = write_guest_string(out_ptr, out_cap, &response_str);
@@ -1621,6 +1925,14 @@ fn write_guest_string(ptr: i32, cap: i32, s: &str) -> i32 {
 
 fn send_initial_shell() {
     let layout = build_shell_layout();
+    // "content" is the static main panel. The "Add camera" wizard's
+    // `add_camera_body` / `add_camera_footer` slots are also declared here, but
+    // as Modal+Hidden overlay slots: the declaration satisfies the Core's slot
+    // ownership check (a slot must be declared in the PanelShell), while the
+    // Modal/Hidden semantics tell addon-app's `isOverlaySlot` to skip building a
+    // static placeholder container for them. Their real containers are created
+    // dynamically by the Modal and auto-registered by the host's
+    // `observe(shell)`, with their SlotContent buffered until registration.
     let slots = vec![
         SlotDecl {
             id: "content".into(),
@@ -1630,7 +1942,29 @@ fn send_initial_shell() {
             visibility: SlotVisibility::Always,
             max_payload_bytes: Some(256 * 1024),
         },
+        SlotDecl {
+            id: "add_camera_body".into(),
+            semantics: SlotSemantics::Modal,
+            default_state: SlotDefault::Empty,
+            cache_policy: CachePolicy::None,
+            visibility: SlotVisibility::Hidden,
+            max_payload_bytes: Some(256 * 1024),
+        },
+        SlotDecl {
+            id: "add_camera_footer".into(),
+            semantics: SlotSemantics::Modal,
+            default_state: SlotDefault::Empty,
+            cache_policy: CachePolicy::None,
+            visibility: SlotVisibility::Hidden,
+            max_payload_bytes: Some(64 * 1024),
+        },
     ];
+    // The frontend resets its reactive store revision to 0 whenever it receives
+    // a PanelShell (new shell/epoch). Reset the guest counter in lockstep so the
+    // first StatePatch after this shell carries base_revision = 0; otherwise a
+    // stale (higher) base from a previous shell would be rejected by the host
+    // and the UI would never update.
+    STATE_REVISION.store(0, Ordering::Relaxed);
     send_panel_shell(layout, slots, vec![]);
 }
 
@@ -1672,7 +2006,19 @@ fn render_panel(panel_id: &str) {
         "bindings" => build_bindings_content(),
         _ => build_overview_content(),
     };
+    // Send "content" first so the host has the Modal (and thus the dynamic
+    // body/footer slot containers) in the DOM before we push their content.
     send_slot_content("content", content);
+
+    // When the "Add camera" wizard is open on the cameras panel, fill the
+    // Modal's body/footer slots. These must be sent AFTER "content" so their
+    // target data-slot-id containers already exist.
+    if panel_id == "cameras" && with_state(|s| s.add_form_visible) {
+        // Seed the full wizard store state alongside the body so the bound
+        // visibility flags, StepProgress and inputs resolve on first paint.
+        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
+        send_slot_content("add_camera_footer", build_add_camera_footer());
+    }
 }
 
 // =============================================================================
@@ -1682,24 +2028,20 @@ fn render_panel(panel_id: &str) {
 fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
     log::info(&alloc::format!("TentaVision UI action '{}'", action));
     match action {
-        "camera-add-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.discover.visible = false; s.clear_messages(); s.form_name.clear(); s.form_url.clear(); }); json!({"ok":true}) }
-        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); s.form_name.clear(); s.form_url.clear(); }); json!({"ok":true}) }
-        "wizard-next" => { with_state(|s| { if s.wizard_step < 3 { s.wizard_step += 1; } }); json!({"ok":true}) }
-        "wizard-prev" => { with_state(|s| { if s.wizard_step > 0 { s.wizard_step -= 1; } }); json!({"ok":true}) }
+        "camera-add-show" => handle_camera_add_show(),
+        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "wizard-source-select" => handle_wizard_source_select(params),
+        "wizard-field-change" => handle_wizard_field_change(params),
+        "wizard-test" => handle_wizard_test(),
+        "wizard-next" => handle_wizard_next(),
+        "wizard-prev" => handle_wizard_prev(),
         "cameras-filter-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.cameras_filter = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
         "camera-add-submit" => handle_camera_add_submit(params),
+        "camera-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
+        "camera-remove-cancel" => { with_state(|s| { s.camera_pending_remove = None; s.clear_messages(); }); json!({"ok":true}) }
         "camera-remove" => handle_camera_remove(params),
-        "discover-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
-        "discover-cancel" => { with_state(|s| { s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
-        "discover-select-by-index" => {
-            let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("");
-            let idx = v.parse::<u64>().ok();
-            handle_discover_select(&json!({"index": idx}))
-        }
-        "discover-name-change" => handle_discover_name_change(params),
-        "discover-add" => handle_discover_add(),
         "cameras-refresh" | "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
         "panel-navigate" => {
             let target = params.get("panel_id")
@@ -1755,27 +2097,270 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
 // Camera action handlers
 // =============================================================================
 
-fn handle_camera_add_submit(params: &JsonValue) -> JsonValue {
-    let values = params.get("values");
-    let name = values.and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let url = values.and_then(|v| v.get("url")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    with_state(|s| { s.form_name = name.clone(); s.form_url = url.clone(); s.clear_messages(); });
-    if name.is_empty() || name.chars().count() > 60 {
-        with_state(|s| { s.error_message = Some("Nazwa musi mieć 1–60 znaków.".to_string()); });
-        return json!({"ok":false,"error":"invalid name"});
-    }
-    if url.is_empty() {
-        with_state(|s| { s.error_message = Some("URL nie może być pusty.".to_string()); });
-        return json!({"ok":false,"error":"invalid url"});
-    }
-    let vendor = match detect_vendor(&url) {
-        Some(v) => v,
-        None => { with_state(|s| { s.error_message = Some("Nieobsługiwany protokół (wspierane: rtsp://, rtsps://, http(s)://.../onvif).".to_string()); }); return json!({"ok":false,"error":"unsupported protocol"}); }
+/// Opens the "Add camera" wizard. Resets backend wizard state, eagerly
+/// enumerates local USB/v4l2 devices (their Select options are static component
+/// fields baked into the body sent here, so they must be known before the body
+/// is built), then sends the cameras content (with the Modal) plus the wizard
+/// body and footer fragments exactly once, seeding all wizard store keys via the
+/// body's `state_overlay`. Every later interaction mutates the store, not the DOM.
+fn handle_camera_add_show() -> JsonValue {
+    with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); });
+    // Enumerate USB devices up front so the device Select can carry real options.
+    let devices = camera_local_devices();
+    with_state(|s| {
+        s.discover.usb_loaded = true;
+        if let Ok(list) = devices {
+            s.discover.usb_devices = list.into_iter()
+                .map(|d| LocalDevice { device_path: d.device_path, label: d.label, vendor: d.vendor })
+                .collect();
+        }
+    });
+    render_panel("cameras");
+    json!({"ok":true})
+}
+
+/// Steps back one wizard step. Pure `StatePatch`: flips the step visibility /
+/// footer flags and clears any error. No fragment is re-sent.
+fn handle_wizard_prev() -> JsonValue {
+    let step = with_state(|s| {
+        if s.wizard_step > 0 { s.wizard_step -= 1; }
+        s.error_message = None;
+        s.wizard_step
+    });
+    let mut pairs = wizard_step_pairs(step);
+    pairs.extend(wizard_error_pairs(None));
+    send_state_patches(pairs);
+    json!({"ok":true})
+}
+
+/// Commits the chosen source type (step 1) to backend state and patches the
+/// per-type config visibility flags. Resetting the per-type fields here keeps a
+/// switched type from carrying stale values into step 2's validation; the reset
+/// is mirrored into the store so the bound inputs clear too. Pure `StatePatch` —
+/// the RadioCardGroup highlight follows `wiz_src` and the config blocks toggle
+/// via `wiz_is_*` without rebuilding the body.
+fn handle_wizard_source_select(params: &JsonValue) -> JsonValue {
+    let raw = params.get("source_type").and_then(|v| v.as_str())
+        .or_else(|| params.get("value").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let t = match SourceType::from_str(raw) {
+        Some(t) => t,
+        None => return json!({"ok":false,"error":"unknown source_type"}),
     };
-    let spec = CameraAddSpec { display_name: name, vendor: vendor.to_string(), url, target_fps: 15, resolution: None, retention_class: "C".to_string(), profile: "default".to_string() };
-    match camera_add(&spec) {
-        Ok(result) => { with_state(|s| { s.add_form_visible = false; s.form_name.clear(); s.form_url.clear(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); }); json!({"ok":true,"camera_id":result.camera_id}) }
-        Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd dodawania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    let changed = with_state(|s| {
+        let changed = s.discover.source_type != Some(t);
+        if changed {
+            s.discover.source_type = Some(t);
+            s.discover.cameras.clear();
+            s.discover.selected_index = None;
+            s.discover.usb_device_path.clear();
+            s.discover.onvif_url.clear();
+            s.discover.rtsp_url.clear();
+            s.discover.file_path.clear();
+            s.discover.test_result = None;
+        }
+        s.error_message = None;
+        changed
+    });
+    let mut pairs = wizard_source_pairs(Some(t));
+    pairs.extend(wizard_error_pairs(None));
+    if changed {
+        // Mirror the per-type field reset into the bound store keys so any
+        // previously typed value disappears from the inputs as well.
+        for key in ["onvif_url", "rtsp_url", "usb_device_path", "file_path"] {
+            pairs.push((key.into(), Value::Text(String::new())));
+        }
+        pairs.extend(wizard_test_pairs(&DiscoverState::new()));
+        // Reset the ONVIF discovery sub-state (cameras were cleared above).
+        pairs.extend(wizard_onvif_pairs(&DiscoverState::new()));
+    }
+    send_state_patches(pairs);
+    json!({"ok":true})
+}
+
+/// Commits a single typed wizard field to backend state on every input change,
+/// keyed by the `field` discriminator the renderer carries in `handler.params`.
+/// The value already lives in the store via the input's two-way `bind_path`, so
+/// this emits no `StatePatch` and no re-render — it only mirrors the value into
+/// backend state for step-3 testing and submit validation.
+fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    with_state(|s| {
+        match field {
+            "onvif_url" => s.discover.onvif_url = value,
+            "rtsp_url" => s.discover.rtsp_url = value,
+            "usb_device_path" => s.discover.usb_device_path = value,
+            "file_path" => s.discover.file_path = value,
+            "cred_user" => s.discover.cred_user = value,
+            "cred_pass" => s.discover.cred_pass = value,
+            "name" => s.discover.name = value,
+            "retention" => s.discover.retention = value,
+            "fps" => s.discover.fps = value,
+            "profile" => s.discover.profile = value,
+            _ => {}
+        }
+    });
+    json!({"ok":true})
+}
+
+/// Runs a real `camera_test_connection` probe for the resolved per-type target
+/// and patches the step-3 result flags + text. Never fabricates success. Pure
+/// `StatePatch`: the test block visibility and message follow the store.
+fn handle_wizard_test() -> JsonValue {
+    let target = with_state(|s| { s.discover.testing = true; s.discover.test_result = None; s.error_message = None; s.discover.resolve_target() });
+    // Emit the spinner state as its own patch BEFORE the blocking probe so the
+    // client paints the "testing" block; otherwise the only patch would arrive
+    // after the probe returns and the spinner would never be seen.
+    send_state_patches(with_state(|s| wizard_test_pairs(&s.discover)));
+    let (vendor, url) = match target {
+        Ok((v, u, _)) => (v, u),
+        Err(msg) => {
+            // Surface the validation message in the step-3 result block (the
+            // dedicated error path), not the wizard-wide error alert.
+            let pairs = with_state(|s| {
+                s.discover.testing = false;
+                s.discover.test_result = Some(Err(msg.to_string()));
+                wizard_test_pairs(&s.discover)
+            });
+            send_state_patches(pairs);
+            return json!({"ok":false,"error":"invalid target"});
+        }
+    };
+    let result = camera_test_connection(&vendor, &url);
+    let pairs = with_state(|s| {
+        s.discover.testing = false;
+        s.discover.test_result = Some(match result {
+            Ok(out) if out.ok => Ok(out.message),
+            Ok(out) => Err(out.message),
+            Err(e) => Err(alloc::format!("Test nieudany: {}", abi_message(e))),
+        });
+        wizard_test_pairs(&s.discover)
+    });
+    send_state_patches(pairs);
+    json!({"ok":true})
+}
+
+/// Advances the wizard, gating each transition on the current step's required
+/// state: a source type must be chosen on step 1, and step 2 must resolve a
+/// valid per-type target before moving on. Pure `StatePatch`: on success it
+/// flips the step visibility / footer flags; on failure it patches the error
+/// alert. The body is never re-sent.
+fn handle_wizard_next() -> JsonValue {
+    let step = with_state(|s| s.wizard_step);
+    match step {
+        0 => {
+            let chosen = with_state(|s| s.discover.source_type.is_some());
+            if !chosen {
+                send_state_patches(wizard_error_pairs(Some("Wybierz typ źródła kamery.")));
+                return json!({"ok":false,"error":"no source type"});
+            }
+            with_state(|s| { s.wizard_step = 1; s.error_message = None; });
+            advance_patch(1);
+            json!({"ok":true})
+        }
+        1 => {
+            let resolved = with_state(|s| s.discover.resolve_target());
+            match resolved {
+                Ok(_) => {
+                    with_state(|s| { s.wizard_step = 2; s.discover.test_result = None; s.error_message = None; });
+                    let mut pairs = wizard_step_pairs(2);
+                    pairs.extend(wizard_error_pairs(None));
+                    pairs.extend(with_state(|s| wizard_test_pairs(&s.discover)));
+                    send_state_patches(pairs);
+                    json!({"ok":true})
+                }
+                Err(msg) => { send_state_patches(wizard_error_pairs(Some(msg))); json!({"ok":false,"error":"invalid target"}) }
+            }
+        }
+        2 => {
+            // Pre-fill a metadata name from a discovered camera when the user has
+            // not typed one yet, otherwise leave it empty (no fake placeholder).
+            let prefill_name = with_state(|s| {
+                if s.discover.name.trim().is_empty() {
+                    if let Some(i) = s.discover.selected_index {
+                        if let Some(cam) = s.discover.cameras.get(i) {
+                            s.discover.name = cam.suggested_name.clone();
+                            return Some(s.discover.name.clone());
+                        }
+                    }
+                }
+                None
+            });
+            with_state(|s| { s.wizard_step = 3; s.error_message = None; });
+            let mut pairs = wizard_step_pairs(3);
+            pairs.extend(wizard_error_pairs(None));
+            if let Some(name) = prefill_name {
+                pairs.push(("name".into(), Value::Text(name)));
+            }
+            send_state_patches(pairs);
+            json!({"ok":true})
+        }
+        _ => json!({"ok":true}),
+    }
+}
+
+/// Helper: emit the step navigation patch + clear error for a forward move.
+fn advance_patch(step: u8) {
+    let mut pairs = wizard_step_pairs(step);
+    pairs.extend(wizard_error_pairs(None));
+    send_state_patches(pairs);
+}
+
+/// Reports a submit failure: surfaces the message in the wizard-wide error alert
+/// (`wiz_error` + `wiz_has_error`) so it is visible inside the open modal, since
+/// the wizard no longer re-renders the body on each action.
+fn submit_fail(msg: &str, err_code: &str) -> JsonValue {
+    with_state(|s| { s.error_message = Some(msg.to_string()); });
+    send_state_patches(wizard_error_pairs(Some(msg)));
+    json!({"ok":false,"error":err_code})
+}
+
+fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
+    let (target, name, retention, fps, profile, user, pass) = with_state(|s| (
+        s.discover.resolve_target(),
+        s.discover.name.trim().to_string(),
+        s.discover.retention_or_default().to_string(),
+        s.discover.fps_value(),
+        s.discover.profile_or_default().to_string(),
+        s.discover.cred_user.clone(),
+        s.discover.cred_pass.clone(),
+    ));
+    with_state(|s| s.clear_messages());
+
+    if name.is_empty() || name.chars().count() > 60 {
+        return submit_fail("Nazwa musi mieć 1–60 znaków.", "invalid name");
+    }
+    let (vendor, url, profile_token) = match target {
+        Ok(t) => t,
+        Err(msg) => return submit_fail(msg, "invalid target"),
+    };
+    let credentials_b64 = match build_credentials_b64(&vendor, &user, &pass) {
+        Ok(c) => c,
+        Err(msg) => return submit_fail(msg, "invalid credentials"),
+    };
+    let spec = CameraAddInput {
+        display_name: name,
+        vendor,
+        url,
+        target_fps: Some(fps),
+        resolution_width: None,
+        resolution_height: None,
+        retention_class: Some(retention),
+        profile: Some(profile),
+        credentials_b64,
+        onvif_profile_token: profile_token,
+    };
+    match camera_add(spec) {
+        Ok(result) => {
+            with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); });
+            // Close the modal and refresh the camera list so the new camera
+            // appears. render_panel re-sends the "cameras" content fragment
+            // without the modal, which is the intended end state on success.
+            render_panel("cameras");
+            json!({"ok":true,"camera_id":result.camera_id})
+        }
+        Err(e) => submit_fail(&alloc::format!("Błąd dodawania: {}", abi_message(e)), &alloc::format!("{}", e)),
     }
 }
 
@@ -1785,56 +2370,57 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     if camera_id.is_empty() { with_state(|s| { s.error_message = Some("Wybierz kamerę do usunięcia.".to_string()); }); return json!({"ok":false,"error":"empty camera_id"}); }
     if !is_valid_camera_id(&camera_id) { with_state(|s| { s.error_message = Some("Niepoprawny identyfikator kamery.".to_string()); }); return json!({"ok":false,"error":"invalid camera_id"}); }
     match camera_remove(&camera_id) {
-        Ok(()) => { with_state(|s| { s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
+        Ok(()) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
 }
 
+/// Runs ONVIF discovery. The discovered camera cards are a genuinely dynamic
+/// list (count + per-row click handlers), so this re-sends the `add_camera_body`
+/// fragment — the only wizard action besides modal open that does. The
+/// discovery-section visibility flags are patched to match the new results.
 fn handle_discover_scan() -> JsonValue {
-    with_state(|s| { s.discover.scanning = true; s.discover.error_message = None; s.discover.cameras.clear(); s.discover.selected_index = None; s.clear_messages(); });
+    with_state(|s| { s.discover.scanning = true; s.discover.error_message = None; s.discover.cameras.clear(); s.discover.selected_index = None; s.error_message = None; });
+    // Patch the scanning flag BEFORE the blocking discovery call so the scan
+    // spinner becomes visible; the final fragment re-send below carries results.
+    send_state_patches(with_state(|s| wizard_onvif_pairs(&s.discover)));
     let result = camera_discover();
     with_state(|s| {
         s.discover.scanning = false;
         match result {
-            Ok(found) => {
-                s.discover.cameras = found.iter().map(|c| DiscoveredCam { vendor: c.vendor.clone(), url: c.url.clone(), suggested_name: default_name_for_discovered(c) }).collect();
-                if !s.discover.cameras.is_empty() { s.discover.selected_index = Some(0); s.discover.custom_name = s.discover.cameras[0].suggested_name.clone(); }
-            }
-            Err(e) => { s.discover.error_message = Some(alloc::format!("Błąd skanowania: {}", abi_message(e))); }
+            Ok(found) => { s.discover.cameras = found.iter().map(discovered_to_cam).collect(); }
+            Err(e) => { s.error_message = Some(alloc::format!("Błąd skanowania: {}", abi_message(e))); }
         }
     });
+    if with_state(|s| s.add_form_visible) {
+        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
+    }
     json!({"ok":true})
 }
 
+/// Selects a discovered ONVIF camera. Mirrors the picked device URL into the
+/// manual ONVIF field and re-sends the body (the row highlight is part of the
+/// dynamic discovered-list fragment, not a store flag), seeding the full wizard
+/// overlay so `onvif_url` and the row selection both reflect the pick.
 fn handle_discover_select(params: &JsonValue) -> JsonValue {
     let index = params.get("index").and_then(|v| v.as_u64());
     with_state(|s| {
-        s.discover.error_message = None;
+        s.error_message = None;
         match index {
-            Some(i) if (i as usize) < s.discover.cameras.len() => { let i = i as usize; s.discover.selected_index = Some(i); if s.discover.custom_name.trim().is_empty() { s.discover.custom_name = s.discover.cameras[i].suggested_name.clone(); } }
-            _ => { s.discover.selected_index = None; s.discover.error_message = Some("Wybierz kamerę z listy.".to_string()); }
+            Some(i) if (i as usize) < s.discover.cameras.len() => {
+                let i = i as usize;
+                s.discover.selected_index = Some(i);
+                // Mirror the picked device URL into the manual ONVIF field so the
+                // resolved target and submit credentials use one consistent value.
+                s.discover.onvif_url = s.discover.cameras[i].url.clone();
+            }
+            _ => { s.discover.selected_index = None; s.error_message = Some("Wybierz kamerę z listy.".to_string()); }
         }
     });
-    json!({"ok":true})
-}
-
-fn handle_discover_name_change(params: &JsonValue) -> JsonValue {
-    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    with_state(|s| { s.discover.custom_name = name; s.discover.error_message = None; });
-    json!({"ok":true})
-}
-
-fn handle_discover_add() -> JsonValue {
-    let snapshot = with_state(|s| { s.clear_messages(); s.discover.error_message = None; (s.discover.selected_index, s.discover.custom_name.trim().to_string(), s.discover.cameras.len()) });
-    let (selected_index, name, total) = snapshot;
-    let index = match selected_index { Some(i) if i < total => i, _ => { with_state(|s| { s.discover.error_message = Some("Wybierz kamerę z listy.".to_string()); }); return json!({"ok":false,"error":"no selection"}); } };
-    if name.is_empty() || name.chars().count() > 60 { with_state(|s| { s.discover.error_message = Some("Nazwa musi mieć 1–60 znaków.".to_string()); }); return json!({"ok":false,"error":"invalid name"}); }
-    let (vendor, url) = with_state(|s| { let cam = &s.discover.cameras[index]; (cam.vendor.clone(), cam.url.clone()) });
-    let spec = CameraAddSpec { display_name: name, vendor, url, target_fps: 15, resolution: None, retention_class: "C".to_string(), profile: "default".to_string() };
-    match camera_add(&spec) {
-        Ok(_) => { with_state(|s| { s.discover.reset(); s.success_message = Some("Kamera dodana z ONVIF.".to_string()); }); json!({"ok":true}) }
-        Err(e) => { with_state(|s| { s.discover.error_message = Some(alloc::format!("Błąd dodawania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    if with_state(|s| s.add_form_visible) {
+        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
     }
+    json!({"ok":true})
 }
 
 fn handle_zone_canvas_pointer(params: &JsonValue) -> JsonValue {
@@ -1855,11 +2441,37 @@ fn handle_zone_canvas_pointer(params: &JsonValue) -> JsonValue {
 // Validation helpers
 // =============================================================================
 
-fn detect_vendor(url: &str) -> Option<&'static str> {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("rtsp://") || lower.starts_with("rtsps://") { return Some("rtsp"); }
-    if (lower.starts_with("http://") || lower.starts_with("https://")) && lower.contains("/onvif") { return Some("onvif"); }
-    None
+/// Resolves wizard credential inputs into the `credentials_b64` field the host
+/// expects on `camera_add`. The host decodes this as STANDARD base64 of a
+/// `user:pass` string and requires it for `vendor == "onvif"` while treating it
+/// as optional for `rtsp`. We enforce the same rule here so an ONVIF camera
+/// surfaces a readable wizard error instead of the host's raw
+/// `missing_credentials` rejection. Returning `Ok(None)` means "no credentials"
+/// (valid only for non-ONVIF vendors). The plaintext lives only for the span of
+/// this call and is never logged.
+fn build_credentials_b64(
+    vendor: &str,
+    user: &str,
+    pass: &str,
+) -> Result<Option<String>, &'static str> {
+    let user = user.trim();
+    let pass = pass.trim();
+    if user.is_empty() && pass.is_empty() {
+        if vendor == "onvif" {
+            return Err("Kamera ONVIF wymaga użytkownika i hasła.");
+        }
+        return Ok(None);
+    }
+    if user.is_empty() {
+        return Err("Podaj użytkownika kamery.");
+    }
+    if pass.is_empty() {
+        return Err("Podaj hasło kamery.");
+    }
+    let plain = alloc::format!("{user}:{pass}");
+    Ok(Some(
+        base64::engine::Engine::encode(&base64::engine::general_purpose::STANDARD, plain),
+    ))
 }
 
 fn is_valid_camera_id(id: &str) -> bool {
@@ -1867,9 +2479,40 @@ fn is_valid_camera_id(id: &str) -> bool {
     id.chars().skip(4).all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-fn default_name_for_discovered(cam: &CameraInfo) -> String {
-    let host = extract_host_port(&cam.url).map(|(h, _)| h).unwrap_or_else(|| "ONVIF".to_string());
-    if !cam.display_name.trim().is_empty() { cam.display_name.clone() } else { alloc::format!("ONVIF — {}", host) }
+/// Maps a host-discovered ONVIF device into the wizard's working representation.
+/// ONVIF WS-Discovery reports `xaddrs` (device service endpoints) rather than a
+/// ready stream URL; the first `xaddr` is the canonical ONVIF service URL, and we
+/// fall back to the device-service path on the bare `address` when none is given.
+fn discovered_to_cam(d: &DiscoveredCameraOut) -> DiscoveredCam {
+    let url = d
+        .xaddrs
+        .first()
+        .cloned()
+        .filter(|x| !x.trim().is_empty())
+        .unwrap_or_else(|| alloc::format!("http://{}/onvif/device_service", d.address));
+    DiscoveredCam {
+        vendor: "onvif".to_string(),
+        url,
+        suggested_name: suggested_name_for_discovered(d),
+        profile_token: None,
+    }
+}
+
+fn suggested_name_for_discovered(d: &DiscoveredCameraOut) -> String {
+    let make = d.manufacturer.trim();
+    let model = d.model.trim();
+    match (make.is_empty(), model.is_empty()) {
+        (false, false) => alloc::format!("{} {}", make, model),
+        (false, true) => make.to_string(),
+        (true, false) => model.to_string(),
+        (true, true) => {
+            let host = extract_host_port(&alloc::format!("onvif://{}", d.address))
+                .map(|(h, _)| h)
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| d.address.clone());
+            alloc::format!("ONVIF — {}", host)
+        }
+    }
 }
 
 fn extract_host_port(url: &str) -> Option<(String, Option<u16>)> {
@@ -1902,6 +2545,7 @@ fn abi_message(e: AbiError) -> &'static str {
         AbiError::CameraVendorUnsupported => "nieobsługiwany typ kamery",
         AbiError::PayloadTooLarge => "zbyt duży payload",
         AbiError::Timeout => "przekroczono czas oczekiwania",
+        AbiError::NoAvailableTarget => "brak dostępnego targetu",
         _ => "błąd operacji",
     }
 }
@@ -2113,19 +2757,35 @@ fn build_messages_section() -> Component {
 }
 
 fn build_live_content() -> Component {
-    let cameras = camera_list().unwrap_or_default();
-    if cameras.is_empty() {
-        return card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby zobaczyć podgląd na żywo."), Some("video"))]);
-    }
-    let streams: Vec<Component> = cameras.iter().take(4).map(|c| {
-        card(Some(&c.display_name), vec![video_stream(&c.url)])
-    }).collect();
     let messages = build_messages_section();
+    let cameras = match camera_list() {
+        Ok(c) => c,
+        Err(e) => {
+            return stack_v(vec![
+                messages,
+                alert(&alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e)), "critical"),
+            ]);
+        }
+    };
+    if cameras.is_empty() {
+        return stack_v(vec![
+            messages,
+            // No outer Outlined Card: matches the dashboard stack so the empty
+            // state does not get a stray white frame around it.
+            empty_state("Brak kamer", Some("Dodaj kamerę aby zobaczyć podgląd na żywo."), Some("video")),
+        ]);
+    }
+    // Live tiles subscribe to the core's per-camera fMP4 publisher over the
+    // binary protocol (`camera:<id>` → streamSubscribeRequest). The raw camera
+    // URL is never handed to the browser — it cannot play rtsp(s):// directly.
+    let streams: Vec<Component> = cameras.iter().take(4).map(|c| {
+        card(Some(&c.display_name), vec![video_stream(&alloc::format!("camera:{}", c.camera_id))])
+    }).collect();
     stack_v(core::iter::once(messages).chain(streams).collect())
 }
 
 fn build_cameras_content() -> Component {
-    let cameras = camera_list().unwrap_or_default();
+    let list_result = camera_list();
     let messages = build_messages_section();
     let (add_visible, filter) = with_state(|s| (s.add_form_visible, s.cameras_filter.clone()));
 
@@ -2163,34 +2823,22 @@ fn build_cameras_content() -> Component {
     ]);
     children.push(toolbar);
 
-    // Use demo data when no real cameras exist
-    let use_demo = cameras.is_empty();
-    struct CamRow { name: &'static str, vendor: &'static str, addr: &'static str, status: &'static str, profile: &'static str, fps: &'static str, diag: &'static str, diag_tone: &'static str }
-    let demo_rows: Vec<CamRow> = vec![
-        CamRow { name: "C-01 brama wjazdowa", vendor: "Hikvision \u{00b7} ISAPI + RTSP", addr: "192.168.40.11", status: "online", profile: "ADR-brama", fps: "5/5", diag: "OK", diag_tone: "success" },
-        CamRow { name: "C-04 wjazd-2", vendor: "Axis \u{00b7} VAPIX + ACAP", addr: "192.168.40.14", status: "online", profile: "Bezpieczeństwo-noc", fps: "12/15", diag: "backpressure", diag_tone: "warning" },
-        CamRow { name: "C-07 peron", vendor: "ONVIF Profile T+M", addr: "192.168.40.17", status: "online", profile: "Peron-publiczny", fps: "10/10", diag: "OK", diag_tone: "success" },
-        CamRow { name: "C-12 magazyn", vendor: "Dahua \u{00b7} CGI", addr: "192.168.40.22", status: "offline", profile: "\u{2014}", fps: "\u{2014}", diag: "brak heartbeat", diag_tone: "critical" },
-        CamRow { name: "C-15 parking", vendor: "UniFi Protect \u{00b7} v3.x", addr: "unifi://nvr-1/cam-15", status: "online", profile: "ANPR-parking", fps: "5/5", diag: "obraz przyciemniony", diag_tone: "warning" },
-        CamRow { name: "C-18 dok", vendor: "Hanwha \u{00b7} ONVIF S+T", addr: "192.168.40.28", status: "online", profile: "ADR-dok", fps: "5/5", diag: "OK", diag_tone: "success" },
-        CamRow { name: "C-22 wjazd ADR", vendor: "Bosch \u{00b7} ONVIF S", addr: "192.168.40.32", status: "degraded", profile: "ADR-brama", fps: "3/5", diag: "drift 38ms", diag_tone: "warning" },
-    ];
-
-    // Compute filter counts
-    let (total, online, offline, warnings, unlinked) = if use_demo {
-        let t = demo_rows.len();
-        let on = demo_rows.iter().filter(|r| r.status == "online").count();
-        let off = demo_rows.iter().filter(|r| r.status == "offline").count();
-        let warn = demo_rows.iter().filter(|r| r.diag_tone == "warning" || r.diag_tone == "critical").count();
-        (t, on, off, warn, 3usize)
-    } else {
-        let t = cameras.len();
-        let on = cameras.iter().filter(|c| c.status == "online").count();
-        let off = cameras.iter().filter(|c| c.status == "offline").count();
-        (t, on, off, 0usize, 0usize)
+    // A host error (permission/DB/supervisor) must never be masked as "no
+    // cameras"; surface the real reason and stop rendering the list.
+    let cameras = match list_result {
+        Ok(c) => c,
+        Err(e) => {
+            children.push(alert(&alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e)), "critical"));
+            return stack_v(children);
+        }
     };
 
-    // Sub-filter tabs
+    // Filter counts derived from live camera status.
+    let total = cameras.len();
+    let online = cameras.iter().filter(|c| c.status == "online").count();
+    let offline = cameras.iter().filter(|c| c.status == "offline").count();
+    let warnings = cameras.iter().filter(|c| camera_has_warning(c)).count();
+
     let active_filter = if filter.is_empty() { "all" } else { &filter };
     let sub_tabs = filter_chips(
         vec![
@@ -2198,212 +2846,515 @@ fn build_cameras_content() -> Component {
             FilterChipDef { id: "online".into(), label: lit(&alloc::format!("Online ({})", online)), icon: None, badge: None, count_path: None },
             FilterChipDef { id: "offline".into(), label: lit(&alloc::format!("Offline ({})", offline)), icon: None, badge: None, count_path: None },
             FilterChipDef { id: "warnings".into(), label: lit(&alloc::format!("Ostrzeżenia ({})", warnings)), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "unlinked".into(), label: lit(&alloc::format!("Niepowiązane ({})", unlinked)), icon: None, badge: None, count_path: None },
         ],
         active_filter,
     );
     children.push(sub_tabs);
 
-    // Wizard modal (when visible)
+    // The "Add camera" wizard renders as a Modal overlay. While visible, the
+    // Modal shell is placed in the content tree; its body/footer are filled by
+    // SlotContent (see render_panel). When hidden, the Modal is absent so the
+    // host unregisters its dynamic body/footer slots.
     if add_visible {
-        children.push(build_add_camera_wizard());
+        children.push(build_add_camera_modal());
     }
 
-    // Camera table
-    if use_demo {
-        let mut table_rows: Vec<Component> = vec![build_cameras_table_header()];
-        for r in &demo_rows {
-            table_rows.push(build_camera_row(r.name, r.vendor, r.addr, r.status, r.profile, r.fps, r.diag, r.diag_tone));
+    let filtered: Vec<&CameraInfoOut> = cameras
+        .iter()
+        .filter(|c| match active_filter {
+            "online" => c.status == "online",
+            "offline" => c.status == "offline",
+            "warnings" => camera_has_warning(c),
+            _ => true,
+        })
+        .collect();
+
+    // A delete-confirmation bar appears above the table once a row is selected.
+    if let Some(pending) = with_state(|s| s.camera_pending_remove.clone()) {
+        if cameras.iter().any(|c| c.camera_id == pending) {
+            children.push(build_camera_remove_confirm(&pending, &cameras));
+        } else {
+            with_state(|s| s.camera_pending_remove = None);
         }
-        children.push(card(None, vec![stack_v_gap("xs", table_rows)]));
-    } else if cameras.is_empty() {
-        children.push(card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras"))]));
+    }
+
+    if cameras.is_empty() {
+        // No outer Outlined Card: the dashboard pushes its sections straight
+        // into the stack, so wrapping these in card(None, ...) would draw a
+        // double container (a stray white frame around the content).
+        children.push(empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras")));
     } else {
-        let mut table_rows: Vec<Component> = vec![build_cameras_table_header()];
-        for c in &cameras {
-            table_rows.push(build_camera_row(&c.display_name, &c.vendor, &redact_url_for_display(&c.url), &c.status, "\u{2014}", "\u{2014}", "\u{2014}", "muted"));
-        }
-        children.push(card(None, vec![stack_v_gap("xs", table_rows)]));
+        // Push the filtered, host-derived rows into panel state under the
+        // Table's rows_path; the Table renderer reads them reactively. An empty
+        // filtered set renders the Table's own empty_state.
+        let rows: Vec<Value> = filtered.iter().map(|c| camera_table_row_value(c)).collect();
+        send_state_patch("cameras_rows", Value::Array(rows));
+        // Table carries its own surface styling; an extra Outlined Card here
+        // would nest a white frame around it, unlike the dashboard layout.
+        children.push(build_cameras_table());
     }
 
     stack_v(children)
 }
 
-fn build_camera_status_chip(status: &str) -> Component {
-    let (label, tone) = match status {
-        "online" => ("online", "success"),
-        "offline" => ("offline", "critical"),
-        "degraded" => ("degraded", "warning"),
-        _ => (status, "muted"),
-    };
-    chip_toned(label, tone)
+/// Builds one Table row as a `Value::Map` keyed by the column field paths.
+/// `camera_id` is the row key the Table uses to scope per-row actions.
+fn camera_table_row_value(c: &CameraInfoOut) -> Value {
+    let fps = camera_fps_display(c);
+    let (diag, _diag_tone) = camera_diagnostics(c);
+    let profile = if c.profile.trim().is_empty() { "\u{2014}".to_string() } else { c.profile.clone() };
+    let entries: Vec<(Value, Value)> = vec![
+        (Value::Text("camera_id".into()), Value::Text(c.camera_id.clone())),
+        (Value::Text("name".into()), Value::Text(c.display_name.clone())),
+        (Value::Text("vendor".into()), Value::Text(c.vendor.clone())),
+        (Value::Text("addr".into()), Value::Text(redact_url_for_display(&c.url))),
+        (Value::Text("status".into()), Value::Text(c.status.clone())),
+        (Value::Text("profile".into()), Value::Text(profile)),
+        (Value::Text("fps".into()), Value::Text(fps)),
+        (Value::Text("diag".into()), Value::Text(diag)),
+    ];
+    Value::Map(entries)
 }
 
-fn build_camera_row(name: &str, vendor: &str, addr: &str, status: &str, profile: &str, fps: &str, diag: &str, diag_tone: &str) -> Component {
-    let name_cell = text_styled(name, "body_strong");
-    let vendor_cell = text(vendor);
-    let addr_cell = text_styled(addr, "mono");
-    let status_cell = build_camera_status_chip(status);
-    let profile_cell = if profile == "\u{2014}" {
-        text("\u{2014}")
-    } else {
-        ChipComp {
-            variant: ChipVariant::Soft,
-            tone: Tone::Primary,
-            label: lit(profile),
-            icon: None,
-            avatar: None,
-            selected: None,
-            removable: false,
-        }.into_component(next_id()).expect("Chip")
-    };
-    let fps_cell = if fps == "\u{2014}" {
-        text("\u{2014}")
-    } else {
-        text_styled(fps, "body_strong")
-    };
-    let diag_cell = match diag_tone {
-        "success" => chip_toned_icon(diag, "success", "check"),
-        "warning" => chip_toned(diag, "warning"),
-        "critical" => chip_toned_icon(diag, "critical", "info"),
-        _ => chip_toned(diag, "muted"),
-    };
-    let action_cell = button("\u{22ef}", "camera-row-action", "ghost");
-
-    Flex {
-        direction: FlexDirection::Row,
-        gap: Spacing::Md,
-        justify: FlexJustify::Start,
-        align: FlexAlign::Center,
-        wrap: FlexWrap::NoWrap,
-        children: vec![name_cell, vendor_cell, addr_cell, status_cell, profile_cell, fps_cell, diag_cell, action_cell],
-        padding: None,
-        background: None,
-        radius: None,
-    }.into_component(next_id()).expect("Flex")
+fn camera_table_column(id: &str, header: &str, render: ColumnRender) -> TableColumn {
+    TableColumn {
+        id: id.into(),
+        header: lit(header),
+        field_path: vec![PathSegment::Key(id.into())],
+        width: TableColumnWidth::Auto,
+        render,
+        format: None,
+        align: None,
+        sortable: true,
+        hidden_by_default: false,
+        sticky_left: false,
+    }
 }
 
-fn build_cameras_table_header() -> Component {
-    let headers: Vec<Component> = ["Nazwa", "Vendor / Protokół", "Adres", "Status", "Profil", "FPS", "Diagnostyka", ""]
-        .iter().map(|h| text_styled(h, "caption")).collect();
-    Flex {
-        direction: FlexDirection::Row,
-        gap: Spacing::Md,
-        justify: FlexJustify::Start,
-        align: FlexAlign::Center,
-        wrap: FlexWrap::NoWrap,
-        children: headers,
-        padding: None,
-        background: None,
-        radius: None,
-    }.into_component(next_id()).expect("Flex")
-}
+fn build_cameras_table() -> Component {
+    let columns = vec![
+        camera_table_column("name", "Nazwa", ColumnRender::Text),
+        camera_table_column("vendor", "Vendor / Protokół", ColumnRender::Text),
+        camera_table_column("addr", "Adres", ColumnRender::Text),
+        camera_table_column("status", "Status", ColumnRender::Chip),
+        camera_table_column("profile", "Profil", ColumnRender::Text),
+        camera_table_column("fps", "FPS", ColumnRender::Text),
+        camera_table_column("diag", "Diagnostyka", ColumnRender::Text),
+    ];
 
-fn build_add_camera_wizard() -> Component {
-    let (step, scanning, discovered_count, err) = with_state(|s| {
-        (s.wizard_step, s.discover.scanning, s.discover.cameras.len(), s.error_message.clone())
-    });
-
-    let step_labels = ["Odkrywanie", "Wybór & poświadczenia", "Podgląd & kalibracja", "Profil analityczny"];
-    let step_indicator = step_progress(
-        step_labels.iter().enumerate().map(|(i, label)| StepDef {
-            id: alloc::format!("step{}", i),
-            label: lit(label),
-            optional: false,
-            status: if (i as u8) < step { Some(lit("done")) } else if i as u8 == step { Some(lit("active")) } else { None },
-            description: None,
-        }).collect(),
-        &alloc::format!("step{}", step),
+    let empty = empty_state(
+        "Brak kamer dla filtra",
+        Some("Zmień filtr, aby zobaczyć pozostałe kamery."),
+        Some("cameras"),
     );
 
-    let title = alloc::format!("Dodaj kamerę \u{2014} krok {} z 4", step + 1);
+    // The per-row "⋯" menu carries the deletion action. The Table renderer
+    // injects the row key into the menu-item action params as both `row_id`
+    // and the concrete `row_key_field` (`camera_id`), so this Button dispatches
+    // `camera-row-select` with the clicked camera_id. Deletion stays gated:
+    // `camera-row-select` only arms the pending-remove confirmation bar
+    // (`build_camera_remove_confirm`); the real `camera-remove` runs from that
+    // bar's explicit Usuń button.
+    let remove_action = button("Usuń", "camera-row-select", "destructive");
 
-    let body = match step {
-        0 => build_wizard_step_discovery(scanning, discovered_count),
-        1 => build_wizard_step_selection(),
-        2 => build_wizard_step_preview(),
-        3 => build_wizard_step_profile(),
-        _ => text("Nieznany krok."),
-    };
-
-    let mut body_children = vec![step_indicator, body];
-    if let Some(e) = err { body_children.push(alert(&e, "critical")); }
-
-    // Footer buttons
-    let mut footer = Vec::new();
-    if step > 0 {
-        footer.push(button_with_icon("Wstecz", "wizard-prev", "ghost", "info"));
-    }
-    footer.push(button("Anuluj", "camera-add-cancel", "ghost"));
-    if step < 3 {
-        let next_label = match step {
-            0 => "Dalej: Wybór",
-            1 => "Dalej: Podgląd",
-            2 => "Dalej: Profil",
-            _ => "Dalej",
-        };
-        footer.push(button(next_label, "wizard-next", "primary"));
-    } else {
-        footer.push(button("Zakończ", "camera-add-submit", "primary"));
-    }
-
-    SectionCard {
-        title: lit(&title),
-        subtitle: None,
-        header_actions: vec![button("×", "camera-add-cancel", "ghost")],
-        header_divider: true,
-        body: body_children,
-        footer: Some(vec![stack_h(footer)]),
-        padding: Spacing::Lg,
-        gap: Spacing::Md,
-        variant: CardVariant::Outlined,
-        radius: RadiusToken::Lg,
-        shadow: ShadowToken::Medium,
-        border: BorderToken::Hairline,
-        background: BackgroundToken::None,
-        accent: None,
-    }.into_component(next_id()).expect("SectionCard")
+    TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("cameras_rows".into())]),
+        row_key_field: "camera_id".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: Some(empty),
+        row_actions: vec![remove_action],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table")
 }
 
-fn build_wizard_step_discovery(scanning: bool, discovered_count: usize) -> Component {
-    if scanning {
-        return stack_v(vec![
-            spinner("lg"),
-            text("Skanowanie sieci kamerowej (ONVIF WS-Discovery + mDNS + ARP)..."),
-        ]);
+/// Confirmation bar for deleting the selected camera. Usuń dispatches
+/// `camera-remove` with the explicit `camera_id`; Anuluj clears the selection.
+fn build_camera_remove_confirm(camera_id: &str, cameras: &[CameraInfoOut]) -> Component {
+    let name = cameras
+        .iter()
+        .find(|c| c.camera_id == camera_id)
+        .map(|c| c.display_name.as_str())
+        .unwrap_or(camera_id);
+
+    let mut params = CborMap::default();
+    params.0.push(("camera_id".into(), Value::Text(camera_id.into())));
+
+    let confirm_btn = button_with_params("Usuń", "camera-remove", "destructive", params);
+    let cancel_btn = button("Anuluj", "camera-remove-cancel", "ghost");
+
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Usunąć kamerę \"{}\"?", name), "body_strong"),
+        text("Tej operacji nie można cofnąć."),
+        stack_h(vec![confirm_btn, cancel_btn]),
+    ])])
+}
+
+/// A camera is "warning" when it is not cleanly online or carries a
+/// status_message diagnostic from the supervisor.
+fn camera_has_warning(c: &CameraInfoOut) -> bool {
+    if c.status != "online" && c.status != "offline" {
+        return true;
     }
-    if discovered_count == 0 {
-        return stack_v(vec![
-            text("Automatyczne wyszukiwanie kamer w sieci lokalnej."),
-            stack_h(vec![
-                button_with_icon("Skanuj sieć", "discover-scan", "primary", "search"),
-            ]),
-        ]);
+    c.status_message.as_deref().map(|m| !m.trim().is_empty()).unwrap_or(false)
+}
+
+/// Renders "<actual>/<target>" fps when a live measurement exists, otherwise the
+/// configured target only, or em-dash for offline cameras with no target.
+fn camera_fps_display(c: &CameraInfoOut) -> String {
+    match c.fps_actual {
+        Some(actual) if c.status == "online" => alloc::format!("{:.0}/{}", actual, c.target_fps),
+        _ if c.target_fps > 0 => alloc::format!("\u{2014}/{}", c.target_fps),
+        _ => "\u{2014}".to_string(),
     }
-    let discovered = with_state(|s| s.discover.cameras.iter().enumerate().map(|(i, c)| {
-        (i, c.suggested_name.clone(), c.url.clone(), c.vendor.clone())
-    }).collect::<Vec<_>>());
+}
+
+/// Maps a camera into a diagnostics label + tone for the table cell.
+fn camera_diagnostics(c: &CameraInfoOut) -> (String, &'static str) {
+    if let Some(msg) = c.status_message.as_deref().filter(|m| !m.trim().is_empty()) {
+        let tone = if c.status == "online" { "warning" } else { "critical" };
+        return (msg.to_string(), tone);
+    }
+    match c.status.as_str() {
+        "online" => ("OK".to_string(), "success"),
+        "offline" => ("offline".to_string(), "critical"),
+        other => (other.to_string(), "warning"),
+    }
+}
+
+
+/// Total number of wizard steps. The wizard is 0-indexed internally.
+const ADD_CAMERA_WIZARD_STEPS: u8 = 4;
+
+/// Store key carrying the active wizard step id (`"step0".."step3"`) consumed by
+/// `StepProgress.current_id_path`.
+fn wiz_step_id(step: u8) -> String {
+    alloc::format!("step{}", step)
+}
+
+/// Builds the per-step visibility / navigation patch pairs for `step`. Every
+/// step container and footer button reads one of these booleans through
+/// `with_visible`, so navigation is a pure `StatePatch` — no fragment rebuild.
+fn wizard_step_pairs(step: u8) -> Vec<(String, Value)> {
+    let last = ADD_CAMERA_WIZARD_STEPS - 1;
+    vec![
+        ("wiz_step".into(), Value::Text(wiz_step_id(step))),
+        ("wiz_show_0".into(), Value::Bool(step == 0)),
+        ("wiz_show_1".into(), Value::Bool(step == 1)),
+        ("wiz_show_2".into(), Value::Bool(step == 2)),
+        ("wiz_show_3".into(), Value::Bool(step == 3)),
+        ("wiz_show_back".into(), Value::Bool(step > 0)),
+        ("wiz_show_next".into(), Value::Bool(step < last)),
+        ("wiz_show_finish".into(), Value::Bool(step >= last)),
+    ]
+}
+
+/// Visibility pairs for the four per-type config blocks of step 2. Exactly one
+/// is `true` for the chosen source; switching type is a `StatePatch` that flips
+/// these, revealing the matching config without rebuilding the body.
+fn wizard_source_pairs(src: Option<SourceType>) -> Vec<(String, Value)> {
+    let s = src.map(SourceType::as_str).unwrap_or("");
+    vec![
+        ("wiz_src".into(), Value::Text(s.into())),
+        ("wiz_is_onvif".into(), Value::Bool(src == Some(SourceType::Onvif))),
+        ("wiz_is_rtsp".into(), Value::Bool(src == Some(SourceType::Rtsp))),
+        ("wiz_is_usb".into(), Value::Bool(src == Some(SourceType::Usb))),
+        ("wiz_is_file".into(), Value::Bool(src == Some(SourceType::File))),
+    ]
+}
+
+/// Patch pairs describing the step-2 ONVIF discovery sub-state (scan spinner,
+/// discovered-list visibility, count line, manual-entry visibility).
+fn wizard_onvif_pairs(s: &DiscoverState) -> Vec<(String, Value)> {
+    let count = s.cameras.len();
+    vec![
+        ("wiz_onvif_scanning".into(), Value::Bool(s.scanning)),
+        ("wiz_onvif_has_results".into(), Value::Bool(!s.scanning && count > 0)),
+        ("wiz_onvif_no_results".into(), Value::Bool(!s.scanning && count == 0)),
+        (
+            "wiz_onvif_count".into(),
+            Value::Text(alloc::format!(
+                "Znaleziono {} kamer. Wybierz jedną lub podaj URL ręcznie.",
+                count
+            )),
+        ),
+    ]
+}
+
+/// Patch pairs describing the step-3 connection-test sub-state (spinner, result
+/// alerts, result text). Mutually exclusive visibility flags drive which block
+/// is shown.
+fn wizard_test_pairs(s: &DiscoverState) -> Vec<(String, Value)> {
+    let (ok, err, text, idle) = match (&s.testing, &s.test_result) {
+        (true, _) => (false, false, String::new(), false),
+        (false, Some(Ok(m))) => {
+            let detail = if m.is_empty() { "Połączenie nawiązane.".to_string() } else { m.clone() };
+            (true, false, alloc::format!("Połączenie OK. {}", detail), false)
+        }
+        (false, Some(Err(m))) => (false, true, m.clone(), false),
+        (false, None) => (false, false, String::new(), true),
+    };
+    vec![
+        ("wiz_testing".into(), Value::Bool(s.testing)),
+        ("wiz_test_ok".into(), Value::Bool(ok)),
+        ("wiz_test_err".into(), Value::Bool(err)),
+        ("wiz_test_idle".into(), Value::Bool(idle)),
+        ("wiz_test_text".into(), Value::Text(text)),
+    ]
+}
+
+/// Error-alert patch pair. `wiz_has_error` toggles the alert's visibility while
+/// `wiz_error` carries its message.
+fn wizard_error_pairs(message: Option<&str>) -> Vec<(String, Value)> {
+    vec![
+        ("wiz_has_error".into(), Value::Bool(message.is_some())),
+        ("wiz_error".into(), Value::Text(message.unwrap_or("").into())),
+    ]
+}
+
+/// The full set of wizard store keys derived from the current backend wizard
+/// state, seeded into the `add_camera_body` SlotContent `state_overlay`. Sent
+/// whenever the body fragment is delivered (modal open or an ONVIF
+/// scan/select re-send) so every bound visibility flag, the StepProgress and
+/// the field inputs resolve to the authoritative backend state on first paint.
+fn wizard_full_overlay() -> Vec<StateEntry> {
+    let (step, src, err) = with_state(|s| (s.wizard_step, s.discover.source_type, s.error_message.clone()));
+    let mut pairs: Vec<(String, Value)> = Vec::new();
+    pairs.extend(wizard_step_pairs(step));
+    pairs.extend(wizard_source_pairs(src));
+    pairs.extend(with_state(|s| wizard_test_pairs(&s.discover)));
+    pairs.extend(with_state(|s| wizard_onvif_pairs(&s.discover)));
+    pairs.extend(wizard_error_pairs(err.as_deref()));
+    // Field bind paths reflect the committed backend values so the two-way-bound
+    // inputs show the right text without any further round-trip.
+    let fields = with_state(|s| [
+        ("onvif_url", s.discover.onvif_url.clone()),
+        ("rtsp_url", s.discover.rtsp_url.clone()),
+        ("usb_device_path", s.discover.usb_device_path.clone()),
+        ("file_path", s.discover.file_path.clone()),
+        ("cred_user", s.discover.cred_user.clone()),
+        ("cred_pass", s.discover.cred_pass.clone()),
+        ("name", s.discover.name.clone()),
+        ("retention", s.discover.retention.clone()),
+        ("fps", s.discover.fps.clone()),
+    ]);
+    for (key, value) in fields {
+        pairs.push((key.into(), Value::Text(value)));
+    }
+    // Reflect the committed profile (defaulting to "default") so the select
+    // shows the authoritative backend value rather than always resetting to it.
+    pairs.push(("profile".into(), Value::Text(with_state(|s| s.discover.profile_or_default().to_string()))));
+    pairs
+        .into_iter()
+        .map(|(key, value)| StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(key)]),
+            value,
+        })
+        .collect()
+}
+
+/// The "Add camera" wizard lives in a Modal overlay. This builds the Modal
+/// shell that is placed in the "content" slot tree while `add_form_visible`.
+/// Its body/footer are filled separately via SlotContent on the dynamic slots
+/// `add_camera_body` / `add_camera_footer`, which the host registers only while
+/// this Modal is in the DOM. The Dismiss event (×/backdrop/ESC) is routed to
+/// the same `camera-add-cancel` action as the footer cancel button so closing
+/// the dialog any way resets the wizard state.
+fn build_add_camera_modal() -> Component {
+    let step = with_state(|s| s.wizard_step);
+    let title = alloc::format!("Dodaj kamerę \u{2014} krok {} z {}", step + 1, ADD_CAMERA_WIZARD_STEPS);
+
+    let mut modal = ModalComp {
+        title: lit(&title),
+        subtitle: None,
+        body_slot: "add_camera_body".into(),
+        footer_slot: Some("add_camera_footer".into()),
+        size: ModalSize::Lg,
+        dismissible: true,
+        prevent_scroll: true,
+        closable: true,
+    }.into_component(next_id()).expect("Modal");
+    modal.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Dismiss,
+        Handler::Backend {
+            action_id: "camera-add-cancel".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    modal
+}
+
+/// Builds the wizard body fragment for the `add_camera_body` slot ONCE, when the
+/// modal opens. Every step lives in the DOM simultaneously, wrapped in a
+/// `with_visible` container bound to a `wiz_show_N` store flag; the active step
+/// is revealed purely by `StatePatch`. The StepProgress, the per-type config
+/// blocks, the test-result block and the error alert are all store-bound, so no
+/// wizard interaction (source pick, Next/Back, typing) rebuilds this fragment.
+fn build_add_camera_body() -> Component {
+    let step_progress = build_wizard_step_progress();
+
+    let step0 = with_visible(build_wizard_step_source_type(), "wiz_show_0");
+    let step1 = with_visible(build_wizard_step_config(), "wiz_show_1");
+    let step2 = with_visible(build_wizard_step_test(), "wiz_show_2");
+    let step3 = with_visible(build_wizard_step_metadata(), "wiz_show_3");
+
+    let error_alert = with_visible(alert_bound("wiz_error", "critical"), "wiz_has_error");
+
+    stack_v(vec![step_progress, step0, step1, step2, step3, error_alert])
+}
+
+/// StepProgress bound to `wiz_step`. Status per step is derived by the renderer
+/// from `current_id_path` position, so advancing a step is a single patch.
+fn build_wizard_step_progress() -> Component {
+    let step_labels = ["Typ źródła", "Konfiguracja", "Test połączenia", "Metadane"];
+    StepProgressComp {
+        steps: step_labels.iter().enumerate().map(|(i, label)| StepDef {
+            id: wiz_step_id(i as u8),
+            label: lit(label),
+            optional: false,
+            status: None,
+            description: None,
+        }).collect(),
+        current_id_path: StatePath::new(vec![PathSegment::Key("wiz_step".into())]),
+        variant: StepProgressVariant::Horizontal,
+        clickable_completed: false,
+    }.into_component(next_id()).expect("StepProgress")
+}
+
+/// Builds the wizard navigation buttons for the `add_camera_footer` slot ONCE.
+/// All four buttons live in the DOM; Back/Next/Finish toggle visibility through
+/// store flags (`wiz_show_back/next/finish`) so navigation never rebuilds the
+/// footer. The Next label is intentionally generic — the step number lives in
+/// the StepProgress, not the button text, so it needs no per-step patching.
+fn build_add_camera_footer() -> Component {
+    let back = with_visible(button_with_icon("Wstecz", "wizard-prev", "ghost", "info"), "wiz_show_back");
+    let cancel = button("Anuluj", "camera-add-cancel", "ghost");
+    let next = with_visible(button("Dalej", "wizard-next", "primary"), "wiz_show_next");
+    let finish = with_visible(button("Zakończ", "camera-add-submit", "primary"), "wiz_show_finish");
+    stack_h(vec![back, cancel, next, finish])
+}
+
+/// Step 1 — source-type chooser as a store-bound `RadioCardGroup`. The pick is
+/// written to `wiz_src` reactively (client highlight) and forwarded to the
+/// backend `wizard-source-select` action, which patches the per-type config
+/// visibility flags. No card is rebuilt on selection.
+fn build_wizard_step_source_type() -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::RadioCardGroup;
+    let options = vec![
+        RadioCardOption {
+            value: SelectValue::Text(SourceType::Onvif.as_str().into()),
+            icon: icon_named(parse_icon_name("search")),
+            title: lit("Kamera sieciowa ONVIF"),
+            description: Some(lit("Automatyczne wykrywanie kamer ONVIF w sieci lokalnej.")),
+            badge: None,
+            disabled: false,
+        },
+        RadioCardOption {
+            value: SelectValue::Text(SourceType::Rtsp.as_str().into()),
+            icon: icon_named(parse_icon_name("video")),
+            title: lit("Strumień RTSP/RTSPS"),
+            description: Some(lit("Ręczny adres strumienia rtsp:// lub rtsps://.")),
+            badge: None,
+            disabled: false,
+        },
+        RadioCardOption {
+            value: SelectValue::Text(SourceType::Usb.as_str().into()),
+            icon: icon_named(parse_icon_name("cameras")),
+            title: lit("Kamera lokalna / USB"),
+            description: Some(lit("Urządzenie wideo podłączone do tego hosta (v4l2).")),
+            badge: None,
+            disabled: false,
+        },
+        RadioCardOption {
+            value: SelectValue::Text(SourceType::File.as_str().into()),
+            icon: icon_named(parse_icon_name("evidence")),
+            title: lit("Plik testowy"),
+            description: Some(lit("Lokalny plik wideo używany jako źródło testowe.")),
+            badge: None,
+            disabled: false,
+        },
+    ];
+
+    let mut group = RadioCardGroup {
+        bind_path: StatePath::new(vec![PathSegment::Key("wiz_src".into())]),
+        options,
+        columns: 2,
+        variant: RadioCardVariant::Default,
+    }.into_component(next_id()).expect("RadioCardGroup");
+    group = with_a11y_label(group, "Typ źródła kamery");
+    // The change carries the picked SelectValue as `{value, kind}` detail; the
+    // backend reads `value` to branch step 2 and patch the per-type flags.
+    group.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "wizard-source-select".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+
+    stack_v(vec![
+        text("Wybierz typ źródła kamery. Dalsze kroki dopasują się do wybranego typu."),
+        group,
+    ])
+}
+
+/// Step 2 — all four per-type config blocks present at once, each wrapped in a
+/// `with_visible` container bound to its `wiz_is_X` flag. Switching source type
+/// is a `StatePatch` that flips exactly one flag visible.
+fn build_wizard_step_config() -> Component {
+    stack_v(vec![
+        with_visible(build_config_onvif(), "wiz_is_onvif"),
+        with_visible(build_config_rtsp(), "wiz_is_rtsp"),
+        with_visible(build_config_usb(), "wiz_is_usb"),
+        with_visible(build_config_file(), "wiz_is_file"),
+    ])
+}
+
+/// ONVIF config block. The discovery list and selectable results are genuinely
+/// dynamic (populated by an explicit `discover-scan`), so their visibility is
+/// store-bound and the scan/select actions re-send this body; the manual URL +
+/// credential inputs are always-present, two-way-bound fields.
+fn build_config_onvif() -> Component {
+    let scanning = with_state(|s| s.discover.scanning);
     let selected_idx = with_state(|s| s.discover.selected_index);
 
+    let scan_spinner = with_visible(
+        stack_v(vec![spinner("md"), text("Skanowanie sieci (ONVIF WS-Discovery)...")]),
+        "wiz_onvif_scanning",
+    );
+
+    let no_results = with_visible(
+        stack_v(vec![
+            text("Zeskanuj sieć w poszukiwaniu kamer ONVIF lub podaj adres URL urządzenia ręcznie."),
+            stack_h(vec![button_with_icon("Skanuj sieć", "discover-scan", "primary", "search")]),
+        ]),
+        "wiz_onvif_no_results",
+    );
+
+    let discovered = with_state(|s| s.discover.cameras.iter().enumerate()
+        .map(|(i, c)| (i, c.suggested_name.clone(), c.url.clone())).collect::<Vec<_>>());
     let mut cam_rows: Vec<Component> = Vec::new();
-    for (i, name, url, vendor) in &discovered {
-        let is_sel = selected_idx == Some(*i);
-        let label = text_styled(name, "body_strong");
-        let meta = text_styled(&alloc::format!("{} \u{00b7} {}", url, vendor), "caption");
-        let capability = if vendor.contains("ONVIF") {
-            chip_toned_icon("ONVIF OK", "success", "check")
-        } else if vendor.contains("ACAP") || vendor.contains("edge") {
-            chip_toned("edge analytics", "info")
-        } else if vendor.contains("RTSP") || vendor.to_ascii_lowercase().contains("rtsp") {
-            chip_toned("tylko RTSP", "warning")
-        } else {
-            chip_toned("standard", "muted")
-        };
-        let row_content = stack_h(vec![
-            stack_v_gap("xs", vec![label, meta]),
-            capability,
+    for (i, name, url) in &discovered {
+        let is_sel = !scanning && selected_idx == Some(*i);
+        let row_content = stack_v_gap("xs", vec![
+            text_styled(name, "body_strong"),
+            text_styled(url, "caption"),
         ]);
-        let tone = if is_sel { Tone::Primary } else { Tone::Neutral };
         let mut row_card = Card {
             variant: if is_sel { CardVariant::Filled } else { CardVariant::Outlined },
             padding: Spacing::Sm,
@@ -2412,7 +3363,7 @@ fn build_wizard_step_discovery(scanning: bool, discovered_count: usize) -> Compo
             shadow: ShadowToken::None,
             border: BorderToken::Hairline,
             background: BackgroundToken::None,
-            accent: if is_sel { Some(tone) } else { None },
+            accent: if is_sel { Some(Tone::Primary) } else { None },
             children: vec![row_content],
             interactive: true,
             clickable: true,
@@ -2430,82 +3381,125 @@ fn build_wizard_step_discovery(scanning: bool, discovered_count: usize) -> Compo
         )]));
         cam_rows.push(row_card);
     }
+    let has_results = with_visible(
+        stack_v(vec![
+            text_bound("wiz_onvif_count"),
+            stack_v_gap("xs", cam_rows),
+            button_with_icon("Skanuj ponownie", "discover-scan", "ghost", "search"),
+        ]),
+        "wiz_onvif_has_results",
+    );
+
+    let url_input = wizard_input("URL urządzenia ONVIF", "http://10.0.0.5/onvif/device_service", "onvif_url", false);
+    let user_input = wizard_input("Użytkownik", "", "cred_user", false);
+    let pass_input = wizard_input("Hasło", "", "cred_pass", true);
 
     stack_v(vec![
-        text(&alloc::format!("Znaleziono {} kamer w sieci kamerowej.", discovered_count)),
-        stack_v_gap("xs", cam_rows),
-        button_with_icon("Skanuj ponownie", "discover-scan", "ghost", "search"),
+        scan_spinner,
+        no_results,
+        has_results,
+        url_input,
+        grid(2, vec![user_input, pass_input]),
+        text_styled("Kamera ONVIF wymaga użytkownika i hasła.", "caption"),
     ])
 }
 
-fn build_wizard_step_selection() -> Component {
-    let discovered_count = with_state(|s| s.discover.cameras.len());
-
-    let discovery_summary = if discovered_count > 0 {
-        text(&alloc::format!("Znaleziono {} nowe kamery w sieci kamerowej (VLAN 40). Wybierz tę, którą chcesz dodać.", discovered_count))
-    } else {
-        text("Brak wyników skanowania. Wróć do kroku 1 aby skanować lub wprowadź dane ręcznie.")
-    };
-
-    // Credential form fields
-    let name_input = input("Nazwa kamery", "C-23 wjazd-ADR-2", "name");
-    let location_select = select("Lokalizacja / strefa", vec![
-        SelectOption { value: SelectValue::Text("brama".into()), label: lit("Brama wjazdowa"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("parking".into()), label: lit("Parking"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("hala".into()), label: lit("Hala"), icon: None, disabled: false, group_id: None, description: None },
-    ], "camera_location");
-    let user_input = input("Użytkownik", "admin", "camera_user");
-    let password_input = {
-        use tentaflow_sdk_spec::protocol::ui::form::Input;
-        Input {
-            r#type: InputType::Password,
-            bind_path: StatePath::new(vec![PathSegment::Key("camera_password".into())]),
-            placeholder: Some(lit("zapisz w vault TentaFlow")),
-            label: Some(lit("Hasło")),
-            hint: Some(lit("Poświadczenia w secret store. Rotacja co 90 dni.")),
-            leading_icon: None,
-            trailing_icon: None,
-            prefix: None,
-            suffix: None,
-            validators: vec![],
-            max_length: None,
-            min_length: None,
-            pattern: None,
-            autocomplete: None,
-            input_mode: None,
-            disabled: None,
-            readonly: None,
-            error: None,
-            size: InputSize::Md,
-        }.into_component("camera_password").expect("Input")
-    };
-    let form_grid = grid(2, vec![name_input, location_select, user_input, password_input]);
-
-    // Firmware warning alert
-    let firmware_alert = AlertComp {
-        tone: parse_tone("warning"),
-        variant: AlertVariant::Default,
-        icon: Some(icon_named(parse_icon_name("info"))),
-        title: Some(lit("Wykryto wariancje firmware")),
-        message: lit("Hikvision firmware 5.7.x ma wyłączony ONVIF domyślnie. Po podaniu poświadczeń włączymy go automatycznie (wymaga uprawnień admin). Alternatywnie: RTSP fallback."),
-        actions: None,
-        dismissible: false,
-    }.into_component(next_id()).expect("Alert");
-
-    stack_v(vec![discovery_summary, form_grid, firmware_alert])
-}
-
-fn build_wizard_step_preview() -> Component {
+fn build_config_rtsp() -> Component {
+    let url_input = wizard_input("URL strumienia RTSP", "rtsp://host:554/stream", "rtsp_url", false);
+    let user_input = wizard_input("Użytkownik (opcjonalnie)", "", "cred_user", false);
+    let pass_input = wizard_input("Hasło (opcjonalnie)", "", "cred_pass", true);
     stack_v(vec![
-        text("Podgląd strumienia i kalibracja kamery."),
-        empty_state("Oczekiwanie na podgląd", Some("Wprowadź poświadczenia w kroku 2, aby uzyskać podgląd strumienia."), Some("video")),
+        text("Podaj adres strumienia RTSP/RTSPS. Poświadczenia są opcjonalne."),
+        url_input,
+        grid(2, vec![user_input, pass_input]),
     ])
 }
 
-fn build_wizard_step_profile() -> Component {
+/// USB config block. Local devices are enumerated eagerly at modal open so the
+/// Select options can be baked into this fragment (Select options are static
+/// component fields, not store-bound). A manual path input is always present so
+/// the step is never a dead end when no device is detected. The device Select
+/// and the manual input both two-way bind `usb_device_path`.
+fn build_config_usb() -> Component {
+    let devices = with_state(|s| s.discover.usb_devices.iter()
+        .map(|d| (d.device_path.clone(), d.label.clone())).collect::<Vec<_>>());
+
+    if devices.is_empty() {
+        return stack_v(vec![
+            alert("Nie wykryto lokalnych urządzeń wideo (v4l2). Podaj ścieżkę ręcznie.", "info"),
+            wizard_input("Ścieżka urządzenia", "/dev/video0", "usb_device_path", false),
+        ]);
+    }
+
+    let options: Vec<SelectOption> = devices.iter().map(|(path, label)| SelectOption {
+        value: SelectValue::Text(path.clone()),
+        label: lit(&alloc::format!("{} ({})", label, path)),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    }).collect();
+    let device_select = wizard_select("Wykryte urządzenie", options, "usb_device_path");
+
     stack_v(vec![
-        text("Przypisz profil analityczny do kamery."),
-        empty_state("Wybierz profil", Some("Wybierz istniejący profil lub utwórz nowy."), Some("brain")),
+        text(&alloc::format!("Wykryto {} urządzeń lokalnych. Wybierz źródło wideo.", devices.len())),
+        device_select,
+    ])
+}
+
+fn build_config_file() -> Component {
+    stack_v(vec![
+        text("Podaj ścieżkę lokalnego pliku wideo używanego jako źródło testowe."),
+        wizard_input("Ścieżka pliku wideo", "/var/lib/tentaflow/sample.mp4", "file_path", false),
+    ])
+}
+
+/// Step 3 — connection probe. Spinner, success alert, error alert and idle
+/// empty-state all live in the DOM, toggled by `wiz_testing/test_ok/test_err/
+/// test_idle` flags; the result text is bound to `wiz_test_text`. Running the
+/// test is a `StatePatch`, never a rebuild. No fabricated preview frame.
+fn build_wizard_step_test() -> Component {
+    let testing_block = with_visible(
+        stack_v(vec![spinner("md"), text("Testowanie połączenia z kamerą...")]),
+        "wiz_testing",
+    );
+    let ok_block = with_visible(alert_bound("wiz_test_text", "success"), "wiz_test_ok");
+    let err_block = with_visible(alert_bound("wiz_test_text", "critical"), "wiz_test_err");
+    let idle_block = with_visible(
+        empty_state("Brak testu", Some("Uruchom test, aby sprawdzić połączenie z kamerą."), Some("info")),
+        "wiz_test_idle",
+    );
+
+    stack_v(vec![
+        text("Sprawdź połączenie ze źródłem przed dodaniem kamery."),
+        stack_h(vec![button_with_icon("Testuj połączenie", "wizard-test", "primary", "check")]),
+        testing_block,
+        ok_block,
+        err_block,
+        idle_block,
+        text_styled("Podgląd na żywo będzie dostępny po dodaniu kamery.", "caption"),
+    ])
+}
+
+/// Step 4 — camera metadata. All fields two-way bind their store keys; no preset
+/// values. The metadata name is pre-filled from a discovered camera on the
+/// step-2→3 transition via a `StatePatch`, not by rebuilding this fragment.
+fn build_wizard_step_metadata() -> Component {
+    let name_input = wizard_input("Nazwa kamery", "np. Brama wjazdowa", "name", false);
+    let retention_select = wizard_select("Klasa retencji", vec![
+        SelectOption { value: SelectValue::Text("A".into()), label: lit("A — długa retencja"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("B".into()), label: lit("B — średnia retencja"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("C".into()), label: lit("C — krótka retencja"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("Unclassified".into()), label: lit("Niesklasyfikowana"), icon: None, disabled: false, group_id: None, description: None },
+    ], "retention");
+    let fps_input = wizard_input("Docelowe FPS", "15", "fps", false);
+    let profile_select = wizard_select("Profil analityczny", vec![
+        SelectOption { value: SelectValue::Text("default".into()), label: lit("default"), icon: None, disabled: false, group_id: None, description: None },
+    ], "profile");
+
+    stack_v(vec![
+        text("Uzupełnij metadane kamery przed jej dodaniem."),
+        grid(2, vec![name_input, retention_select, fps_input, profile_select]),
     ])
 }
 

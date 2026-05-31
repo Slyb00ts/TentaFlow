@@ -264,42 +264,44 @@ function renderInput(component, ctx) {
 
   applyValueReactive(el, bindPath, ctx);
 
-  // tf-input emits native input/change with detail.value (bubbles:true).
-  // Engine applyEventHandlers listens on root element for these. We intercept
-  // to add SDK-required `kind` field and suppress disabled/readonly controls.
+  // tf-input emits native input/change with detail.value (bubbles:true), and
+  // the inner native control's own input/change bubble to the host too. The
+  // engine's applyEventHandlers listens on the host for these. We intercept to
+  // add the SDK `kind` field and suppress disabled/readonly controls — but the
+  // raw events carry no `{value, kind}` (a native InputEvent.detail is the
+  // number 0), so if they reached the dispatcher they'd send an EMPTY value and
+  // clobber the field. We therefore stopImmediatePropagation on every raw event
+  // (blocking the dispatcher listener registered after us) and re-emit a single
+  // synthetic event tagged `__tfReemit` that we let pass straight through.
   const muted = () => isDisabledFn() || isReadonlyFn();
 
+  const reemit = (name) => {
+    const ce = new CustomEvent(name, {
+      bubbles: false,
+      detail: { value: el.value, kind: 'tstr' },
+    });
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
+  };
+
   const onInput = (e) => {
-    e.stopPropagation();
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
     if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('input', {
-        bubbles: false,
-        detail: { value: el.value, kind: 'tstr' },
-      })
-    );
+    reemit('input');
   };
   const onChange = (e) => {
-    e.stopPropagation();
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
     if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('change', {
-        bubbles: false,
-        detail: { value: el.value, kind: 'tstr' },
-      })
-    );
+    reemit('change');
   };
   const onKeyDown = (e) => {
     if (e.key !== 'Enter') return;
     if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
     e.preventDefault();
     if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('submit', {
-        bubbles: false,
-        detail: { value: el.value, kind: 'tstr' },
-      })
-    );
+    reemit('submit');
   };
   const onFocus = () => {
     if (muted()) return;
@@ -417,29 +419,32 @@ function renderTextarea(component, ctx) {
 
   applyValueReactive(el, bindPath, ctx);
 
-  // tf-textarea emits native input/change with detail.value (bubbles:true).
-  // Intercept to add SDK `kind` and suppress disabled/readonly.
+  // tf-textarea emits native input/change with detail.value (bubbles:true), and
+  // the inner native control's events bubble to the host too. Raw events carry
+  // no {value, kind}, so we stopImmediatePropagation them (blocking the empty
+  // emit) and re-emit a single synthetic tagged event the dispatcher consumes.
   const muted = () => isDisabledFn() || isReadonlyFn();
 
+  const reemit = (name) => {
+    const ce = new CustomEvent(name, {
+      bubbles: false,
+      detail: { value: el.value, kind: 'tstr' },
+    });
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
+  };
+
   const onInput = (e) => {
-    e.stopPropagation();
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
     if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('input', {
-        bubbles: false,
-        detail: { value: el.value, kind: 'tstr' },
-      })
-    );
+    reemit('input');
   };
   const onChange = (e) => {
-    e.stopPropagation();
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
     if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('change', {
-        bubbles: false,
-        detail: { value: el.value, kind: 'tstr' },
-      })
-    );
+    reemit('change');
   };
   const onFocus = () => {
     if (muted()) return;

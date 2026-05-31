@@ -17,12 +17,15 @@
 // inspected the catalog from their tenancy.
 // =============================================================================
 
-use serde::{Deserialize, Serialize};
-
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
-use super::{
-    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
+use minicbor::Encode;
+use tentaflow_sdk_spec::{
+    GpuOut, NodeResourcesInput, NodeResourcesOut, ServiceInfoOut, ServiceListInput,
+    ServiceListOutput,
 };
+
+use super::abi_helpers::{write_output_with_retry_semantics, PayloadKind};
+use super::cbor_io::read_input_cbor;
+use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller};
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 
@@ -32,51 +35,6 @@ const PERM_SERVICE_READ: &str = "service.read";
 // ---------------------------------------------------------------------------
 // service_list_v1
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, Default)]
-struct ServiceListInput {
-    /// Optional category filter (`llm`, `embedding`, `stt`, `tts`, `vision`,
-    /// ...). Match is case-sensitive against `ServiceInfo.category`.
-    #[serde(default)]
-    kind: Option<String>,
-    /// Optional status filter (`starting`, `running`, `degraded`, `failed`,
-    /// `stopped`). Match is case-sensitive.
-    #[serde(default)]
-    status: Option<String>,
-    /// Restrict the list to one mesh node (typically the local node id).
-    #[serde(default)]
-    node_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Default)]
-struct ServiceListOutput {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    services: Vec<ServiceInfoOut>,
-}
-
-#[derive(Debug, Serialize)]
-struct ServiceInfoOut {
-    /// Stable composite id `<node>:<service>` so addons can address the same
-    /// service across mesh reconnects without juggling two fields.
-    service_id: String,
-    /// Numeric service id local to the owning node (matches the DB rowid
-    /// emitted by `services_repo`). Kept alongside `service_id` because the
-    /// router APIs key on the numeric value.
-    service_local_id: i64,
-    display_name: String,
-    /// `category` from the registry (`llm`, `embedding`, …).
-    kind: String,
-    status: String,
-    node_id: String,
-    /// Public endpoint URL where addons can dispatch (may be `None` for
-    /// embedded native services that go via the in-process backend).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    endpoint: Option<String>,
-    /// Union of model `capabilities` declared by every model the service
-    /// exposes. Empty when the service publishes no models.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    capabilities: Vec<String>,
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn service_list_v1(
@@ -92,32 +50,6 @@ pub fn service_list_v1(
         None => return AbiError::Operation.as_i32(),
     };
 
-    // Empty input (input_len == 0) is allowed — returns the unfiltered list.
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit_service(
-                caller.data(),
-                "service.list",
-                "error",
-                Some("input_read_failed"),
-            );
-            return e.as_i32();
-        }
-    };
-
-    let input: ServiceListInput = if raw.trim().is_empty() {
-        ServiceListInput::default()
-    } else {
-        match toml::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => {
-                audit_service(caller.data(), "service.list", "error", Some("invalid_toml"));
-                return AbiError::Operation.as_i32();
-            }
-        }
-    };
-
     if !check_permission(caller.data(), PERM_SERVICE_READ, None) {
         audit_service(
             caller.data(),
@@ -127,6 +59,28 @@ pub fn service_list_v1(
         );
         return AbiError::Permission.as_i32();
     }
+
+    // Empty input (input_len == 0) is allowed — returns the unfiltered list.
+    let input: ServiceListInput = if input_len == 0 {
+        ServiceListInput::default()
+    } else {
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::Secret) {
+            Ok(v) => v,
+            Err(e) => {
+                audit_service(
+                    caller.data(),
+                    "service.list",
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        }
+    };
 
     let router = match caller.data().router.as_ref() {
         Some(r) => r.clone(),
@@ -141,7 +95,9 @@ pub fn service_list_v1(
                 Some("router_unavailable"),
             );
             let empty = ServiceListOutput::default();
-            return write_toml_capped(&memory, &mut caller, &empty, out_ptr, out_cap, out_len_ptr);
+            return write_services_output(
+                &memory, &mut caller, &empty, out_ptr, out_cap, out_len_ptr,
+            );
         }
     };
 
@@ -190,7 +146,7 @@ pub fn service_list_v1(
 
     let out = ServiceListOutput { services: filtered };
     audit_service(caller.data(), "service.list", "ok", None);
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_services_output(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
 /// Strips userinfo (`user:pass@`) and query-string from a service endpoint
@@ -216,34 +172,6 @@ fn sanitize_endpoint_url(raw: &str) -> String {
 // node_resources_get_v1
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct NodeResourcesInput {
-    node_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct NodeResourcesOut {
-    node_id: String,
-    cpu_cores: u32,
-    /// Aggregate CPU usage across all cores, last refresh. 0..=100.
-    cpu_load_pct: f64,
-    ram_total_mb: u64,
-    ram_used_mb: u64,
-    /// First GPU only when the host exposes one. `gpu_count` carries the
-    /// total so a multi-GPU host is not silently misreported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    gpu: Option<GpuOut>,
-    gpu_count: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct GpuOut {
-    name: String,
-    vram_total_mb: u64,
-    vram_used_mb: u64,
-    utilization_pct: f64,
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn node_resources_get_v1(
     mut caller: WasmCaller<'_, AddonState>,
@@ -257,30 +185,6 @@ pub fn node_resources_get_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
-        Ok(s) => s,
-        Err(e) => {
-            audit_service(
-                caller.data(),
-                "service.node_resources_get",
-                "error",
-                Some("input_read_failed"),
-            );
-            return e.as_i32();
-        }
-    };
-    let input: NodeResourcesInput = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            audit_service(
-                caller.data(),
-                "service.node_resources_get",
-                "error",
-                Some("invalid_toml"),
-            );
-            return AbiError::Operation.as_i32();
-        }
-    };
     if !check_permission(caller.data(), PERM_SERVICE_READ, None) {
         audit_service(
             caller.data(),
@@ -290,6 +194,23 @@ pub fn node_resources_get_v1(
         );
         return AbiError::Permission.as_i32();
     }
+    let input: NodeResourcesInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::Secret) {
+            Ok(v) => v,
+            Err(e) => {
+                audit_service(
+                    caller.data(),
+                    "service.node_resources_get",
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
 
     // Resolve which node the caller asked about. We materialise resources
     // only for the local node — remote peers do not yet broadcast a stable
@@ -341,38 +262,19 @@ pub fn node_resources_get_v1(
     };
 
     audit_service(caller.data(), "service.node_resources_get", "ok", None);
-    write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+    write_services_output(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers (private to this module)
 // ---------------------------------------------------------------------------
 
-fn read_input_toml(
-    memory: &super::super::runtime::WasmMemory,
-    caller: &WasmCaller<'_, AddonState>,
-    input_ptr: i32,
-    input_len: i32,
-) -> Result<String, AbiError> {
-    if input_len < 0 {
-        return Err(AbiError::Operation);
-    }
-    // Service list / node resources payloads are tiny — cap at the Secret
-    // bucket (64 KiB) which is plenty for any conceivable filter combo.
-    if enforce_payload_size(input_len as usize, PayloadKind::Secret).is_err() {
-        return Err(AbiError::PayloadTooLarge);
-    }
-    if input_len == 0 {
-        return Ok(String::new());
-    }
-    let bytes =
-        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| AbiError::Operation)
-}
-
-fn write_toml_capped<T: Serialize>(
+/// Encodes `value` to CBOR and writes it through the retry helper. The service
+/// catalog / node-resources responses are small and bounded by design, so the
+/// cap stays at the module-local 32 KiB ceiling rather than a `PayloadKind`
+/// bucket: typical clusters carry under ~100 services and UI consumers paginate
+/// in JS if they ever approach it.
+fn write_services_output<T: Encode<()>>(
     memory: &super::super::runtime::WasmMemory,
     caller: &mut WasmCaller<'_, AddonState>,
     value: &T,
@@ -380,24 +282,14 @@ fn write_toml_capped<T: Serialize>(
     out_cap: i32,
     out_len_ptr: i32,
 ) -> i32 {
-    let serialized = match toml::to_string(value) {
-        Ok(s) => s,
-        Err(_) => return AbiError::Operation.as_i32(),
-    };
-    // Plan target: typical clusters carry under ~100 services. A 32 KiB cap
-    // keeps the wire format honest; UI consumers paginate in JS if they
-    // ever exceed it.
+    let mut serialized = Vec::new();
+    if minicbor::encode(value, &mut serialized).is_err() {
+        return AbiError::Operation.as_i32();
+    }
     if serialized.len() > 32 * 1024 {
         return AbiError::PayloadTooLarge.as_i32();
     }
-    write_output_with_retry_semantics(
-        memory,
-        caller,
-        serialized.as_bytes(),
-        out_ptr,
-        out_cap,
-        out_len_ptr,
-    )
+    write_output_with_retry_semantics(memory, caller, &serialized, out_ptr, out_cap, out_len_ptr)
 }
 
 fn audit_service(state: &AddonState, action: &str, result: &str, reason: Option<&str>) {
@@ -545,22 +437,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn service_list_input_accepts_empty_toml() {
-        let v: ServiceListInput = toml::from_str("").expect("empty toml parses");
-        assert!(v.kind.is_none() && v.status.is_none() && v.node_id.is_none());
+    fn service_list_input_roundtrips_filters() {
+        let input = ServiceListInput {
+            kind: Some("llm".into()),
+            status: Some("running".into()),
+            node_id: Some("n1".into()),
+        };
+        let mut buf = Vec::new();
+        minicbor::encode(&input, &mut buf).unwrap();
+        let decoded: ServiceListInput = minicbor::decode(&buf).unwrap();
+        assert_eq!(decoded.kind.as_deref(), Some("llm"));
+        assert_eq!(decoded.status.as_deref(), Some("running"));
+        assert_eq!(decoded.node_id.as_deref(), Some("n1"));
     }
 
     #[test]
-    fn service_list_input_parses_filters() {
-        let v: ServiceListInput =
-            toml::from_str("kind = \"llm\"\nstatus = \"running\"\nnode_id = \"n1\"").unwrap();
-        assert_eq!(v.kind.as_deref(), Some("llm"));
-        assert_eq!(v.status.as_deref(), Some("running"));
-        assert_eq!(v.node_id.as_deref(), Some("n1"));
-    }
-
-    #[test]
-    fn service_list_output_serialises_minimal_shape() {
+    fn service_list_output_roundtrips_minimal_shape() {
         let out = ServiceListOutput {
             services: vec![ServiceInfoOut {
                 service_id: "n1:7".to_string(),
@@ -573,15 +465,23 @@ mod tests {
                 capabilities: vec!["detect".into()],
             }],
         };
-        let s = toml::to_string(&out).unwrap();
-        assert!(s.contains("service_id = \"n1:7\""));
-        assert!(s.contains("kind = \"vision\""));
-        assert!(s.contains("capabilities = [\"detect\"]"));
+        let mut buf = Vec::new();
+        minicbor::encode(&out, &mut buf).unwrap();
+        let decoded: ServiceListOutput = minicbor::decode(&buf).unwrap();
+        assert_eq!(decoded.services.len(), 1);
+        assert_eq!(decoded.services[0].service_id, "n1:7");
+        assert_eq!(decoded.services[0].kind, "vision");
+        assert_eq!(decoded.services[0].capabilities, vec!["detect".to_string()]);
     }
 
     #[test]
-    fn node_resources_input_requires_node_id() {
-        let parsed: Result<NodeResourcesInput, _> = toml::from_str("");
-        assert!(parsed.is_err(), "node_id is mandatory");
+    fn node_resources_input_roundtrips_node_id() {
+        let input = NodeResourcesInput {
+            node_id: "n1".into(),
+        };
+        let mut buf = Vec::new();
+        minicbor::encode(&input, &mut buf).unwrap();
+        let decoded: NodeResourcesInput = minicbor::decode(&buf).unwrap();
+        assert_eq!(decoded.node_id, "n1");
     }
 }

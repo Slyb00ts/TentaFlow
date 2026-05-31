@@ -417,20 +417,79 @@ fn trigger_camera_vendor_unsupported_via_camera_add() {
         wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
     };
 
-    // F1b P1.B accepts `fake_file` and `rtsp`. `onvif` is still rejected
-    // (planned for P1.D) and is used here to exercise the rejection path.
-    let raw = br#"
-vendor = "onvif"
-url = "http://example.com/onvif/device_service"
-target_fps = 15
-retention_class = "short"
-display_name = "Test cam"
-profile = "default"
-"#;
-    let rc = camera_test_api::camera_add_with_raw_input(&state, raw);
+    // A vendor outside the addable whitelist must reject with
+    // CameraVendorUnsupported before any other validation runs.
+    let input = tentaflow_sdk_spec::CameraAddInput {
+        display_name: "Test cam".to_string(),
+        vendor: "made_up_vendor".to_string(),
+        url: "http://example.com/stream".to_string(),
+        target_fps: Some(15),
+        resolution_width: None,
+        resolution_height: None,
+        retention_class: Some("C".to_string()),
+        profile: Some("default".to_string()),
+        credentials_b64: None,
+        onvif_profile_token: None,
+    };
+    let mut raw = Vec::new();
+    minicbor::encode(&input, &mut raw).expect("encode camera add input");
+    let rc = camera_test_api::camera_add_with_raw_input(&state, &raw);
     assert_eq!(
         rc,
         AbiError::CameraVendorUnsupported.as_i32(),
-        "camera_add with vendor='onvif' must return CameraVendorUnsupported (14), got {rc}"
+        "camera_add with an unknown vendor must return CameraVendorUnsupported (14), got {rc}"
+    );
+}
+
+// =============================================================================
+// Permission is checked before the CBOR payload is decoded: an unauthorized
+// caller sending malformed CBOR must get AbiError::Permission, not
+// AbiError::Operation (invalid_payload). This pins the F1a ordering where a
+// missing permission shadows any payload-shape error.
+// =============================================================================
+
+#[cfg(feature = "camera")]
+#[test]
+fn camera_add_permission_check_precedes_payload_decode() {
+    use parking_lot::Mutex as ParkingMutex;
+    use tentaflow_core::addon::event_bus::EventBus;
+    use tentaflow_core::addon::host_functions::camera::test_api as camera_test_api;
+    use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
+    use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
+    use tentaflow_core::addon::permissions::PermissionChecker;
+    use tentaflow_core::addon::AddonState;
+
+    let db = make_db();
+    let state = AddonState {
+        addon_id: "perm-order-addon".to_string(),
+        instance_id: "p-1".to_string(),
+        user_id: None,
+        org_id: None,
+        db: db.clone(),
+        // No `cameras.write` — the caller is unauthorized for camera_add.
+        permissions: vec![],
+        event_bus: Arc::new(EventBus::new()),
+        permission_checker: Arc::new(PermissionChecker::new(db)),
+        fuel_consumed: 0,
+        is_system_call: false,
+        rate_limiter: None,
+        net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
+        settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),
+        manifest: Arc::new(AddonManifest::default()),
+        memory_limit: 16 * 1024 * 1024,
+        router: None,
+        oauth_refresh_guard: Arc::new(OAuthRefreshGuard::new()),
+        ui_panels: None,
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
+    };
+
+    // Garbage bytes that are not valid CBOR for CameraAddInput.
+    let raw = vec![0xff, 0x00, 0x13, 0x37, 0xde, 0xad, 0xbe, 0xef];
+    let rc = camera_test_api::camera_add_with_raw_input(&state, &raw);
+    assert_eq!(
+        rc,
+        AbiError::Permission.as_i32(),
+        "unauthorized caller with malformed CBOR must return Permission, not invalid_payload, got {rc}"
     );
 }

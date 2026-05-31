@@ -1374,6 +1374,54 @@ export function encodeClusterUpdateRequest(cluster_id, name, description, strate
 }
 
 /**
+ * @param {string | null} [status]
+ * @param {number | null} [user_id]
+ * @param {string | null} [addon_id]
+ * @param {number | null} [limit]
+ * @param {number | null} [offset]
+ * @returns {Uint8Array}
+ */
+export function encodeComplianceAiEventsListRequest(status, user_id, addon_id, limit, offset) {
+    var ptr0 = isLikeNone(status) ? 0 : passStringToWasm0(status, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    var ptr1 = isLikeNone(addon_id) ? 0 : passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeComplianceAiEventsListRequest(ptr0, len0, !isLikeNone(user_id), isLikeNone(user_id) ? 0 : user_id, ptr1, len1, isLikeNone(limit) ? Number.MAX_SAFE_INTEGER : (limit) >>> 0, isLikeNone(offset) ? Number.MAX_SAFE_INTEGER : (offset) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeComplianceDataCategoriesListRequest() {
+    const ret = wasm.encodeComplianceDataCategoriesListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeComplianceRetentionPoliciesListRequest() {
+    const ret = wasm.encodeComplianceRetentionPoliciesListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * MessageBody::DashboardMetricsRequest (unit variant).
  * @returns {Uint8Array}
  */
