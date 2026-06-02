@@ -223,8 +223,7 @@ pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody,
         let body_bytes = if is_sensitive_variant(body) {
             Vec::new()
         } else {
-            tentaflow_protocol::cbor::encode(body)
-                .unwrap_or_default()
+            tentaflow_protocol::cbor::encode(body).unwrap_or_default()
         };
         let flags: u8 = if is_sensitive_variant(body) {
             0b1000_0000
@@ -256,8 +255,7 @@ pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody,
         let body_bytes = if is_sensitive_variant(&result.0) {
             Vec::new()
         } else {
-            tentaflow_protocol::cbor::encode(&result.0)
-                .unwrap_or_default()
+            tentaflow_protocol::cbor::encode(&result.0).unwrap_or_default()
         };
         let resp_variant_name = variant_name_of(&result.0);
         // Bit 0 = is_error, bit 7 = body_redacted (sensitive variant)
@@ -454,9 +452,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ComplianceAdminPayload::ListRetentionPoliciesRequest => {
                 "ComplianceRetentionPoliciesListRequest"
             }
-            tentaflow_protocol::ComplianceAdminPayload::ListRetentionPoliciesResponse { .. } => {
-                "ComplianceRetentionPoliciesListResponse"
-            }
+            tentaflow_protocol::ComplianceAdminPayload::ListRetentionPoliciesResponse {
+                ..
+            } => "ComplianceRetentionPoliciesListResponse",
             tentaflow_protocol::ComplianceAdminPayload::ListAiEventsRequest(_) => {
                 "ComplianceAiEventsListRequest"
             }
@@ -1081,7 +1079,7 @@ mod tests {
     fn sync_test_ctx(role: &str) -> HandlerContext {
         HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: [0xFF, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                user_id: [1u8; 16],
                 role: Some(role.to_string()),
             },
             correlation_id: 1,
@@ -1123,7 +1121,7 @@ mod tests {
             ],
             rows_affected: 1,
             last_insert_id: 1,
-            actor_user_id: Some(1),
+            actor_user_id: Some("1".to_string()),
             created_at_ms: crate::sync::runtime::now_ms(),
         }
     }
@@ -1269,9 +1267,11 @@ mod tests {
             let db = crate::db::init(&db_path).expect("test DB init");
             let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[0xB2; 32]));
             let security = std::sync::Arc::new(
-                crate::mesh::security::MeshSecurity::new(db, cipher.clone()).expect("mesh security"),
+                crate::mesh::security::MeshSecurity::new(db, cipher.clone())
+                    .expect("mesh security"),
             );
-            crate::sync::runtime::init(security.db.clone(), security, cipher).expect("sync runtime");
+            crate::sync::runtime::init(security.db.clone(), security, cipher)
+                .expect("sync runtime");
             crate::addon::storage_sql_exec::record_sync_conflict(
                 &sync_conflict_capture(addon_id),
                 operation_id,
@@ -1443,10 +1443,8 @@ mod tests {
     async fn dispatch_archetype_coverage_real_handlers() {
         use tentaflow_protocol::{AuthLoginRequest, ClusterUpdateRequest};
 
-        // user_id w 0xFF-marker formacie (real binary protocol convention).
-        let mut user_bytes = [0u8; 16];
-        user_bytes[0] = 0xFF;
-        user_bytes[8..].copy_from_slice(&1u64.to_le_bytes());
+        // Session user_id = 16 surowych bajtow UUID (raw wire form).
+        let user_bytes = *uuid::Uuid::nil().as_bytes();
 
         let ctx_user = HandlerContext {
             session: SessionAuth::UserSession {
@@ -1581,16 +1579,13 @@ mod visibility_enforcement_tests {
     use super::*;
     use crate::db::repository;
 
-    /// Helper: buduje user_id bytes w 0xFF-marker formacie.
-    fn user_id_bytes(id: i64) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        b[0] = 0xFF;
-        b[8..].copy_from_slice(&(id as u64).to_le_bytes());
-        b
+    /// Helper: koduje UUID user_id do 16 surowych bajtow sesji.
+    fn user_id_bytes(id: &str) -> [u8; 16] {
+        *uuid::Uuid::parse_str(id).expect("valid uuid").as_bytes()
     }
 
-    /// Helper: tworzy testowy user i rejestruje addon w DB. Zwraca user_id.
-    fn setup_user_and_addon(db: &crate::db::DbPool, username: &str, addon_id: &str) -> i64 {
+    /// Helper: tworzy testowy user i rejestruje addon w DB. Zwraca user_id (UUID).
+    fn setup_user_and_addon(db: &crate::db::DbPool, username: &str, addon_id: &str) -> String {
         repository::register_addon(db, addon_id, addon_id, "1.0.0", "{}", "linux")
             .expect("register_addon failed");
         repository::create_user_account(db, username, "hash", username, "a@a.pl")
@@ -1611,7 +1606,7 @@ mod visibility_enforcement_tests {
 
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: user_id_bytes(user_id),
+                user_id: user_id_bytes(&user_id),
                 role: None,
             },
             correlation_id: 1,
@@ -1644,11 +1639,11 @@ mod visibility_enforcement_tests {
             repository::create_user_account(&state.db, "anna", "h", "anna", "a@x.pl").unwrap();
         // Grupa B — user tam NIE nalezy; addon widoczny tylko dla grupy B.
         let gb = repository::create_group(&state.db, "groupB", "").unwrap();
-        repository::set_addon_visibility(&state.db, "grp-addon", gb, true, None).unwrap();
+        repository::set_addon_visibility(&state.db, "grp-addon", &gb, true, None).unwrap();
 
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: user_id_bytes(user_id),
+                user_id: user_id_bytes(&user_id),
                 role: None,
             },
             correlation_id: 2,
@@ -1678,7 +1673,7 @@ mod visibility_enforcement_tests {
 
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: user_id_bytes(user_id),
+                user_id: user_id_bytes(&user_id),
                 role: Some("admin".to_string()),
             },
             correlation_id: 3,
@@ -1705,7 +1700,7 @@ mod visibility_enforcement_tests {
 
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: user_id_bytes(user_id),
+                user_id: user_id_bytes(&user_id),
                 role: None,
             },
             correlation_id: 4,
@@ -1737,7 +1732,7 @@ mod visibility_enforcement_tests {
 
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: user_id_bytes(user_id),
+                user_id: user_id_bytes(&user_id),
                 role: None,
             },
             correlation_id: 5,
@@ -1773,7 +1768,7 @@ mod visibility_enforcement_tests {
 
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: user_id_bytes(user_id),
+                user_id: user_id_bytes(&user_id),
                 role: None,
             },
             correlation_id: 6,

@@ -18,7 +18,7 @@ pub struct DbApiKey {
     pub last_used_at: Option<String>,
     /// Migracja 51 — nullable. None = legacy admin-equivalent.
     #[serde(default)]
-    pub owner_user_id: Option<i64>,
+    pub owner_user_id: Option<String>,
 }
 
 /// Ustawienie
@@ -126,7 +126,7 @@ pub struct DbClusterMember {
 /// Definicja flow (przeplyw przetwarzania)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbFlow {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub description: Option<String>,
     pub version: i64,
@@ -145,8 +145,8 @@ pub struct DbFlow {
 /// Powiazanie flow z wzorcem nazwy modelu
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbFlowModelBinding {
-    pub id: i64,
-    pub flow_id: i64,
+    pub id: String,
+    pub flow_id: String,
     pub model_pattern: String,
     pub priority: i64,
 }
@@ -214,8 +214,8 @@ pub struct DbTtsCleaningRule {
 /// Snapshot wersji flow (historia zmian dla rollbacku)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbFlowVersion {
-    pub id: i64,
-    pub flow_id: i64,
+    pub id: String,
+    pub flow_id: String,
     pub version_num: i64,
     pub name: String,
     pub description: Option<String>,
@@ -231,7 +231,7 @@ pub struct DbFlowVersion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbFlowExecution {
     pub id: i64,
-    pub flow_id: i64,
+    pub flow_id: String,
     pub request_id: Option<String>,
     pub model: Option<String>,
     pub started_at: Option<String>,
@@ -284,7 +284,7 @@ pub struct FlowParams<'a> {
     /// `Some` advertises it as a model (validated against alias / flow
     /// collisions in the handler before this struct is built).
     pub published_model_name: Option<&'a str>,
-    pub actor_user_id: Option<i64>,
+    pub actor_user_id: Option<&'a str>,
 }
 
 /// Parametry tworzenia/aktualizacji szablonu wezla flow
@@ -384,7 +384,7 @@ pub struct DbDockerRegistry {
 /// Rozszerzone konto uzytkownika (tabela user_accounts)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAccount {
-    pub id: i64,
+    pub id: String,
     pub username: String,
     #[serde(skip_serializing)]
     pub password_hash: String,
@@ -413,7 +413,7 @@ fn default_role() -> String {
 /// Grupa uzytkownikow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserGroup {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub description: String,
     pub created_at: String,
@@ -425,7 +425,7 @@ pub struct AddonPermission {
     pub id: i64,
     pub addon_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub permission_id: String,
     pub granted: bool,
     pub created_at: String,
@@ -436,7 +436,7 @@ pub struct AddonPermission {
 pub struct AuditLogEntry {
     pub id: i64,
     pub timestamp: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: Option<String>,
     pub action: String,
     pub resource: Option<String>,
@@ -493,7 +493,7 @@ pub struct SsoProvider {
     pub discovery_url: String,
     pub enabled: bool,
     pub auto_create_users: bool,
-    pub default_group_id: Option<i64>,
+    pub default_group_id: Option<String>,
     pub created_at: String,
 }
 
@@ -534,7 +534,7 @@ pub struct SyncNodeIdentity {
     pub display_name: String,
     pub node_kind: String,
     pub trust_status: String,
-    pub owner_user_id: Option<i64>,
+    pub owner_user_id: Option<String>,
     pub sync_profile: String,
     pub last_seen_at: Option<String>,
     pub created_at: String,
@@ -545,7 +545,7 @@ pub struct SyncNodeIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserIdentityKey {
     pub key_id: String,
-    pub user_id: i64,
+    pub user_id: String,
     pub key_type: String,
     pub public_key: String,
     pub purpose: String,
@@ -558,11 +558,11 @@ pub struct UserIdentityKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeUserAssignment {
     pub node_id: String,
-    pub user_id: i64,
+    pub user_id: String,
     pub assignment_mode: String,
     pub valid_from: String,
     pub valid_until: Option<String>,
-    pub created_by: Option<i64>,
+    pub created_by: Option<String>,
     pub created_at: String,
 }
 
@@ -570,9 +570,9 @@ pub struct NodeUserAssignment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncUserOrgProfile {
     pub org_id: String,
-    pub user_id: i64,
+    pub user_id: String,
     pub department_id: Option<String>,
-    pub manager_user_id: Option<i64>,
+    pub manager_user_id: Option<String>,
     pub is_department_manager: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -585,10 +585,10 @@ pub struct SyncResourceAcl {
     pub addon_id: String,
     pub resource_type: String,
     pub resource_id: String,
-    pub owner_user_id: Option<i64>,
-    pub assigned_user_id: Option<i64>,
+    pub owner_user_id: Option<String>,
+    pub assigned_user_id: Option<String>,
     pub department_id: Option<String>,
-    pub manager_user_id: Option<i64>,
+    pub manager_user_id: Option<String>,
     pub visibility_scope: String,
     pub created_at: String,
     pub updated_at: String,
@@ -684,7 +684,7 @@ pub struct SyncPolicyTarget {
 /// Filtry do przeszukiwania logu audytowego
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AuditLogFilters {
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: Option<String>,
     pub action: Option<String>,
     pub from_date: Option<String>,

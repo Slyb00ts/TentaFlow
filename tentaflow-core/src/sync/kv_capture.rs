@@ -18,7 +18,7 @@ pub struct KvWriteCapture {
     pub instance_id: String,
     pub key: String,
     pub value: Option<Vec<u8>>,
-    pub actor_user_id: Option<i64>,
+    pub actor_user_id: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -29,7 +29,7 @@ impl KvWriteCapture {
         instance_id: impl Into<String>,
         key: impl Into<String>,
         value: Option<Vec<u8>>,
-        actor_user_id: Option<i64>,
+        actor_user_id: Option<String>,
     ) -> Self {
         let org_id = org_id.into();
         let addon_id = addon_id.into();
@@ -315,7 +315,7 @@ mod tests {
             "inst-1",
             "settings/theme",
             Some(vec![0, 1, 2, 255]),
-            Some(1),
+            Some("1".to_string()),
         );
 
         record_kv_write_capture(&tx, &capture).expect("record capture");

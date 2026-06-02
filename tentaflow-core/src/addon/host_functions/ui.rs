@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use tracing::info;
 
+use super::abi_helpers::{enforce_payload_size, PayloadKind};
 use super::{
     audit_log, check_permission, get_memory, read_guest_bytes, read_guest_string, AddonState,
     WasmCaller, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
 };
-use super::abi_helpers::{enforce_payload_size, PayloadKind};
 use tentaflow_sdk_spec::{validate_canonical, UiTag};
 
 // Thread-local reusable buffer for guest CBOR bytes. Avoids a fresh heap
@@ -32,11 +32,7 @@ thread_local! {
 /// ABI:
 /// - cbor_ptr/cbor_len: CBOR bytes encoding a UiPayload message
 /// - Returns: ABI_OK or error code
-pub fn ui_render_cbor(
-    mut caller: WasmCaller<'_, AddonState>,
-    cbor_ptr: i32,
-    cbor_len: i32,
-) -> i32 {
+pub fn ui_render_cbor(mut caller: WasmCaller<'_, AddonState>, cbor_ptr: i32, cbor_len: i32) -> i32 {
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => return ABI_ERR_OPERATION,
@@ -129,10 +125,10 @@ pub fn ui_render_cbor(
 
     // Validate outbound slot/shell messages against session state.
     if let Some(registry) = crate::addon::ui_session::global_registry() {
-        let user_id = caller.data().user_id.unwrap_or(0);
+        let user_id = caller.data().user_id.clone().unwrap_or_default();
         tracing::info!(addon = %addon_id, user_id, tag = tag.as_u16(), "ui_render_cbor: looking up connection");
 
-        if let Some(conn_id) = registry.find_connection(&addon_id, user_id) {
+        if let Some(conn_id) = registry.find_connection(&addon_id, &user_id) {
             tracing::info!(conn_id, "ui_render_cbor: found connection");
             let session_lock = registry.get_or_create(conn_id);
             let mut session = session_lock.lock();
@@ -183,11 +179,11 @@ pub fn ui_render_cbor(
     // Store raw validated CBOR bytes in the ui_panels cache.
     // Key uses "cbor_msg" as the panel slot — the actual panel routing
     // happens downstream in the CBOR dispatch layer.
-    let cache_user_id = caller.data().user_id;
+    let cache_user_id = caller.data().user_id.clone();
     let cbor_arc: Arc<[u8]> = cbor_bytes.into();
 
     if let Some(cache) = caller.data().ui_panels.clone() {
-        let key_user = cache_user_id.unwrap_or(0);
+        let key_user = cache_user_id.clone().unwrap_or_default();
         cache.write().insert(
             (key_user, addon_id.clone(), "cbor_msg".into()),
             cbor_arc.to_vec(),
@@ -201,7 +197,7 @@ pub fn ui_render_cbor(
         .publish(crate::addon::event_bus::Event {
             event_type: "ui.cbor_message".into(),
             source_addon: Some(addon_id),
-            source_user: cache_user_id,
+            source_user: cache_user_id.clone(),
             payload: serde_json::json!({
                 "tag": tag.as_u16(),
                 "cbor": &*cbor_arc,
@@ -211,12 +207,10 @@ pub fn ui_render_cbor(
 
     // Publish to tokio broadcast for WS push to the frontend connection.
     // Arc<[u8]> avoids cloning CBOR payload per broadcast subscriber.
-    crate::dispatch::ui_cbor_broadcast::publish(
-        crate::dispatch::ui_cbor_broadcast::UiCborPush {
-            user_id: cache_user_id.unwrap_or(0),
-            cbor: cbor_arc,
-        },
-    );
+    crate::dispatch::ui_cbor_broadcast::publish(crate::dispatch::ui_cbor_broadcast::UiCborPush {
+        user_id: cache_user_id.unwrap_or_default(),
+        cbor: cbor_arc,
+    });
 
     ABI_OK
 }
@@ -230,9 +224,7 @@ fn validate_tag_session(
     session: &mut crate::addon::ui_session::SessionState,
 ) -> Result<(), String> {
     match tag {
-        UiTag::PanelShell => {
-            handle_panel_shell_registration(cbor_bytes, session, addon_id)
-        }
+        UiTag::PanelShell => handle_panel_shell_registration(cbor_bytes, session, addon_id),
         UiTag::SlotContent => {
             if let Some((panel_id, slot_id)) = extract_panel_and_slot_id(cbor_bytes) {
                 session
@@ -349,7 +341,7 @@ pub fn ui_notify(
         .publish(crate::addon::event_bus::Event {
             event_type: "ui.notification".to_string(),
             source_addon: Some(addon_id.clone()),
-            source_user: caller.data().user_id,
+            source_user: caller.data().user_id.clone(),
             payload: serde_json::json!({
                 "title": &title,
                 "body": &body,
@@ -393,7 +385,9 @@ fn extract_panel_and_slot_id(bytes: &[u8]) -> Option<(String, String)> {
         match key {
             1 => panel_id = Some(dec.str().ok()?.to_owned()),
             3 => slot_id = Some(dec.str().ok()?.to_owned()),
-            _ => { dec.skip().ok()?; }
+            _ => {
+                dec.skip().ok()?;
+            }
         }
         if panel_id.is_some() && slot_id.is_some() {
             break;
@@ -522,8 +516,7 @@ where
         .map_err(|e| format!("array: {e}"))?
         .ok_or("indefinite array")?;
     dec.u16().map_err(|e| format!("tag: {e}"))?;
-    minicbor::Decode::decode(&mut dec, &mut ())
-        .map_err(|e| format!("body decode: {e}"))
+    minicbor::Decode::decode(&mut dec, &mut ()).map_err(|e| format!("body decode: {e}"))
 }
 
 /// Validates panel open + epoch match.
@@ -544,9 +537,7 @@ fn validate_panel_epoch(
                 Ok(())
             }
         }
-        None => Err(format!(
-            "panel_not_open: addon={addon_id} panel={panel_id}"
-        )),
+        None => Err(format!("panel_not_open: addon={addon_id} panel={panel_id}")),
     }
 }
 
@@ -555,8 +546,7 @@ fn handle_state_snapshot(
     session: &mut crate::addon::ui_session::SessionState,
     addon_id: &str,
 ) -> Result<(), String> {
-    let snap: tentaflow_sdk_spec::protocol::ui::state::StateSnapshot =
-        decode_state_body(bytes)?;
+    let snap: tentaflow_sdk_spec::protocol::ui::state::StateSnapshot = decode_state_body(bytes)?;
 
     validate_panel_epoch(session, addon_id, &snap.panel_id, snap.panel_epoch)?;
 
@@ -570,8 +560,7 @@ fn handle_state_patch(
     session: &mut crate::addon::ui_session::SessionState,
     addon_id: &str,
 ) -> Result<(), String> {
-    let patch: tentaflow_sdk_spec::protocol::ui::state::StatePatch =
-        decode_state_body(bytes)?;
+    let patch: tentaflow_sdk_spec::protocol::ui::state::StatePatch = decode_state_body(bytes)?;
 
     validate_panel_epoch(session, addon_id, &patch.panel_id, patch.panel_epoch)?;
 
@@ -599,8 +588,7 @@ fn handle_state_reset(
     session: &mut crate::addon::ui_session::SessionState,
     addon_id: &str,
 ) -> Result<(), String> {
-    let reset: tentaflow_sdk_spec::protocol::ui::state::StateReset =
-        decode_state_body(bytes)?;
+    let reset: tentaflow_sdk_spec::protocol::ui::state::StateReset = decode_state_body(bytes)?;
 
     validate_panel_epoch(session, addon_id, &reset.panel_id, reset.panel_epoch)?;
 
@@ -701,9 +689,7 @@ fn validate_outbound_member(
     use tentaflow_sdk_spec::UiTag;
 
     match tag {
-        UiTag::PanelShell => {
-            handle_panel_shell_registration(member_bytes, session, addon_id)
-        }
+        UiTag::PanelShell => handle_panel_shell_registration(member_bytes, session, addon_id),
         UiTag::SlotContent | UiTag::SlotClear | UiTag::SlotShow | UiTag::SlotHide => {
             if let Some((panel_id, slot_id)) = extract_panel_and_slot_id(member_bytes) {
                 session
@@ -771,18 +757,18 @@ fn validate_command_security(bytes: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
     use minicbor::Encode;
-    use tentaflow_sdk_spec::UiPayload;
     use tentaflow_sdk_spec::protocol::control::CborMap;
     use tentaflow_sdk_spec::protocol::ui::a11y::EventKind;
     use tentaflow_sdk_spec::protocol::ui::component::HandlerMap;
-    use tentaflow_sdk_spec::protocol::ui::handler::{FailurePolicy, Handler};
-    use tentaflow_sdk_spec::protocol::ui::typed_field::encode_to_value;
-    use tentaflow_sdk_spec::protocol::ui::slot_msg::{SlotClear, SlotContent, SlotHide, SlotShow};
     use tentaflow_sdk_spec::protocol::ui::component::{Component, FieldMap};
+    use tentaflow_sdk_spec::protocol::ui::handler::{FailurePolicy, Handler};
     use tentaflow_sdk_spec::protocol::ui::panel::PanelShell;
     use tentaflow_sdk_spec::protocol::ui::slot::{
         CachePolicy, SlotDecl, SlotDefault, SlotSemantics, SlotVisibility,
     };
+    use tentaflow_sdk_spec::protocol::ui::slot_msg::{SlotClear, SlotContent, SlotHide, SlotShow};
+    use tentaflow_sdk_spec::protocol::ui::typed_field::encode_to_value;
+    use tentaflow_sdk_spec::UiPayload;
 
     fn encode_payload(p: &UiPayload) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -893,11 +879,17 @@ mod tests {
         handle_panel_shell_registration(&bytes, &mut session, "contacts").unwrap();
 
         // Declared slots pass validation.
-        assert!(session.validate_slot_ownership("contacts", "main", "content").is_ok());
-        assert!(session.validate_slot_ownership("contacts", "main", "drawer").is_ok());
+        assert!(session
+            .validate_slot_ownership("contacts", "main", "content")
+            .is_ok());
+        assert!(session
+            .validate_slot_ownership("contacts", "main", "drawer")
+            .is_ok());
 
         // Undeclared slot fails.
-        assert!(session.validate_slot_ownership("contacts", "main", "other").is_err());
+        assert!(session
+            .validate_slot_ownership("contacts", "main", "other")
+            .is_err());
     }
 
     #[test]
@@ -968,10 +960,10 @@ mod tests {
     // State dispatch tests
     // =========================================================================
 
-    use tentaflow_sdk_spec::protocol::ui::state::{StatePatch, StateReset, StateSnapshot};
     use tentaflow_sdk_spec::protocol::ui::bind::{PathSegment, StatePath};
     use tentaflow_sdk_spec::protocol::ui::patch::{PatchOp, PatchOpKind};
     use tentaflow_sdk_spec::protocol::ui::slot::StateEntry;
+    use tentaflow_sdk_spec::protocol::ui::state::{StatePatch, StateReset, StateSnapshot};
     use tentaflow_sdk_spec::protocol::value::Value;
 
     #[test]
@@ -1218,7 +1210,10 @@ mod tests {
             enc.map(3).unwrap();
             enc.str("kind").unwrap().str("download").unwrap();
             enc.str("signed_url_ref").unwrap().str("ref-1").unwrap();
-            enc.str("filename").unwrap().str("../../etc/passwd").unwrap();
+            enc.str("filename")
+                .unwrap()
+                .str("../../etc/passwd")
+                .unwrap();
         }
         let err = validate_command_security(&buf);
         assert!(err.is_err());
@@ -1273,8 +1268,10 @@ mod tests {
     // Event topic validation tests
     // =========================================================================
 
-    use tentaflow_sdk_spec::protocol::ui::event::{Event as UiEvent, Topic, TopicSegment as EvTopicSegment};
     use crate::addon::ui_session::TopicPattern;
+    use tentaflow_sdk_spec::protocol::ui::event::{
+        Event as UiEvent, Topic, TopicSegment as EvTopicSegment,
+    };
 
     #[test]
     fn event_topic_permitted_passes() {
@@ -1296,9 +1293,15 @@ mod tests {
         let payload = UiPayload::Event(UiEvent {
             source_addon_id: "addon-a".into(),
             topic: Topic::new(vec![
-                EvTopicSegment::Literal { value: "addon-a".into() },
-                EvTopicSegment::Id { value: "entity-5".into() },
-                EvTopicSegment::Literal { value: "updated".into() },
+                EvTopicSegment::Literal {
+                    value: "addon-a".into(),
+                },
+                EvTopicSegment::Id {
+                    value: "entity-5".into(),
+                },
+                EvTopicSegment::Literal {
+                    value: "updated".into(),
+                },
             ]),
             payload: tentaflow_sdk_spec::protocol::value::Value::Null,
             ts_ms: 1_700_000_000_000,
@@ -1328,9 +1331,15 @@ mod tests {
         let payload = UiPayload::Event(UiEvent {
             source_addon_id: "addon-a".into(),
             topic: Topic::new(vec![
-                EvTopicSegment::Literal { value: "addon-a".into() },
-                EvTopicSegment::Literal { value: "contacts".into() },
-                EvTopicSegment::Literal { value: "deleted".into() },
+                EvTopicSegment::Literal {
+                    value: "addon-a".into(),
+                },
+                EvTopicSegment::Literal {
+                    value: "contacts".into(),
+                },
+                EvTopicSegment::Literal {
+                    value: "deleted".into(),
+                },
             ]),
             payload: tentaflow_sdk_spec::protocol::value::Value::Null,
             ts_ms: 1_700_000_000_000,

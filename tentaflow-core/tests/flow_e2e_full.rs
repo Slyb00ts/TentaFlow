@@ -205,8 +205,11 @@ async fn flow_e2e_install_then_invoke_returns_filtered_records() {
         &addon_id,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload =
-        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: FIXTURE_FLOW_ID.to_string(),
+        input_toml: Some("value = 10.0\n".to_string()),
+        wait_ms: 5000,
+    };
 
     let outcome = {
         let sched = sched.clone();
@@ -260,8 +263,11 @@ async fn flow_e2e_threshold_filters_low_values() {
         &addon_id,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload =
-        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 2.0\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: FIXTURE_FLOW_ID.to_string(),
+        input_toml: Some("value = 2.0\n".to_string()),
+        wait_ms: 5000,
+    };
 
     let outcome = tokio::task::spawn_blocking({
         let sched = sched.clone();
@@ -320,8 +326,11 @@ async fn flow_e2e_addon_uninstall_drops_flow() {
         &addon_id,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload =
-        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 1000\n\n[input]\nvalue = 10.0\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: FIXTURE_FLOW_ID.to_string(),
+        input_toml: Some("value = 10.0\n".to_string()),
+        wait_ms: 1000,
+    };
     let outcome = tokio::task::spawn_blocking({
         let sched = sched.clone();
         move || flow_api::dispatch_invoke(&state, &sched, &payload)
@@ -349,8 +358,11 @@ async fn flow_e2e_audit_log_records_invocation_lifecycle() {
         &addon_id,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload =
-        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: FIXTURE_FLOW_ID.to_string(),
+        input_toml: Some("value = 10.0\n".to_string()),
+        wait_ms: 5000,
+    };
     let outcome = tokio::task::spawn_blocking({
         let sched = sched.clone();
         move || flow_api::dispatch_invoke(&state, &sched, &payload)
@@ -407,8 +419,11 @@ async fn flow_e2e_cross_addon_cannot_read_status() {
         &addon_a,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload =
-        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: FIXTURE_FLOW_ID.to_string(),
+        input_toml: Some("value = 10.0\n".to_string()),
+        wait_ms: 5000,
+    };
     let started = tokio::task::spawn_blocking({
         let sched = sched.clone();
         move || flow_api::dispatch_invoke(&state_a, &sched, &payload)
@@ -432,7 +447,9 @@ async fn flow_e2e_cross_addon_cannot_read_status() {
         &addon_b,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let status_payload = format!("invocation_id = \"{invocation_id}\"\n");
+    let status_payload = flow_api::FlowInvocationIdInput {
+        invocation_id: invocation_id.clone(),
+    };
     let outcome = tokio::task::spawn_blocking({
         let sched = sched.clone();
         move || flow_api::dispatch_status(&state_b, &sched, &status_payload)

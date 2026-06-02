@@ -92,7 +92,7 @@ pub fn oauth_get_token(
     }
 
     let addon_id = caller.data().addon_id.clone();
-    let user_id = caller.data().user_id;
+    let user_id = caller.data().user_id.clone();
 
     // Resolve token blob + account row. The whole resolve/refresh flow is run
     // in a helper to keep ABI logic clean; map errors to audit entries + ABI codes.
@@ -210,7 +210,7 @@ pub(crate) fn resolve_and_refresh(
     state: &AddonState,
     addon_id: &str,
     provider_id: &str,
-    user_id: Option<i64>,
+    user_id: Option<String>,
 ) -> Result<OAuthTokenOutPublic, HostOAuthError> {
     let cfg = repository::get_oauth_config(&state.db, addon_id, provider_id)
         .map_err(|e| HostOAuthError::Internal(format!("get_oauth_config: {}", e)))?
@@ -229,7 +229,7 @@ pub(crate) fn resolve_and_refresh(
         "none" | _ => return Err(HostOAuthError::ModeDenied),
     };
 
-    let account = find_account(&state.db, target_user_id, addon_id, provider_id)
+    let account = find_account(&state.db, target_user_id.clone(), addon_id, provider_id)
         .map_err(|e| HostOAuthError::Internal(format!("find_account: {}", e)))?
         .ok_or(HostOAuthError::AccountMissing)?;
 
@@ -350,7 +350,7 @@ pub(crate) fn resolve_and_refresh(
 
     repository::upsert_user_oauth_account(
         &state.db,
-        account.user_id,
+        account.user_id.as_deref(),
         addon_id,
         provider_id,
         &account.external_account_id,
@@ -408,12 +408,12 @@ fn parse_scopes(s: &str) -> Vec<String> {
 /// `user_id=None` matches rows where user_id IS NULL (global mode).
 fn find_account(
     pool: &crate::db::DbPool,
-    user_id: Option<i64>,
+    user_id: Option<String>,
     addon_id: &str,
     provider_id: &str,
 ) -> anyhow::Result<Option<repository::DbUserOAuthAccount>> {
     match user_id {
-        Some(uid) => Ok(repository::list_user_oauth_accounts_for_user(pool, uid)?
+        Some(uid) => Ok(repository::list_user_oauth_accounts_for_user(pool, &uid)?
             .into_iter()
             .find(|a| a.addon_id == addon_id && a.provider_id == provider_id)),
         None => Ok(
@@ -433,7 +433,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Build a minimal AddonState for resolve_and_refresh tests (no WASM runtime).
-    fn mk_state(db: DbPool, addon_id: &str, user_id: Option<i64>) -> AddonState {
+    fn mk_state(db: DbPool, addon_id: &str, user_id: Option<String>) -> AddonState {
         use crate::addon::host_functions::network::NetworkConnectionManager;
         use crate::addon::AddonManifest;
         use parking_lot::Mutex;
@@ -504,7 +504,7 @@ mod tests {
 
     fn seed_account(
         db: &DbPool,
-        user_id: Option<i64>,
+        user_id: Option<&str>,
         addon_id: &str,
         provider_id: &str,
         expires_at: Option<&str>,
@@ -549,7 +549,7 @@ mod tests {
     fn test_oauth_get_token_returns_valid_access_token() {
         let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
         // Ensure user exists for permission checks via FK.
-        let user_id = 42i64;
+        let user_id = "00000000-0000-0000-0000-000000000042".to_string();
         {
             let conn = db.lock().unwrap();
             conn.execute(
@@ -562,15 +562,16 @@ mod tests {
         seed_config_and_decl(&db, "addon-a", "microsoft", "individual");
         seed_account(
             &db,
-            Some(user_id),
+            Some(user_id.as_str()),
             "addon-a",
             "microsoft",
             Some(&future_expires()),
             true,
         );
 
-        let state = mk_state(db.clone(), "addon-a", Some(user_id));
-        let out = resolve_and_refresh(&state, "addon-a", "microsoft", Some(user_id)).unwrap();
+        let state = mk_state(db.clone(), "addon-a", Some(user_id.clone()));
+        let out =
+            resolve_and_refresh(&state, "addon-a", "microsoft", Some(user_id.clone())).unwrap();
         assert_eq!(out.access_token, "ACCESS-PLAIN");
         assert_eq!(out.token_type, "Bearer");
         assert_eq!(out.scopes, vec!["scope1".to_string()]);
@@ -580,7 +581,7 @@ mod tests {
     #[test]
     fn test_oauth_get_token_returns_error_when_no_refresh_token_and_expired() {
         let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
-        let user_id = 7i64;
+        let user_id = "00000000-0000-0000-0000-000000000007".to_string();
         {
             let conn = db.lock().unwrap();
             conn.execute(
@@ -593,15 +594,16 @@ mod tests {
         seed_config_and_decl(&db, "addon-b", "google", "individual");
         seed_account(
             &db,
-            Some(user_id),
+            Some(user_id.as_str()),
             "addon-b",
             "google",
             Some(&past_expires()),
             false,
         );
 
-        let state = mk_state(db.clone(), "addon-b", Some(user_id));
-        let err = resolve_and_refresh(&state, "addon-b", "google", Some(user_id)).unwrap_err();
+        let state = mk_state(db.clone(), "addon-b", Some(user_id.clone()));
+        let err =
+            resolve_and_refresh(&state, "addon-b", "google", Some(user_id.clone())).unwrap_err();
         assert!(
             matches!(err, HostOAuthError::ExpiredNoRefresh),
             "got {:?}",
@@ -624,8 +626,18 @@ mod tests {
         );
 
         // Caller has user_id=99 but mode=global -> must read NULL row.
-        let state = mk_state(db.clone(), "addon-c", Some(99));
-        let out = resolve_and_refresh(&state, "addon-c", "github", Some(99)).unwrap();
+        let state = mk_state(
+            db.clone(),
+            "addon-c",
+            Some("00000000-0000-0000-0000-000000000099".to_string()),
+        );
+        let out = resolve_and_refresh(
+            &state,
+            "addon-c",
+            "github",
+            Some("00000000-0000-0000-0000-000000000099".to_string()),
+        )
+        .unwrap();
         assert_eq!(out.access_token, "ACCESS-PLAIN");
     }
 
@@ -634,7 +646,7 @@ mod tests {
         let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
         seed_config_and_decl(&db, "addon-d", "microsoft", "individual");
         // No account seeded for this user.
-        let user_id = 33i64;
+        let user_id = "00000000-0000-0000-0000-000000000033".to_string();
         {
             let conn = db.lock().unwrap();
             conn.execute(
@@ -645,8 +657,9 @@ mod tests {
             .unwrap();
         }
 
-        let state = mk_state(db.clone(), "addon-d", Some(user_id));
-        let err = resolve_and_refresh(&state, "addon-d", "microsoft", Some(user_id)).unwrap_err();
+        let state = mk_state(db.clone(), "addon-d", Some(user_id.clone()));
+        let err =
+            resolve_and_refresh(&state, "addon-d", "microsoft", Some(user_id.clone())).unwrap_err();
         assert!(
             matches!(err, HostOAuthError::AccountMissing),
             "got {:?}",
@@ -659,16 +672,36 @@ mod tests {
         let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
         seed_config_and_decl(&db, "addon-e", "github", "none");
 
-        let state = mk_state(db.clone(), "addon-e", Some(1));
-        let err = resolve_and_refresh(&state, "addon-e", "github", Some(1)).unwrap_err();
+        let state = mk_state(
+            db.clone(),
+            "addon-e",
+            Some("00000000-0000-0000-0000-000000000001".to_string()),
+        );
+        let err = resolve_and_refresh(
+            &state,
+            "addon-e",
+            "github",
+            Some("00000000-0000-0000-0000-000000000001".to_string()),
+        )
+        .unwrap_err();
         assert!(matches!(err, HostOAuthError::ModeDenied), "got {:?}", err);
     }
 
     #[test]
     fn test_oauth_get_token_not_configured_when_missing() {
         let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
-        let state = mk_state(db.clone(), "addon-f", Some(1));
-        let err = resolve_and_refresh(&state, "addon-f", "nowhere", Some(1)).unwrap_err();
+        let state = mk_state(
+            db.clone(),
+            "addon-f",
+            Some("00000000-0000-0000-0000-000000000001".to_string()),
+        );
+        let err = resolve_and_refresh(
+            &state,
+            "addon-f",
+            "nowhere",
+            Some("00000000-0000-0000-0000-000000000001".to_string()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, HostOAuthError::NotConfigured),
             "got {:?}",

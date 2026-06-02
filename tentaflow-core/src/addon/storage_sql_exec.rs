@@ -15,17 +15,17 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use regex::Regex;
-use rusqlite::OptionalExtension;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
-use serde_json::{Value as JsonValue, json};
+use rusqlite::OptionalExtension;
+use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
 use crate::addon::errors::AbiError;
 use crate::addon::lifecycle::parse_manifest_toml;
-use crate::addon::storage_sql::{AddonDbPool, get_addon_pool, open_addon_db};
-use crate::db::{DbPool, repository};
+use crate::addon::storage_sql::{get_addon_pool, open_addon_db, AddonDbPool};
+use crate::db::{repository, DbPool};
 use crate::sync::ledger::OperationId;
 use crate::sync::runtime::{self as sync_runtime, SqlWriteAction, SqlWriteCapture};
 
@@ -402,7 +402,7 @@ pub fn exec_for_addon(
     addon_id: &str,
     query: &str,
     params: &[JsonValue],
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> Result<(u64, i64), StorageSqlError> {
     if is_ddl(query) {
         return Err(StorageSqlError::DdlBlocked);
@@ -519,7 +519,7 @@ pub fn transaction_for_addon(
     org_id: &str,
     addon_id: &str,
     statements: &[(String, Vec<JsonValue>)],
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> Result<i64, StorageSqlError> {
     for (q, _) in statements {
         if is_ddl(q) {
@@ -557,7 +557,7 @@ pub fn transaction_for_addon(
             params_json_values,
             n as u64,
             last_id,
-            actor_user_id,
+            actor_user_id.clone(),
         )?;
         insert_capture(&tx, &capture)?;
         captures.push(capture);
@@ -964,7 +964,7 @@ fn build_capture(
     params: &[JsonValue],
     rows_affected: u64,
     last_insert_id: i64,
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> Result<SqlWriteCapture, StorageSqlError> {
     let created_at_ms = sync_runtime::now_ms();
     let params_json = serde_json::to_vec(params)
@@ -1155,7 +1155,7 @@ mod tests {
                 "sync-capture-test",
                 "INSERT INTO contacts (name) VALUES (?1)",
                 &[JsonValue::String("Jan".to_string())],
-                Some(7),
+                Some("7".to_string()),
             )
             .expect("exec");
 
@@ -1174,7 +1174,7 @@ mod tests {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(4)?,
                             row.get::<_, String>(5)?,
                         ))
                     },
@@ -1185,7 +1185,7 @@ mod tests {
             assert_eq!(row.1, "insert");
             assert_eq!(row.2, "contacts");
             assert_eq!(row.3, "1");
-            assert_eq!(row.4, 7);
+            assert_eq!(row.4, "7");
             assert_eq!(row.5, "pending");
         });
     }
@@ -1209,7 +1209,7 @@ mod tests {
                 "drain-test",
                 "INSERT INTO contacts (name) VALUES (?1)",
                 &[JsonValue::String("Anna".to_string())],
-                Some(9),
+                Some("9".to_string()),
             )
             .expect("exec");
 
@@ -1254,7 +1254,7 @@ mod tests {
                 params: vec![JsonValue::from(1), JsonValue::String("Ewa".to_string())],
                 rows_affected: 1,
                 last_insert_id: 1,
-                actor_user_id: Some(11),
+                actor_user_id: Some("11".to_string()),
                 created_at_ms: sync_runtime::now_ms(),
             };
 
@@ -1306,7 +1306,7 @@ mod tests {
                 params: vec![JsonValue::from(1), JsonValue::String("Ewa".to_string())],
                 rows_affected: 1,
                 last_insert_id: 1,
-                actor_user_id: Some(11),
+                actor_user_id: Some("11".to_string()),
                 created_at_ms: sync_runtime::now_ms(),
             };
             let operation_id = OperationId::from_hash([4; 32]);
@@ -1475,7 +1475,7 @@ mod tests {
             params: vec![JsonValue::from(1), JsonValue::String(name.to_string())],
             rows_affected: 1,
             last_insert_id: 1,
-            actor_user_id: Some(11),
+            actor_user_id: Some("11".to_string()),
             created_at_ms: sync_runtime::now_ms(),
         }
     }

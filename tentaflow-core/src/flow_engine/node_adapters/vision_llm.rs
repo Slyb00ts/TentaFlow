@@ -190,7 +190,7 @@ impl NodeAdapter for VisionNodeAdapter {
             stop: Self::pick_stop(node),
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),
-            user_id: ctx.user_id,
+            user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
         };
 

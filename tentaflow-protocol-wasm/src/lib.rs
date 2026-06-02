@@ -341,7 +341,7 @@ pub fn encode_chat_stream_request_simple(
 #[wasm_bindgen(js_name = encodeFlowInvokeAudio)]
 #[allow(clippy::too_many_arguments)]
 pub fn encode_flow_invoke_audio(
-    flow_id: Option<i64>,
+    flow_id: Option<String>,
     model: String,
     service_type: String,
     mime: String,
@@ -779,7 +779,7 @@ pub fn encode_sso_provider_create_request(
     client_secret: String,
     discovery_url: String,
     auto_create_users: bool,
-    default_group_id: Option<f64>,
+    default_group_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::SsoProviderCreateRequestBody(
         SsoProviderCreateRequest {
@@ -789,7 +789,7 @@ pub fn encode_sso_provider_create_request(
             client_secret,
             discovery_url,
             auto_create_users,
-            default_group_id: default_group_id.map(|v| v as i64),
+            default_group_id,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -997,13 +997,13 @@ pub fn encode_addon_visibility_list_request(addon_id: String) -> Result<Vec<u8>,
 #[wasm_bindgen(js_name = encodeAddonVisibilitySetRequest)]
 pub fn encode_addon_visibility_set_request(
     addon_id: String,
-    group_id: f64,
+    group_id: String,
     visible: bool,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonVisibilitySetRequestBody(
         AddonVisibilitySetRequest {
             addon_id,
-            group_id: group_id as i64,
+            group_id,
             visible,
         },
     ))
@@ -1063,7 +1063,7 @@ pub fn encode_addon_permission_matrix_request(addon_id: String) -> Result<Vec<u8
 pub fn encode_addon_permission_set_request(
     addon_id: String,
     subject_type: String,
-    subject_id: f64,
+    subject_id: String,
     permission_id: String,
     grant_mode: String,
 ) -> Result<Vec<u8>, JsError> {
@@ -1071,7 +1071,7 @@ pub fn encode_addon_permission_set_request(
         AddonPermissionSetRequest {
             addon_id,
             subject_type,
-            subject_id: subject_id as i64,
+            subject_id,
             permission_id,
             grant_mode,
         },
@@ -1102,13 +1102,13 @@ pub fn encode_addon_permission_default_set_request(
 pub fn encode_addon_permission_check_request(
     addon_id: String,
     permission_id: String,
-    user_id: Option<f64>,
+    user_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonPermissionCheckRequestBody(
         AddonPermissionCheckRequest {
             addon_id,
             permission_id,
-            user_id: user_id.map(|v| v as i64),
+            user_id,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -1246,7 +1246,7 @@ pub fn encode_my_oauth_accounts_list_request() -> Result<Vec<u8>, JsError> {
 
 /// Buduje `AuditLogFilters` z pol nullable — wszystkie parametry optional.
 fn build_audit_filters(
-    user_id: Option<f64>,
+    user_id: Option<String>,
     addon_id: Option<String>,
     action: Option<String>,
     from_date: Option<String>,
@@ -1254,7 +1254,7 @@ fn build_audit_filters(
     search: Option<String>,
 ) -> tentaflow_protocol::AuditLogFilters {
     tentaflow_protocol::AuditLogFilters {
-        user_id: user_id.map(|v| v as i64),
+        user_id,
         addon_id,
         action,
         from_date,
@@ -1266,7 +1266,7 @@ fn build_audit_filters(
 /// MessageBody::AuditLogListRequest — lista logu z filtrami + paginacja.
 #[wasm_bindgen(js_name = encodeAuditLogListRequest)]
 pub fn encode_audit_log_list_request(
-    user_id: Option<f64>,
+    user_id: Option<String>,
     addon_id: Option<String>,
     action: Option<String>,
     from_date: Option<String>,
@@ -1414,7 +1414,7 @@ pub fn encode_sync_storage_report_request() -> Result<Vec<u8>, JsError> {
 /// MessageBody::AuditLogExportRequest — eksport CSV z filtrami.
 #[wasm_bindgen(js_name = encodeAuditLogExportRequest)]
 pub fn encode_audit_log_export_request(
-    user_id: Option<f64>,
+    user_id: Option<String>,
     addon_id: Option<String>,
     action: Option<String>,
     from_date: Option<String>,
@@ -2154,19 +2154,19 @@ fn sync_storage_level_to_str(level: tentaflow_protocol::SyncStoragePressureLevel
 
 fn set_optional_u64(obj: &js_sys::Object, key: &str, value: Option<u64>) {
     if let Some(value) = value {
-        set(obj, key, (value as f64).into());
+        set(obj, key, value.clone().into());
     }
 }
 
 fn set_optional_u32(obj: &js_sys::Object, key: &str, value: Option<u32>) {
     if let Some(value) = value {
-        set(obj, key, (value as f64).into());
+        set(obj, key, value.clone().into());
     }
 }
 
 fn set_optional_i64(obj: &js_sys::Object, key: &str, value: Option<i64>) {
     if let Some(value) = value {
-        set(obj, key, (value as f64).into());
+        set(obj, key, value.clone().into());
     }
 }
 
@@ -2197,7 +2197,7 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             let arr = js_sys::Array::new();
             for s in r.services {
                 let item = js_sys::Object::new();
-                set(&item, "id", (s.id as f64).into());
+                set(&item, "id", s.id.clone().into());
                 set(&item, "nodeId", s.node_id.clone().into());
                 set(&item, "node_id", s.node_id.into());
                 set(&item, "engineId", s.engine_id.clone().into());
@@ -2212,8 +2212,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 set(&item, "pinned", s.pinned.into());
                 set(&item, "paused", s.paused.into());
                 if let Some(pid) = s.runtime_pid {
-                    set(&item, "runtimePid", (pid as f64).into());
-                    set(&item, "runtime_pid", (pid as f64).into());
+                    set(&item, "runtimePid", pid.clone().into());
+                    set(&item, "runtime_pid", pid.clone().into());
                 }
                 if let Some(p) = s.runtime_port {
                     set(&item, "runtimePort", (p as u32).into());
@@ -2288,8 +2288,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
         }
         SP::ReqDelete(r) => {
             set(obj, "variant", "ServiceDeleteRequest".into());
-            set(obj, "serviceId", (r.service_id as f64).into());
-            set(obj, "service_id", (r.service_id as f64).into());
+            set(obj, "serviceId", r.service_id.clone().into());
+            set(obj, "service_id", r.service_id.clone().into());
             if let Some(n) = r.node_id {
                 set(obj, "nodeId", n.clone().into());
                 set(obj, "node_id", n.into());
@@ -2304,8 +2304,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
         }
         SP::ReqPin(r) => {
             set(obj, "variant", "ServicePinRequest".into());
-            set(obj, "serviceId", (r.service_id as f64).into());
-            set(obj, "service_id", (r.service_id as f64).into());
+            set(obj, "serviceId", r.service_id.clone().into());
+            set(obj, "service_id", r.service_id.clone().into());
             set(obj, "pinned", r.pinned.into());
             if let Some(n) = r.node_id {
                 set(obj, "nodeId", n.clone().into());
@@ -2321,8 +2321,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
         }
         SP::ReqPause(r) => {
             set(obj, "variant", "ServicePauseRequest".into());
-            set(obj, "serviceId", (r.service_id as f64).into());
-            set(obj, "service_id", (r.service_id as f64).into());
+            set(obj, "serviceId", r.service_id.clone().into());
+            set(obj, "service_id", r.service_id.clone().into());
             set(obj, "paused", r.paused.into());
             if let Some(n) = r.node_id {
                 set(obj, "nodeId", n.clone().into());
@@ -2338,8 +2338,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
         }
         SP::ReqStart(r) => {
             set(obj, "variant", "ServiceStartRequest".into());
-            set(obj, "serviceId", (r.service_id as f64).into());
-            set(obj, "service_id", (r.service_id as f64).into());
+            set(obj, "serviceId", r.service_id.clone().into());
+            set(obj, "service_id", r.service_id.clone().into());
             if let Some(n) = r.node_id {
                 set(obj, "nodeId", n.clone().into());
                 set(obj, "node_id", n.into());
@@ -2371,30 +2371,30 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
         SP::ResVramHint(r) => {
             set(obj, "variant", "ServiceVramHintResponse".into());
             if let Some(rec) = r.recommended_utilization {
-                set(obj, "recommendedUtilization", (rec as f64).into());
-                set(obj, "recommended_utilization", (rec as f64).into());
+                set(obj, "recommendedUtilization", rec.clone().into());
+                set(obj, "recommended_utilization", rec.clone().into());
             }
             let arr = js_sys::Array::new();
             for g in r.gpus {
                 let item = js_sys::Object::new();
-                set(&item, "gpuIndex", (g.gpu_index as f64).into());
-                set(&item, "gpu_index", (g.gpu_index as f64).into());
+                set(&item, "gpuIndex", g.gpu_index.clone().into());
+                set(&item, "gpu_index", g.gpu_index.clone().into());
                 set(&item, "gpuName", g.gpu_name.clone().into());
                 set(&item, "gpu_name", g.gpu_name.into());
-                set(&item, "totalMib", (g.total_mib as f64).into());
-                set(&item, "total_mib", (g.total_mib as f64).into());
-                set(&item, "freeMib", (g.free_mib as f64).into());
-                set(&item, "free_mib", (g.free_mib as f64).into());
-                set(&item, "usedMib", (g.used_mib as f64).into());
-                set(&item, "used_mib", (g.used_mib as f64).into());
+                set(&item, "totalMib", g.total_mib.clone().into());
+                set(&item, "total_mib", g.total_mib.clone().into());
+                set(&item, "freeMib", g.free_mib.clone().into());
+                set(&item, "free_mib", g.free_mib.clone().into());
+                set(&item, "usedMib", g.used_mib.clone().into());
+                set(&item, "used_mib", g.used_mib.clone().into());
                 let procs = js_sys::Array::new();
                 for p in g.external_processes {
                     let pi = js_sys::Object::new();
-                    set(&pi, "pid", (p.pid as f64).into());
+                    set(&pi, "pid", p.pid.clone().into());
                     set(&pi, "processName", p.process_name.clone().into());
                     set(&pi, "process_name", p.process_name.into());
-                    set(&pi, "usedMib", (p.used_mib as f64).into());
-                    set(&pi, "used_mib", (p.used_mib as f64).into());
+                    set(&pi, "usedMib", p.used_mib.clone().into());
+                    set(&pi, "used_mib", p.used_mib.clone().into());
                     procs.push(&pi);
                 }
                 set(&item, "externalProcesses", procs.clone().into());
@@ -2473,8 +2473,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "category", m.category.into());
                 set(&item, "engineId", m.engine_id.clone().into());
                 set(&item, "engine_id", m.engine_id.into());
-                set(&item, "serviceId", (m.service_id as f64).into());
-                set(&item, "service_id", (m.service_id as f64).into());
+                set(&item, "serviceId", m.service_id.clone().into());
+                set(&item, "service_id", m.service_id.clone().into());
                 set(&item, "nodeId", m.node_id.clone().into());
                 set(&item, "node_id", m.node_id.into());
                 set(&item, "availability", m.availability.into());
@@ -3017,14 +3017,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             let arr = js_sys::Array::new();
             for p in resp.providers {
                 let item = js_sys::Object::new();
-                set(&item, "id", (p.id as f64).into());
+                set(&item, "id", p.id.clone().into());
                 set(&item, "name", p.name.into());
                 set(&item, "providerType", p.provider_type.into());
                 set(&item, "discoveryUrl", p.discovery_url.into());
                 set(&item, "enabled", p.enabled.into());
                 set(&item, "autoCreateUsers", p.auto_create_users.into());
                 if let Some(g) = p.default_group_id {
-                    set(&item, "defaultGroupId", (g as f64).into());
+                    set(&item, "defaultGroupId", g.clone().into());
                 }
                 set(&item, "createdAt", p.created_at.into());
                 arr.push(&item.into());
@@ -3040,18 +3040,18 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "discoveryUrl", req.discovery_url.into());
             set(&obj, "autoCreateUsers", req.auto_create_users.into());
             if let Some(g) = req.default_group_id {
-                set(&obj, "defaultGroupId", (g as f64).into());
+                set(&obj, "defaultGroupId", g.clone().into());
             }
         }
         MessageBody::SsoProviderCreateResponseBody(resp) => {
             set(&obj, "variant", "SsoProviderCreateResponse".into());
-            set(&obj, "id", (resp.id as f64).into());
+            set(&obj, "id", resp.id.clone().into());
             set(&obj, "name", resp.name.into());
             set(&obj, "providerType", resp.provider_type.into());
         }
         MessageBody::SsoProviderDeleteRequestBody(req) => {
             set(&obj, "variant", "SsoProviderDeleteRequest".into());
-            set(&obj, "id", (req.id as f64).into());
+            set(&obj, "id", req.id.clone().into());
         }
         MessageBody::SsoProviderDeleteResponseBody(resp) => {
             set(&obj, "variant", "SsoProviderDeleteResponse".into());
@@ -3088,7 +3088,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "publisher", c.publisher.into());
                 set(&item, "category", c.category.into());
                 if let Some(mem) = c.min_gpu_memory_gb {
-                    set(&item, "minGpuMemoryGb", (mem as f64).into());
+                    set(&item, "minGpuMemoryGb", mem.clone().into());
                 }
                 if let Some(at) = c.updated_at {
                     set(&item, "updatedAt", at.into());
@@ -3130,12 +3130,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(
                     &item,
                     "declaredPermissionsCount",
-                    (a.declared_permissions_count as f64).into(),
+                    a.declared_permissions_count.clone().into(),
                 );
                 set(
                     &item,
                     "usersWithOauthCount",
-                    (a.users_with_oauth_count as f64).into(),
+                    a.users_with_oauth_count.clone().into(),
                 );
                 if let Some(v) = a.icon {
                     set(&item, "icon", v.into());
@@ -3147,7 +3147,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 } else {
                     set(&item, "category", JsValue::NULL);
                 }
-                set(&item, "fileSizeBytes", (a.file_size_bytes as f64).into());
+                set(&item, "fileSizeBytes", a.file_size_bytes.clone().into());
                 arr.push(&item.into());
             }
             set(&obj, "addons", arr.into());
@@ -3166,7 +3166,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 }
                 IP::ReqGetUser { user_id } => {
                     set(&obj, "variant", "IamGetUserRequest".into());
-                    set(&obj, "userId", (user_id as f64).into());
+                    set(&obj, "userId", user_id.clone().into());
                 }
                 IP::ResGetUser { user } => {
                     set(&obj, "variant", "IamGetUserResponse".into());
@@ -3175,7 +3175,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 IP::ReqCreateUser { .. } => set(&obj, "variant", "IamCreateUserRequest".into()),
                 IP::ResCreateUser { user_id } => {
                     set(&obj, "variant", "IamCreateUserResponse".into());
-                    set(&obj, "userId", (user_id as f64).into());
+                    set(&obj, "userId", user_id.clone().into());
                 }
                 IP::ReqUpdateUser { .. } => set(&obj, "variant", "IamUpdateUserRequest".into()),
                 IP::ReqDeleteUser { .. } => set(&obj, "variant", "IamDeleteUserRequest".into()),
@@ -3191,11 +3191,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     let arr = js_sys::Array::new();
                     for g in groups {
                         let item = js_sys::Object::new();
-                        set(&item, "id", (g.id as f64).into());
+                        set(&item, "id", g.id.clone().into());
                         set(&item, "name", g.name.clone().into());
                         set(&item, "description", g.description.clone().into());
-                        set(&item, "memberCount", (g.member_count as f64).into());
-                        set(&item, "member_count", (g.member_count as f64).into());
+                        set(&item, "memberCount", g.member_count.clone().into());
+                        set(&item, "member_count", g.member_count.clone().into());
                         arr.push(&item.into());
                     }
                     set(&obj, "groups", arr.into());
@@ -3203,7 +3203,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 IP::ReqCreateGroup { .. } => set(&obj, "variant", "IamCreateGroupRequest".into()),
                 IP::ResCreateGroup { group_id } => {
                     set(&obj, "variant", "IamCreateGroupResponse".into());
-                    set(&obj, "groupId", (group_id as f64).into());
+                    set(&obj, "groupId", group_id.clone().into());
                 }
                 IP::ReqUpdateGroup { .. } => set(&obj, "variant", "IamUpdateGroupRequest".into()),
                 IP::ReqDeleteGroup { .. } => set(&obj, "variant", "IamDeleteGroupRequest".into()),
@@ -3239,8 +3239,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&item, "resource_id", e.resource_id.clone().into());
                         set(&item, "subjectType", e.subject_type.clone().into());
                         set(&item, "subject_type", e.subject_type.clone().into());
-                        set(&item, "subjectId", (e.subject_id as f64).into());
-                        set(&item, "subject_id", (e.subject_id as f64).into());
+                        set(&item, "subjectId", e.subject_id.clone().into());
+                        set(&item, "subject_id", e.subject_id.clone().into());
                         set(&item, "accessLevel", e.access_level.clone().into());
                         set(&item, "access_level", e.access_level.clone().into());
                         arr.push(&item.into());
@@ -3270,8 +3270,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&item, "entry_panel", a.entry_panel.into());
                         set(&item, "icon", a.icon.into());
                         set(&item, "description", a.description.into());
-                        set(&item, "sortOrder", (a.sort_order as f64).into());
-                        set(&item, "sort_order", (a.sort_order as f64).into());
+                        set(&item, "sortOrder", a.sort_order.clone().into());
+                        set(&item, "sort_order", a.sort_order.clone().into());
                         set(&item, "enabled", a.enabled.into());
                         arr.push(&item.into());
                     }
@@ -3289,11 +3289,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             let arr = js_sys::Array::new();
             for e in resp.entries {
                 let item = js_sys::Object::new();
-                set(&item, "id", (e.id as f64).into());
+                set(&item, "id", e.id.clone().into());
                 set(&item, "timestamp", e.timestamp.into());
                 set(&item, "action", e.action.into());
                 if let Some(uid) = e.user_id {
-                    set(&item, "userId", (uid as f64).into());
+                    set(&item, "userId", uid.clone().into());
                 }
                 if let Some(aid) = e.addon_id {
                     set(&item, "addonId", aid.into());
@@ -3313,7 +3313,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 arr.push(&item.into());
             }
             set(&obj, "entries", arr.into());
-            set(&obj, "totalCount", (resp.total_count as f64).into());
+            set(&obj, "totalCount", resp.total_count.clone().into());
         }
         MessageBody::AuditLogExportRequestBody(_) => {
             set(&obj, "variant", "AuditLogExportRequest".into());
@@ -3321,15 +3321,15 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::AuditLogExportResponseBody(resp) => {
             set(&obj, "variant", "AuditLogExportResponse".into());
             set(&obj, "csv", resp.csv.into());
-            set(&obj, "rowCount", (resp.row_count as f64).into());
+            set(&obj, "rowCount", resp.row_count.clone().into());
         }
         MessageBody::AuditLogCleanupRequestBody(req) => {
             set(&obj, "variant", "AuditLogCleanupRequest".into());
-            set(&obj, "keepDays", (req.keep_days as f64).into());
+            set(&obj, "keepDays", req.keep_days.clone().into());
         }
         MessageBody::AuditLogCleanupResponseBody(resp) => {
             set(&obj, "variant", "AuditLogCleanupResponse".into());
-            set(&obj, "deletedCount", (resp.deleted_count as f64).into());
+            set(&obj, "deletedCount", resp.deleted_count.clone().into());
         }
         MessageBody::SchedulerBody(payload) => match payload {
             tentaflow_protocol::SchedulerPayload::JobsListRequest(_) => {
@@ -3352,7 +3352,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "SchedulerRunsListRequest".into());
                 set(&obj, "jobId", req.job_id.clone().into());
                 set(&obj, "job_id", req.job_id.into());
-                set(&obj, "limit", (req.limit as f64).into());
+                set(&obj, "limit", req.limit.clone().into());
             }
             tentaflow_protocol::SchedulerPayload::RunsListResponse(resp) => {
                 set(&obj, "variant", "SchedulerRunsListResponse".into());
@@ -3397,7 +3397,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "addonId", req.addon_id.clone().into());
                 set(&obj, "addon_id", req.addon_id.into());
                 set(&obj, "status", req.status.into());
-                set(&obj, "limit", (req.limit as f64).into());
+                set(&obj, "limit", req.limit.clone().into());
             }
             tentaflow_protocol::SyncConflictPayload::ListResponse(resp) => {
                 set(&obj, "variant", "SyncConflictsListResponse".into());
@@ -3428,11 +3428,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "errorMessage", conflict.error_message.clone().into());
                     set(&item, "error_message", conflict.error_message.into());
                     set(&item, "status", conflict.status.into());
-                    set(&item, "createdAtMs", (conflict.created_at_ms as f64).into());
+                    set(&item, "createdAtMs", conflict.created_at_ms.clone().into());
                     set(
                         &item,
                         "created_at_ms",
-                        (conflict.created_at_ms as f64).into(),
+                        conflict.created_at_ms.clone().into(),
                     );
                     set_optional_i64(&item, "resolvedAtMs", conflict.resolved_at_ms);
                     set_optional_i64(&item, "resolved_at_ms", conflict.resolved_at_ms);
@@ -3461,8 +3461,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "operation_id", resp.operation_id.into());
                 set(&obj, "status", resp.status.into());
                 set(&obj, "resolution", resp.resolution.into());
-                set(&obj, "rowsAffected", (resp.rows_affected as f64).into());
-                set(&obj, "rows_affected", (resp.rows_affected as f64).into());
+                set(&obj, "rowsAffected", resp.rows_affected.clone().into());
+                set(&obj, "rows_affected", resp.rows_affected.clone().into());
             }
         },
         MessageBody::SyncStorageBody(payload) => match payload {
@@ -3479,64 +3479,64 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set_optional_u64(&obj, "available_bytes", resp.available_bytes);
                 set_optional_u32(&obj, "freePercentBps", resp.free_percent_bps);
                 set_optional_u32(&obj, "free_percent_bps", resp.free_percent_bps);
-                set(&obj, "sqliteBytes", (resp.sqlite_bytes as f64).into());
-                set(&obj, "sqlite_bytes", (resp.sqlite_bytes as f64).into());
+                set(&obj, "sqliteBytes", resp.sqlite_bytes.clone().into());
+                set(&obj, "sqlite_bytes", resp.sqlite_bytes.clone().into());
                 set(
                     &obj,
                     "fjallLedgerBytes",
-                    (resp.fjall_ledger_bytes as f64).into(),
+                    resp.fjall_ledger_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "fjall_ledger_bytes",
-                    (resp.fjall_ledger_bytes as f64).into(),
+                    resp.fjall_ledger_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "snapshotBlobBytes",
-                    (resp.snapshot_blob_bytes as f64).into(),
+                    resp.snapshot_blob_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "snapshot_blob_bytes",
-                    (resp.snapshot_blob_bytes as f64).into(),
+                    resp.snapshot_blob_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "finalBlobBytes",
-                    (resp.final_blob_bytes as f64).into(),
+                    resp.final_blob_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "final_blob_bytes",
-                    (resp.final_blob_bytes as f64).into(),
+                    resp.final_blob_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "pendingBlobChunkBytes",
-                    (resp.pending_blob_chunk_bytes as f64).into(),
+                    resp.pending_blob_chunk_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "pending_blob_chunk_bytes",
-                    (resp.pending_blob_chunk_bytes as f64).into(),
+                    resp.pending_blob_chunk_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "largeBlobBlockBytes",
-                    (resp.large_blob_block_bytes as f64).into(),
+                    resp.large_blob_block_bytes.clone().into(),
                 );
                 set(
                     &obj,
                     "large_blob_block_bytes",
-                    (resp.large_blob_block_bytes as f64).into(),
+                    resp.large_blob_block_bytes.clone().into(),
                 );
                 let arr = js_sys::Array::new();
                 for path in resp.paths {
                     let item = js_sys::Object::new();
                     set(&item, "label", path.label.into());
                     set(&item, "path", path.path.into());
-                    set(&item, "bytes", (path.bytes as f64).into());
+                    set(&item, "bytes", path.bytes.clone().into());
                     arr.push(&item);
                 }
                 set(&obj, "paths", arr.into());
@@ -3585,22 +3585,22 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 let arr = js_sys::Array::new();
                 for n in resp.notes {
                     let item = js_sys::Object::new();
-                    set(&item, "id", (n.id as f64).into());
+                    set(&item, "id", n.id.clone().into());
                     set(&item, "title", n.title.into());
                     set(&item, "bodyPreview", n.body_preview.clone().into());
                     set(&item, "body_preview", n.body_preview.into());
                     set(&item, "pinned", n.pinned.into());
-                    set(&item, "createdAtEpoch", (n.created_at_epoch as f64).into());
+                    set(&item, "createdAtEpoch", n.created_at_epoch.clone().into());
                     set(
                         &item,
                         "created_at_epoch",
-                        (n.created_at_epoch as f64).into(),
+                        n.created_at_epoch.clone().into(),
                     );
-                    set(&item, "updatedAtEpoch", (n.updated_at_epoch as f64).into());
+                    set(&item, "updatedAtEpoch", n.updated_at_epoch.clone().into());
                     set(
                         &item,
                         "updated_at_epoch",
-                        (n.updated_at_epoch as f64).into(),
+                        n.updated_at_epoch.clone().into(),
                     );
                     arr.push(&item.into());
                 }
@@ -3608,24 +3608,24 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             NotesResponse::Detail(d) => {
                 set(&obj, "variant", "NoteDetailResponse".into());
-                set(&obj, "id", (d.id as f64).into());
+                set(&obj, "id", d.id.clone().into());
                 set(&obj, "title", d.title.into());
                 set(&obj, "body", d.body.into());
                 set(&obj, "pinned", d.pinned.into());
-                set(&obj, "createdAtEpoch", (d.created_at_epoch as f64).into());
-                set(&obj, "created_at_epoch", (d.created_at_epoch as f64).into());
-                set(&obj, "updatedAtEpoch", (d.updated_at_epoch as f64).into());
-                set(&obj, "updated_at_epoch", (d.updated_at_epoch as f64).into());
+                set(&obj, "createdAtEpoch", d.created_at_epoch.clone().into());
+                set(&obj, "created_at_epoch", d.created_at_epoch.clone().into());
+                set(&obj, "updatedAtEpoch", d.updated_at_epoch.clone().into());
+                set(&obj, "updated_at_epoch", d.updated_at_epoch.clone().into());
             }
             NotesResponse::Create(c) => {
                 set(&obj, "variant", "NoteCreateResponse".into());
-                set(&obj, "id", (c.id as f64).into());
+                set(&obj, "id", c.id.clone().into());
             }
             NotesResponse::Update(u) => {
                 set(&obj, "variant", "NoteUpdateResponse".into());
                 set(&obj, "ok", u.ok.into());
-                set(&obj, "updatedAtEpoch", (u.updated_at_epoch as f64).into());
-                set(&obj, "updated_at_epoch", (u.updated_at_epoch as f64).into());
+                set(&obj, "updatedAtEpoch", u.updated_at_epoch.clone().into());
+                set(&obj, "updated_at_epoch", u.updated_at_epoch.clone().into());
             }
             NotesResponse::SetPinned(p) => {
                 set(&obj, "variant", "NoteSetPinnedResponse".into());
@@ -3795,7 +3795,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             tentaflow_protocol::VisionInferPayload::InferResponse(r) => {
                 set(&obj, "variant", "VisionInferResponse".into());
                 set(&obj, "serviceName", r.service_name.into());
-                set(&obj, "latencyMs", (r.latency_ms as f64).into());
+                set(&obj, "latencyMs", r.latency_ms.clone().into());
                 match r.result {
                     tentaflow_protocol::VisionInferResult::Faces(faces) => {
                         set(&obj, "kind", "faces".into());
@@ -3969,7 +3969,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::DashboardMetricsResponse(s) => {
             set(&obj, "variant", "DashboardMetricsResponse".into());
-            set(&obj, "cpuUsagePercent", (s.cpu_usage_percent as f64).into());
+            set(&obj, "cpuUsagePercent", s.cpu_usage_percent.clone().into());
             set(&obj, "ramUsedMb", s.ram_used_mb.into());
             set(&obj, "ramTotalMb", s.ram_total_mb.into());
             set(&obj, "activeRequests", s.active_requests.into());
@@ -4018,7 +4018,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 if let Some(s) = m.interface_speed_mbps {
                     set(&item, "interfaceSpeedMbps", s.into());
                 }
-                set(&item, "joinedAt", (m.joined_at as f64).into());
+                set(&item, "joinedAt", m.joined_at.clone().into());
                 arr.push(&item.into());
             }
             set(&obj, "members", arr.into());
@@ -4152,7 +4152,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 if let Some(ip) = p.remote_ip {
                     set(&item, "remoteIp", ip.into());
                 }
-                set(&item, "initiatedAt", (p.initiated_at as f64).into());
+                set(&item, "initiatedAt", p.initiated_at.clone().into());
                 set(&item, "state", p.state.into());
                 if let Some(pin) = p.pin {
                     set(&item, "pin", pin.into());
@@ -4183,12 +4183,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(
                 &obj,
                 "invitePinExpiresSec",
-                (resp.invite_pin_expires_sec as f64).into(),
+                resp.invite_pin_expires_sec.clone().into(),
             );
             set(
                 &obj,
                 "invite_pin_expires_sec",
-                (resp.invite_pin_expires_sec as f64).into(),
+                resp.invite_pin_expires_sec.clone().into(),
             );
         }
         MessageBody::MeshServicesListRequest => {
@@ -4224,7 +4224,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(
                     &item,
                     "trustedSinceEpoch",
-                    (t.trusted_since_epoch as f64).into(),
+                    t.trusted_since_epoch.clone().into(),
                 );
                 arr.push(&item.into());
             }
@@ -4334,7 +4334,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::CatalogListResponseBody(resp) => {
             set(&obj, "variant", "CatalogListResponse".into());
-            set(&obj, "version", (resp.version as f64).into());
+            set(&obj, "version", resp.version.clone().into());
             let arr = js_sys::Array::new();
             for entry in resp.entries {
                 let item = js_sys::Object::new();
@@ -4367,13 +4367,13 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                             if let Some(ref h) = i.node_hostname {
                                 set(&inst, "nodeHostname", h.clone().into());
                             }
-                            set(&inst, "serviceId", (i.service_id as f64).into());
+                            set(&inst, "serviceId", i.service_id.clone().into());
                             set(&inst, "status", i.status.into());
                             if let Some(b) = i.backend {
                                 set(&inst, "backend", b.into());
                             }
                             if let Some(s) = i.size_mb {
-                                set(&inst, "sizeMb", (s as f64).into());
+                                set(&inst, "sizeMb", s.clone().into());
                             }
                             set(&inst, "loaded", i.loaded.into());
                             inst_arr.push(&inst.into());
@@ -4385,7 +4385,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         published_name,
                     } => {
                         set(&kind, "kind", "flow".into());
-                        set(&kind, "flowId", (flow_id as f64).into());
+                        set(&kind, "flowId", flow_id.clone().into());
                         set(&kind, "publishedName", published_name.into());
                     }
                     tentaflow_protocol::CatalogEntryKindWire::Alias {
@@ -4465,11 +4465,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::ModelAliasCreateResponseBody(r) => {
             set(&obj, "variant", "ModelAliasCreateResponse".into());
-            set(&obj, "id", (r.id as f64).into());
+            set(&obj, "id", r.id.clone().into());
         }
         MessageBody::ModelAliasUpdateRequestBody(r) => {
             set(&obj, "variant", "ModelAliasUpdateRequest".into());
-            set(&obj, "id", (r.id as f64).into());
+            set(&obj, "id", r.id.clone().into());
             set(&obj, "alias", r.alias.into());
             set(&obj, "targetModel", r.target_model.clone().into());
             set(&obj, "target_model", r.target_model.into());
@@ -4491,7 +4491,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::ModelAliasDeleteRequestBody(r) => {
             set(&obj, "variant", "ModelAliasDeleteRequest".into());
-            set(&obj, "id", (r.id as f64).into());
+            set(&obj, "id", r.id.clone().into());
         }
         MessageBody::ModelAliasDeleteResponseBody(r) => {
             set(&obj, "variant", "ModelAliasDeleteResponse".into());
@@ -4530,11 +4530,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "oauthProviders", providers.clone().into());
             set(&obj, "oauth_providers", providers.into());
             set(&obj, "license", resp.license.into());
-            set(&obj, "fileSizeBytes", (resp.file_size_bytes as f64).into());
+            set(&obj, "fileSizeBytes", resp.file_size_bytes.clone().into());
             set(
                 &obj,
                 "file_size_bytes",
-                (resp.file_size_bytes as f64).into(),
+                resp.file_size_bytes.clone().into(),
             );
             set(&obj, "runtime", resp.runtime.into());
             match resp.icon {
@@ -4554,34 +4554,34 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(
                 &obj,
                 "visibilityGroupsVisible",
-                (resp.visibility_groups_visible as f64).into(),
+                resp.visibility_groups_visible.clone().into(),
             );
             set(
                 &obj,
                 "visibility_groups_visible",
-                (resp.visibility_groups_visible as f64).into(),
+                resp.visibility_groups_visible.clone().into(),
             );
             set(
                 &obj,
                 "visibilityGroupsTotal",
-                (resp.visibility_groups_total as f64).into(),
+                resp.visibility_groups_total.clone().into(),
             );
             set(
                 &obj,
                 "visibility_groups_total",
-                (resp.visibility_groups_total as f64).into(),
+                resp.visibility_groups_total.clone().into(),
             );
-            set(&obj, "toolsCount", (resp.tools_count as f64).into());
-            set(&obj, "tools_count", (resp.tools_count as f64).into());
+            set(&obj, "toolsCount", resp.tools_count.clone().into());
+            set(&obj, "tools_count", resp.tools_count.clone().into());
             set(
                 &obj,
                 "linkedAccountsCount",
-                (resp.linked_accounts_count as f64).into(),
+                resp.linked_accounts_count.clone().into(),
             );
             set(
                 &obj,
                 "linked_accounts_count",
-                (resp.linked_accounts_count as f64).into(),
+                resp.linked_accounts_count.clone().into(),
             );
             set(&obj, "showInCatalog", resp.show_in_catalog.into());
             set(&obj, "show_in_catalog", resp.show_in_catalog.into());
@@ -4600,8 +4600,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 let item = js_sys::Object::new();
                 set(&item, "addonId", r.addon_id.clone().into());
                 set(&item, "addon_id", r.addon_id.into());
-                set(&item, "groupId", (r.group_id as f64).into());
-                set(&item, "group_id", (r.group_id as f64).into());
+                set(&item, "groupId", r.group_id.clone().into());
+                set(&item, "group_id", r.group_id.clone().into());
                 set(&item, "groupName", r.group_name.clone().into());
                 set(&item, "group_name", r.group_name.into());
                 set(&item, "visible", r.visible.into());
@@ -4611,8 +4611,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     r.group_description.clone().into(),
                 );
                 set(&item, "group_description", r.group_description.into());
-                set(&item, "userCount", (r.user_count as f64).into());
-                set(&item, "user_count", (r.user_count as f64).into());
+                set(&item, "userCount", r.user_count.clone().into());
+                set(&item, "user_count", r.user_count.clone().into());
                 arr.push(&item.into());
             }
             set(&obj, "rows", arr.into());
@@ -4623,16 +4623,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "AddonVisibilitySetRequest".into());
             set(&obj, "addonId", req.addon_id.clone().into());
             set(&obj, "addon_id", req.addon_id.into());
-            set(&obj, "groupId", (req.group_id as f64).into());
-            set(&obj, "group_id", (req.group_id as f64).into());
+            set(&obj, "groupId", req.group_id.clone().into());
+            set(&obj, "group_id", req.group_id.clone().into());
             set(&obj, "visible", req.visible.into());
         }
         MessageBody::AddonVisibilitySetResponseBody(resp) => {
             set(&obj, "variant", "AddonVisibilitySetResponse".into());
             set(&obj, "addonId", resp.addon_id.clone().into());
             set(&obj, "addon_id", resp.addon_id.into());
-            set(&obj, "groupId", (resp.group_id as f64).into());
-            set(&obj, "group_id", (resp.group_id as f64).into());
+            set(&obj, "groupId", resp.group_id.clone().into());
+            set(&obj, "group_id", resp.group_id.clone().into());
             set(&obj, "visible", resp.visible.into());
         }
         MessageBody::AddonAdminOnlySetRequestBody(req) => {
@@ -4702,12 +4702,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(
                 &obj,
                 "lastChangeAtEpoch",
-                (resp.last_change_at_epoch as f64).into(),
+                resp.last_change_at_epoch.clone().into(),
             );
             set(
                 &obj,
                 "last_change_at_epoch",
-                (resp.last_change_at_epoch as f64).into(),
+                resp.last_change_at_epoch.clone().into(),
             );
         }
         MessageBody::AddonPermissionSetRequestBody(req) => {
@@ -4716,8 +4716,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "addon_id", req.addon_id.into());
             set(&obj, "subjectType", req.subject_type.clone().into());
             set(&obj, "subject_type", req.subject_type.into());
-            set(&obj, "subjectId", (req.subject_id as f64).into());
-            set(&obj, "subject_id", (req.subject_id as f64).into());
+            set(&obj, "subjectId", req.subject_id.clone().into());
+            set(&obj, "subject_id", req.subject_id.clone().into());
             set(&obj, "permissionId", req.permission_id.clone().into());
             set(&obj, "permission_id", req.permission_id.into());
             set(&obj, "grantMode", req.grant_mode.clone().into());
@@ -4729,8 +4729,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "addon_id", resp.addon_id.into());
             set(&obj, "subjectType", resp.subject_type.clone().into());
             set(&obj, "subject_type", resp.subject_type.into());
-            set(&obj, "subjectId", (resp.subject_id as f64).into());
-            set(&obj, "subject_id", (resp.subject_id as f64).into());
+            set(&obj, "subjectId", resp.subject_id.clone().into());
+            set(&obj, "subject_id", resp.subject_id.clone().into());
             set(&obj, "permissionId", resp.permission_id.clone().into());
             set(&obj, "permission_id", resp.permission_id.into());
             set(&obj, "grantMode", resp.grant_mode.clone().into());
@@ -4761,8 +4761,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "permissionId", req.permission_id.clone().into());
             set(&obj, "permission_id", req.permission_id.into());
             if let Some(uid) = req.user_id {
-                set(&obj, "userId", (uid as f64).into());
-                set(&obj, "user_id", (uid as f64).into());
+                set(&obj, "userId", uid.clone().into());
+                set(&obj, "user_id", uid.clone().into());
             }
         }
         MessageBody::AddonPermissionCheckResponseBody(resp) => {
@@ -4871,19 +4871,19 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::AddonOAuthRevokeRequestBody(req) => {
             set(&obj, "variant", "AddonOAuthRevokeRequest".into());
-            set(&obj, "accountId", (req.account_id as f64).into());
-            set(&obj, "account_id", (req.account_id as f64).into());
+            set(&obj, "accountId", req.account_id.clone().into());
+            set(&obj, "account_id", req.account_id.clone().into());
         }
         MessageBody::AddonOAuthRevokeResponseBody(resp) => {
             set(&obj, "variant", "AddonOAuthRevokeResponse".into());
-            set(&obj, "accountId", (resp.account_id as f64).into());
-            set(&obj, "account_id", (resp.account_id as f64).into());
+            set(&obj, "accountId", resp.account_id.clone().into());
+            set(&obj, "account_id", resp.account_id.clone().into());
             set(&obj, "revoked", resp.revoked.into());
         }
         MessageBody::AddonOAuthReauthorizeRequestBody(req) => {
             set(&obj, "variant", "AddonOAuthReauthorizeRequest".into());
-            set(&obj, "accountId", (req.account_id as f64).into());
-            set(&obj, "account_id", (req.account_id as f64).into());
+            set(&obj, "accountId", req.account_id.clone().into());
+            set(&obj, "account_id", req.account_id.clone().into());
         }
         MessageBody::AddonOAuthReauthorizeResponseBody(resp) => {
             set(&obj, "variant", "AddonOAuthReauthorizeResponse".into());
@@ -4963,8 +4963,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "subject_type", st.into());
             }
             if let Some(sid) = evt.subject_id {
-                set(&obj, "subjectId", (sid as f64).into());
-                set(&obj, "subject_id", (sid as f64).into());
+                set(&obj, "subjectId", sid.clone().into());
+                set(&obj, "subject_id", sid.clone().into());
             }
             if let Some(pid) = evt.permission_id {
                 set(&obj, "permissionId", pid.clone().into());
@@ -4998,8 +4998,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::AddonLogsRequestBody(r) => {
             set(&obj, "variant", "AddonLogsRequest".into());
             set(&obj, "addonId", r.addon_id.into());
-            set(&obj, "limit", (r.limit as f64).into());
-            set(&obj, "offset", (r.offset as f64).into());
+            set(&obj, "limit", r.limit.clone().into());
+            set(&obj, "offset", r.offset.clone().into());
         }
         MessageBody::AddonToolsRequestBody(r) => {
             set(&obj, "variant", "AddonToolsRequest".into());
@@ -5094,13 +5094,13 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             let arr = js_sys::Array::new();
             for e in r.entries {
                 let eo = js_sys::Object::new();
-                set(&eo, "id", (e.id as f64).into());
+                set(&eo, "id", e.id.clone().into());
                 set(&eo, "timestamp", e.timestamp.into());
                 set(&eo, "level", e.level.into());
                 set(&eo, "action", e.action.into());
                 set(&eo, "message", e.message.into());
                 if let Some(uid) = e.user_id {
-                    set(&eo, "userId", (uid as f64).into());
+                    set(&eo, "userId", uid.clone().into());
                 }
                 if let Some(un) = e.user_name {
                     set(&eo, "userName", un.into());
@@ -5109,7 +5109,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 arr.push(&eo.into());
             }
             set(&obj, "entries", arr.into());
-            set(&obj, "total", (r.total as f64).into());
+            set(&obj, "total", r.total.clone().into());
         }
         MessageBody::AddonToolsResponseBody(r) => {
             set(&obj, "variant", "AddonToolsResponse".into());
@@ -5138,19 +5138,19 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::AddonResourcesGetResponseBody(r) => {
             set(&obj, "variant", "AddonResourcesGetResponse".into());
-            set(&obj, "maxInstances", (r.max_instances as f64).into());
-            set(&obj, "cpuLimitPct", (r.cpu_limit_pct as f64).into());
-            set(&obj, "ramMb", (r.ram_mb as f64).into());
-            set(&obj, "storageMb", (r.storage_mb as f64).into());
+            set(&obj, "maxInstances", r.max_instances.clone().into());
+            set(&obj, "cpuLimitPct", r.cpu_limit_pct.clone().into());
+            set(&obj, "ramMb", r.ram_mb.clone().into());
+            set(&obj, "storageMb", r.storage_mb.clone().into());
             set(
                 &obj,
                 "httpRequestsPerMin",
-                (r.http_requests_per_min as f64).into(),
+                r.http_requests_per_min.clone().into(),
             );
             set(
                 &obj,
                 "llmTokensPerMin",
-                (r.llm_tokens_per_min as f64).into(),
+                r.llm_tokens_per_min.clone().into(),
             );
         }
         MessageBody::AddonResourcesSetResponseBody(r) => {
@@ -5179,7 +5179,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "rule_id", d.rule_id.into());
                 set(&item, "host", d.host.into());
                 match d.port {
-                    Some(p) => set(&item, "port", (p as f64).into()),
+                    Some(p) => set(&item, "port", p.clone().into()),
                     None => set(&item, "port", JsValue::NULL),
                 }
                 set(&item, "protocol", d.protocol.into());
@@ -5212,8 +5212,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::BrowserCaptureBody(payload) => match payload {
             tentaflow_protocol::BrowserCapturePayload::Request(r) => {
                 set(&obj, "variant", "BrowserCaptureRequest".into());
-                set(&obj, "sessionId", (r.session_id as f64).into());
-                set(&obj, "session_id", (r.session_id as f64).into());
+                set(&obj, "sessionId", r.session_id.clone().into());
+                set(&obj, "session_id", r.session_id.clone().into());
                 set(&obj, "kind", r.kind.into());
                 set(&obj, "fullPage", r.full_page.into());
                 set(&obj, "full_page", r.full_page.into());
@@ -5232,7 +5232,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MeetingLiveEventBody(event) => {
             set(&obj, "variant", "MeetingLiveEventBody".into());
             set(&obj, "meetingKey", event.meeting_key.clone().into());
-            set(&obj, "timestampMs", (event.timestamp_ms as f64).into());
+            set(&obj, "timestampMs", event.timestamp_ms.clone().into());
             let payload = js_sys::Object::new();
             meeting_event_payload_to_js(&payload, event.payload);
             set(&obj, "payload", payload.into());
@@ -5274,27 +5274,27 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&obj, "variant", "NetworkRelayStatusResponse".into());
                     set(&obj, "url", info.url.clone().into());
                     set(&obj, "reachable", info.reachable.into());
-                    set(&obj, "rttMs", (info.rtt_ms as f64).into());
-                    set(&obj, "rtt_ms", (info.rtt_ms as f64).into());
+                    set(&obj, "rttMs", info.rtt_ms.clone().into());
+                    set(&obj, "rtt_ms", info.rtt_ms.clone().into());
                     set(
                         &obj,
                         "lastCheckUnixSecs",
-                        (info.last_check_unix_secs as f64).into(),
+                        info.last_check_unix_secs.clone().into(),
                     );
                     set(
                         &obj,
                         "last_check_unix_secs",
-                        (info.last_check_unix_secs as f64).into(),
+                        info.last_check_unix_secs.clone().into(),
                     );
                     set(
                         &obj,
                         "lastSuccessUnixSecs",
-                        (info.last_success_unix_secs as f64).into(),
+                        info.last_success_unix_secs.clone().into(),
                     );
                     set(
                         &obj,
                         "last_success_unix_secs",
-                        (info.last_success_unix_secs as f64).into(),
+                        info.last_success_unix_secs.clone().into(),
                     );
                     set(&obj, "status", info.status.clone().into());
                     set(&obj, "bindAddrActual", info.bind_addr_actual.clone().into());
@@ -5398,8 +5398,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "CameraFrameUrlResponse".into());
                 set(&obj, "signedUrl", resp.signed_url.clone().into());
                 set(&obj, "signed_url", resp.signed_url.into());
-                set(&obj, "expiresAtMs", (resp.expires_at_ms as f64).into());
-                set(&obj, "expires_at_ms", (resp.expires_at_ms as f64).into());
+                set(&obj, "expiresAtMs", resp.expires_at_ms.clone().into());
+                set(&obj, "expires_at_ms", resp.expires_at_ms.clone().into());
             }
         },
         MessageBody::LegalAdminBody(payload) => match payload {
@@ -5426,8 +5426,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "variant", doc.variant.into());
                     // `generated_at` on the wire is unix-ms — expose under the
                     // dashboard's preferred `generated_at_ms` key plus camelCase.
-                    set(&item, "generated_at_ms", (doc.generated_at as f64).into());
-                    set(&item, "generatedAtMs", (doc.generated_at as f64).into());
+                    set(&item, "generated_at_ms", doc.generated_at.clone().into());
+                    set(&item, "generatedAtMs", doc.generated_at.clone().into());
                     set(
                         &item,
                         "generated_by_user_id",
@@ -5436,8 +5436,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "generatedByUserId", doc.generated_by_user_id.into());
                     set(&item, "content_hash", doc.content_hash.clone().into());
                     set(&item, "contentHash", doc.content_hash.into());
-                    set(&item, "revoked_at_ms", (doc.revoked_at_ms as f64).into());
-                    set(&item, "revokedAtMs", (doc.revoked_at_ms as f64).into());
+                    set(&item, "revoked_at_ms", doc.revoked_at_ms.clone().into());
+                    set(&item, "revokedAtMs", doc.revoked_at_ms.clone().into());
                     arr.push(&item.into());
                 }
                 set(&obj, "documents", arr.into());
@@ -5471,8 +5471,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "LegalDocumentRevokeResponse".into());
                 set(&obj, "doc_id", resp.doc_id.clone().into());
                 set(&obj, "docId", resp.doc_id.into());
-                set(&obj, "revoked_at_ms", (resp.revoked_at_ms as f64).into());
-                set(&obj, "revokedAtMs", (resp.revoked_at_ms as f64).into());
+                set(&obj, "revoked_at_ms", resp.revoked_at_ms.clone().into());
+                set(&obj, "revokedAtMs", resp.revoked_at_ms.clone().into());
             }
         },
         MessageBody::ComplianceAdminBody(payload) => {
@@ -5646,15 +5646,15 @@ fn compliance_admin_payload_to_js(
                 set(
                     &item,
                     "retentionDays",
-                    (policy.retention_days as f64).into(),
+                    policy.retention_days.clone().into(),
                 );
                 set(
                     &item,
                     "retention_days",
-                    (policy.retention_days as f64).into(),
+                    policy.retention_days.clone().into(),
                 );
-                set(&item, "minimumDays", (policy.minimum_days as f64).into());
-                set(&item, "minimum_days", (policy.minimum_days as f64).into());
+                set(&item, "minimumDays", policy.minimum_days.clone().into());
+                set(&item, "minimum_days", policy.minimum_days.clone().into());
                 set(
                     &item,
                     "actionAfterRetention",
@@ -5679,8 +5679,8 @@ fn compliance_admin_payload_to_js(
                 set(obj, "status", status.into());
             }
             if let Some(user_id) = filter.user_id {
-                set(obj, "userId", (user_id as f64).into());
-                set(obj, "user_id", (user_id as f64).into());
+                set(obj, "userId", user_id.clone().into());
+                set(obj, "user_id", user_id.clone().into());
             }
             if let Some(addon_id) = filter.addon_id {
                 set(obj, "addonId", addon_id.clone().into());
@@ -5706,8 +5706,8 @@ fn compliance_admin_payload_to_js(
                 set(&item, "eventId", event.event_id.clone().into());
                 set(&item, "event_id", event.event_id.into());
                 if let Some(user_id) = event.user_id {
-                    set(&item, "userId", (user_id as f64).into());
-                    set(&item, "user_id", (user_id as f64).into());
+                    set(&item, "userId", user_id.clone().into());
+                    set(&item, "user_id", user_id.clone().into());
                 }
                 set(&item, "nodeId", event.node_id.clone().into());
                 set(&item, "node_id", event.node_id.into());
@@ -5720,8 +5720,8 @@ fn compliance_admin_payload_to_js(
                     set(&item, "instance_id", instance_id.into());
                 }
                 if let Some(flow_id) = event.flow_id {
-                    set(&item, "flowId", (flow_id as f64).into());
-                    set(&item, "flow_id", (flow_id as f64).into());
+                    set(&item, "flowId", flow_id.clone().into());
+                    set(&item, "flow_id", flow_id.clone().into());
                 }
                 if let Some(flow_node_id) = event.flow_node_id {
                     set(&item, "flowNodeId", flow_node_id.clone().into());
@@ -5760,8 +5760,8 @@ fn compliance_admin_payload_to_js(
                 set(&item, "responseHash", event.response_hash.clone().into());
                 set(&item, "response_hash", event.response_hash.into());
                 if let Some(audit_log_id) = event.audit_log_id {
-                    set(&item, "auditLogId", (audit_log_id as f64).into());
-                    set(&item, "audit_log_id", (audit_log_id as f64).into());
+                    set(&item, "auditLogId", audit_log_id.clone().into());
+                    set(&item, "audit_log_id", audit_log_id.clone().into());
                 }
                 if let Some(error_message) = event.error_message {
                     set(&item, "errorMessage", error_message.clone().into());
@@ -5996,7 +5996,7 @@ fn role_catalog_detail_to_js(d: tentaflow_protocol::RoleCatalogDetail) -> js_sys
 
 fn user_info_to_js(u: &tentaflow_protocol::UserInfo) -> js_sys::Object {
     let o = js_sys::Object::new();
-    set(&o, "id", (u.id as f64).into());
+    set(&o, "id", u.id.clone().into());
     set(&o, "username", u.username.clone().into());
     set(&o, "displayName", u.display_name.clone().into());
     set(&o, "display_name", u.display_name.clone().into());
@@ -6018,7 +6018,7 @@ fn user_info_to_js(u: &tentaflow_protocol::UserInfo) -> js_sys::Object {
     set(&o, "created_at", u.created_at.clone().into());
     let gs = js_sys::Array::new();
     for gid in &u.group_ids {
-        gs.push(&(*gid as f64).into());
+        gs.push(&gid.clone().into());
     }
     set(&o, "groupIds", gs.into());
     o
@@ -6039,7 +6039,7 @@ fn deployment_summary_to_js(s: tentaflow_protocol::DeploymentSummary) -> js_sys:
     set(&o, "finishedAt", s.finished_at.into());
     set(&o, "errorMessage", s.error_message.into());
     set(&o, "logTail", s.log_tail.into());
-    set(&o, "userId", (s.user_id as f64).into());
+    set(&o, "userId", s.user_id.clone().into());
     o
 }
 
@@ -6101,7 +6101,7 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
             set(obj, "line", c.line.into());
             set(obj, "phase", c.phase.into());
             set(obj, "progressPct", c.progress_pct.into());
-            set(obj, "tsMs", (c.ts_ms as f64).into());
+            set(obj, "tsMs", c.ts_ms.clone().into());
         }
         DP::StreamEnd(e) => {
             set(obj, "variant", "DeploymentStreamEnd".into());
@@ -6110,7 +6110,7 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
             set(obj, "imageTag", e.image_tag.into());
             set(obj, "containerName", e.container_name.into());
             set(obj, "errorMessage", e.error_message.into());
-            set(obj, "durationMs", (e.duration_ms as f64).into());
+            set(obj, "durationMs", e.duration_ms.clone().into());
         } // ReqRedeploy/ResRedeploy were removed when DeploymentPayload was
           // trimmed; kept as a comment so future searches find the change.
     }
@@ -6118,7 +6118,7 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
 
 fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_sys::Object {
     let o = js_sys::Object::new();
-    set(&o, "sessionId", (s.session_id as f64).into());
+    set(&o, "sessionId", s.session_id.clone().into());
     set(&o, "meetingKey", s.meeting_key.into());
     set(&o, "meetingUrl", s.meeting_url.into());
     set(&o, "title", s.title.into());
@@ -6127,13 +6127,13 @@ fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_
     set(&o, "lastActivityAt", s.last_activity_at.into());
     set(&o, "endedAt", s.ended_at.into());
     set(&o, "platform", s.platform.into());
-    set(&o, "entryCount", (s.entry_count as f64).into());
+    set(&o, "entryCount", s.entry_count.clone().into());
     set(&o, "quicPort", s.quic_port.into());
     set(&o, "vncPort", s.vnc_port.into());
     set(&o, "novncPort", s.novnc_port.into());
     set(&o, "botEndpointId", s.bot_endpoint_id.into());
     set(&o, "containerName", s.container_name.into());
-    set(&o, "ownerUserId", (s.owner_user_id as f64).into());
+    set(&o, "ownerUserId", s.owner_user_id.clone().into());
     // Lifecycle pola są kluczowe dla live view (chip LIVE/JOINING) i dla
     // onJoinClick który decyduje czy wracać do joining screen czy nawigować
     // wprost do live view po reload. Bez nich chip zawsze zostaje JOINING.
@@ -6152,7 +6152,7 @@ fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_
         if v < 0 {
             wasm_bindgen::JsValue::NULL
         } else {
-            (v as f64).into()
+            v.clone().into()
         }
     };
     set(&o, "backendSttModel", opt_str(s.backend_stt_model));
@@ -6187,12 +6187,12 @@ fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_
 
 fn meeting_entry_to_js(e: tentaflow_protocol::MeetingTranscriptEntry) -> js_sys::Object {
     let o = js_sys::Object::new();
-    set(&o, "id", (e.id as f64).into());
-    set(&o, "sessionId", (e.session_id as f64).into());
-    set(&o, "timestampMs", (e.timestamp_ms as f64).into());
+    set(&o, "id", e.id.clone().into());
+    set(&o, "sessionId", e.session_id.clone().into());
+    set(&o, "timestampMs", e.timestamp_ms.clone().into());
     set(&o, "speaker", e.speaker.into());
-    set(&o, "profileId", (e.profile_id as f64).into());
-    set(&o, "confidence", (e.confidence as f64).into());
+    set(&o, "profileId", e.profile_id.clone().into());
+    set(&o, "confidence", e.confidence.clone().into());
     set(&o, "isEnrolled", e.is_enrolled.into());
     set(&o, "text", e.text.into());
     set(&o, "model", e.model.into());
@@ -6204,7 +6204,7 @@ fn vnc_tunnel_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::VncTunn
     match p {
         VP::ReqOpen(r) => {
             set(obj, "variant", "VncTunnelOpenRequest".into());
-            set(obj, "sessionId", (r.session_id as f64).into());
+            set(obj, "sessionId", r.session_id.clone().into());
         }
         VP::ResOpen(r) => {
             set(obj, "variant", "VncTunnelOpenResponse".into());
@@ -6368,7 +6368,7 @@ fn meeting_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingPay
 
 fn wake_word_to_js(w: tentaflow_protocol::WakeWord) -> js_sys::Object {
     let o = js_sys::Object::new();
-    set(&o, "id", (w.id as f64).into());
+    set(&o, "id", w.id.clone().into());
     set(&o, "word", w.word.into());
     set(&o, "enabled", w.enabled.into());
     set(&o, "createdAt", w.created_at.into());
@@ -6388,12 +6388,12 @@ fn wake_word_op_to_js(op: tentaflow_protocol::WakeWordOp) -> js_sys::Object {
         }
         Op::Toggle { id, enabled } => {
             set(&o, "kind", "Toggle".into());
-            set(&o, "id", (id as f64).into());
+            set(&o, "id", id.clone().into());
             set(&o, "enabled", enabled.into());
         }
         Op::Delete { id } => {
             set(&o, "kind", "Delete".into());
-            set(&o, "id", (id as f64).into());
+            set(&o, "id", id.clone().into());
         }
     }
     o
@@ -6401,7 +6401,7 @@ fn wake_word_op_to_js(op: tentaflow_protocol::WakeWordOp) -> js_sys::Object {
 
 fn meeting_summary_to_js(s: tentaflow_protocol::MeetingSummaryItem) -> js_sys::Object {
     let o = js_sys::Object::new();
-    set(&o, "id", (s.id as f64).into());
+    set(&o, "id", s.id.clone().into());
     set(&o, "createdAt", s.created_at.into());
     set(&o, "decisionsText", s.decisions_text.into());
     set(&o, "summaryText", s.summary_text.into());
@@ -6411,7 +6411,7 @@ fn meeting_summary_to_js(s: tentaflow_protocol::MeetingSummaryItem) -> js_sys::O
 
 fn meeting_action_item_to_js(a: tentaflow_protocol::MeetingActionItemItem) -> js_sys::Object {
     let o = js_sys::Object::new();
-    set(&o, "id", (a.id as f64).into());
+    set(&o, "id", a.id.clone().into());
     set(&o, "owner", a.owner.into());
     set(&o, "task", a.task.into());
     if let Some(d) = a.deadline {
@@ -6470,14 +6470,14 @@ fn meeting_event_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Meet
             }
             set(&data, "isEnrolled", is_enrolled.into());
             if let Some(c) = speaker_confidence {
-                set(&data, "speakerConfidence", (c as f64).into());
+                set(&data, "speakerConfidence", c.clone().into());
             }
             set(&data, "text", text.into());
             if let Some(l) = language {
                 set(&data, "language", l.into());
             }
             set(&data, "resolvedSttModel", resolved_stt_model.into());
-            set(&data, "latencyMs", (latency_ms as f64).into());
+            set(&data, "latencyMs", latency_ms.clone().into());
         }
         EP::RosterSnapshot { entries } => {
             set(obj, "type", "RosterSnapshot".into());
@@ -6490,7 +6490,7 @@ fn meeting_event_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Meet
                 }
                 set(&eo, "status", entry.status.into());
                 if let Some(s) = entry.last_spoken_ago_sec {
-                    set(&eo, "lastSpokenAgoSec", (s as f64).into());
+                    set(&eo, "lastSpokenAgoSec", s.clone().into());
                 }
                 arr.push(&eo.into());
             }
@@ -6511,13 +6511,13 @@ fn meeting_event_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Meet
             set(&data, "summarizationModel", summarization_model.into());
             set(&data, "diarizationModel", diarization_model.into());
             if let Some(v) = streaming_latency_ms {
-                set(&data, "streamingLatencyMs", (v as f64).into());
+                set(&data, "streamingLatencyMs", v.clone().into());
             }
             if let Some(v) = enrolled_speakers {
-                set(&data, "enrolledSpeakers", (v as f64).into());
+                set(&data, "enrolledSpeakers", v.clone().into());
             }
             if let Some(v) = total_participants {
-                set(&data, "totalParticipants", (v as f64).into());
+                set(&data, "totalParticipants", v.clone().into());
             }
         }
         EP::LifecycleUpdate { stage, details } => {
@@ -6542,7 +6542,7 @@ fn meeting_event_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Meet
             if let Some(n) = name {
                 set(&data, "name", n.into());
             }
-            set(&data, "tsMs", (ts_ms as f64).into());
+            set(&data, "tsMs", ts_ms.clone().into());
             let arr = js_sys::Uint8Array::new_with_length(jpeg.len() as u32);
             arr.copy_from(&jpeg);
             set(&data, "jpeg", arr.into());
@@ -6561,18 +6561,18 @@ fn meeting_event_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Meet
             if let Some(n) = name {
                 set(&data, "name", n.into());
             }
-            set(&data, "tsMs", (ts_ms as f64).into());
+            set(&data, "tsMs", ts_ms.clone().into());
             if let Some(e) = emotion {
                 set(&data, "emotion", e.into());
             }
             if let Some(c) = emotion_confidence {
-                set(&data, "emotionConfidence", (c as f64).into());
+                set(&data, "emotionConfidence", c.clone().into());
             }
             if let Some(a) = age {
-                set(&data, "age", (a as f64).into());
+                set(&data, "age", a.clone().into());
             }
             if let Some(g) = gender_male_prob {
-                set(&data, "genderMaleProb", (g as f64).into());
+                set(&data, "genderMaleProb", g.clone().into());
             }
         }
     }
@@ -6584,7 +6584,7 @@ fn flow_node_template_to_js(
 ) -> js_sys::Object {
     let obj = js_sys::Object::new();
     // Emitujemy rownoczesnie camelCase (nowy kod) i snake_case (istniejaca paleta).
-    set(&obj, "id", (t.id as f64).into());
+    set(&obj, "id", t.id.clone().into());
     set(&obj, "nodeType", t.node_type.clone().into());
     set(&obj, "node_type", t.node_type.into());
     set(&obj, "category", t.category.into());
@@ -6633,8 +6633,8 @@ fn flow_version_summary_to_js(
     set(&obj, "id", v.id.into());
     set(&obj, "flowId", v.flow_id.clone().into());
     set(&obj, "flow_id", v.flow_id.into());
-    set(&obj, "versionNum", (v.version_num as f64).into());
-    set(&obj, "version_num", (v.version_num as f64).into());
+    set(&obj, "versionNum", v.version_num.clone().into());
+    set(&obj, "version_num", v.version_num.clone().into());
     set(&obj, "name", v.name.into());
     if let Some(d) = v.description {
         set(&obj, "description", d.into());
@@ -6656,8 +6656,8 @@ fn flow_version_full_to_js(v: tentaflow_protocol::message_body::FlowVersionFull)
     set(&obj, "id", v.id.into());
     set(&obj, "flowId", v.flow_id.clone().into());
     set(&obj, "flow_id", v.flow_id.into());
-    set(&obj, "versionNum", (v.version_num as f64).into());
-    set(&obj, "version_num", (v.version_num as f64).into());
+    set(&obj, "versionNum", v.version_num.clone().into());
+    set(&obj, "version_num", v.version_num.clone().into());
     set(&obj, "name", v.name.into());
     if let Some(d) = v.description {
         set(&obj, "description", d.into());
@@ -6678,7 +6678,7 @@ fn flow_version_full_to_js(v: tentaflow_protocol::message_body::FlowVersionFull)
 
 fn model_alias_entry_to_js(a: tentaflow_protocol::ModelAliasEntry) -> js_sys::Object {
     let obj = js_sys::Object::new();
-    set(&obj, "id", (a.id as f64).into());
+    set(&obj, "id", a.id.clone().into());
     set(&obj, "alias", a.alias.into());
     set(&obj, "targetModel", a.target_model.clone().into());
     set(&obj, "target_model", a.target_model.into());
@@ -6709,8 +6709,8 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "isLocal", n.is_local.into());
     set(&obj, "is_local", n.is_local.into());
     if let Some(v) = n.uptime_secs {
-        set(&obj, "uptimeSecs", (v as f64).into());
-        set(&obj, "uptime_secs", (v as f64).into());
+        set(&obj, "uptimeSecs", v.clone().into());
+        set(&obj, "uptime_secs", v.clone().into());
     }
     let ifs = js_sys::Array::new();
     let mut total_rx: u64 = 0;
@@ -6745,49 +6745,49 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&item, "numa_node", v.into());
         }
         if let Some(v) = i.rx_bytes_per_sec {
-            set(&item, "rxBytesPerSec", (v as f64).into());
-            set(&item, "rx_bytes_per_sec", (v as f64).into());
+            set(&item, "rxBytesPerSec", v.clone().into());
+            set(&item, "rx_bytes_per_sec", v.clone().into());
             total_rx += v;
         }
         if let Some(v) = i.tx_bytes_per_sec {
-            set(&item, "txBytesPerSec", (v as f64).into());
-            set(&item, "tx_bytes_per_sec", (v as f64).into());
+            set(&item, "txBytesPerSec", v.clone().into());
+            set(&item, "tx_bytes_per_sec", v.clone().into());
             total_tx += v;
         }
         ifs.push(&item.into());
     }
     set(&obj, "networkInterfaces", ifs.clone().into());
     set(&obj, "network_interfaces", ifs.into());
-    set(&obj, "network_rx_bytes", (total_rx as f64).into());
-    set(&obj, "network_tx_bytes", (total_tx as f64).into());
+    set(&obj, "network_rx_bytes", total_rx.clone().into());
+    set(&obj, "network_tx_bytes", total_tx.clone().into());
     if let Some(v) = n.cpu_count {
         set(&obj, "cpuCount", v.into());
         set(&obj, "cpu_count", v.into());
     }
     if let Some(v) = n.cpu_usage_percent {
-        set(&obj, "cpuUsagePercent", (v as f64).into());
-        set(&obj, "cpu_usage_percent", (v as f64).into());
-        set(&obj, "cpu_usage", (v as f64).into());
+        set(&obj, "cpuUsagePercent", v.clone().into());
+        set(&obj, "cpu_usage_percent", v.clone().into());
+        set(&obj, "cpu_usage", v.clone().into());
     }
     if let Some(v) = n.ram_total_mb {
-        set(&obj, "ramTotalMb", (v as f64).into());
-        set(&obj, "ram_total_mb", (v as f64).into());
+        set(&obj, "ramTotalMb", v.clone().into());
+        set(&obj, "ram_total_mb", v.clone().into());
     }
     if let Some(v) = n.ram_used_mb {
-        set(&obj, "ramUsedMb", (v as f64).into());
-        set(&obj, "ram_used_mb", (v as f64).into());
+        set(&obj, "ramUsedMb", v.clone().into());
+        set(&obj, "ram_used_mb", v.clone().into());
     }
     if let Some(v) = n.vram_total_mb {
-        set(&obj, "vramTotalMb", (v as f64).into());
-        set(&obj, "vram_total_mb", (v as f64).into());
+        set(&obj, "vramTotalMb", v.clone().into());
+        set(&obj, "vram_total_mb", v.clone().into());
     }
     if let Some(v) = n.vram_used_mb {
-        set(&obj, "vramUsedMb", (v as f64).into());
-        set(&obj, "vram_used_mb", (v as f64).into());
+        set(&obj, "vramUsedMb", v.clone().into());
+        set(&obj, "vram_used_mb", v.clone().into());
     }
     if let Some(v) = n.gpu_load_percent {
-        set(&obj, "gpuLoadPercent", (v as f64).into());
-        set(&obj, "gpu_load_percent", (v as f64).into());
+        set(&obj, "gpuLoadPercent", v.clone().into());
+        set(&obj, "gpu_load_percent", v.clone().into());
     }
     if let Some(connection) = &n.connection {
         let connection_obj = js_sys::Object::new();
@@ -6803,22 +6803,22 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         set(
             &connection_obj,
             "sinceMs",
-            (connection.since_ms as f64).into(),
+            connection.since_ms.clone().into(),
         );
         set(
             &connection_obj,
             "since_ms",
-            (connection.since_ms as f64).into(),
+            connection.since_ms.clone().into(),
         );
         set(
             &connection_obj,
             "lastAppHeartbeatMs",
-            (connection.last_app_heartbeat_ms as f64).into(),
+            connection.last_app_heartbeat_ms.clone().into(),
         );
         set(
             &connection_obj,
             "last_app_heartbeat_ms",
-            (connection.last_app_heartbeat_ms as f64).into(),
+            connection.last_app_heartbeat_ms.clone().into(),
         );
         set(
             &connection_obj,
@@ -6897,23 +6897,23 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         let item = js_sys::Object::new();
         set(&item, "vendor", g.vendor.clone().into());
         set(&item, "name", g.name.clone().into());
-        set(&item, "vramTotalMb", (g.vram_total_mb as f64).into());
-        set(&item, "vram_total_mb", (g.vram_total_mb as f64).into());
+        set(&item, "vramTotalMb", g.vram_total_mb.clone().into());
+        set(&item, "vram_total_mb", g.vram_total_mb.clone().into());
         if let Some(v) = g.vram_used_mb {
-            set(&item, "vramUsedMb", (v as f64).into());
-            set(&item, "vram_used_mb", (v as f64).into());
+            set(&item, "vramUsedMb", v.clone().into());
+            set(&item, "vram_used_mb", v.clone().into());
         }
         if let Some(v) = g.utilization_percent {
-            set(&item, "utilizationPercent", (v as f64).into());
-            set(&item, "usage_percent", (v as f64).into());
+            set(&item, "utilizationPercent", v.clone().into());
+            set(&item, "usage_percent", v.clone().into());
         }
         if let Some(v) = g.temperature_c {
-            set(&item, "temperatureC", (v as f64).into());
-            set(&item, "temperature_c", (v as f64).into());
+            set(&item, "temperatureC", v.clone().into());
+            set(&item, "temperature_c", v.clone().into());
         }
         if let Some(v) = g.power_draw_w {
-            set(&item, "powerDrawW", (v as f64).into());
-            set(&item, "power_draw_w", (v as f64).into());
+            set(&item, "powerDrawW", v.clone().into());
+            set(&item, "power_draw_w", v.clone().into());
         }
         if let Some(ref v) = g.driver_version {
             set(&item, "driverVersion", v.clone().into());
@@ -6938,8 +6938,8 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&item, "backend", v.into());
         }
         if let Some(v) = m.size_mb {
-            set(&item, "sizeMb", (v as f64).into());
-            set(&item, "size_mb", (v as f64).into());
+            set(&item, "sizeMb", v.clone().into());
+            set(&item, "size_mb", v.clone().into());
         }
         set(&item, "loaded", m.loaded.into());
         models.push(&item.into());
@@ -6957,16 +6957,16 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             containers_running += 1;
         }
         if let Some(v) = c.cpu_percent {
-            set(&item, "cpuPercent", (v as f64).into());
-            set(&item, "cpu_percent", (v as f64).into());
+            set(&item, "cpuPercent", v.clone().into());
+            set(&item, "cpu_percent", v.clone().into());
         }
         if let Some(v) = c.memory_mb {
-            set(&item, "memoryMb", (v as f64).into());
-            set(&item, "memory_mb", (v as f64).into());
+            set(&item, "memoryMb", v.clone().into());
+            set(&item, "memory_mb", v.clone().into());
         }
         if let Some(v) = c.memory_limit_mb {
-            set(&item, "memoryLimitMb", (v as f64).into());
-            set(&item, "memory_limit_mb", (v as f64).into());
+            set(&item, "memoryLimitMb", v.clone().into());
+            set(&item, "memory_limit_mb", v.clone().into());
         }
         containers.push(&item.into());
     }
@@ -6975,8 +6975,8 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "containers_running", containers_running.into());
     set(&obj, "containers_total", containers_total.into());
     if let Some(v) = n.last_seen_epoch {
-        set(&obj, "lastSeenEpoch", (v as f64).into());
-        set(&obj, "last_seen_epoch", (v as f64).into());
+        set(&obj, "lastSeenEpoch", v.clone().into());
+        set(&obj, "last_seen_epoch", v.clone().into());
     }
     if let Some(r) = n.route {
         let route = js_sys::Object::new();
@@ -7017,8 +7017,8 @@ fn cluster_info_to_js(c: tentaflow_protocol::ClusterInfo) -> js_sys::Object {
     set(&obj, "status", c.status.into());
     set(&obj, "membersCount", c.members_count.into());
     set(&obj, "membersOnline", c.members_online.into());
-    set(&obj, "createdAt", (c.created_at as f64).into());
-    set(&obj, "updatedAt", (c.updated_at as f64).into());
+    set(&obj, "createdAt", c.created_at.clone().into());
+    set(&obj, "updatedAt", c.updated_at.clone().into());
     set(&obj, "failoverEnabled", c.failover_enabled.into());
     if let Some(t) = c.failover_target {
         set(&obj, "failoverTarget", t.into());
@@ -7061,14 +7061,14 @@ fn addon_permission_row_to_js(
     set(&obj, "addon_id", r.addon_id.into());
     set(&obj, "subjectType", r.subject_type.clone().into());
     set(&obj, "subject_type", r.subject_type.into());
-    set(&obj, "subjectId", (r.subject_id as f64).into());
-    set(&obj, "subject_id", (r.subject_id as f64).into());
+    set(&obj, "subjectId", r.subject_id.clone().into());
+    set(&obj, "subject_id", r.subject_id.clone().into());
     set(&obj, "permissionId", r.permission_id.clone().into());
     set(&obj, "permission_id", r.permission_id.into());
     set(&obj, "grantMode", r.grant_mode.clone().into());
     set(&obj, "grant_mode", r.grant_mode.into());
-    set(&obj, "updatedAtEpoch", (r.updated_at_epoch as f64).into());
-    set(&obj, "updated_at_epoch", (r.updated_at_epoch as f64).into());
+    set(&obj, "updatedAtEpoch", r.updated_at_epoch.clone().into());
+    set(&obj, "updated_at_epoch", r.updated_at_epoch.clone().into());
     obj
 }
 
@@ -7083,8 +7083,8 @@ fn addon_permission_default_to_js(
     set(&obj, "permission_id", d.permission_id.into());
     set(&obj, "grantMode", d.grant_mode.clone().into());
     set(&obj, "grant_mode", d.grant_mode.into());
-    set(&obj, "updatedAtEpoch", (d.updated_at_epoch as f64).into());
-    set(&obj, "updated_at_epoch", (d.updated_at_epoch as f64).into());
+    set(&obj, "updatedAtEpoch", d.updated_at_epoch.clone().into());
+    set(&obj, "updated_at_epoch", d.updated_at_epoch.clone().into());
     obj
 }
 
@@ -7133,19 +7133,19 @@ fn addon_oauth_config_row_to_js(
     set(&obj, "redirectUri", c.redirect_uri.clone().into());
     set(&obj, "redirect_uri", c.redirect_uri.into());
     set(&obj, "enabled", c.enabled.into());
-    set(&obj, "updatedAtEpoch", (c.updated_at_epoch as f64).into());
-    set(&obj, "updated_at_epoch", (c.updated_at_epoch as f64).into());
+    set(&obj, "updatedAtEpoch", c.updated_at_epoch.clone().into());
+    set(&obj, "updated_at_epoch", c.updated_at_epoch.clone().into());
     set(&obj, "oauthMode", c.oauth_mode.clone().into());
     set(&obj, "oauth_mode", c.oauth_mode.into());
     set(
         &obj,
         "linkedAccountsCount",
-        (c.linked_accounts_count as f64).into(),
+        c.linked_accounts_count.clone().into(),
     );
     set(
         &obj,
         "linked_accounts_count",
-        (c.linked_accounts_count as f64).into(),
+        c.linked_accounts_count.clone().into(),
     );
     if let Some(email) = c.shared_account_email {
         set(&obj, "sharedAccountEmail", email.clone().into());
@@ -7159,10 +7159,10 @@ fn user_oauth_account_row_to_js(
     a: tentaflow_protocol::message_body::UserOAuthAccountRow,
 ) -> js_sys::Object {
     let obj = js_sys::Object::new();
-    set(&obj, "id", (a.id as f64).into());
+    set(&obj, "id", a.id.clone().into());
     if let Some(uid) = a.user_id {
-        set(&obj, "userId", (uid as f64).into());
-        set(&obj, "user_id", (uid as f64).into());
+        set(&obj, "userId", uid.clone().into());
+        set(&obj, "user_id", uid.clone().into());
     }
     set(&obj, "addonId", a.addon_id.clone().into());
     set(&obj, "addon_id", a.addon_id.into());
@@ -7184,14 +7184,14 @@ fn user_oauth_account_row_to_js(
     }
     set(&obj, "scopes", scopes.into());
     if let Some(v) = a.expires_at_epoch {
-        set(&obj, "expiresAtEpoch", (v as f64).into());
-        set(&obj, "expires_at_epoch", (v as f64).into());
+        set(&obj, "expiresAtEpoch", v.clone().into());
+        set(&obj, "expires_at_epoch", v.clone().into());
     }
-    set(&obj, "createdAtEpoch", (a.created_at_epoch as f64).into());
-    set(&obj, "created_at_epoch", (a.created_at_epoch as f64).into());
+    set(&obj, "createdAtEpoch", a.created_at_epoch.clone().into());
+    set(&obj, "created_at_epoch", a.created_at_epoch.clone().into());
     if let Some(v) = a.last_used_at_epoch {
-        set(&obj, "lastUsedAtEpoch", (v as f64).into());
-        set(&obj, "last_used_at_epoch", (v as f64).into());
+        set(&obj, "lastUsedAtEpoch", v.clone().into());
+        set(&obj, "last_used_at_epoch", v.clone().into());
     }
     set(&obj, "revoked", a.revoked.into());
     obj
@@ -7229,8 +7229,8 @@ fn my_oauth_entry_to_js(e: tentaflow_protocol::message_body::MyOAuthEntry) -> js
     );
     set(&obj, "status", e.status.into());
     if let Some(aid) = e.account_id {
-        set(&obj, "accountId", (aid as f64).into());
-        set(&obj, "account_id", (aid as f64).into());
+        set(&obj, "accountId", aid.clone().into());
+        set(&obj, "account_id", aid.clone().into());
     } else {
         set(&obj, "accountId", JsValue::NULL);
         set(&obj, "account_id", JsValue::NULL);
@@ -7251,25 +7251,25 @@ fn my_oauth_entry_to_js(e: tentaflow_protocol::message_body::MyOAuthEntry) -> js
     set(
         &obj,
         "connectedAtEpoch",
-        (e.connected_at_epoch as f64).into(),
+        e.connected_at_epoch.clone().into(),
     );
     set(
         &obj,
         "connected_at_epoch",
-        (e.connected_at_epoch as f64).into(),
+        e.connected_at_epoch.clone().into(),
     );
     set(
         &obj,
         "lastUsedAtEpoch",
-        (e.last_used_at_epoch as f64).into(),
+        e.last_used_at_epoch.clone().into(),
     );
     set(
         &obj,
         "last_used_at_epoch",
-        (e.last_used_at_epoch as f64).into(),
+        e.last_used_at_epoch.clone().into(),
     );
-    set(&obj, "expiresAtEpoch", (e.expires_at_epoch as f64).into());
-    set(&obj, "expires_at_epoch", (e.expires_at_epoch as f64).into());
+    set(&obj, "expiresAtEpoch", e.expires_at_epoch.clone().into());
+    set(&obj, "expires_at_epoch", e.expires_at_epoch.clone().into());
     obj
 }
 
@@ -7549,10 +7549,8 @@ pub fn encode_iam_list_users() -> Result<Vec<u8>, JsError> {
 }
 
 #[wasm_bindgen(js_name = encodeIamGetUserRequest)]
-pub fn encode_iam_get_user(user_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqGetUser {
-        user_id: user_id as i64,
-    })
+pub fn encode_iam_get_user(user_id: String) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqGetUser { user_id })
 }
 
 #[wasm_bindgen(js_name = encodeIamCreateUserRequest)]
@@ -7564,9 +7562,11 @@ pub fn encode_iam_create_user(
     role: String,
     group_ids_csv: String,
 ) -> Result<Vec<u8>, JsError> {
-    let group_ids: Vec<i64> = group_ids_csv
+    let group_ids: Vec<String> = group_ids_csv
         .split(',')
-        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
         .collect();
     encode_iam(IamPayload::ReqCreateUser {
         username,
@@ -7580,14 +7580,14 @@ pub fn encode_iam_create_user(
 
 #[wasm_bindgen(js_name = encodeIamUpdateUserRequest)]
 pub fn encode_iam_update_user(
-    user_id: f64,
+    user_id: String,
     display_name: String,
     email: String,
     is_active: bool,
     role: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqUpdateUser {
-        user_id: user_id as i64,
+        user_id,
         display_name,
         email,
         is_active,
@@ -7596,28 +7596,31 @@ pub fn encode_iam_update_user(
 }
 
 #[wasm_bindgen(js_name = encodeIamDeleteUserRequest)]
-pub fn encode_iam_delete_user(user_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqDeleteUser {
-        user_id: user_id as i64,
-    })
+pub fn encode_iam_delete_user(user_id: String) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqDeleteUser { user_id })
 }
 
 #[wasm_bindgen(js_name = encodeIamSetUserGroupsRequest)]
-pub fn encode_iam_set_user_groups(user_id: f64, group_ids_csv: String) -> Result<Vec<u8>, JsError> {
-    let group_ids: Vec<i64> = group_ids_csv
+pub fn encode_iam_set_user_groups(
+    user_id: String,
+    group_ids_csv: String,
+) -> Result<Vec<u8>, JsError> {
+    let group_ids: Vec<String> = group_ids_csv
         .split(',')
-        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
         .collect();
-    encode_iam(IamPayload::ReqSetUserGroups {
-        user_id: user_id as i64,
-        group_ids,
-    })
+    encode_iam(IamPayload::ReqSetUserGroups { user_id, group_ids })
 }
 
 #[wasm_bindgen(js_name = encodeIamResetUserPasswordRequest)]
-pub fn encode_iam_reset_password(user_id: f64, new_password: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_iam_reset_password(
+    user_id: String,
+    new_password: String,
+) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqResetUserPassword {
-        user_id: user_id as i64,
+        user_id,
         new_password,
     })
 }
@@ -7634,29 +7637,25 @@ pub fn encode_iam_create_group(name: String, description: String) -> Result<Vec<
 
 #[wasm_bindgen(js_name = encodeIamUpdateGroupRequest)]
 pub fn encode_iam_update_group(
-    group_id: f64,
+    group_id: String,
     name: String,
     description: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqUpdateGroup {
-        group_id: group_id as i64,
+        group_id,
         name,
         description,
     })
 }
 
 #[wasm_bindgen(js_name = encodeIamDeleteGroupRequest)]
-pub fn encode_iam_delete_group(group_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqDeleteGroup {
-        group_id: group_id as i64,
-    })
+pub fn encode_iam_delete_group(group_id: String) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqDeleteGroup { group_id })
 }
 
 #[wasm_bindgen(js_name = encodeIamGroupMembersRequest)]
-pub fn encode_iam_group_members(group_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqGroupMembers {
-        group_id: group_id as i64,
-    })
+pub fn encode_iam_group_members(group_id: String) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqGroupMembers { group_id })
 }
 
 #[wasm_bindgen(js_name = encodeIamSetPermissionRequest)]
@@ -7664,14 +7663,14 @@ pub fn encode_iam_set_permission(
     resource_type: String,
     resource_id: String,
     subject_type: String,
-    subject_id: f64,
+    subject_id: String,
     access_level: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqSetPermission {
         resource_type,
         resource_id,
         subject_type,
-        subject_id: subject_id as i64,
+        subject_id,
         access_level,
     })
 }
@@ -7681,13 +7680,13 @@ pub fn encode_iam_clear_permission(
     resource_type: String,
     resource_id: String,
     subject_type: String,
-    subject_id: f64,
+    subject_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqClearPermission {
         resource_type,
         resource_id,
         subject_type,
-        subject_id: subject_id as i64,
+        subject_id,
     })
 }
 
@@ -7705,11 +7704,11 @@ pub fn encode_iam_list_perms_resource(
 #[wasm_bindgen(js_name = encodeIamListPermsForSubjectRequest)]
 pub fn encode_iam_list_perms_subject(
     subject_type: String,
-    subject_id: f64,
+    subject_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqListPermsForSubject {
         subject_type,
-        subject_id: subject_id as i64,
+        subject_id,
     })
 }
 
@@ -7752,7 +7751,7 @@ fn network_interface_info_to_js(iface: &NetworkInterfaceInfo) -> js_sys::Object 
     }
     set(&obj, "ipv4Addrs", ipv4.clone().into());
     set(&obj, "ipv4_addrs", ipv4.into());
-    set(&obj, "mtu", (iface.mtu as f64).into());
+    set(&obj, "mtu", iface.mtu.clone().into());
     set(&obj, "kind", iface.kind.clone().into());
     set(&obj, "isUp", iface.is_up.into());
     set(&obj, "is_up", iface.is_up.into());
@@ -7863,7 +7862,7 @@ fn gpu_targets_to_js(t: &tentaflow_protocol::GpuTargets) -> JsValue {
         G::Indices(idx) => {
             let arr = js_sys::Array::new();
             for i in idx {
-                arr.push(&(*i as f64).into());
+                arr.push(&i.clone().into());
             }
             let o = js_sys::Object::new();
             set(&o, "indices", arr.into());
@@ -7936,7 +7935,7 @@ fn profile_target_to_js(t: &tentaflow_protocol::ProfileTarget) -> JsValue {
         T::OwnProcess => "own_process".into(),
         T::Pid(pid) => {
             let o = js_sys::Object::new();
-            set(&o, "pid", (*pid as f64).into());
+            set(&o, "pid", pid.clone().into());
             o.into()
         }
     }
@@ -8046,11 +8045,11 @@ fn profile_scope_from_js(value: &JsValue) -> Result<tentaflow_protocol::ProfileS
 
 fn profile_scope_to_js(s: &tentaflow_protocol::ProfileScope) -> JsValue {
     let o = js_sys::Object::new();
-    set(&o, "sources", (s.sources.0 as f64).into());
+    set(&o, "sources", s.sources.0.clone().into());
     set(&o, "gpuTargets", gpu_targets_to_js(&s.gpu_targets));
-    set(&o, "cpuSamplingHz", (s.cpu_sampling_hz as f64).into());
+    set(&o, "cpuSamplingHz", s.cpu_sampling_hz.clone().into());
     set(&o, "target", profile_target_to_js(&s.target));
-    set(&o, "durationSeconds", (s.duration_seconds as f64).into());
+    set(&o, "durationSeconds", s.duration_seconds.clone().into());
     set(&o, "label", s.label.clone().into());
     o.into()
 }
@@ -8091,7 +8090,7 @@ fn power_domain_to_js(d: &tentaflow_protocol::PowerDomain) -> JsValue {
         P::Gpu(idx) => {
             let o = js_sys::Object::new();
             set(&o, "kind", "gpu".into());
-            set(&o, "index", (*idx as f64).into());
+            set(&o, "index", idx.clone().into());
             o.into()
         }
     }
@@ -8150,14 +8149,14 @@ fn collector_run_info_to_js(c: &tentaflow_protocol::CollectorRunInfo) -> JsValue
     let o = js_sys::Object::new();
     set(&o, "id", c.id.clone().into());
     set(&o, "status", collector_status_to_js(&c.status));
-    set(&o, "samplesCollected", (c.samples_collected as f64).into());
-    set(&o, "rawSizeBytes", (c.raw_size_bytes as f64).into());
+    set(&o, "samplesCollected", c.samples_collected.clone().into());
+    set(&o, "rawSizeBytes", c.raw_size_bytes.clone().into());
     set(
         &o,
         "primaryCategory",
         event_category_to_js(c.primary_category),
     );
-    set(&o, "durationNs", (c.duration_ns as f64).into());
+    set(&o, "durationNs", c.duration_ns.clone().into());
     o.into()
 }
 
@@ -8177,7 +8176,7 @@ fn frame_to_js(f: &tentaflow_protocol::Frame) -> JsValue {
         &o,
         "line",
         match f.line {
-            Some(n) => (n as f64).into(),
+            Some(n) => n.clone().into(),
             None => JsValue::NULL,
         },
     );
@@ -8187,7 +8186,7 @@ fn frame_to_js(f: &tentaflow_protocol::Frame) -> JsValue {
 fn u32_array_to_js(arr: &[u32]) -> JsValue {
     let out = js_sys::Array::new();
     for v in arr {
-        out.push(&(*v as f64).into());
+        out.push(&v.clone().into());
     }
     out.into()
 }
@@ -8198,9 +8197,9 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
     match p {
         P::CpuSample { tid, cpu, stack_id } => {
             set(&o, "kind", "cpu_sample".into());
-            set(&o, "tid", (*tid as f64).into());
-            set(&o, "cpu", (*cpu as f64).into());
-            set(&o, "stackId", (*stack_id as f64).into());
+            set(&o, "tid", tid.clone().into());
+            set(&o, "cpu", cpu.clone().into());
+            set(&o, "stackId", stack_id.clone().into());
         }
         P::CpuCounter { kind, value } => {
             set(&o, "kind", "cpu_counter".into());
@@ -8213,9 +8212,9 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             freq_mhz,
         } => {
             set(&o, "kind", "cpu_util".into());
-            set(&o, "core", (*core as f64).into());
-            set(&o, "utilPct", (*util_pct as f64).into());
-            set(&o, "freqMhz", (*freq_mhz as f64).into());
+            set(&o, "core", core.clone().into());
+            set(&o, "utilPct", util_pct.clone().into());
+            set(&o, "freqMhz", freq_mhz.clone().into());
         }
         P::RamSample {
             used_bytes,
@@ -8223,17 +8222,17 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             page_faults_per_s,
         } => {
             set(&o, "kind", "ram_sample".into());
-            set(&o, "usedBytes", (*used_bytes as f64).into());
-            set(&o, "availableBytes", (*available_bytes as f64).into());
-            set(&o, "pageFaultsPerS", (*page_faults_per_s as f64).into());
+            set(&o, "usedBytes", used_bytes.clone().into());
+            set(&o, "availableBytes", available_bytes.clone().into());
+            set(&o, "pageFaultsPerS", page_faults_per_s.clone().into());
         }
         P::RamBandwidth {
             read_bps,
             write_bps,
         } => {
             set(&o, "kind", "ram_bandwidth".into());
-            set(&o, "readBps", (*read_bps as f64).into());
-            set(&o, "writeBps", (*write_bps as f64).into());
+            set(&o, "readBps", read_bps.clone().into());
+            set(&o, "writeBps", write_bps.clone().into());
         }
         P::DiskIoBurst {
             device_name_id,
@@ -8246,12 +8245,12 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             set(&o, "kind", "disk_io_burst".into());
             // Device label is interned in `ProfileReportV2.names`; the GUI
             // resolves the string via `names[deviceNameId]`.
-            set(&o, "deviceNameId", (*device_name_id as f64).into());
-            set(&o, "readBps", (*read_bps as f64).into());
-            set(&o, "writeBps", (*write_bps as f64).into());
-            set(&o, "iopsR", (*iops_r as f64).into());
-            set(&o, "iopsW", (*iops_w as f64).into());
-            set(&o, "awaitMsP99", (*await_ms_p99 as f64).into());
+            set(&o, "deviceNameId", device_name_id.clone().into());
+            set(&o, "readBps", read_bps.clone().into());
+            set(&o, "writeBps", write_bps.clone().into());
+            set(&o, "iopsR", iops_r.clone().into());
+            set(&o, "iopsW", iops_w.clone().into());
+            set(&o, "awaitMsP99", await_ms_p99.clone().into());
         }
         P::GpuKernel {
             device_id,
@@ -8261,11 +8260,11 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             shared_mem_bytes,
         } => {
             set(&o, "kind", "gpu_kernel".into());
-            set(&o, "deviceId", (*device_id as f64).into());
-            set(&o, "nameId", (*name_id as f64).into());
+            set(&o, "deviceId", device_id.clone().into());
+            set(&o, "nameId", name_id.clone().into());
             set(&o, "grid", u32_array_to_js(grid));
             set(&o, "block", u32_array_to_js(block));
-            set(&o, "sharedMemBytes", (*shared_mem_bytes as f64).into());
+            set(&o, "sharedMemBytes", shared_mem_bytes.clone().into());
         }
         P::GpuApiCall {
             device_id,
@@ -8273,9 +8272,9 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             return_code,
         } => {
             set(&o, "kind", "gpu_api_call".into());
-            set(&o, "deviceId", (*device_id as f64).into());
-            set(&o, "nameId", (*name_id as f64).into());
-            set(&o, "returnCode", (*return_code as f64).into());
+            set(&o, "deviceId", device_id.clone().into());
+            set(&o, "nameId", name_id.clone().into());
+            set(&o, "returnCode", return_code.clone().into());
         }
         P::GpuUtilSample {
             device_id,
@@ -8285,11 +8284,11 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             temp_c,
         } => {
             set(&o, "kind", "gpu_util_sample".into());
-            set(&o, "deviceId", (*device_id as f64).into());
-            set(&o, "computePct", (*compute_pct as f64).into());
-            set(&o, "memPct", (*mem_pct as f64).into());
-            set(&o, "memUsedBytes", (*mem_used_bytes as f64).into());
-            set(&o, "tempC", (*temp_c as f64).into());
+            set(&o, "deviceId", device_id.clone().into());
+            set(&o, "computePct", compute_pct.clone().into());
+            set(&o, "memPct", mem_pct.clone().into());
+            set(&o, "memUsedBytes", mem_used_bytes.clone().into());
+            set(&o, "tempC", temp_c.clone().into());
         }
         P::GpuMemSample {
             device_id,
@@ -8297,9 +8296,9 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             free_bytes,
         } => {
             set(&o, "kind", "gpu_mem_sample".into());
-            set(&o, "deviceId", (*device_id as f64).into());
-            set(&o, "allocatedBytes", (*allocated_bytes as f64).into());
-            set(&o, "freeBytes", (*free_bytes as f64).into());
+            set(&o, "deviceId", device_id.clone().into());
+            set(&o, "allocatedBytes", allocated_bytes.clone().into());
+            set(&o, "freeBytes", free_bytes.clone().into());
         }
         P::GpuMemTransfer {
             device_id,
@@ -8307,14 +8306,14 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             bytes,
         } => {
             set(&o, "kind", "gpu_mem_transfer".into());
-            set(&o, "deviceId", (*device_id as f64).into());
+            set(&o, "deviceId", device_id.clone().into());
             set(&o, "transferKind", transfer_kind_to_js(*kind));
-            set(&o, "bytes", (*bytes as f64).into());
+            set(&o, "bytes", bytes.clone().into());
         }
         P::PowerSample { domain, watts } => {
             set(&o, "kind", "power_sample".into());
             set(&o, "domain", power_domain_to_js(domain));
-            set(&o, "watts", (*watts as f64).into());
+            set(&o, "watts", watts.clone().into());
         }
         P::NvtxRange {
             device_id,
@@ -8322,9 +8321,9 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             color,
         } => {
             set(&o, "kind", "nvtx_range".into());
-            set(&o, "deviceId", (*device_id as f64).into());
-            set(&o, "nameId", (*name_id as f64).into());
-            set(&o, "color", (*color as f64).into());
+            set(&o, "deviceId", device_id.clone().into());
+            set(&o, "nameId", name_id.clone().into());
+            set(&o, "color", color.clone().into());
         }
         P::NetworkSample {
             iface_name_id,
@@ -8335,15 +8334,15 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
         } => {
             set(&o, "kind", "network_sample".into());
             // Interface label is interned in `ProfileReportV2.names`.
-            set(&o, "ifaceNameId", (*iface_name_id as f64).into());
-            set(&o, "rxBps", (*rx_bps as f64).into());
-            set(&o, "txBps", (*tx_bps as f64).into());
-            set(&o, "rxPps", (*rx_pps as f64).into());
-            set(&o, "txPps", (*tx_pps as f64).into());
+            set(&o, "ifaceNameId", iface_name_id.clone().into());
+            set(&o, "rxBps", rx_bps.clone().into());
+            set(&o, "txBps", tx_bps.clone().into());
+            set(&o, "rxPps", rx_pps.clone().into());
+            set(&o, "txPps", tx_pps.clone().into());
         }
         P::Custom { name_id, value } => {
             set(&o, "kind", "custom".into());
-            set(&o, "nameId", (*name_id as f64).into());
+            set(&o, "nameId", name_id.clone().into());
             set(&o, "value", (*value).into());
         }
         P::ProcessRssSample {
@@ -8353,10 +8352,10 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             vsz_bytes,
         } => {
             set(&o, "kind", "process_rss_sample".into());
-            set(&o, "pid", (*pid as f64).into());
-            set(&o, "commNameId", (*comm_name_id as f64).into());
-            set(&o, "rssBytes", (*rss_bytes as f64).into());
-            set(&o, "vszBytes", (*vsz_bytes as f64).into());
+            set(&o, "pid", pid.clone().into());
+            set(&o, "commNameId", comm_name_id.clone().into());
+            set(&o, "rssBytes", rss_bytes.clone().into());
+            set(&o, "vszBytes", vsz_bytes.clone().into());
         }
         P::ProcessIoSample {
             pid,
@@ -8365,10 +8364,10 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             write_bytes,
         } => {
             set(&o, "kind", "process_io_sample".into());
-            set(&o, "pid", (*pid as f64).into());
-            set(&o, "commNameId", (*comm_name_id as f64).into());
-            set(&o, "readBytes", (*read_bytes as f64).into());
-            set(&o, "writeBytes", (*write_bytes as f64).into());
+            set(&o, "pid", pid.clone().into());
+            set(&o, "commNameId", comm_name_id.clone().into());
+            set(&o, "readBytes", read_bytes.clone().into());
+            set(&o, "writeBytes", write_bytes.clone().into());
         }
     }
     o.into()
@@ -8376,11 +8375,11 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
 
 fn timeline_event_to_js(e: &tentaflow_protocol::TimelineEvent) -> JsValue {
     let o = js_sys::Object::new();
-    set(&o, "sourceIdx", (e.source_idx as f64).into());
-    set(&o, "tStartNs", (e.t_start_ns as f64).into());
-    set(&o, "tEndNs", (e.t_end_ns as f64).into());
+    set(&o, "sourceIdx", e.source_idx.clone().into());
+    set(&o, "tStartNs", e.t_start_ns.clone().into());
+    set(&o, "tEndNs", e.t_end_ns.clone().into());
     set(&o, "category", event_category_to_js(e.category));
-    set(&o, "laneHint", (e.lane_hint as f64).into());
+    set(&o, "laneHint", e.lane_hint.clone().into());
     set(&o, "payload", event_payload_to_js(&e.payload));
     o.into()
 }
@@ -8391,8 +8390,8 @@ fn clock_samples_to_js(c: &tentaflow_protocol::ClockSamples) -> JsValue {
     let pairs = js_sys::Array::new();
     for (a, b) in &c.pairs {
         let p = js_sys::Array::new();
-        p.push(&(*a as f64).into());
-        p.push(&(*b as f64).into());
+        p.push(&a.clone().into());
+        p.push(&b.clone().into());
         pairs.push(&p.into());
     }
     set(&o, "pairs", pairs.into());
@@ -8409,26 +8408,26 @@ fn drift_report_to_js(d: &tentaflow_protocol::DriftReport) -> JsValue {
     set(
         &o,
         "maxObservedDriftNs",
-        (d.max_observed_drift_ns as f64).into(),
+        d.max_observed_drift_ns.clone().into(),
     );
     set(&o, "exceededTolerance", d.exceeded_tolerance.into());
-    set(&o, "toleranceNs", (d.tolerance_ns as f64).into());
+    set(&o, "toleranceNs", d.tolerance_ns.clone().into());
     o.into()
 }
 
 fn profile_report_v2_to_js(r: &tentaflow_protocol::ProfileReportV2) -> JsValue {
     let o = js_sys::Object::new();
-    set(&o, "schemaVersion", (r.schema_version as f64).into());
+    set(&o, "schemaVersion", r.schema_version.clone().into());
     set(&o, "sessionId", r.session_id.clone().into());
     set(&o, "nodeId", r.node_id.clone().into());
     set(&o, "scope", profile_scope_to_js(&r.scope));
-    set(&o, "t0MonotonicNs", (r.t0_monotonic_ns as f64).into());
+    set(&o, "t0MonotonicNs", r.t0_monotonic_ns.clone().into());
     set(
         &o,
         "t0WallclockUnixNs",
-        (r.t0_wallclock_unix_ns as f64).into(),
+        r.t0_wallclock_unix_ns.clone().into(),
     );
-    set(&o, "durationNs", (r.duration_ns as f64).into());
+    set(&o, "durationNs", r.duration_ns.clone().into());
 
     let collectors = js_sys::Array::new();
     for c in &r.collectors {
@@ -8483,14 +8482,14 @@ fn profiling_session_entry_to_js(e: &tentaflow_protocol::ProfilingSessionEntry) 
     set(&o, "sessionId", e.session_id.clone().into());
     set(&o, "label", e.label.clone().into());
     set(&o, "startedAt", e.started_at.clone().into());
-    set(&o, "durationNs", (e.duration_ns as f64).into());
+    set(&o, "durationNs", e.duration_ns.clone().into());
     set(&o, "kind", e.kind.clone().into());
     let cols = js_sys::Array::new();
     for c in &e.collectors_used {
         cols.push(&JsValue::from_str(c));
     }
     set(&o, "collectorsUsed", cols.into());
-    set(&o, "sizeBytes", (e.size_bytes as f64).into());
+    set(&o, "sizeBytes", e.size_bytes.clone().into());
     o.into()
 }
 
@@ -8504,14 +8503,14 @@ fn profiling_active_session_info_to_js(
     set(
         &o,
         "startedAtUnixNs",
-        (info.started_at_unix_ns as f64).into(),
+        info.started_at_unix_ns.clone().into(),
     );
     set(
         &o,
         "plannedDurationNs",
-        (info.planned_duration_ns as f64).into(),
+        info.planned_duration_ns.clone().into(),
     );
-    set(&o, "elapsedNs", (info.elapsed_ns as f64).into());
+    set(&o, "elapsedNs", info.elapsed_ns.clone().into());
     let running = js_sys::Array::new();
     for c in &info.collectors_running {
         running.push(&JsValue::from_str(c));
@@ -8547,7 +8546,7 @@ fn profiling_payload_fill_obj(
         P::StartResponse(r) => {
             set(obj, "variant", "ProfilingStartResponse".into());
             set(obj, "sessionId", r.session_id.clone().into());
-            set(obj, "startedAtUnixNs", (r.started_at_unix_ns as f64).into());
+            set(obj, "startedAtUnixNs", r.started_at_unix_ns.clone().into());
             let started = js_sys::Array::new();
             for c in &r.collectors_started {
                 started.push(&JsValue::from_str(c));
@@ -8648,7 +8647,7 @@ fn profiling_payload_fill_obj(
                 arr.push(&profiling_collector_status_to_js(c));
             }
             set(obj, "collectors", arr.into());
-            set(obj, "ageSeconds", (r.age_seconds as f64).into());
+            set(obj, "ageSeconds", r.age_seconds.clone().into());
         }
     }
 }
@@ -8927,14 +8926,14 @@ pub fn encode_compliance_retention_policies_list_request() -> Result<Vec<u8>, Js
 #[wasm_bindgen(js_name = encodeComplianceAiEventsListRequest)]
 pub fn encode_compliance_ai_events_list_request(
     status: Option<String>,
-    user_id: Option<f64>,
+    user_id: Option<String>,
     addon_id: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> Result<Vec<u8>, JsError> {
     let filter = tentaflow_protocol::ComplianceAiEventListFilter {
         status,
-        user_id: user_id.map(|value| value as i64),
+        user_id,
         addon_id,
         limit,
         offset,
@@ -9335,7 +9334,7 @@ fn state_entries_to_js(
                 }
                 PathSegment::Index(i) => {
                     set(&seg_obj, "kind", "index".into());
-                    set(&seg_obj, "value", (*i as f64).into());
+                    set(&seg_obj, "value", i.clone().into());
                 }
             }
             path_arr.push(&seg_obj.into());
@@ -9370,7 +9369,7 @@ fn patch_ops_to_js(
                 }
                 PathSegment::Index(i) => {
                     set(&seg_obj, "kind", "index".into());
-                    set(&seg_obj, "value", (*i as f64).into());
+                    set(&seg_obj, "value", i.clone().into());
                 }
             }
             path_arr.push(&seg_obj.into());
@@ -9411,7 +9410,7 @@ fn patch_ops_to_js(
             }
             PatchOpKind::InsertArray { index, value } => {
                 set(&op_obj, "kind", "insert_array".into());
-                set(&op_obj, "index", (*index as f64).into());
+                set(&op_obj, "index", index.clone().into());
                 set(
                     &op_obj,
                     "value",
@@ -9420,7 +9419,7 @@ fn patch_ops_to_js(
             }
             PatchOpKind::RemoveArray { index } => {
                 set(&op_obj, "kind", "remove_array".into());
-                set(&op_obj, "index", (*index as f64).into());
+                set(&op_obj, "index", index.clone().into());
             }
             PatchOpKind::MergeMap { value } => {
                 set(&op_obj, "kind", "merge_map".into());
@@ -9432,7 +9431,7 @@ fn patch_ops_to_js(
             }
             PatchOpKind::Increment { delta } => {
                 set(&op_obj, "kind", "increment".into());
-                set(&op_obj, "delta", (*delta as f64).into());
+                set(&op_obj, "delta", delta.clone().into());
             }
         }
         set(&obj, "op", op_obj.into());
@@ -9451,18 +9450,18 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
 
     let obj = js_sys::Object::new();
     let tag = payload.tag().as_u16();
-    set(&obj, "tag", (tag as f64).into());
+    set(&obj, "tag", tag.clone().into());
 
     match payload {
         UiPayload::PanelOpen(p) => {
             set(&obj, "addonId", p.addon_id.into());
             set(&obj, "panelId", p.panel_id.into());
-            set(&obj, "assignedEpoch", (p.ctx.assigned_epoch as f64).into());
+            set(&obj, "assignedEpoch", p.ctx.assigned_epoch.clone().into());
         }
         UiPayload::PanelShell(s) => {
             set(&obj, "addonId", s.addon_id.into());
             set(&obj, "panelId", s.panel_id.into());
-            set(&obj, "panelEpoch", (s.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", s.panel_epoch.clone().into());
             // Layout Component decoded directly to JS — no re-encode round-trip
             set(
                 &obj,
@@ -9490,7 +9489,7 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
                     slot_visibility_to_js(&slot.visibility)?,
                 );
                 if let Some(max) = slot.max_payload_bytes {
-                    set(&s_obj, "max_payload_bytes", (max as f64).into());
+                    set(&s_obj, "max_payload_bytes", max.clone().into());
                 }
                 slots.push(&s_obj.into());
             }
@@ -9501,7 +9500,7 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
         UiPayload::PanelReady(r) => {
             set(&obj, "addonId", r.addon_id.into());
             set(&obj, "panelId", r.panel_id.into());
-            set(&obj, "panelEpoch", (r.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", r.panel_epoch.clone().into());
         }
         UiPayload::PanelError(e) => {
             set(&obj, "addonId", e.addon_id.into());
@@ -9511,17 +9510,17 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
         UiPayload::PanelClose(c) => {
             set(&obj, "addonId", c.addon_id.into());
             set(&obj, "panelId", c.panel_id.into());
-            set(&obj, "panelEpoch", (c.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", c.panel_epoch.clone().into());
         }
         UiPayload::PanelReset(r) => {
             set(&obj, "addonId", r.addon_id.into());
             set(&obj, "panelId", r.panel_id.into());
-            set(&obj, "newPanelEpoch", (r.new_panel_epoch as f64).into());
+            set(&obj, "newPanelEpoch", r.new_panel_epoch.clone().into());
         }
         UiPayload::SlotContent(sc) => {
             set(&obj, "addonId", sc.addon_id.into());
             set(&obj, "panelId", sc.panel_id.into());
-            set(&obj, "panelEpoch", (sc.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", sc.panel_epoch.clone().into());
             set(&obj, "slotId", sc.slot_id.into());
             set(
                 &obj,
@@ -9537,62 +9536,62 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
         UiPayload::SlotClear(c) => {
             set(&obj, "addonId", c.addon_id.into());
             set(&obj, "panelId", c.panel_id.into());
-            set(&obj, "panelEpoch", (c.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", c.panel_epoch.clone().into());
             set(&obj, "slotId", c.slot_id.into());
         }
         UiPayload::SlotShow(s) => {
             set(&obj, "addonId", s.addon_id.into());
             set(&obj, "panelId", s.panel_id.into());
-            set(&obj, "panelEpoch", (s.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", s.panel_epoch.clone().into());
             set(&obj, "slotId", s.slot_id.into());
         }
         UiPayload::SlotHide(h) => {
             set(&obj, "addonId", h.addon_id.into());
             set(&obj, "panelId", h.panel_id.into());
-            set(&obj, "panelEpoch", (h.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", h.panel_epoch.clone().into());
             set(&obj, "slotId", h.slot_id.into());
         }
         UiPayload::StateSnapshot(ss) => {
             set(&obj, "addonId", ss.addon_id.into());
             set(&obj, "panelId", ss.panel_id.into());
-            set(&obj, "panelEpoch", (ss.panel_epoch as f64).into());
-            set(&obj, "stateRevision", (ss.state_revision as f64).into());
+            set(&obj, "panelEpoch", ss.panel_epoch.clone().into());
+            set(&obj, "stateRevision", ss.state_revision.clone().into());
             set(&obj, "entries", state_entries_to_js(&ss.entries)?);
             set(&obj, "truncated", ss.truncated.into());
         }
         UiPayload::StatePatch(sp) => {
             set(&obj, "addonId", sp.addon_id.into());
             set(&obj, "panelId", sp.panel_id.into());
-            set(&obj, "panelEpoch", (sp.panel_epoch as f64).into());
-            set(&obj, "baseRevision", (sp.base_revision as f64).into());
-            set(&obj, "newRevision", (sp.new_revision as f64).into());
+            set(&obj, "panelEpoch", sp.panel_epoch.clone().into());
+            set(&obj, "baseRevision", sp.base_revision.clone().into());
+            set(&obj, "newRevision", sp.new_revision.clone().into());
             set(&obj, "ops", patch_ops_to_js(&sp.ops)?);
         }
         UiPayload::StateReset(sr) => {
             set(&obj, "addonId", sr.addon_id.into());
             set(&obj, "panelId", sr.panel_id.into());
-            set(&obj, "panelEpoch", (sr.panel_epoch as f64).into());
-            set(&obj, "newRevision", (sr.new_revision as f64).into());
+            set(&obj, "panelEpoch", sr.panel_epoch.clone().into());
+            set(&obj, "newRevision", sr.new_revision.clone().into());
         }
         UiPayload::PatchRejected(pr) => {
             set(&obj, "addonId", pr.addon_id.into());
             set(&obj, "panelId", pr.panel_id.into());
-            set(&obj, "panelEpoch", (pr.panel_epoch as f64).into());
-            set(&obj, "rejectedMsgId", (pr.rejected_msg_id as f64).into());
+            set(&obj, "panelEpoch", pr.panel_epoch.clone().into());
+            set(&obj, "rejectedMsgId", pr.rejected_msg_id.clone().into());
             if let Some(rev) = pr.current_revision {
-                set(&obj, "currentRevision", (rev as f64).into());
+                set(&obj, "currentRevision", rev.clone().into());
             }
         }
         UiPayload::Action(a) => {
             set(&obj, "addonId", a.addon_id.into());
             set(&obj, "panelId", a.panel_id.into());
-            set(&obj, "panelEpoch", (a.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", a.panel_epoch.clone().into());
             set(&obj, "actionId", a.action_id.into());
         }
         UiPayload::ActionAck(ack) => {
             set(&obj, "addonId", ack.addon_id.into());
             set(&obj, "panelId", ack.panel_id.into());
-            set(&obj, "panelEpoch", (ack.panel_epoch as f64).into());
+            set(&obj, "panelEpoch", ack.panel_epoch.clone().into());
             set(&obj, "actionId", ack.action_id.into());
             let status_str = match &ack.status {
                 tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Ok => "ok",
@@ -9629,7 +9628,7 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
                 "topicCbor",
                 js_sys::Uint8Array::from(&topic_cbor[..]).into(),
             );
-            set(&obj, "tsMs", (ev.ts_ms as f64).into());
+            set(&obj, "tsMs", ev.ts_ms.clone().into());
         }
         UiPayload::Batch(_) => {
             // Batch is decoded member-by-member on frontend.
@@ -9745,7 +9744,7 @@ pub fn decode_state_entries_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> 
                 }
                 PathSegment::Index(i) => {
                     set(&seg_obj, "kind", "index".into());
-                    set(&seg_obj, "value", (*i as f64).into());
+                    set(&seg_obj, "value", i.clone().into());
                 }
             }
             path_arr.push(&seg_obj.into());
@@ -9783,7 +9782,7 @@ pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
                 }
                 PathSegment::Index(i) => {
                     set(&seg_obj, "kind", "index".into());
-                    set(&seg_obj, "value", (*i as f64).into());
+                    set(&seg_obj, "value", i.clone().into());
                 }
             }
             path_arr.push(&seg_obj.into());
@@ -9819,7 +9818,7 @@ pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             PatchOpKind::InsertArray { index, value } => {
                 set(&obj, "op", "insert_array".into());
-                set(&obj, "index", (*index as f64).into());
+                set(&obj, "index", index.clone().into());
                 set(
                     &obj,
                     "value",
@@ -9828,7 +9827,7 @@ pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             PatchOpKind::RemoveArray { index } => {
                 set(&obj, "op", "remove_array".into());
-                set(&obj, "index", (*index as f64).into());
+                set(&obj, "index", index.clone().into());
             }
             PatchOpKind::MergeMap { value } => {
                 set(&obj, "op", "merge_map".into());
@@ -9840,7 +9839,7 @@ pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             PatchOpKind::Increment { delta } => {
                 set(&obj, "op", "increment".into());
-                set(&obj, "delta", (*delta as f64).into());
+                set(&obj, "delta", delta.clone().into());
             }
         }
         arr.push(&obj.into());
@@ -9912,7 +9911,7 @@ fn inline_value_to_js(
             .unwrap_or("");
         let js_val = value_to_js_with_wire(val, field_wire)?;
         let pair = js_sys::Array::new();
-        pair.push(&(key_idx as f64).into());
+        pair.push(&key_idx.clone().into());
         pair.push(&js_val);
         arr.push(&pair.into());
     }
@@ -9998,7 +9997,7 @@ fn component_to_js(
     c: &tentaflow_sdk_spec::protocol::ui::component::Component,
 ) -> Result<JsValue, String> {
     let obj = js_sys::Object::new();
-    set(&obj, "tag", (c.tag as f64).into());
+    set(&obj, "tag", c.tag.clone().into());
     set(&obj, "id", c.id.clone().into());
 
     // fields: Array<[u8, Value]> — use schema-aware conversion so inline
@@ -10011,7 +10010,7 @@ fn component_to_js(
             .map(|f| f.wire)
             .unwrap_or("");
         let pair = js_sys::Array::new();
-        pair.push(&(*k as f64).into());
+        pair.push(&k.clone().into());
         pair.push(&value_to_js_with_wire(v, wire)?);
         fields_arr.push(&pair.into());
     }
@@ -10067,8 +10066,8 @@ fn value_to_js(v: &tentaflow_sdk_spec::protocol::value::Value) -> Result<JsValue
     match v {
         Value::Null => Ok(JsValue::NULL),
         Value::Bool(b) => Ok((*b).into()),
-        Value::U64(n) => Ok((*n as f64).into()),
-        Value::I64(n) => Ok((*n as f64).into()),
+        Value::U64(n) => Ok(n.clone().into()),
+        Value::I64(n) => Ok(n.clone().into()),
         Value::F64(f) => Ok((*f).into()),
         Value::Bytes(b) => {
             // Without wire-type context, bytes are opaque binary data.
@@ -10208,7 +10207,7 @@ fn local_action_to_js(
         LocalAction::Increment { path, delta } => {
             set(&obj, "kind", "increment".into());
             set(&obj, "path", state_path_to_js(path)?);
-            set(&obj, "delta", (*delta as f64).into());
+            set(&obj, "delta", delta.clone().into());
         }
         LocalAction::Navigate { panel_id } => {
             set(&obj, "kind", "navigate".into());
@@ -10262,7 +10261,7 @@ fn local_action_to_js(
         }
         LocalAction::Debounce { ms, then } => {
             set(&obj, "kind", "debounce".into());
-            set(&obj, "ms", (*ms as f64).into());
+            set(&obj, "ms", ms.clone().into());
             set(&obj, "then", handler_to_js(then)?);
         }
         LocalAction::Sequence { steps } => {
@@ -10346,7 +10345,7 @@ fn cache_policy_to_js(
         }
         CachePolicy::TtlSeconds { value } => {
             set(&obj, "kind", "ttl_seconds".into());
-            set(&obj, "value", (*value as f64).into());
+            set(&obj, "value", value.clone().into());
         }
     }
     Ok(obj.into())
@@ -10400,7 +10399,7 @@ fn path_segment_to_js(
         }
         PathSegment::Index(i) => {
             set(&obj, "kind", "index".into());
-            set(&obj, "value", (*i as f64).into());
+            set(&obj, "value", i.clone().into());
         }
     }
     Ok(obj.into())

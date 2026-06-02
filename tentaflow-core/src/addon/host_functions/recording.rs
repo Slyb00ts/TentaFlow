@@ -193,29 +193,40 @@ pub fn recording_save_snapshot_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingSaveSnapshotInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "recording.save_snapshot",
-                    None,
-                    RiskClass::A,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
-    match save_snapshot_core(caller.data(), &input) {
-        CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    let input: RecordingSaveSnapshotInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "recording.save_snapshot",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
         }
+    };
+    match save_snapshot_core(caller.data(), &input) {
+        CoreResult::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        ),
         CoreResult::Err(code) => code,
     }
 }
@@ -247,29 +258,40 @@ pub fn recording_save_segment_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingSaveSegmentInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "recording.save_segment",
-                    None,
-                    RiskClass::A,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
-    match save_segment_core(caller.data(), &input) {
-        CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    let input: RecordingSaveSegmentInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "recording.save_segment",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
         }
+    };
+    match save_segment_core(caller.data(), &input) {
+        CoreResult::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        ),
         CoreResult::Err(code) => code,
     }
 }
@@ -301,29 +323,40 @@ pub fn recording_get_url_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingGetUrlInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "recording.get_url",
-                    None,
-                    RiskClass::B,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
-    match get_url_core(caller.data(), &input) {
-        CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    let input: RecordingGetUrlInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "recording.get_url",
+                None,
+                RiskClass::B,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
         }
+    };
+    match get_url_core(caller.data(), &input) {
+        CoreResult::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        ),
         CoreResult::Err(code) => code,
     }
 }
@@ -355,7 +388,13 @@ pub fn recording_get_stream_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingRefInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let input: RecordingRefInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -374,9 +413,15 @@ pub fn recording_get_stream_v1(
         }
     };
     match get_stream_core(caller.data(), &input) {
-        CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
-        }
+        CoreResult::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        ),
         CoreResult::Err(code) => code,
     }
 }
@@ -408,7 +453,13 @@ pub fn recording_purge_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: RecordingRefInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let input: RecordingRefInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -427,9 +478,15 @@ pub fn recording_purge_v1(
         }
     };
     match purge_core(caller.data(), &input) {
-        CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
-        }
+        CoreResult::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        ),
         CoreResult::Err(code) => code,
     }
 }
@@ -478,7 +535,13 @@ pub fn recording_stats_v1(
     let input: RecordingStatsInput = if input_len == 0 {
         RecordingStatsInput::default()
     } else {
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+        match read_input_cbor(
+            &memory,
+            &caller,
+            input_ptr,
+            input_len,
+            PayloadKind::ServiceCall,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 audit(
@@ -498,9 +561,15 @@ pub fn recording_stats_v1(
         }
     };
     match stats_core(caller.data(), &input) {
-        CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
-        }
+        CoreResult::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        ),
         CoreResult::Err(code) => code,
     }
 }
@@ -532,7 +601,13 @@ pub fn frame_url_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: FrameUrlInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let input: FrameUrlInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -551,9 +626,15 @@ pub fn frame_url_v1(
         }
     };
     match frame_url_core(caller.data(), &input) {
-        CoreResult::Ok(out) => {
-            write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
-        }
+        CoreResult::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        ),
         CoreResult::Err(code) => code,
     }
 }
@@ -1288,33 +1369,53 @@ pub mod test_api {
     use super::*;
 
     pub fn save_snapshot_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, PERM_RECORDING_WRITE, "recording.save_snapshot", |s, i| {
-            save_snapshot_core(s, &i)
-        })
+        run_input(
+            state,
+            raw_input,
+            PERM_RECORDING_WRITE,
+            "recording.save_snapshot",
+            |s, i| save_snapshot_core(s, &i),
+        )
     }
 
     pub fn save_segment_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, PERM_RECORDING_WRITE, "recording.save_segment", |s, i| {
-            save_segment_core(s, &i)
-        })
+        run_input(
+            state,
+            raw_input,
+            PERM_RECORDING_WRITE,
+            "recording.save_segment",
+            |s, i| save_segment_core(s, &i),
+        )
     }
 
     pub fn get_url_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, PERM_RECORDING_READ, "recording.get_url", |s, i| {
-            get_url_core(s, &i)
-        })
+        run_input(
+            state,
+            raw_input,
+            PERM_RECORDING_READ,
+            "recording.get_url",
+            |s, i| get_url_core(s, &i),
+        )
     }
 
     pub fn get_stream_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, PERM_RECORDING_READ, "recording.get_stream", |s, i| {
-            get_stream_core(s, &i)
-        })
+        run_input(
+            state,
+            raw_input,
+            PERM_RECORDING_READ,
+            "recording.get_stream",
+            |s, i| get_stream_core(s, &i),
+        )
     }
 
     pub fn purge_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, PERM_RECORDING_WRITE, "recording.purge", |s, i| {
-            purge_core(s, &i)
-        })
+        run_input(
+            state,
+            raw_input,
+            PERM_RECORDING_WRITE,
+            "recording.purge",
+            |s, i| purge_core(s, &i),
+        )
     }
 
     /// Stats accepts an empty payload (no filter); a non-empty payload is a
@@ -1356,9 +1457,13 @@ pub mod test_api {
     }
 
     pub fn frame_url_with_raw_input(state: &AddonState, raw_input: &[u8]) -> (i32, Vec<u8>) {
-        run_input(state, raw_input, PERM_RECORDING_READ, "recording.frame_url", |s, i| {
-            frame_url_core(s, &i)
-        })
+        run_input(
+            state,
+            raw_input,
+            PERM_RECORDING_READ,
+            "recording.frame_url",
+            |s, i| frame_url_core(s, &i),
+        )
     }
 
     fn run_input<I, O, F>(
@@ -1379,7 +1484,14 @@ pub mod test_api {
             RiskClass::B
         };
         if !check_permission(state, perm, None) {
-            audit(state, action, None, risk, "denied", Some("missing_permission"));
+            audit(
+                state,
+                action,
+                None,
+                risk,
+                "denied",
+                Some("missing_permission"),
+            );
             return (AbiError::Permission.as_i32(), Vec::new());
         }
         if enforce_payload_size(raw_input.len(), PayloadKind::ServiceCall).is_err() {

@@ -49,7 +49,7 @@ pub async fn execute_blocking(
     let initial_arc = Arc::new(initial);
     ctx.initial_envelope = initial_arc.clone();
 
-    let execution_id = create_execution_record(&db, compiled.flow_id).await?;
+    let execution_id = create_execution_record(&db, &compiled.flow_id).await?;
     ctx.execution_id = execution_id;
 
     let continue_on_error = compiled.continue_on_error();
@@ -300,7 +300,7 @@ pub async fn execute_streaming(
     let initial_arc = Arc::new(initial);
     ctx.initial_envelope = initial_arc.clone();
 
-    let execution_id = create_execution_record(&db, compiled.flow_id).await?;
+    let execution_id = create_execution_record(&db, &compiled.flow_id).await?;
     ctx.execution_id = execution_id;
 
     let llm_run_idx = compiled
@@ -675,13 +675,14 @@ fn aggregate_usage(trace: &[TraceStep]) -> TokenUsage {
 /// na `flows(id)` failuje przy `PRAGMA foreign_keys=ON`. Skipujemy audit
 /// row i zwracamy execution_id=0 jako sentinel; persist_execution też
 /// to honoruje.
-async fn create_execution_record(db: &DbPool, flow_id: i64) -> Result<i64> {
-    if flow_id == 0 {
+async fn create_execution_record(db: &DbPool, flow_id: &str) -> Result<i64> {
+    if flow_id.is_empty() {
         return Ok(0);
     }
     let pool = db.clone();
+    let flow_id = flow_id.to_string();
     let id = tokio::task::spawn_blocking(move || {
-        repository::create_flow_execution(&pool, flow_id, None, None, "running")
+        repository::create_flow_execution(&pool, &flow_id, None, None, "running")
     })
     .await??;
     Ok(id)
@@ -743,8 +744,7 @@ mod chain_integration_tests {
     };
     use crate::flow_engine::node_adapter::{test_support::stub_ctx, AdapterRegistry};
     use crate::flow_engine::node_adapters::{
-        LlmNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, TriggerNodeAdapter,
-        TtsNodeAdapter,
+        LlmNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, TriggerNodeAdapter, TtsNodeAdapter,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -826,7 +826,18 @@ mod chain_integration_tests {
     }
 
     fn fresh_db() -> DbPool {
-        crate::db::init(Path::new(":memory:")).expect("in-memory db")
+        let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
+        // `execute_streaming` writes a `flow_executions` row FK-bound to `flows(id)`;
+        // seed the flow these tests compile under id "0" so the log write succeeds.
+        {
+            let conn = pool.lock().expect("db lock");
+            conn.execute(
+                "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
+                [],
+            )
+            .expect("seed flow");
+        }
+        pool
     }
 
     /// Krok 8 item 33: chain LLM → pii_filter → output(stream).
@@ -852,12 +863,8 @@ mod chain_integration_tests {
             ]
         }"#;
         let compiled = Arc::new(
-            crate::flow_engine::cache::CompiledFlow::from_json(
-                0,
-                flow_json,
-                &registry,
-            )
-            .expect("compile"),
+            crate::flow_engine::cache::CompiledFlow::from_json("0", flow_json, &registry)
+                .expect("compile"),
         );
 
         let llm_chunks = vec![
@@ -934,12 +941,8 @@ mod chain_integration_tests {
             ]
         }"#;
         let compiled = Arc::new(
-            crate::flow_engine::cache::CompiledFlow::from_json(
-                0,
-                flow_json,
-                &registry,
-            )
-            .expect("compile"),
+            crate::flow_engine::cache::CompiledFlow::from_json("0", flow_json, &registry)
+                .expect("compile"),
         );
 
         let audio_bytes = vec![0xAA, 0xBB, 0xCC];
@@ -1086,13 +1089,31 @@ mod concurrent_executor_tests {
     }
 
     fn db() -> DbPool {
-        crate::db::init(Path::new(":memory:")).expect("in-memory db")
+        let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
+        // `execute_blocking` writes a `flow_executions` row FK-bound to `flows(id)`;
+        // seed the flow these tests compile under id "0" so the log write succeeds.
+        {
+            let conn = pool.lock().expect("db lock");
+            conn.execute(
+                "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
+                [],
+            )
+            .expect("seed flow");
+        }
+        pool
     }
 
     async fn run(json: &str) -> FlowExecutionOutcome {
+        run_with_db(json, db()).await
+    }
+
+    /// Runs `json` against a pre-built db. Timing-sensitive tests build the db
+    /// outside the timed region (running the full migration suite on a fresh
+    /// in-memory db costs ~100ms, which would otherwise dominate the measurement).
+    async fn run_with_db(json: &str, db: DbPool) -> FlowExecutionOutcome {
         let reg = registry();
-        let compiled = Arc::new(CompiledFlow::from_json(0, json, &reg).expect("compile"));
-        execute_blocking(db(), compiled, FlowEnvelope::empty(), stub_ctx(), reg)
+        let compiled = Arc::new(CompiledFlow::from_json("0", json, &reg).expect("compile"));
+        execute_blocking(db, compiled, FlowEnvelope::empty(), stub_ctx(), reg)
             .await
             .expect("exec")
     }
@@ -1118,8 +1139,9 @@ mod concurrent_executor_tests {
                 {"from":"c","to":"o","from_port":"full","to_port":"text"}
             ]
         }"#;
+        let db = db();
         let start = Instant::now();
-        let outcome = run(json).await;
+        let outcome = run_with_db(json, db).await;
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(280),
@@ -1162,8 +1184,9 @@ mod concurrent_executor_tests {
                 {"from":"c","to":"o","from_port":"full","to_port":"text"}
             ]
         }"#;
+        let db = db();
         let start = Instant::now();
-        let outcome = run(json).await;
+        let outcome = run_with_db(json, db).await;
         let elapsed = start.elapsed();
         // Sekwencyjnie 5×80=400ms; równolegle ~80ms.
         assert!(

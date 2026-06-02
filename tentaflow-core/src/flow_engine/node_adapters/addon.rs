@@ -149,7 +149,7 @@ impl NodeAdapter for AddonNodeAdapter {
         let manager = self.manager.clone();
         let addon_id = self.addon_id.clone();
         let block_type = self.block_type.clone();
-        let user_id = ctx.user_id;
+        let user_id = ctx.user_id.clone();
         let node_type = self.node_type.clone();
 
         let response_bytes = tokio::task::spawn_blocking(move || {

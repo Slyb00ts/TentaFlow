@@ -49,15 +49,10 @@ fn validate_addon_id(addon_id: &str) -> Result<(), ProtocolError> {
 }
 
 /// Pobiera numeryczne user_id z kontekstu (dla audytu).
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -75,7 +70,7 @@ fn audit(
     let node_id = ctx.state.local_node_id.as_ref();
     if let Err(e) = repository::log_audit_full(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         Some(addon_id),
         action,
         Some("addon"),
@@ -536,7 +531,7 @@ pub fn addon_config_set(
             k,
             v,
             field.secret,
-            updated_by,
+            updated_by.as_deref(),
         )
         .map_err(db_err)?;
         fields_changed.push(k.clone());
@@ -650,7 +645,7 @@ pub fn addon_tools(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         let uid = current_user_id(ctx).ok_or_else(|| {
             ProtocolError::new(ProtocolErrorCode::AuthRequired, "brak user_id w sesji")
         })?;
-        if !repository::is_addon_visible_to_user(&ctx.state.db, &payload.addon_id, uid)
+        if !repository::is_addon_visible_to_user(&ctx.state.db, &payload.addon_id, &uid)
             .map_err(db_err)?
         {
             return Err(ProtocolError::not_found("addon nie istnieje"));
@@ -1003,14 +998,19 @@ pub fn addon_network_rules_set(
         blocked_hosts: payload.blocked_hosts.clone(),
         mode: payload.mode.clone(),
     };
-    repository::set_addon_network_config(&ctx.state.db, &payload.addon_id, &new, updated_by)
-        .map_err(db_err)?;
+    repository::set_addon_network_config(
+        &ctx.state.db,
+        &payload.addon_id,
+        &new,
+        updated_by.as_deref(),
+    )
+    .map_err(db_err)?;
     repository::set_addon_network_rule_approvals(
         &ctx.state.db,
         &payload.addon_id,
         &payload.allowed_hosts,
         &payload.blocked_hosts,
-        updated_by,
+        updated_by.as_deref(),
     )
     .map_err(db_err)?;
 

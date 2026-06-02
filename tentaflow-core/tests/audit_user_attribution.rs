@@ -40,7 +40,7 @@ fn fresh_db() -> DbPool {
 fn make_state(
     db: DbPool,
     addon_id: &str,
-    user_id: Option<i64>,
+    user_id: Option<String>,
     is_system_call: bool,
 ) -> AddonState {
     let event_bus = Arc::new(EventBus::new());
@@ -75,15 +75,15 @@ fn make_state(
     }
 }
 
-/// Insert a `users` row with the given id so the `actor_user_id` FK on
-/// `flow_invocations` is satisfiable. Production callers receive their id from
-/// the auth layer after a real user exists; this fixture mirrors that
+/// Insert a `user_accounts` row with the given UUID so the `actor_user_id` FK
+/// on `flow_invocations` is satisfiable. Production callers receive their id
+/// from the auth layer after a real user exists; this fixture mirrors that
 /// invariant inside the in-memory test DB.
-fn ensure_user(db: &DbPool, id: i64, username: &str) {
+fn ensure_user(db: &DbPool, id: &str, username: &str) {
     let conn = db.lock().expect("db lock");
     conn.execute(
-        "INSERT INTO users (id, username, password_hash, role) \
-         VALUES (?1, ?2, 'x', 'viewer')",
+        "INSERT INTO user_accounts (id, username, password_hash, display_name) \
+         VALUES (?1, ?2, 'x', ?2)",
         rusqlite::params![id, username],
     )
     .expect("insert user");
@@ -137,15 +137,24 @@ fn register_minimal_flow(addon_id: &str) -> String {
 async fn flow_invoke_records_actor_user_id() {
     let db = fresh_db();
     let addon_id = "audit-attr-user";
-    ensure_user(&db, 42, "alice");
+    ensure_user(&db, "00000000-0000-0000-0000-000000000042", "alice");
     let flow_id = register_minimal_flow(addon_id);
     grant_flow_invoke_default(&db, addon_id);
     let sched = Arc::new(FlowScheduler::new(db.clone()));
 
     // Authenticated operator user_id = 42.
-    let state = make_state(db.clone(), addon_id, Some(42), false);
+    let state = make_state(
+        db.clone(),
+        addon_id,
+        Some("00000000-0000-0000-0000-000000000042".to_string()),
+        false,
+    );
     state.permission_checker.refresh_all();
-    let payload = format!("flow_id = \"{flow_id}\"\nwait_ms = 5000\n\n[input]\nvalue = 1\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: flow_id.clone(),
+        input_toml: Some("value = 1\n".to_string()),
+        wait_ms: 5000,
+    };
 
     let outcome = {
         let sched = sched.clone();
@@ -160,16 +169,16 @@ async fn flow_invoke_records_actor_user_id() {
 
     // SELECT actor_user_id FROM flow_invocations WHERE id = ?
     let conn = db.lock().expect("db lock");
-    let recorded: Option<i64> = conn
+    let recorded: Option<String> = conn
         .query_row(
             "SELECT actor_user_id FROM flow_invocations WHERE id = ?1",
             rusqlite::params![out.invocation_id],
-            |r| r.get::<_, Option<i64>>(0),
+            |r| r.get::<_, Option<String>>(0),
         )
         .expect("invocation row present");
     assert_eq!(
         recorded,
-        Some(42),
+        Some("00000000-0000-0000-0000-000000000042".to_string()),
         "flow_invocations.actor_user_id must mirror AddonState.user_id"
     );
 }
@@ -188,7 +197,11 @@ async fn flow_invoke_system_call_records_null_user_id() {
 
     // Background / boot path — no authenticated user, system-trusted call.
     let state = make_state(db.clone(), addon_id, None, true);
-    let payload = format!("flow_id = \"{flow_id}\"\nwait_ms = 5000\n\n[input]\nvalue = 1\n");
+    let payload = flow_api::FlowInvokeInput {
+        flow_id: flow_id.clone(),
+        input_toml: Some("value = 1\n".to_string()),
+        wait_ms: 5000,
+    };
 
     let outcome = {
         let sched = sched.clone();
@@ -202,11 +215,11 @@ async fn flow_invoke_system_call_records_null_user_id() {
     };
 
     let conn = db.lock().expect("db lock");
-    let recorded: Option<i64> = conn
+    let recorded: Option<String> = conn
         .query_row(
             "SELECT actor_user_id FROM flow_invocations WHERE id = ?1",
             rusqlite::params![out.invocation_id],
-            |r| r.get::<_, Option<i64>>(0),
+            |r| r.get::<_, Option<String>>(0),
         )
         .expect("invocation row present");
     assert_eq!(
@@ -227,7 +240,12 @@ async fn flow_invoke_system_call_records_null_user_id() {
 async fn audit_log_with_risk_carries_actor_user_id() {
     let db = fresh_db();
     let addon_id = "audit-attr-hostfn";
-    let state = make_state(db.clone(), addon_id, Some(7), false);
+    let state = make_state(
+        db.clone(),
+        addon_id,
+        Some("00000000-0000-0000-0000-000000000007".to_string()),
+        false,
+    );
 
     audit_log_with_risk(
         &state,
@@ -242,17 +260,17 @@ async fn audit_log_with_risk_carries_actor_user_id() {
     );
 
     let conn = db.lock().expect("db lock");
-    let recorded: Option<i64> = conn
+    let recorded: Option<String> = conn
         .query_row(
             "SELECT user_id FROM audit_log \
              WHERE addon_id = ?1 AND action = 'camera.credentials_rotate'",
             rusqlite::params![addon_id],
-            |r| r.get::<_, Option<i64>>(0),
+            |r| r.get::<_, Option<String>>(0),
         )
         .expect("audit row present");
     assert_eq!(
         recorded,
-        Some(7),
+        Some("00000000-0000-0000-0000-000000000007".to_string()),
         "audit_log.user_id must mirror AddonState.user_id"
     );
 }

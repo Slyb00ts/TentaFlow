@@ -4,8 +4,8 @@
 // =============================================================================
 
 use super::types::{
-    LedgerResult, SyncLedgerError, SyncMerkleSummary, SyncOperation, SyncOperationSigner,
-    SyncOperationVerifier, hash_canonical,
+    hash_canonical, LedgerResult, SyncLedgerError, SyncMerkleSummary, SyncOperation,
+    SyncOperationSigner, SyncOperationVerifier,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::BTreeMap;
@@ -275,6 +275,10 @@ mod tests {
                     wall_time_ms: 1_765_000_000_000,
                     logical: sequence as u32,
                     node_id: signer.node_id().to_string(),
+                },
+                epoch: crate::sync::ledger::BaselineEpoch {
+                    counter: 0,
+                    origin_node: String::new(),
                 },
                 payload_hash: [1; 32],
                 acl_snapshot_hash: [2; 32],

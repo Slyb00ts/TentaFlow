@@ -18,15 +18,10 @@ fn db_err(e: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::internal(format!("database error: {}", e))
 }
 
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -36,6 +31,7 @@ fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
 /// or body content, to avoid leaking private text into the audit stream.
 fn audit(ctx: &HandlerContext, action: &str, note_id: Option<i64>) {
     let user_id = current_user_id(ctx);
+    let user_id = user_id.as_deref();
     let details = match note_id {
         Some(id) => format!(r#"{{"note_id":{},"action":"{}"}}"#, id, action),
         None => format!(r#"{{"action":"{}"}}"#, action),
@@ -61,7 +57,7 @@ fn audit(ctx: &HandlerContext, action: &str, note_id: Option<i64>) {
     }
 }
 
-fn require_user(ctx: &HandlerContext) -> Result<i64, ProtocolError> {
+fn require_user(ctx: &HandlerContext) -> Result<String, ProtocolError> {
     current_user_id(ctx).ok_or_else(|| {
         ProtocolError::new(
             ProtocolErrorCode::AuthRequired,
@@ -105,7 +101,7 @@ pub fn notes_dispatch(
     let inner = notes_req(req)?;
     let out = match inner {
         NotesRequest::List(_) => {
-            let rows = repository::list_notes_for_user(&ctx.state.db, uid).map_err(db_err)?;
+            let rows = repository::list_notes_for_user(&ctx.state.db, &uid).map_err(db_err)?;
             let notes = rows
                 .into_iter()
                 .map(|n| NoteEntry {
@@ -120,7 +116,7 @@ pub fn notes_dispatch(
             NotesResponse::List(NotesListResponse { notes })
         }
         NotesRequest::Detail(r) => {
-            let note = repository::get_note(&ctx.state.db, r.note_id, uid)
+            let note = repository::get_note(&ctx.state.db, r.note_id, &uid)
                 .map_err(db_err)?
                 .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "note not found"))?;
             NotesResponse::Detail(NoteDetailResponse {
@@ -134,14 +130,14 @@ pub fn notes_dispatch(
         }
         NotesRequest::Create(r) => {
             let id =
-                repository::create_note(&ctx.state.db, uid, &r.title, &r.body).map_err(db_err)?;
+                repository::create_note(&ctx.state.db, &uid, &r.title, &r.body).map_err(db_err)?;
             audit(ctx, "note_create", Some(id));
             NotesResponse::Create(NoteCreateResponse { id })
         }
         NotesRequest::Update(r) => {
-            repository::update_note(&ctx.state.db, r.note_id, uid, &r.title, &r.body)
+            repository::update_note(&ctx.state.db, r.note_id, &uid, &r.title, &r.body)
                 .map_err(not_found_err)?;
-            let updated = repository::get_note(&ctx.state.db, r.note_id, uid)
+            let updated = repository::get_note(&ctx.state.db, r.note_id, &uid)
                 .map_err(db_err)?
                 .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "note vanished"))?;
             audit(ctx, "note_update", Some(r.note_id));
@@ -151,7 +147,7 @@ pub fn notes_dispatch(
             })
         }
         NotesRequest::SetPinned(r) => {
-            repository::set_note_pinned(&ctx.state.db, r.note_id, uid, r.pinned)
+            repository::set_note_pinned(&ctx.state.db, r.note_id, &uid, r.pinned)
                 .map_err(not_found_err)?;
             audit(
                 ctx,
@@ -161,7 +157,7 @@ pub fn notes_dispatch(
             NotesResponse::SetPinned(NoteSetPinnedResponse { ok: true })
         }
         NotesRequest::Delete(r) => {
-            repository::delete_note(&ctx.state.db, r.note_id, uid).map_err(not_found_err)?;
+            repository::delete_note(&ctx.state.db, r.note_id, &uid).map_err(not_found_err)?;
             audit(ctx, "note_delete", Some(r.note_id));
             NotesResponse::Delete(NoteDeleteResponse { ok: true })
         }

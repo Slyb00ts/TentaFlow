@@ -555,6 +555,7 @@ mod tests {
                 speculator_repo: None,
                 speculator_method: None,
                 speculator_num_tokens: None,
+                vllm: None,
             }],
             parameters: vec![],
             docker_source_hash: String::new(),

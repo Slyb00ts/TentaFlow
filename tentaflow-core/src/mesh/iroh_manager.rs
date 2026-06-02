@@ -1878,7 +1878,8 @@ impl IrohMeshManagerRef {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(1500)).await;
                     if !connections.contains_key(&peer_hex) {
-                        let _ = event_tx.send(IrohMeshEvent::PeerDisconnected { node_id: peer_hex });
+                        let _ =
+                            event_tx.send(IrohMeshEvent::PeerDisconnected { node_id: peer_hex });
                     }
                 });
             } else {

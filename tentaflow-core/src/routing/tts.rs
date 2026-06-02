@@ -41,10 +41,10 @@ impl Router {
                     db,
                     "model",
                     &request.model,
-                    u.user_id,
+                    &u.user_id,
                     &u.role,
                 ) {
-                    tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied TTS model");
+                    tracing::warn!(user_id = %u.user_id, model = %request.model, "ACL denied TTS model");
                     return Err(crate::error::CoreError::ModelNotFound {
                         model_name: request.model.clone(),
                     }

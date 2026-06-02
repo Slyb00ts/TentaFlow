@@ -7,11 +7,11 @@
 
 pub mod abi_helpers;
 pub mod aliases;
-pub mod cbor_io;
 #[cfg(feature = "camera")]
 pub mod camera;
 #[cfg(feature = "camera")]
 pub mod camera_metadata;
+pub mod cbor_io;
 pub mod events;
 pub mod flow;
 pub mod gate;
@@ -27,13 +27,14 @@ pub mod service;
 pub mod services;
 pub mod sql;
 pub mod storage;
-pub mod sync_acl;
 #[cfg(feature = "camera")]
 pub mod streaming;
+pub mod sync_acl;
 pub mod ui;
 pub mod user;
 #[cfg(feature = "vector")]
 pub mod vector;
+pub mod web_research;
 
 use anyhow::Result;
 
@@ -140,6 +141,14 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "http_request", http::http_request)
         .map_err(|e| anyhow::anyhow!("Rejestracja http_request: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "web_research_v1",
+            web_research::web_research_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja web_research_v1: {e}"))?;
 
     // --- Event API ---
     linker
@@ -590,7 +599,7 @@ pub fn audit_log_with_risk(
         let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let risk_class_db = risk_class.as_db_str();
         let hash_input = crate::audit::chain::AuditRowHashInput {
-            user_id: state.user_id,
+            user_id: state.user_id.as_deref(),
             addon_id: Some(state.addon_id.as_str()),
             instance_id: Some(state.instance_id.as_str()),
             action,
@@ -657,7 +666,7 @@ pub fn check_permission(state: &AddonState, permission_type: &str, resource: Opt
     }
 
     // Jesli brak user_id — sprawdz czy to jawne wywolanie systemowe
-    let user_id = match state.user_id {
+    let user_id = match state.user_id.as_deref() {
         Some(id) => id,
         None => {
             // CR-006: Tylko jawne wywolania systemowe (is_system_call=true) omijaja

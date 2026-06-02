@@ -146,7 +146,7 @@ impl InstancePool {
 
     /// Pobiera instancje z puli — jesli pula pusta, tworzy nowa.
     /// Ustawia user_id na instancji.
-    pub fn acquire(&self, user_id: Option<i64>) -> Result<AddonInstance> {
+    pub fn acquire(&self, user_id: Option<String>) -> Result<AddonInstance> {
         let entry = {
             let mut pool = self.pool.lock();
             pool.pop_front()
@@ -160,12 +160,12 @@ impl InstancePool {
                     "InstancePool[{}]: pula wyczerpana, tworzenie instancji on-demand",
                     self.addon_id
                 );
-                self.create_instance(user_id)?
+                self.create_instance(user_id.clone())?
             }
         };
 
         // Ustaw user_id na pobranej instancji
-        store.data_mut().user_id = user_id;
+        store.data_mut().user_id = user_id.clone();
 
         // Monotonic counter — no syscall, unique within process lifetime
         let seq = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -183,7 +183,9 @@ impl InstancePool {
 
         trace!(
             "InstancePool[{}]: instancja przydzielona (instance_id={}, user_id={:?})",
-            self.addon_id, instance_id, user_id
+            self.addon_id,
+            instance_id,
+            user_id
         );
 
         let language_adapter = super::runtime::adapter_for_runtime(&self.runtime_id)
@@ -209,7 +211,8 @@ impl InstancePool {
         if pool.len() >= self.pool_size {
             trace!(
                 "InstancePool[{}]: pula pelna, instancja {} zostanie zdropowana",
-                self.addon_id, addon_instance.instance_id
+                self.addon_id,
+                addon_instance.instance_id
             );
             return;
         }
@@ -285,8 +288,9 @@ impl InstancePool {
     /// Tworzy nowa instancje WASM (store + instance)
     fn create_instance(
         &self,
-        user_id: Option<i64>,
+        user_id: Option<String>,
     ) -> Result<(WasmStore<AddonState>, WasmInstance)> {
+        let is_system_call = user_id.is_none();
         let state = AddonState {
             addon_id: self.addon_id.clone(),
             instance_id: String::new(), // Bedzie ustawiony przy acquire()
@@ -297,7 +301,7 @@ impl InstancePool {
             event_bus: self.event_bus.clone(),
             permission_checker: self.permission_checker.clone(),
             fuel_consumed: 0,
-            is_system_call: user_id.is_none(),
+            is_system_call,
             rate_limiter: None,
             net_manager: Arc::new(parking_lot::Mutex::new(
                 host_functions::network::NetworkConnectionManager::new(),

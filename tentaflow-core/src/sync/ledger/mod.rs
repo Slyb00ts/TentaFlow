@@ -10,13 +10,13 @@ mod validation;
 pub use fjall_store::FjallSyncLedgerStore;
 pub(crate) use types::{decode, encode, hash_canonical};
 pub use types::{
-    ActionType, AppendResult, CORE_PARTITION_PREFIX, CompactionPolicy, FieldValue,
-    HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, OperationId, OperationQuery,
-    OutboxEntry, PartitionHead, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId,
-    SyncLedgerError, SyncLedgerStore, SyncMerkleSummary, SyncOperation, SyncOperationBody,
-    SyncOperationSigner, SyncOperationVerifier, SyncSnapshot, SyncTarget,
+    ActionType, AppendResult, BaselineEpoch, CompactionPolicy, FieldValue, HybridLogicalTimestamp,
+    InboxEntry, LedgerResult, NewSyncOperation, OperationId, OperationQuery, OutboxEntry,
+    PartitionHead, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
+    SyncLedgerStore, SyncMerkleSummary, SyncOperation, SyncOperationBody, SyncOperationSigner,
+    SyncOperationVerifier, SyncSnapshot, SyncTarget, CORE_PARTITION_PREFIX,
 };
 pub use validation::{
-    Ed25519OperationSigner, HexNodeIdOperationVerifier, TrustedKeyOperationVerifier,
     build_merkle_summary, operation_body_hash, validate_hash_chain, validate_hash_chain_from,
+    Ed25519OperationSigner, HexNodeIdOperationVerifier, TrustedKeyOperationVerifier,
 };

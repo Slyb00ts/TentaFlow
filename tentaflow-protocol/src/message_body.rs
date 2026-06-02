@@ -609,7 +609,7 @@ pub enum FlowInputValue {
 pub struct FlowInvokeRequest {
     /// Gdy ustawione — odpal KONKRETNY flow po ID (wybrany przez usera). Ma
     /// priorytet nad model/service_type (np. audio chat uruchamia wybrany flow).
-    pub flow_id: Option<i64>,
+    pub flow_id: Option<String>,
     /// Nazwa modelu — używana do rozwiązania flow przez model/service_type gdy
     /// `flow_id` nie jest podany.
     pub model: String,
@@ -823,7 +823,7 @@ pub struct AuditEvent {
 /// Optional filters for audit log list/export — all fields nullable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogFilters {
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: Option<String>,
     pub action: Option<String>,
     pub from_date: Option<String>,
@@ -837,7 +837,7 @@ pub struct AuditLogEntry {
     pub id: i64,
     pub timestamp: String,
     pub action: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: Option<String>,
     pub resource: Option<String>,
     pub details: Option<String>,
@@ -1941,7 +1941,7 @@ pub struct SsoProviderEntry {
     pub discovery_url: String,
     pub enabled: bool,
     pub auto_create_users: bool,
-    pub default_group_id: Option<i64>,
+    pub default_group_id: Option<String>,
     pub created_at: String,
 }
 
@@ -1961,7 +1961,7 @@ pub struct SsoProviderCreateRequest {
     pub client_secret: String,
     pub discovery_url: String,
     pub auto_create_users: bool,
-    pub default_group_id: Option<i64>,
+    pub default_group_id: Option<String>,
 }
 
 /// Response: potwierdzenie utworzenia providera SSO.
@@ -2026,7 +2026,7 @@ pub enum CatalogEntryKindWire {
         instances: Vec<CatalogModelInstance>,
     },
     Flow {
-        flow_id: i64,
+        flow_id: String,
         published_name: String,
     },
     Alias {
@@ -2551,7 +2551,7 @@ pub struct AddonLogEntry {
     pub level: String,
     pub action: String,
     pub message: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub user_name: Option<String>,
     pub details: String,
 }
@@ -2664,7 +2664,7 @@ pub struct AddonNetworkRulesSetResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilityRow {
     pub addon_id: String,
-    pub group_id: i64,
+    pub group_id: String,
     pub group_name: String,
     pub visible: bool,
     pub group_description: String,
@@ -2686,14 +2686,14 @@ pub struct AddonVisibilityListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilitySetRequest {
     pub addon_id: String,
-    pub group_id: i64,
+    pub group_id: String,
     pub visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilitySetResponse {
     pub addon_id: String,
-    pub group_id: i64,
+    pub group_id: String,
     pub visible: bool,
 }
 
@@ -2737,7 +2737,7 @@ pub struct AddonPermissionCatalogResponse {
 pub struct AddonPermissionRow {
     pub addon_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub permission_id: String,
     pub grant_mode: String,
     pub updated_at_epoch: u64,
@@ -2770,7 +2770,7 @@ pub struct AddonPermissionMatrixResponse {
 pub struct AddonPermissionSetRequest {
     pub addon_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub permission_id: String,
     pub grant_mode: String,
 }
@@ -2779,7 +2779,7 @@ pub struct AddonPermissionSetRequest {
 pub struct AddonPermissionSetResponse {
     pub addon_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub permission_id: String,
     pub grant_mode: String,
 }
@@ -2802,7 +2802,7 @@ pub struct AddonPermissionDefaultSetResponse {
 pub struct AddonPermissionCheckRequest {
     pub addon_id: String,
     pub permission_id: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -2818,7 +2818,7 @@ pub struct AddonPermissionCheckResponse {
 pub struct AddonPermissionChangedEvent {
     pub addon_id: String,
     pub subject_type: Option<String>,
-    pub subject_id: Option<i64>,
+    pub subject_id: Option<String>,
     pub permission_id: Option<String>,
 }
 
@@ -2898,7 +2898,7 @@ pub struct AddonOAuthAuthorizeStartResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct UserOAuthAccountRow {
     pub id: i64,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: String,
     pub provider_id: String,
     pub external_account_id: String,
@@ -3109,7 +3109,7 @@ pub struct DeploymentSummary {
     pub finished_at: String,
     pub error_message: String,
     pub log_tail: String,
-    pub user_id: i64,
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -3235,7 +3235,7 @@ pub struct MeetingSessionDescriptor {
     pub novnc_port: i32,
     pub bot_endpoint_id: String,
     pub container_name: String,
-    pub owner_user_id: i64,
+    pub owner_user_id: String,
     /// Aktualny etap lifecycle bota (patrz `LIFECYCLE_*` w `types.rs`).
     /// Pusty string gdy sesja jeszcze nie dotknęła żadnego etapu.
     pub lifecycle_stage: String,
@@ -3641,7 +3641,7 @@ pub enum TranslatePayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct UserInfo {
-    pub id: i64,
+    pub id: String,
     pub username: String,
     pub display_name: String,
     pub email: String,
@@ -3653,7 +3653,7 @@ pub struct UserInfo {
     /// "user" | "power_user" | "admin". Default "user" przy deserializacji
     /// starego payloadu.
     pub role: String,
-    pub group_ids: Vec<i64>,
+    pub group_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -3663,7 +3663,7 @@ pub struct UsersListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct GroupInfo {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub description: String,
     pub member_count: u32,
@@ -3674,7 +3674,7 @@ pub struct PermissionEntry {
     pub resource_type: String,
     pub resource_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub access_level: String,
 }
 
@@ -3688,7 +3688,7 @@ pub enum IamPayload {
         users: Vec<UserInfo>,
     },
     ReqGetUser {
-        user_id: i64,
+        user_id: String,
     },
     ResGetUser {
         user: UserInfo,
@@ -3699,27 +3699,27 @@ pub enum IamPayload {
         display_name: String,
         email: String,
         role: String,
-        group_ids: Vec<i64>,
+        group_ids: Vec<String>,
     },
     ResCreateUser {
-        user_id: i64,
+        user_id: String,
     },
     ReqUpdateUser {
-        user_id: i64,
+        user_id: String,
         display_name: String,
         email: String,
         is_active: bool,
         role: String,
     },
     ReqDeleteUser {
-        user_id: i64,
+        user_id: String,
     },
     ReqSetUserGroups {
-        user_id: i64,
-        group_ids: Vec<i64>,
+        user_id: String,
+        group_ids: Vec<String>,
     },
     ReqResetUserPassword {
-        user_id: i64,
+        user_id: String,
         new_password: String,
     },
 
@@ -3733,18 +3733,18 @@ pub enum IamPayload {
         description: String,
     },
     ResCreateGroup {
-        group_id: i64,
+        group_id: String,
     },
     ReqUpdateGroup {
-        group_id: i64,
+        group_id: String,
         name: String,
         description: String,
     },
     ReqDeleteGroup {
-        group_id: i64,
+        group_id: String,
     },
     ReqGroupMembers {
-        group_id: i64,
+        group_id: String,
     },
     ResGroupMembers {
         members: Vec<UserInfo>,
@@ -3758,14 +3758,14 @@ pub enum IamPayload {
         resource_type: String,
         resource_id: String,
         subject_type: String,
-        subject_id: i64,
+        subject_id: String,
         access_level: String,
     },
     ReqClearPermission {
         resource_type: String,
         resource_id: String,
         subject_type: String,
-        subject_id: i64,
+        subject_id: String,
     },
     ReqListPermsForResource {
         resource_type: String,
@@ -3773,7 +3773,7 @@ pub enum IamPayload {
     },
     ReqListPermsForSubject {
         subject_type: String,
-        subject_id: i64,
+        subject_id: String,
     },
     ResListPermissions {
         entries: Vec<PermissionEntry>,

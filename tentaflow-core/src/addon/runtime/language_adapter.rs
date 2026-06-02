@@ -46,15 +46,33 @@ pub trait LanguageAdapter: Send + Sync {
 pub struct RustAdapter;
 
 impl LanguageAdapter for RustAdapter {
-    fn runtime_id(&self) -> &str { "wasmtime" }
-    fn export_on_start(&self) -> &str { "on_start" }
-    fn export_on_stop(&self) -> &str { "on_stop" }
-    fn export_on_request(&self) -> &str { "on_request" }
-    fn export_on_tick(&self) -> &str { "on_tick" }
-    fn export_on_event(&self) -> &str { "on_event" }
-    fn export_on_panel_open(&self) -> &str { "on_panel_open" }
-    fn needs_wasi_start(&self) -> bool { false }
-    fn init_fuel_budget(&self) -> u64 { 0 }
+    fn runtime_id(&self) -> &str {
+        "wasmtime"
+    }
+    fn export_on_start(&self) -> &str {
+        "on_start"
+    }
+    fn export_on_stop(&self) -> &str {
+        "on_stop"
+    }
+    fn export_on_request(&self) -> &str {
+        "on_request"
+    }
+    fn export_on_tick(&self) -> &str {
+        "on_tick"
+    }
+    fn export_on_event(&self) -> &str {
+        "on_event"
+    }
+    fn export_on_panel_open(&self) -> &str {
+        "on_panel_open"
+    }
+    fn needs_wasi_start(&self) -> bool {
+        false
+    }
+    fn init_fuel_budget(&self) -> u64 {
+        0
+    }
 }
 
 // =============================================================================
@@ -64,15 +82,33 @@ impl LanguageAdapter for RustAdapter {
 pub struct DotnetAdapter;
 
 impl LanguageAdapter for DotnetAdapter {
-    fn runtime_id(&self) -> &str { "dotnet" }
-    fn export_on_start(&self) -> &str { "tentaflow_on_start" }
-    fn export_on_stop(&self) -> &str { "tentaflow_on_stop" }
-    fn export_on_request(&self) -> &str { "tentaflow_on_request" }
-    fn export_on_tick(&self) -> &str { "tentaflow_on_tick" }
-    fn export_on_event(&self) -> &str { "tentaflow_on_event" }
-    fn export_on_panel_open(&self) -> &str { "tentaflow_on_panel_open" }
-    fn needs_wasi_start(&self) -> bool { true }
-    fn init_fuel_budget(&self) -> u64 { 50_000_000 }
+    fn runtime_id(&self) -> &str {
+        "dotnet"
+    }
+    fn export_on_start(&self) -> &str {
+        "tentaflow_on_start"
+    }
+    fn export_on_stop(&self) -> &str {
+        "tentaflow_on_stop"
+    }
+    fn export_on_request(&self) -> &str {
+        "tentaflow_on_request"
+    }
+    fn export_on_tick(&self) -> &str {
+        "tentaflow_on_tick"
+    }
+    fn export_on_event(&self) -> &str {
+        "tentaflow_on_event"
+    }
+    fn export_on_panel_open(&self) -> &str {
+        "tentaflow_on_panel_open"
+    }
+    fn needs_wasi_start(&self) -> bool {
+        true
+    }
+    fn init_fuel_budget(&self) -> u64 {
+        50_000_000
+    }
 }
 
 // =============================================================================
@@ -82,15 +118,33 @@ impl LanguageAdapter for DotnetAdapter {
 pub struct PythonAdapter;
 
 impl LanguageAdapter for PythonAdapter {
-    fn runtime_id(&self) -> &str { "python" }
-    fn export_on_start(&self) -> &str { "tentaflow_on_start" }
-    fn export_on_stop(&self) -> &str { "tentaflow_on_stop" }
-    fn export_on_request(&self) -> &str { "tentaflow_on_request" }
-    fn export_on_tick(&self) -> &str { "tentaflow_on_tick" }
-    fn export_on_event(&self) -> &str { "tentaflow_on_event" }
-    fn export_on_panel_open(&self) -> &str { "tentaflow_on_panel_open" }
-    fn needs_wasi_start(&self) -> bool { true }
-    fn init_fuel_budget(&self) -> u64 { 100_000_000 }
+    fn runtime_id(&self) -> &str {
+        "python"
+    }
+    fn export_on_start(&self) -> &str {
+        "tentaflow_on_start"
+    }
+    fn export_on_stop(&self) -> &str {
+        "tentaflow_on_stop"
+    }
+    fn export_on_request(&self) -> &str {
+        "tentaflow_on_request"
+    }
+    fn export_on_tick(&self) -> &str {
+        "tentaflow_on_tick"
+    }
+    fn export_on_event(&self) -> &str {
+        "tentaflow_on_event"
+    }
+    fn export_on_panel_open(&self) -> &str {
+        "tentaflow_on_panel_open"
+    }
+    fn needs_wasi_start(&self) -> bool {
+        true
+    }
+    fn init_fuel_budget(&self) -> u64 {
+        100_000_000
+    }
 }
 
 // =============================================================================
@@ -158,16 +212,28 @@ mod tests {
     #[test]
     fn adapter_factory() {
         assert!(adapter_for_runtime("wasmtime").is_some());
-        assert_eq!(adapter_for_runtime("wasmtime").unwrap().runtime_id(), "wasmtime");
+        assert_eq!(
+            adapter_for_runtime("wasmtime").unwrap().runtime_id(),
+            "wasmtime"
+        );
 
         assert!(adapter_for_runtime("wasmi").is_some());
-        assert_eq!(adapter_for_runtime("wasmi").unwrap().runtime_id(), "wasmtime");
+        assert_eq!(
+            adapter_for_runtime("wasmi").unwrap().runtime_id(),
+            "wasmtime"
+        );
 
         assert!(adapter_for_runtime("dotnet").is_some());
-        assert_eq!(adapter_for_runtime("dotnet").unwrap().runtime_id(), "dotnet");
+        assert_eq!(
+            adapter_for_runtime("dotnet").unwrap().runtime_id(),
+            "dotnet"
+        );
 
         assert!(adapter_for_runtime("python").is_some());
-        assert_eq!(adapter_for_runtime("python").unwrap().runtime_id(), "python");
+        assert_eq!(
+            adapter_for_runtime("python").unwrap().runtime_id(),
+            "python"
+        );
 
         assert!(adapter_for_runtime("unknown").is_none());
         assert!(adapter_for_runtime("").is_none());

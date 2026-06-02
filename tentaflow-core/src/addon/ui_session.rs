@@ -238,7 +238,9 @@ impl SessionState {
 
     #[inline]
     fn find_panel(&self, addon_id: &str, panel_id: &str) -> Option<usize> {
-        self.open_panels.iter().position(|p| p.addon_id == addon_id && p.panel_id == panel_id)
+        self.open_panels
+            .iter()
+            .position(|p| p.addon_id == addon_id && p.panel_id == panel_id)
     }
 
     /// Registers a panel as open, assigns a monotonically increasing epoch.
@@ -269,11 +271,7 @@ impl SessionState {
     }
 
     /// Removes a panel, returning its ownership data for cleanup.
-    pub fn close_panel(
-        &mut self,
-        addon_id: &str,
-        panel_id: &str,
-    ) -> Option<PanelOwnership> {
+    pub fn close_panel(&mut self, addon_id: &str, panel_id: &str) -> Option<PanelOwnership> {
         let idx = self.find_panel(addon_id, panel_id)?;
         Some(self.open_panels.swap_remove(idx).ownership)
     }
@@ -283,11 +281,7 @@ impl SessionState {
         Some(&self.open_panels[idx].ownership)
     }
 
-    pub fn get_panel_mut(
-        &mut self,
-        addon_id: &str,
-        panel_id: &str,
-    ) -> Option<&mut PanelOwnership> {
+    pub fn get_panel_mut(&mut self, addon_id: &str, panel_id: &str) -> Option<&mut PanelOwnership> {
         let idx = self.find_panel(addon_id, panel_id)?;
         Some(&mut self.open_panels[idx].ownership)
     }
@@ -307,12 +301,12 @@ impl SessionState {
         subscribe_topics: Vec<TopicPattern>,
         capabilities: HashSet<LocalCapability>,
     ) -> Result<(), SessionError> {
-        let idx = self.find_panel(addon_id, panel_id).ok_or_else(|| {
-            SessionError::PanelNotOpen {
-                addon_id: addon_id.to_owned(),
-                panel_id: panel_id.to_owned(),
-            }
-        })?;
+        let idx =
+            self.find_panel(addon_id, panel_id)
+                .ok_or_else(|| SessionError::PanelNotOpen {
+                    addon_id: addon_id.to_owned(),
+                    panel_id: panel_id.to_owned(),
+                })?;
         let ownership = &mut self.open_panels[idx].ownership;
 
         if ownership.shell_registered {
@@ -354,12 +348,12 @@ impl SessionState {
         panel_id: &str,
         slot_id: &str,
     ) -> Result<(), SessionError> {
-        let ownership = self.get_panel(addon_id, panel_id).ok_or_else(|| {
-            SessionError::PanelNotOpen {
-                addon_id: addon_id.to_owned(),
-                panel_id: panel_id.to_owned(),
-            }
-        })?;
+        let ownership =
+            self.get_panel(addon_id, panel_id)
+                .ok_or_else(|| SessionError::PanelNotOpen {
+                    addon_id: addon_id.to_owned(),
+                    panel_id: panel_id.to_owned(),
+                })?;
         if !ownership.declared_slots.contains(slot_id) {
             return Err(SessionError::SlotOwnershipViolation {
                 addon_id: addon_id.to_owned(),
@@ -379,12 +373,12 @@ impl SessionState {
         panel_id: &str,
         base_revision: u64,
     ) -> Result<(), SessionError> {
-        let ownership = self.get_panel(addon_id, panel_id).ok_or_else(|| {
-            SessionError::PanelNotOpen {
-                addon_id: addon_id.to_owned(),
-                panel_id: panel_id.to_owned(),
-            }
-        })?;
+        let ownership =
+            self.get_panel(addon_id, panel_id)
+                .ok_or_else(|| SessionError::PanelNotOpen {
+                    addon_id: addon_id.to_owned(),
+                    panel_id: panel_id.to_owned(),
+                })?;
         if ownership.state_revision != base_revision {
             return Err(SessionError::RevisionMismatch {
                 expected: ownership.state_revision,
@@ -401,12 +395,12 @@ impl SessionState {
         panel_id: &str,
         new_revision: u64,
     ) -> Result<(), SessionError> {
-        let ownership = self.get_panel_mut(addon_id, panel_id).ok_or_else(|| {
-            SessionError::PanelNotOpen {
-                addon_id: addon_id.to_owned(),
-                panel_id: panel_id.to_owned(),
-            }
-        })?;
+        let ownership =
+            self.get_panel_mut(addon_id, panel_id)
+                .ok_or_else(|| SessionError::PanelNotOpen {
+                    addon_id: addon_id.to_owned(),
+                    panel_id: panel_id.to_owned(),
+                })?;
         ownership.state_revision = new_revision;
         Ok(())
     }
@@ -418,12 +412,12 @@ impl SessionState {
         panel_id: &str,
         action_id: &str,
     ) -> Result<(), SessionError> {
-        let ownership = self.get_panel(addon_id, panel_id).ok_or_else(|| {
-            SessionError::PanelNotOpen {
-                addon_id: addon_id.to_owned(),
-                panel_id: panel_id.to_owned(),
-            }
-        })?;
+        let ownership =
+            self.get_panel(addon_id, panel_id)
+                .ok_or_else(|| SessionError::PanelNotOpen {
+                    addon_id: addon_id.to_owned(),
+                    panel_id: panel_id.to_owned(),
+                })?;
         if !ownership.declared_actions.contains(action_id) {
             return Err(SessionError::ActionNotDeclared {
                 addon_id: addon_id.to_owned(),
@@ -459,9 +453,7 @@ impl SessionState {
         path_root: &str,
         from_local_action: bool,
     ) -> Result<(), SessionError> {
-        if !from_local_action
-            && RESERVED_STATE_ROOTS.contains(&path_root)
-        {
+        if !from_local_action && RESERVED_STATE_ROOTS.contains(&path_root) {
             return Err(SessionError::ReservedNamespace {
                 path_root: path_root.to_owned(),
             });
@@ -531,7 +523,7 @@ pub struct SessionRegistry {
     sessions: RwLock<HashMap<u64, Arc<Mutex<SessionState>>>>,
     /// Maps (addon_id, user_id) to connection_id so host functions can look up
     /// which SessionState owns the panel they are rendering to.
-    addon_connections: RwLock<HashMap<(String, i64), u64>>,
+    addon_connections: RwLock<HashMap<(String, String), u64>>,
 }
 
 impl Default for SessionRegistry {
@@ -570,39 +562,43 @@ impl SessionRegistry {
     }
 
     /// Records which connection_id is serving a given addon+user panel session.
-    pub fn register_addon_connection(&self, addon_id: &str, user_id: i64, connection_id: u64) {
+    pub fn register_addon_connection(&self, addon_id: &str, user_id: &str, connection_id: u64) {
         tracing::info!(
-            addon = addon_id, user_id, connection_id,
+            addon = addon_id,
+            user_id,
+            connection_id,
             registry_ptr = format_args!("{:p}", self),
             "register_addon_connection"
         );
         self.addon_connections
             .write()
-            .insert((addon_id.to_owned(), user_id), connection_id);
+            .insert((addon_id.to_owned(), user_id.to_owned()), connection_id);
     }
 
     /// Removes the addon+user → connection_id mapping (panel close / disconnect).
-    pub fn unregister_addon_connection(&self, addon_id: &str, user_id: i64) {
+    pub fn unregister_addon_connection(&self, addon_id: &str, user_id: &str) {
         self.addon_connections
             .write()
-            .retain(|(aid, uid), _| !(aid == addon_id && *uid == user_id));
+            .retain(|(aid, uid), _| !(aid == addon_id && uid == user_id));
     }
 
     /// Looks up the connection_id serving a given addon+user panel.
     /// Uses linear scan to avoid String allocation on every lookup.
     /// Typical session count is < 50, so linear scan is faster than
     /// HashMap hashing + allocation overhead.
-    pub fn find_connection(&self, addon_id: &str, user_id: i64) -> Option<u64> {
+    pub fn find_connection(&self, addon_id: &str, user_id: &str) -> Option<u64> {
         let read = self.addon_connections.read();
         let count = read.len();
         tracing::info!(
-            addon = addon_id, user_id, entries = count,
+            addon = addon_id,
+            user_id,
+            entries = count,
             registry_ptr = format_args!("{:p}", self),
             "find_connection lookup"
         );
         for ((aid, uid), conn_id) in read.iter() {
-            tracing::info!(stored_addon = %aid, stored_uid = uid, stored_conn = conn_id, "find_connection entry");
-            if *uid == user_id && aid == addon_id {
+            tracing::info!(stored_addon = %aid, stored_uid = %uid, stored_conn = conn_id, "find_connection entry");
+            if uid == user_id && aid == addon_id {
                 return Some(*conn_id);
             }
         }
@@ -765,14 +761,10 @@ mod tests {
         state.open_panel("addon-a", "main").unwrap();
 
         // Initially at revision 0.
-        assert!(state
-            .validate_state_revision("addon-a", "main", 0)
-            .is_ok());
+        assert!(state.validate_state_revision("addon-a", "main", 0).is_ok());
 
         // Advance to 1.
-        state
-            .advance_state_revision("addon-a", "main", 1)
-            .unwrap();
+        state.advance_state_revision("addon-a", "main", 1).unwrap();
 
         // Now base_revision 0 is stale.
         let err = state
@@ -787,16 +779,13 @@ mod tests {
         ));
 
         // Matching revision works.
-        assert!(state
-            .validate_state_revision("addon-a", "main", 1)
-            .is_ok());
+        assert!(state.validate_state_revision("addon-a", "main", 1).is_ok());
     }
 
     #[test]
     fn reserved_namespace_enforcement() {
         for root in RESERVED_STATE_ROOTS {
-            let err =
-                SessionState::validate_state_path_writable(root, false).unwrap_err();
+            let err = SessionState::validate_state_path_writable(root, false).unwrap_err();
             assert!(matches!(err, SessionError::ReservedNamespace { .. }));
 
             // From a local action handler, reserved roots are writable.
@@ -863,12 +852,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(state
-            .validate_action("addon-a", "main", "save")
-            .is_ok());
-        assert!(state
-            .validate_action("addon-a", "main", "delete")
-            .is_ok());
+        assert!(state.validate_action("addon-a", "main", "save").is_ok());
+        assert!(state.validate_action("addon-a", "main", "delete").is_ok());
 
         let err = state
             .validate_action("addon-a", "main", "hack")
@@ -998,9 +983,7 @@ mod tests {
     #[test]
     fn advance_revision_panel_not_open() {
         let mut state = SessionState::new();
-        let err = state
-            .advance_state_revision("x", "y", 1)
-            .unwrap_err();
+        let err = state.advance_state_revision("x", "y", 1).unwrap_err();
         assert!(matches!(err, SessionError::PanelNotOpen { .. }));
     }
 
@@ -1035,24 +1018,24 @@ mod tests {
     fn registry_addon_connection_lifecycle() {
         let reg = SessionRegistry::new();
 
-        assert!(reg.find_connection("contacts", 1).is_none());
+        assert!(reg.find_connection("contacts", "1").is_none());
 
-        reg.register_addon_connection("contacts", 1, 42);
-        assert_eq!(reg.find_connection("contacts", 1), Some(42));
+        reg.register_addon_connection("contacts", "1", 42);
+        assert_eq!(reg.find_connection("contacts", "1"), Some(42));
 
         // Different user_id — not found.
-        assert!(reg.find_connection("contacts", 2).is_none());
+        assert!(reg.find_connection("contacts", "2").is_none());
 
-        reg.unregister_addon_connection("contacts", 1);
-        assert!(reg.find_connection("contacts", 1).is_none());
+        reg.unregister_addon_connection("contacts", "1");
+        assert!(reg.find_connection("contacts", "1").is_none());
     }
 
     #[test]
     fn registry_addon_connection_overwrite() {
         let reg = SessionRegistry::new();
-        reg.register_addon_connection("a", 1, 10);
-        reg.register_addon_connection("a", 1, 20);
-        assert_eq!(reg.find_connection("a", 1), Some(20));
+        reg.register_addon_connection("a", "1", 10);
+        reg.register_addon_connection("a", "1", 20);
+        assert_eq!(reg.find_connection("a", "1"), Some(20));
     }
 
     // =========================================================================
@@ -1156,7 +1139,9 @@ mod tests {
             ("literal".into(), "contacts".into()),
             ("literal".into(), "deleted".into()),
         ];
-        let err = state.validate_event_publish("addon-a", &segments).unwrap_err();
+        let err = state
+            .validate_event_publish("addon-a", &segments)
+            .unwrap_err();
         assert!(matches!(err, SessionError::EventTopicNotDeclared { .. }));
     }
 
@@ -1164,7 +1149,9 @@ mod tests {
     fn validate_event_publish_no_panels_open() {
         let state = SessionState::new();
         let segments = vec![("literal".into(), "x".into())];
-        let err = state.validate_event_publish("addon-a", &segments).unwrap_err();
+        let err = state
+            .validate_event_publish("addon-a", &segments)
+            .unwrap_err();
         assert!(matches!(err, SessionError::EventTopicNotDeclared { .. }));
     }
 }

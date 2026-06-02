@@ -28,15 +28,10 @@ fn bad_request(msg: &str) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidFrame, msg.to_string())
 }
 
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -67,7 +62,7 @@ fn desc_to_proto(d: crate::meeting::SessionDescriptor) -> MeetingSessionDescript
         novnc_port: d.novnc_port.map(|p| p as i32).unwrap_or(0),
         bot_endpoint_id: d.bot_endpoint_id.unwrap_or_default(),
         container_name: d.container_name.unwrap_or_default(),
-        owner_user_id: d.owner_user_id.unwrap_or(0),
+        owner_user_id: d.owner_user_id.unwrap_or_default(),
         lifecycle_stage: d.lifecycle_stage.unwrap_or_default(),
         lifecycle_details: d.lifecycle_details.unwrap_or_default(),
         backend_stt_model: d.backend_stt_model.unwrap_or_default(),
@@ -97,7 +92,7 @@ fn empty_desc() -> MeetingSessionDescriptor {
         novnc_port: 0,
         bot_endpoint_id: String::new(),
         container_name: String::new(),
-        owner_user_id: 0,
+        owner_user_id: String::new(),
         lifecycle_stage: String::new(),
         lifecycle_details: String::new(),
         backend_stt_model: String::new(),
@@ -277,7 +272,7 @@ pub fn meeting_session_list(
     let sessions = ctx
         .state
         .meeting_manager
-        .session_list(owner)
+        .session_list(owner.as_deref())
         .map_err(internal)?
         .into_iter()
         .map(desc_to_proto)
@@ -388,7 +383,7 @@ pub fn meeting_active_session(
     let active = ctx
         .state
         .meeting_manager
-        .active_for_user(uid)
+        .active_for_user(&uid)
         .map_err(internal)?;
     let resp = match active {
         Some(d) => MeetingActiveSessionResponse {
@@ -419,7 +414,8 @@ pub fn meeting_settings_get(
     let uid = current_user_id(ctx).ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "session missing user_id")
     })?;
-    let rows = repository::transcripts::list_user_settings(&ctx.state.db, uid).map_err(internal)?;
+    let rows =
+        repository::transcripts::list_user_settings(&ctx.state.db, &uid).map_err(internal)?;
     let settings = rows
         .into_iter()
         .map(|(k, v)| MeetingSettingKv { key: k, value: v })
@@ -454,7 +450,7 @@ pub fn meeting_settings_update(
         if kv.value.len() > 1024 {
             return Err(bad_request("value >1024 znakow"));
         }
-        repository::transcripts::set_user_setting(&ctx.state.db, uid, &kv.key, &kv.value)
+        repository::transcripts::set_user_setting(&ctx.state.db, &uid, &kv.key, &kv.value)
             .map_err(internal)?;
     }
     Ok(MessageBody::MeetingBody(MeetingPayload::ResSettingsUpdate(
@@ -483,7 +479,7 @@ fn resolve_owned_session_id(ctx: &HandlerContext, meeting_key: &str) -> Result<i
     let owner = repository::transcripts::owner_of_meeting_key(&ctx.state.db, meeting_key)
         .map_err(internal)?
         .flatten();
-    if owner != Some(me) {
+    if owner != Some(me.clone()) {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             "nie masz dostepu do tej sesji",
@@ -763,10 +759,16 @@ mod tests {
         MeetingSummariesListRequest, MeetingTranscriptExportRequest,
     };
 
+    /// Buduje deterministyczny UUID string z liczby testowej (te same int → ten
+    /// sam UUID), zgodny z owner_user_id zapisywanym w fixture'ach.
+    fn test_uuid(uid: i64) -> String {
+        format!("00000000-0000-0000-0000-{:012}", uid)
+    }
+
     fn user_ctx(state: std::sync::Arc<AppState>, uid: i64, admin: bool) -> HandlerContext {
-        let mut bytes = [0u8; 16];
-        bytes[0] = 0xFF;
-        bytes[8..].copy_from_slice(&(uid as u64).to_le_bytes());
+        let bytes = *uuid::Uuid::parse_str(&test_uuid(uid))
+            .expect("valid uuid")
+            .as_bytes();
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: bytes,
@@ -788,7 +790,7 @@ mod tests {
             let conn = state.db.lock().unwrap();
             conn.execute(
                 "UPDATE meeting_sessions SET owner_user_id = ?1, started_at = '2024-04-23 14:22:00' WHERE id = ?2",
-                rusqlite::params![owner, sid],
+                rusqlite::params![test_uuid(owner), sid],
             )
             .unwrap();
         }

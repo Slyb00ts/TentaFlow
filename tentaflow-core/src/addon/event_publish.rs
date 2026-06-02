@@ -88,7 +88,7 @@ pub fn publish_event(
     let event = Event {
         event_type: event_type.to_string(),
         source_addon: Some(caller.addon_id.clone()),
-        source_user: caller.user_id,
+        source_user: caller.user_id.clone(),
         payload,
         timestamp: chrono::Utc::now(),
     };
@@ -116,7 +116,7 @@ fn permission_granted(
     if !permissions.iter().any(|p| p == permission_type) {
         return false;
     }
-    let user_id = match caller.user_id {
+    let user_id = match caller.user_id.as_deref() {
         Some(id) => id,
         None => return caller.is_system_call,
     };
@@ -146,7 +146,7 @@ fn emit_audit(
     let risk_db = RiskClass::Unclassified.as_db_str();
     let instance = caller.instance_id.as_deref();
     let hash_input = crate::audit::chain::AuditRowHashInput {
-        user_id: caller.user_id,
+        user_id: caller.user_id.as_deref(),
         addon_id: Some(caller.addon_id.as_str()),
         instance_id: instance,
         action,

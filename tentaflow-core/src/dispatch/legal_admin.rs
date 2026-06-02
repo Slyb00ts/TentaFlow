@@ -25,8 +25,8 @@ use tentaflow_protocol::{
 use super::HandlerContext;
 use crate::db::legal_documents::list_by_org;
 use crate::services::legal::{
-    RodoGenerationError, RodoGenerationInput, RodoVariant, generate_rodo, mint_legal_url,
-    revoke_document_async,
+    generate_rodo, mint_legal_url, revoke_document_async, RodoGenerationError, RodoGenerationInput,
+    RodoVariant,
 };
 use crate::services::rbac::OrgContext;
 

@@ -173,7 +173,9 @@ pub async fn ensure_embedded_engine_loaded(
     engine_id: &str,
     model_repo: &str,
     // Uzywany tylko przez arm sherpa-onnx (wybor voice z wielogłosowego repo).
-    #[cfg_attr(not(feature = "inference-sherpa"), allow(unused_variables))] voice_hint: Option<&str>,
+    #[cfg_attr(not(feature = "inference-sherpa"), allow(unused_variables))] voice_hint: Option<
+        &str,
+    >,
 ) -> anyhow::Result<()> {
     if shared_tts_manager().read().await.has(engine_id) {
         return Ok(());

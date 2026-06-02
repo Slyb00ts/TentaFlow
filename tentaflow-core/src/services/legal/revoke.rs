@@ -217,9 +217,12 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::migrations::run(&conn).expect("run migrations");
-        // Patch the default org_id to a UUIDv4 the legal subsystem accepts.
+        // Seed a dedicated UUIDv4 org the legal subsystem accepts. Renaming the
+        // migration-seeded `org-default` PK in place would trip the 24 child-table
+        // FKs that reference organizations(org_id).
         conn.execute(
-            "UPDATE organizations SET org_id = ?1 WHERE org_id = 'org-default'",
+            "INSERT INTO organizations (org_id, name, slug, contact_email, dpo_contact, retention_policy_json, status, created_at) \
+             VALUES (?1, ?1, 'test-org', 'office@example.test', NULL, NULL, 'active', '2026-01-01T00:00:00Z')",
             params![ORG],
         )
         .unwrap();

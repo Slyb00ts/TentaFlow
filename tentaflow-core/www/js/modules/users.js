@@ -305,12 +305,12 @@ function handleListClick(e) {
     e.stopPropagation();
     const action = actionBtn.dataset.action;
     if (action === 'edit-user' && row) {
-      openUserDetail(Number(row.dataset.userId));
+      openUserDetail(row.dataset.userId);
     } else if (action === 'delete-user' && row) {
       const u = users.find((x) => String(x.id) === row.dataset.userId);
       if (u) confirmDeleteUser(u);
     } else if (action === 'edit-group' && groupRow) {
-      openGroupDetail(Number(groupRow.dataset.groupId));
+      openGroupDetail(groupRow.dataset.groupId);
     } else if (action === 'delete-group' && groupRow) {
       const g = groups.find((x) => String(x.id) === groupRow.dataset.groupId);
       if (g) confirmDeleteGroup(g);
@@ -324,9 +324,9 @@ function handleListClick(e) {
     return;
   }
   if (row) {
-    openUserDetail(Number(row.dataset.userId));
+    openUserDetail(row.dataset.userId);
   } else if (groupRow) {
-    openGroupDetail(Number(groupRow.dataset.groupId));
+    openGroupDetail(groupRow.dataset.groupId);
   }
 }
 
@@ -826,7 +826,7 @@ function wireGroupPicker(host, selectedSet) {
     const rm = e.target.closest('[data-remove]');
     if (rm) {
       e.preventDefault();
-      selectedSet.delete(Number(rm.dataset.remove));
+      selectedSet.delete(rm.dataset.remove);
       refresh();
     }
   });
@@ -835,7 +835,7 @@ function wireGroupPicker(host, selectedSet) {
     const opt = e.target.closest('[data-add]');
     if (!opt) return;
     e.preventDefault();
-    selectedSet.add(Number(opt.dataset.add));
+    selectedSet.add(opt.dataset.add);
     refresh();
   });
 }

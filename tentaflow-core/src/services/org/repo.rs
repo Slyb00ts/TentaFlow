@@ -10,7 +10,7 @@
 // single hard-coded id (matches `DEFAULT_ORG_ID` in mod.rs) so migration
 // backfills can target it.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 use std::collections::BTreeMap;
 
 use super::error::{OrgError, Result};
@@ -110,17 +110,39 @@ fn record_core_capture_tx(
     resource_id: impl Into<String>,
     action: crate::sync::runtime::SqlWriteAction,
     changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> Result<()> {
+    let resource_id = resource_id.into();
+    // Mint the HLC inside this write transaction so the capture, the drained
+    // ledger operation and the local resource-version index share one instant.
+    let hlc = crate::sync::runtime::core_hlc_now();
+    let epoch = crate::sync::runtime::core_epoch();
+    let descriptor = crate::sync::core_registry::descriptor_for_kind(kind);
     let capture = crate::sync::core_capture::CoreWriteCapture::new(
         kind,
         org_id,
-        resource_id,
+        resource_id.clone(),
         action,
         changed_fields,
         actor_user_id,
+        hlc.clone(),
+        epoch,
     );
     crate::sync::core_capture::record_core_write_capture(tx, &capture).map_err(map_db)?;
+    tx.execute(
+        "INSERT INTO core_resource_versions (resource_type, resource_id, hlc_wall, hlc_logical, hlc_node) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+         hlc_wall = excluded.hlc_wall, hlc_logical = excluded.hlc_logical, hlc_node = excluded.hlc_node",
+        params![
+            descriptor.resource_type,
+            resource_id,
+            hlc.wall_time_ms,
+            hlc.logical as i64,
+            hlc.node_id,
+        ],
+    )
+    .map_err(map_db)?;
     Ok(())
 }
 
@@ -148,7 +170,7 @@ pub fn create_organization(
     contact_email: Option<&str>,
     dpo_contact: Option<&str>,
     retention_policy_json: Option<&str>,
-    _created_by_user_id: Option<i64>,
+    _created_by_user_id: Option<&str>,
 ) -> Result<Organization> {
     let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
     let tx = conn.transaction().map_err(map_db)?;
@@ -186,7 +208,7 @@ pub fn create_organization(
                     Some(retention_policy_json),
                     Some("active"),
                 ),
-                _created_by_user_id,
+                _created_by_user_id.map(|id| id.to_string()),
             )?;
             tx.commit().map_err(map_db)?;
             Ok(Organization {
@@ -795,7 +817,7 @@ mod tests {
             Some("captured@example.com"),
             None,
             None,
-            Some(actor_id),
+            Some(actor_id.as_str()),
         )
         .unwrap();
         let capture_id = capture_id_for_resource(&pool, "core.organization", &org.org_id);

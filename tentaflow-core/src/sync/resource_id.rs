@@ -74,18 +74,10 @@ mod tests {
     fn composite_is_injective_even_when_segments_contain_separator() {
         // Reviewer's collision case: a raw-separator codec maps both inputs to
         // the same key. Length-prefixing must keep them distinct.
-        let left = composite_resource_id(&[
-            "org",
-            &format!("addon{RESOURCE_ID_SEP}type"),
-            "res",
-            "id",
-        ]);
-        let right = composite_resource_id(&[
-            "org",
-            "addon",
-            "type",
-            &format!("res{RESOURCE_ID_SEP}id"),
-        ]);
+        let left =
+            composite_resource_id(&["org", &format!("addon{RESOURCE_ID_SEP}type"), "res", "id"]);
+        let right =
+            composite_resource_id(&["org", "addon", "type", &format!("res{RESOURCE_ID_SEP}id")]);
         assert_ne!(left, right);
     }
 

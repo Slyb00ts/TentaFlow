@@ -16,7 +16,7 @@ const CHANNEL_CAPACITY: usize = 512;
 #[derive(Debug, Clone)]
 pub struct UiCborPush {
     /// User that owns the panel session receiving this message.
-    pub user_id: i64,
+    pub user_id: String,
     /// Raw CBOR bytes (UiPayload wire encoding). Arc-shared to avoid
     /// cloning per broadcast subscriber.
     pub cbor: Arc<[u8]>,

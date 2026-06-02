@@ -59,7 +59,7 @@ pub struct ExecutionContext {
     /// Stack of flow ids currently executing. A flow that resolves into
     /// another flow pushes onto this stack; a 4th entry would mean a
     /// deeply nested user flow, which we reject as a config mistake.
-    pub flow_stack: Vec<i64>,
+    pub flow_stack: Vec<String>,
     /// Stack of alias names currently being resolved. Each `enter_alias`
     /// pushes; cycle detection compares against existing entries.
     pub alias_stack: Vec<String>,
@@ -77,7 +77,7 @@ pub enum ContextLimitError {
     #[error("alias cycle detected at '{name}' (chain: {chain})")]
     AliasCycle { name: String, chain: String },
     #[error("flow recursion exceeded depth {limit} at flow_id={flow_id}")]
-    MaxFlowDepth { flow_id: i64, limit: usize },
+    MaxFlowDepth { flow_id: String, limit: usize },
     #[error("mesh forward exceeded {limit} hops")]
     MaxHopCount { limit: u8 },
 }
@@ -120,14 +120,14 @@ impl ExecutionContext {
     }
 
     /// Push a flow id onto the recursion stack.
-    pub fn enter_flow(&mut self, flow_id: i64) -> Result<(), ContextLimitError> {
+    pub fn enter_flow(&mut self, flow_id: &str) -> Result<(), ContextLimitError> {
         if self.flow_stack.len() >= MAX_FLOW_DEPTH {
             return Err(ContextLimitError::MaxFlowDepth {
-                flow_id,
+                flow_id: flow_id.to_string(),
                 limit: MAX_FLOW_DEPTH,
             });
         }
-        self.flow_stack.push(flow_id);
+        self.flow_stack.push(flow_id.to_string());
         Ok(())
     }
 
@@ -181,9 +181,9 @@ mod tests {
     fn flow_depth_3_passes_4_fails() {
         let mut ctx = ExecutionContext::new(None);
         for i in 0..MAX_FLOW_DEPTH {
-            ctx.enter_flow(i as i64).unwrap();
+            ctx.enter_flow(&i.to_string()).unwrap();
         }
-        let err = ctx.enter_flow(99).unwrap_err();
+        let err = ctx.enter_flow("99").unwrap_err();
         assert!(matches!(err, ContextLimitError::MaxFlowDepth { .. }));
     }
 

@@ -36,15 +36,10 @@ fn parse_epoch_opt(s: &Option<String>) -> Option<u64> {
     s.as_deref().map(parse_epoch)
 }
 
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -73,7 +68,7 @@ fn audit(
     let node_id = ctx.state.local_node_id.as_ref();
     if let Err(e) = repository::log_audit_full(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         addon_id_hint,
         action,
         Some(resource_type),
@@ -225,7 +220,7 @@ pub async fn addon_oauth_config_set(
         encrypted.as_deref(),
         &payload.redirect_uri,
         payload.enabled,
-        updated_by,
+        updated_by.as_deref(),
         &payload.oauth_mode,
     )
     .map_err(db_err)?;
@@ -383,7 +378,7 @@ pub fn addon_oauth_authorize_start(
     repository::insert_oauth_state(
         &ctx.state.db,
         &state,
-        store_user_id,
+        store_user_id.as_deref(),
         &payload.addon_id,
         &payload.provider_id,
         effective_mode,
@@ -435,7 +430,7 @@ pub fn addon_oauth_linked_accounts(
             let uid = current_user_id(ctx).ok_or_else(|| {
                 ProtocolError::new(ProtocolErrorCode::AuthRequired, "brak user_id")
             })?;
-            repository::list_user_oauth_accounts_for_user(&ctx.state.db, uid)
+            repository::list_user_oauth_accounts_for_user(&ctx.state.db, &uid)
                 .map_err(db_err)?
                 .into_iter()
                 .filter(|a| a.addon_id == payload.addon_id)
@@ -516,7 +511,7 @@ pub async fn addon_oauth_revoke(
     let revoked =
         repository::revoke_oauth_account(&ctx.state.db, payload.account_id).map_err(db_err)?;
     if revoked {
-        let target_email = match account.user_id {
+        let target_email = match account.user_id.as_deref() {
             Some(uid) => repository::get_user_email_by_id(&ctx.state.db, uid)
                 .map_err(db_err)?
                 .unwrap_or_default(),
@@ -601,7 +596,7 @@ pub fn addon_oauth_reauthorize(
     repository::insert_oauth_state(
         &ctx.state.db,
         &state,
-        account.user_id,
+        account.user_id.as_deref(),
         &account.addon_id,
         &account.provider_id,
         mode,
@@ -671,7 +666,7 @@ pub async fn addon_oauth_test_connection(
 
     // Pick target user_id: global -> NULL, individual -> admin's own id.
     let admin_uid = current_user_id(ctx);
-    let target_user_id: Option<i64> = match cfg.oauth_mode.as_str() {
+    let target_user_id: Option<String> = match cfg.oauth_mode.as_str() {
         "global" => None,
         "individual" => match admin_uid {
             Some(uid) => Some(uid),
@@ -697,7 +692,7 @@ pub async fn addon_oauth_test_connection(
     };
 
     // Find matching account row.
-    let accounts = match target_user_id {
+    let accounts = match target_user_id.as_deref() {
         Some(uid) => repository::list_user_oauth_accounts_for_user(&ctx.state.db, uid)
             .map_err(db_err)?
             .into_iter()
@@ -831,7 +826,7 @@ pub async fn addon_oauth_test_connection(
     });
     let _ = repository::upsert_user_oauth_account(
         &ctx.state.db,
-        account.user_id,
+        account.user_id.as_deref(),
         &payload.addon_id,
         &payload.provider_id,
         &account.external_account_id,

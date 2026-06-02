@@ -53,8 +53,7 @@ pub async fn write_envelope(
     send: &mut SendStream,
     envelope: &Envelope,
 ) -> Result<(), IrohStreamError> {
-    let bytes = tentaflow_protocol::cbor::encode(envelope)
-        .map_err(IrohStreamError::Encode)?;
+    let bytes = tentaflow_protocol::cbor::encode(envelope).map_err(IrohStreamError::Encode)?;
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(IrohStreamError::FrameTooLarge(bytes.len()));
     }

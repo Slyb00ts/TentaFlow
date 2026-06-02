@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 mod tests {
-    use super::super::{HandlerContext, dispatch, find, handler_count};
+    use super::super::{dispatch, find, handler_count, HandlerContext};
     use std::time::Instant;
     use tentaflow_protocol::{MessageBody, SessionAuth};
 

@@ -624,14 +624,10 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::migrations::run(&conn).expect("run migrations");
-        // Migrations seed a default org under a non-UUID slug; rename it to a
-        // valid UUIDv4 so path containment (which requires UUIDv4) is exercised
-        // by the happy-path tests as well.
-        conn.execute(
-            "UPDATE organizations SET org_id = ?1 WHERE org_id = 'org-default'",
-            params![TEST_ORG_ID],
-        )
-        .unwrap();
+        // Seed a dedicated UUIDv4 org (path containment requires UUIDv4) instead
+        // of renaming the migration-seeded `org-default`: 24 child tables FK the
+        // org PK, so an in-place rename would trip foreign-key enforcement.
+        seed_org(&conn, TEST_ORG_ID, "test-org");
         seed_membership(&conn, TEST_ORG_ID, TEST_USER_ID);
         conn
     }
