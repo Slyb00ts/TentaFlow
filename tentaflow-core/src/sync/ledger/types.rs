@@ -195,6 +195,25 @@ pub struct HybridLogicalTimestamp {
     pub node_id: String,
 }
 
+// Total order over the lexicographic tuple (wall_time_ms, logical, node_id).
+// The node_id tie-break makes the order total even when two nodes mint the
+// same (wall, logical) pair, which is what conflict resolution needs to pick a
+// single deterministic winner across the whole mesh.
+impl Ord for HybridLogicalTimestamp {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.wall_time_ms
+            .cmp(&other.wall_time_ms)
+            .then_with(|| self.logical.cmp(&other.logical))
+            .then_with(|| self.node_id.cmp(&other.node_id))
+    }
+}
+
+impl PartialOrd for HybridLogicalTimestamp {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewSyncOperation {
     pub org_id: String,
@@ -467,6 +486,10 @@ pub trait SyncLedgerStore: Send + Sync {
     ) -> LedgerResult<()>;
     fn mark_delivered(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn mark_acknowledged(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
+    /// Removes a single outbox entry keyed by `(target, op_id)`. Used to lazily
+    /// reap orphaned entries whose backing operation has been compacted away;
+    /// removing an absent key is a no-op.
+    fn remove_outbox_entry(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn get_peer_cursor(
         &self,
         peer: PeerId,
@@ -507,7 +530,18 @@ pub trait SyncLedgerStore: Send + Sync {
         up_to_sequence: u64,
     ) -> LedgerResult<Vec<OutboxEntry>>;
     fn compact(&self, policy: CompactionPolicy) -> LedgerResult<()>;
+    /// Wipes all ledger state for partitions whose `partition_id` starts with
+    /// `partition_prefix`. Phase B uses this to rebuild core data from a fresh
+    /// baseline without touching addon/kv data.
+    fn reset_partitions_with_prefix(&self, partition_prefix: &str) -> LedgerResult<()>;
+    /// Convenience wrapper that resets every core partition (`core/...`).
+    fn reset_core_partitions(&self) -> LedgerResult<()> {
+        self.reset_partitions_with_prefix(CORE_PARTITION_PREFIX)
+    }
 }
+
+/// Prefix shared by every core-owned partition_id (`core/org/<org>/<suffix>`).
+pub const CORE_PARTITION_PREFIX: &str = "core/";
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> LedgerResult<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -529,4 +563,49 @@ pub(crate) fn signing_bytes_for_hash(operation_hash: [u8; 32]) -> Vec<u8> {
     let mut bytes = b"tentaflow-sync-operation-v1".to_vec();
     bytes.extend_from_slice(&operation_hash);
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn hlc(wall: i64, logical: u32, node: &str) -> HybridLogicalTimestamp {
+        HybridLogicalTimestamp {
+            wall_time_ms: wall,
+            logical,
+            node_id: node.to_string(),
+        }
+    }
+
+    #[test]
+    fn newer_wall_time_is_greater() {
+        let older = hlc(100, 9, "node_z");
+        let newer = hlc(200, 0, "node_a");
+        assert!(newer > older);
+        assert!(older < newer);
+    }
+
+    #[test]
+    fn equal_wall_breaks_on_logical() {
+        let lower = hlc(100, 1, "node_z");
+        let higher = hlc(100, 2, "node_a");
+        assert!(higher > lower);
+    }
+
+    #[test]
+    fn equal_wall_and_logical_breaks_on_node_id() {
+        let a = hlc(100, 5, "node_a");
+        let b = hlc(100, 5, "node_b");
+        assert!(b > a);
+        assert_eq!(a.cmp(&b), Ordering::Less);
+    }
+
+    #[test]
+    fn ordering_is_antisymmetric_and_reflexive() {
+        let a = hlc(100, 5, "node_a");
+        let b = hlc(100, 5, "node_b");
+        assert_eq!(a.cmp(&b), b.cmp(&a).reverse());
+        assert_eq!(a.cmp(&a), Ordering::Equal);
+    }
 }

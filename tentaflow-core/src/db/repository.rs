@@ -2601,11 +2601,18 @@ fn field_optional_i64(value: Option<i64>) -> crate::sync::ledger::FieldValue {
         .unwrap_or(crate::sync::ledger::FieldValue::Null)
 }
 
-fn sync_resource_acl_core_id(addon_id: &str, resource_type: &str, resource_id: &str) -> String {
-    format!("{addon_id}\u{1f}{resource_type}\u{1f}{resource_id}")
+fn sync_resource_acl_core_id(
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> String {
+    crate::sync::resource_id::scoped_acl_resource_id(org_id, addon_id, resource_type, resource_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_explicit_share_core_id(
+    org_id: &str,
     addon_id: &str,
     resource_type: &str,
     resource_id: &str,
@@ -2613,15 +2620,27 @@ fn sync_explicit_share_core_id(
     subject_id: &str,
     action: &str,
 ) -> String {
-    format!("{addon_id}\u{1f}{resource_type}\u{1f}{resource_id}\u{1f}{subject_type}\u{1f}{subject_id}\u{1f}{action}")
+    crate::sync::resource_id::scoped_explicit_share_resource_id(
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        subject_type,
+        subject_id,
+        action,
+    )
 }
 
 fn node_user_assignment_core_id(node_id: &str, user_id: i64, assignment_mode: &str) -> String {
-    format!("{node_id}\u{1f}{user_id}\u{1f}{assignment_mode}")
+    crate::sync::resource_id::composite_resource_id(&[
+        node_id,
+        &user_id.to_string(),
+        assignment_mode,
+    ])
 }
 
 fn sync_user_org_profile_core_id(org_id: &str, user_id: i64) -> String {
-    format!("{org_id}\u{1f}{user_id}")
+    crate::sync::resource_id::composite_resource_id(&[org_id, &user_id.to_string()])
 }
 
 fn flow_changed_fields(
@@ -4982,6 +5001,28 @@ pub fn ensure_trusted_nodes_in_sync_identity(pool: &DbPool) -> Result<usize> {
     Ok(changed)
 }
 
+/// Rejestruje lokalny node we własnym rejestrze tożsamości sync. Bez tego wpisu
+/// `ensure_local_target_allowed` odrzuca każdy przychodzący push (lokalny node nie
+/// jest widziany jako dozwolony target własnych zasobów). Wpis jest czysto lokalny
+/// i nie generuje operacji sync — peery weryfikują operacje po node_id (hex klucza
+/// ed25519), nie po zsynchronizowanym wierszu sync_nodes. Domyślnie `authority`,
+/// bo lokalny node przechowuje wszystko, co jest do niego replikowane. Czysto
+/// addytywne: istniejący wiersz (np. skonfigurowany profil) nie jest nadpisywany.
+pub fn ensure_local_node_in_sync_identity(
+    pool: &DbPool,
+    node_id: &str,
+    public_key: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_nodes \
+         (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile) \
+         VALUES (?1, ?2, 'ed25519', '', 'server', 'trusted', NULL, 'authority')",
+        rusqlite::params![node_id, public_key],
+    )?;
+    Ok(())
+}
+
 // =============================================================================
 // Sync Identity Registry — node/device, user keys i przypisania
 // =============================================================================
@@ -5467,7 +5508,7 @@ pub fn upsert_sync_resource_acl(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::SyncResourceAcl,
         org_id,
-        sync_resource_acl_core_id(addon_id, resource_type, resource_id),
+        sync_resource_acl_core_id(org_id, addon_id, resource_type, resource_id),
         crate::sync::runtime::SqlWriteAction::Insert,
         fields,
         None,
@@ -5525,7 +5566,7 @@ pub fn delete_sync_resource_acl(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::SyncResourceAcl,
         org_id,
-        sync_resource_acl_core_id(addon_id, resource_type, resource_id),
+        sync_resource_acl_core_id(org_id, addon_id, resource_type, resource_id),
         crate::sync::runtime::SqlWriteAction::Delete,
         fields,
         None,
@@ -5582,6 +5623,7 @@ pub fn grant_sync_explicit_share(
         crate::sync::core_registry::CoreSyncResourceKind::SyncExplicitShare,
         org_id,
         sync_explicit_share_core_id(
+            org_id,
             addon_id,
             resource_type,
             resource_id,
@@ -5643,6 +5685,7 @@ pub fn revoke_sync_explicit_share(
         crate::sync::core_registry::CoreSyncResourceKind::SyncExplicitShare,
         org_id,
         sync_explicit_share_core_id(
+            org_id,
             addon_id,
             resource_type,
             resource_id,
@@ -5810,7 +5853,16 @@ fn can_node_receive_sync_resource_with_conn(
         return Ok(allow("authority_node"));
     }
     if is_default_core_sync_resource(addon_id, resource_type) {
-        return Ok(allow("core_trusted_node"));
+        // Blanket replication to trusted nodes only applies when the resource has no
+        // per-resource ACL row. Once a row exists in sync_resource_acl (explicit share /
+        // assigned user), it scopes the resource and the blanket allow must yield to the
+        // per-ACL checks below; otherwise a denied/revoked node would still receive pushes.
+        // Resources without a row (RBAC, identity, global settings) keep the blanket allow.
+        if load_sync_resource_acl_with_conn(conn, org_id, addon_id, resource_type, resource_id)?
+            .is_none()
+        {
+            return Ok(allow("core_trusted_node"));
+        }
     }
     if has_explicit_share_with_conn(
         conn,

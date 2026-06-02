@@ -250,6 +250,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_restore_org_id",
             MigrationStep::Rust(cameras_restore_org_id_column),
         ),
+        (
+            52,
+            "core_resource_versions",
+            MigrationStep::Sql(CORE_RESOURCE_VERSIONS),
+        ),
     ]
 }
 
@@ -767,6 +772,21 @@ CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_sha
     ON __tentaflow_blob_sync_captures(org_id, sha256);
 CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_operation
     ON __tentaflow_blob_sync_captures(operation_id);
+"#;
+
+// v52 — last-writer HLC bookmark per synced resource. Phase B will write the
+// HLC of the most recently applied operation here so conflict resolution can
+// compare an incoming operation against the resource's current version without
+// replaying the ledger. Additive in phase A: no write path touches it yet.
+const CORE_RESOURCE_VERSIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS core_resource_versions (
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    hlc_wall INTEGER NOT NULL,
+    hlc_logical INTEGER NOT NULL,
+    hlc_node TEXT NOT NULL,
+    PRIMARY KEY(resource_type, resource_id)
+);
 "#;
 
 // F2 P2.a — formalise the legal value set for `model_aliases.strategy`.

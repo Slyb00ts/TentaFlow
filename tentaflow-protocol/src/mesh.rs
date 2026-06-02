@@ -1041,6 +1041,83 @@ pub struct MeshSyncSnapshotResponsePayload {
     pub operations_after_snapshot: Vec<MeshSyncOperationWire>,
 }
 
+// =============================================================================
+// Sync Ledger — baseline-adopt pairing (faza A: definicje typow)
+// =============================================================================
+//
+// Baseline adopt: gdy nowy node dolacza do mesh, wybierany jest donor, ktory
+// przesyla pelny baseline core'a (snapshot tabel) w chunkach. Typy ponizej
+// opisuja wire format negocjacji donora i transferu. Faza A dodaje wylacznie
+// definicje + (de)serializacje; podpiecie do ledgera nastapi w fazie B.
+
+/// Monotoniczny epoch baseline'u. Porzadek leksykograficzny (counter,
+/// origin_node) daje deterministyczny tie-break gdy dwa nody wybija ten sam
+/// licznik.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineEpoch {
+    pub counter: u64,
+    pub origin_node: String,
+}
+
+impl Ord for BaselineEpoch {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.counter
+            .cmp(&other.counter)
+            .then_with(|| self.origin_node.cmp(&other.origin_node))
+    }
+}
+
+impl PartialOrd for BaselineEpoch {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Propozycja donora baseline'u wyslana przez dolaczajacy node.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineElect {
+    pub node_id: String,
+    pub proposed_donor: String,
+    pub epoch_seen: u64,
+}
+
+/// Odpowiedz donora na `BaselineElect` — akceptacja albo odrzucenie roli donora.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAck {
+    pub accepted: bool,
+    pub donor: String,
+    pub joiner: String,
+    pub epoch: u64,
+}
+
+/// Naglowek transferu baseline'u — opisuje co i ile zostanie przeslane przed
+/// pierwszym chunkiem.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineHeader {
+    pub schema_version: u32,
+    pub epoch: u64,
+    pub tables: Vec<String>,
+    pub row_counts: Vec<u64>,
+    pub total_bytes: u64,
+    pub max_bytes: u64,
+}
+
+/// Pojedynczy chunk baseline'u. `content_hash` to 32-bajtowy hash `bytes`,
+/// weryfikowany przez odbiorce przed zlozeniem snapshotu.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineChunk {
+    pub seq: u64,
+    pub content_hash: [u8; 32],
+    pub bytes: Vec<u8>,
+}
+
+/// Potwierdzenie pojedynczego chunka baseline'u.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineChunkAck {
+    pub seq: u64,
+    pub ok: bool,
+}
+
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum StorageValueWire {
     Null,
@@ -1315,6 +1392,103 @@ mod tests {
             }
             _ => panic!("Oczekiwano wariantu ForwardRequest"),
         }
+    }
+
+    // =========================================================================
+    // Testy typow baseline-adopt
+    // =========================================================================
+
+    #[test]
+    fn baseline_epoch_orders_by_counter_then_origin() {
+        let a = BaselineEpoch {
+            counter: 1,
+            origin_node: "node_z".to_string(),
+        };
+        let b = BaselineEpoch {
+            counter: 2,
+            origin_node: "node_a".to_string(),
+        };
+        assert!(b > a);
+
+        let same_counter_a = BaselineEpoch {
+            counter: 5,
+            origin_node: "node_a".to_string(),
+        };
+        let same_counter_b = BaselineEpoch {
+            counter: 5,
+            origin_node: "node_b".to_string(),
+        };
+        assert!(same_counter_b > same_counter_a);
+    }
+
+    #[test]
+    fn baseline_epoch_roundtrip() {
+        let epoch = BaselineEpoch {
+            counter: 42,
+            origin_node: "donor-1".to_string(),
+        };
+        let bytes = crate::cbor::encode(&epoch).expect("encode");
+        let decoded = crate::cbor::decode::<BaselineEpoch>(&bytes).expect("decode");
+        assert_eq!(decoded, epoch);
+    }
+
+    #[test]
+    fn baseline_elect_and_ack_roundtrip() {
+        let elect = BaselineElect {
+            node_id: "joiner-1".to_string(),
+            proposed_donor: "donor-1".to_string(),
+            epoch_seen: 7,
+        };
+        let bytes = crate::cbor::encode(&elect).expect("encode");
+        let decoded = crate::cbor::decode::<BaselineElect>(&bytes).expect("decode");
+        assert_eq!(decoded.node_id, "joiner-1");
+        assert_eq!(decoded.proposed_donor, "donor-1");
+        assert_eq!(decoded.epoch_seen, 7);
+
+        let ack = BaselineAck {
+            accepted: true,
+            donor: "donor-1".to_string(),
+            joiner: "joiner-1".to_string(),
+            epoch: 7,
+        };
+        let bytes = crate::cbor::encode(&ack).expect("encode");
+        let decoded = crate::cbor::decode::<BaselineAck>(&bytes).expect("decode");
+        assert!(decoded.accepted);
+        assert_eq!(decoded.epoch, 7);
+    }
+
+    #[test]
+    fn baseline_header_and_chunk_roundtrip() {
+        let header = BaselineHeader {
+            schema_version: 52,
+            epoch: 7,
+            tables: vec!["flows".to_string(), "roles".to_string()],
+            row_counts: vec![3, 5],
+            total_bytes: 4096,
+            max_bytes: 1_048_576,
+        };
+        let bytes = crate::cbor::encode(&header).expect("encode");
+        let decoded = crate::cbor::decode::<BaselineHeader>(&bytes).expect("decode");
+        assert_eq!(decoded.tables, vec!["flows", "roles"]);
+        assert_eq!(decoded.row_counts, vec![3, 5]);
+        assert_eq!(decoded.schema_version, 52);
+
+        let chunk = BaselineChunk {
+            seq: 2,
+            content_hash: [9u8; 32],
+            bytes: vec![1, 2, 3, 4],
+        };
+        let bytes = crate::cbor::encode(&chunk).expect("encode");
+        let decoded = crate::cbor::decode::<BaselineChunk>(&bytes).expect("decode");
+        assert_eq!(decoded.seq, 2);
+        assert_eq!(decoded.content_hash, [9u8; 32]);
+        assert_eq!(decoded.bytes, vec![1, 2, 3, 4]);
+
+        let ack = BaselineChunkAck { seq: 2, ok: true };
+        let bytes = crate::cbor::encode(&ack).expect("encode");
+        let decoded = crate::cbor::decode::<BaselineChunkAck>(&bytes).expect("decode");
+        assert_eq!(decoded.seq, 2);
+        assert!(decoded.ok);
     }
 
     // =========================================================================
