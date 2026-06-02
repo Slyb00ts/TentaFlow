@@ -154,7 +154,10 @@ impl EmbeddedDeploy {
         }
         crate::tts::ensure_embedded_engine_loaded(&engine_id, &model_repo, voice_hint)
             .await
-            .map_err(|e| DeployError::Other(format!("load embedded TTS '{engine_id}': {e}")))?;
+            // {e:#} — pelny lancuch przyczyn anyhow (np. "dlopen ... nieudane:
+            // Library not loaded @rpath/MLX.framework"), nie tylko zewnetrzny
+            // context. Bez tego deploy-log pokazywal generyczne "load kokoro".
+            .map_err(|e| DeployError::Other(format!("load embedded TTS '{engine_id}': {e:#}")))?;
         if let Some(s) = &self.log_sink {
             s.info(&format!("[tts] {engine_id} engine registered"));
         }

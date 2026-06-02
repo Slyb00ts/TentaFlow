@@ -28,7 +28,10 @@ hex = "0.4"
 data-encoding = "2"
 
 [target.'cfg(target_os = "ios")'.dependencies]
-tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "dashboard-api"] }
+# inference-sherpa: sherpa-onnx + onnxruntime jako embedded TTS/STT. sherpa-rs-sys
+# pobiera prebuilt statyczne libsherpa-onnx.a + libonnxruntime.a dla aarch64-apple-ios
+# (download-binaries) — linkowanie domyka Xcode (libc++, CoreML.framework).
+tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "inference-mlx-kokoro", "inference-sherpa", "dashboard-api"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15.1"

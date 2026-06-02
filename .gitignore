@@ -34,6 +34,11 @@ tentaflow-core/wwwroot/js/generated/
 # Wygenerowany cbindgen header dla .NET P/Invoke
 tentaflow-client/native/include/
 
+# GStreamer iOS xcframework (pobierany przez scripts/setup.sh,
+# install_ios_gstreamer_xcframework — ~600 MB archiwum, 1.2 GB combined lib)
+tentaflow-mobile/ios/Frameworks/GStreamer.xcframework/
+tentaflow-mobile/ios/Frameworks/pkgconfig/
+
 # =============================================================================
 # Bazy danych
 # =============================================================================

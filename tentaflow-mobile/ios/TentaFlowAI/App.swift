@@ -53,6 +53,17 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         MLXSwiftEngine.shared.registerWithRust()
         NSLog("[TentaFlow] MLX callbacks zarejestrowane")
 
+        // Apple TTS (AVSpeechSynthesizer) — rejestracja wskaznikow przed startem
+        // Rust core, tak samo jak MLX (na iOS brak libMLXBridge.dylib do dlopen).
+        NSLog("[TentaFlow] Rejestracja Apple TTS callbacks...")
+        AppleTTSEngine.registerWithRust()
+        NSLog("[TentaFlow] Apple TTS callbacks zarejestrowane")
+
+        // Kokoro MLX (KokoroBridge) — rejestracja przed startem Rust core.
+        NSLog("[TentaFlow] Rejestracja Kokoro callbacks...")
+        KokoroEngineBridge.registerWithRust()
+        NSLog("[TentaFlow] Kokoro callbacks zarejestrowane")
+
         // Uruchom Rust core — serwisy startuja w osobnym watku, nie blokuje main thread.
         // MeshSecurity (z ktorej bierze sie nasz node_id iroh) inicjalizuje sie w tle,
         // wiec NativeDiscovery startujemy dopiero po 4s zeby mesh byl gotowy i FFI

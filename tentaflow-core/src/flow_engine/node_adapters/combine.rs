@@ -79,9 +79,12 @@ impl NodeAdapter for CombineNodeAdapter {
         let mut sorted: Vec<&NodeInput> = inputs.iter().collect();
         sorted.sort_by(|a, b| a.from_node_id.cmp(&b.from_node_id));
 
+        // Puste czlony odfiltrowane — inaczej audio (renderowane do "") albo
+        // Empty payload zostawialy wiszace separatory w prompcie LLM.
         let parts: Vec<String> = sorted
             .iter()
             .map(|inp| flow_value_to_text(&inp.envelope.payload))
+            .filter(|s| !s.is_empty())
             .collect();
         let joined = parts.join(separator);
 
@@ -103,7 +106,10 @@ fn flow_value_to_text(v: &FlowValue) -> String {
         FlowValue::Empty => String::new(),
         FlowValue::Text(s) => s.clone(),
         FlowValue::Json(j) => j.to_string(),
-        FlowValue::Audio { mime, .. } => format!("<audio: {mime}>"),
+        // Audio NIE jest inline'owane do tekstu — w pipeline audio→tekst zawsze
+        // idzie przez STT, a surowy placeholder "<audio: ...>" w prompcie LLM to
+        // smiec (text LLM nic z nim nie zrobi). Zwracamy "" → combine je odfiltruje.
+        FlowValue::Audio { .. } => String::new(),
         FlowValue::Image { mime, .. } => format!("<image: {mime}>"),
         FlowValue::Video { mime, .. } => format!("<video: {mime}>"),
         FlowValue::Embedding(values) => format!("<embedding: {} dims>", values.len()),

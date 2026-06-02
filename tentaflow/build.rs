@@ -373,8 +373,58 @@ fn build_kokoro_bridge() {
         .args(["-id", "@rpath/libKokoroBridge.dylib"])
         .arg(&dylib_dest)
         .status();
+
+    // KokoroBridge — w przeciwienstwie do MLXBridge (statyczny, samowystarczalny)
+    // — jest DYNAMICZNIE linkowany: dylib ma @rpath zaleznosci na MLX.framework,
+    // Cmlx, MLXNN, MisakiSwift, MLXUtilsLibrary, Numerics (bo MisakiSwift/
+    // MLXUtilsLibrary deklaruja `type: .dynamic`). Bez dostarczenia tych
+    // frameworkow + resource bundli (KokoroBridge_KokoroSwiftLocal, MisakiSwift,
+    // Cmlx-metallib, ZIPFoundation) obok dylib, dlopen pada
+    // ("Library not loaded: @rpath/MLX.framework") i deploy konczy sie
+    // generycznym "load kokoro". rpath @loader_path + target_dir ustawia
+    // build_mlx_bridge. Walidacja: dlopen+loadModel+synthesize OK po skopiowaniu.
+    if let Ok(entries) = std::fs::read_dir(products.join("PackageFrameworks")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_str() == Some("KokoroBridge.framework") {
+                continue; // skopiowany juz jako libKokoroBridge.dylib
+            }
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("framework") {
+                continue;
+            }
+            let dest = target_dir.join(&name);
+            let _ = std::fs::remove_dir_all(&dest);
+            if let Err(e) = copy_dir_recursive(&entry.path(), &dest) {
+                println!(
+                    "cargo:warning=tentaflow: copy {} nieudane: {}",
+                    name.to_string_lossy(),
+                    e
+                );
+            }
+        }
+    }
+    // Resource bundle (Bundle.module): KokoroSwiftLocal (espeak/lexicon),
+    // MisakiSwift (G2P), Cmlx (default.metallib), ZIPFoundation.
+    if let Ok(entries) = std::fs::read_dir(&products) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("bundle") {
+                continue;
+            }
+            let dest = target_dir.join(&name);
+            let _ = std::fs::remove_dir_all(&dest);
+            if let Err(e) = copy_dir_recursive(&entry.path(), &dest) {
+                println!(
+                    "cargo:warning=tentaflow: copy {} nieudane: {}",
+                    name.to_string_lossy(),
+                    e
+                );
+            }
+        }
+    }
+
     println!(
-        "cargo:warning=tentaflow: KokoroBridge gotowy ({})",
+        "cargo:warning=tentaflow: KokoroBridge gotowy ({} + frameworks + bundles)",
         dylib_dest.display()
     );
 }
