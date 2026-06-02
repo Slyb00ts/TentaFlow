@@ -17,6 +17,10 @@ pub const SETTING_HIDE_LINK_LOCAL: &str = "mesh.advertise_hide_link_local";
 pub const SETTING_HIDE_LOOPBACK: &str = "mesh.advertise_hide_loopback";
 pub const SETTING_HIDE_CGNAT: &str = "mesh.advertise_hide_cgnat";
 pub const SETTING_PREFER_SAME_SUBNET: &str = "mesh.advertise_prefer_same_subnet";
+/// JSON array nazw interfejsow wykluczonych per-karta z advertise (np.
+/// `["eth3","tun0"]`). Globalne `hide_*` filtruja po kategorii IP; to filtruje
+/// po konkretnej nazwie karty, niezaleznie od kategorii.
+pub const SETTING_EXCLUDED_INTERFACES: &str = "mesh.advertise_excluded_interfaces";
 
 /// Buduje snapshot wszystkich interfejsow sieciowych hosta z adresami IPv4.
 /// IPv6 jest pomijane swiadomie — mesh bind/advertise dziala wylacznie po v4.
@@ -57,12 +61,15 @@ pub fn list_interfaces() -> Vec<NetworkInterfaceInfo> {
 
 /// Filtry decydujace ktore adresy IPv4 wysylamy peerom jako kandydatow.
 /// Kazdy `hide_*` wylacza konkretny zakres; puste filtry => wszystko advertise.
-#[derive(Debug, Clone, Copy)]
+/// `excluded_interfaces` wyklucza konkretne karty po nazwie, niezaleznie od
+/// kategorii IP.
+#[derive(Debug, Clone, Default)]
 pub struct AdvertiseFilters {
     pub hide_docker: bool,
     pub hide_link_local: bool,
     pub hide_loopback: bool,
     pub hide_cgnat: bool,
+    pub excluded_interfaces: Vec<String>,
 }
 
 /// Prosta decyzja po samym IP — dla callerow ktorzy nie znaja kind interfejsu.
@@ -252,11 +259,17 @@ pub fn load_advertise_filters(db: &DbPool) -> AdvertiseFilters {
             .flatten(),
         false,
     );
+    let excluded_interfaces = repository::get_setting(db, SETTING_EXCLUDED_INTERFACES)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default();
     AdvertiseFilters {
         hide_docker,
         hide_link_local,
         hide_loopback,
         hide_cgnat,
+        excluded_interfaces,
     }
 }
 
@@ -283,6 +296,39 @@ pub fn ipv4_kind_map() -> std::collections::HashMap<Ipv4Addr, String> {
         }
     }
     map
+}
+
+/// Mapa `IPv4 -> nazwa interfejsu` z `list_interfaces()`. Potrzebna zeby filtr
+/// per-karta (`excluded_interfaces`) wiedzial do ktorej karty nalezy dany adres.
+pub fn ipv4_name_map() -> std::collections::HashMap<Ipv4Addr, String> {
+    let mut map = std::collections::HashMap::new();
+    for iface in list_interfaces() {
+        for addr in &iface.ipv4_addrs {
+            if let Ok(ip) = addr.parse::<Ipv4Addr>() {
+                map.insert(ip, iface.name.clone());
+            }
+        }
+    }
+    map
+}
+
+/// Pelna decyzja advertise dla adresu: najpierw per-karta exclude (po nazwie),
+/// potem filtry kategorii IP. `kind_map`/`name_map` z `ipv4_kind_map()` /
+/// `ipv4_name_map()`. Wspoldzielona przez `filter_advertise_ips` i sanitizer
+/// trusted-contacts, zeby logika wykluczania nie rozjechala sie miedzy nimi.
+pub fn should_advertise_ip(
+    ip: Ipv4Addr,
+    filters: &AdvertiseFilters,
+    kind_map: &std::collections::HashMap<Ipv4Addr, String>,
+    name_map: &std::collections::HashMap<Ipv4Addr, String>,
+) -> bool {
+    if let Some(name) = name_map.get(&ip) {
+        if filters.excluded_interfaces.iter().any(|n| n == name) {
+            return false;
+        }
+    }
+    let kind = kind_map.get(&ip).map(String::as_str).unwrap_or("unknown");
+    should_advertise_interface_ipv4(ip, kind, filters)
 }
 
 /// Wyznacza bind SocketAddr dla iroh endpoint na podstawie settings.
@@ -337,13 +383,13 @@ pub fn filter_advertise_ips(
     addrs: &[IpAddr],
     filters: &AdvertiseFilters,
     kind_map: &std::collections::HashMap<Ipv4Addr, String>,
+    name_map: &std::collections::HashMap<Ipv4Addr, String>,
 ) -> Vec<IpAddr> {
     addrs
         .iter()
         .filter_map(|ip| match ip {
             IpAddr::V4(v4) => {
-                let kind = kind_map.get(v4).map(String::as_str).unwrap_or("unknown");
-                if should_advertise_interface_ipv4(*v4, kind, filters) {
+                if should_advertise_ip(*v4, filters, kind_map, name_map) {
                     Some(IpAddr::V4(*v4))
                 } else {
                     None
@@ -368,6 +414,7 @@ mod tests {
             hide_link_local: true,
             hide_loopback: true,
             hide_cgnat: true,
+            excluded_interfaces: vec![],
         }
     }
 
@@ -377,6 +424,7 @@ mod tests {
             hide_link_local: false,
             hide_loopback: false,
             hide_cgnat: false,
+            excluded_interfaces: vec![],
         }
     }
 
@@ -505,7 +553,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1)),
             IpAddr::V6(Ipv6Addr::LOCALHOST),
         ];
-        let out = filter_advertise_ips(&input, &filters, &kind_map);
+        let name_map: HashMap<Ipv4Addr, String> = HashMap::new();
+        let out = filter_advertise_ips(&input, &filters, &kind_map, &name_map);
         assert_eq!(
             out,
             vec![
@@ -513,6 +562,28 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1)),
             ]
         );
+    }
+
+    #[test]
+    fn excluded_interface_drops_all_its_ips_regardless_of_kind() {
+        use std::collections::HashMap;
+        let filters = AdvertiseFilters {
+            excluded_interfaces: vec!["eth3".to_string()],
+            ..Default::default()
+        };
+        let mut kind_map: HashMap<Ipv4Addr, String> = HashMap::new();
+        kind_map.insert(Ipv4Addr::new(192, 168, 1, 10), "ethernet".to_string());
+        kind_map.insert(Ipv4Addr::new(10, 0, 0, 5), "ethernet".to_string());
+        let mut name_map: HashMap<Ipv4Addr, String> = HashMap::new();
+        name_map.insert(Ipv4Addr::new(192, 168, 1, 10), "eth2".to_string());
+        name_map.insert(Ipv4Addr::new(10, 0, 0, 5), "eth3".to_string());
+        let input = vec![
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        ];
+        let out = filter_advertise_ips(&input, &filters, &kind_map, &name_map);
+        // eth3 wykluczony per-karta, eth2 zostaje — mimo ze oba to ethernet.
+        assert_eq!(out, vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))]);
     }
 
     #[test]
