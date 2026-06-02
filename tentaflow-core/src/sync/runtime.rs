@@ -112,6 +112,8 @@ pub fn init(
     let ledger_path = paths::tentaflow_home().join("sync").join("ledger");
     let ledger = Arc::new(FjallSyncLedgerStore::open(&ledger_path)?);
     let local_node_id = signer.ed25519_public_key_hex();
+    repository::ensure_local_node_in_sync_identity(&db, &local_node_id, &local_node_id)
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
     let runtime = Arc::new(SyncRuntime {
         db,
         ledger,
@@ -450,6 +452,9 @@ impl SyncRuntime {
         .map_err(|e| crate::sync::ledger::SyncLedgerError::Runtime(e.to_string()))?;
         let mut queued = 0usize;
         for target in targets {
+            if target.node_id == self.local_node_id {
+                continue;
+            }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
                     self.ledger.put_in_outbox(sync_target, op_id)?;
@@ -476,6 +481,9 @@ impl SyncRuntime {
         .map_err(|e| crate::sync::ledger::SyncLedgerError::Runtime(e.to_string()))?;
         let mut queued = 0usize;
         for target in targets {
+            if target.node_id == self.local_node_id {
+                continue;
+            }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
                     self.ledger.put_in_outbox(sync_target, op_id)?;
@@ -499,7 +507,22 @@ impl SyncRuntime {
         }
         let mut pending = Vec::with_capacity(entries.len());
         for entry in entries {
-            let operation = self.ledger.get_operation(entry.op_id)?;
+            let operation = match self.ledger.get_operation(entry.op_id) {
+                Ok(operation) => operation,
+                // Orphaned outbox row: the backing operation was compacted away
+                // (reset_partitions_with_prefix intentionally leaves orphans of
+                // unknown partition). Skip it and reap it lazily instead of
+                // failing the whole push.
+                Err(SyncLedgerError::OperationNotFound(_)) => {
+                    warn!(
+                        "sync runtime: pomijam osierocony wpis outbox op_id={} (operacja skompaktowana), usuwam",
+                        entry.op_id
+                    );
+                    self.ledger.remove_outbox_entry(target.clone(), entry.op_id)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if !self.outbox_target_still_allowed(target.as_str(), &operation)? {
                 self.ledger.mark_acknowledged(target.clone(), entry.op_id)?;
                 continue;
@@ -2657,6 +2680,71 @@ mod tests {
             assert_eq!(result.queued_targets, 1);
             assert_eq!(outbox.len(), 1);
             assert_eq!(outbox[0].op_id, result.op_id);
+        });
+    }
+
+    #[test]
+    fn push_skips_and_reaps_orphaned_outbox_entry() {
+        with_tmp_home(|| {
+            let source = make_runtime(221);
+            let receiver = make_runtime(222);
+            seed_core_authority_target(
+                &source.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+
+            // Two captures land in the same core/flows partition (sequences 1 and
+            // 2). Both get queued to the receiver's outbox.
+            let first = source
+                .runtime
+                .record_core_capture(core_flow_capture("flow-orphan", "Orphan"))
+                .expect("record first");
+            let second = source
+                .runtime
+                .record_core_capture(core_flow_capture("flow-live", "Live"))
+                .expect("record second");
+
+            // Compact away sequence 1: its operation + op_id index disappear, but
+            // its outbox row stays — turning it into an orphan.
+            source
+                .runtime
+                .ledger
+                .compact(CompactionPolicy {
+                    partition_id: PartitionId::new("core/org/org-default/flows").unwrap(),
+                    keep_operations_after_sequence: Some(2),
+                })
+                .expect("compact");
+            assert!(source.runtime.ledger.get_operation(first.op_id).is_err());
+
+            // The push path must skip the orphan and still emit the live op,
+            // rather than erroring out on the missing operation.
+            let payload = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("build push must not fail on orphan")
+                .expect("live operation should produce a payload");
+            assert_eq!(payload.operations.len(), 1);
+
+            // The orphaned outbox row was reaped during the push.
+            let target =
+                SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
+            assert!(
+                source
+                    .runtime
+                    .ledger
+                    .get_outbox_entry(target.clone(), first.op_id)
+                    .is_err(),
+                "orphaned outbox entry must be removed by the push path"
+            );
+            // The live entry was marked delivered, not removed.
+            assert!(
+                source
+                    .runtime
+                    .ledger
+                    .get_outbox_entry(target, second.op_id)
+                    .is_ok()
+            );
         });
     }
 
