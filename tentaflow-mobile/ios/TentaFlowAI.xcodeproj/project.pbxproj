@@ -10,11 +10,14 @@
 		15411774C6A85B958F8E8203 /* WhisperAudio.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1639DC5A7CBB492B9DE5F2AD /* WhisperAudio.swift */; };
 		21FC5E44642C4756703D9C90 /* WhisperDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 571AB1133F353570AFEBD0FB /* WhisperDecoder.swift */; };
 		23A218F422D6B64281F9DF5D /* MLXRandom in Frameworks */ = {isa = PBXBuildFile; productRef = 33745B1592517CCC56D466CB /* MLXRandom */; };
+		27E0000000000000000000A3 /* KokoroBridge in Frameworks */ = {isa = PBXBuildFile; productRef = 27E0000000000000000000A2 /* KokoroBridge */; };
+		27E0000000000000000000B1 /* KokoroEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27E0000000000000000000B0 /* KokoroEngine.swift */; };
 		275C52482F6EBF9300AF3541 /* MLXEmbedders in Frameworks */ = {isa = PBXBuildFile; productRef = 275C52472F6EBF9300AF3541 /* MLXEmbedders */; };
 		275C524A2F6EBF9300AF3541 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 275C52492F6EBF9300AF3541 /* MLXLLM */; };
 		275C524C2F6EBF9300AF3541 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 275C524B2F6EBF9300AF3541 /* MLXLMCommon */; };
 		275C52502F6EBF9300AF3541 /* MLXVLM in Frameworks */ = {isa = PBXBuildFile; productRef = 275C524F2F6EBF9300AF3541 /* MLXVLM */; };
 		275C52522F6EC6CE00AF3541 /* MLXSwiftEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */; };
+		A3000011 /* AppleTTSEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000010 /* AppleTTSEngine.swift */; };
 		27B840522FCB3B7E009187A3 /* Hub in Frameworks */ = {isa = PBXBuildFile; productRef = 27B840512FCB3B7E009187A3 /* Hub */; };
 		27B840542FCB3B7E009187A3 /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 27B840532FCB3B7E009187A3 /* Tokenizers */; };
 		27B840562FCB3B7E009187A3 /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = 27B840552FCB3B7E009187A3 /* Transformers */; };
@@ -34,12 +37,15 @@
 		EE761ADA29EC7F9DF9F2B066 /* MLXFFT in Frameworks */ = {isa = PBXBuildFile; productRef = 6CDD0465CA0FD0D9425608F2 /* MLXFFT */; };
 		27C5A0010000000000000003 /* MLXHuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = 27C5A0010000000000000002 /* MLXHuggingFace */; };
 		27C5A0010000000000000005 /* HuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = 27C5A0010000000000000004 /* HuggingFace */; };
+		A2000021 /* GStreamer.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000020 /* GStreamer.xcframework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		0AF3E069D016DA9BCC8E2468 /* WhisperTokenizer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperTokenizer.swift; sourceTree = "<group>"; };
 		1639DC5A7CBB492B9DE5F2AD /* WhisperAudio.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperAudio.swift; sourceTree = "<group>"; };
 		275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MLXSwiftEngine.swift; sourceTree = "<group>"; };
+		A3000010 /* AppleTTSEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleTTSEngine.swift; sourceTree = "<group>"; };
+		27E0000000000000000000B0 /* KokoroEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KokoroEngine.swift; sourceTree = "<group>"; };
 		2E2BF368B5697E31775093F6 /* WhisperLoader.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperLoader.swift; sourceTree = "<group>"; };
 		571AB1133F353570AFEBD0FB /* WhisperDecoder.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperDecoder.swift; sourceTree = "<group>"; };
 		6FF1F1B0AE2CC24E493179EC /* WhisperEngine.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperEngine.swift; sourceTree = "<group>"; };
@@ -54,6 +60,7 @@
 		A2000010 /* TentaFlowAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TentaFlowAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AF27372E3CE0E9A08BCC3F52 /* WhisperConfig.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperConfig.swift; sourceTree = "<group>"; };
 		DD7575C171E9112E6F63B7A9 /* WhisperModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperModel.swift; sourceTree = "<group>"; };
+		A2000020 /* GStreamer.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Frameworks/GStreamer.xcframework; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -68,6 +75,7 @@
 				275C52482F6EBF9300AF3541 /* MLXEmbedders in Frameworks */,
 				275C524C2F6EBF9300AF3541 /* MLXLMCommon in Frameworks */,
 				A1000003 /* libtentaflow_mobile.a in Frameworks */,
+				27E0000000000000000000A3 /* KokoroBridge in Frameworks */,
 				27B840522FCB3B7E009187A3 /* Hub in Frameworks */,
 				27C5A0010000000000000003 /* MLXHuggingFace in Frameworks */,
 				27C5A0010000000000000005 /* HuggingFace in Frameworks */,
@@ -75,6 +83,7 @@
 				EE761ADA29EC7F9DF9F2B066 /* MLXFFT in Frameworks */,
 				8B1EB5ECD7F8F14E5BEAEDAA /* MLXFast in Frameworks */,
 				23A218F422D6B64281F9DF5D /* MLXRandom in Frameworks */,
+				A2000021 /* GStreamer.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -94,6 +103,8 @@
 			isa = PBXGroup;
 			children = (
 				275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */,
+				A3000010 /* AppleTTSEngine.swift */,
+				27E0000000000000000000B0 /* KokoroEngine.swift */,
 				A0000002 /* DeviceInfo.swift */,
 				A0000004 /* NativeDiscovery.swift */,
 				A2000001 /* App.swift */,
@@ -118,6 +129,7 @@
 			isa = PBXGroup;
 			children = (
 				A2000003 /* libtentaflow_mobile.a */,
+				A2000020 /* GStreamer.xcframework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -153,6 +165,7 @@
 			);
 			name = TentaFlowAI;
 			packageProductDependencies = (
+				27E0000000000000000000A2 /* KokoroBridge */,
 				AAEA1E451AB2CA1194FD1225 /* MLXNN */,
 				6CDD0465CA0FD0D9425608F2 /* MLXFFT */,
 				F7784328F624698C39AD20C2 /* MLXFast */,
@@ -187,6 +200,7 @@
 			);
 			mainGroup = A4000001;
 			packageReferences = (
+				27E0000000000000000000A1 /* XCLocalSwiftPackageReference "KokoroBridge" */,
 				27B8404E2FCB3B32009187A3 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
 				27C5A0010000000000000001 /* XCRemoteSwiftPackageReference "mlx-swift" */,
 				27B8404F2FCB3B5D009187A3 /* XCRemoteSwiftPackageReference "swift-huggingface" */,
@@ -221,6 +235,8 @@
 				A0000003 /* NativeDiscovery.swift in Sources */,
 				A1000001 /* App.swift in Sources */,
 				275C52522F6EC6CE00AF3541 /* MLXSwiftEngine.swift in Sources */,
+				A3000011 /* AppleTTSEngine.swift in Sources */,
+				27E0000000000000000000B1 /* KokoroEngine.swift in Sources */,
 				A1000002 /* ContentView.swift in Sources */,
 				D84385F8D8DC1FC7B110FD46 /* WhisperConfig.swift in Sources */,
 				8B59B1D0425A2020FCAF5AD9 /* WhisperModel.swift in Sources */,
@@ -244,7 +260,7 @@
 				DEVELOPMENT_TEAM = KZXD4ZWQ85;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TentaFlowAI/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -255,10 +271,19 @@
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/release",
 					"$(TOOLCHAIN_DIR)/usr/lib/clang/21/lib/darwin",
 				);
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Frameworks",
+				);
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
 					"-ltentaflow_mobile",
 					"-lc++",
+					"-ObjC",
+					"-lresolv",
+					"-liconv",
+					"-framework",
+					AssetsLibrary,
 					"-framework",
 					Metal,
 					"-framework",
@@ -293,7 +318,7 @@
 				DEVELOPMENT_TEAM = KZXD4ZWQ85;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TentaFlowAI/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -304,10 +329,19 @@
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/release",
 					"$(TOOLCHAIN_DIR)/usr/lib/clang/21/lib/darwin",
 				);
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Frameworks",
+				);
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
 					"-ltentaflow_mobile",
 					"-lc++",
+					"-ObjC",
+					"-lresolv",
+					"-liconv",
+					"-framework",
+					AssetsLibrary,
 					"-framework",
 					Metal,
 					"-framework",
@@ -347,7 +381,7 @@
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_OPTIMIZATION_LEVEL = 0;
 				GCC_WARN_UNINITIALIZED_AUTOS = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
@@ -370,7 +404,7 @@
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_WARN_UNINITIALIZED_AUTOS = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
@@ -401,6 +435,13 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		27E0000000000000000000A1 /* XCLocalSwiftPackageReference "KokoroBridge" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "../../tentaflow-desktop/macos/swift/KokoroBridge";
+		};
+/* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
 		27B8404E2FCB3B32009187A3 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */ = {
@@ -438,6 +479,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		27E0000000000000000000A2 /* KokoroBridge */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 27E0000000000000000000A1 /* XCLocalSwiftPackageReference "KokoroBridge" */;
+			productName = KokoroBridge;
+		};
 		275C52472F6EBF9300AF3541 /* MLXEmbedders */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 27B8404E2FCB3B32009187A3 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
