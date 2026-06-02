@@ -67,4 +67,67 @@ void tentaflow_register_mlx_swift(
     void* context
 );
 
+// =============================================================================
+// Apple TTS bridge — AVSpeechSynthesizer (AppleTTSEngine.swift). Na iOS nie ma
+// libMLXBridge.dylib, wiec Rust dostaje wskazniki przez rejestracje.
+// =============================================================================
+
+// Lista glosow jako JSON C-string (caller zwalnia przez free()).
+typedef char* (*apple_tts_list_voices_fn_t)(void);
+
+// Synteza -> malloc'd bufor Float32. out_sample_rate / out_num_samples
+// wypelniane przez callee. Zwraca NULL przy bledzie.
+typedef float* (*apple_tts_synthesize_fn_t)(
+    const char* text,
+    const char* voice_id,
+    const char* language,
+    float rate,
+    int* out_sample_rate,
+    int* out_num_samples
+);
+
+// Zwalnia bufor zwrocony przez apple_tts_synthesize_fn_t.
+typedef void (*apple_tts_free_buffer_fn_t)(float* ptr);
+
+// Rejestracja callbackow Apple TTS — wywolywane z Swift przy starcie aplikacji.
+void tentaflow_register_apple_tts(
+    apple_tts_list_voices_fn_t list_voices,
+    apple_tts_synthesize_fn_t synthesize,
+    apple_tts_free_buffer_fn_t free_buffer
+);
+
+// =============================================================================
+// Kokoro MLX bridge — KokoroSwiftLocal (mlalma) przez KokoroBridge package.
+// Na iOS brak libKokoroBridge.dylib; Swift rejestruje wskazniki + context.
+// =============================================================================
+
+// Zaladuj model z katalogu. Zwraca 0=OK, <0=blad.
+typedef int (*kokoro_load_model_fn_t)(const char* model_path, void* context);
+
+// Wyladuj model.
+typedef void (*kokoro_unload_model_fn_t)(void* context);
+
+// Synteza -> malloc'd bufor Float32 (24 kHz). out_* wypelniane przez callee.
+typedef float* (*kokoro_synthesize_fn_t)(
+    const char* text,
+    const char* voice,
+    const char* language,
+    float speed,
+    int* out_sample_rate,
+    int* out_num_samples,
+    void* context
+);
+
+// Zwalnia bufor zwrocony przez kokoro_synthesize_fn_t.
+typedef void (*kokoro_free_buffer_fn_t)(float* ptr);
+
+// Rejestracja callbackow Kokoro MLX — wywolywane z Swift przy starcie aplikacji.
+void tentaflow_register_kokoro(
+    kokoro_load_model_fn_t load_fn,
+    kokoro_unload_model_fn_t unload_fn,
+    kokoro_synthesize_fn_t synthesize_fn,
+    kokoro_free_buffer_fn_t free_buffer_fn,
+    void* context
+);
+
 #endif

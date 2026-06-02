@@ -1394,7 +1394,7 @@ impl ModelRuntimeExecutor {
                             Some(model_name_owned.as_str()),
                         )
                         .await
-                        .map_err(|e| ExecutorError::Internal(format!("embedded TTS load: {e}")))?;
+                        .map_err(|e| ExecutorError::Internal(format!("embedded TTS load: {e:#}")))?;
                     }
                     let text = request.input.clone();
                     let speed = request.speed.unwrap_or(1.0);

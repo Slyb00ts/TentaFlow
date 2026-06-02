@@ -1,5 +1,5 @@
 {
-  "originHash" : "cb8261bbc2502b51faf972be3878734fbea265626c305106ead77a124113139d",
+  "originHash" : "eaf4559599bf63b8adcc35b9f831adb347f01d6d0d6441f83e1bd193f7c3a0b8",
   "pins" : [
     {
       "identity" : "mlx-swift",
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-numerics",
       "state" : {
-        "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
-        "version" : "1.1.1"
+        "revision" : "bbadd4b853a33fd78c4ae977d17bb2af15eb3f2a",
+        "version" : "1.1.0"
       }
     },
     {

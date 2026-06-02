@@ -75,15 +75,19 @@ rustup target add "$DEVICE_TARGET" 2>/dev/null || true
 rustup target add "$SIMULATOR_TARGET" 2>/dev/null || true
 
 find_gstreamer_pkg_config_dir() {
-    # Domyslna sciezka do syntetycznego pkgconfig (xcframework GStreamer 1.28.3).
-    # Mozna nadpisac eksportujac GSTREAMER_IOS_ROOT przed uruchomieniem.
-    local root="${GSTREAMER_IOS_ROOT:-$HOME/Downloads/gst-ios-root}"
-    local candidates=()
-    if [ -n "$root" ]; then
+    # 1) Repo-local pkgconfig generowany przez scripts/setup.sh w
+    #    tentaflow-mobile/ios/Frameworks/pkgconfig (preferowane — zero zaleznosci
+    #    od lokalnej instalacji w $HOME/Downloads albo /Library/Frameworks).
+    # 2) GSTREAMER_IOS_ROOT — override env var dla niestandardowych instalacji.
+    # 3) System-wide /Library/Frameworks/GStreamer.framework (legacy fallback).
+    local repo_pkgconfig="$SCRIPT_DIR/../Frameworks/pkgconfig"
+    local override_root="${GSTREAMER_IOS_ROOT:-}"
+    local candidates=("$repo_pkgconfig")
+    if [ -n "$override_root" ]; then
         candidates+=(
-            "$root/lib/pkgconfig"
-            "$root/GStreamer.framework/Versions/1.0/lib/pkgconfig"
-            "$root/Versions/1.0/lib/pkgconfig"
+            "$override_root/lib/pkgconfig"
+            "$override_root/GStreamer.framework/Versions/1.0/lib/pkgconfig"
+            "$override_root/Versions/1.0/lib/pkgconfig"
         )
     fi
     candidates+=(
@@ -208,6 +212,11 @@ else
     echo "ERROR: Brak pliku $DEVICE_LIB — build prawdopodobnie FAILED!"
     exit 1
 fi
+# Uwaga: libsherpa-onnx.a + libonnxruntime.a NIE sa kopiowane osobno — Rust
+# `staticlib` (libtentaflow_mobile.a) jest samowystarczalny i bundluje natywne
+# zaleznosci (sherpa-onnx + onnxruntime). Osobne -lsherpa-onnx/-lonnxruntime
+# dawalo duplicate symbols (_OBJC_CLASS_$_CoreMLExecution). Linkujemy tylko
+# libtentaflow_mobile.a + frameworki (CoreML) + -lc++.
 
 echo ""
 echo "=== Build complete ==="
