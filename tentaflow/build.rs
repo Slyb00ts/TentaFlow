@@ -328,6 +328,17 @@ fn build_kokoro_bridge() {
     );
     println!("cargo:rerun-if-changed={}/Sources", package_dir.display());
 
+    // Zwendorowany MisakiSwift (zaleznosc lokalna KokoroBridge) — jego Resources
+    // (wagi BART us/gb_bart.safetensors + leksykony) trafiaja do bundla
+    // MisakiSwift_MisakiSwift. Bez tej obserwacji zmiana wag nie wymusza rebuildu
+    // i bundle zostaje nieaktualny (brak wag => Kokoro TTS crashuje na ang. OOV).
+    let misaki_dir = package_dir
+        .parent()
+        .expect("KokoroBridge/.. musi istniec")
+        .join("vendor/MisakiSwift");
+    println!("cargo:rerun-if-changed={}/Resources", misaki_dir.display());
+    println!("cargo:rerun-if-changed={}/Sources", misaki_dir.display());
+
     let cargo_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let xcode_arch = match cargo_arch.as_str() {
         "aarch64" => "arm64",

@@ -139,6 +139,10 @@ tentaflow-core/assets/test/sample_traffic.mp4
 *.ggml
 *.bin
 *.safetensors
+# Wagi BART (G2P fallback dla angielskiego) zwendorowanego MisakiSwift — MUSZA byc
+# w repo, inaczej Kokoro TTS crashuje force-unwrapem przy pierwszym ang. slowie OOV.
+!tentaflow-desktop/macos/swift/vendor/MisakiSwift/Resources/us_bart.safetensors
+!tentaflow-desktop/macos/swift/vendor/MisakiSwift/Resources/gb_bart.safetensors
 *.pt
 *.pth
 *.onnx

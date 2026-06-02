@@ -96,6 +96,10 @@ pub struct NewService {
     pub active_deploy_id: String,
     pub last_deploy_id: String,
     pub deployment_progress_pct: i64,
+    /// Sha256 drzewa zrodel bundla z momentu deployu (porownywany z aktualnym
+    /// hashem z manifestu, aby wykryc dostepna aktualizacje). Pusty dla
+    /// embedded/external.
+    pub deployed_source_hash: String,
 }
 
 impl NewService {
@@ -122,6 +126,7 @@ impl NewService {
             active_deploy_id: String::new(),
             last_deploy_id: String::new(),
             deployment_progress_pct: 0,
+            deployed_source_hash: String::new(),
         }
     }
 }
@@ -146,6 +151,7 @@ pub struct ServiceRow {
     pub active_deploy_id: String,
     pub last_deploy_id: String,
     pub deployment_progress_pct: i64,
+    pub deployed_source_hash: String,
     pub health_last_ok: Option<String>,
     pub health_last_err: Option<String>,
     pub progress_message: Option<String>,
@@ -189,6 +195,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
         active_deploy_id: row.get("active_deploy_id")?,
         last_deploy_id: row.get("last_deploy_id")?,
         deployment_progress_pct: row.get("deployment_progress_pct")?,
+        deployed_source_hash: row.get("deployed_source_hash")?,
         health_last_ok: row.get("health_last_ok")?,
         health_last_err: row.get("health_last_err")?,
         progress_message: row.get("progress_message").ok().flatten(),
@@ -200,13 +207,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
 
 const SELECT_COLUMNS: &str = "id, engine_id, category, display_name, deploy_method, transport, \
     status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
-    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct, health_last_ok, \
-    health_last_err, progress_message, restart_count, created_at, updated_at";
+    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct, deployed_source_hash, \
+    health_last_ok, health_last_err, progress_message, restart_count, created_at, updated_at";
 
 const INSERT_SQL: &str = "INSERT INTO services (engine_id, category, display_name, deploy_method, \
     transport, status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
-    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
+    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct, deployed_source_hash) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)";
 
 /// Inserts a new service row. Returns the assigned id.
 pub fn insert(conn: &Connection, new: &NewService) -> Result<i64> {
@@ -229,6 +236,7 @@ pub fn insert(conn: &Connection, new: &NewService) -> Result<i64> {
             new.active_deploy_id,
             new.last_deploy_id,
             new.deployment_progress_pct,
+            new.deployed_source_hash,
         ],
     )
     .context("insert services")?;
@@ -256,6 +264,7 @@ pub fn insert_in_tx(tx: &Transaction<'_>, new: &NewService) -> Result<i64> {
             new.active_deploy_id,
             new.last_deploy_id,
             new.deployment_progress_pct,
+            new.deployed_source_hash,
         ],
     )
     .context("insert services (tx)")?;
@@ -360,6 +369,7 @@ pub fn finish_deploy_in_tx(
                 config_json = ?14,
                 active_deploy_id = '',
                 last_deploy_id = CASE WHEN ?15 = '' THEN last_deploy_id ELSE ?15 END,
+                deployed_source_hash = ?16,
                 deployment_progress_pct = CASE WHEN ?7 = 'running' THEN 100 ELSE deployment_progress_pct END,
                 health_last_err = CASE WHEN ?7 = 'running' THEN NULL ELSE health_last_err END,
                 progress_message = NULL,
@@ -381,6 +391,7 @@ pub fn finish_deploy_in_tx(
             new.endpoint_url,
             new.config_json,
             new.last_deploy_id,
+            new.deployed_source_hash,
         ],
     )?;
     if n == 0 {
