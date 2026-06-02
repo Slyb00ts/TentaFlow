@@ -1596,6 +1596,11 @@ pub struct NetworkConfig {
     pub hide_cgnat: bool,
     pub prefer_same_subnet: bool,
     pub iroh_relay_url: String,
+    /// Nazwy interfejsow wykluczonych z advertise mesh per-karta (np. "eth3").
+    /// `#[serde(default)]` zachowuje kompatybilnosc ze starszymi peerami ktorzy
+    /// tego pola nie wysylaja. Pusta lista = nic nie wykluczone.
+    #[serde(default)]
+    pub excluded_interfaces: Vec<String>,
 }
 
 /// Snapshot zdrowia relay iroh — co backend wie o aktualnym stanie polaczenia

@@ -661,6 +661,7 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
 
     let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
     let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+    let name_map = crate::mesh::network_interfaces::ipv4_name_map();
 
     for row in rows {
         if row.trust_state != db::repository::TRUST_TRUSTED {
@@ -691,12 +692,9 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
                     return false;
                 };
                 match ip_part.parse::<std::net::Ipv4Addr>() {
-                    Ok(v4) => {
-                        let kind = kind_map.get(&v4).map(String::as_str).unwrap_or("unknown");
-                        crate::mesh::network_interfaces::should_advertise_interface_ipv4(
-                            v4, kind, &filters,
-                        )
-                    }
+                    Ok(v4) => crate::mesh::network_interfaces::should_advertise_ip(
+                        v4, &filters, &kind_map, &name_map,
+                    ),
                     Err(_) => false,
                 }
             })
