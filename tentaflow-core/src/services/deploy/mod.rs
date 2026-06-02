@@ -687,6 +687,19 @@ fn mark_service_deploy_failed(
 
 /// Builds the canonical `NewService` row from the prepared state.
 pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus) -> NewService {
+    // Zapamietujemy hash drzewa zrodel z momentu deployu, aby pozniej wykryc, ze
+    // wbudowany bundle zostal zaktualizowany (snapshot porownuje go z aktualnym
+    // hashem manifestu). embedded/external nie maja buildowalnego drzewa -> pusty.
+    let deployed_source_hash = crate::services::manifest::registry()
+        .by_id(&prepared.engine_id)
+        .map(|m| match prepared.deploy_method {
+            DeployMethod::Docker => m.docker_source_hash.clone(),
+            DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => {
+                m.native_source_hash.clone()
+            }
+            _ => String::new(),
+        })
+        .unwrap_or_default();
     NewService {
         engine_id: prepared.engine_id.clone(),
         category: prepared.category.clone(),
@@ -709,6 +722,7 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         active_deploy_id: String::new(),
         last_deploy_id: String::new(),
         deployment_progress_pct: if status == ServiceStatus::Running { 100 } else { 0 },
+        deployed_source_hash,
     }
 }
 
@@ -735,6 +749,7 @@ fn build_placeholder_service(
         active_deploy_id: deploy_id.to_string(),
         last_deploy_id: deploy_id.to_string(),
         deployment_progress_pct: 0,
+        deployed_source_hash: String::new(),
     }
 }
 

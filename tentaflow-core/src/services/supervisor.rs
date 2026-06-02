@@ -136,6 +136,10 @@ pub struct ServiceEntry {
     /// Ostatni błąd zdrowia (failed health probe, pinned auto-start
     /// failure). Przekazywany 1:1 z `services.health_last_err`.
     pub health_last_err: Option<String>,
+    /// Hash drzewa źródeł bundla z momentu deployu (`services.deployed_source_hash`).
+    /// Snapshot porównuje go z aktualnym hashem manifestu, by wystawić
+    /// `update_available`. Pusty dla embedded/external i zdalnych serwisów mesh.
+    pub deployed_source_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -728,6 +732,7 @@ impl Supervisor {
                     extra_config: meta.extra_config,
                     progress_message: row.progress_message,
                     health_last_err: row.health_last_err,
+                    deployed_source_hash: row.deployed_source_hash,
                 });
             }
 
@@ -1428,6 +1433,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap()
@@ -1494,6 +1500,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap();
@@ -1547,6 +1554,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap()
@@ -1665,6 +1673,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap();
@@ -1736,6 +1745,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap();
@@ -1807,6 +1817,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap()
@@ -1858,6 +1869,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap()
@@ -1919,6 +1931,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap()
@@ -1959,6 +1972,7 @@ mod tests {
                     active_deploy_id: String::new(),
                     last_deploy_id: String::new(),
                     deployment_progress_pct: 0,
+                    deployed_source_hash: String::new(),
                 },
             )
             .unwrap()
@@ -2017,6 +2031,7 @@ mod tests {
                 quantization: None,
                 is_default: true,
             }],
+            update_available: false,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),

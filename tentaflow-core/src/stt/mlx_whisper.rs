@@ -97,8 +97,13 @@ fn tokenizer_repo_for(mlx_model_id: &str) -> &'static str {
 /// `tokenizer_repo_for`).
 ///
 /// Zwraca sciezke do scalonego katalogu, ktora mozna podac do `MLXWhisper_loadModel`.
-pub async fn prepare_model(mlx_repo_id: &str) -> Result<PathBuf> {
-    use hf_hub::api::sync::Api;
+/// `log_sink` (opcjonalny) raportuje postep pobierania do okienka deploy.
+pub async fn prepare_model(
+    mlx_repo_id: &str,
+    log_sink: Option<&crate::services::deploy::LogSink>,
+) -> Result<PathBuf> {
+    use crate::services::model_download::download_with_progress;
+
     let target = mlx_whisper_cache_dir().join(
         mlx_repo_id
             .replace('/', "_")
@@ -122,62 +127,72 @@ pub async fn prepare_model(mlx_repo_id: &str) -> Result<PathBuf> {
         return Ok(target);
     }
 
-    let mlx_id = mlx_repo_id.to_string();
-    let oai_id = tokenizer_repo_for(mlx_repo_id).to_string();
-    let target_clone = target.clone();
+    let oai_id = tokenizer_repo_for(mlx_repo_id);
     info!(
         "[mlx-whisper] pobieranie {} + tokenizer z {}",
-        mlx_id, oai_id
+        mlx_repo_id, oai_id
     );
+    if let Some(sink) = log_sink {
+        sink.phase(
+            "downloading-stt",
+            &format!("Pobieram {} …", mlx_repo_id),
+        );
+    }
 
-    let result = tokio::task::spawn_blocking(move || -> Result<()> {
-        let api = Api::new().context("hf-hub Api::new")?;
+    // Pliki MLX (wymagane) — blad propaguje. Tokenizer (opcjonalny) — brak/404
+    // ignorujemy, bo nie kazde repo zawiera wszystkie pliki tokenizera.
+    let mlx_files = ["config.json", "model.safetensors"];
+    let oai_files = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "added_tokens.json",
+        "special_tokens_map.json",
+        "generation_config.json",
+        "vocab.json",
+        "merges.txt",
+        "normalizer.json",
+    ];
 
-        // Lista plikow do pobrania z kazdego repo. Tokeny + JSON-y maja staly
-        // zestaw nazw — jezeli ktores nie istnieje, ignorujemy (nie wszystkie
-        // repo zawieraja `added_tokens.json`).
-        let mlx_files = ["config.json", "model.safetensors"];
-        let oai_files = [
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "added_tokens.json",
-            "special_tokens_map.json",
-            "generation_config.json",
-            "vocab.json",
-            "merges.txt",
-            "normalizer.json",
-        ];
+    for f in mlx_files.iter() {
+        let url = format!("https://huggingface.co/{}/resolve/main/{}", mlx_repo_id, f);
+        let dst = target.join(f);
+        download_with_progress(&url, &dst, f, progress_for_sink(log_sink, f))
+            .await
+            .with_context(|| format!("download {}/{}", mlx_repo_id, f))?;
+    }
 
-        let mlx_repo = api.model(mlx_id.clone());
-        for f in mlx_files.iter() {
-            let src = mlx_repo
-                .get(f)
-                .with_context(|| format!("download {}/{}", mlx_id, f))?;
-            let dst = target_clone.join(f);
-            std::fs::copy(&src, &dst)
-                .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-        }
-
-        let oai_repo = api.model(oai_id.clone());
-        for f in oai_files.iter() {
-            // Tokenizer files — niektore opcjonalne. Brak nie jest bledem.
-            let src = match oai_repo.get(f) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let dst = target_clone.join(f);
-            std::fs::copy(&src, &dst).with_context(|| {
-                format!("copy tokenizer {} -> {}", src.display(), dst.display())
-            })?;
-        }
-        Ok(())
-    })
-    .await
-    .context("blocking task panic")?;
-    result?;
+    for f in oai_files.iter() {
+        let url = format!("https://huggingface.co/{}/resolve/main/{}", oai_id, f);
+        let dst = target.join(f);
+        let _ = download_with_progress(&url, &dst, f, progress_for_sink(log_sink, f)).await;
+    }
 
     info!("[mlx-whisper] gotowy: {}", target.display());
     Ok(target)
+}
+
+/// Buduje progress callback emitujacy do `LogSink::progress` w fazie
+/// `downloading-stt`. Kazdy plik potrzebuje swiezego `ProgressFn`, bo
+/// `download_with_progress` konsumuje go przez wartosc.
+fn progress_for_sink(
+    log_sink: Option<&crate::services::deploy::LogSink>,
+    label: &str,
+) -> Option<crate::services::model_download::ProgressFn> {
+    let sink = log_sink.cloned()?;
+    let label = label.to_string();
+    Some(Box::new(move |downloaded: u64, total: u64, _l: &str| {
+        let pct: u8 = if total > 0 {
+            (((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)) as u8
+        } else {
+            0
+        };
+        let line = if total > 0 {
+            format!("{}: {}/{} KB ({}%)", label, downloaded / 1024, total / 1024, pct)
+        } else {
+            format!("{}: {} KB", label, downloaded / 1024)
+        };
+        sink.progress("downloading-stt", pct, &line);
+    }))
 }
 
 // Helpery `locate_dylib` + `ensure_metallib_next_to` zostaly przeniesione do
@@ -291,7 +306,7 @@ impl SttEngine for MlxWhisperEngine {
                 .context("Sciezka modelu zawiera nieprawidlowe znaki UTF-8")?;
             if s.contains('/') && !s.starts_with('/') && !s.starts_with('.') {
                 info!("[mlx-whisper] traktuje '{}' jako HF repo_id", s);
-                prepare_model(s).await?
+                prepare_model(s, None).await?
             } else {
                 anyhow::bail!("Sciezka modelu nie istnieje: {}", s);
             }

@@ -182,6 +182,10 @@ pub const WHISPER_MODEL_SIZE: u64 = 1_600_000_000;
 
 const WHISPER_HF_REPO: &str = "ggerganov/whisper.cpp";
 
+/// Domyslne repo MLX Whisper, gdy deploy nie poda jawnego `model_repo`
+/// (np. leniwy reload po restarcie procesu).
+pub const MLX_WHISPER_DEFAULT_REPO: &str = "mlx-community/whisper-large-v3-turbo-4bit";
+
 /// Status modelu Whisper (pobrany / zaladowany)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhisperModelStatus {
@@ -318,8 +322,50 @@ impl SttManager {
         }
     }
 
-    /// Pobierz model Whisper z HF (jesli brak w cache) i zaladuj go
-    pub async fn ensure_and_load(&mut self, device: Option<&str>) -> anyhow::Result<SttModelInfo> {
+    /// Pobierz model STT (jesli brak w cache) i zaladuj go, swiadomie wybierajac
+    /// engine. `engine_id == None` => auto: preferuj `mlx-whisper` gdy dostepny,
+    /// inaczej `whisper` (whisper.cpp). Galaz MLX pobiera katalog z
+    /// `config.json`+`model.safetensors`+tokenizer (przez `prepare_model`);
+    /// galaz whisper.cpp pobiera plik ggml. `log_sink` raportuje postep do
+    /// okienka deploy (uzywany tylko przez galaz MLX).
+    pub async fn ensure_and_load(
+        &mut self,
+        engine_id: Option<&str>,
+        model_repo: Option<&str>,
+        device: Option<&str>,
+        log_sink: Option<&crate::services::deploy::LogSink>,
+        deploy_params: WhisperDeployParams,
+    ) -> anyhow::Result<SttModelInfo> {
+        // Auto-pick musi zwrocic `&'static str`, zeby immutable borrow przez
+        // `available_backends()` zakonczyl sie przed `&mut self.load_model`.
+        let engine_id: &str = engine_id.unwrap_or_else(|| {
+            if self
+                .available_backends()
+                .iter()
+                .any(|b| b == "mlx-whisper")
+            {
+                "mlx-whisper"
+            } else {
+                "whisper"
+            }
+        });
+
+        #[cfg(feature = "inference-mlx-whisper")]
+        if engine_id == "mlx-whisper" {
+            let repo = model_repo
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(MLX_WHISPER_DEFAULT_REPO);
+            let dir = mlx_whisper::prepare_model(repo, log_sink).await?;
+            return self
+                .load_model(&dir, device, Some("mlx-whisper"), deploy_params)
+                .await;
+        }
+
+        // Galaz whisper.cpp — laduje wylacznie plik ggml. `engine_id` (gdy MLX
+        // niezbudowany jest tu nieczytany), `model_repo`/`log_sink` sa
+        // nieuzywane (model jest staly: large-v3-turbo z whisper.cpp).
+        let _ = (engine_id, model_repo, log_sink);
         let filename = WHISPER_MODEL_FILENAME;
         let models_dir = Self::whisper_models_dir();
         let model_path = models_dir.join(filename);
@@ -345,7 +391,7 @@ impl SttManager {
             );
         }
 
-        self.load_model(&model_path, device, None, WhisperDeployParams::default())
+        self.load_model(&model_path, device, Some("whisper"), deploy_params)
             .await
     }
 }

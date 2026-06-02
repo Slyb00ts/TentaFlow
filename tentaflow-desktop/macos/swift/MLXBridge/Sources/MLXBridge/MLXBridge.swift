@@ -107,11 +107,15 @@ public final class MLXBridgeEngine: @unchecked Sendable {
         print("[MLXBridge] Generowanie: max_tokens=\(maxTokens), temp=\(temperature), topP=\(topP), maxCtx=\(maxContextTokens), budgetMB=\(memoryBudgetMB)")
         print("[MLXBridge] Prompt (\(prompt.count) znakow): \(prompt.prefix(200))")
 
-        // Twardy limit pamieci MLX: relaxed:false sprawia, ze MLX rzuca blad
-        // zamiast swapowac poza budzet — surfacujemy czysty blad zamiast OOM-kill.
+        // Limit pamieci MLX z relaxed:true: pozwala MLX zwalniac cache/eviction
+        // zamiast wywalac caly proces (natywny abort/trap) przy przekroczeniu
+        // budzetu. Przy wspolrezydencji wielu modeli MLX (np. whisper STT + LLM)
+        // suma wag + KV moze przekroczyc budzet — relaxed:false ubilby proces.
+        // Budzet egzekwuje czysto miekki straznik snapshotu w callbacku tokenow
+        // (zwraca .stop -> kod -10), wiec nie potrzebujemy twardego trapa.
         let budgetBytes = memoryBudgetMB > 0 ? memoryBudgetMB * 1024 * 1024 : 0
         if budgetBytes > 0 {
-            MLX.GPU.set(memoryLimit: budgetBytes, relaxed: false)
+            MLX.GPU.set(memoryLimit: budgetBytes, relaxed: true)
         }
 
         let semaphore = DispatchSemaphore(value: 0)
