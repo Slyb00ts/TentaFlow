@@ -12,7 +12,6 @@ pub const CORE_SYNC_ADDON_ID: &str = "core";
 pub enum CoreSyncResourceKind {
     Organization,
     UserAccount,
-    LegacyUser,
     UserGroup,
     GroupMember,
     Role,
@@ -22,7 +21,6 @@ pub enum CoreSyncResourceKind {
     NodeUserAssignment,
     SyncUserOrgProfile,
     Flow,
-    FlowVersion,
     FlowModelBinding,
     SyncPolicy,
     SyncResourceAcl,
@@ -57,14 +55,14 @@ impl CoreSyncDescriptor {
     pub fn partition_id(
         &self,
         org_id: &str,
-        owner_user_id: Option<i64>,
+        owner_user_id: Option<&str>,
     ) -> LedgerResult<PartitionId> {
         match self.scope {
             CoreSyncScope::Organization => {
                 PartitionId::new(format!("core/org/{org_id}/{}", self.partition_suffix))
             }
             CoreSyncScope::User => {
-                let user_id = owner_user_id.unwrap_or(0);
+                let user_id = owner_user_id.unwrap_or("system");
                 PartitionId::new(format!(
                     "core/org/{org_id}/user/{user_id}/{}",
                     self.partition_suffix
@@ -88,15 +86,6 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         kind: CoreSyncResourceKind::UserAccount,
         table_name: "user_accounts",
         resource_type: "core.user_account",
-        primary_key_column: "id",
-        scope: CoreSyncScope::Organization,
-        retention: CoreSyncRetention::Durable,
-        partition_suffix: "users",
-    },
-    CoreSyncDescriptor {
-        kind: CoreSyncResourceKind::LegacyUser,
-        table_name: "users",
-        resource_type: "core.legacy_user",
         primary_key_column: "id",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
@@ -184,15 +173,6 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         partition_suffix: "flows",
     },
     CoreSyncDescriptor {
-        kind: CoreSyncResourceKind::FlowVersion,
-        table_name: "flow_versions",
-        resource_type: "core.flow_version",
-        primary_key_column: "id",
-        scope: CoreSyncScope::Organization,
-        retention: CoreSyncRetention::Durable,
-        partition_suffix: "flows",
-    },
-    CoreSyncDescriptor {
         kind: CoreSyncResourceKind::FlowModelBinding,
         table_name: "flow_model_bindings",
         resource_type: "core.flow_model_binding",
@@ -223,7 +203,8 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         kind: CoreSyncResourceKind::SyncExplicitShare,
         table_name: "sync_explicit_shares",
         resource_type: "core.sync_explicit_share",
-        primary_key_column: "org_id,addon_id,resource_type,resource_id,subject_type,subject_id,action",
+        primary_key_column:
+            "org_id,addon_id,resource_type,resource_id,subject_type,subject_id,action",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "sync-control",
@@ -273,13 +254,12 @@ mod tests {
             Some("core.flow")
         );
         assert_eq!(
-            descriptor_for_table("flow_versions").map(|descriptor| descriptor.resource_type),
-            Some("core.flow_version")
-        );
-        assert_eq!(
             descriptor_for_table("flow_model_bindings").map(|descriptor| descriptor.resource_type),
             Some("core.flow_model_binding")
         );
+        // flow_versions are a local-only snapshot history now; they must NOT be
+        // a core sync resource after the UUID identity redesign.
+        assert!(descriptor_for_table("flow_versions").is_none());
     }
 
     #[test]
@@ -287,7 +267,6 @@ mod tests {
         for table in [
             "organizations",
             "user_accounts",
-            "users",
             "user_groups",
             "group_members",
             "roles",
@@ -295,6 +274,8 @@ mod tests {
         ] {
             assert!(is_core_sync_table(table), "missing descriptor for {table}");
         }
+        // The legacy `users` table is no longer a sync resource.
+        assert!(!is_core_sync_table("users"));
     }
 
     #[test]

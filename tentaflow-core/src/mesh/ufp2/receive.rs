@@ -265,5 +265,4 @@ mod tests {
         let r2 = classify_inbound(0xFF, Vec::new(), peer, local);
         assert!(r2.is_err());
     }
-
 }

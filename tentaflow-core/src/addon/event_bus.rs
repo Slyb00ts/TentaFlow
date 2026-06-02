@@ -27,7 +27,7 @@ pub struct Event {
     /// Addon zrodlowy (None = event systemowy)
     pub source_addon: Option<String>,
     /// Uzytkownik zrodlowy (None = system)
-    pub source_user: Option<i64>,
+    pub source_user: Option<String>,
     /// Dane eventu
     pub payload: serde_json::Value,
     /// Znacznik czasu

@@ -12,8 +12,8 @@ use anyhow::Result;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use super::core_registry::{CoreSyncResourceKind, descriptor_for_kind};
-use super::ledger::FieldValue;
+use super::core_registry::{descriptor_for_kind, CoreSyncResourceKind};
+use super::ledger::{BaselineEpoch, FieldValue, HybridLogicalTimestamp};
 use super::runtime::SqlWriteAction;
 
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -28,18 +28,30 @@ pub struct CoreWriteCapture {
     pub primary_key: String,
     pub action: SqlWriteAction,
     pub changed_fields: BTreeMap<String, FieldValue>,
-    pub actor_user_id: Option<i64>,
+    pub actor_user_id: Option<String>,
+    /// HLC stamp minted inside the write transaction. The drained ledger
+    /// operation reuses this exact timestamp so the originating order survives,
+    /// and the receiver's HLC-LWW comparison sees a stable, pre-commit instant.
+    pub hlc: HybridLogicalTimestamp,
+    /// Locally-active baseline epoch at capture time. The drained operation
+    /// inherits it so a post-cutover reset cannot silently mix epochs.
+    pub epoch: BaselineEpoch,
     pub created_at_ms: i64,
 }
 
 impl CoreWriteCapture {
+    /// Builds a capture. `hlc` and `epoch` are mandatory and minted by the
+    /// caller inside the same SQLite transaction as the write, so a capture can
+    /// never exist without the timestamp the ledger operation will carry.
     pub fn new(
         kind: CoreSyncResourceKind,
         org_id: impl Into<String>,
         resource_id: impl Into<String>,
         action: SqlWriteAction,
         changed_fields: BTreeMap<String, FieldValue>,
-        actor_user_id: Option<i64>,
+        actor_user_id: Option<String>,
+        hlc: HybridLogicalTimestamp,
+        epoch: BaselineEpoch,
     ) -> Self {
         let descriptor = descriptor_for_kind(kind);
         let org_id = org_id.into();
@@ -64,6 +76,8 @@ impl CoreWriteCapture {
             action,
             changed_fields,
             actor_user_id,
+            hlc,
+            epoch,
             created_at_ms,
         }
     }
@@ -77,8 +91,8 @@ pub fn record_core_write_capture(
     tx.execute(
         "INSERT INTO __tentaflow_core_sync_captures \
          (capture_id, org_id, table_name, resource_type, resource_id, primary_key, action, \
-          changed_fields_blob, actor_user_id, created_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          changed_fields_blob, actor_user_id, hlc_wall, hlc_logical, hlc_node, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             &capture.capture_id,
             &capture.org_id,
@@ -89,6 +103,9 @@ pub fn record_core_write_capture(
             capture.action.as_str(),
             changed_fields_blob,
             capture.actor_user_id,
+            capture.hlc.wall_time_ms,
+            capture.hlc.logical,
+            &capture.hlc.node_id,
             capture.created_at_ms,
         ],
     )?;
@@ -101,7 +118,7 @@ pub fn load_core_write_capture(
 ) -> Result<Option<CoreWriteCapture>> {
     conn.query_row(
         "SELECT capture_id, org_id, table_name, resource_type, resource_id, primary_key, action, \
-                changed_fields_blob, actor_user_id, created_at_ms \
+                changed_fields_blob, actor_user_id, hlc_wall, hlc_logical, hlc_node, created_at_ms \
          FROM __tentaflow_core_sync_captures WHERE capture_id = ?1",
         rusqlite::params![capture_id],
         |row| {
@@ -111,6 +128,11 @@ pub fn load_core_write_capture(
                 .map_err(|e| rusqlite_decode_error(e.to_string()))?;
             let changed_fields = decode_changed_fields(&changed_fields_blob)
                 .map_err(|e| rusqlite_decode_error(e.to_string()))?;
+            let hlc = HybridLogicalTimestamp {
+                wall_time_ms: row.get(9)?,
+                logical: row.get::<_, i64>(10)? as u32,
+                node_id: row.get(11)?,
+            };
             Ok(CoreWriteCapture {
                 capture_id: row.get(0)?,
                 org_id: row.get(1)?,
@@ -121,7 +143,14 @@ pub fn load_core_write_capture(
                 action,
                 changed_fields,
                 actor_user_id: row.get(8)?,
-                created_at_ms: row.get(9)?,
+                hlc,
+                // Resolved from the live ledger epoch when the operation is
+                // built at drain time; the capture row does not persist it.
+                epoch: BaselineEpoch {
+                    counter: 0,
+                    origin_node: String::new(),
+                },
+                created_at_ms: row.get(12)?,
             })
         },
     )
@@ -130,6 +159,24 @@ pub fn load_core_write_capture(
 }
 
 pub fn drain_pending_core_captures(pool: &crate::db::DbPool, limit: usize) -> Result<usize> {
+    drain_pending_core_captures_with(pool, limit, |capture| {
+        super::runtime::record_core_capture(capture)
+            .map(|opt| opt.map(|record| record.op_id))
+    })
+}
+
+/// Drains pending core captures through an explicit recorder. `drain_pending_core_captures`
+/// records via the global runtime; the baseline reset path records through the
+/// same `SyncRuntime` it just bumped, so the re-seed cannot land in a different
+/// runtime than the one that advanced the epoch.
+pub fn drain_pending_core_captures_with<F>(
+    pool: &crate::db::DbPool,
+    limit: usize,
+    mut record: F,
+) -> Result<usize>
+where
+    F: FnMut(CoreWriteCapture) -> super::ledger::LedgerResult<Option<super::ledger::OperationId>>,
+{
     let captures = {
         let conn = pool
             .lock()
@@ -138,8 +185,8 @@ pub fn drain_pending_core_captures(pool: &crate::db::DbPool, limit: usize) -> Re
     };
     let mut drained = 0usize;
     for capture in captures {
-        match super::runtime::record_core_capture(capture.clone()) {
-            Ok(Some(record)) => {
+        match record(capture.clone()) {
+            Ok(Some(op_id)) => {
                 let mut conn = pool
                     .lock()
                     .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
@@ -147,7 +194,7 @@ pub fn drain_pending_core_captures(pool: &crate::db::DbPool, limit: usize) -> Re
                     &mut conn,
                     &capture.capture_id,
                     "ledgered",
-                    Some(record.op_id.to_hex()),
+                    Some(op_id.to_hex()),
                     None,
                 )?;
                 drained += 1;
@@ -168,6 +215,21 @@ pub fn drain_pending_core_captures(pool: &crate::db::DbPool, limit: usize) -> Re
         }
     }
     Ok(drained)
+}
+
+/// Re-arms every core capture row back to `pending` so a baseline reset re-emits
+/// the full core write journal under the freshly-bumped epoch. The stored HLC is
+/// kept so the originating order survives the re-seed.
+pub fn requeue_all_core_captures(pool: &crate::db::DbPool) -> Result<usize> {
+    let conn = pool
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
+    let updated = conn.execute(
+        "UPDATE __tentaflow_core_sync_captures \
+         SET status = 'pending', operation_id = NULL, error_message = NULL, ledgered_at_ms = NULL",
+        [],
+    )?;
+    Ok(updated)
 }
 
 fn load_pending_core_captures(
@@ -259,7 +321,11 @@ fn stable_capture_id(
     hasher.update(action.as_str().as_bytes());
     hasher.update([0]);
     hasher.update(created_at_ms.to_le_bytes());
-    hasher.update(CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    hasher.update(
+        CAPTURE_SEQUENCE
+            .fetch_add(1, Ordering::Relaxed)
+            .to_le_bytes(),
+    );
     if let Ok(fields) = encode_changed_fields(changed_fields) {
         hasher.update(fields);
     }
@@ -295,19 +361,36 @@ mod tests {
         let db = db::init(&dir.path().join("core.db")).expect("db init");
         let mut conn = db.lock().expect("db lock");
         let tx = conn.transaction().expect("begin tx");
+        // `actor_user_id` is FK-bound to `user_accounts(id)`, so the referenced
+        // user must exist before the capture row is inserted.
+        tx.execute(
+            "INSERT INTO user_accounts (id, username, password_hash) VALUES ('user-uuid', 'user-uuid', 'h')",
+            [],
+        )
+        .expect("seed actor user");
         let mut fields = BTreeMap::new();
         fields.insert(
             "name".to_string(),
             FieldValue::String("Pipeline sprzedaży".to_string()),
         );
         fields.insert("version".to_string(), FieldValue::I64(3));
-        let capture = CoreWriteCapture::new(
+        let hlc = HybridLogicalTimestamp {
+            wall_time_ms: 1_765_000_000_000,
+            logical: 4,
+            node_id: "node_a".to_string(),
+        };
+        let mut capture = CoreWriteCapture::new(
             CoreSyncResourceKind::Flow,
             "org-default",
             "42",
             SqlWriteAction::Update,
             fields,
-            Some(1),
+            Some("user-uuid".to_string()),
+            hlc,
+            BaselineEpoch {
+                counter: 2,
+                origin_node: "node_a".to_string(),
+            },
         );
 
         record_core_write_capture(&tx, &capture).expect("record capture");
@@ -317,6 +400,12 @@ mod tests {
             .expect("load capture")
             .expect("capture exists");
 
+        // The capture row does not persist the epoch (it is resolved at drain
+        // time), so normalise it before comparing the remaining fields.
+        capture.epoch = BaselineEpoch {
+            counter: 0,
+            origin_node: String::new(),
+        };
         assert_eq!(loaded, capture);
     }
 }

@@ -1833,7 +1833,7 @@ fn extract_ws_user_session(
     req: &Request<Incoming>,
     db: &DbPool,
     settings_cipher: &crate::crypto::SettingsCipher,
-) -> Option<(i64, Option<String>)> {
+) -> Option<(String, Option<String>)> {
     let jwt_secret = db::repository::get_setting_secure(db, "jwt_secret", settings_cipher)
         .ok()
         .flatten()?;
@@ -1852,7 +1852,7 @@ fn extract_ws_user_session(
 
     // Zero Trust: role z DB lookup, nie z JWT (chroni przed token-replay z
     // odebranymi uprawnieniami).
-    let role = db::repository::get_user_account_by_id(db, claims.user_id)
+    let role = db::repository::get_user_account_by_id(db, &claims.user_id)
         .ok()
         .flatten()
         .map(|acc| {

@@ -814,9 +814,9 @@ mod tests {
                 restart_count: 0,
                 health_last_err: None,
                 active_deploy_id: String::new(),
-            last_deploy_id: String::new(),
-            deployment_progress_pct: 0,
-            progress_message: None,
+                last_deploy_id: String::new(),
+                deployment_progress_pct: 0,
+                progress_message: None,
                 models: vec![ServiceModelEntry {
                     // Same name as the seeded alias above.
                     model_name: "test-alias".into(),
@@ -889,9 +889,9 @@ mod tests {
                 restart_count: 0,
                 health_last_err: None,
                 active_deploy_id: String::new(),
-            last_deploy_id: String::new(),
-            deployment_progress_pct: 0,
-            progress_message: None,
+                last_deploy_id: String::new(),
+                deployment_progress_pct: 0,
+                progress_message: None,
                 models: vec![ServiceModelEntry {
                     model_name: "whisper-base".into(),
                     display_name: None,

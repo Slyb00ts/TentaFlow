@@ -226,7 +226,7 @@ export const encode = {
   ) {
     assertReady();
     const body = _wasm.encodeFlowInvokeAudio(
-      flowId != null ? BigInt(flowId) : undefined,
+      flowId != null ? String(flowId) : undefined,
       model || '',
       serviceType || 'chat',
       mime || 'audio/wav',
@@ -827,7 +827,7 @@ export const encode = {
   /** MessageBody::FlowDetailRequest { flowId } */
   flowDetailRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowDetailRequest(flowId);
+    const body = _wasm.encodeFlowDetailRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -865,7 +865,7 @@ export const encode = {
   /** MessageBody::FlowDeleteRequest { flowId } */
   flowDeleteRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowDeleteRequest(flowId);
+    const body = _wasm.encodeFlowDeleteRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -877,7 +877,7 @@ export const encode = {
   /** MessageBody::FlowExecutionsListRequest { flowId } */
   flowExecutionsListRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowExecutionsListRequest(flowId);
+    const body = _wasm.encodeFlowExecutionsListRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1730,7 +1730,7 @@ export const encode = {
       String(payload.clientSecret ?? ''),
       String(payload.discoveryUrl ?? ''),
       !!payload.autoCreateUsers,
-      payload.defaultGroupId == null ? undefined : Number(payload.defaultGroupId),
+      payload.defaultGroupId == null ? undefined : String(payload.defaultGroupId),
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
@@ -1858,7 +1858,7 @@ export const encode = {
   auditLogListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeAuditLogListRequest(
-      payload.userId ?? null,
+      payload.userId == null ? null : String(payload.userId),
       payload.addonId ?? null,
       payload.action ?? null,
       payload.fromDate ?? null,
@@ -1996,7 +1996,7 @@ export const encode = {
   auditLogExportRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeAuditLogExportRequest(
-      payload.userId ?? null,
+      payload.userId == null ? null : String(payload.userId),
       payload.addonId ?? null,
       payload.action ?? null,
       payload.fromDate ?? null,
@@ -2059,7 +2059,7 @@ export const encode = {
     assertReady();
     const body = _wasm.encodeAddonVisibilitySetRequest(
       String(payload.addonId ?? ''),
-      Number(payload.groupId ?? 0),
+      String(payload.groupId ?? ''),
       Boolean(payload.visible),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -2130,7 +2130,7 @@ export const encode = {
     const body = _wasm.encodeAddonPermissionSetRequest(
       String(payload.addonId ?? ''),
       String(payload.subjectType ?? 'user'),
-      Number(payload.subjectId ?? 0),
+      String(payload.subjectId ?? ''),
       String(payload.permissionId ?? ''),
       String(payload.grantMode ?? 'inherit'),
     );
@@ -2161,7 +2161,7 @@ export const encode = {
   /** MessageBody::AddonPermissionCheckRequest — sprawdz efektywny grant. */
   addonPermissionCheckRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const userId = payload.userId == null ? null : Number(payload.userId);
+    const userId = payload.userId == null ? null : String(payload.userId);
     const body = _wasm.encodeAddonPermissionCheckRequest(
       String(payload.addonId ?? ''),
       String(payload.permissionId ?? ''),
@@ -2519,7 +2519,7 @@ export const encode = {
   },
   iamGetUserRequest(correlationId, { userId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamGetUserRequest(Number(userId));
+    const body = _wasm.encodeIamGetUserRequest(String(userId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamCreateUserRequest(correlationId, p, sequence = 1) {
@@ -2534,25 +2534,25 @@ export const encode = {
   iamUpdateUserRequest(correlationId, p, sequence = 1) {
     assertReady();
     const body = _wasm.encodeIamUpdateUserRequest(
-      Number(p.userId), String(p.displayName ?? ''), String(p.email ?? ''),
+      String(p.userId), String(p.displayName ?? ''), String(p.email ?? ''),
       !!p.isActive, String(p.role ?? 'user'),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamDeleteUserRequest(correlationId, { userId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamDeleteUserRequest(Number(userId));
+    const body = _wasm.encodeIamDeleteUserRequest(String(userId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamSetUserGroupsRequest(correlationId, p, sequence = 1) {
     assertReady();
     const csv = Array.isArray(p.groupIds) ? p.groupIds.join(',') : String(p.groupIds ?? '');
-    const body = _wasm.encodeIamSetUserGroupsRequest(Number(p.userId), csv);
+    const body = _wasm.encodeIamSetUserGroupsRequest(String(p.userId), csv);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamResetUserPasswordRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamResetUserPasswordRequest(Number(p.userId), String(p.newPassword ?? ''));
+    const body = _wasm.encodeIamResetUserPasswordRequest(String(p.userId), String(p.newPassword ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamListGroupsRequest(correlationId, _payload, sequence = 1) {
@@ -2567,24 +2567,24 @@ export const encode = {
   },
   iamUpdateGroupRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamUpdateGroupRequest(Number(p.groupId), String(p.name ?? ''), String(p.description ?? ''));
+    const body = _wasm.encodeIamUpdateGroupRequest(String(p.groupId), String(p.name ?? ''), String(p.description ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamDeleteGroupRequest(correlationId, { groupId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamDeleteGroupRequest(Number(groupId));
+    const body = _wasm.encodeIamDeleteGroupRequest(String(groupId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamGroupMembersRequest(correlationId, { groupId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamGroupMembersRequest(Number(groupId));
+    const body = _wasm.encodeIamGroupMembersRequest(String(groupId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamSetPermissionRequest(correlationId, p, sequence = 1) {
     assertReady();
     const body = _wasm.encodeIamSetPermissionRequest(
       String(p.resourceType), String(p.resourceId),
-      String(p.subjectType), Number(p.subjectId), String(p.accessLevel),
+      String(p.subjectType), String(p.subjectId), String(p.accessLevel),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -2592,7 +2592,7 @@ export const encode = {
     assertReady();
     const body = _wasm.encodeIamClearPermissionRequest(
       String(p.resourceType), String(p.resourceId),
-      String(p.subjectType), Number(p.subjectId),
+      String(p.subjectType), String(p.subjectId),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -2603,7 +2603,7 @@ export const encode = {
   },
   iamListPermsForSubjectRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamListPermsForSubjectRequest(String(p.subjectType), Number(p.subjectId));
+    const body = _wasm.encodeIamListPermsForSubjectRequest(String(p.subjectType), String(p.subjectId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

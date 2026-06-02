@@ -646,7 +646,7 @@ function bindSsoTab() {
     const discoveryUrl = byId('sso-discovery-url')?.value?.trim() || '';
     const autoCreateUsers = byId('sso-auto-create')?.hasAttribute('checked') ?? false;
     const defaultGroupStr = byId('sso-default-group')?.value?.trim() || '';
-    const defaultGroupId = defaultGroupStr ? parseInt(defaultGroupStr, 10) : null;
+    const defaultGroupId = defaultGroupStr || null;
 
     if (!name || !clientId || !clientSecret || !discoveryUrl) {
       toast(I18n.t('settings.sso_add_required'), 'error');

@@ -76,7 +76,7 @@ pub struct ExecutionContext {
     pub request_id: String,
     pub execution_id: i64,
     pub session_id: Option<String>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub user_role: Option<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,

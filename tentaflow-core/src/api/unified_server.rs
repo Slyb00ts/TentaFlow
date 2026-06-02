@@ -393,7 +393,7 @@ pub fn start_unified_server_with_permissions(
                                             ) {
                                                 Ok(Some(api_key_row)) => {
                                                     if let Some(uid) = api_key_row.owner_user_id {
-                                                        let role = crate::db::repository::get_user_account_by_id(&db, uid)
+                                                        let role = crate::db::repository::get_user_account_by_id(&db, &uid)
                                                         .ok()
                                                         .flatten()
                                                         .map(|u| u.role)

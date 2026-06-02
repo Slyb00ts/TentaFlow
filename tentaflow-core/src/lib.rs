@@ -32,6 +32,7 @@ pub mod sync;
 pub mod tts;
 pub mod vision;
 pub mod vision_models;
+pub mod web_research;
 
 // macos_ffi: dlopen helpery dla libMLXBridge.dylib. Zawsze aktywne na
 // macOS/iOS (apple-tts), oraz pod feature flags mlx-whisper/mlx-kokoro

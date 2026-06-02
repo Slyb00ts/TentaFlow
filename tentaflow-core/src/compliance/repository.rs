@@ -3,13 +3,13 @@
 // Opis: Repozytorium SQLite dla Compliance Core, ROPA, retencji i AI audit.
 // =============================================================================
 
-use anyhow::{Result, anyhow};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{anyhow, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::MINIMUM_AI_AUDIT_RETENTION_DAYS;
 use super::models::*;
+use super::MINIMUM_AI_AUDIT_RETENTION_DAYS;
 
 fn now_utc() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -536,7 +536,7 @@ pub fn list_ai_events(
                    WHERE org_id = ?1"
         .to_string();
     let status_value = filter.status.map(|status| status.as_str().to_string());
-    let user_id_value = filter.user_id;
+    let user_id_value = filter.user_id.as_deref();
     let addon_id_value = filter.addon_id.as_deref();
     let mut next_param = 2;
 
@@ -730,12 +730,10 @@ mod tests {
         let categories = list_data_categories(&conn, crate::services::org::DEFAULT_ORG_ID)
             .expect("lista kategorii");
 
-        assert!(
-            categories
-                .iter()
-                .any(|c| c.name_translations.contains("Konta użytkowników")
-                    && c.name_translations.contains("User accounts"))
-        );
+        assert!(categories
+            .iter()
+            .any(|c| c.name_translations.contains("Konta użytkowników")
+                && c.name_translations.contains("User accounts")));
     }
 
     #[test]
@@ -771,11 +769,9 @@ mod tests {
             resolve_retention_policy(&conn, &org.org_id, RetentionScopeKind::AiAudit, None)
                 .expect("polityka AI");
 
-        assert!(
-            categories
-                .iter()
-                .any(|category| category.slug == "ai_prompt")
-        );
+        assert!(categories
+            .iter()
+            .any(|category| category.slug == "ai_prompt"));
         assert_eq!(policy.org_id, org.org_id);
         assert!(policy.retention_days >= MINIMUM_AI_AUDIT_RETENTION_DAYS);
     }

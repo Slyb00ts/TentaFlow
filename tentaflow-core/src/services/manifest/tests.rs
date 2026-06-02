@@ -989,6 +989,7 @@ mod capability_axes {
             speculator_repo: None,
             speculator_method: None,
             speculator_num_tokens: None,
+            vllm: None,
         }
     }
 

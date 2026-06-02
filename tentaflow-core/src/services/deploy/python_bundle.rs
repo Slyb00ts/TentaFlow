@@ -15,11 +15,11 @@ use async_trait::async_trait;
 use rusqlite::Transaction;
 
 use super::{
-    DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
-    SmartProbeConfig, SmartProbeOutcome, auto_gpu_memory_utilization, build_endpoint_url,
-    build_new_service, category_tag, host_os_supported, is_cuda_vllm_engine, models_from_manifest,
-    normalize_vllm_spark_args, parse_gpu_memory_utilization_arg, query_cuda0_vram_mib,
-    resolve_display_name, smart_health_probe, strip_gpu_memory_utilization,
+    auto_gpu_memory_utilization, build_endpoint_url, build_new_service, category_tag,
+    host_os_supported, is_cuda_vllm_engine, models_from_manifest, normalize_vllm_spark_args,
+    parse_gpu_memory_utilization_arg, query_cuda0_vram_mib, resolve_display_name,
+    smart_health_probe, strip_gpu_memory_utilization, DeployError, DeployResult, DeployStrategy,
+    LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::deploy::process_ctl;
 use crate::deploy::python_venv::{self, NativeDeployRequest};
@@ -209,6 +209,21 @@ impl DeployStrategy for PythonBundleDeploy {
         }
         let is_cuda_vllm = is_cuda_vllm_engine(&engine_id);
         apply_vllm_user_args(&engine_id, &self.user_config, &mut env);
+        // vLLM featured presets (Bielik draft, Qwen MTP): append the preset's
+        // `--speculative-config` to VLLM_ARGS so the native server enables
+        // speculative decoding. (NVFP4 self-quant for native still serves the
+        // unquantized HF repo — the quantize prelaunch is docker-only for now.)
+        if let Some(spec_arg) =
+            super::vllm_native_speculative_arg(&self.manifest, &self.user_config)
+        {
+            let merged = match env.get("VLLM_ARGS") {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{} {}", existing, spec_arg)
+                }
+                _ => spec_arg,
+            };
+            env.insert("VLLM_ARGS".into(), merged);
+        }
         // VLLM_ARGS / gpu_memory_utilization sa pojeciami specyficznymi dla
         // vllm. Inne python-bundle silniki (qwen-asr, parakeet, xtts itd.)
         // odpalaja przez uvicorn lub wlasny entrypoint, ktore nie znaja

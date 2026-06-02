@@ -24,15 +24,10 @@ use crate::dispatch::{HandlerContext, SessionAuthKind};
 // crate-wide re-export for a single-feature module).
 // -----------------------------------------------------------------------------
 
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -114,7 +109,7 @@ fn vnc_tunnel_open_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subsc
         };
 
         // 2. BOLA check: only owner or admin.
-        if !is_admin(&ctx) && desc.owner_user_id != Some(me) {
+        if !is_admin(&ctx) && desc.owner_user_id.as_deref() != Some(me.as_str()) {
             emit_open_status(&sub, VNC_TUNNEL_OPEN_FORBIDDEN, "not your session");
             return;
         }
@@ -135,7 +130,7 @@ fn vnc_tunnel_open_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subsc
         };
 
         // 5. Per-user tunnel budget.
-        if vnc_tunnel::count_for_user(&ctx.state.vnc_tunnels, me) >= MAX_TUNNELS_PER_USER {
+        if vnc_tunnel::count_for_user(&ctx.state.vnc_tunnels, &me) >= MAX_TUNNELS_PER_USER {
             emit_open_status(
                 &sub,
                 VNC_TUNNEL_OPEN_FAILED,
@@ -164,7 +159,7 @@ fn vnc_tunnel_open_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subsc
         vnc_tunnel::spawn_tunnel_bridge(
             Arc::clone(&ctx.state.vnc_tunnels),
             tunnel_id,
-            me,
+            me.clone(),
             port,
             sub,
         );

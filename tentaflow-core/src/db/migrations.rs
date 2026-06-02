@@ -15,9 +15,16 @@ use tracing::info;
 /// - `Rust` — funkcja, ktora dostaje `&Connection` w transakcji. Uzywana
 ///   gdy logika nie da sie zapisac jako pure SQL (np. row-by-row JSON
 ///   serializacja po stronie Rust).
+/// - `RustSelfManaged` — funkcja, ktora sama zarzadza pragma + transakcja.
+///   Uzywana dla rebuildow tabel wymagajacych `PRAGMA foreign_keys=OFF`
+///   POZA transakcja (SQLite ignoruje zmiane tego pragma wewnatrz aktywnej
+///   transakcji) oraz `PRAGMA foreign_key_check` przed commitem. Funkcja
+///   musi sama zapisac wiersz `_migrations` w obrebie swojej transakcji,
+///   bo runner nie otwiera dla niej wlasnej.
 pub enum MigrationStep {
     Sql(&'static str),
     Rust(fn(&Connection) -> Result<()>),
+    RustSelfManaged(fn(&Connection, i64, &str) -> Result<()>),
 }
 
 /// Uruchamia migracje bazy danych.
@@ -38,24 +45,72 @@ pub fn run(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
 
+    // The v53 INTEGER→UUID identity flip rewrites every core PK, so every core
+    // operation a peer already holds points at a dead integer id. Upgrading ACROSS
+    // v53 this run arms a one-shot baseline reset that the sync runtime consumes
+    // after it is up (it owns the Fjall ledger + signer this `Connection` lacks):
+    // bump the epoch, drop the stale core ledger state, and re-seed the outbox
+    // from the post-flip rows. The marker is set only on the crossing boot and
+    // cleared by the consumer, so a routine restart never re-bumps the epoch.
+    //
+    // A FRESH install (`current_version == 0`) runs v53 against empty identity
+    // tables and has no peers holding stale integer-keyed ops, so it must NOT
+    // bump: it stays on the genesis epoch every other fresh node shares,
+    // otherwise two fresh nodes could never exchange core ops (epoch is compared
+    // for exact equality, origin node included).
+    let crossing_identity_flip =
+        current_version > 0 && current_version < CORE_IDENTITY_FLIP_VERSION;
+
     for (version, name, step) in get_migrations() {
         if version > current_version {
             info!("Migracja {}: {}", version, name);
-            let tx = conn.unchecked_transaction()?;
             match step {
-                MigrationStep::Sql(sql) => tx.execute_batch(sql)?,
-                MigrationStep::Rust(f) => f(&tx)?,
+                MigrationStep::Sql(sql) => {
+                    let tx = conn.unchecked_transaction()?;
+                    tx.execute_batch(sql)?;
+                    tx.execute(
+                        "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+                        rusqlite::params![version, name],
+                    )?;
+                    tx.commit()?;
+                }
+                MigrationStep::Rust(f) => {
+                    let tx = conn.unchecked_transaction()?;
+                    f(&tx)?;
+                    tx.execute(
+                        "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+                        rusqlite::params![version, name],
+                    )?;
+                    tx.commit()?;
+                }
+                MigrationStep::RustSelfManaged(f) => {
+                    // Runner nie otwiera transakcji ani nie zapisuje
+                    // `_migrations` — robi to sama funkcja, bo musi
+                    // sterowac `PRAGMA foreign_keys` poza transakcja.
+                    f(conn, version, name)?;
+                }
             }
-            tx.execute(
-                "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
-                rusqlite::params![version, name],
-            )?;
-            tx.commit()?;
         }
+    }
+
+    if crossing_identity_flip {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+            rusqlite::params![CORE_BASELINE_RESET_PENDING_KEY],
+        )?;
     }
 
     Ok(())
 }
+
+/// Migration version of the INTEGER→UUID core identity flip. Crossing it arms
+/// the one-shot Sync Ledger baseline reset.
+pub const CORE_IDENTITY_FLIP_VERSION: i64 = 53;
+
+/// `settings` key holding the one-shot "baseline reset pending after cutover"
+/// flag. Written by `run` when v53 is crossed, consumed (and cleared) by the
+/// sync runtime once it owns the ledger.
+pub const CORE_BASELINE_RESET_PENDING_KEY: &str = "core_baseline_reset_pending";
 
 fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
     vec![
@@ -255,7 +310,922 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "core_resource_versions",
             MigrationStep::Sql(CORE_RESOURCE_VERSIONS),
         ),
+        (
+            53,
+            "core_identity_int_to_uuid",
+            MigrationStep::RustSelfManaged(core_identity_int_to_uuid),
+        ),
+        (
+            54,
+            "core_sync_captures_hlc",
+            MigrationStep::Sql(CORE_SYNC_CAPTURES_HLC),
+        ),
     ]
+}
+
+// =============================================================================
+// v53 — core identity INTEGER -> TEXT UUID migration
+// =============================================================================
+//
+// The five core identity tables (`flows`, `flow_model_bindings`,
+// `flow_versions`, `user_accounts`, `user_groups`) historically used INTEGER
+// AUTOINCREMENT primary keys. Decentralized sync requires globally-unique,
+// collision-free identifiers, so this migration rewrites each PK to a TEXT
+// UUIDv4 and remaps EVERY dependent FK / identity column accordingly.
+//
+// The remap is driven by `child_remaps()` — the single source of truth shared
+// with the schema guard test, so a forgotten child column cannot silently drift.
+// Each child column is rewritten through the same old_int -> new_uuid map that
+// was applied to its parent's PK, keeping referential integrity intact.
+
+/// One child column that references a core identity table by its old INTEGER id
+/// and must be rewritten to the parent's new UUID.
+struct ChildRemap {
+    /// Child table holding the FK / identity column.
+    table: &'static str,
+    /// FK / identity column inside `table`.
+    column: &'static str,
+    /// Identity table whose PK map drives the rewrite.
+    parent: IdentityTable,
+}
+
+/// Parent identity tables that appear as a remap target for a child column.
+/// `flow_model_bindings` and `flow_versions` also flip to UUID PKs but no other
+/// table references them, so they are not selectable parents here — their PK
+/// rebuild is invoked directly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentityTable {
+    Flows,
+    UserAccounts,
+    UserGroups,
+}
+
+impl IdentityTable {
+    fn table_name(self) -> &'static str {
+        match self {
+            Self::Flows => "flows",
+            Self::UserAccounts => "user_accounts",
+            Self::UserGroups => "user_groups",
+        }
+    }
+}
+
+/// Exhaustive FK closure: every child column that references one of the five
+/// core identity tables. Source of truth for both the migration remap and the
+/// `INITIAL_SCHEMA` allowlist guard. A column referencing `user_accounts` or
+/// `user_groups` is included even when no SQL-level `REFERENCES` clause exists
+/// (several user-attribution columns were declared without a constraint).
+fn child_remaps() -> Vec<ChildRemap> {
+    use IdentityTable::*;
+    let f = |table, column, parent| ChildRemap {
+        table,
+        column,
+        parent,
+    };
+    vec![
+        // -- references to flows(id) --
+        f("flow_versions", "flow_id", Flows),
+        f("flow_model_bindings", "flow_id", Flows),
+        f("flow_executions", "flow_id", Flows),
+        f("flow_invocations", "flow_id", Flows),
+        f("compliance_ai_events", "flow_id", Flows),
+        // -- references to user_accounts(id) --
+        f("api_keys", "owner_user_id", UserAccounts),
+        f("addon_secrets", "user_id", UserAccounts),
+        f("audit_log", "user_id", UserAccounts),
+        f("addon_config", "updated_by", UserAccounts),
+        f("addon_permissions", "updated_by", UserAccounts),
+        f("addon_permission_defaults", "updated_by", UserAccounts),
+        f("addon_visibility", "updated_by", UserAccounts),
+        f("addon_oauth_config", "updated_by", UserAccounts),
+        f("addon_network_config", "updated_by", UserAccounts),
+        f("addon_instances", "created_by", UserAccounts),
+        f("addon_network_rules", "approved_by", UserAccounts),
+        f("oauth_pending_states", "user_id", UserAccounts),
+        f("user_oauth_accounts", "user_id", UserAccounts),
+        f("notes", "user_id", UserAccounts),
+        f("meeting_settings", "user_id", UserAccounts),
+        f("meeting_sessions", "owner_user_id", UserAccounts),
+        f("deployments", "user_id", UserAccounts),
+        f("scheduled_jobs", "created_by_user_id", UserAccounts),
+        f("sync_nodes", "owner_user_id", UserAccounts),
+        f("user_identity_keys", "user_id", UserAccounts),
+        f("node_user_assignments", "user_id", UserAccounts),
+        f("node_user_assignments", "created_by", UserAccounts),
+        f("sync_user_org_profiles", "user_id", UserAccounts),
+        f("sync_user_org_profiles", "manager_user_id", UserAccounts),
+        f("sync_resource_acl", "owner_user_id", UserAccounts),
+        f("sync_resource_acl", "assigned_user_id", UserAccounts),
+        f("sync_resource_acl", "manager_user_id", UserAccounts),
+        f("sync_explicit_shares", "granted_by", UserAccounts),
+        f(
+            "__tentaflow_core_sync_captures",
+            "actor_user_id",
+            UserAccounts,
+        ),
+        f(
+            "__tentaflow_kv_sync_captures",
+            "actor_user_id",
+            UserAccounts,
+        ),
+        f(
+            "__tentaflow_blob_sync_captures",
+            "actor_user_id",
+            UserAccounts,
+        ),
+        f(
+            "compliance_processing_activities",
+            "owner_user_id",
+            UserAccounts,
+        ),
+        f("compliance_legal_holds", "created_by_user_id", UserAccounts),
+        f(
+            "compliance_legal_holds",
+            "released_by_user_id",
+            UserAccounts,
+        ),
+        f("compliance_documents", "created_by_user_id", UserAccounts),
+        f("compliance_ai_events", "user_id", UserAccounts),
+        f(
+            "compliance_dsar_requests",
+            "handled_by_user_id",
+            UserAccounts,
+        ),
+        f("compliance_dpia_records", "owner_user_id", UserAccounts),
+        f(
+            "compliance_breach_incidents",
+            "created_by_user_id",
+            UserAccounts,
+        ),
+        // -- references to user_groups(id) --
+        f("sso_providers", "default_group_id", UserGroups),
+        f("addon_visibility", "group_id", UserGroups),
+        f("sync_exclusions", "group_id", UserGroups),
+        // -- polymorphic subject columns (user OR group, by subject_type) --
+        // One remap per subject kind: the user-typed rows resolve against the
+        // user map, the group-typed rows against the group map.
+        f("addon_permissions", "subject_id", UserAccounts),
+        f("addon_permissions", "subject_id", UserGroups),
+        f("resource_permissions", "subject_id", UserAccounts),
+        f("resource_permissions", "subject_id", UserGroups),
+        // -- composite member table: both columns flip --
+        f("group_members", "group_id", UserGroups),
+        f("group_members", "user_id", UserAccounts),
+    ]
+}
+
+/// INTEGER columns that match the FK naming pattern but intentionally stay
+/// INTEGER because they reference a table whose PK is NOT migrated in this step
+/// (services, voice_profiles, meeting_sessions, model_aliases) or are a local
+/// surrogate / payload value, not a core-identity FK.
+#[cfg(test)]
+struct IntentionalLocalInteger {
+    table: &'static str,
+    column: &'static str,
+    /// WHY this column is exempt.
+    reason: &'static str,
+}
+
+#[cfg(test)]
+fn intentionally_local_integers() -> Vec<IntentionalLocalInteger> {
+    let l = |table, column, reason| IntentionalLocalInteger {
+        table,
+        column,
+        reason,
+    };
+    vec![
+        l(
+            "meeting_transcripts",
+            "profile_id",
+            "references voice_profiles(id), which stays INTEGER",
+        ),
+        l(
+            "model_alias_visibility",
+            "updated_by_user_id",
+            "model_aliases subtree retains legacy INTEGER user attribution; no FK, audit-only",
+        ),
+        l(
+            "model_alias_consumers",
+            "granted_by_user_id",
+            "model_aliases subtree audit-only user attribution, no FK constraint",
+        ),
+        l(
+            "model_visibility",
+            "updated_by_user_id",
+            "model_aliases subtree audit-only user attribution, no FK constraint",
+        ),
+        l(
+            "model_consumers",
+            "granted_by_user_id",
+            "model_aliases subtree audit-only user attribution, no FK constraint",
+        ),
+        l(
+            "addon_uses_alias",
+            "grant_decided_by_user_id",
+            "model_aliases subtree audit-only user attribution, no FK constraint",
+        ),
+        l(
+            "addon_uses_model",
+            "grant_decided_by_user_id",
+            "model_aliases subtree audit-only user attribution, no FK constraint",
+        ),
+        l(
+            "alias_calls",
+            "caller_user_id",
+            "model_aliases call-log user attribution, no FK constraint",
+        ),
+        l(
+            "model_alias_changes",
+            "changed_by_user_id",
+            "model_aliases change-log user attribution, no FK constraint",
+        ),
+        l(
+            "deployments",
+            "target_service_id",
+            "references services(id), which stays INTEGER",
+        ),
+        l(
+            "service_aliases",
+            "target_service_id",
+            "references services(id), which stays INTEGER",
+        ),
+        l(
+            "model_registry",
+            "service_id",
+            "references services(id), which stays INTEGER",
+        ),
+    ]
+}
+
+/// Columns matching the FK naming pattern that are already TEXT but are NOT a
+/// core-identity (user/group/flow) FK: free-text attribution, composite-FK user
+/// references, or FKs to other TEXT-PK tables. Listed so the guard does not flag
+/// them. Each entry documents WHY it is not a core-identity remap target.
+#[cfg(test)]
+struct IntentionalTextNonIdentity {
+    table: &'static str,
+    column: &'static str,
+    reason: &'static str,
+}
+
+#[cfg(test)]
+fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
+    let t = |table, column, reason| IntentionalTextNonIdentity {
+        table,
+        column,
+        reason,
+    };
+    vec![
+        t(
+            "flow_invocations",
+            "actor_user_id",
+            "added directly as TEXT user_accounts(id) UUID; no INTEGER→UUID remap needed",
+        ),
+        t(
+            "org_memberships",
+            "user_id",
+            "already TEXT (CAST(id AS TEXT)); remapped in place by v53, not a rebuilt table",
+        ),
+        t(
+            "org_memberships",
+            "granted_by",
+            "free-text grantor marker ('system' / admin id), not a user_accounts FK",
+        ),
+        t(
+            "trusted_nodes",
+            "approved_by",
+            "free-text approver label, no user_accounts FK",
+        ),
+        t(
+            "role_catalog",
+            "created_by",
+            "free-text creator marker, no user_accounts FK",
+        ),
+        t(
+            "flow_versions",
+            "created_by",
+            "free-text author marker on the version snapshot, no user_accounts FK",
+        ),
+        t(
+            "legal_documents",
+            "generated_by_user_id",
+            "composite FK to org_memberships(org_id,user_id); the user_id half is already \
+             org-scoped TEXT, remapped via org_memberships, not user_accounts.id directly",
+        ),
+        t(
+            "sync_explicit_shares",
+            "subject_id",
+            "polymorphic user|node id stored as free TEXT (subject_type discriminator)",
+        ),
+        t(
+            "compliance_data_subjects",
+            "subject_id",
+            "PK of compliance_data_subjects (TEXT UUID), a data-subject, not a platform user",
+        ),
+        t(
+            "compliance_data_subject_links",
+            "subject_id",
+            "FK to compliance_data_subjects(subject_id), not user_accounts",
+        ),
+        t(
+            "compliance_consent_records",
+            "subject_id",
+            "FK to compliance_data_subjects(subject_id), not user_accounts",
+        ),
+        t(
+            "compliance_dsar_requests",
+            "subject_id",
+            "FK to compliance_data_subjects(subject_id), not user_accounts",
+        ),
+    ]
+}
+
+/// Identity columns (the rewritten PKs) for the allowlist guard. Their parent
+/// PK becomes TEXT; the guard treats them as migrated.
+#[cfg(test)]
+fn identity_pk_columns() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("flows", "id"),
+        ("flow_model_bindings", "id"),
+        ("flow_versions", "id"),
+        ("user_accounts", "id"),
+        ("user_groups", "id"),
+    ]
+}
+
+/// Rewrites the five core identity tables to TEXT UUID PKs and remaps every
+/// dependent column. Self-managed: owns the `foreign_keys` pragma and the
+/// transaction because the pragma flip is a no-op inside an open transaction.
+fn core_identity_int_to_uuid(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    // A re-run after a successful prior attempt would find the PKs already TEXT;
+    // the version guard in `run` prevents that, but stay defensive: if `flows.id`
+    // is already TEXT, this DB was migrated — record the version and return.
+    if column_is_text(conn, "flows", "id")? {
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        // Phase 1: build the old_int -> new_uuid map for each identity table.
+        let flows_map = build_id_map(&tx, "flows")?;
+        let bindings_map = build_id_map(&tx, "flow_model_bindings")?;
+        let versions_map = build_id_map(&tx, "flow_versions")?;
+        let users_map = build_id_map(&tx, "user_accounts")?;
+        let groups_map = build_id_map(&tx, "user_groups")?;
+
+        let map_for = |parent: IdentityTable| -> &std::collections::HashMap<i64, String> {
+            match parent {
+                IdentityTable::Flows => &flows_map,
+                IdentityTable::UserAccounts => &users_map,
+                IdentityTable::UserGroups => &groups_map,
+            }
+        };
+
+        // Phase 2: rebuild every child column FIRST while parents still hold
+        // their old INTEGER ids (so a child value can still be matched against
+        // the parent's pre-rewrite id space via the map). For polymorphic
+        // subject_id columns the remap is conditioned on subject_type.
+        for remap in child_remaps() {
+            if !table_exists(&tx, remap.table)? {
+                continue;
+            }
+            remap_child_column(&tx, &remap, map_for(remap.parent))?;
+        }
+
+        // Phase 3: rewrite each identity table's own PK to TEXT.
+        rebuild_flows(&tx, &flows_map)?;
+        rebuild_flow_model_bindings(&tx, &bindings_map)?;
+        rebuild_flow_versions(&tx, &versions_map)?;
+        rebuild_user_accounts(&tx, &users_map)?;
+        rebuild_user_groups(&tx, &groups_map)?;
+
+        // org_memberships.user_id is already TEXT (backfilled as CAST(id AS TEXT)
+        // by v32/v38). Remap those textual integer values through the same map
+        // so memberships keep pointing at the right user.
+        if table_exists(&tx, "org_memberships")? {
+            remap_text_int_column(&tx, "org_memberships", "user_id", &users_map)?;
+        }
+
+        // Drop AUTOINCREMENT bookkeeping for the rebuilt tables.
+        if table_exists(&tx, "sqlite_sequence")? {
+            tx.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN \
+                 ('flows','flow_model_bindings','flow_versions','user_accounts','user_groups')",
+                [],
+            )?;
+        }
+
+        // Phase 4: referential integrity gate. `foreign_key_check` catches every
+        // declared FK; untyped attribution columns (no REFERENCES clause) are
+        // scanned manually for orphans.
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "core_identity_int_to_uuid: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+        scan_untyped_orphans(&tx, &users_map, &groups_map, &flows_map)?;
+
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            Ok(())
+        }
+        Err(e) => {
+            // Leave a recovery marker. The transaction already rolled back on
+            // drop; a later recovery step can detect the half state.
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES \
+                 ('migration_phase', ?1)",
+                rusqlite::params![format!("core_identity_int_to_uuid:failed:{e}")],
+            );
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            Err(e)
+        }
+    }
+}
+
+/// True when `table.column` has declared type affinity TEXT (per PRAGMA).
+fn column_is_text(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            let ty: String = row.get(2)?;
+            return Ok(ty.eq_ignore_ascii_case("TEXT"));
+        }
+    }
+    Ok(false)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Builds the old INTEGER id -> new UUIDv4 map for one identity table.
+fn build_id_map(conn: &Connection, table: &str) -> Result<std::collections::HashMap<i64, String>> {
+    let mut map = std::collections::HashMap::new();
+    let mut stmt = conn.prepare(&format!("SELECT id FROM {table}"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let old_id: i64 = row.get(0)?;
+        map.insert(old_id, uuid::Uuid::new_v4().to_string());
+    }
+    Ok(map)
+}
+
+/// Rewrites a child INTEGER FK column to the parent's new UUID. Rows whose
+/// value is NULL stay NULL; rows whose value is missing from the map are
+/// orphans and abort the migration (they would dangle after the PK flip).
+/// `addon_permissions.subject_id` / `resource_permissions.subject_id` are
+/// polymorphic: only rows with the matching `subject_type` are rewritten here,
+/// the call site enqueues one remap per subject kind.
+fn remap_child_column(
+    conn: &Connection,
+    remap: &ChildRemap,
+    map: &std::collections::HashMap<i64, String>,
+) -> Result<()> {
+    let polymorphic = remap.column == "subject_id"
+        && matches!(remap.table, "addon_permissions" | "resource_permissions");
+
+    let select_sql = if polymorphic {
+        let want = match remap.parent {
+            IdentityTable::UserGroups => "group",
+            _ => "user",
+        };
+        format!(
+            "SELECT rowid, {col} FROM {tbl} \
+             WHERE {col} IS NOT NULL AND subject_type = '{want}'",
+            col = remap.column,
+            tbl = remap.table,
+        )
+    } else {
+        format!(
+            "SELECT rowid, {col} FROM {tbl} WHERE {col} IS NOT NULL",
+            col = remap.column,
+            tbl = remap.table,
+        )
+    };
+
+    let mut to_update: Vec<(i64, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&select_sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            // Value may already be TEXT (e.g. polymorphic group rows pointing at
+            // the legacy textual group id). Read as i64 first; fall back to TEXT
+            // parse so a partially-textual column does not abort.
+            let old_int: Option<i64> = match row.get::<_, i64>(1) {
+                Ok(v) => Some(v),
+                Err(_) => row
+                    .get::<_, String>(1)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+            };
+            let Some(old_int) = old_int else {
+                continue;
+            };
+            let Some(new_uuid) = map.get(&old_int) else {
+                anyhow::bail!(
+                    "core_identity_int_to_uuid: orphan {}.{} = {} has no parent in {}",
+                    remap.table,
+                    remap.column,
+                    old_int,
+                    remap.parent.table_name()
+                );
+            };
+            to_update.push((rowid, new_uuid.clone()));
+        }
+    }
+
+    let update_sql = format!(
+        "UPDATE {tbl} SET {col} = ?1 WHERE rowid = ?2",
+        tbl = remap.table,
+        col = remap.column
+    );
+    for (rowid, new_uuid) in to_update {
+        conn.execute(&update_sql, rusqlite::params![new_uuid, rowid])?;
+    }
+    Ok(())
+}
+
+/// Remaps a column that already stores the old integer id as TEXT
+/// (`CAST(id AS TEXT)`), e.g. `org_memberships.user_id`.
+fn remap_text_int_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    map: &std::collections::HashMap<i64, String>,
+) -> Result<()> {
+    let mut to_update: Vec<(i64, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
+        ))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let cur: String = row.get(1)?;
+            // Only remap values that are still legacy integers; UUIDs are left
+            // untouched (idempotent if a value was already converted).
+            if let Ok(old_int) = cur.parse::<i64>() {
+                if let Some(new_uuid) = map.get(&old_int) {
+                    to_update.push((rowid, new_uuid.clone()));
+                }
+            }
+        }
+    }
+    for (rowid, new_uuid) in to_update {
+        conn.execute(
+            &format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2"),
+            rusqlite::params![new_uuid, rowid],
+        )?;
+    }
+    Ok(())
+}
+
+/// Returns one human-readable line per `foreign_key_check` violation.
+fn foreign_key_check(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        let rowid: Option<i64> = row.get(1).ok();
+        let parent: String = row.get(2)?;
+        out.push(format!("{table} rowid={rowid:?} -> {parent}",));
+    }
+    Ok(out)
+}
+
+/// Scans untyped (no REFERENCES) attribution columns for values that no longer
+/// match any parent UUID. `foreign_key_check` cannot see these because they
+/// carry no FK constraint, yet a dangling value is still a data-integrity bug.
+fn scan_untyped_orphans(
+    conn: &Connection,
+    users_map: &std::collections::HashMap<i64, String>,
+    _groups_map: &std::collections::HashMap<i64, String>,
+    _flows_map: &std::collections::HashMap<i64, String>,
+) -> Result<()> {
+    let user_uuids: std::collections::HashSet<&String> = users_map.values().collect();
+    // audit_log.user_id has no FK clause (kept nullable for system actors), but
+    // a non-NULL value must resolve to a real user UUID after the remap.
+    if table_exists(conn, "audit_log")? {
+        let mut stmt = conn.prepare("SELECT user_id FROM audit_log WHERE user_id IS NOT NULL")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let uid: String = row.get(0)?;
+            if !user_uuids.contains(&uid) {
+                anyhow::bail!(
+                    "core_identity_int_to_uuid: audit_log.user_id={uid} is orphaned after remap"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_flows(conn: &Connection, map: &std::collections::HashMap<i64, String>) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS flows_uuid_new;
+        CREATE TABLE flows_uuid_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            version INTEGER DEFAULT 1,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            service_type TEXT,
+            flow_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','active','decoded')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            published_model_name TEXT NULL
+        );
+        "#,
+    )?;
+    {
+        let mut sel = conn.prepare(
+            "SELECT id, name, description, version, is_default, service_type, flow_json, \
+             status, created_at, updated_at, published_model_name FROM flows",
+        )?;
+        let mut rows = sel.query([])?;
+        while let Some(row) = rows.next()? {
+            let old_id: i64 = row.get(0)?;
+            let new_id = map.get(&old_id).expect("flows id in map");
+            conn.execute(
+                "INSERT INTO flows_uuid_new (id, name, description, version, is_default, \
+                 service_type, flow_json, status, created_at, updated_at, published_model_name) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                rusqlite::params![
+                    new_id,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        r#"
+        DROP TABLE flows;
+        ALTER TABLE flows_uuid_new RENAME TO flows;
+        CREATE INDEX idx_flows_status ON flows(status);
+        CREATE INDEX idx_flows_service_type ON flows(service_type);
+        CREATE INDEX idx_flows_default_lookup ON flows(is_default, service_type, status);
+        CREATE UNIQUE INDEX idx_flows_published_model_name
+            ON flows(published_model_name)
+            WHERE published_model_name IS NOT NULL;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn rebuild_flow_model_bindings(
+    conn: &Connection,
+    map: &std::collections::HashMap<i64, String>,
+) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS flow_model_bindings_uuid_new;
+        CREATE TABLE flow_model_bindings_uuid_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+            model_pattern TEXT NOT NULL UNIQUE,
+            priority INTEGER DEFAULT 0
+        );
+        "#,
+    )?;
+    {
+        let mut sel =
+            conn.prepare("SELECT id, flow_id, model_pattern, priority FROM flow_model_bindings")?;
+        let mut rows = sel.query([])?;
+        while let Some(row) = rows.next()? {
+            let old_id: i64 = row.get(0)?;
+            let new_id = map.get(&old_id).expect("binding id in map");
+            // flow_id was already rewritten to TEXT UUID in Phase 2.
+            let flow_id: String = row.get(1)?;
+            conn.execute(
+                "INSERT INTO flow_model_bindings_uuid_new (id, flow_id, model_pattern, priority) \
+                 VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    new_id,
+                    flow_id,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        r#"
+        DROP TABLE flow_model_bindings;
+        ALTER TABLE flow_model_bindings_uuid_new RENAME TO flow_model_bindings;
+        CREATE INDEX idx_flow_model_bindings_flow ON flow_model_bindings(flow_id);
+        CREATE INDEX idx_flow_model_bindings_priority ON flow_model_bindings(flow_id, priority);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn rebuild_flow_versions(
+    conn: &Connection,
+    map: &std::collections::HashMap<i64, String>,
+) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS flow_versions_uuid_new;
+        CREATE TABLE flow_versions_uuid_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+            version_num INTEGER NOT NULL,
+            flow_json TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            status TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_by TEXT,
+            UNIQUE(flow_id, version_num)
+        );
+        "#,
+    )?;
+    {
+        let mut sel = conn.prepare(
+            "SELECT id, flow_id, version_num, flow_json, name, description, status, \
+             created_at, created_by FROM flow_versions",
+        )?;
+        let mut rows = sel.query([])?;
+        while let Some(row) = rows.next()? {
+            let old_id: i64 = row.get(0)?;
+            let new_id = map.get(&old_id).expect("flow_version id in map");
+            let flow_id: String = row.get(1)?;
+            conn.execute(
+                "INSERT INTO flow_versions_uuid_new (id, flow_id, version_num, flow_json, name, \
+                 description, status, created_at, created_by) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params![
+                    new_id,
+                    flow_id,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        r#"
+        DROP TABLE flow_versions;
+        ALTER TABLE flow_versions_uuid_new RENAME TO flow_versions;
+        CREATE INDEX idx_flow_versions_flow_id ON flow_versions(flow_id, version_num DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn rebuild_user_accounts(
+    conn: &Connection,
+    map: &std::collections::HashMap<i64, String>,
+) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS user_accounts_uuid_new;
+        CREATE TABLE user_accounts_uuid_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            email TEXT DEFAULT '',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            is_admin INTEGER NOT NULL DEFAULT 0,
+            sso_provider TEXT DEFAULT NULL,
+            sso_subject TEXT DEFAULT NULL,
+            last_login_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            role TEXT NOT NULL DEFAULT 'user',
+            preferred_language TEXT
+        );
+        "#,
+    )?;
+    {
+        let mut sel = conn.prepare(
+            "SELECT id, username, password_hash, display_name, email, is_active, is_admin, \
+             sso_provider, sso_subject, last_login_at, created_at, updated_at, \
+             must_change_password, role FROM user_accounts",
+        )?;
+        let mut rows = sel.query([])?;
+        while let Some(row) = rows.next()? {
+            let old_id: i64 = row.get(0)?;
+            let new_id = map.get(&old_id).expect("user id in map");
+            conn.execute(
+                "INSERT INTO user_accounts_uuid_new (id, username, password_hash, display_name, \
+                 email, is_active, is_admin, sso_provider, sso_subject, last_login_at, created_at, \
+                 updated_at, must_change_password, role) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                rusqlite::params![
+                    new_id,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, String>(13)?,
+                ],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        r#"
+        DROP TABLE user_accounts;
+        ALTER TABLE user_accounts_uuid_new RENAME TO user_accounts;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn rebuild_user_groups(
+    conn: &Connection,
+    map: &std::collections::HashMap<i64, String>,
+) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS user_groups_uuid_new;
+        CREATE TABLE user_groups_uuid_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        "#,
+    )?;
+    {
+        let mut sel = conn.prepare("SELECT id, name, description, created_at FROM user_groups")?;
+        let mut rows = sel.query([])?;
+        while let Some(row) = rows.next()? {
+            let old_id: i64 = row.get(0)?;
+            let new_id = map.get(&old_id).expect("group id in map");
+            conn.execute(
+                "INSERT INTO user_groups_uuid_new (id, name, description, created_at) \
+                 VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    new_id,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        r#"
+        DROP TABLE user_groups;
+        ALTER TABLE user_groups_uuid_new RENAME TO user_groups;
+        "#,
+    )?;
+    Ok(())
 }
 
 // The v48 `cameras` rebuild (CAMERAS_VENDOR_CHECK_LOCAL_SOURCES) recreated the
@@ -507,7 +1477,7 @@ CREATE TABLE IF NOT EXISTS sync_nodes (
         CHECK(node_kind IN ('unknown','phone','tablet','laptop','desktop','server','shared','authority')),
     trust_status TEXT NOT NULL DEFAULT 'untrusted'
         CHECK(trust_status IN ('untrusted','pending','trusted','revoked')),
-    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    owner_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     sync_profile TEXT NOT NULL DEFAULT 'standard'
         CHECK(sync_profile IN ('standard','limited','authority','storage_only','ephemeral')),
     last_seen_at TEXT NULL,
@@ -530,7 +1500,7 @@ END;
 
 CREATE TABLE IF NOT EXISTS user_identity_keys (
     key_id TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
     key_type TEXT NOT NULL CHECK(key_type IN ('ed25519','secp256k1')),
     public_key TEXT NOT NULL,
     purpose TEXT NOT NULL DEFAULT 'sync'
@@ -547,12 +1517,12 @@ CREATE INDEX IF NOT EXISTS idx_user_identity_keys_public ON user_identity_keys(k
 
 CREATE TABLE IF NOT EXISTS node_user_assignments (
     node_id TEXT NOT NULL REFERENCES sync_nodes(node_id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
     assignment_mode TEXT NOT NULL
         CHECK(assignment_mode IN ('primary','allowed','shared_session','authority_operator')),
     valid_from TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     valid_until TEXT NULL,
-    created_by INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_by TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     PRIMARY KEY(node_id, user_id, assignment_mode)
 );
@@ -576,9 +1546,9 @@ FROM trusted_nodes;
 const SYNC_PERMISSION_ENGINE: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_user_org_profiles (
     org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
     department_id TEXT NULL,
-    manager_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    manager_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     is_department_manager INTEGER NOT NULL DEFAULT 0 CHECK(is_department_manager IN (0,1)),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -604,10 +1574,10 @@ CREATE TABLE IF NOT EXISTS sync_resource_acl (
     addon_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
-    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
-    assigned_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    owner_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    assigned_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     department_id TEXT NULL,
-    manager_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    manager_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     visibility_scope TEXT NOT NULL DEFAULT 'assigned'
         CHECK(visibility_scope IN ('private','own','assigned','department','manager_subtree','explicit_share','all')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -644,7 +1614,7 @@ CREATE TABLE IF NOT EXISTS sync_explicit_shares (
     subject_type TEXT NOT NULL CHECK(subject_type IN ('user','node')),
     subject_id TEXT NOT NULL,
     action TEXT NOT NULL CHECK(action IN ('read','write','sync_receive','admin')),
-    granted_by INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    granted_by TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     granted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     revoked_at TEXT NULL,
     PRIMARY KEY(org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action)
@@ -708,7 +1678,7 @@ CREATE TABLE IF NOT EXISTS __tentaflow_core_sync_captures (
     primary_key TEXT NOT NULL,
     action TEXT NOT NULL CHECK(action IN ('insert','update','delete')),
     changed_fields_blob BLOB NOT NULL,
-    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    actor_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
     operation_id TEXT NULL,
     error_message TEXT NULL,
@@ -724,6 +1694,16 @@ CREATE INDEX IF NOT EXISTS idx_core_sync_captures_operation
     ON __tentaflow_core_sync_captures(operation_id);
 "#;
 
+// v54 — carry the pre-commit HLC stamp on each core capture row so the ledger
+// operation drained later reuses the exact timestamp recorded inside the write
+// transaction (not a fresh clock read at drain time), and so the materializer's
+// HLC-LWW comparison sees the originating order.
+const CORE_SYNC_CAPTURES_HLC: &str = r#"
+ALTER TABLE __tentaflow_core_sync_captures ADD COLUMN hlc_wall INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE __tentaflow_core_sync_captures ADD COLUMN hlc_logical INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE __tentaflow_core_sync_captures ADD COLUMN hlc_node TEXT NOT NULL DEFAULT '';
+"#;
+
 const KV_SYNC_CAPTURES: &str = r#"
 CREATE TABLE IF NOT EXISTS __tentaflow_kv_sync_captures (
     capture_id TEXT PRIMARY KEY,
@@ -733,7 +1713,7 @@ CREATE TABLE IF NOT EXISTS __tentaflow_kv_sync_captures (
     storage_key TEXT NOT NULL,
     action TEXT NOT NULL CHECK(action IN ('set','delete')),
     storage_value BLOB NULL,
-    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    actor_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
     operation_id TEXT NULL,
     error_message TEXT NULL,
@@ -758,7 +1738,7 @@ CREATE TABLE IF NOT EXISTS __tentaflow_blob_sync_captures (
     mime TEXT NOT NULL,
     size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
     file_path TEXT NOT NULL,
-    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    actor_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
     operation_id TEXT NULL,
     error_message TEXT NULL,
@@ -1099,8 +2079,8 @@ fn flow_invocations_add_actor_user_id(conn: &Connection) -> Result<()> {
 
     if !has_col {
         conn.execute_batch(
-            "ALTER TABLE flow_invocations ADD COLUMN actor_user_id INTEGER NULL \
-                 REFERENCES users(id);",
+            "ALTER TABLE flow_invocations ADD COLUMN actor_user_id TEXT NULL \
+                 REFERENCES user_accounts(id);",
         )?;
     }
     Ok(())
@@ -1810,7 +2790,7 @@ CREATE TABLE deployments (
     image_tag TEXT NOT NULL DEFAULT '',
     container_name TEXT NOT NULL DEFAULT '',
     config_json TEXT NOT NULL DEFAULT '{}',
-    user_id INTEGER,
+    user_id TEXT,
     started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMP,
     error_message TEXT,
@@ -1895,7 +2875,7 @@ CREATE INDEX IF NOT EXISTS idx_deployments_target_service ON deployments(target_
 const FLOW_EXECUTIONS_ALLOW_COMPLETED: &str = r#"
 CREATE TABLE flow_executions_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    flow_id INTEGER NOT NULL REFERENCES flows(id),
+    flow_id TEXT NOT NULL REFERENCES flows(id),
     request_id TEXT,
     model TEXT,
     started_at TEXT,
@@ -1923,7 +2903,7 @@ CREATE TABLE api_keys (
     is_active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_used_at TEXT,
-    owner_user_id INTEGER
+    owner_user_id TEXT
 );
 CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix);
 CREATE INDEX idx_apikeys_owner ON api_keys(owner_user_id);
@@ -1963,7 +2943,7 @@ CREATE TABLE model_aliases (
 CREATE INDEX idx_model_aliases_alias ON model_aliases(alias);
 
 CREATE TABLE flows (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL,
     description TEXT,
     version INTEGER DEFAULT 1,
@@ -1983,8 +2963,8 @@ CREATE UNIQUE INDEX idx_flows_published_model_name
     WHERE published_model_name IS NOT NULL;
 
 CREATE TABLE flow_model_bindings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    flow_id INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+    id TEXT PRIMARY KEY NOT NULL,
+    flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
     model_pattern TEXT NOT NULL UNIQUE,
     priority INTEGER DEFAULT 0
 );
@@ -2046,7 +3026,7 @@ CREATE UNIQUE INDEX idx_tts_rules_type_pattern_unique ON tts_cleaning_rules(rule
 
 CREATE TABLE flow_executions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    flow_id INTEGER NOT NULL REFERENCES flows(id),
+    flow_id TEXT NOT NULL REFERENCES flows(id),
     request_id TEXT,
     model TEXT,
     started_at TEXT,
@@ -2074,7 +3054,7 @@ CREATE TABLE registries (
 CREATE INDEX idx_registries_name ON registries(name);
 
 CREATE TABLE user_accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT PRIMARY KEY NOT NULL,
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     display_name TEXT NOT NULL DEFAULT '',
@@ -2087,19 +3067,20 @@ CREATE TABLE user_accounts (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     must_change_password INTEGER NOT NULL DEFAULT 0,
-    role TEXT NOT NULL DEFAULT 'user'
+    role TEXT NOT NULL DEFAULT 'user',
+    preferred_language TEXT
 );
 
 CREATE TABLE user_groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL UNIQUE,
     description TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE group_members (
-    group_id INTEGER NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
     PRIMARY KEY (group_id, user_id)
 );
 
@@ -2112,7 +3093,7 @@ CREATE TABLE sso_providers (
     discovery_url TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     auto_create_users INTEGER NOT NULL DEFAULT 0,
-    default_group_id INTEGER REFERENCES user_groups(id),
+    default_group_id TEXT REFERENCES user_groups(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -2144,7 +3125,7 @@ CREATE TABLE addons (
 CREATE TABLE addon_secrets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     addon_id TEXT NOT NULL,
-    user_id INTEGER,
+    user_id TEXT,
     key TEXT NOT NULL,
     value_encrypted TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -2155,7 +3136,7 @@ CREATE TABLE addon_secrets (
 CREATE TABLE audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-    user_id INTEGER,
+    user_id TEXT,
     addon_id TEXT,
     action TEXT NOT NULL,
     resource TEXT,
@@ -2177,7 +3158,7 @@ CREATE INDEX idx_audit_log_severity ON audit_log(severity);
 
 CREATE TABLE sync_exclusions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER REFERENCES user_groups(id) ON DELETE CASCADE,
+    group_id TEXT REFERENCES user_groups(id) ON DELETE CASCADE,
     resource_type TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(group_id, resource_type)
@@ -2226,7 +3207,7 @@ CREATE TABLE addon_config (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     is_secret INTEGER NOT NULL DEFAULT 0,
-    updated_by INTEGER,
+    updated_by TEXT,
     PRIMARY KEY (addon_id, key)
 );
 
@@ -2234,14 +3215,14 @@ CREATE TABLE addon_permissions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     addon_id TEXT NOT NULL,
     subject_type TEXT NOT NULL CHECK(subject_type IN ('user','group')),
-    subject_id INTEGER NOT NULL,
+    subject_id TEXT NOT NULL,
     permission_id TEXT NOT NULL,
     granted INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     grant_mode TEXT NOT NULL DEFAULT 'inherit'
         CHECK(grant_mode IN ('allow','deny','inherit')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_by INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL,
+    updated_by TEXT REFERENCES user_accounts(id) ON DELETE SET NULL,
     UNIQUE(addon_id, subject_type, subject_id, permission_id)
 );
 
@@ -2263,7 +3244,7 @@ CREATE TABLE addon_instances (
     instance_id TEXT NOT NULL UNIQUE,
     instance_name TEXT,
     status TEXT NOT NULL DEFAULT 'stopped',
-    created_by INTEGER,
+    created_by TEXT,
     started_at TEXT,
     stopped_at TEXT
 );
@@ -2306,7 +3287,7 @@ CREATE TABLE addon_network_rules (
     description TEXT DEFAULT '',
     required INTEGER NOT NULL DEFAULT 0,
     approved INTEGER NOT NULL DEFAULT 0,
-    approved_by INTEGER,
+    approved_by TEXT,
     approved_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(addon_id, rule_id)
@@ -2421,7 +3402,7 @@ CREATE TABLE meeting_sessions (
     bot_endpoint_id TEXT,
     bot_secret_key_hex TEXT,
     platform TEXT,
-    owner_user_id INTEGER,
+    owner_user_id TEXT,
     lifecycle_stage TEXT DEFAULT 'idle',
     lifecycle_details TEXT,
     lifecycle_updated_at TEXT,
@@ -2452,8 +3433,8 @@ CREATE TABLE meeting_transcripts (
 CREATE INDEX idx_meeting_transcripts_session ON meeting_transcripts(session_id, timestamp_ms);
 
 CREATE TABLE flow_versions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    flow_id INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+    id TEXT PRIMARY KEY NOT NULL,
+    flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
     version_num INTEGER NOT NULL,
     flow_json TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -2471,7 +3452,7 @@ CREATE TABLE addon_permission_defaults (
     permission_id TEXT NOT NULL,
     grant_mode TEXT NOT NULL CHECK(grant_mode IN ('allow','deny')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_by INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL,
+    updated_by TEXT REFERENCES user_accounts(id) ON DELETE SET NULL,
     UNIQUE(addon_id, permission_id)
 );
 CREATE INDEX idx_addon_perm_defaults_addon ON addon_permission_defaults(addon_id);
@@ -2479,10 +3460,10 @@ CREATE INDEX idx_addon_perm_defaults_addon ON addon_permission_defaults(addon_id
 CREATE TABLE addon_visibility (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     addon_id TEXT NOT NULL,
-    group_id INTEGER NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
     visible INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_by INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL,
+    updated_by TEXT REFERENCES user_accounts(id) ON DELETE SET NULL,
     UNIQUE(addon_id, group_id)
 );
 CREATE INDEX idx_addon_visibility_addon ON addon_visibility(addon_id);
@@ -2525,7 +3506,7 @@ CREATE TABLE addon_oauth_config (
     redirect_uri TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_by INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL,
+    updated_by TEXT REFERENCES user_accounts(id) ON DELETE SET NULL,
     oauth_mode TEXT NOT NULL DEFAULT 'individual'
         CHECK(oauth_mode IN ('global','individual','none')),
     UNIQUE(addon_id, provider_id)
@@ -2534,7 +3515,7 @@ CREATE INDEX idx_addon_oauth_config_addon ON addon_oauth_config(addon_id);
 
 CREATE TABLE oauth_pending_states (
     state TEXT PRIMARY KEY,
-    user_id INTEGER REFERENCES user_accounts(id) ON DELETE CASCADE,
+    user_id TEXT REFERENCES user_accounts(id) ON DELETE CASCADE,
     addon_id TEXT NOT NULL,
     provider_id TEXT NOT NULL,
     mode TEXT NOT NULL CHECK(mode IN ('global','individual')),
@@ -2551,12 +3532,12 @@ CREATE TABLE addon_network_config (
     blocked_hosts TEXT NOT NULL DEFAULT '[]',
     mode TEXT NOT NULL DEFAULT 'strict' CHECK(mode IN ('strict','permissive')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_by INTEGER
+    updated_by TEXT
 );
 
 CREATE TABLE user_oauth_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER REFERENCES user_accounts(id) ON DELETE CASCADE,
+    user_id TEXT REFERENCES user_accounts(id) ON DELETE CASCADE,
     addon_id TEXT NOT NULL,
     provider_id TEXT NOT NULL,
     external_account_id TEXT NOT NULL DEFAULT '',
@@ -2583,7 +3564,7 @@ CREATE INDEX idx_user_oauth_accounts_addon_provider ON user_oauth_accounts(addon
 
 CREATE TABLE notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
     title TEXT NOT NULL DEFAULT '',
     body TEXT NOT NULL DEFAULT '',
     pinned INTEGER NOT NULL DEFAULT 0,
@@ -2604,7 +3585,7 @@ CREATE TABLE meeting_port_allocations (
 CREATE INDEX idx_meeting_port_allocations_session ON meeting_port_allocations(session_id);
 
 CREATE TABLE meeting_settings (
-    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
     key TEXT NOT NULL,
     value TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -2631,7 +3612,7 @@ CREATE TABLE resource_permissions (
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     subject_type TEXT NOT NULL,
-    subject_id INTEGER NOT NULL,
+    subject_id TEXT NOT NULL,
     access_level TEXT NOT NULL CHECK(access_level IN ('allow','deny')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(resource_type, resource_id, subject_type, subject_id)
@@ -2752,7 +3733,7 @@ CREATE TABLE deployments (
     image_tag TEXT NOT NULL DEFAULT '',
     container_name TEXT NOT NULL DEFAULT '',
     config_json TEXT NOT NULL DEFAULT '{}',
-    user_id INTEGER,
+    user_id TEXT,
     started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMP,
     error_message TEXT,
@@ -2784,7 +3765,8 @@ CREATE TABLE peer_hints (
 );
 CREATE INDEX idx_peer_hints_node ON peer_hints(node_id);
 
-INSERT INTO user_groups (id, name, description) VALUES (1, 'admins', 'Administratorzy systemu');
+INSERT INTO user_groups (id, name, description) VALUES
+    ('00000000-0000-4000-8000-000000000001', 'admins', 'Administratorzy systemu');
 
 INSERT INTO settings(key, value) VALUES
     ('mesh.bind_mode', 'auto'),
@@ -2813,7 +3795,7 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     max_runtime_seconds INTEGER NOT NULL DEFAULT 1800,
     retry_policy_json TEXT NOT NULL DEFAULT '{"max_attempts":1,"backoff_seconds":60}',
     concurrency_policy TEXT NOT NULL DEFAULT 'skip',
-    created_by_user_id INTEGER,
+    created_by_user_id TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -2876,7 +3858,7 @@ CREATE TABLE IF NOT EXISTS compliance_processing_activities (
     purpose_translations TEXT NOT NULL DEFAULT '{}',
     controller_role TEXT NOT NULL DEFAULT 'controller'
         CHECK(controller_role IN ('controller','processor','joint_controller')),
-    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    owner_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     system_scope TEXT NOT NULL DEFAULT 'core' CHECK(system_scope IN ('core','addon','external')),
     addon_id TEXT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('draft','active','retired')),
@@ -2973,10 +3955,10 @@ CREATE TABLE IF NOT EXISTS compliance_legal_holds (
     scope_kind TEXT NOT NULL CHECK(scope_kind IN ('audit','ai_audit','data_category','document','dsar','breach','resource','general')),
     scope_id TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL,
-    created_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_by_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     released_at TEXT NULL,
-    released_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    released_by_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     release_reason TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compliance_legal_holds_active
@@ -2992,7 +3974,7 @@ CREATE TABLE IF NOT EXISTS compliance_documents (
     version INTEGER NOT NULL DEFAULT 1,
     artifact_path TEXT NOT NULL DEFAULT '',
     artifact_hash TEXT NOT NULL DEFAULT '',
-    created_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_by_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     UNIQUE(org_id, document_type, version),
@@ -3013,11 +3995,11 @@ END;
 CREATE TABLE IF NOT EXISTS compliance_ai_events (
     event_id TEXT PRIMARY KEY,
     org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
-    user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     node_id TEXT NOT NULL DEFAULT '',
     addon_id TEXT NULL,
     instance_id TEXT NULL,
-    flow_id INTEGER NULL REFERENCES flows(id) ON DELETE SET NULL,
+    flow_id TEXT NULL REFERENCES flows(id) ON DELETE SET NULL,
     flow_node_id TEXT NULL,
     request_id TEXT NOT NULL,
     model_id TEXT NOT NULL DEFAULT '',
@@ -3153,7 +4135,7 @@ CREATE TABLE IF NOT EXISTS compliance_dsar_requests (
     requested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     due_at TEXT NOT NULL,
     completed_at TEXT NULL,
-    handled_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    handled_by_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     notes TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_compliance_dsar_requests_org
@@ -3188,7 +4170,7 @@ CREATE TABLE IF NOT EXISTS compliance_dpia_records (
     activity_id TEXT NOT NULL REFERENCES compliance_processing_activities(activity_id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','review','approved','rejected','retired')),
     risk_class TEXT NOT NULL DEFAULT 'standard' CHECK(risk_class IN ('low','standard','high','critical')),
-    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    owner_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     summary TEXT NOT NULL DEFAULT '',
     reviewed_at TEXT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -3216,7 +4198,7 @@ CREATE TABLE IF NOT EXISTS compliance_breach_incidents (
     summary_translations TEXT NOT NULL DEFAULT '{}',
     dpa_notified_at TEXT NULL,
     subjects_notified_at TEXT NULL,
-    created_by_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_by_user_id TEXT NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     CHECK(json_valid(title_translations)),
@@ -3415,3 +4397,449 @@ INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description
  json_object('pl','Kluczowy uzytkownik i sponsor wdrozenia po stronie klienta','en','Key user and rollout sponsor on the client side'),
  'i-user-cog', 0, 'assigned');
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Regex-free heuristic: does a column name look like a core-identity FK?
+    /// Matches the discovery pattern from FAZA B krok 1A.
+    fn looks_like_identity_fk(table: &str, column: &str) -> bool {
+        if column == "id"
+            && matches!(
+                table,
+                "flows" | "flow_model_bindings" | "flow_versions" | "user_accounts" | "user_groups"
+            )
+        {
+            return true;
+        }
+        const SUFFIXES: &[&str] = &["_user_id", "_group_id"];
+        const EXACT: &[&str] = &[
+            "user_id",
+            "group_id",
+            "flow_id",
+            "subject_id",
+            "granted_by",
+            "approved_by",
+            "created_by",
+            "updated_by",
+            "owner_user_id",
+            "actor_user_id",
+            "manager_user_id",
+            "assigned_user_id",
+            "default_group_id",
+            "created_by_user_id",
+            "handled_by_user_id",
+            "released_by_user_id",
+            "generated_by_user_id",
+            "changed_by_user_id",
+            "caller_user_id",
+            "grant_decided_by_user_id",
+        ];
+        EXACT.contains(&column) || SUFFIXES.iter().any(|s| column.ends_with(s))
+    }
+
+    /// PRAGMA-introspect a live DB: returns (table, column, declared_type) for
+    /// every column whose name matches the identity-FK pattern.
+    fn pattern_integer_columns(conn: &Connection) -> Vec<(String, String, String)> {
+        let mut tables: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            for r in rows {
+                tables.push(r.unwrap());
+            }
+        }
+        let mut out = Vec::new();
+        for table in tables {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .unwrap();
+            for r in rows {
+                let (col, ty) = r.unwrap();
+                if looks_like_identity_fk(&table, &col) {
+                    out.push((table.clone(), col, ty));
+                }
+            }
+        }
+        out
+    }
+
+    /// Fresh install: run all migrations, then assert every identity-FK-pattern
+    /// column is either migrated to TEXT (per the allowlist) or explicitly
+    /// flagged intentionally-local INTEGER. A column matching the pattern that
+    /// is neither TEXT-allowlisted nor exempt fails the build — this is the
+    /// guard that stops a future column from silently keeping an INTEGER id.
+    #[test]
+    fn allowlist_guard_no_unaccounted_identity_integer() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Build the migrated-to-text set: identity PKs + every child remap.
+        let mut migrated: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for (t, c) in identity_pk_columns() {
+            migrated.insert((t.to_string(), c.to_string()));
+        }
+        for r in child_remaps() {
+            migrated.insert((r.table.to_string(), r.column.to_string()));
+        }
+        // Every exemption must carry a WHY reason; an empty one is a doc gap.
+        let exempt: std::collections::HashSet<(String, String)> = intentionally_local_integers()
+            .into_iter()
+            .map(|e| {
+                assert!(
+                    !e.reason.is_empty(),
+                    "intentionally-local {}.{} needs a WHY reason",
+                    e.table,
+                    e.column
+                );
+                (e.table.to_string(), e.column.to_string())
+            })
+            .collect();
+        let text_non_identity: std::collections::HashSet<(String, String)> =
+            intentionally_text_non_identity()
+                .into_iter()
+                .map(|e| {
+                    assert!(
+                        !e.reason.is_empty(),
+                        "intentionally-text {}.{} needs a WHY reason",
+                        e.table,
+                        e.column
+                    );
+                    (e.table.to_string(), e.column.to_string())
+                })
+                .collect();
+
+        for (table, column, ty) in pattern_integer_columns(&conn) {
+            let key = (table.clone(), column.clone());
+            if migrated.contains(&key) {
+                assert!(
+                    ty.eq_ignore_ascii_case("TEXT"),
+                    "{table}.{column} is on the migrated allowlist but is declared {ty}, not TEXT"
+                );
+                continue;
+            }
+            if exempt.contains(&key) {
+                assert!(
+                    ty.eq_ignore_ascii_case("INTEGER"),
+                    "{table}.{column} is flagged intentionally-local INTEGER but is declared {ty}"
+                );
+                continue;
+            }
+            if text_non_identity.contains(&key) {
+                assert!(
+                    ty.eq_ignore_ascii_case("TEXT"),
+                    "{table}.{column} is flagged intentionally-text-non-identity but is declared {ty}"
+                );
+                continue;
+            }
+            panic!(
+                "{table}.{column} ({ty}) matches the identity-FK pattern but is on neither the \
+                 migrated-to-text allowlist nor the intentionally-local-integer list. \
+                 Add it to child_remaps() (and flip its schema to TEXT) or to \
+                 intentionally_local_integers() with a WHY comment."
+            );
+        }
+    }
+
+    /// Seeds a DB at the pre-UUID schema (INTEGER ids) by running migrations up
+    /// to v52, then exercises v53 and verifies PK flip + referential integrity.
+    #[test]
+    fn migration_remaps_integer_ids_to_uuid() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Run the historical migrations only up to v52 so identity tables still
+        // hold INTEGER ids when we seed.
+        seed_pre_uuid_schema(&conn);
+
+        // Seed users, groups, flows and dependent children with INTEGER ids.
+        conn.execute_batch(
+            r#"
+            INSERT INTO user_accounts (id, username, password_hash) VALUES
+                (10, 'alice', 'h'), (11, 'bob', 'h');
+            INSERT INTO user_groups (id, name) VALUES (100, 'eng'), (101, 'ops');
+            INSERT INTO group_members (group_id, user_id) VALUES (100, 10), (101, 11);
+            INSERT INTO flows (id, name, flow_json) VALUES
+                (5, 'f1', '{}'), (6, 'f2', '{}');
+            INSERT INTO flow_model_bindings (id, flow_id, model_pattern) VALUES
+                (1, 5, 'gpt-*');
+            INSERT INTO flow_versions (id, flow_id, version_num, flow_json, name) VALUES
+                (1, 5, 1, '{}', 'v1');
+            INSERT INTO flow_executions (flow_id, status) VALUES (5, 'success');
+            INSERT INTO notes (user_id, title) VALUES (10, 'note');
+            INSERT INTO api_keys (key_hash, key_prefix, name, owner_user_id)
+                VALUES ('kh', 'kp', 'k', 11);
+            INSERT INTO addon_permissions (addon_id, subject_type, subject_id, permission_id)
+                VALUES ('a', 'user', 10, 'p1'), ('a', 'group', 100, 'p2');
+            INSERT INTO audit_log (action, user_id) VALUES ('login', 10);
+            INSERT INTO sso_providers
+                (name, provider_type, client_id, client_secret_encrypted, discovery_url, default_group_id)
+                VALUES ('idp', 'oidc', 'cid', 'sec', 'http://x', 101);
+            "#,
+        )
+        .unwrap();
+
+        // org_memberships.user_id is TEXT (CAST(id AS TEXT)). Seed legacy ints.
+        conn.execute_batch(
+            r#"
+            INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by)
+            VALUES ('org-default', '10', 'role-org-admin', 'now', 'system');
+            "#,
+        )
+        .unwrap();
+
+        let users_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM user_accounts", [], |r| r.get(0))
+            .unwrap();
+        let flows_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
+            .unwrap();
+
+        // Run v53.
+        core_identity_int_to_uuid(&conn, 53, "core_identity_int_to_uuid").unwrap();
+
+        // (a) PKs are now TEXT UUIDs.
+        for table in [
+            "flows",
+            "flow_model_bindings",
+            "flow_versions",
+            "user_accounts",
+            "user_groups",
+        ] {
+            assert!(
+                column_is_text(&conn, table, "id").unwrap(),
+                "{table}.id should be TEXT after migration"
+            );
+        }
+        let alice_id: String = conn
+            .query_row(
+                "SELECT id FROM user_accounts WHERE username='alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alice_id.len(), 36, "user id should be a UUID");
+
+        // (b) foreign_key_check is empty.
+        let violations = foreign_key_check(&conn).unwrap();
+        assert!(violations.is_empty(), "FK violations: {violations:?}");
+
+        // (c) row counts preserved.
+        let users_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM user_accounts", [], |r| r.get(0))
+            .unwrap();
+        let flows_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(users_before, users_after);
+        assert_eq!(flows_before, flows_after);
+
+        // (d) child FKs point at existing parent UUIDs.
+        let dangling_bindings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_model_bindings b \
+                 LEFT JOIN flows f ON f.id = b.flow_id WHERE f.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling_bindings, 0, "binding.flow_id must resolve");
+        let dangling_notes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes n \
+                 LEFT JOIN user_accounts u ON u.id = n.user_id WHERE u.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling_notes, 0, "notes.user_id must resolve");
+
+        // group_members both columns resolve.
+        let dangling_members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM group_members m \
+                 LEFT JOIN user_accounts u ON u.id = m.user_id \
+                 LEFT JOIN user_groups g ON g.id = m.group_id \
+                 WHERE u.id IS NULL OR g.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling_members, 0, "group_members must resolve both sides");
+
+        // polymorphic subject_id: user row -> alice uuid, group row -> eng uuid.
+        let perm_user: String = conn
+            .query_row(
+                "SELECT subject_id FROM addon_permissions WHERE permission_id='p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(perm_user, alice_id);
+        let eng_id: String = conn
+            .query_row("SELECT id FROM user_groups WHERE name='eng'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let perm_group: String = conn
+            .query_row(
+                "SELECT subject_id FROM addon_permissions WHERE permission_id='p2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(perm_group, eng_id);
+
+        // org_memberships.user_id remapped from '10' to alice uuid.
+        let membership_user: String = conn
+            .query_row(
+                "SELECT user_id FROM org_memberships WHERE org_id='org-default'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(membership_user, alice_id);
+
+        // audit_log.user_id remapped.
+        let audit_user: String = conn
+            .query_row(
+                "SELECT user_id FROM audit_log WHERE action='login'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_user, alice_id);
+    }
+
+    /// Builds a DB at exactly the v52 schema state (INTEGER identity ids) by
+    /// running every migration except v53. Mirrors `run` but stops before the
+    /// UUID flip so the migration test can seed legacy integer rows.
+    fn seed_pre_uuid_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        for (version, name, step) in get_migrations() {
+            if version >= 53 {
+                break;
+            }
+            let tx = conn.unchecked_transaction().unwrap();
+            match step {
+                MigrationStep::Sql(sql) => tx.execute_batch(sql).unwrap(),
+                MigrationStep::Rust(f) => f(&tx).unwrap(),
+                MigrationStep::RustSelfManaged(_) => unreachable!("no self-managed step below v53"),
+            }
+            tx.execute(
+                "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+                rusqlite::params![version, name],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        // Re-stamp identity tables back to INTEGER PKs: the squashed v1 now
+        // declares them TEXT, so for the migration test we must recreate the
+        // pre-UUID INTEGER shape that real legacy databases carry.
+        rebuild_identity_tables_as_integer(conn);
+    }
+
+    /// Drops the TEXT-PK identity tables created by the (already-flipped) v1
+    /// schema and recreates them with the historical INTEGER AUTOINCREMENT PKs,
+    /// so the migration test reproduces a genuine legacy database.
+    fn rebuild_identity_tables_as_integer(conn: &Connection) {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS group_members;
+            DROP TABLE IF EXISTS flow_versions;
+            DROP TABLE IF EXISTS flow_model_bindings;
+            DROP TABLE IF EXISTS flow_executions;
+            DROP TABLE IF EXISTS flows;
+            DROP TABLE IF EXISTS user_groups;
+            DROP TABLE IF EXISTS user_accounts;
+
+            CREATE TABLE user_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                email TEXT DEFAULT '',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                sso_provider TEXT DEFAULT NULL,
+                sso_subject TEXT DEFAULT NULL,
+                last_login_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                must_change_password INTEGER NOT NULL DEFAULT 0,
+                role TEXT NOT NULL DEFAULT 'user'
+            );
+            CREATE TABLE user_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE group_members (
+                group_id INTEGER NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+                PRIMARY KEY (group_id, user_id)
+            );
+            CREATE TABLE flows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                version INTEGER DEFAULT 1,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                service_type TEXT,
+                flow_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','active','decoded')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                published_model_name TEXT NULL
+            );
+            CREATE TABLE flow_model_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                flow_id INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+                model_pattern TEXT NOT NULL UNIQUE,
+                priority INTEGER DEFAULT 0
+            );
+            CREATE TABLE flow_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                flow_id INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+                version_num INTEGER NOT NULL,
+                flow_json TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                status TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_by TEXT,
+                UNIQUE(flow_id, version_num)
+            );
+            CREATE TABLE flow_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                flow_id INTEGER NOT NULL REFERENCES flows(id),
+                request_id TEXT,
+                model TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                status TEXT CHECK(status IN ('running','success','completed','error','cancelled')),
+                execution_log TEXT,
+                total_latency_ms INTEGER,
+                total_tokens INTEGER
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    }
+}

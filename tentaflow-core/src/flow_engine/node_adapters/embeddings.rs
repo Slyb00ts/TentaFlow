@@ -132,7 +132,7 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
             inputs,
             dimensions,
             encoding_format,
-            user_id: ctx.user_id,
+            user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
         };
 

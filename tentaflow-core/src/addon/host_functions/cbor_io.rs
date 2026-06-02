@@ -8,9 +8,9 @@
 
 use minicbor::{Decode, Encode};
 
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
 use super::super::errors::AbiError;
 use super::super::runtime::WasmMemory;
+use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
 use super::{read_guest_bytes, AddonState, WasmCaller};
 
 /// Reads CBOR input from guest memory and decodes it into `T`, enforcing the

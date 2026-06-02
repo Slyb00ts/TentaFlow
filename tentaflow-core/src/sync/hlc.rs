@@ -81,10 +81,7 @@ impl HlcClock {
     pub fn observe(&self, remote: &HybridLogicalTimestamp) {
         let mut state = self.state.lock();
         let physical = super::runtime::now_ms();
-        let wall = state
-            .wall_time_ms
-            .max(remote.wall_time_ms)
-            .max(physical);
+        let wall = state.wall_time_ms.max(remote.wall_time_ms).max(physical);
 
         // Pick a logical counter strictly greater than every source that shares
         // the chosen wall time. When the wall time advances past a source, that
@@ -157,7 +154,10 @@ mod tests {
             }
             previous = next;
         }
-        assert!(saw_same_wall_bump, "expected at least one same-ms logical bump");
+        assert!(
+            saw_same_wall_bump,
+            "expected at least one same-ms logical bump"
+        );
     }
 
     #[test]

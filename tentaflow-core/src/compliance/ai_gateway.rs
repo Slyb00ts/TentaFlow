@@ -26,7 +26,7 @@ pub struct AiGatewayContext {
     pub org_id: Option<String>,
     pub addon_id: Option<String>,
     pub instance_id: Option<String>,
-    pub flow_id: Option<i64>,
+    pub flow_id: Option<String>,
     pub flow_node_id: Option<String>,
 }
 
@@ -64,11 +64,11 @@ impl AiGateway {
             &conn,
             &NewAiEvent {
                 org_id: &org_id,
-                user_id: user.map(|u| u.user_id),
+                user_id: user.map(|u| u.user_id.as_str()),
                 node_id: &self.node_id,
                 addon_id: context.and_then(|c| c.addon_id.as_deref()),
                 instance_id: context.and_then(|c| c.instance_id.as_deref()),
-                flow_id: context.and_then(|c| c.flow_id),
+                flow_id: context.and_then(|c| c.flow_id.as_deref()),
                 flow_node_id: context.and_then(|c| c.flow_node_id.as_deref()),
                 request_id: &request_id,
                 model_id: &request.model,
@@ -278,7 +278,7 @@ fn insert_ai_audit_row(
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let resource_id = event.event_id.as_str();
     let hash_input = crate::audit::chain::AuditRowHashInput {
-        user_id: event.user_id,
+        user_id: event.user_id.as_deref(),
         addon_id: event.addon_id.as_deref(),
         instance_id: event.instance_id.as_deref(),
         action: "ai.completion",

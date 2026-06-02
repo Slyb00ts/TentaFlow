@@ -27,7 +27,7 @@ fn fresh_chain_verifies_clean() {
     for i in 0..5 {
         log_audit(
             &pool,
-            Some(i as i64),
+            Some(&i.to_string()),
             Some("com.test"),
             "smoke",
             Some("res"),
@@ -50,9 +50,39 @@ fn fresh_chain_verifies_clean() {
 fn tampering_action_is_detected() {
     let (_td, pool) = open_pool();
 
-    log_audit(&pool, Some(1), Some("a1"), "act_a", None, None, None, None).unwrap();
-    log_audit(&pool, Some(2), Some("a2"), "act_b", None, None, None, None).unwrap();
-    log_audit(&pool, Some(3), Some("a3"), "act_c", None, None, None, None).unwrap();
+    log_audit(
+        &pool,
+        Some("1"),
+        Some("a1"),
+        "act_a",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    log_audit(
+        &pool,
+        Some("2"),
+        Some("a2"),
+        "act_b",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    log_audit(
+        &pool,
+        Some("3"),
+        Some("a3"),
+        "act_c",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     {
         let conn = pool.lock().unwrap();
@@ -80,9 +110,9 @@ fn tampering_action_is_detected() {
 fn deleting_middle_row_breaks_prev_hash() {
     let (_td, pool) = open_pool();
 
-    log_audit(&pool, Some(1), Some("a"), "a1", None, None, None, None).unwrap();
-    log_audit(&pool, Some(2), Some("a"), "a2", None, None, None, None).unwrap();
-    log_audit(&pool, Some(3), Some("a"), "a3", None, None, None, None).unwrap();
+    log_audit(&pool, Some("1"), Some("a"), "a1", None, None, None, None).unwrap();
+    log_audit(&pool, Some("2"), Some("a"), "a2", None, None, None, None).unwrap();
+    log_audit(&pool, Some("3"), Some("a"), "a3", None, None, None, None).unwrap();
 
     {
         let conn = pool.lock().unwrap();
@@ -107,7 +137,7 @@ fn deleting_middle_row_breaks_prev_hash() {
 fn raw_bypass_insert_after_chain_start_is_tamper() {
     let (_td, pool) = open_pool();
 
-    log_audit(&pool, Some(1), Some("a"), "first", None, None, None, None).unwrap();
+    log_audit(&pool, Some("1"), Some("a"), "first", None, None, None, None).unwrap();
 
     {
         let conn = pool.lock().unwrap();

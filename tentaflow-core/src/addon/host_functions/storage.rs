@@ -96,7 +96,7 @@ pub fn storage_get(
             addon_id: addon_id.clone(),
             resource_type: "addon.kv".to_string(),
             resource_id: kv_resource_id(&instance_id, &key),
-            actor_user_id: caller.data().user_id,
+            actor_user_id: caller.data().user_id.clone(),
             kind: StorageProxyRequestKind::KvGet {
                 instance_id: instance_id.clone(),
                 key: key.clone(),
@@ -245,7 +245,7 @@ pub fn storage_set(
         .org_id
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
-    let actor_user_id = caller.data().user_id;
+    let actor_user_id = caller.data().user_id.clone();
     let value_size = value.len() as i64;
 
     if let Some((authority_node_id, iroh)) =
@@ -403,10 +403,9 @@ pub fn storage_set(
 
     match result {
         Ok(_) => {
-            if let Err(e) = crate::sync::kv_capture::ledger_kv_capture_now(
-                &caller.data().db,
-                &capture,
-            ) {
+            if let Err(e) =
+                crate::sync::kv_capture::ledger_kv_capture_now(&caller.data().db, &capture)
+            {
                 tracing::warn!("storage.set sync capture failed: {}", e);
             }
             audit_log(
@@ -474,7 +473,7 @@ pub fn storage_delete(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_
         .org_id
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
-    let actor_user_id = caller.data().user_id;
+    let actor_user_id = caller.data().user_id.clone();
     if let Some((authority_node_id, iroh)) =
         central_kv_target(caller.data(), &org_id, &addon_id, &instance_id, &key)
     {
@@ -545,10 +544,9 @@ pub fn storage_delete(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_
 
     match result {
         Ok(_) => {
-            if let Err(e) = crate::sync::kv_capture::ledger_kv_capture_now(
-                &caller.data().db,
-                &capture,
-            ) {
+            if let Err(e) =
+                crate::sync::kv_capture::ledger_kv_capture_now(&caller.data().db, &capture)
+            {
                 tracing::warn!("storage.delete sync capture failed: {}", e);
             }
             audit_log(
@@ -663,7 +661,7 @@ pub fn storage_list(
             addon_id: addon_id.clone(),
             resource_type: "addon.kv".to_string(),
             resource_id: String::new(),
-            actor_user_id: caller.data().user_id,
+            actor_user_id: caller.data().user_id.clone(),
             kind: StorageProxyRequestKind::KvList {
                 instance_id: instance_id.clone(),
                 prefix: prefix.clone(),
@@ -800,9 +798,7 @@ fn kv_resource_id(instance_id: &str, key: &str) -> String {
     format!("{}:{}", instance_id, hex::encode(hasher.finalize()))
 }
 
-fn storage_proxy_error_to_legacy(
-    error: &crate::services::storage_proxy::StorageProxyError,
-) -> i32 {
+fn storage_proxy_error_to_legacy(error: &crate::services::storage_proxy::StorageProxyError) -> i32 {
     match error {
         crate::services::storage_proxy::StorageProxyError::Timeout(_) => ABI_ERR_TIMEOUT,
         crate::services::storage_proxy::StorageProxyError::Remote { code, .. }

@@ -14,17 +14,11 @@ use tentaflow_sdk_spec::{UiPayload, UiTag};
 
 use super::HandlerContext;
 
-/// Extracts the SQLite i64 user_id from the session (marker-byte format).
-fn extract_user_id_i64(ctx: &HandlerContext) -> Option<i64> {
+/// Extracts the `user_accounts` UUID from the session (raw 16-byte form).
+fn extract_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] == 0xFF && user_id[1..8].iter().all(|&b| b == 0) {
-                let mut le = [0u8; 8];
-                le.copy_from_slice(&user_id[8..]);
-                Some(i64::from_le_bytes(le))
-            } else {
-                None
-            }
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -114,7 +108,7 @@ fn handle_panel_open(
 
     // Register addon→connection mapping so host functions (ui_render_cbor)
     // can find this session and register declared actions.
-    let user_id_for_conn = extract_user_id_i64(ctx).unwrap_or(0);
+    let user_id_for_conn = extract_user_id(ctx).unwrap_or_default();
     tracing::info!(
         addon = %panel_open.addon_id,
         user_id = user_id_for_conn,
@@ -123,28 +117,34 @@ fn handle_panel_open(
     );
     ctx.state.ui_sessions.register_addon_connection(
         &panel_open.addon_id,
-        user_id_for_conn,
+        &user_id_for_conn,
         ctx.connection_id,
     );
 
     if let Some(addon_mgr) = ctx.state.addon_manager.as_ref() {
-        let user_id = extract_user_id_i64(ctx);
+        let user_id = extract_user_id(ctx);
 
         if addon_mgr.has_running_instance(&panel_open.addon_id) {
             // Addon already running — call on_panel_open on existing instance.
             // If the addon doesn't export on_panel_open (legacy), fall back
             // to stop+start.
             let has_handler = addon_mgr
-                .call_panel_open(&panel_open.addon_id, &panel_open.panel_id, epoch, user_id)
+                .call_panel_open(
+                    &panel_open.addon_id,
+                    &panel_open.panel_id,
+                    epoch,
+                    user_id.clone(),
+                )
                 .unwrap_or(false);
 
             if !has_handler {
                 let _ = addon_mgr.stop_addon(&panel_open.addon_id);
                 addon_mgr
-                    .start_addon(&panel_open.addon_id, user_id, None)
+                    .start_addon(&panel_open.addon_id, user_id.clone(), None)
                     .map_err(|e| {
                         let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
-                        sl.lock().close_panel(&panel_open.addon_id, &panel_open.panel_id);
+                        sl.lock()
+                            .close_panel(&panel_open.addon_id, &panel_open.panel_id);
                         ProtocolError::internal(format!(
                             "failed to start addon '{}': {e}",
                             panel_open.addon_id
@@ -153,10 +153,11 @@ fn handle_panel_open(
             }
         } else {
             addon_mgr
-                .start_addon(&panel_open.addon_id, user_id, None)
+                .start_addon(&panel_open.addon_id, user_id.clone(), None)
                 .map_err(|e| {
                     let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
-                    sl.lock().close_panel(&panel_open.addon_id, &panel_open.panel_id);
+                    sl.lock()
+                        .close_panel(&panel_open.addon_id, &panel_open.panel_id);
                     ProtocolError::internal(format!(
                         "failed to start addon '{}': {e}",
                         panel_open.addon_id
@@ -167,10 +168,10 @@ fn handle_panel_open(
 
     // Track which connection is serving this addon+user panel so host
     // functions can locate the SessionState for outbound validation.
-    let user_id = extract_user_id_i64(ctx).unwrap_or(0);
+    let user_id = extract_user_id(ctx).unwrap_or_default();
     ctx.state.ui_sessions.register_addon_connection(
         &panel_open.addon_id,
-        user_id,
+        &user_id,
         ctx.connection_id,
     );
 
@@ -211,10 +212,10 @@ fn handle_panel_close(
     // Drop session lock before calling into registry (avoids nested lock).
     drop(session);
 
-    let user_id = extract_user_id_i64(ctx).unwrap_or(0);
+    let user_id = extract_user_id(ctx).unwrap_or_default();
     ctx.state
         .ui_sessions
-        .unregister_addon_connection(&panel_close.addon_id, user_id);
+        .unregister_addon_connection(&panel_close.addon_id, &user_id);
 
     // Echo the PanelClose back as acknowledgment.
     let response = UiPayload::PanelClose(panel_close);
@@ -328,7 +329,9 @@ fn handle_action(
             )));
         }
 
-        if let Err(e) = session.validate_action(&action.addon_id, &action.panel_id, &action.action_id) {
+        if let Err(e) =
+            session.validate_action(&action.addon_id, &action.panel_id, &action.action_id)
+        {
             tracing::warn!(error = %e, addon = %action.addon_id, action = %action.action_id, "UI action validation failed");
             return Err(ProtocolError::bad_request(e.to_string()));
         }
@@ -341,12 +344,12 @@ fn handle_action(
         .as_ref()
         .ok_or_else(|| ProtocolError::internal("addon manager not configured"))?;
 
-    let user_id = extract_user_id_i64(ctx).unwrap_or(0);
+    let user_id = extract_user_id(ctx).unwrap_or_default();
     let tool_name = format!("ui.{}.{}", action.panel_id, action.action_id);
     let params_json = cbor_map_to_json(&action.params);
     tracing::info!(tool = %tool_name, params = %params_json, "UI action calling addon tool");
 
-    let status = match addon_mgr.call_tool(&action.addon_id, &tool_name, params_json, user_id) {
+    let status = match addon_mgr.call_tool(&action.addon_id, &tool_name, params_json, &user_id) {
         Ok(result) => {
             tracing::info!(result = %result, "UI action tool returned");
             tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Ok
@@ -387,7 +390,7 @@ mod tests {
     fn test_ctx() -> HandlerContext {
         HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: [0xFFu8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                user_id: [1u8; 16],
                 role: Some("user".to_string()),
             },
             correlation_id: 1,

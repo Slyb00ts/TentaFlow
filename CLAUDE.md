@@ -121,6 +121,42 @@ registry lookup, stateless), `contacts` (CRM source-of-truth: companies/persons/
 Flow blocks + app panels), `memory`, `embeddings-chunker`. Per-addon detail lives in each
 addon directory.
 
+`[[network_rule]].host` supports exact hosts, `*.domain` subdomain wildcards and `*` for
+public-web addons. Wildcards still require explicit admin approval, keep the declared port,
+and remain behind the host HTTP SSRF guard.
+
+`tentaflow-core/src/web_research/` is the central public-web research service for addons:
+configurable search providers (`searxng`, `duckduckgo`, `brave`, `tavily`), public URL reading with DNS
+pinning/redirect revalidation/body limits, generic HTML/text extraction and batch
+`read_search_results`. Addons call it through SDK `web_*` wrappers and need `web.research`.
+When a search request omits `provider`, the host function resolves a running local
+`searxng` service from `services.endpoint_url` and marks it as an internal Core provider.
+If no local service exists, Core selects a visible remote `searxng` service from the mesh
+registry and sends a trusted `MeshCommandType::WebResearch` command to that owning node;
+the remote node executes the request against its own local endpoint and returns the serialized
+`WebResearchResponse`. This keeps phones and other mobile nodes from needing direct HTTP
+access to another node's loopback SearXNG port. If no SearXNG exists anywhere, Core falls
+back to the public DuckDuckGo HTML provider. Page URLs returned by search are still read through
+the public URL SSRF guard.
+
+Page reading is not a simple tag-stripper: `reader.rs` fetches only public readable content types
+with redirect revalidation and body limits, then `extract.rs` runs `readability` (default features
+disabled, no independent HTTP client) against the already fetched HTML. If Readability cannot
+produce useful text, Core falls back to local semantic block scoring (`article`/`main`/content
+classes, link-density penalty, boilerplate cleanup). Responses include extraction method,
+character count, word count and `quality_score` so flows/LLMs can rank or reject weak pages.
+`read_search_results` now treats `search_limit` as the candidate pool and keeps reading until it
+gets `read_limit` successful pages or runs out of search results. Bundled addon `deep-research`
+is only the LLM tool / Flow Builder facade over that SDK.
+
+## Service Containers
+
+`tentaflow-containers/tools/_services/searxng.toml` registers SearXNG as an infra service
+for public-web search. It has a Docker deployment based on the official
+`searxng/searxng` image and a native `python-bundle` deployment from the upstream git repo.
+Both variants enable JSON search output for `web_research`; iOS does not run this service
+natively because SearXNG is a Python web application, not an embedded Rust engine.
+
 ## Admin Scheduler
 
 `tentaflow-core/src/scheduler/`, state in SQLite (`scheduled_jobs`, `scheduled_runs`). Runs

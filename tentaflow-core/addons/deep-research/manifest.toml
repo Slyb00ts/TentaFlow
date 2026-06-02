@@ -1,0 +1,106 @@
+[addon]
+id = "deep-research"
+name = "Deep Research"
+version = "0.1.0"
+description = "Wyszukiwanie internetu, pobieranie publicznych stron i ekstrakcja tekstu przez Core Web Research SDK."
+category = "ai"
+keywords = ["research", "web", "search", "crawler", "internet", "sources"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "search"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "web.research"
+display_name = "Web research"
+description = "Wyszukuje i czyta publiczne strony przez kontrolowany Core Web Research SDK."
+risk = "critical"
+
+[[permission]]
+id = "flow_blocks"
+display_name = "Research flow blocks"
+description = "Udostepnia wyszukiwanie i czytanie stron jako bloki flow buildera."
+risk = "medium"
+
+[visibility]
+admin_only = true
+default_groups = []
+show_in_catalog = true
+
+[resources]
+memory_mb = 192
+fuel_limit = 80000000
+http_requests_per_minute = 120
+
+[lifecycle]
+background = false
+auto_start = false
+
+[[tool]]
+id = "search_web"
+display_name = "Szukaj w internecie"
+description = "Wyszukuje publiczne strony przez skonfigurowany provider search i zwraca liste wynikow."
+keywords = ["search", "web", "internet", "research"]
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Zapytanie wyszukiwania."
+required = true
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Maksymalna liczba wynikow, 1-10."
+required = false
+
+[[tool.parameter]]
+name = "provider"
+param_type = "object"
+description = "Opcjonalna konfiguracja providera search. Gdy puste, Core uzyje lokalnego SearXNG, zdalnego SearXNG przez mesh albo publicznego DuckDuckGo."
+required = false
+
+[[tool]]
+id = "fetch_url"
+display_name = "Pobierz strone"
+description = "Pobiera publiczny URL HTTP/HTTPS i ekstrahuje czytelny tekst."
+keywords = ["fetch", "read", "url", "page"]
+
+[[tool.parameter]]
+name = "url"
+param_type = "string"
+description = "Publiczny URL strony."
+required = true
+
+[[tool.parameter]]
+name = "max_chars"
+param_type = "number"
+description = "Maksymalna dlugosc tekstu w odpowiedzi."
+required = false
+
+[[tool]]
+id = "read_search_results"
+display_name = "Czytaj wyniki wyszukiwania"
+description = "Wyszukuje publiczne strony i czyta tresc wybranych wynikow bez syntezy LLM."
+keywords = ["deep", "research", "sources", "read", "content"]
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Zapytanie wyszukiwania."
+required = true
+
+[[tool.parameter]]
+name = "read_limit"
+param_type = "number"
+description = "Liczba stron do przeczytania, 1-25."
+required = false
+
+[[tool.parameter]]
+name = "provider"
+param_type = "object"
+description = "Opcjonalna konfiguracja providera search. Gdy puste, Core uzyje lokalnego SearXNG, zdalnego SearXNG przez mesh albo publicznego DuckDuckGo."
+required = false

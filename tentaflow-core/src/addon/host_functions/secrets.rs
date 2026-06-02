@@ -66,7 +66,7 @@ pub fn secret_get(
     }
 
     let addon_id = caller.data().addon_id.clone();
-    let user_id = caller.data().user_id;
+    let user_id = caller.data().user_id.clone();
 
     // Pobierz zaszyfrowany sekret z DB
     let secret_data: Option<(Vec<u8>, Vec<u8>)> = {
@@ -201,7 +201,7 @@ pub fn secret_set(
     }
 
     let addon_id = caller.data().addon_id.clone();
-    let user_id = caller.data().user_id;
+    let user_id = caller.data().user_id.clone();
 
     // Zaszyfruj wartosc — VULN-022: brak master key = blad
     let encryption_key = match derive_key(&addon_id, caller.data()) {

@@ -106,6 +106,7 @@ pin-project-lite = "0.2"
 
 # HTTP
 reqwest = { version = "0.13.3", features = ["json", "stream", "rustls", "multipart", "blocking", "form"] }
+readability = { version = "0.3.0", default-features = false }
 hyper = { version = "1.9.0", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1.3"

@@ -1826,7 +1826,10 @@ fn spawn_quic_event_handler(
                         None => false,
                     };
                     if !sender_trusted {
-                        warn!("Odrzucono DeployProgress od niezaufanego noda {}", from_node_id);
+                        warn!(
+                            "Odrzucono DeployProgress od niezaufanego noda {}",
+                            from_node_id
+                        );
                         continue;
                     }
                     match crate::mesh::cbor::decode::<tentaflow_protocol::mesh::MeshMessage>(&data)

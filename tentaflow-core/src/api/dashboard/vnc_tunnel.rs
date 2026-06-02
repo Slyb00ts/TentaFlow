@@ -28,7 +28,7 @@ use crate::dispatch::subscription::{push_chunk, push_end, Subscription};
 /// cleanup on the reader side.
 pub struct VncTunnelEntry {
     /// Owner for the BOLA check on `VncTunnelSendRequest` / `VncTunnelCloseRequest`.
-    pub owner_user_id: i64,
+    pub owner_user_id: String,
     /// Write half of the TCP connection to the container's websockify port.
     /// Wrapped in a Mutex so concurrent `Send` requests serialise writes.
     pub write_half: Arc<Mutex<OwnedWriteHalf>>,
@@ -39,7 +39,7 @@ pub struct VncTunnelEntry {
 pub const MAX_TUNNELS_PER_USER: usize = 3;
 
 /// Counts how many tunnel entries already belong to `user_id`.
-pub fn count_for_user(registry: &DashMap<String, VncTunnelEntry>, user_id: i64) -> usize {
+pub fn count_for_user(registry: &DashMap<String, VncTunnelEntry>, user_id: &str) -> usize {
     registry
         .iter()
         .filter(|e| e.value().owner_user_id == user_id)
@@ -54,7 +54,7 @@ pub fn count_for_user(registry: &DashMap<String, VncTunnelEntry>, user_id: i64) 
 pub fn spawn_tunnel_bridge(
     registry: Arc<DashMap<String, VncTunnelEntry>>,
     tunnel_id: String,
-    owner_user_id: i64,
+    owner_user_id: String,
     port: u16,
     sub: Arc<Subscription>,
 ) {

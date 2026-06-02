@@ -7,7 +7,7 @@ use crate::sync::ledger::{
     CompactionPolicy, LedgerResult, OperationQuery, OutboxEntry, PartitionId, SyncLedgerError,
     SyncLedgerStore, SyncSnapshot, SyncTarget,
 };
-use crate::sync::snapshot::{SnapshotPackageStore, verify_snapshot_signature};
+use crate::sync::snapshot::{verify_snapshot_signature, SnapshotPackageStore};
 use std::collections::{BTreeSet, HashSet};
 
 pub struct CompactionManager<'a> {
@@ -221,6 +221,10 @@ mod tests {
                 logical: 0,
                 node_id: signer.node_id().to_string(),
             },
+            epoch: crate::sync::ledger::BaselineEpoch {
+                counter: 0,
+                origin_node: String::new(),
+            },
             payload_hash: [1; 32],
             acl_snapshot_hash: [2; 32],
             policy_epoch: 1,
@@ -279,17 +283,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.compacted_up_to_sequence, 1);
-        assert!(
-            store
-                .get_operations(OperationQuery {
-                    partition_id: partition.clone(),
-                    from_sequence: Some(1),
-                    to_sequence: Some(1),
-                    limit: None,
-                })
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .get_operations(OperationQuery {
+                partition_id: partition.clone(),
+                from_sequence: Some(1),
+                to_sequence: Some(1),
+                limit: None,
+            })
+            .unwrap()
+            .is_empty());
         assert_eq!(
             store
                 .get_operations(OperationQuery {

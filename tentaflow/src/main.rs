@@ -245,6 +245,14 @@ async fn run_server(args: Args) -> Result<()> {
                 Err(e) => error!("Sync Ledger shared secret enqueue failed: {}", e),
                 _ => {}
             }
+            match tentaflow_core::sync::runtime::run_pending_baseline_cutover() {
+                Ok(Some(reseeded)) => info!(
+                    "Sync Ledger core baseline reset after v53 cutover: re-seeded {} core ops under new epoch",
+                    reseeded
+                ),
+                Ok(None) => {}
+                Err(e) => error!("Sync Ledger baseline cutover failed: {}", e),
+            }
             match tentaflow_core::addon::storage_sql_exec::drain_installed_sql_captures(&db, 1000) {
                 Ok(drained) => info!("Sync Ledger drained {} pending SQL captures", drained),
                 Err(e) => error!("Sync Ledger SQL capture drain failed: {}", e),
