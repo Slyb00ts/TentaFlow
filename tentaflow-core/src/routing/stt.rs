@@ -30,10 +30,10 @@ impl Router {
                     db,
                     "model",
                     &request.model,
-                    u.user_id,
+                    &u.user_id,
                     &u.role,
                 ) {
-                    tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied STT model");
+                    tracing::warn!(user_id = %u.user_id, model = %request.model, "ACL denied STT model");
                     return Err(crate::error::CoreError::ModelNotFound {
                         model_name: request.model.clone(),
                     }

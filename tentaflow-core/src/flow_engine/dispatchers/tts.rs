@@ -24,7 +24,7 @@ pub struct TtsRequest {
     /// Backend embedded ignoruje gdy nie wspiera (whisper-cpp skips); HTTP
     /// backendy przepisują w request body.
     pub speed: Option<f32>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub user_role: Option<String>,
     /// Etap 3c: cancel signal dla stream_synthesize (klient disconnect).
     /// Blocking `synthesize` ignoruje (nie ma chunked emit do przerwania).

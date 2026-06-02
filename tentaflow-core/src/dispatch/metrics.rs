@@ -9,8 +9,8 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use parking_lot::RwLock;
@@ -213,5 +213,4 @@ mod tests {
         assert_eq!(s.calls_total, 1);
         assert_eq!(s.errors_total, 1);
     }
-
 }

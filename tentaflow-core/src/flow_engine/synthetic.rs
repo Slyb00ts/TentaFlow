@@ -181,15 +181,14 @@ mod tests {
     #[test]
     fn synthetic_chat_compiles_with_synthetic_source() {
         let def = synthetic_chat("qwen3.5-0.8b");
-        let compiled = CompiledFlow::compile(0, def, &min_registry());
+        let compiled = CompiledFlow::compile("0", def, &min_registry());
         assert!(compiled.is_ok(), "synthetic chat: {:?}", compiled.err());
     }
 
     #[test]
     fn synthetic_chat_stream_marks_streaming() {
         let def = synthetic_chat_stream("qwen3.5-0.8b");
-        let compiled = CompiledFlow::compile(0, def, &min_registry())
-            .expect("compile");
+        let compiled = CompiledFlow::compile("0", def, &min_registry()).expect("compile");
         assert!(
             compiled.is_streaming,
             "stream-port edge musi włączyć is_streaming"

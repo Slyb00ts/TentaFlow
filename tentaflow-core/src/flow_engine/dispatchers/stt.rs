@@ -23,7 +23,7 @@ pub struct SttRequest {
     /// Dla verbose_json adapter wypełnia language/duration/segments na
     /// envelope artifacts.
     pub response_format: Option<String>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub user_role: Option<String>,
 }
 

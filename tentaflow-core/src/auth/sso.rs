@@ -22,7 +22,7 @@ pub struct OidcConfig {
     pub redirect_uri: String,
     pub scopes: Vec<String>,
     pub auto_create_users: bool,
-    pub default_group_id: Option<i64>,
+    pub default_group_id: Option<String>,
 }
 
 /// Endpointy odkryte z .well-known/openid-configuration
@@ -240,7 +240,7 @@ pub fn provider_to_config(
             "email".to_string(),
         ],
         auto_create_users: provider.auto_create_users,
-        default_group_id: provider.default_group_id,
+        default_group_id: provider.default_group_id.clone(),
     }
 }
 
@@ -271,7 +271,7 @@ pub async fn handle_sso_callback(
 
     let (user_id, username, is_new_user) = if let Some(user) = existing_user {
         // Uzytkownik juz istnieje — aktualizuj last_login
-        let _ = db::repository::update_user_account_last_login(db, user.id);
+        let _ = db::repository::update_user_account_last_login(db, &user.id);
         (user.id, user.username, false)
     } else if config.auto_create_users {
         // Automatyczne tworzenie uzytkownika
@@ -289,14 +289,14 @@ pub async fn handle_sso_callback(
         )?;
 
         // Dodaj do domyslnej grupy jesli skonfigurowana
-        if let Some(group_id) = config.default_group_id {
-            let _ = db::repository::add_user_to_group(db, group_id, user_id);
+        if let Some(group_id) = config.default_group_id.as_deref() {
+            let _ = db::repository::add_user_to_group(db, group_id, &user_id);
         }
 
         // Audit log
         let _ = db::repository::log_audit(
             db,
-            Some(user_id),
+            Some(&user_id),
             None,
             "sso.user_created",
             Some(&username),
@@ -324,12 +324,12 @@ pub async fn handle_sso_callback(
         .unwrap_or(24);
 
     let token =
-        crate::api::dashboard::auth::generate_jwt(user_id, &username, &jwt_secret, expiry_hours)?;
+        crate::api::dashboard::auth::generate_jwt(&user_id, &username, &jwt_secret, expiry_hours)?;
 
     // Audit log
     let _ = db::repository::log_audit(
         db,
-        Some(user_id),
+        Some(&user_id),
         None,
         "sso.login",
         Some(&username),

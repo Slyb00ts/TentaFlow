@@ -12,20 +12,20 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use serde_json::{Value as JsonValue, json};
+use serde_json::{json, Value as JsonValue};
 
-use super::abi_helpers::{PayloadKind, enforce_payload_size, write_output_with_retry_semantics};
+use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
 use super::{
-    AddonState, WasmCaller, audit_log_with_risk, check_permission, get_memory, read_guest_string,
+    audit_log_with_risk, check_permission, get_memory, read_guest_string, AddonState, WasmCaller,
 };
 use crate::addon::errors::AbiError;
 use crate::addon::storage_sql_exec::{
-    StorageSqlError, exec_for_addon, is_ddl, parse_write_action_and_table, query_for_addon,
-    query_hash_short, query_one_for_addon, resource_type_for_query, transaction_for_addon,
+    exec_for_addon, is_ddl, parse_write_action_and_table, query_for_addon, query_hash_short,
+    query_one_for_addon, resource_type_for_query, transaction_for_addon, StorageSqlError,
 };
 use crate::audit::RiskClass;
 use crate::services::storage_proxy::{
-    DEFAULT_STORAGE_PROXY_TIMEOUT, remote_sql_exec, remote_sql_query,
+    remote_sql_exec, remote_sql_query, DEFAULT_STORAGE_PROXY_TIMEOUT,
 };
 use tentaflow_protocol::mesh::{StorageProxyRequestKind, StorageProxyRequestPayload};
 
@@ -117,7 +117,7 @@ pub fn sql_exec_v1(
             addon_id: addon_id.clone(),
             resource_type: table_name,
             resource_id: String::new(),
-            actor_user_id: caller.data().user_id,
+            actor_user_id: caller.data().user_id.clone(),
             kind: StorageProxyRequestKind::SqlExec {
                 query: query.clone(),
                 params: params
@@ -178,7 +178,13 @@ pub fn sql_exec_v1(
         }
     }
 
-    let result = exec_for_addon(&org_id, &addon_id, &query, &params, caller.data().user_id);
+    let result = exec_for_addon(
+        &org_id,
+        &addon_id,
+        &query,
+        &params,
+        caller.data().user_id.clone(),
+    );
     match result {
         Ok((rows_affected, last_insert_id)) => {
             audit_log_with_risk(
@@ -364,7 +370,7 @@ fn sql_query_inner(
             addon_id: addon_id.clone(),
             resource_type,
             resource_id: String::new(),
-            actor_user_id: caller.data().user_id,
+            actor_user_id: caller.data().user_id.clone(),
             kind: StorageProxyRequestKind::SqlQuery {
                 query: query.clone(),
                 params: params
@@ -583,7 +589,7 @@ pub fn sql_transaction_v1(
         .org_id
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
-    match transaction_for_addon(&org_id, &addon_id, &prepared, caller.data().user_id) {
+    match transaction_for_addon(&org_id, &addon_id, &prepared, caller.data().user_id.clone()) {
         Ok(total) => {
             audit_log_with_risk(
                 caller.data(),
@@ -706,7 +712,9 @@ where
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
 }
 
-pub(crate) fn proxy_error_to_abi(error: &crate::services::storage_proxy::StorageProxyError) -> AbiError {
+pub(crate) fn proxy_error_to_abi(
+    error: &crate::services::storage_proxy::StorageProxyError,
+) -> AbiError {
     match error {
         crate::services::storage_proxy::StorageProxyError::Timeout(_) => AbiError::Timeout,
         crate::services::storage_proxy::StorageProxyError::Remote { code, .. }

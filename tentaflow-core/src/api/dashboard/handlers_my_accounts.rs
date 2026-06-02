@@ -18,15 +18,10 @@ fn db_err(e: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::internal(format!("database error: {}", e))
 }
 
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -42,7 +37,7 @@ pub fn my_oauth_accounts_list(
     let uid = current_user_id(ctx).ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "brak user_id w sesji")
     })?;
-    let rows = repository::list_my_oauth_entries(&ctx.state.db, uid).map_err(db_err)?;
+    let rows = repository::list_my_oauth_entries(&ctx.state.db, &uid).map_err(db_err)?;
     let accounts = rows
         .into_iter()
         .map(|r| MyOAuthEntry {

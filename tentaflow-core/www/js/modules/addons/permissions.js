@@ -89,7 +89,7 @@ async function loadAll() {
     })).sort((a, b) => a.sortOrder - b.sortOrder);
 
     groups = (visibility.rows || []).map((r) => ({
-      groupId: Number(r.groupId ?? r.group_id),
+      groupId: String(r.groupId ?? r.group_id),
       groupName: r.groupName ?? r.group_name ?? `#${r.groupId ?? r.group_id}`,
       visible: Boolean(r.visible),
       userCount: Number(r.userCount ?? r.user_count ?? 0),
@@ -100,7 +100,7 @@ async function loadAll() {
     overriddenUserIds = new Set();
     for (const r of (matrix.rows || [])) {
       const st = r.subjectType ?? r.subject_type;
-      const sid = Number(r.subjectId ?? r.subject_id);
+      const sid = String(r.subjectId ?? r.subject_id);
       const pid = r.permissionId ?? r.permission_id;
       const gm = r.grantMode ?? r.grant_mode;
       if (st === 'group') {
@@ -137,7 +137,7 @@ async function refreshMatrixFromRemote() {
       ApiBinary.one('addonPermissionMatrixRequest', { addonId: currentAddonId }),
     ]);
     groups = (visibility.rows || []).map((r) => ({
-      groupId: Number(r.groupId ?? r.group_id),
+      groupId: String(r.groupId ?? r.group_id),
       groupName: r.groupName ?? r.group_name ?? `#${r.groupId ?? r.group_id}`,
       visible: Boolean(r.visible),
       userCount: Number(r.userCount ?? r.user_count ?? 0),
@@ -147,7 +147,7 @@ async function refreshMatrixFromRemote() {
     overriddenUserIds = new Set();
     for (const r of (matrix.rows || [])) {
       const st = r.subjectType ?? r.subject_type;
-      const sid = Number(r.subjectId ?? r.subject_id);
+      const sid = String(r.subjectId ?? r.subject_id);
       const pid = r.permissionId ?? r.permission_id;
       const gm = r.grantMode ?? r.grant_mode;
       if (st === 'group') {
@@ -174,7 +174,7 @@ async function ensureUsersCatalog() {
   try {
     const rows = await ApiBinary.list('usersListRequest', { arrayKey: 'users' });
     usersCatalog = rows.map((u) => ({
-      userId: Number(u.userId ?? u.user_id ?? u.id),
+      userId: String(u.userId ?? u.user_id ?? u.id),
       username: u.username ?? u.name ?? `#${u.userId ?? u.user_id ?? u.id}`,
     }));
   } catch (_) {
@@ -360,11 +360,8 @@ function renderPerUser(body) {
   body.querySelector('#perm-user-add')?.addEventListener('change', (e) => {
     const val = e.detail?.value || '';
     if (!val) return;
-    const uid = Number(val);
-    if (Number.isFinite(uid)) {
-      overriddenUserIds.add(uid);
-      renderPerUser(body);
-    }
+    overriddenUserIds.add(val);
+    renderPerUser(body);
   });
 
   attachUserHandlers(body);
@@ -497,7 +494,7 @@ function attachGroupHandlers(root) {
     btn.addEventListener('click', async () => {
       if (btn.disabled) return;
       const pid = btn.dataset.perm;
-      const sid = Number(btn.dataset.subjectId);
+      const sid = btn.dataset.subjectId;
       const current = btn.dataset.mode;
       const next = NEXT_MODE_FULL[current] || 'allow';
       const prev = current;
@@ -527,7 +524,7 @@ function attachUserHandlers(root) {
   root.querySelectorAll('.perm-btn[data-subject-type="user"]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const pid = btn.dataset.perm;
-      const sid = Number(btn.dataset.subjectId);
+      const sid = btn.dataset.subjectId;
       const current = btn.dataset.mode;
       const next = NEXT_MODE_FULL[current] || 'allow';
       const prev = current;

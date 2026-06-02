@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 pub struct Claims {
     /// Nazwa uzytkownika
     pub sub: String,
-    /// Identyfikator uzytkownika w bazie
-    pub user_id: i64,
+    /// Identyfikator uzytkownika w bazie (UUID `user_accounts.id`)
+    pub user_id: String,
     /// Czas wygasniecia (unix timestamp)
     pub exp: usize,
 }
@@ -54,7 +54,7 @@ pub fn hash_api_key(key: &str) -> String {
 /// Generuje token JWT dla uzytkownika.
 /// VULN-004: Token NIE zawiera flagi is_admin — sprawdzane w DB przy kazdym requeście.
 pub fn generate_jwt(
-    user_id: i64,
+    user_id: &str,
     username: &str,
     secret: &str,
     expiry_hours: i64,
@@ -66,7 +66,7 @@ pub fn generate_jwt(
 
     let claims = Claims {
         sub: username.to_string(),
-        user_id,
+        user_id: user_id.to_string(),
         exp: expiration,
     };
 

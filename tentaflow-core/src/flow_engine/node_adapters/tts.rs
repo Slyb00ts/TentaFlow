@@ -159,7 +159,7 @@ impl NodeAdapter for TtsNodeAdapter {
             format: Self::pick_optional_str(node, envelope, "format"),
             language: Self::pick_optional_str(node, envelope, "language"),
             speed: Self::pick_optional_f32(node, envelope, "speed"),
-            user_id: ctx.user_id,
+            user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
             cancel_token: ctx.cancel_token.clone(),
         };
@@ -227,7 +227,7 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
         let format = Self::pick_optional_str(node, &seed_envelope, "format");
         let language = Self::pick_optional_str(node, &seed_envelope, "language");
         let speed = Self::pick_optional_f32(node, &seed_envelope, "speed");
-        let user_id = ctx.user_id;
+        let user_id = ctx.user_id.clone();
         let user_role = ctx.user_role.clone();
         let cancel = ctx.cancel_token.clone();
         let tts = ctx.tts.clone();
@@ -299,6 +299,7 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
                 let voice = voice.clone();
                 let format = format.clone();
                 let language = language.clone();
+                let user_id = user_id.clone();
                 let user_role = user_role.clone();
                 let cancel = cancel.clone();
                 let tts = tts.clone();
@@ -320,7 +321,7 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
                                         format.clone(),
                                         language.clone(),
                                         speed,
-                                        user_id,
+                                        user_id.clone(),
                                         user_role.clone(),
                                         cancel.clone(),
                                         &tts,
@@ -387,7 +388,7 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
                                         format.clone(),
                                         language.clone(),
                                         speed,
-                                        user_id,
+                                        user_id.clone(),
                                         user_role.clone(),
                                         cancel.clone(),
                                         &tts,
@@ -456,7 +457,7 @@ async fn synthesize_chunk(
     format: Option<String>,
     language: Option<String>,
     speed: Option<f32>,
-    user_id: Option<i64>,
+    user_id: Option<String>,
     user_role: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
     tts: &Arc<dyn crate::flow_engine::dispatchers::TtsDispatcher>,
@@ -617,7 +618,10 @@ mod tests {
             FlowValue::Audio { blob_ref, .. } => assert_eq!(blob_ref.id, "out-blob"),
             other => panic!("expected Audio, got {other:?}"),
         }
-        assert_eq!(f.last.lock().unwrap().as_ref().unwrap().voice.as_deref(), Some("alloy"));
+        assert_eq!(
+            f.last.lock().unwrap().as_ref().unwrap().voice.as_deref(),
+            Some("alloy")
+        );
         match out.artifacts.get("source_text") {
             Some(FlowValue::Text(s)) => assert_eq!(s, "hello"),
             other => panic!("expected source_text Text, got {other:?}"),

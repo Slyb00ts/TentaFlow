@@ -441,7 +441,8 @@ impl Supervisor {
                 svc.id,
                 svc.engine_id
             );
-            self.spawn_detached_respawn(svc, "embedded boot-reload").await;
+            self.spawn_detached_respawn(svc, "embedded boot-reload")
+                .await;
         }
         Ok(())
     }
@@ -469,7 +470,8 @@ impl Supervisor {
             // tokio::select! z deploy::respawn() future i interval
             // tick — pierwszy deploy result wins, interval jest
             // anulowany.
-            update_progress_detached(&db_for_task, svc_id, Some("starting — bootstrap+spawn")).await;
+            update_progress_detached(&db_for_task, svc_id, Some("starting — bootstrap+spawn"))
+                .await;
             let respawn_fut = deploy::respawn(
                 &engine_id,
                 deploy_method,
@@ -507,7 +509,8 @@ impl Supervisor {
                             e
                         );
                     }
-                    update_status_detached(&db_for_task, svc_id, ServiceStatus::Running, None).await;
+                    update_status_detached(&db_for_task, svc_id, ServiceStatus::Running, None)
+                        .await;
                     update_progress_detached(&db_for_task, svc_id, None).await;
                     tracing::info!(
                         "supervisor: {} service {} ({}) up after detached deploy ({}s)",

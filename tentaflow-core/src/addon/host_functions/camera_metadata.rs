@@ -129,24 +129,29 @@ pub fn camera_metadata_subscribe_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: MetadataSubscribeInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "camera.metadata.subscribe",
-                    None,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: MetadataSubscribeInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.metadata.subscribe",
+                None,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
 
     let addon_id = caller.data().addon_id.clone();
     let org_id = caller.data().org_id.clone();
@@ -335,24 +340,29 @@ pub fn camera_metadata_unsubscribe_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: MetadataUnsubscribeInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "camera.metadata.unsubscribe",
-                    None,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: MetadataUnsubscribeInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.metadata.unsubscribe",
+                None,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
 
     // Peek the active entry to enforce addon ownership BEFORE we atomically
     // remove it. The ownership check must precede the remove so a foreign
@@ -488,25 +498,30 @@ pub fn camera_metadata_poll_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: MetadataPollInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit_with_risk(
-                    caller.data(),
-                    "camera.metadata.poll",
-                    None,
-                    RiskClass::C,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: MetadataPollInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit_with_risk(
+                caller.data(),
+                "camera.metadata.poll",
+                None,
+                RiskClass::C,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
 
     let timeout_ms = input.timeout_ms_or_default().min(MAX_POLL_TIMEOUT_MS);
     let max_items = input.max_items_or_default().clamp(1, MAX_POLL_ITEMS) as usize;

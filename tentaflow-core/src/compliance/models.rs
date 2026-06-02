@@ -198,11 +198,11 @@ pub struct ComplianceRetentionPolicy {
 #[derive(Debug, Clone)]
 pub struct NewAiEvent<'a> {
     pub org_id: &'a str,
-    pub user_id: Option<i64>,
+    pub user_id: Option<&'a str>,
     pub node_id: &'a str,
     pub addon_id: Option<&'a str>,
     pub instance_id: Option<&'a str>,
-    pub flow_id: Option<i64>,
+    pub flow_id: Option<&'a str>,
     pub flow_node_id: Option<&'a str>,
     pub request_id: &'a str,
     pub model_id: &'a str,
@@ -215,11 +215,11 @@ pub struct NewAiEvent<'a> {
 pub struct ComplianceAiEvent {
     pub event_id: String,
     pub org_id: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub node_id: String,
     pub addon_id: Option<String>,
     pub instance_id: Option<String>,
-    pub flow_id: Option<i64>,
+    pub flow_id: Option<String>,
     pub flow_node_id: Option<String>,
     pub request_id: String,
     pub model_id: String,
@@ -239,7 +239,7 @@ pub struct ComplianceAiEvent {
 #[derive(Debug, Clone, Default)]
 pub struct AiEventListFilter {
     pub status: Option<AiEventStatus>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: Option<String>,
     pub limit: u32,
     pub offset: u32,

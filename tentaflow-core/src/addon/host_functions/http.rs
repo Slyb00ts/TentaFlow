@@ -7,7 +7,7 @@
 //              Fail-closed — brak deklaracji blokuje request zanim opusci proces Core.
 // =============================================================================
 
-use std::sync::OnceLock;
+use std::net::{SocketAddr, ToSocketAddrs};
 use tracing::{info, warn};
 
 use super::{
@@ -16,20 +16,6 @@ use super::{
 };
 
 use crate::addon::rate_limiter::ResourceType;
-
-/// Globalny klient HTTP — reuzywany miedzy requestami (K1: unikanie tworzenia przy kazdym requeście)
-static HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-
-/// Pobiera lub tworzy globalny klient HTTP z domyslnym timeoutem
-fn get_http_client() -> &'static reqwest::blocking::Client {
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_millis(30_000))
-            .pool_max_idle_per_host(10)
-            .build()
-            .expect("Nie udalo sie utworzyc globalnego klienta HTTP")
-    })
-}
 
 // =============================================================================
 // Walidacja SSRF — blokowanie lokalnych adresow
@@ -199,6 +185,33 @@ pub fn http_request(
         }
     };
 
+    let resolved_addrs = match resolve_public_destination(&domain, port) {
+        Some(addrs) => addrs,
+        None => {
+            audit_log(
+                caller.data(),
+                "http.request",
+                Some("http"),
+                Some(&url),
+                "denied",
+                Some("DNS resolution points to a local or private address"),
+            );
+            return ABI_ERR_PERMISSION;
+        }
+    };
+
+    if resolved_addrs.is_empty() {
+        audit_log(
+            caller.data(),
+            "http.request",
+            Some("http"),
+            Some(&url),
+            "denied",
+            Some("DNS resolution points to a local or private address"),
+        );
+        return ABI_ERR_PERMISSION;
+    }
+
     if !check_permission(caller.data(), "http.request", None) {
         audit_log(
             caller.data(),
@@ -267,7 +280,7 @@ pub fn http_request(
     info!("http_request: addon='{}', {} {}", addon_id, method, url);
 
     // Wykonaj HTTP request synchronicznie
-    let response_json = execute_http_request(&request, &url, method);
+    let response_json = execute_http_request(&request, &url, method, &domain, &resolved_addrs);
 
     let response_bytes = match serde_json::to_vec(&response_json) {
         Ok(b) => b,
@@ -308,7 +321,7 @@ fn extract_http_destination(url: &str) -> Option<(String, u16)> {
 /// Sprawdza czy manifest addonu i DB pozwalaja na konkretny cel HTTP.
 fn is_http_destination_approved(state: &AddonState, domain: &str, port: u16) -> bool {
     let rule = match state.manifest.network_rules.iter().find(|rule| {
-        rule.protocol == "tcp" && rule.port == port && rule.host.eq_ignore_ascii_case(domain)
+        rule.protocol == "tcp" && rule.port == port && host_rule_matches(&rule.host, domain)
     }) {
         Some(rule) => rule,
         None => return false,
@@ -320,13 +333,75 @@ fn is_http_destination_approved(state: &AddonState, domain: &str, port: u16) -> 
                 "SELECT approved FROM addon_network_rules \
                  WHERE addon_id = ?1 AND rule_id = ?2 AND protocol = 'tcp' \
                    AND host = ?3 COLLATE NOCASE AND port = ?4",
-                rusqlite::params![&state.addon_id, &rule.id, domain, port],
+                rusqlite::params![&state.addon_id, &rule.id, &rule.host, port],
                 |row| row.get::<_, i32>(0),
             )
             .unwrap_or(0)
                 == 1
         }
         Err(_) => false,
+    }
+}
+
+fn host_rule_matches(rule_host: &str, domain: &str) -> bool {
+    let rule_host = rule_host.to_ascii_lowercase();
+    let domain = domain.to_ascii_lowercase();
+
+    if rule_host == "*" {
+        return true;
+    }
+
+    if let Some(suffix) = rule_host.strip_prefix("*.") {
+        return domain != suffix
+            && domain
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'));
+    }
+
+    rule_host == domain
+}
+
+fn resolve_public_destination(domain: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    let addrs = match (domain, port).to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => return None,
+    };
+
+    let mut out = Vec::new();
+    for addr in addrs {
+        if !is_public_ip(addr.ip()) {
+            return None;
+        }
+        out.push(addr);
+    }
+
+    Some(out)
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.octets()[0] == 0
+                || v4.is_broadcast())
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return false;
+            }
+            if v6.segments()[0] & 0xffc0 == 0xfe80 {
+                return false;
+            }
+            if v6.segments()[0] & 0xff00 == 0xfd00 {
+                return false;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(v4));
+            }
+            true
+        }
     }
 }
 
@@ -360,9 +435,29 @@ fn check_http_rate_limit(state: &AddonState) -> bool {
     }
 }
 
-/// Wykonuje HTTP request (synchronicznie) uzywajac globalnego klienta HTTP (K1)
-fn execute_http_request(request: &serde_json::Value, url: &str, method: &str) -> serde_json::Value {
-    let client = get_http_client();
+/// Wykonuje HTTP request (synchronicznie) uzywajac zweryfikowanych adresow DNS.
+fn execute_http_request(
+    request: &serde_json::Value,
+    url: &str,
+    method: &str,
+    domain: &str,
+    resolved_addrs: &[SocketAddr],
+) -> serde_json::Value {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(30_000))
+        .pool_max_idle_per_host(10)
+        .resolve_to_addrs(domain, resolved_addrs)
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            return serde_json::json!({
+                "status": 0,
+                "headers": {},
+                "body": format!("Blad HTTP client: {}", e),
+            });
+        }
+    };
 
     let request_builder = match method.to_uppercase().as_str() {
         "GET" => client.get(url),
@@ -547,5 +642,59 @@ mod tests {
         assert!(is_http_destination_approved(&state, "example.com", 443));
         assert!(!is_http_destination_approved(&state, "other.example", 443));
         assert!(!is_http_destination_approved(&state, "example.com", 80));
+    }
+
+    #[test]
+    fn host_rule_matches_public_wildcard() {
+        assert!(host_rule_matches("*", "example.com"));
+        assert!(host_rule_matches("*", "sub.example.com"));
+    }
+
+    #[test]
+    fn host_rule_matches_subdomain_wildcard() {
+        assert!(host_rule_matches("*.example.com", "www.example.com"));
+        assert!(host_rule_matches("*.example.com", "a.b.example.com"));
+        assert!(!host_rule_matches("*.example.com", "example.com"));
+        assert!(!host_rule_matches("*.example.com", "badexample.com"));
+    }
+
+    #[test]
+    fn wildcard_destination_requires_approved_rule_pattern() {
+        let rule = ManifestNetworkRule {
+            id: "public-web-https".to_string(),
+            protocol: "tcp".to_string(),
+            host: "*".to_string(),
+            port: 443,
+            description: Some("Public web".to_string()),
+            required: true,
+        };
+        let state = make_state(
+            vec!["http.request".to_string(), "http".to_string()],
+            vec![rule],
+        );
+
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO addon_network_rules \
+                 (addon_id, rule_id, protocol, host, port, description, required, approved) \
+                 VALUES (?1, 'public-web-https', 'tcp', '*', 443, 'Public web', 1, 1)",
+                rusqlite::params![&state.addon_id],
+            )
+            .unwrap();
+        }
+
+        assert!(is_http_destination_approved(&state, "example.com", 443));
+        assert!(is_http_destination_approved(&state, "docs.rs", 443));
+        assert!(!is_http_destination_approved(&state, "example.com", 80));
+    }
+
+    #[test]
+    fn public_ip_check_blocks_local_and_private_ranges() {
+        assert!(!is_public_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("10.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("192.168.1.1".parse().unwrap()));
+        assert!(!is_public_ip("169.254.169.254".parse().unwrap()));
+        assert!(is_public_ip("93.184.216.34".parse().unwrap()));
     }
 }

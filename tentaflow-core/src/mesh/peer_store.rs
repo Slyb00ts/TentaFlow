@@ -90,9 +90,7 @@ pub struct MeshPeerInfo {
 
 /// Producent GPU — wykrywany po nazwie / PCI; uzywany do gating profilowania
 /// (np. NVIDIA Nsight Systems wymaga `vendor == Nvidia`).
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GpuVendor {
     Nvidia,
     Amd,

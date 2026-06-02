@@ -162,7 +162,7 @@ pub fn event_publish(
     let state = caller.data();
     let req_caller = crate::services::service_call::CallerContext {
         addon_id: state.addon_id.clone(),
-        user_id: state.user_id,
+        user_id: state.user_id.clone(),
         instance_id: Some(state.instance_id.clone()),
         is_system_call: state.is_system_call,
         org_id: state.org_id.clone(),

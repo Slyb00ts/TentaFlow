@@ -161,7 +161,7 @@ async function loadAndRenderGroups(container) {
     }).join('');
 
     list.querySelectorAll('.group-row[data-group-id]').forEach((row) => {
-      const gid = Number(row.dataset.groupId);
+      const gid = row.dataset.groupId;
       const tgl = row.querySelector('tf-toggle[data-vis-toggle]');
       tgl?.addEventListener('change', async (e) => {
         const visible = !!e.detail?.checked;

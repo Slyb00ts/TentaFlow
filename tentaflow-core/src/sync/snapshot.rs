@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sync::ledger::{
+    build_merkle_summary, hash_canonical, validate_hash_chain, validate_hash_chain_from,
     HexNodeIdOperationVerifier, LedgerResult, OperationQuery, PartitionId, SnapshotId,
     SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier,
-    SyncSnapshot, build_merkle_summary, hash_canonical, validate_hash_chain,
-    validate_hash_chain_from,
+    SyncSnapshot,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
@@ -936,6 +936,10 @@ mod tests {
                 logical,
                 node_id: signer.node_id().to_string(),
             },
+            epoch: crate::sync::ledger::BaselineEpoch {
+                counter: 0,
+                origin_node: String::new(),
+            },
             payload_hash: [1; 32],
             acl_snapshot_hash: [2; 32],
             policy_epoch: 3,
@@ -985,6 +989,10 @@ mod tests {
                 logical,
                 node_id: signer.node_id().to_string(),
             },
+            epoch: crate::sync::ledger::BaselineEpoch {
+                counter: 0,
+                origin_node: String::new(),
+            },
             payload_hash: [3; 32],
             acl_snapshot_hash: [4; 32],
             policy_epoch: 3,
@@ -998,6 +1006,41 @@ mod tests {
             .expect("clock")
             .as_nanos();
         format!("{prefix}-{nanos}")
+    }
+
+    /// Pins a stable `HOME` (resolved by `dirs::home_dir()` inside `open_addon_db`)
+    /// under the shared `test_home_lock`. Without the lock a concurrently running
+    /// test that mutates the process-global `HOME` could yank it out from under
+    /// an addon-db open here; holding the guard serialises HOME-dependent tests.
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        old_home: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.old_home {
+                Some(value) => unsafe { std::env::set_var("HOME", value) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    fn pin_home() -> HomeGuard {
+        let lock = crate::addon::fs_sandbox::test_home_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().expect("home tempdir");
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        HomeGuard {
+            _lock: lock,
+            _tmp: tmp,
+            old_home,
+        }
     }
 
     #[test]
@@ -1171,6 +1214,7 @@ mod tests {
 
     #[test]
     fn snapshot_restore_materializes_sqlite_state_from_ledger_history() {
+        let _home = pin_home();
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
         let signer = signer();
@@ -1260,6 +1304,7 @@ mod tests {
 
     #[test]
     fn snapshot_sql_package_restores_after_prefix_compaction() {
+        let _home = pin_home();
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
         let signer = signer();
@@ -1335,17 +1380,15 @@ mod tests {
                 keep_operations_after_sequence: Some(2),
             })
             .unwrap();
-        assert!(
-            store
-                .get_operations(OperationQuery {
-                    partition_id: partition.clone(),
-                    from_sequence: Some(1),
-                    to_sequence: Some(1),
-                    limit: None,
-                })
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .get_operations(OperationQuery {
+                partition_id: partition.clone(),
+                from_sequence: Some(1),
+                to_sequence: Some(1),
+                limit: None,
+            })
+            .unwrap()
+            .is_empty());
 
         let result = manager
             .restore_sql_from_package(SnapshotSqlPackageRestoreRequest {
@@ -1369,6 +1412,7 @@ mod tests {
 
     #[test]
     fn snapshot_sql_package_store_persists_and_restores_package() {
+        let _home = pin_home();
         let dir = tempfile::tempdir().unwrap();
         let blob_dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
@@ -1467,6 +1511,7 @@ mod tests {
 
     #[test]
     fn snapshot_sql_package_rejects_tampered_blob() {
+        let _home = pin_home();
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
         let signer = signer();

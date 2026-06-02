@@ -18,7 +18,7 @@ pub struct EmbeddingsRequest {
     pub dimensions: Option<u32>,
     /// Etap 2: "float" lub "base64". Backend embedded ignoruje.
     pub encoding_format: Option<String>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub user_role: Option<String>,
 }
 

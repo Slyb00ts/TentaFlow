@@ -279,25 +279,30 @@ pub fn vector_upsert_v1(
         return AbiError::Permission.as_i32();
     }
 
-    let input: VectorUpsertInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::VectorItem) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "vector.upsert",
-                    None,
-                    RiskClass::B,
-                    "denied",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: VectorUpsertInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::VectorItem,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "vector.upsert",
+                None,
+                RiskClass::B,
+                "denied",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
 
     if let Err(_e) = validate_namespace_name(&input.namespace) {
         audit(
@@ -451,25 +456,30 @@ pub fn vector_search_v1(
         return AbiError::Permission.as_i32();
     }
 
-    let input: VectorSearchInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::VectorItem) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "vector.search",
-                    None,
-                    RiskClass::B,
-                    "denied",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: VectorSearchInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::VectorItem,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "vector.search",
+                None,
+                RiskClass::B,
+                "denied",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
 
     if input.k == 0 || input.k > MAX_SEARCH_K {
         audit(
@@ -687,25 +697,30 @@ pub fn vector_delete_v1(
         return AbiError::Permission.as_i32();
     }
 
-    let input: VectorDeleteInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::VectorItem) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "vector.delete",
-                    None,
-                    RiskClass::B,
-                    "denied",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: VectorDeleteInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::VectorItem,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "vector.delete",
+                None,
+                RiskClass::B,
+                "denied",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
 
     if validate_namespace_name(&input.namespace).is_err() {
         audit(

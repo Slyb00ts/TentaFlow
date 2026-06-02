@@ -31,7 +31,7 @@ pub type ModelRuntimeSlot =
 /// Brak `role` przy obecnym `user_id` defaultuje na "user" (najściślejsza
 /// rola, ACL i tak gateuje wcześniej w FlowDispatcher::acl_allow).
 pub(crate) fn build_user_context(
-    user_id: Option<i64>,
+    user_id: Option<String>,
     user_role: Option<&str>,
 ) -> Option<crate::auth::acl::UserContext> {
     user_id.map(|uid| crate::auth::acl::UserContext {

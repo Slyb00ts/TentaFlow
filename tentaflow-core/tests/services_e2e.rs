@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 use serde_json::json;
 use tentaflow_core::db;
-use tentaflow_core::services::deploy::{deploy, DeployError};
+use tentaflow_core::services::deploy::{create_deploy_job, deploy, DeployError};
 use tentaflow_core::services::manifest::{
     ApiKind, Category, DeploySection, Engine, ModelPreset, NativeDeploy, NativeRuntime,
     ServiceManifest, TargetOs,
@@ -82,6 +82,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             repo: "org/model".into(),
             quantization: None,
             recommended: true,
+            featured: false,
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
@@ -89,6 +90,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             speculator_repo: None,
             speculator_method: None,
             speculator_num_tokens: None,
+            vllm: None,
         }],
         parameters: vec![],
         docker_source_hash: String::new(),
@@ -114,6 +116,9 @@ fn fake_service_info(id: i64, node_id: &str, model_name: &str) -> ServiceInfo {
         endpoint_url: None,
         restart_count: 0,
         health_last_err: None,
+        active_deploy_id: String::new(),
+        last_deploy_id: String::new(),
+        deployment_progress_pct: 0,
         // progress_message: brak raportu fazy startu w tescie
         progress_message: None,
         models: vec![ServiceModelEntry {
@@ -141,13 +146,23 @@ async fn deploy_embedded_persists_to_services_and_model_registry() {
     let ports = Arc::new(PortAllocator::new((45_900, 45_999), Default::default()).unwrap());
     let manifest = dummy_embedded_manifest("emb-e2e-persist");
 
+    let job = create_deploy_job(
+        DeployMethod::NativeEmbedded,
+        &manifest,
+        &json!({}),
+        &db,
+        "node-test",
+        None,
+        None,
+    )
+    .expect("create deploy job");
     let outcome = deploy(
+        job,
         DeployMethod::NativeEmbedded,
         &manifest,
         &json!({}),
         &ports,
         &db,
-        None,
         None,
     )
     .await
@@ -186,13 +201,23 @@ async fn delete_service_cascades_to_model_registry() {
     let ports = Arc::new(PortAllocator::new((45_700, 45_799), Default::default()).unwrap());
     let manifest = dummy_embedded_manifest("emb-e2e-cascade");
 
+    let job = create_deploy_job(
+        DeployMethod::NativeEmbedded,
+        &manifest,
+        &json!({}),
+        &db,
+        "node-test",
+        None,
+        None,
+    )
+    .expect("create deploy job");
     let outcome = deploy(
+        job,
         DeployMethod::NativeEmbedded,
         &manifest,
         &json!({}),
         &ports,
         &db,
-        None,
         None,
     )
     .await
@@ -268,13 +293,23 @@ async fn external_deploy_rejects_manifest_without_external_section() {
     // Embedded manifest — no [deploy.external].
     let manifest = dummy_embedded_manifest("emb-no-external");
 
+    let job = create_deploy_job(
+        DeployMethod::External,
+        &manifest,
+        &json!({}),
+        &db,
+        "node-test",
+        None,
+        None,
+    )
+    .expect("create deploy job");
     let err = deploy(
+        job,
         DeployMethod::External,
         &manifest,
         &json!({}),
         &ports,
         &db,
-        None,
         None,
     )
     .await

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub use tentaflow_protocol::mesh::BaselineEpoch;
+
 pub type LedgerResult<T> = std::result::Result<T, SyncLedgerError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +33,9 @@ pub enum SyncLedgerError {
     },
     #[error("hash operacji nie zgadza sie z trescia: {op_id}")]
     InvalidOperationHash { op_id: OperationId },
-    #[error("identyfikator operacji nie zgadza sie z hashem: expected={expected}, actual={actual}")]
+    #[error(
+        "identyfikator operacji nie zgadza sie z hashem: expected={expected}, actual={actual}"
+    )]
     InvalidOperationId {
         expected: OperationId,
         actual: OperationId,
@@ -50,6 +54,11 @@ pub enum SyncLedgerError {
     InvalidPublicKey { actor_node_id: String },
     #[error("hash-chain partycji nie zgadza sie: partition={partition}, sequence={sequence}")]
     HashChainMismatch { partition: String, sequence: u64 },
+    #[error("operacja z innego epoch baseline: expected={expected:?}, actual={actual:?}")]
+    EpochMismatch {
+        expected: BaselineEpoch,
+        actual: BaselineEpoch,
+    },
     #[error("merkle summary wymaga przynajmniej jednej operacji")]
     EmptyMerkleSummary,
     #[error("operacja z innej partycji w merkle summary: expected={expected}, actual={actual}")]
@@ -231,6 +240,7 @@ pub struct NewSyncOperation {
     pub actor_device_id: String,
     pub actor_node_id: String,
     pub hlc_timestamp: HybridLogicalTimestamp,
+    pub epoch: BaselineEpoch,
     pub payload_hash: [u8; 32],
     pub acl_snapshot_hash: [u8; 32],
     pub policy_epoch: u64,
@@ -255,6 +265,7 @@ pub struct SyncOperationBody {
     pub actor_device_id: String,
     pub actor_node_id: String,
     pub hlc_timestamp: HybridLogicalTimestamp,
+    pub epoch: BaselineEpoch,
     pub prev_partition_hash: Option<[u8; 32]>,
     pub payload_hash: [u8; 32],
     pub acl_snapshot_hash: [u8; 32],
@@ -300,6 +311,7 @@ impl SyncOperation {
             actor_device_id: new_operation.actor_device_id,
             actor_node_id: new_operation.actor_node_id,
             hlc_timestamp: new_operation.hlc_timestamp,
+            epoch: new_operation.epoch,
             prev_partition_hash,
             payload_hash: new_operation.payload_hash,
             acl_snapshot_hash: new_operation.acl_snapshot_hash,
@@ -462,7 +474,7 @@ pub trait SyncLedgerStore: Send + Sync {
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation>;
     fn put_in_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn get_outbox_entry(&self, target: SyncTarget, op_id: OperationId)
-    -> LedgerResult<OutboxEntry>;
+        -> LedgerResult<OutboxEntry>;
     fn list_pending_outbox(
         &self,
         target: SyncTarget,
@@ -530,6 +542,30 @@ pub trait SyncLedgerStore: Send + Sync {
         up_to_sequence: u64,
     ) -> LedgerResult<Vec<OutboxEntry>>;
     fn compact(&self, policy: CompactionPolicy) -> LedgerResult<()>;
+    /// Returns the locally-active baseline epoch. Every operation minted or
+    /// accepted into the inbox must carry exactly this epoch; mismatches are
+    /// rejected so a node never mixes pre/post-baseline-reset operations.
+    fn current_epoch(&self) -> LedgerResult<BaselineEpoch>;
+    /// Persists `epoch` as the locally-active baseline epoch. Called during a
+    /// baseline reset (phase B/C cutover) to advance past every prior operation.
+    fn set_epoch(&self, epoch: BaselineEpoch) -> LedgerResult<()>;
+    /// Returns the last persisted HLC state, used to resume the local clock
+    /// after a restart so monotonicity survives across process boundaries.
+    fn current_hlc(&self) -> LedgerResult<Option<HybridLogicalTimestamp>>;
+    /// Persists the latest HLC state emitted/observed by the local clock.
+    fn save_hlc(&self, timestamp: &HybridLogicalTimestamp) -> LedgerResult<()>;
+    /// Advances the local epoch counter, stamping `origin_node` as the minter,
+    /// and returns the new epoch. Used by the local node when it performs a
+    /// core baseline reset and re-seeds operations under a fresh epoch.
+    fn bump_epoch(&self, origin_node: &str) -> LedgerResult<BaselineEpoch> {
+        let current = self.current_epoch()?;
+        let next = BaselineEpoch {
+            counter: current.counter.saturating_add(1),
+            origin_node: origin_node.to_string(),
+        };
+        self.set_epoch(next.clone())?;
+        Ok(next)
+    }
     /// Wipes all ledger state for partitions whose `partition_id` starts with
     /// `partition_prefix`. Phase B uses this to rebuild core data from a fresh
     /// baseline without touching addon/kv data.
@@ -599,6 +635,44 @@ mod tests {
         let b = hlc(100, 5, "node_b");
         assert!(b > a);
         assert_eq!(a.cmp(&b), Ordering::Less);
+    }
+
+    #[test]
+    fn operation_body_with_epoch_round_trips_cbor() {
+        let body = SyncOperationBody {
+            org_id: "org_1".to_string(),
+            partition_id: PartitionId::new("core/org/org_1/flows").unwrap(),
+            partition_sequence: 7,
+            addon_id: "core".to_string(),
+            resource_type: "core.flow".to_string(),
+            resource_id: "flow-uuid".to_string(),
+            table_name: "flows".to_string(),
+            primary_key: "id".to_string(),
+            action: ActionType::Insert,
+            changed_fields: BTreeMap::new(),
+            before_hash: None,
+            after_hash: Some([3; 32]),
+            actor_user_id: "user-uuid".to_string(),
+            actor_device_id: "node_a".to_string(),
+            actor_node_id: "node_a".to_string(),
+            hlc_timestamp: hlc(100, 1, "node_a"),
+            epoch: BaselineEpoch {
+                counter: 5,
+                origin_node: "node_a".to_string(),
+            },
+            prev_partition_hash: Some([9; 32]),
+            payload_hash: [1; 32],
+            acl_snapshot_hash: [2; 32],
+            policy_epoch: 2,
+            encryption_info: None,
+        };
+
+        let bytes = encode(&body).expect("encode");
+        let decoded: SyncOperationBody = decode(&bytes).expect("decode");
+
+        assert_eq!(decoded.epoch.counter, 5);
+        assert_eq!(decoded.epoch.origin_node, "node_a");
+        assert_eq!(decoded, body);
     }
 
     #[test]

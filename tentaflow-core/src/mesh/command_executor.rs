@@ -393,6 +393,37 @@ impl MeshCommandExecutor {
                 )
                 .await
             }
+            MeshCommandType::WebResearch { request_json } => {
+                self.handle_web_research(request_json).await
+            }
+        }
+    }
+
+    async fn handle_web_research(&self, request_json: String) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("web research remote context is not initialized");
+        };
+        let request =
+            match serde_json::from_str::<crate::web_research::WebResearchRequest>(&request_json) {
+                Ok(request) => request,
+                Err(e) => {
+                    return CommandResponse::fail(format!("invalid web research request: {}", e))
+                }
+            };
+        let result = tokio::task::spawn_blocking(move || {
+            crate::web_research::execute_with_local_searxng(request, &ctx.db)
+        })
+        .await;
+        let response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return CommandResponse::fail(e.to_string()),
+            Err(e) => return CommandResponse::fail(format!("web research task failed: {}", e)),
+        };
+        match serde_json::to_string(&response) {
+            Ok(response_json) => {
+                CommandResponse::ok(MeshCommandResponsePayload::WebResearchResult { response_json })
+            }
+            Err(e) => CommandResponse::fail(format!("serialize web research response: {}", e)),
         }
     }
 

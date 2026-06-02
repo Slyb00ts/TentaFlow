@@ -37,9 +37,7 @@ use tentaflow_sdk_spec::{
 
 use super::abi_helpers::{enforce_payload_size, PayloadKind};
 use super::cbor_io::{decode_cbor_exact, read_input_cbor, write_cbor_capped};
-use super::{
-    audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller,
-};
+use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller};
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
@@ -661,7 +659,13 @@ pub fn camera_add_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let mut input: CameraAddInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let mut input: CameraAddInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -928,7 +932,15 @@ pub fn camera_add_v1(
         camera_id: camera_id.clone(),
         status: "starting".to_string(),
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -999,7 +1011,15 @@ pub fn camera_list_v1(
         }
     };
     audit(caller.data(), "camera.list", None, RiskClass::B, "ok", None);
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -1049,7 +1069,15 @@ pub fn camera_local_devices_v1(
         "ok",
         None,
     );
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -1079,7 +1107,13 @@ pub fn camera_get_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraIdInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let input: CameraIdInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -1172,7 +1206,15 @@ pub fn camera_get_v1(
         "ok",
         None,
     );
-    write_cbor_capped(&memory, &mut caller, &info, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &info,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -1202,7 +1244,13 @@ pub fn camera_update_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraUpdateInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let input: CameraUpdateInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -1428,7 +1476,15 @@ pub fn camera_update_v1(
         "ok",
         Some(&reason),
     );
-    write_cbor_capped(&memory, &mut caller, &info, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &info,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -1458,7 +1514,13 @@ pub fn camera_remove_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraIdInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let input: CameraIdInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -1578,7 +1640,15 @@ pub fn camera_remove_v1(
         None,
     );
     let out = CameraRemoveOut { removed: true };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -1608,7 +1678,13 @@ pub fn camera_snapshot_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraIdInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let input: CameraIdInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -1713,7 +1789,15 @@ pub fn camera_snapshot_v1(
             out.width, out.height, bytes_size
         )),
     );
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -1743,7 +1827,13 @@ pub fn camera_health_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraIdInput = match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+    let input: CameraIdInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
         Ok(v) => v,
         Err(e) => {
             audit(
@@ -1848,7 +1938,15 @@ pub fn camera_health_v1(
         "ok",
         None,
     );
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -1915,7 +2013,15 @@ pub fn camera_discover_v1(
         Some(&format!("count={}", discovered.len())),
     );
     let out = CameraDiscoverOut { discovered };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -1945,25 +2051,30 @@ pub fn camera_test_connection_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraTestConnectionInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "camera.test_connection",
-                    None,
-                    RiskClass::A,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: CameraTestConnectionInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.test_connection",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
     if input.vendor.is_empty() || input.vendor.len() > MAX_VENDOR {
         audit(
             caller.data(),
@@ -1999,7 +2110,15 @@ pub fn camera_test_connection_v1(
             ok: false,
             message: format!("vendor '{}' not supported", input.vendor),
         };
-        return write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall);
+        return write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        );
     }
     let out = match input.vendor.as_str() {
         "fake_file" => match crate::services::camera_ingest::fakefile::resolve_file_url(&input.url)
@@ -2070,7 +2189,15 @@ pub fn camera_test_connection_v1(
         "ok",
         Some(&format!("ok={}", out.ok)),
     );
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -2100,25 +2227,30 @@ pub fn camera_credentials_rotate_v1(
         );
         return AbiError::Permission.as_i32();
     }
-    let input: CameraCredentialsRotateInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "camera.credentials_rotate",
-                    None,
-                    RiskClass::A,
-                    "error",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: CameraCredentialsRotateInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.credentials_rotate",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
     if !camera_id_valid(&input.camera_id) {
         audit(
             caller.data(),
@@ -2192,7 +2324,15 @@ pub fn camera_credentials_rotate_v1(
             rotated: false,
             reason: format!("vendor '{}' has no credentials field", row.vendor),
         };
-        return write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall);
+        return write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        );
     }
     let blob_ref = new_blob.as_deref();
     let blob_len = blob_ref.map(|b| b.len()).unwrap_or(0);
@@ -2352,7 +2492,15 @@ pub fn camera_credentials_rotate_v1(
             "credentials cleared".to_string()
         },
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================

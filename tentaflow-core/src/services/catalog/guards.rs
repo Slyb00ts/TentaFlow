@@ -73,7 +73,7 @@ pub fn check_alias_collision(
 pub fn check_flow_publish_collision(
     pool: &DbPool,
     published_name: &str,
-    excluding_flow_id: Option<i64>,
+    excluding_flow_id: Option<&str>,
 ) -> Result<(), GuardError> {
     let trimmed = published_name.trim();
     if trimmed.is_empty() {
@@ -91,7 +91,7 @@ pub fn check_flow_publish_collision(
 
     let conflicting = published_flow_owner(pool, trimmed)?;
     if let Some(other_id) = conflicting {
-        if Some(other_id) != excluding_flow_id {
+        if Some(other_id.as_str()) != excluding_flow_id {
             return Err(GuardError::FlowVsFlow {
                 name: trimmed.to_string(),
             });
@@ -138,18 +138,18 @@ fn published_flow_name_exists(pool: &DbPool, name: &str) -> Result<bool, GuardEr
     Ok(published_flow_owner(pool, name)?.is_some())
 }
 
-fn published_flow_owner(pool: &DbPool, name: &str) -> Result<Option<i64>, GuardError> {
+fn published_flow_owner(pool: &DbPool, name: &str) -> Result<Option<String>, GuardError> {
     // Reject the name across every status. Allowing two flows to share
     // `published_model_name` while one is `draft` would create a hidden
     // landmine: the moment the draft is activated it would collide with the
     // already-active flow. The collision is reported now, not later.
-    let lookup = || -> Result<Option<i64>> {
+    let lookup = || -> Result<Option<String>> {
         let conn = pool
             .lock()
             .map_err(|_| anyhow::anyhow!("db pool lock poisoned"))?;
         let mut stmt =
             conn.prepare_cached("SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1")?;
-        let result: Option<i64> = stmt
+        let result: Option<String> = stmt
             .query_row(rusqlite::params![name], |row| row.get(0))
             .ok();
         Ok(result)
@@ -256,12 +256,12 @@ mod tests {
             conn.query_row(
                 "SELECT id FROM flows WHERE name = 'Standardowy pipeline LLM'",
                 [],
-                |row| row.get::<_, i64>(0),
+                |row| row.get::<_, String>(0),
             )
             .unwrap()
         };
         // Re-publishing the same flow under the same name must succeed.
-        check_flow_publish_collision(&pool, "chat-pl", Some(flow_id)).unwrap();
+        check_flow_publish_collision(&pool, "chat-pl", Some(flow_id.as_str())).unwrap();
     }
 
     #[test]

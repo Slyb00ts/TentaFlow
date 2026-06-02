@@ -30,7 +30,7 @@ mod core_sync_repository_tests {
     fn flow_params<'a>(
         name: &'a str,
         flow_json: &'a str,
-        actor_user_id: Option<i64>,
+        actor_user_id: Option<&'a str>,
     ) -> FlowParams<'a> {
         FlowParams {
             name,
@@ -42,10 +42,6 @@ mod core_sync_repository_tests {
             published_model_name: None,
             actor_user_id,
         }
-    }
-
-    fn capture_id_for_resource(db: &DbPool, resource_type: &str, resource_id: i64) -> String {
-        capture_id_for_resource_str(db, resource_type, &resource_id.to_string())
     }
 
     fn capture_id_for_resource_str(db: &DbPool, resource_type: &str, resource_id: &str) -> String {
@@ -63,7 +59,7 @@ mod core_sync_repository_tests {
     fn capture_id_for_action(
         db: &DbPool,
         resource_type: &str,
-        resource_id: i64,
+        resource_id: &str,
         action: &str,
     ) -> String {
         let conn = db.lock().expect("db lock");
@@ -71,13 +67,13 @@ mod core_sync_repository_tests {
             "SELECT capture_id FROM __tentaflow_core_sync_captures \
              WHERE resource_type = ?1 AND resource_id = ?2 AND action = ?3 \
              ORDER BY created_at_ms DESC LIMIT 1",
-            rusqlite::params![resource_type, resource_id.to_string(), action],
+            rusqlite::params![resource_type, resource_id, action],
             |row| row.get(0),
         )
         .expect("capture id")
     }
 
-    fn create_actor(db: &DbPool) -> i64 {
+    fn create_actor(db: &DbPool) -> String {
         create_user_account(
             db,
             "flow-owner",
@@ -91,20 +87,16 @@ mod core_sync_repository_tests {
     #[test]
     fn create_flow_records_binary_core_capture() {
         let db = setup_db();
-        let actor_id = create_actor(&db);
-        let id = create_flow(
-            &db,
-            &flow_params("Flow A", r#"{"nodes":[]}"#, Some(actor_id)),
-        )
-        .expect("create flow");
-        let capture_id = capture_id_for_resource(&db, "core.flow", id);
+        let _actor_id = create_actor(&db);
+        let id =
+            create_flow(&db, &flow_params("Flow A", r#"{"nodes":[]}"#, None)).expect("create flow");
+        let capture_id = capture_id_for_resource_str(&db, "core.flow", &id);
         let conn = db.lock().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
             .expect("capture");
 
         assert_eq!(capture.action, SqlWriteAction::Insert);
-        assert_eq!(capture.actor_user_id, Some(actor_id));
         assert_eq!(
             capture.changed_fields.get("name"),
             Some(&FieldValue::String("Flow A".to_string()))
@@ -112,20 +104,17 @@ mod core_sync_repository_tests {
     }
 
     #[test]
-    fn update_flow_with_snapshot_records_flow_and_version_captures() {
+    fn update_flow_with_snapshot_records_only_flow_capture() {
         let db = setup_db();
-        let actor_id = create_actor(&db);
-        let id = create_flow(
-            &db,
-            &flow_params("Flow A", r#"{"nodes":[]}"#, Some(actor_id)),
-        )
-        .expect("create flow");
+        let _actor_id = create_actor(&db);
+        let id =
+            create_flow(&db, &flow_params("Flow A", r#"{"nodes":[]}"#, None)).expect("create flow");
         update_flow_with_snapshot(
             &db,
-            id,
+            &id,
             1,
-            &flow_params("Flow B", r#"{"nodes":[{"id":"n1"}]}"#, Some(actor_id)),
-            Some(&actor_id.to_string()),
+            &flow_params("Flow B", r#"{"nodes":[{"id":"n1"}]}"#, None),
+            None,
         )
         .expect("update flow");
         let conn = db.lock().expect("db lock");
@@ -133,10 +122,12 @@ mod core_sync_repository_tests {
             .query_row(
                 "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
                  WHERE resource_type = 'core.flow' AND resource_id = ?1",
-                rusqlite::params![id.to_string()],
+                rusqlite::params![id],
                 |row| row.get(0),
             )
             .expect("flow capture count");
+        // flow_versions are local-only now, so the snapshot insert must NOT emit a
+        // core capture — only the two flow writes (insert + update) do.
         let version_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
@@ -145,9 +136,18 @@ mod core_sync_repository_tests {
                 |row| row.get(0),
             )
             .expect("version capture count");
+        // The local snapshot row still exists for rollback.
+        let local_version_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_versions WHERE flow_id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .expect("local version rows");
 
         assert_eq!(flow_count, 2);
-        assert_eq!(version_count, 1);
+        assert_eq!(version_count, 0);
+        assert_eq!(local_version_rows, 1);
     }
 
     #[test]
@@ -161,7 +161,7 @@ mod core_sync_repository_tests {
             "sales@example.com",
         )
         .expect("create user");
-        let capture_id = capture_id_for_resource(&db, "core.user_account", user_id);
+        let capture_id = capture_id_for_resource_str(&db, "core.user_account", &user_id);
         let conn = db.lock().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
@@ -186,8 +186,8 @@ mod core_sync_repository_tests {
             "password@example.com",
         )
         .expect("create user");
-        update_user_account_password(&db, user_id, "new-secret-hash").expect("update password");
-        let capture_id = capture_id_for_action(&db, "core.user_account", user_id, "update");
+        update_user_account_password(&db, &user_id, "new-secret-hash").expect("update password");
+        let capture_id = capture_id_for_action(&db, "core.user_account", &user_id, "update");
         let conn = db.lock().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
@@ -208,8 +208,8 @@ mod core_sync_repository_tests {
             create_user_account(&db, "group-user", "hash", "Group User", "group@example.com")
                 .expect("create user");
         let group_id = create_group(&db, "Sales", "CRM team").expect("create group");
-        add_user_to_group(&db, group_id, user_id).expect("add member");
-        let resource_id = group_member_resource_id(group_id, user_id);
+        add_user_to_group(&db, &group_id, &user_id).expect("add member");
+        let resource_id = group_member_resource_id(&group_id, &user_id);
         let capture_id = capture_id_for_resource_str(&db, "core.group_member", &resource_id);
         let conn = db.lock().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
@@ -219,11 +219,11 @@ mod core_sync_repository_tests {
         assert_eq!(capture.action, SqlWriteAction::Insert);
         assert_eq!(
             capture.changed_fields.get("group_id"),
-            Some(&FieldValue::I64(group_id))
+            Some(&FieldValue::String(group_id.clone()))
         );
         assert_eq!(
             capture.changed_fields.get("user_id"),
-            Some(&FieldValue::I64(user_id))
+            Some(&FieldValue::String(user_id.clone()))
         );
     }
 
@@ -236,12 +236,12 @@ mod core_sync_repository_tests {
         let initial =
             get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
 
-        update_user_account_password(&db, user_id, "new-hash").expect("password");
+        update_user_account_password(&db, &user_id, "new-hash").expect("password");
         let after_password =
             get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
         assert_eq!(after_password, initial);
 
-        set_user_role(&db, user_id, "admin").expect("role");
+        set_user_role(&db, &user_id, "admin").expect("role");
         let after_role =
             get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
         assert!(after_role > after_password);
@@ -252,8 +252,8 @@ mod core_sync_repository_tests {
             crate::sync::core_registry::CORE_SYNC_ADDON_ID,
             "core.flow",
             "flow-epoch",
-            Some(user_id),
-            Some(user_id),
+            Some(&user_id),
+            Some(&user_id),
             None,
             None,
             "assigned",
@@ -456,7 +456,7 @@ fn row_to_api_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbApiKey> {
         is_active: row.get(5)?,
         created_at: row.get(6)?,
         last_used_at: row.get(7)?,
-        owner_user_id: row.get::<_, Option<i64>>(8).ok().flatten(),
+        owner_user_id: row.get::<_, Option<String>>(8).ok().flatten(),
     })
 }
 
@@ -476,7 +476,7 @@ pub fn list_api_keys(pool: &DbPool) -> Result<Vec<DbApiKey>> {
                 is_active: row.get(4)?,
                 created_at: row.get(5)?,
                 last_used_at: row.get(6)?,
-                owner_user_id: row.get::<_, Option<i64>>(7).ok().flatten(),
+                owner_user_id: row.get::<_, Option<String>>(7).ok().flatten(),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -631,14 +631,16 @@ pub fn set_shared_secret_setting_secure(
     key: &str,
     value: &str,
     cipher: &crate::crypto::SettingsCipher,
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<&str>,
 ) -> Result<()> {
     if !is_shared_secret_setting_key(key) {
         anyhow::bail!("setting nie jest syncowalnym sekretem: {}", key);
     }
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
-    let encrypted = cipher.encrypt(value).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let encrypted = cipher
+        .encrypt(value)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     tx.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) \
          ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
@@ -650,7 +652,7 @@ pub fn set_shared_secret_setting_secure(
         key,
         crate::sync::runtime::SqlWriteAction::Update,
         shared_secret_setting_fields(key, value),
-        actor_user_id,
+        actor_user_id.map(|id| id.to_string()),
     )?;
     tx.commit()?;
     Ok(())
@@ -686,7 +688,9 @@ pub fn enqueue_existing_shared_secret_settings(
         if existing > 0 {
             continue;
         }
-        let value = cipher.decrypt(&raw_value).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let value = cipher
+            .decrypt(&raw_value)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         record_core_capture_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
@@ -816,11 +820,11 @@ pub fn clear_must_change_password(pool: &DbPool, user_id: i64) -> Result<()> {
 pub const SUPPORTED_USER_LANGUAGES: &[&str] = &["pl", "en", "fr", "es", "de"];
 
 /// Zwraca preferowany jezyk uzytkownika lub None jesli brak preferencji.
-pub fn get_user_preferred_language(pool: &DbPool, user_id: i64) -> Result<Option<String>> {
+pub fn get_user_preferred_language(pool: &DbPool, user_id: &str) -> Result<Option<String>> {
     let conn = acquire(pool)?;
     let result = conn
         .query_row(
-            "SELECT preferred_language FROM users WHERE id = ?1",
+            "SELECT preferred_language FROM user_accounts WHERE id = ?1",
             rusqlite::params![user_id],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -831,7 +835,7 @@ pub fn get_user_preferred_language(pool: &DbPool, user_id: i64) -> Result<Option
 
 /// Ustawia preferowany jezyk uzytkownika. `lang = None` czysci preferencje.
 /// Zwraca blad gdy `lang` nie nalezy do `SUPPORTED_USER_LANGUAGES`.
-pub fn set_user_preferred_language(pool: &DbPool, user_id: i64, lang: Option<&str>) -> Result<()> {
+pub fn set_user_preferred_language(pool: &DbPool, user_id: &str, lang: Option<&str>) -> Result<()> {
     if let Some(code) = lang {
         if !SUPPORTED_USER_LANGUAGES.contains(&code) {
             return Err(anyhow::anyhow!(
@@ -843,7 +847,7 @@ pub fn set_user_preferred_language(pool: &DbPool, user_id: i64, lang: Option<&st
     }
     let conn = acquire(pool)?;
     conn.execute(
-        "UPDATE users SET preferred_language = ?1 WHERE id = ?2",
+        "UPDATE user_accounts SET preferred_language = ?1 WHERE id = ?2",
         rusqlite::params![lang, user_id],
     )?;
     Ok(())
@@ -2548,7 +2552,7 @@ pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>>
     Ok(rows)
 }
 
-pub fn get_flow(pool: &DbPool, id: i64) -> Result<Option<DbFlow>> {
+pub fn get_flow(pool: &DbPool, id: &str) -> Result<Option<DbFlow>> {
     let conn = acquire(pool)?;
     let mut stmt =
         conn.prepare_cached(&format!("SELECT {} FROM flows WHERE id = ?1", FLOW_COLS))?;
@@ -2631,16 +2635,12 @@ fn sync_explicit_share_core_id(
     )
 }
 
-fn node_user_assignment_core_id(node_id: &str, user_id: i64, assignment_mode: &str) -> String {
-    crate::sync::resource_id::composite_resource_id(&[
-        node_id,
-        &user_id.to_string(),
-        assignment_mode,
-    ])
+fn node_user_assignment_core_id(node_id: &str, user_id: &str, assignment_mode: &str) -> String {
+    crate::sync::resource_id::composite_resource_id(&[node_id, user_id, assignment_mode])
 }
 
-fn sync_user_org_profile_core_id(org_id: &str, user_id: i64) -> String {
-    crate::sync::resource_id::composite_resource_id(&[org_id, &user_id.to_string()])
+fn sync_user_org_profile_core_id(org_id: &str, user_id: &str) -> String {
+    crate::sync::resource_id::composite_resource_id(&[org_id, user_id])
 }
 
 fn flow_changed_fields(
@@ -2669,45 +2669,13 @@ fn flow_changed_fields(
     fields
 }
 
-fn flow_version_changed_fields(
-    flow_id: i64,
-    version_num: i64,
-    flow_json: &str,
-    name: &str,
-    description: Option<&str>,
-    status: Option<&str>,
-    created_by: Option<&str>,
-) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
-    let mut fields = BTreeMap::new();
-    fields.insert(
-        "flow_id".to_string(),
-        crate::sync::ledger::FieldValue::I64(flow_id),
-    );
-    fields.insert(
-        "version_num".to_string(),
-        crate::sync::ledger::FieldValue::I64(version_num),
-    );
-    fields.insert("flow_json".to_string(), field_string(flow_json));
-    fields.insert("name".to_string(), field_string(name));
-    fields.insert(
-        "description".to_string(),
-        field_optional_string(description),
-    );
-    fields.insert("status".to_string(), field_optional_string(status));
-    fields.insert("created_by".to_string(), field_optional_string(created_by));
-    fields
-}
-
 fn flow_binding_changed_fields(
-    flow_id: i64,
+    flow_id: &str,
     model_pattern: &str,
     priority: i64,
 ) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
     let mut fields = BTreeMap::new();
-    fields.insert(
-        "flow_id".to_string(),
-        crate::sync::ledger::FieldValue::I64(flow_id),
-    );
+    fields.insert("flow_id".to_string(), field_string(flow_id));
     fields.insert("model_pattern".to_string(), field_string(model_pattern));
     fields.insert(
         "priority".to_string(),
@@ -2722,7 +2690,7 @@ fn record_core_capture_tx(
     resource_id: impl Into<String>,
     action: crate::sync::runtime::SqlWriteAction,
     changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> Result<()> {
     record_core_capture_for_org_tx(
         tx,
@@ -2742,17 +2710,43 @@ fn record_core_capture_for_org_tx(
     resource_id: impl Into<String>,
     action: crate::sync::runtime::SqlWriteAction,
     changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> Result<()> {
+    let resource_id = resource_id.into();
+    // Mint the HLC inside this write transaction so the capture row, the ledger
+    // operation drained from it, and the local resource-version index all share
+    // one timestamp — the originating instant of this write.
+    let hlc = crate::sync::runtime::core_hlc_now();
+    let epoch = crate::sync::runtime::core_epoch();
+    let descriptor = crate::sync::core_registry::descriptor_for_kind(kind);
     let capture = crate::sync::core_capture::CoreWriteCapture::new(
         kind,
         org_id,
-        resource_id,
+        resource_id.clone(),
         action,
         changed_fields,
         actor_user_id,
+        hlc.clone(),
+        epoch,
     );
     crate::sync::core_capture::record_core_write_capture(tx, &capture)?;
+    // Stamp the local resource version so the HLC-LWW gate on the receive side
+    // has a baseline, and a future inbound edit older than this local write is
+    // rejected. Insert-only / always-monotonic tables still get a row; the
+    // comparison is harmless for them.
+    tx.execute(
+        "INSERT INTO core_resource_versions (resource_type, resource_id, hlc_wall, hlc_logical, hlc_node) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+         hlc_wall = excluded.hlc_wall, hlc_logical = excluded.hlc_logical, hlc_node = excluded.hlc_node",
+        rusqlite::params![
+            descriptor.resource_type,
+            resource_id,
+            hlc.wall_time_ms,
+            hlc.logical as i64,
+            hlc.node_id,
+        ],
+    )?;
     Ok(())
 }
 
@@ -2804,33 +2798,29 @@ fn group_changed_fields(
     fields
 }
 
-fn group_member_resource_id(group_id: i64, user_id: i64) -> String {
+fn group_member_resource_id(group_id: &str, user_id: &str) -> String {
     format!("{}:{}", group_id, user_id)
 }
 
 fn group_member_changed_fields(
-    group_id: i64,
-    user_id: i64,
+    group_id: &str,
+    user_id: &str,
 ) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
     let mut fields = BTreeMap::new();
-    fields.insert(
-        "group_id".to_string(),
-        crate::sync::ledger::FieldValue::I64(group_id),
-    );
-    fields.insert(
-        "user_id".to_string(),
-        crate::sync::ledger::FieldValue::I64(user_id),
-    );
+    fields.insert("group_id".to_string(), field_string(group_id));
+    fields.insert("user_id".to_string(), field_string(user_id));
     fields
 }
 
-pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<i64> {
+pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<String> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
+    let id = uuid::Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO flows (name, description, is_default, service_type, flow_json, status, published_model_name) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO flows (id, name, description, is_default, service_type, flow_json, status, published_model_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
+            id,
             params.name,
             params.description,
             params.is_default,
@@ -2840,14 +2830,13 @@ pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<i64> {
             params.published_model_name,
         ],
     )?;
-    let id = tx.last_insert_rowid();
     record_core_capture_tx(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::Flow,
-        id.to_string(),
+        id.clone(),
         crate::sync::runtime::SqlWriteAction::Insert,
         flow_changed_fields(params),
-        params.actor_user_id,
+        params.actor_user_id.map(|id| id.to_string()),
     )?;
     tx.commit()?;
     Ok(id)
@@ -2855,7 +2844,7 @@ pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<i64> {
 
 pub fn update_flow(
     pool: &DbPool,
-    id: i64,
+    id: &str,
     expected_version: i64,
     params: &FlowParams<'_>,
 ) -> Result<()> {
@@ -2888,19 +2877,19 @@ pub fn update_flow(
         id.to_string(),
         crate::sync::runtime::SqlWriteAction::Update,
         flow_changed_fields(params),
-        params.actor_user_id,
+        params.actor_user_id.map(|id| id.to_string()),
     )?;
     tx.commit()?;
     Ok(())
 }
 
-pub fn delete_flow(pool: &DbPool, id: i64) -> Result<()> {
+pub fn delete_flow(pool: &DbPool, id: &str) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute("DELETE FROM flows WHERE id = ?1", rusqlite::params![id])?;
     if rows_affected > 0 {
         let mut fields = BTreeMap::new();
-        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        fields.insert("id".to_string(), field_string(id));
         record_core_capture_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::Flow,
@@ -2953,7 +2942,7 @@ fn row_to_flow_version_full(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowV
 }
 
 /// Zwraca liste wersji (bez flow_json) posortowana malejaco, max 5.
-pub fn list_flow_versions(pool: &DbPool, flow_id: i64) -> Result<Vec<DbFlowVersion>> {
+pub fn list_flow_versions(pool: &DbPool, flow_id: &str) -> Result<Vec<DbFlowVersion>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_versions WHERE flow_id = ?1 \
@@ -2969,8 +2958,8 @@ pub fn list_flow_versions(pool: &DbPool, flow_id: i64) -> Result<Vec<DbFlowVersi
 /// Zwraca pojedyncza wersje z pelnym flow_json.
 pub fn get_flow_version(
     pool: &DbPool,
-    flow_id: i64,
-    version_id: i64,
+    flow_id: &str,
+    version_id: &str,
 ) -> Result<Option<DbFlowVersion>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
@@ -2995,7 +2984,7 @@ pub fn get_flow_version(
 /// Zwraca `Err("CONFLICT")` jesli expected_version nie pasuje.
 pub fn update_flow_with_snapshot(
     pool: &DbPool,
-    id: i64,
+    id: &str,
     expected_version: i64,
     params: &FlowParams<'_>,
     created_by: Option<&str>,
@@ -3020,11 +3009,15 @@ pub fn update_flow_with_snapshot(
             |r| r.get(0),
         )?;
 
+        // flow_versions is a LOCAL-ONLY snapshot history (not core-synced), so it
+        // gets a local UUID and no capture row. It still uses UUID ids after v53.
+        let version_id = uuid::Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO flow_versions \
-             (flow_id, version_num, flow_json, name, description, status, created_by) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (id, flow_id, version_num, flow_json, name, description, status, created_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
+                version_id,
                 id,
                 next_ver,
                 old_flow_json,
@@ -3033,23 +3026,6 @@ pub fn update_flow_with_snapshot(
                 old_status,
                 created_by,
             ],
-        )?;
-        let flow_version_id = tx.last_insert_rowid();
-        record_core_capture_tx(
-            &tx,
-            crate::sync::core_registry::CoreSyncResourceKind::FlowVersion,
-            flow_version_id.to_string(),
-            crate::sync::runtime::SqlWriteAction::Insert,
-            flow_version_changed_fields(
-                id,
-                next_ver,
-                &old_flow_json,
-                &old_name,
-                old_description.as_deref(),
-                old_status.as_deref(),
-                created_by,
-            ),
-            params.actor_user_id,
         )?;
 
         // Prune — zostawiamy tylko FLOW_VERSIONS_KEEP najnowszych
@@ -3087,7 +3063,7 @@ pub fn update_flow_with_snapshot(
         id.to_string(),
         crate::sync::runtime::SqlWriteAction::Update,
         flow_changed_fields(params),
-        params.actor_user_id,
+        params.actor_user_id.map(|id| id.to_string()),
     )?;
 
     tx.commit()?;
@@ -3119,7 +3095,7 @@ pub fn list_flow_model_bindings(pool: &DbPool) -> Result<Vec<DbFlowModelBinding>
     Ok(rows)
 }
 
-pub fn get_flow_model_binding(pool: &DbPool, id: i64) -> Result<Option<DbFlowModelBinding>> {
+pub fn get_flow_model_binding(pool: &DbPool, id: &str) -> Result<Option<DbFlowModelBinding>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_model_bindings WHERE id = ?1",
@@ -3133,21 +3109,21 @@ pub fn get_flow_model_binding(pool: &DbPool, id: i64) -> Result<Option<DbFlowMod
 
 pub fn create_flow_model_binding(
     pool: &DbPool,
-    flow_id: i64,
+    flow_id: &str,
     model_pattern: &str,
     priority: i64,
-) -> Result<i64> {
+) -> Result<String> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
+    let id = uuid::Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO flow_model_bindings (flow_id, model_pattern, priority) VALUES (?1, ?2, ?3)",
-        rusqlite::params![flow_id, model_pattern, priority],
+        "INSERT INTO flow_model_bindings (id, flow_id, model_pattern, priority) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![id, flow_id, model_pattern, priority],
     )?;
-    let id = tx.last_insert_rowid();
     record_core_capture_tx(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
-        id.to_string(),
+        id.clone(),
         crate::sync::runtime::SqlWriteAction::Insert,
         flow_binding_changed_fields(flow_id, model_pattern, priority),
         None,
@@ -3158,8 +3134,8 @@ pub fn create_flow_model_binding(
 
 pub fn update_flow_model_binding(
     pool: &DbPool,
-    id: i64,
-    flow_id: i64,
+    id: &str,
+    flow_id: &str,
     model_pattern: &str,
     priority: i64,
 ) -> Result<()> {
@@ -3183,7 +3159,7 @@ pub fn update_flow_model_binding(
     Ok(())
 }
 
-pub fn delete_flow_model_binding(pool: &DbPool, id: i64) -> Result<()> {
+pub fn delete_flow_model_binding(pool: &DbPool, id: &str) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
@@ -3192,7 +3168,7 @@ pub fn delete_flow_model_binding(pool: &DbPool, id: i64) -> Result<()> {
     )?;
     if rows_affected > 0 {
         let mut fields = BTreeMap::new();
-        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        fields.insert("id".to_string(), field_string(id));
         record_core_capture_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
@@ -3528,7 +3504,7 @@ pub fn list_flow_executions(
 
 pub fn list_flow_executions_for_flow(
     pool: &DbPool,
-    flow_id: i64,
+    flow_id: &str,
     limit: i64,
 ) -> Result<Vec<DbFlowExecution>> {
     let conn = acquire(pool)?;
@@ -3556,7 +3532,7 @@ pub fn get_flow_execution(pool: &DbPool, id: i64) -> Result<Option<DbFlowExecuti
 
 pub fn create_flow_execution(
     pool: &DbPool,
-    flow_id: i64,
+    flow_id: &str,
     request_id: Option<&str>,
     model: Option<&str>,
     status: &str,
@@ -3797,7 +3773,7 @@ const USER_ACCOUNT_COLS: &str =
 
 /// Ustaw role usera. Akceptuje tylko 'user' | 'power_user' | 'admin'.
 /// is_admin jest synchronizowany automatycznie (role='admin' → is_admin=1).
-pub fn set_user_role(pool: &DbPool, user_id: i64, role: &str) -> Result<()> {
+pub fn set_user_role(pool: &DbPool, user_id: &str, role: &str) -> Result<()> {
     let role = match role {
         "user" | "power_user" | "admin" => role,
         _ => anyhow::bail!("Nieprawidlowa rola: {}", role),
@@ -3838,19 +3814,19 @@ pub fn create_user_account(
     password_hash: &str,
     display_name: &str,
     email: &str,
-) -> Result<i64> {
+) -> Result<String> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
+    let id = uuid::Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO user_accounts (username, password_hash, display_name, email) \
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![username, password_hash, display_name, email],
+        "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![id, username, password_hash, display_name, email],
     )?;
-    let id = tx.last_insert_rowid();
     record_core_capture_tx(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
-        id.to_string(),
+        id.clone(),
         crate::sync::runtime::SqlWriteAction::Insert,
         user_account_changed_fields(Some(username), Some(display_name), Some(email), Some(true)),
         None,
@@ -3873,7 +3849,7 @@ pub fn get_user_account_by_username(pool: &DbPool, username: &str) -> Result<Opt
 }
 
 /// Pobiera uzytkownika po ID z tabeli user_accounts.
-pub fn get_user_account_by_id(pool: &DbPool, id: i64) -> Result<Option<UserAccount>> {
+pub fn get_user_account_by_id(pool: &DbPool, id: &str) -> Result<Option<UserAccount>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts WHERE id = ?1",
@@ -3899,7 +3875,11 @@ pub fn list_user_accounts(pool: &DbPool) -> Result<Vec<UserAccount>> {
 }
 
 /// Aktualizuje hash hasla uzytkownika w tabeli user_accounts.
-pub fn update_user_account_password(pool: &DbPool, id: i64, new_password_hash: &str) -> Result<()> {
+pub fn update_user_account_password(
+    pool: &DbPool,
+    id: &str,
+    new_password_hash: &str,
+) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
@@ -3923,7 +3903,7 @@ pub fn update_user_account_password(pool: &DbPool, id: i64, new_password_hash: &
 /// Aktualizuje dane uzytkownika (display_name, email, is_active).
 pub fn update_user_account(
     pool: &DbPool,
-    id: i64,
+    id: &str,
     display_name: &str,
     email: &str,
     is_active: bool,
@@ -3951,7 +3931,7 @@ pub fn update_user_account(
 }
 
 /// Usuwa uzytkownika z tabeli user_accounts (kaskadowo czlonkostwa w grupach).
-pub fn delete_user_account(pool: &DbPool, id: i64) -> Result<()> {
+pub fn delete_user_account(pool: &DbPool, id: &str) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
@@ -3960,7 +3940,7 @@ pub fn delete_user_account(pool: &DbPool, id: i64) -> Result<()> {
     )?;
     if rows_affected > 0 {
         let mut fields = BTreeMap::new();
-        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        fields.insert("id".to_string(), field_string(id));
         record_core_capture_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
@@ -4006,18 +3986,18 @@ pub fn verify_user_account_password(
 // =============================================================================
 
 /// Tworzy nowa grupe uzytkownikow. Zwraca ID.
-pub fn create_group(pool: &DbPool, name: &str, description: &str) -> Result<i64> {
+pub fn create_group(pool: &DbPool, name: &str, description: &str) -> Result<String> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
+    let id = uuid::Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO user_groups (name, description) VALUES (?1, ?2)",
-        rusqlite::params![name, description],
+        "INSERT INTO user_groups (id, name, description) VALUES (?1, ?2, ?3)",
+        rusqlite::params![id, name, description],
     )?;
-    let id = tx.last_insert_rowid();
     record_core_capture_tx(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::UserGroup,
-        id.to_string(),
+        id.clone(),
         crate::sync::runtime::SqlWriteAction::Insert,
         group_changed_fields(Some(name), Some(description)),
         None,
@@ -4045,7 +4025,7 @@ pub fn list_groups(pool: &DbPool) -> Result<Vec<UserGroup>> {
 }
 
 /// Dodaje uzytkownika do grupy.
-pub fn add_user_to_group(pool: &DbPool, group_id: i64, user_id: i64) -> Result<()> {
+pub fn add_user_to_group(pool: &DbPool, group_id: &str, user_id: &str) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
@@ -4067,7 +4047,7 @@ pub fn add_user_to_group(pool: &DbPool, group_id: i64, user_id: i64) -> Result<(
 }
 
 /// Usuwa uzytkownika z grupy.
-pub fn remove_user_from_group(pool: &DbPool, group_id: i64, user_id: i64) -> Result<()> {
+pub fn remove_user_from_group(pool: &DbPool, group_id: &str, user_id: &str) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
@@ -4089,7 +4069,7 @@ pub fn remove_user_from_group(pool: &DbPool, group_id: i64, user_id: i64) -> Res
 }
 
 /// Pobiera grupy do ktorych nalezy uzytkownik.
-pub fn get_user_groups(pool: &DbPool, user_id: i64) -> Result<Vec<UserGroup>> {
+pub fn get_user_groups(pool: &DbPool, user_id: &str) -> Result<Vec<UserGroup>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT g.id, g.name, g.description, g.created_at \
@@ -4111,7 +4091,7 @@ pub fn get_user_groups(pool: &DbPool, user_id: i64) -> Result<Vec<UserGroup>> {
 }
 
 /// Aktualizuje nazwe i opis grupy.
-pub fn update_group(pool: &DbPool, id: i64, name: &str, description: &str) -> Result<()> {
+pub fn update_group(pool: &DbPool, id: &str, name: &str, description: &str) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
@@ -4133,7 +4113,7 @@ pub fn update_group(pool: &DbPool, id: i64, name: &str, description: &str) -> Re
 }
 
 /// Lista czlonkow grupy (user accounts).
-pub fn list_group_members(pool: &DbPool, group_id: i64) -> Result<Vec<UserAccount>> {
+pub fn list_group_members(pool: &DbPool, group_id: &str) -> Result<Vec<UserAccount>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts u \
@@ -4148,7 +4128,7 @@ pub fn list_group_members(pool: &DbPool, group_id: i64) -> Result<Vec<UserAccoun
 }
 
 /// Pobiera grupe po id.
-pub fn get_group_by_id(pool: &DbPool, id: i64) -> Result<Option<UserGroup>> {
+pub fn get_group_by_id(pool: &DbPool, id: &str) -> Result<Option<UserGroup>> {
     let conn = acquire(pool)?;
     let result = conn
         .query_row(
@@ -4168,7 +4148,7 @@ pub fn get_group_by_id(pool: &DbPool, id: i64) -> Result<Option<UserGroup>> {
 }
 
 /// Usuwa grupe uzytkownikow (kaskadowo czlonkostwa).
-pub fn delete_group(pool: &DbPool, id: i64) -> Result<()> {
+pub fn delete_group(pool: &DbPool, id: &str) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
@@ -4177,7 +4157,7 @@ pub fn delete_group(pool: &DbPool, id: i64) -> Result<()> {
     )?;
     if rows_affected > 0 {
         let mut fields = BTreeMap::new();
-        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        fields.insert("id".to_string(), field_string(id));
         record_core_capture_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::UserGroup,
@@ -4243,7 +4223,7 @@ pub fn get_addon_permissions(pool: &DbPool, addon_id: &str) -> Result<Vec<AddonP
 pub fn check_permission(
     pool: &DbPool,
     addon_id: &str,
-    user_id: i64,
+    user_id: &str,
     permission_id: &str,
 ) -> Result<bool> {
     let conn = acquire(pool)?;
@@ -4272,7 +4252,7 @@ pub fn check_permission(
 }
 
 /// Pobiera wszystkie uprawnienia (bezposrednie i przez grupy) dla danego uzytkownika.
-pub fn get_user_permissions(pool: &DbPool, user_id: i64) -> Result<Vec<AddonPermission>> {
+pub fn get_user_permissions(pool: &DbPool, user_id: &str) -> Result<Vec<AddonPermission>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, subject_type, subject_id, permission_id, granted, created_at \
@@ -4306,7 +4286,7 @@ pub fn get_user_permissions(pool: &DbPool, user_id: i64) -> Result<Vec<AddonPerm
 /// Zapisuje wpis logu audytowego.
 pub fn log_audit(
     pool: &DbPool,
-    user_id: Option<i64>,
+    user_id: Option<&str>,
     addon_id: Option<&str>,
     action: &str,
     resource: Option<&str>,
@@ -4360,7 +4340,7 @@ pub fn list_audit_logs(
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     let mut idx = 1;
 
-    if let Some(uid) = filters.user_id {
+    if let Some(uid) = filters.user_id.clone() {
         sql.push_str(&format!(" AND user_id = ?{}", idx));
         params.push(Box::new(uid));
         idx += 1;
@@ -4424,7 +4404,7 @@ pub fn count_audit_logs(pool: &DbPool, filters: &AuditLogFilters) -> Result<u64>
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     let mut idx = 1;
 
-    if let Some(uid) = filters.user_id {
+    if let Some(uid) = filters.user_id.clone() {
         sql.push_str(&format!(" AND user_id = ?{}", idx));
         params.push(Box::new(uid));
         idx += 1;
@@ -4591,7 +4571,7 @@ pub fn delete_addon(pool: &DbPool, addon_id: &str) -> Result<()> {
 pub fn set_addon_secret(
     pool: &DbPool,
     addon_id: &str,
-    user_id: Option<i64>,
+    user_id: Option<&str>,
     key: &str,
     encrypted_value: &str,
 ) -> Result<()> {
@@ -4653,7 +4633,7 @@ pub fn create_sso_provider(
     client_secret_encrypted: &str,
     discovery_url: &str,
     auto_create_users: bool,
-    default_group_id: Option<i64>,
+    default_group_id: Option<&str>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     conn.execute(
@@ -4778,15 +4758,18 @@ pub fn create_user_account_sso(
     email: &str,
     sso_provider: &str,
     sso_subject: &str,
-) -> Result<i64> {
-    let conn = acquire(pool)?;
+) -> Result<String> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let id = uuid::Uuid::new_v4().to_string();
     // Haslo = losowy hash (uzytkownik SSO nie loguje sie haslem)
     let random_hash = format!("$sso${}${}", sso_provider, uuid::Uuid::new_v4());
-    conn.execute(
-        "INSERT INTO user_accounts (username, password_hash, display_name, email, \
+    tx.execute(
+        "INSERT INTO user_accounts (id, username, password_hash, display_name, email, \
          sso_provider, sso_subject, is_active) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
         rusqlite::params![
+            id,
             username,
             random_hash,
             display_name,
@@ -4795,7 +4778,16 @@ pub fn create_user_account_sso(
             sso_subject
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+        id.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        user_account_changed_fields(Some(username), Some(display_name), Some(email), Some(true)),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Wyszukuje uzytkownika po SSO provider + subject.
@@ -4819,7 +4811,7 @@ pub fn get_user_account_by_sso(
 }
 
 /// Aktualizuje last_login_at uzytkownika.
-pub fn update_user_account_last_login(pool: &DbPool, id: i64) -> Result<()> {
+pub fn update_user_account_last_login(pool: &DbPool, id: &str) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
         "UPDATE user_accounts SET last_login_at = datetime('now') WHERE id = ?1",
@@ -4949,10 +4941,7 @@ pub fn ensure_default_core_sync_policies(pool: &DbPool) -> Result<usize> {
     let conn = acquire(pool)?;
     let mut inserted = 0usize;
     for descriptor in crate::sync::core_registry::CORE_SYNC_DESCRIPTORS {
-        let policy_id = format!(
-            "policy-core-{}",
-            descriptor.resource_type.replace('.', "-")
-        );
+        let policy_id = format!("policy-core-{}", descriptor.resource_type.replace('.', "-"));
         inserted += conn.execute(
             "INSERT OR IGNORE INTO sync_policies \
              (policy_id, org_id, addon_id, resource_type, resource_id, mode, authority_node_id, retention_days, is_enabled) \
@@ -5103,7 +5092,7 @@ pub fn upsert_sync_node_identity(
     display_name: &str,
     node_kind: &str,
     trust_status: &str,
-    owner_user_id: Option<i64>,
+    owner_user_id: Option<&str>,
     sync_profile: &str,
 ) -> Result<()> {
     let mut conn = acquire(pool)?;
@@ -5137,7 +5126,10 @@ pub fn upsert_sync_node_identity(
     fields.insert("display_name".to_string(), field_string(display_name));
     fields.insert("node_kind".to_string(), field_string(node_kind));
     fields.insert("trust_status".to_string(), field_string(trust_status));
-    fields.insert("owner_user_id".to_string(), field_optional_i64(owner_user_id));
+    fields.insert(
+        "owner_user_id".to_string(),
+        field_optional_string(owner_user_id),
+    );
     fields.insert("sync_profile".to_string(), field_string(sync_profile));
     record_core_capture_tx(
         &tx,
@@ -5145,7 +5137,7 @@ pub fn upsert_sync_node_identity(
         node_id,
         crate::sync::runtime::SqlWriteAction::Insert,
         fields,
-        owner_user_id,
+        owner_user_id.map(|id| id.to_string()),
     )?;
     bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
     tx.commit()?;
@@ -5182,7 +5174,7 @@ pub fn touch_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<()> {
 pub fn upsert_user_identity_key(
     pool: &DbPool,
     key_id: &str,
-    user_id: i64,
+    user_id: &str,
     key_type: &str,
     public_key: &str,
     purpose: &str,
@@ -5202,26 +5194,32 @@ pub fn upsert_user_identity_key(
         rusqlite::params![key_id, user_id, key_type, public_key, purpose],
     )?;
     let mut fields = BTreeMap::new();
-    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("user_id".to_string(), field_string(user_id));
     fields.insert("key_type".to_string(), field_string(key_type));
     fields.insert("public_key".to_string(), field_string(public_key));
     fields.insert("purpose".to_string(), field_string(purpose));
     fields.insert("status".to_string(), field_string("active"));
-    fields.insert("revoked_at".to_string(), crate::sync::ledger::FieldValue::Null);
+    fields.insert(
+        "revoked_at".to_string(),
+        crate::sync::ledger::FieldValue::Null,
+    );
     record_core_capture_tx(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::UserIdentityKey,
         key_id,
         crate::sync::runtime::SqlWriteAction::Insert,
         fields,
-        Some(user_id),
+        Some(user_id.to_string()),
     )?;
     tx.commit()?;
     Ok(())
 }
 
 /// Pobiera aktywne klucze kryptograficzne uzytkownika.
-pub fn list_active_user_identity_keys(pool: &DbPool, user_id: i64) -> Result<Vec<UserIdentityKey>> {
+pub fn list_active_user_identity_keys(
+    pool: &DbPool,
+    user_id: &str,
+) -> Result<Vec<UserIdentityKey>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT key_id, user_id, key_type, public_key, purpose, status, created_at, revoked_at \
@@ -5267,9 +5265,9 @@ pub fn revoke_user_identity_key(pool: &DbPool, key_id: &str) -> Result<()> {
 pub fn assign_node_to_user(
     pool: &DbPool,
     node_id: &str,
-    user_id: i64,
+    user_id: &str,
     assignment_mode: &str,
-    created_by: Option<i64>,
+    created_by: Option<&str>,
 ) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
@@ -5284,16 +5282,16 @@ pub fn assign_node_to_user(
     )?;
     let mut fields = BTreeMap::new();
     fields.insert("node_id".to_string(), field_string(node_id));
-    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("user_id".to_string(), field_string(user_id));
     fields.insert("assignment_mode".to_string(), field_string(assignment_mode));
-    fields.insert("created_by".to_string(), field_optional_i64(created_by));
+    fields.insert("created_by".to_string(), field_optional_string(created_by));
     record_core_capture_tx(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::NodeUserAssignment,
         node_user_assignment_core_id(node_id, user_id, assignment_mode),
         crate::sync::runtime::SqlWriteAction::Insert,
         fields,
-        created_by,
+        created_by.map(|id| id.to_string()),
     )?;
     bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
     tx.commit()?;
@@ -5304,7 +5302,7 @@ pub fn assign_node_to_user(
 pub fn revoke_node_user_assignment(
     pool: &DbPool,
     node_id: &str,
-    user_id: i64,
+    user_id: &str,
     assignment_mode: &str,
 ) -> Result<()> {
     let mut conn = acquire(pool)?;
@@ -5317,7 +5315,7 @@ pub fn revoke_node_user_assignment(
     )?;
     let mut fields = BTreeMap::new();
     fields.insert("node_id".to_string(), field_string(node_id));
-    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("user_id".to_string(), field_string(user_id));
     fields.insert("assignment_mode".to_string(), field_string(assignment_mode));
     fields.insert(
         "valid_until".to_string(),
@@ -5355,7 +5353,7 @@ pub fn list_active_node_user_assignments(
 }
 
 /// Lista node/device aktywnie przypisanych do uzytkownika.
-pub fn list_sync_nodes_for_user(pool: &DbPool, user_id: i64) -> Result<Vec<SyncNodeIdentity>> {
+pub fn list_sync_nodes_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<SyncNodeIdentity>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT n.node_id, n.public_key, n.public_key_type, n.display_name, n.node_kind, \
@@ -5396,9 +5394,9 @@ fn row_to_sync_resource_acl(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncRes
 pub fn upsert_sync_user_org_profile(
     pool: &DbPool,
     org_id: &str,
-    user_id: i64,
+    user_id: &str,
     department_id: Option<&str>,
-    manager_user_id: Option<i64>,
+    manager_user_id: Option<&str>,
     is_department_manager: bool,
 ) -> Result<()> {
     let mut conn = acquire(pool)?;
@@ -5421,14 +5419,14 @@ pub fn upsert_sync_user_org_profile(
     )?;
     let mut fields = BTreeMap::new();
     fields.insert("org_id".to_string(), field_string(org_id));
-    fields.insert("user_id".to_string(), crate::sync::ledger::FieldValue::I64(user_id));
+    fields.insert("user_id".to_string(), field_string(user_id));
     fields.insert(
         "department_id".to_string(),
         field_optional_string(department_id),
     );
     fields.insert(
         "manager_user_id".to_string(),
-        field_optional_i64(manager_user_id),
+        field_optional_string(manager_user_id),
     );
     fields.insert(
         "is_department_manager".to_string(),
@@ -5441,7 +5439,7 @@ pub fn upsert_sync_user_org_profile(
         sync_user_org_profile_core_id(org_id, user_id),
         crate::sync::runtime::SqlWriteAction::Insert,
         fields,
-        Some(user_id),
+        Some(user_id.to_string()),
     )?;
     bump_sync_permission_epoch_with_conn(&tx, org_id)?;
     tx.commit()?;
@@ -5455,10 +5453,10 @@ pub fn upsert_sync_resource_acl(
     addon_id: &str,
     resource_type: &str,
     resource_id: &str,
-    owner_user_id: Option<i64>,
-    assigned_user_id: Option<i64>,
+    owner_user_id: Option<&str>,
+    assigned_user_id: Option<&str>,
     department_id: Option<&str>,
-    manager_user_id: Option<i64>,
+    manager_user_id: Option<&str>,
     visibility_scope: &str,
 ) -> Result<()> {
     let mut conn = acquire(pool)?;
@@ -5490,10 +5488,13 @@ pub fn upsert_sync_resource_acl(
     fields.insert("addon_id".to_string(), field_string(addon_id));
     fields.insert("resource_type".to_string(), field_string(resource_type));
     fields.insert("resource_id".to_string(), field_string(resource_id));
-    fields.insert("owner_user_id".to_string(), field_optional_i64(owner_user_id));
+    fields.insert(
+        "owner_user_id".to_string(),
+        field_optional_string(owner_user_id),
+    );
     fields.insert(
         "assigned_user_id".to_string(),
-        field_optional_i64(assigned_user_id),
+        field_optional_string(assigned_user_id),
     );
     fields.insert(
         "department_id".to_string(),
@@ -5501,9 +5502,12 @@ pub fn upsert_sync_resource_acl(
     );
     fields.insert(
         "manager_user_id".to_string(),
-        field_optional_i64(manager_user_id),
+        field_optional_string(manager_user_id),
     );
-    fields.insert("visibility_scope".to_string(), field_string(visibility_scope));
+    fields.insert(
+        "visibility_scope".to_string(),
+        field_string(visibility_scope),
+    );
     record_core_capture_for_org_tx(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::SyncResourceAcl,
@@ -5586,7 +5590,7 @@ pub fn grant_sync_explicit_share(
     subject_type: &str,
     subject_id: &str,
     action: &str,
-    granted_by: Option<i64>,
+    granted_by: Option<&str>,
 ) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
@@ -5617,7 +5621,7 @@ pub fn grant_sync_explicit_share(
     fields.insert("subject_type".to_string(), field_string(subject_type));
     fields.insert("subject_id".to_string(), field_string(subject_id));
     fields.insert("action".to_string(), field_string(action));
-    fields.insert("granted_by".to_string(), field_optional_i64(granted_by));
+    fields.insert("granted_by".to_string(), field_optional_string(granted_by));
     record_core_capture_for_org_tx(
         &tx,
         crate::sync::core_registry::CoreSyncResourceKind::SyncExplicitShare,
@@ -5633,7 +5637,7 @@ pub fn grant_sync_explicit_share(
         ),
         crate::sync::runtime::SqlWriteAction::Insert,
         fields,
-        granted_by,
+        granted_by.map(|id| id.to_string()),
     )?;
     bump_sync_permission_epoch_with_conn(&tx, org_id)?;
     tx.commit()?;
@@ -5705,7 +5709,7 @@ pub fn revoke_sync_explicit_share(
 /// Sprawdza effective access usera do zasobu.
 pub fn can_user_access_sync_resource(
     pool: &DbPool,
-    user_id: i64,
+    user_id: &str,
     org_id: &str,
     addon_id: &str,
     resource_type: &str,
@@ -5726,7 +5730,7 @@ pub fn can_user_access_sync_resource(
 
 fn can_user_access_sync_resource_with_conn(
     conn: &rusqlite::Connection,
-    user_id: i64,
+    user_id: &str,
     org_id: &str,
     addon_id: &str,
     resource_type: &str,
@@ -5744,7 +5748,7 @@ fn can_user_access_sync_resource_with_conn(
         resource_type,
         resource_id,
         "user",
-        &user_id.to_string(),
+        user_id,
         action,
     )? {
         return Ok(allow("explicit_share"));
@@ -5755,13 +5759,13 @@ fn can_user_access_sync_resource_with_conn(
         return Ok(deny("resource_acl_missing"));
     };
 
-    if acl.owner_user_id == Some(user_id) {
+    if acl.owner_user_id.as_deref() == Some(user_id) {
         return Ok(allow("owner"));
     }
-    if acl.assigned_user_id == Some(user_id) {
+    if acl.assigned_user_id.as_deref() == Some(user_id) {
         return Ok(allow("assigned"));
     }
-    if acl.manager_user_id == Some(user_id) {
+    if acl.manager_user_id.as_deref() == Some(user_id) {
         return Ok(allow("manager"));
     }
     if acl.visibility_scope == "all" {
@@ -5773,7 +5777,7 @@ fn can_user_access_sync_resource_with_conn(
         return Ok(allow("department"));
     }
     if acl.visibility_scope == "manager_subtree"
-        && user_manages_subject_with_conn(conn, org_id, user_id, acl.assigned_user_id)?
+        && user_manages_subject_with_conn(conn, org_id, user_id, acl.assigned_user_id.as_deref())?
     {
         return Ok(allow("manager_subtree"));
     }
@@ -5882,14 +5886,14 @@ fn can_node_receive_sync_resource_with_conn(
          WHERE node_id = ?1 AND valid_until IS NULL",
     )?;
     let user_ids = stmt
-        .query_map(rusqlite::params![node_id], |row| row.get::<_, i64>(0))?
+        .query_map(rusqlite::params![node_id], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
 
     for user_id in user_ids {
         let decision = can_user_access_sync_resource_with_conn(
             conn,
-            user_id,
+            &user_id,
             org_id,
             addon_id,
             resource_type,
@@ -5953,7 +5957,7 @@ fn load_sync_node_identity_with_conn(
 
 fn is_user_org_admin_with_conn(
     conn: &rusqlite::Connection,
-    user_id: i64,
+    user_id: &str,
     org_id: &str,
 ) -> Result<bool> {
     let is_admin = conn
@@ -5971,7 +5975,7 @@ fn is_user_org_admin_with_conn(
         "SELECT COUNT(*) \
          FROM org_memberships \
          WHERE org_id = ?1 AND user_id = ?2 AND role_id = 'role-org-admin'",
-        rusqlite::params![org_id, user_id.to_string()],
+        rusqlite::params![org_id, user_id],
         |row| row.get(0),
     )?;
     Ok(count > 0)
@@ -6008,7 +6012,7 @@ fn has_explicit_share_with_conn(
 fn user_in_department_with_conn(
     conn: &rusqlite::Connection,
     org_id: &str,
-    user_id: i64,
+    user_id: &str,
     department_id: Option<&str>,
 ) -> Result<bool> {
     let Some(department_id) = department_id else {
@@ -6026,8 +6030,8 @@ fn user_in_department_with_conn(
 fn user_manages_subject_with_conn(
     conn: &rusqlite::Connection,
     org_id: &str,
-    manager_user_id: i64,
-    subject_user_id: Option<i64>,
+    manager_user_id: &str,
+    subject_user_id: Option<&str>,
 ) -> Result<bool> {
     let Some(subject_user_id) = subject_user_id else {
         return Ok(false);
@@ -6195,13 +6199,15 @@ pub fn list_sync_targets_for_resource(
                 Ok(Vec::new())
             }
         }
-        SyncPolicyMode::ReplicatedByPermission | SyncPolicyMode::Sharded => list_permission_filtered_sync_targets_with_conn(
-            &conn,
-            org_id,
-            addon_id,
-            resource_type,
-            resource_id,
-        ),
+        SyncPolicyMode::ReplicatedByPermission | SyncPolicyMode::Sharded => {
+            list_permission_filtered_sync_targets_with_conn(
+                &conn,
+                org_id,
+                addon_id,
+                resource_type,
+                resource_id,
+            )
+        }
     }
 }
 
@@ -6882,7 +6888,7 @@ pub mod transcripts {
         pub novnc_port: Option<i64>,
         pub bot_endpoint_id: Option<String>,
         pub platform: Option<String>,
-        pub owner_user_id: Option<i64>,
+        pub owner_user_id: Option<String>,
         pub lifecycle_stage: Option<String>,
         pub lifecycle_details: Option<String>,
         pub lifecycle_updated_at: Option<String>,
@@ -7029,12 +7035,15 @@ pub mod transcripts {
         }
     }
 
-    pub fn owner_of_meeting_key(pool: &DbPool, meeting_key: &str) -> Result<Option<Option<i64>>> {
+    pub fn owner_of_meeting_key(
+        pool: &DbPool,
+        meeting_key: &str,
+    ) -> Result<Option<Option<String>>> {
         let conn = pool.lock().unwrap();
-        let row: rusqlite::Result<Option<i64>> = conn.query_row(
+        let row: rusqlite::Result<Option<String>> = conn.query_row(
             "SELECT owner_user_id FROM meeting_sessions WHERE meeting_key = ?1",
             rusqlite::params![meeting_key],
-            |r| r.get::<_, Option<i64>>(0),
+            |r| r.get::<_, Option<String>>(0),
         );
         match row {
             Ok(opt) => Ok(Some(opt)),
@@ -7044,7 +7053,7 @@ pub mod transcripts {
     }
 
     /// Lista sesji posortowana po last_activity_at malejaco. Opcjonalny filtr po owner_user_id.
-    pub fn list_sessions(pool: &DbPool, owner_user_id: Option<i64>) -> Result<Vec<SessionRow>> {
+    pub fn list_sessions(pool: &DbPool, owner_user_id: Option<&str>) -> Result<Vec<SessionRow>> {
         let conn = pool.lock().unwrap();
         let sql_all = format!(
             "SELECT {} FROM meeting_sessions s ORDER BY s.last_activity_at DESC",
@@ -7073,7 +7082,7 @@ pub mod transcripts {
     /// Uzywane przez frontend do odnowienia UI po refresh (jesli bot wciaz lata).
     pub fn active_session_for_user(
         pool: &DbPool,
-        owner_user_id: i64,
+        owner_user_id: &str,
     ) -> Result<Option<SessionRow>> {
         let conn = pool.lock().unwrap();
         let sql = format!(
@@ -7145,7 +7154,7 @@ pub mod transcripts {
         bot_endpoint_id: &str,
         bot_secret_key_hex: &str,
         platform: &str,
-        owner_user_id: Option<i64>,
+        owner_user_id: Option<&str>,
     ) -> Result<()> {
         let conn = pool.lock().unwrap();
         conn.execute(
@@ -7182,7 +7191,7 @@ pub mod transcripts {
         bot_endpoint_id: &str,
         bot_secret_key_hex: &str,
         platform: &str,
-        owner_user_id: Option<i64>,
+        owner_user_id: Option<&str>,
     ) -> Result<()> {
         let conn = pool.lock().unwrap();
         conn.execute(
@@ -7358,7 +7367,7 @@ pub mod transcripts {
     // Per-user settings
     // =========================================================================
 
-    pub fn get_user_setting(pool: &DbPool, user_id: i64, key: &str) -> Result<Option<String>> {
+    pub fn get_user_setting(pool: &DbPool, user_id: &str, key: &str) -> Result<Option<String>> {
         let conn = pool.lock().unwrap();
         let val = conn
             .query_row(
@@ -7370,7 +7379,7 @@ pub mod transcripts {
         Ok(val)
     }
 
-    pub fn list_user_settings(pool: &DbPool, user_id: i64) -> Result<Vec<(String, String)>> {
+    pub fn list_user_settings(pool: &DbPool, user_id: &str) -> Result<Vec<(String, String)>> {
         let conn = pool.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT key, value FROM meeting_settings WHERE user_id = ?1 ORDER BY key ASC",
@@ -7381,7 +7390,7 @@ pub mod transcripts {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn set_user_setting(pool: &DbPool, user_id: i64, key: &str, value: &str) -> Result<()> {
+    pub fn set_user_setting(pool: &DbPool, user_id: &str, key: &str, value: &str) -> Result<()> {
         let conn = pool.lock().unwrap();
         conn.execute(
             "INSERT INTO meeting_settings (user_id, key, value, updated_at)
@@ -7552,7 +7561,7 @@ pub mod transcripts {
 pub struct DbAddonPermissionRow {
     pub addon_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub permission_id: String,
     pub grant_mode: String,
     pub updated_at: String,
@@ -7569,7 +7578,7 @@ pub struct DbAddonPermissionDefault {
 /// Wiersz widocznosci addonu per grupa.
 pub struct DbAddonVisibilityRow {
     pub addon_id: String,
-    pub group_id: i64,
+    pub group_id: String,
     pub group_name: String,
     pub visible: bool,
     /// Opis grupy z `user_groups.description` (linia meta w UI).
@@ -7628,7 +7637,7 @@ pub fn validate_oauth_mode(mode: &str) -> Result<()> {
 /// Konto OAuth uzytkownika.
 pub struct DbUserOAuthAccount {
     pub id: i64,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: String,
     pub provider_id: String,
     pub external_account_id: String,
@@ -7647,7 +7656,7 @@ pub struct DbUserOAuthAccount {
 /// Pending state (anti-CSRF).
 pub struct DbOAuthPendingState {
     pub state: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: String,
     pub provider_id: String,
     pub mode: String,
@@ -7687,9 +7696,9 @@ pub fn list_addon_visibility(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddo
 pub fn set_addon_visibility(
     pool: &DbPool,
     addon_id: &str,
-    group_id: i64,
+    group_id: &str,
     visible: bool,
-    updated_by: Option<i64>,
+    updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
@@ -7704,7 +7713,7 @@ pub fn set_addon_visibility(
 }
 
 /// Zwraca aktualna wartosc widocznosci (visible) dla (addon, group) lub None gdy brak wpisu.
-pub fn get_addon_visibility(pool: &DbPool, addon_id: &str, group_id: i64) -> Result<Option<bool>> {
+pub fn get_addon_visibility(pool: &DbPool, addon_id: &str, group_id: &str) -> Result<Option<bool>> {
     let conn = acquire(pool)?;
     let v: Option<i64> = conn
         .query_row(
@@ -7717,7 +7726,7 @@ pub fn get_addon_visibility(pool: &DbPool, addon_id: &str, group_id: i64) -> Res
 }
 
 /// Zwraca nazwe grupy po id (lub None).
-pub fn get_group_name_by_id(pool: &DbPool, group_id: i64) -> Result<Option<String>> {
+pub fn get_group_name_by_id(pool: &DbPool, group_id: &str) -> Result<Option<String>> {
     let conn = acquire(pool)?;
     let name: Option<String> = conn
         .query_row(
@@ -7730,9 +7739,9 @@ pub fn get_group_name_by_id(pool: &DbPool, group_id: i64) -> Result<Option<Strin
 }
 
 /// Zwraca id grupy po nazwie (lub None jesli nie istnieje).
-pub fn get_group_id_by_name(pool: &DbPool, name: &str) -> Result<Option<i64>> {
+pub fn get_group_id_by_name(pool: &DbPool, name: &str) -> Result<Option<String>> {
     let conn = acquire(pool)?;
-    let id: Option<i64> = conn
+    let id: Option<String> = conn
         .query_row(
             "SELECT id FROM user_groups WHERE name = ?1",
             rusqlite::params![name],
@@ -7918,7 +7927,7 @@ pub fn compute_addon_oauth_mode(pool: &DbPool, addon_id: &str) -> Result<Option<
 /// Czy addon jest widoczny dla uzytkownika: `admin_only=1` ⇒ tylko admini; inaczej
 /// wystarczy dowolna grupa usera z `visible=1`. Gdy nikt nie skonfigurowal widocznosci —
 /// default = widoczny dla wszystkich.
-pub fn is_addon_visible_to_user(pool: &DbPool, addon_id: &str, user_id: i64) -> Result<bool> {
+pub fn is_addon_visible_to_user(pool: &DbPool, addon_id: &str, user_id: &str) -> Result<bool> {
     let conn = acquire(pool)?;
     let admin_only: i64 = conn
         .query_row(
@@ -8187,10 +8196,10 @@ pub fn upsert_permission(
     pool: &DbPool,
     addon_id: &str,
     subject_type: &str,
-    subject_id: i64,
+    subject_id: &str,
     permission_id: &str,
     grant_mode: &str,
-    updated_by: Option<i64>,
+    updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     let granted = matches!(grant_mode, "allow") as i64;
@@ -8213,7 +8222,7 @@ pub fn get_permission_grant_mode(
     pool: &DbPool,
     addon_id: &str,
     subject_type: &str,
-    subject_id: i64,
+    subject_id: &str,
     permission_id: &str,
 ) -> Result<Option<String>> {
     let conn = acquire(pool)?;
@@ -8233,7 +8242,7 @@ pub fn upsert_permission_default(
     addon_id: &str,
     permission_id: &str,
     grant_mode: &str,
-    updated_by: Option<i64>,
+    updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
@@ -8292,7 +8301,7 @@ pub fn get_permission_catalog_risk(
 #[allow(clippy::too_many_arguments)]
 pub fn log_audit_full(
     pool: &DbPool,
-    user_id: Option<i64>,
+    user_id: Option<&str>,
     addon_id: Option<&str>,
     action: &str,
     resource_type: Option<&str>,
@@ -8339,7 +8348,7 @@ pub fn log_audit_full(
 }
 
 /// Pobiera email uzytkownika po id (do wzbogacenia wpisow audytowych o target_user_email).
-pub fn get_user_email_by_id(pool: &DbPool, user_id: i64) -> Result<Option<String>> {
+pub fn get_user_email_by_id(pool: &DbPool, user_id: &str) -> Result<Option<String>> {
     let conn = acquire(pool)?;
     let v: Option<String> = conn
         .query_row(
@@ -8357,7 +8366,7 @@ pub fn resolve_permission(
     pool: &DbPool,
     addon_id: &str,
     permission_id: &str,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<(bool, String)> {
     let conn = acquire(pool)?;
     // 1. admin_only
@@ -8558,7 +8567,7 @@ pub fn upsert_oauth_config(
     client_secret_encrypted: Option<&[u8]>,
     redirect_uri: &str,
     enabled: bool,
-    updated_by: Option<i64>,
+    updated_by: Option<&str>,
     oauth_mode: &str,
 ) -> Result<()> {
     validate_oauth_mode(oauth_mode)?;
@@ -8691,7 +8700,7 @@ pub fn update_user_oauth_token_blobs(
 pub fn insert_oauth_state(
     pool: &DbPool,
     state: &str,
-    user_id: Option<i64>,
+    user_id: Option<&str>,
     addon_id: &str,
     provider_id: &str,
     mode: &str,
@@ -8768,7 +8777,7 @@ pub fn purge_expired_oauth_states(pool: &DbPool) -> Result<usize> {
 
 pub fn upsert_user_oauth_account(
     pool: &DbPool,
-    user_id: Option<i64>,
+    user_id: Option<&str>,
     addon_id: &str,
     provider_id: &str,
     external_account_id: &str,
@@ -8881,7 +8890,7 @@ const OAUTH_ACCOUNT_COLS: &str =
 
 pub fn list_user_oauth_accounts_for_user(
     pool: &DbPool,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<Vec<DbUserOAuthAccount>> {
     let conn = acquire(pool)?;
     let sql = format!(
@@ -8971,7 +8980,7 @@ pub struct MyOAuthEntryRow {
 /// - odpowiadaja addonom zainstalowanym i wlaczonym,
 /// - sa widoczne dla uzytkownika wg `is_addon_visible_to_user`.
 /// Dla kazdej pary LEFT JOIN do `user_oauth_accounts` (user_id) wyznacza status.
-pub fn list_my_oauth_entries(pool: &DbPool, user_id: i64) -> Result<Vec<MyOAuthEntryRow>> {
+pub fn list_my_oauth_entries(pool: &DbPool, user_id: &str) -> Result<Vec<MyOAuthEntryRow>> {
     let conn = acquire(pool)?;
     let sql = "
         SELECT
@@ -9214,7 +9223,7 @@ pub fn upsert_addon_config_value(
     key: &str,
     value: &str,
     is_secret: bool,
-    updated_by: Option<i64>,
+    updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
@@ -9238,7 +9247,7 @@ pub struct AddonAuditRow {
     pub severity: String,
     pub action: String,
     pub details: Option<String>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub username: Option<String>,
 }
 
@@ -9396,7 +9405,7 @@ pub fn set_addon_network_rule_approvals(
     addon_id: &str,
     allowed_hosts: &[String],
     blocked_hosts: &[String],
-    updated_by: Option<i64>,
+    updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
@@ -9424,7 +9433,7 @@ pub fn set_addon_network_config(
     pool: &DbPool,
     addon_id: &str,
     cfg: &AddonNetworkConfig,
-    updated_by: Option<i64>,
+    updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     let allowed = serde_json::to_string(&cfg.allowed_hosts).unwrap_or_else(|_| "[]".into());
@@ -9448,7 +9457,7 @@ pub fn set_addon_network_config(
 /// Single note row from `notes` table. Epoch times converted from SQLite datetime strings.
 pub struct Note {
     pub id: i64,
-    pub user_id: i64,
+    pub user_id: String,
     pub title: String,
     pub body: String,
     pub pinned: bool,
@@ -9480,7 +9489,7 @@ fn parse_sqlite_datetime_epoch(s: &str) -> i64 {
 
 const NOTE_COLS: &str = "id, user_id, title, body, pinned, created_at, updated_at";
 
-pub fn list_notes_for_user(pool: &DbPool, user_id: i64) -> Result<Vec<Note>> {
+pub fn list_notes_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<Note>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM notes WHERE user_id = ?1 ORDER BY pinned DESC, updated_at DESC",
@@ -9492,7 +9501,7 @@ pub fn list_notes_for_user(pool: &DbPool, user_id: i64) -> Result<Vec<Note>> {
     Ok(rows)
 }
 
-pub fn get_note(pool: &DbPool, note_id: i64, user_id: i64) -> Result<Option<Note>> {
+pub fn get_note(pool: &DbPool, note_id: i64, user_id: &str) -> Result<Option<Note>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM notes WHERE id = ?1 AND user_id = ?2",
@@ -9504,7 +9513,7 @@ pub fn get_note(pool: &DbPool, note_id: i64, user_id: i64) -> Result<Option<Note
     Ok(result)
 }
 
-pub fn create_note(pool: &DbPool, user_id: i64, title: &str, body: &str) -> Result<i64> {
+pub fn create_note(pool: &DbPool, user_id: &str, title: &str, body: &str) -> Result<i64> {
     let conn = acquire(pool)?;
     conn.execute(
         "INSERT INTO notes (user_id, title, body) VALUES (?1, ?2, ?3)",
@@ -9516,7 +9525,7 @@ pub fn create_note(pool: &DbPool, user_id: i64, title: &str, body: &str) -> Resu
 pub fn update_note(
     pool: &DbPool,
     note_id: i64,
-    user_id: i64,
+    user_id: &str,
     title: &str,
     body: &str,
 ) -> Result<()> {
@@ -9535,7 +9544,7 @@ pub fn update_note(
     Ok(())
 }
 
-pub fn set_note_pinned(pool: &DbPool, note_id: i64, user_id: i64, pinned: bool) -> Result<()> {
+pub fn set_note_pinned(pool: &DbPool, note_id: i64, user_id: &str, pinned: bool) -> Result<()> {
     let conn = acquire(pool)?;
     let affected = conn.execute(
         "UPDATE notes SET pinned = ?3, updated_at = datetime('now') \
@@ -9551,7 +9560,7 @@ pub fn set_note_pinned(pool: &DbPool, note_id: i64, user_id: i64, pinned: bool) 
     Ok(())
 }
 
-pub fn delete_note(pool: &DbPool, note_id: i64, user_id: i64) -> Result<()> {
+pub fn delete_note(pool: &DbPool, note_id: i64, user_id: &str) -> Result<()> {
     let conn = acquire(pool)?;
     let affected = conn.execute(
         "DELETE FROM notes WHERE id = ?1 AND user_id = ?2",
@@ -9654,7 +9663,7 @@ mod alias_resolve_tests {
     fn resolve_alias_no_fallbacks() {
         // Arrange
         let db = create_test_db();
-        create_model_alias_unchecked(&db, "simple", "jedyny-model", None, Some("least_loaded"))
+        create_model_alias_unchecked(&db, "simple", "jedyny-model", None, Some("round_robin"))
             .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
@@ -9664,7 +9673,7 @@ mod alias_resolve_tests {
 
         // Assert
         assert!(result.fallback_targets.is_none());
-        assert_eq!(result.strategy.as_deref(), Some("least_loaded"));
+        assert_eq!(result.strategy.as_deref(), Some("round_robin"));
     }
 
     #[test]
@@ -10375,8 +10384,8 @@ mod permission_and_oauth_tests {
             .expect("register_addon failed");
     }
 
-    /// Tworzy uzytkownika i zwraca jego id.
-    fn create_user(db: &DbPool, username: &str) -> i64 {
+    /// Tworzy uzytkownika i zwraca jego id (UUID).
+    fn create_user(db: &DbPool, username: &str) -> String {
         create_user_account(
             db,
             username,
@@ -10385,6 +10394,13 @@ mod permission_and_oauth_tests {
             &format!("{}@x.pl", username),
         )
         .expect("create_user_account failed")
+    }
+
+    /// Zwraca UUID grupy 'admins' zaseedowanej przy inicjalizacji DB.
+    fn admins_group_id(db: &DbPool) -> String {
+        get_group_id_by_name(db, "admins")
+            .expect("admins group lookup")
+            .expect("admins group exists")
     }
 
     // -------- Widocznosc addonu --------
@@ -10397,7 +10413,7 @@ mod permission_and_oauth_tests {
         let group_id = create_group(&db, "testerzy", "grupa testowa").unwrap();
 
         // Act
-        set_addon_visibility(&db, "addon-vis", group_id, true, None).unwrap();
+        set_addon_visibility(&db, "addon-vis", &group_id, true, None).unwrap();
         let rows = list_addon_visibility(&db, "addon-vis").unwrap();
 
         // Assert
@@ -10408,7 +10424,7 @@ mod permission_and_oauth_tests {
         assert!(entry.visible, "visible powinno byc true");
 
         // Toggle off
-        set_addon_visibility(&db, "addon-vis", group_id, false, None).unwrap();
+        set_addon_visibility(&db, "addon-vis", &group_id, false, None).unwrap();
         let rows = list_addon_visibility(&db, "addon-vis").unwrap();
         let entry = rows.iter().find(|r| r.group_id == group_id).unwrap();
         assert!(!entry.visible, "po toggle visible=false");
@@ -10421,8 +10437,9 @@ mod permission_and_oauth_tests {
         register_test_addon(&db, "secret-addon");
         let admin_id = create_user(&db, "adminuser");
         let regular_id = create_user(&db, "jankowalski");
-        // Admin do grupy 'admins' (id=1 z seedow)
-        add_user_to_group(&db, 1, admin_id).unwrap();
+        // Admin do grupy 'admins' (UUID z seedow)
+        let admins = admins_group_id(&db);
+        add_user_to_group(&db, &admins, &admin_id).unwrap();
 
         // Act
         set_addon_admin_only(&db, "secret-addon", true).unwrap();
@@ -10430,11 +10447,11 @@ mod permission_and_oauth_tests {
         // Assert
         assert!(get_addon_admin_only(&db, "secret-addon").unwrap());
         assert!(
-            is_addon_visible_to_user(&db, "secret-addon", admin_id).unwrap(),
+            is_addon_visible_to_user(&db, "secret-addon", &admin_id).unwrap(),
             "admin powinien widziec addon"
         );
         assert!(
-            !is_addon_visible_to_user(&db, "secret-addon", regular_id).unwrap(),
+            !is_addon_visible_to_user(&db, "secret-addon", &regular_id).unwrap(),
             "zwykly user NIE powinien widziec admin-only addonu"
         );
     }
@@ -10446,17 +10463,17 @@ mod permission_and_oauth_tests {
         register_test_addon(&db, "grp-addon");
         let user_id = create_user(&db, "anna");
         let group_id = create_group(&db, "marketing", "").unwrap();
-        set_addon_visibility(&db, "grp-addon", group_id, true, None).unwrap();
+        set_addon_visibility(&db, "grp-addon", &group_id, true, None).unwrap();
 
         // Przed dodaniem do grupy — user nie widzi (skoro sa reguly i zadna mu nie pasuje)
-        assert!(!is_addon_visible_to_user(&db, "grp-addon", user_id).unwrap());
+        assert!(!is_addon_visible_to_user(&db, "grp-addon", &user_id).unwrap());
 
         // Act — dodanie do grupy z visibility=1
-        add_user_to_group(&db, group_id, user_id).unwrap();
+        add_user_to_group(&db, &group_id, &user_id).unwrap();
 
         // Assert
         assert!(
-            is_addon_visible_to_user(&db, "grp-addon", user_id).unwrap(),
+            is_addon_visible_to_user(&db, "grp-addon", &user_id).unwrap(),
             "user w grupie z visible=1 powinien widziec addon"
         );
     }
@@ -10502,8 +10519,8 @@ mod permission_and_oauth_tests {
         register_test_addon(&db, "badge3");
         let g1 = create_group(&db, "g1", "").unwrap();
         let g2 = create_group(&db, "g2", "").unwrap();
-        set_addon_visibility(&db, "badge3", g1, true, None).unwrap();
-        set_addon_visibility(&db, "badge3", g2, true, None).unwrap();
+        set_addon_visibility(&db, "badge3", &g1, true, None).unwrap();
+        set_addon_visibility(&db, "badge3", &g2, true, None).unwrap();
         let b = get_addon_badges(&db, "badge3").unwrap();
         assert_eq!(b.visibility_scope, "2_groups");
     }
@@ -10557,13 +10574,13 @@ mod permission_and_oauth_tests {
         register_test_addon(&db, "a1");
         let user_id = create_user(&db, "u1");
         let group_id = create_group(&db, "g1", "").unwrap();
-        add_user_to_group(&db, group_id, user_id).unwrap();
+        add_user_to_group(&db, &group_id, &user_id).unwrap();
 
-        upsert_permission(&db, "a1", "group", group_id, "perm.x", "allow", None).unwrap();
-        upsert_permission(&db, "a1", "user", user_id, "perm.x", "deny", None).unwrap();
+        upsert_permission(&db, "a1", "group", &group_id, "perm.x", "allow", None).unwrap();
+        upsert_permission(&db, "a1", "user", &user_id, "perm.x", "deny", None).unwrap();
 
         // Act
-        let (allowed, reason) = resolve_permission(&db, "a1", "perm.x", user_id).unwrap();
+        let (allowed, reason) = resolve_permission(&db, "a1", "perm.x", &user_id).unwrap();
 
         // Assert
         assert!(!allowed, "user deny ma pierwszenstwo nad group allow");
@@ -10577,13 +10594,13 @@ mod permission_and_oauth_tests {
         register_test_addon(&db, "a2");
         let user_id = create_user(&db, "u2");
         let group_id = create_group(&db, "g2", "").unwrap();
-        add_user_to_group(&db, group_id, user_id).unwrap();
+        add_user_to_group(&db, &group_id, &user_id).unwrap();
 
-        upsert_permission(&db, "a2", "group", group_id, "perm.y", "allow", None).unwrap();
+        upsert_permission(&db, "a2", "group", &group_id, "perm.y", "allow", None).unwrap();
         upsert_permission_default(&db, "a2", "perm.y", "deny", None).unwrap();
 
         // Act
-        let (allowed, reason) = resolve_permission(&db, "a2", "perm.y", user_id).unwrap();
+        let (allowed, reason) = resolve_permission(&db, "a2", "perm.y", &user_id).unwrap();
 
         // Assert
         assert!(allowed);
@@ -10600,7 +10617,7 @@ mod permission_and_oauth_tests {
         upsert_permission_default(&db, "a3", "perm.z", "allow", None).unwrap();
 
         // Act
-        let (allowed, reason) = resolve_permission(&db, "a3", "perm.z", user_id).unwrap();
+        let (allowed, reason) = resolve_permission(&db, "a3", "perm.z", &user_id).unwrap();
 
         // Assert
         assert!(allowed);
@@ -10615,7 +10632,7 @@ mod permission_and_oauth_tests {
         let user_id = create_user(&db, "u4");
 
         // Act
-        let (allowed, reason) = resolve_permission(&db, "a4", "perm.nope", user_id).unwrap();
+        let (allowed, reason) = resolve_permission(&db, "a4", "perm.nope", &user_id).unwrap();
 
         // Assert
         assert!(!allowed);
@@ -10629,18 +10646,19 @@ mod permission_and_oauth_tests {
         register_test_addon(&db, "a5");
         let admin_id = create_user(&db, "adm");
         let user_id = create_user(&db, "reg");
-        add_user_to_group(&db, 1, admin_id).unwrap();
+        let admins = admins_group_id(&db);
+        add_user_to_group(&db, &admins, &admin_id).unwrap();
 
         set_addon_admin_only(&db, "a5", true).unwrap();
 
         // Act + Assert
         let (admin_allowed, admin_reason) =
-            resolve_permission(&db, "a5", "perm.any", admin_id).unwrap();
+            resolve_permission(&db, "a5", "perm.any", &admin_id).unwrap();
         assert!(admin_allowed);
         assert_eq!(admin_reason, "admin_only");
 
         let (user_allowed, user_reason) =
-            resolve_permission(&db, "a5", "perm.any", user_id).unwrap();
+            resolve_permission(&db, "a5", "perm.any", &user_id).unwrap();
         assert!(!user_allowed);
         assert_eq!(user_reason, "admin_only");
     }
@@ -10735,7 +10753,7 @@ mod permission_and_oauth_tests {
         insert_oauth_state(
             &db,
             "state-token-1",
-            Some(user_id),
+            Some(user_id.as_str()),
             "a-state",
             "microsoft",
             "individual",
@@ -10849,7 +10867,7 @@ mod permission_and_oauth_tests {
         // Act — pierwszy insert
         let id1 = upsert_user_oauth_account(
             &db,
-            Some(user_id),
+            Some(user_id.as_str()),
             "a-acc",
             "microsoft",
             "ext-1",
@@ -10865,7 +10883,7 @@ mod permission_and_oauth_tests {
         // Drugi upsert ta sama trojka (user, addon, provider) — powinno zaktualizowac
         let id2 = upsert_user_oauth_account(
             &db,
-            Some(user_id),
+            Some(user_id.as_str()),
             "a-acc",
             "microsoft",
             "ext-1",
@@ -10880,7 +10898,7 @@ mod permission_and_oauth_tests {
 
         // Assert — ten sam id, duplikatu brak
         assert_eq!(id1, id2, "upsert musi aktualizowac ten sam rekord");
-        let accs = list_user_oauth_accounts_for_user(&db, user_id).unwrap();
+        let accs = list_user_oauth_accounts_for_user(&db, &user_id).unwrap();
         assert_eq!(accs.len(), 1, "nie moze byc duplikatu");
         assert_eq!(accs[0].display_name, "Jan K. (updated)");
         assert_eq!(accs[0].access_token_encrypted, Some(vec![0x03, 0x04]));
@@ -10896,7 +10914,7 @@ mod permission_and_oauth_tests {
         let user_id = create_user(&db, "revu");
         let id = upsert_user_oauth_account(
             &db,
-            Some(user_id),
+            Some(user_id.as_str()),
             "a-rev",
             "google",
             "ext-g",
@@ -10930,7 +10948,7 @@ mod permission_and_oauth_tests {
 
         upsert_user_oauth_account(
             &db,
-            Some(u1),
+            Some(u1.as_str()),
             "a-flt",
             "p1",
             "e1",
@@ -10944,7 +10962,7 @@ mod permission_and_oauth_tests {
         .unwrap();
         upsert_user_oauth_account(
             &db,
-            Some(u1),
+            Some(u1.as_str()),
             "a-flt",
             "p2",
             "e2",
@@ -10958,7 +10976,7 @@ mod permission_and_oauth_tests {
         .unwrap();
         upsert_user_oauth_account(
             &db,
-            Some(u2),
+            Some(u2.as_str()),
             "a-flt",
             "p1",
             "e3",
@@ -10972,14 +10990,18 @@ mod permission_and_oauth_tests {
         .unwrap();
 
         // Act
-        let list_u1 = list_user_oauth_accounts_for_user(&db, u1).unwrap();
-        let list_u2 = list_user_oauth_accounts_for_user(&db, u2).unwrap();
+        let list_u1 = list_user_oauth_accounts_for_user(&db, &u1).unwrap();
+        let list_u2 = list_user_oauth_accounts_for_user(&db, &u2).unwrap();
 
         // Assert
         assert_eq!(list_u1.len(), 2, "u1 ma 2 konta");
         assert_eq!(list_u2.len(), 1, "u2 ma 1 konto");
-        assert!(list_u1.iter().all(|a| a.user_id == Some(u1)));
-        assert!(list_u2.iter().all(|a| a.user_id == Some(u2)));
+        assert!(list_u1
+            .iter()
+            .all(|a| a.user_id.as_deref() == Some(u1.as_str())));
+        assert!(list_u2
+            .iter()
+            .all(|a| a.user_id.as_deref() == Some(u2.as_str())));
     }
 
     // -------- Partial unique indexes (migracja 42) --------
@@ -10994,7 +11016,7 @@ mod permission_and_oauth_tests {
 
         let id1 = upsert_user_oauth_account(
             &db,
-            Some(uid),
+            Some(uid.as_str()),
             "a-ind",
             "p",
             "ext-1",
@@ -11008,7 +11030,7 @@ mod permission_and_oauth_tests {
         .unwrap();
         let id2 = upsert_user_oauth_account(
             &db,
-            Some(uid),
+            Some(uid.as_str()),
             "a-ind",
             "p",
             "ext-2",
@@ -11098,7 +11120,7 @@ mod permission_and_oauth_tests {
         .unwrap();
         upsert_user_oauth_account(
             &db,
-            Some(uid),
+            Some(uid.as_str()),
             "a-both",
             "p",
             "ext-user",
@@ -11122,7 +11144,8 @@ mod permission_and_oauth_tests {
             .any(|r| r.user_id.is_none() && r.external_account_id == "ext-global"));
         assert!(rows
             .iter()
-            .any(|r| r.user_id == Some(uid) && r.external_account_id == "ext-user"));
+            .any(|r| r.user_id.as_deref() == Some(uid.as_str())
+                && r.external_account_id == "ext-user"));
     }
 
     /// Different addon_id ⇒ separate rows even for global tokens.
@@ -11321,7 +11344,7 @@ mod permission_and_oauth_tests {
         // Token individual dla u.
         upsert_user_oauth_account(
             &db,
-            Some(u),
+            Some(u.as_str()),
             "addon-glob",
             "p",
             "ext-i",
@@ -11334,14 +11357,16 @@ mod permission_and_oauth_tests {
         )
         .unwrap();
 
-        let list = list_user_oauth_accounts_for_user(&db, u).unwrap();
+        let list = list_user_oauth_accounts_for_user(&db, &u).unwrap();
         assert_eq!(
             list.len(),
             1,
             "tylko individual; global NIE powinien byc widoczny"
         );
         assert_eq!(list[0].external_account_id, "ext-i");
-        assert!(list.iter().all(|a| a.user_id == Some(u)));
+        assert!(list
+            .iter()
+            .all(|a| a.user_id.as_deref() == Some(u.as_str())));
     }
 
     // -------- Audyt lifecycle --------
@@ -11365,7 +11390,7 @@ mod permission_and_oauth_tests {
 
         log_audit_full(
             &db,
-            Some(user_id),
+            Some(user_id.as_str()),
             Some("audit-toggle"),
             "addon_toggle",
             Some("addon"),
@@ -11521,7 +11546,7 @@ mod notes_tests {
         crate::db::init(Path::new(":memory:")).expect("cannot build test DB")
     }
 
-    fn mk_user(db: &DbPool, name: &str) -> i64 {
+    fn mk_user(db: &DbPool, name: &str) -> String {
         create_user_account(db, name, "hash", name, &format!("{}@test", name))
             .expect("create_user_account")
     }
@@ -11530,9 +11555,9 @@ mod notes_tests {
     fn test_create_and_list_notes_for_user() {
         let db = setup_db();
         let uid = mk_user(&db, "alice");
-        let a = create_note(&db, uid, "first", "body A").unwrap();
-        let b = create_note(&db, uid, "second", "body B").unwrap();
-        let rows = list_notes_for_user(&db, uid).unwrap();
+        let a = create_note(&db, &uid, "first", "body A").unwrap();
+        let b = create_note(&db, &uid, "second", "body B").unwrap();
+        let rows = list_notes_for_user(&db, &uid).unwrap();
         assert_eq!(rows.len(), 2);
         // Newest first (both same-second timestamp — order by id desc is acceptable fallback).
         let ids: Vec<i64> = rows.iter().map(|n| n.id).collect();
@@ -11548,14 +11573,14 @@ mod notes_tests {
         let db = setup_db();
         let alice = mk_user(&db, "alice");
         let bob = mk_user(&db, "bob");
-        let note_id = create_note(&db, alice, "t", "b").unwrap();
+        let note_id = create_note(&db, &alice, "t", "b").unwrap();
 
         // Bob cannot update Alice's note.
-        let res = update_note(&db, note_id, bob, "hacked", "hacked body");
+        let res = update_note(&db, note_id, &bob, "hacked", "hacked body");
         assert!(res.is_err());
 
         // Alice's note content stays intact.
-        let got = get_note(&db, note_id, alice).unwrap().expect("present");
+        let got = get_note(&db, note_id, &alice).unwrap().expect("present");
         assert_eq!(got.title, "t");
         assert_eq!(got.body, "b");
     }
@@ -11565,38 +11590,38 @@ mod notes_tests {
         let db = setup_db();
         let alice = mk_user(&db, "alice");
         let bob = mk_user(&db, "bob");
-        let note_id = create_note(&db, alice, "t", "b").unwrap();
+        let note_id = create_note(&db, &alice, "t", "b").unwrap();
 
-        let res = delete_note(&db, note_id, bob);
+        let res = delete_note(&db, note_id, &bob);
         assert!(res.is_err(), "bob must not be able to delete alice's note");
 
         // Still present for alice.
-        let got = get_note(&db, note_id, alice).unwrap();
+        let got = get_note(&db, note_id, &alice).unwrap();
         assert!(got.is_some());
 
         // Alice can delete her own.
-        delete_note(&db, note_id, alice).unwrap();
-        assert!(get_note(&db, note_id, alice).unwrap().is_none());
+        delete_note(&db, note_id, &alice).unwrap();
+        assert!(get_note(&db, note_id, &alice).unwrap().is_none());
     }
 
     #[test]
     fn test_notes_sorted_pinned_first_then_updated_desc() {
         let db = setup_db();
         let uid = mk_user(&db, "alice");
-        let first = create_note(&db, uid, "first", "x").unwrap();
+        let first = create_note(&db, &uid, "first", "x").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let second = create_note(&db, uid, "second", "y").unwrap();
+        let second = create_note(&db, &uid, "second", "y").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let third = create_note(&db, uid, "third", "z").unwrap();
+        let third = create_note(&db, &uid, "third", "z").unwrap();
 
         // Without pinning: newest first.
-        let rows = list_notes_for_user(&db, uid).unwrap();
+        let rows = list_notes_for_user(&db, &uid).unwrap();
         assert_eq!(rows[0].id, third);
         assert_eq!(rows[2].id, first);
 
         // Pin the oldest — it must jump to the top.
-        set_note_pinned(&db, first, uid, true).unwrap();
-        let rows = list_notes_for_user(&db, uid).unwrap();
+        set_note_pinned(&db, first, &uid, true).unwrap();
+        let rows = list_notes_for_user(&db, &uid).unwrap();
         assert_eq!(rows[0].id, first, "pinned note sorts first");
         assert!(rows[0].pinned);
         // Remaining two are in updated_at DESC order.
@@ -11632,7 +11657,7 @@ mod notes_tests {
         }
         // And the table is usable.
         let uid = mk_user(&db, "alice");
-        create_note(&db, uid, "t", "b").unwrap();
+        create_note(&db, &uid, "t", "b").unwrap();
     }
 }
 
@@ -11664,7 +11689,7 @@ pub mod deployments {
         pub image_tag: String,
         pub container_name: String,
         pub config_json: String,
-        pub user_id: Option<i64>,
+        pub user_id: Option<String>,
         pub started_at: String,
         pub finished_at: Option<String>,
         pub error_message: Option<String>,
@@ -11787,7 +11812,7 @@ pub mod deployments {
         pool: &DbPool,
         engine_id: Option<&str>,
         status: Option<&str>,
-        user_id: Option<i64>,
+        user_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<DeploymentRow>> {
         let conn = pool.lock().unwrap();
@@ -11803,7 +11828,7 @@ pub mod deployments {
         }
         if let Some(uid) = user_id {
             where_clauses.push("user_id = ?");
-            bind_params.push(Box::new(uid));
+            bind_params.push(Box::new(uid.to_string()));
         }
         let where_sql = if where_clauses.is_empty() {
             String::new()
@@ -11863,7 +11888,7 @@ pub mod resource_permissions {
         pub resource_type: String,
         pub resource_id: String,
         pub subject_type: String, // "user" | "group"
-        pub subject_id: i64,
+        pub subject_id: String,
         pub access_level: String, // "allow" | "deny"
     }
 
@@ -11873,7 +11898,7 @@ pub mod resource_permissions {
         resource_type: &str,
         resource_id: &str,
         subject_type: &str,
-        subject_id: i64,
+        subject_id: &str,
         access_level: &str,
     ) -> Result<()> {
         if !matches!(access_level, "allow" | "deny") {
@@ -11906,7 +11931,7 @@ pub mod resource_permissions {
         resource_type: &str,
         resource_id: &str,
         subject_type: &str,
-        subject_id: i64,
+        subject_id: &str,
     ) -> Result<()> {
         let conn = pool.lock().unwrap();
         conn.execute(
@@ -11951,7 +11976,7 @@ pub mod resource_permissions {
     pub fn list_for_subject(
         pool: &DbPool,
         subject_type: &str,
-        subject_id: i64,
+        subject_id: &str,
     ) -> Result<Vec<ResourcePermission>> {
         let conn = pool.lock().unwrap();
         let mut stmt = conn.prepare_cached(
@@ -11986,7 +12011,7 @@ pub mod resource_permissions {
         pool: &DbPool,
         resource_type: &str,
         resource_id: &str,
-        user_id: i64,
+        user_id: &str,
         user_role: &str,
     ) -> Result<bool> {
         // 1. Admin zawsze moze.
@@ -12657,13 +12682,13 @@ mod meeting_summary_action_items_tests {
         {
             let conn = db.lock().unwrap();
             conn.execute(
-                "UPDATE meeting_sessions SET owner_user_id = 42 WHERE id = ?1",
+                "UPDATE meeting_sessions SET owner_user_id = '42' WHERE id = ?1",
                 rusqlite::params![sid],
             )
             .unwrap();
         }
         let got = owner_of_meeting_key(&db, "owned").unwrap();
-        assert_eq!(got, Some(Some(42)));
+        assert_eq!(got, Some(Some("42".to_string())));
     }
 
     #[test]
@@ -14264,12 +14289,12 @@ mod chunk_c_visibility_consumer_tests {
         let user_id = {
             let conn = db.lock().expect("lock");
             conn.execute(
-                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
-                 VALUES ('jan', 'hash', 'Jan', 'jan@example.com')",
+                "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'jan', 'hash', 'Jan', 'jan@example.com')",
                 [],
             )
             .expect("insert user");
-            conn.last_insert_rowid()
+            "00000000-0000-0000-0000-000000000001".to_string()
         };
 
         upsert_sync_node_identity(
@@ -14280,13 +14305,14 @@ mod chunk_c_visibility_consumer_tests {
             "Laptop Jana",
             "laptop",
             "trusted",
-            Some(user_id),
+            Some(user_id.as_str()),
             "standard",
         )
         .expect("upsert node");
-        assign_node_to_user(&db, "node-a", user_id, "primary", Some(user_id)).expect("assign node");
+        assign_node_to_user(&db, "node-a", &user_id, "primary", Some(user_id.as_str()))
+            .expect("assign node");
 
-        let nodes = list_sync_nodes_for_user(&db, user_id).expect("list nodes");
+        let nodes = list_sync_nodes_for_user(&db, &user_id).expect("list nodes");
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, "node-a");
@@ -14299,19 +14325,19 @@ mod chunk_c_visibility_consumer_tests {
         let user_id = {
             let conn = db.lock().expect("lock");
             conn.execute(
-                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
-                 VALUES ('ewa', 'hash', 'Ewa', 'ewa@example.com')",
+                "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+                 VALUES ('00000000-0000-0000-0000-000000000002', 'ewa', 'hash', 'Ewa', 'ewa@example.com')",
                 [],
             )
             .expect("insert user");
-            conn.last_insert_rowid()
+            "00000000-0000-0000-0000-000000000002".to_string()
         };
 
-        upsert_user_identity_key(&db, "key-1", user_id, "ed25519", "pub-user", "sync")
+        upsert_user_identity_key(&db, "key-1", &user_id, "ed25519", "pub-user", "sync")
             .expect("insert key");
         revoke_user_identity_key(&db, "key-1").expect("revoke key");
 
-        let keys = list_active_user_identity_keys(&db, user_id).expect("list keys");
+        let keys = list_active_user_identity_keys(&db, &user_id).expect("list keys");
 
         assert!(keys.is_empty());
     }
@@ -14322,19 +14348,19 @@ mod chunk_c_visibility_consumer_tests {
         let (owner_id, other_id) = {
             let conn = db.lock().expect("lock");
             conn.execute(
-                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
-                 VALUES ('owner', 'hash', 'Owner', 'owner@example.com')",
+                "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+                 VALUES ('00000000-0000-0000-0000-000000000003', 'owner', 'hash', 'Owner', 'owner@example.com')",
                 [],
             )
             .expect("insert owner");
-            let owner_id = conn.last_insert_rowid();
+            let owner_id = "00000000-0000-0000-0000-000000000003".to_string();
             conn.execute(
-                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
-                 VALUES ('other', 'hash', 'Other', 'other@example.com')",
+                "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+                 VALUES ('00000000-0000-0000-0000-000000000004', 'other', 'hash', 'Other', 'other@example.com')",
                 [],
             )
             .expect("insert other");
-            (owner_id, conn.last_insert_rowid())
+            (owner_id, "00000000-0000-0000-0000-000000000004".to_string())
         };
         upsert_sync_resource_acl(
             &db,
@@ -14342,7 +14368,7 @@ mod chunk_c_visibility_consumer_tests {
             "contacts",
             "person",
             "person-1",
-            Some(owner_id),
+            Some(owner_id.as_str()),
             None,
             None,
             None,
@@ -14352,7 +14378,7 @@ mod chunk_c_visibility_consumer_tests {
 
         let owner = can_user_access_sync_resource(
             &db,
-            owner_id,
+            &owner_id,
             "org-default",
             "contacts",
             "person",
@@ -14362,7 +14388,7 @@ mod chunk_c_visibility_consumer_tests {
         .expect("owner access");
         let other = can_user_access_sync_resource(
             &db,
-            other_id,
+            &other_id,
             "org-default",
             "contacts",
             "person",
@@ -14381,12 +14407,12 @@ mod chunk_c_visibility_consumer_tests {
         let user_id = {
             let conn = db.lock().expect("lock");
             conn.execute(
-                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
-                 VALUES ('shared', 'hash', 'Shared', 'shared@example.com')",
+                "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+                 VALUES ('00000000-0000-0000-0000-000000000005', 'shared', 'hash', 'Shared', 'shared@example.com')",
                 [],
             )
             .expect("insert user");
-            conn.last_insert_rowid()
+            "00000000-0000-0000-0000-000000000005".to_string()
         };
         upsert_sync_resource_acl(
             &db,
@@ -14427,7 +14453,7 @@ mod chunk_c_visibility_consumer_tests {
 
         let decision = can_user_access_sync_resource(
             &db,
-            user_id,
+            &user_id,
             "org-default",
             "contacts",
             "company",
@@ -14445,12 +14471,12 @@ mod chunk_c_visibility_consumer_tests {
         let user_id = {
             let conn = db.lock().expect("lock");
             conn.execute(
-                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
-                 VALUES ('node-user', 'hash', 'Node User', 'node-user@example.com')",
+                "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+                 VALUES ('00000000-0000-0000-0000-000000000101', 'node-user', 'hash', 'Node User', 'node-user@example.com')",
                 [],
             )
             .expect("insert user");
-            conn.last_insert_rowid()
+            "00000000-0000-0000-0000-000000000101".to_string()
         };
         upsert_sync_node_identity(
             &db,
@@ -14460,11 +14486,11 @@ mod chunk_c_visibility_consumer_tests {
             "Phone",
             "phone",
             "trusted",
-            Some(user_id),
+            Some(user_id.as_str()),
             "standard",
         )
         .expect("node");
-        assign_node_to_user(&db, "node-sync", user_id, "primary", None).expect("assign");
+        assign_node_to_user(&db, "node-sync", &user_id, "primary", None).expect("assign");
         upsert_sync_resource_acl(
             &db,
             "org-default",
@@ -14472,7 +14498,7 @@ mod chunk_c_visibility_consumer_tests {
             "person",
             "person-2",
             None,
-            Some(user_id),
+            Some(user_id.as_str()),
             None,
             None,
             "assigned",
@@ -14551,12 +14577,12 @@ mod chunk_c_visibility_consumer_tests {
         let user_id = {
             let conn = db.lock().expect("lock");
             conn.execute(
-                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
-                 VALUES ('sync-target', 'hash', 'Sync Target', 'sync-target@example.com')",
+                "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+                 VALUES ('00000000-0000-0000-0000-000000000102', 'sync-target', 'hash', 'Sync Target', 'sync-target@example.com')",
                 [],
             )
             .expect("insert user");
-            conn.last_insert_rowid()
+            "00000000-0000-0000-0000-000000000102".to_string()
         };
         upsert_sync_node_identity(
             &db,
@@ -14566,11 +14592,11 @@ mod chunk_c_visibility_consumer_tests {
             "Laptop",
             "laptop",
             "trusted",
-            Some(user_id),
+            Some(user_id.as_str()),
             "standard",
         )
         .expect("node");
-        assign_node_to_user(&db, "node-target", user_id, "primary", None).expect("assign");
+        assign_node_to_user(&db, "node-target", &user_id, "primary", None).expect("assign");
         upsert_sync_resource_acl(
             &db,
             "org-default",
@@ -14578,7 +14604,7 @@ mod chunk_c_visibility_consumer_tests {
             "person",
             "person-4",
             None,
-            Some(user_id),
+            Some(user_id.as_str()),
             None,
             None,
             "assigned",

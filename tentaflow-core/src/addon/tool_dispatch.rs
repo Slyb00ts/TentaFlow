@@ -79,7 +79,7 @@ impl ToolDispatcher {
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
-        user_id: i64,
+        user_id: &str,
     ) -> Result<serde_json::Value> {
         // Parsuj addon_id i function_name z formatu "addon_id.function_name"
         let (addon_id, function_name) = tool_name.split_once('.')
@@ -135,7 +135,7 @@ impl ToolDispatcher {
     pub fn process_tool_calls(
         &self,
         tool_calls: &[LlmToolCall],
-        user_id: i64,
+        user_id: &str,
     ) -> Vec<ToolCallResult> {
         tool_calls
             .iter()
@@ -176,7 +176,7 @@ impl ToolDispatcher {
     /// Zwraca liste narzedzi w formacie OpenAI function calling.
     /// Filtruje po uprawnieniach uzytkownika — zwraca tylko narzedzia
     /// do ktorych uzytkownik ma dostep.
-    pub fn get_tools_for_llm(&self, user_id: i64) -> Vec<serde_json::Value> {
+    pub fn get_tools_for_llm(&self, user_id: &str) -> Vec<serde_json::Value> {
         self.addon_manager
             .list_tools()
             .into_iter()

@@ -417,6 +417,11 @@ pub enum MeshCommandType {
         paused: Option<bool>,
         restart_after_save: bool,
     },
+    /// Forwarded web research request. Receiver executes it against its local
+    /// SearXNG service and returns serialized WebResearchResponse JSON.
+    WebResearch {
+        request_json: String,
+    },
 }
 
 // =============================================================================
@@ -476,6 +481,8 @@ pub enum MeshCommandResponsePayload {
         engine_id: String,
         deploy_method: String,
     },
+    /// Serialized WebResearchResponse JSON produced by the receiver.
+    WebResearchResult { response_json: String },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -606,6 +613,10 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("ServiceUpdateRemote")
                 .field("service_id", service_id)
                 .field("restart_after_save", restart_after_save)
+                .finish(),
+            Self::WebResearch { request_json } => f
+                .debug_struct("WebResearch")
+                .field("request_len", &request_json.len())
                 .finish(),
         }
     }
@@ -1182,7 +1193,7 @@ pub struct StorageProxyRequestPayload {
     pub addon_id: String,
     pub resource_type: String,
     pub resource_id: String,
-    pub actor_user_id: Option<i64>,
+    pub actor_user_id: Option<String>,
     pub kind: StorageProxyRequestKind,
 }
 
@@ -1950,11 +1961,30 @@ mod tests {
                 rdma: false,
             },
             MeshCommandResponsePayload::Text("Total reclaimed space: 1.2GB".into()),
+            MeshCommandResponsePayload::WebResearchResult {
+                response_json: r#"{"type":"search","results":[]}"#.into(),
+            },
         ];
         for p in payloads {
             let bytes = crate::cbor::encode(&p).expect("encode");
             crate::cbor::decode::<MeshCommandResponsePayload>(&bytes)
                 .expect("decode");
+        }
+    }
+
+    #[test]
+    fn web_research_mesh_command_round_trip() {
+        let command = MeshCommandType::WebResearch {
+            request_json: r#"{"type":"search","query":"rust"}"#.into(),
+        };
+        let bytes = crate::cbor::encode(&command).expect("encode");
+        let decoded = crate::cbor::decode::<MeshCommandType>(&bytes).expect("decode");
+
+        match decoded {
+            MeshCommandType::WebResearch { request_json } => {
+                assert!(request_json.contains("\"query\":\"rust\""));
+            }
+            _ => panic!("Oczekiwano wariantu WebResearch"),
         }
     }
 

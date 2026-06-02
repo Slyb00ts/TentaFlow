@@ -380,7 +380,7 @@ fn kv_set(
     instance_id: &str,
     key: &str,
     value: Vec<u8>,
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> anyhow::Result<u64> {
     let capture = crate::sync::kv_capture::KvWriteCapture::new(
         org_id,
@@ -412,7 +412,7 @@ fn kv_delete(
     addon_id: &str,
     instance_id: &str,
     key: &str,
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> anyhow::Result<u64> {
     let capture = crate::sync::kv_capture::KvWriteCapture::new(
         org_id,
@@ -513,7 +513,7 @@ fn blob_put_chunk(
     chunk_count: u32,
     chunk_sha256: &str,
     bytes: Vec<u8>,
-    actor_user_id: Option<i64>,
+    actor_user_id: Option<String>,
 ) -> anyhow::Result<(bool, u32)> {
     validate_blob_sha(sha256)?;
     validate_blob_sha(chunk_sha256)?;

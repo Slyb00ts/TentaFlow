@@ -3,10 +3,32 @@
 // Opis: Bezpieczne aplikowanie odebranych operacji Core Sync do glownej SQLite.
 // =============================================================================
 
-use super::core_registry::{CORE_SYNC_ADDON_ID, CoreSyncResourceKind, descriptor_for_table};
-use super::ledger::{ActionType, FieldValue, LedgerResult, SyncLedgerError, SyncOperation};
+use super::core_registry::{descriptor_for_table, CoreSyncResourceKind, CORE_SYNC_ADDON_ID};
+use super::ledger::{
+    ActionType, FieldValue, HybridLogicalTimestamp, LedgerResult, SyncLedgerError, SyncOperation,
+};
 use crate::db::DbPool;
+use rusqlite::OptionalExtension;
 use std::sync::Arc;
+
+/// Resource kinds that multiple nodes may edit concurrently. Their writes go
+/// through HLC last-writer-wins: an incoming operation is applied only when its
+/// HLC strictly exceeds the version recorded in `core_resource_versions`. The
+/// remaining kinds are either insert-only (group_members, org_memberships) or
+/// keyed so that concurrent edits never collide, so they bypass LWW.
+fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
+    matches!(
+        kind,
+        CoreSyncResourceKind::Flow
+            | CoreSyncResourceKind::UserAccount
+            | CoreSyncResourceKind::Organization
+            | CoreSyncResourceKind::Role
+            | CoreSyncResourceKind::UserGroup
+            | CoreSyncResourceKind::SyncPolicy
+            | CoreSyncResourceKind::SyncResourceAcl
+            | CoreSyncResourceKind::SyncUserOrgProfile
+    )
+}
 
 pub fn apply_core_operation(
     pool: &DbPool,
@@ -31,12 +53,33 @@ pub fn apply_core_operation(
             operation.body.table_name
         )));
     }
+    // Fold the incoming HLC into the local clock so the next locally-minted
+    // operation is strictly later than anything we have observed from the mesh.
+    crate::sync::runtime::observe_core_hlc(&operation.body.hlc_timestamp);
+
+    let lww_tracked = is_lww_tracked(descriptor.kind);
     let mut conn = pool
         .lock()
         .map_err(|e| SyncLedgerError::Runtime(format!("Blad blokady bazy: {e}")))?;
     let tx = conn
         .transaction()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+
+    // HLC last-writer-wins gate: drop stale concurrent edits before touching the
+    // target row, so a slower-but-older write never clobbers a newer one.
+    if lww_tracked
+        && !incoming_hlc_wins(
+            &tx,
+            &operation.body.resource_type,
+            &operation.body.resource_id,
+            &operation.body.hlc_timestamp,
+        )?
+    {
+        tx.commit()
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        return Ok(0);
+    }
+
     let rows = match descriptor.kind {
         CoreSyncResourceKind::Organization => apply_organization(&tx, operation)?,
         CoreSyncResourceKind::UserAccount => apply_user_account(&tx, operation)?,
@@ -49,7 +92,6 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::NodeUserAssignment => apply_node_user_assignment(&tx, operation)?,
         CoreSyncResourceKind::SyncUserOrgProfile => apply_sync_user_org_profile(&tx, operation)?,
         CoreSyncResourceKind::Flow => apply_flow(&tx, operation)?,
-        CoreSyncResourceKind::FlowVersion => apply_flow_version(&tx, operation)?,
         CoreSyncResourceKind::FlowModelBinding => apply_flow_model_binding(&tx, operation)?,
         CoreSyncResourceKind::SyncPolicy => apply_sync_policy(&tx, operation)?,
         CoreSyncResourceKind::SyncResourceAcl => apply_sync_resource_acl(&tx, operation)?,
@@ -57,15 +99,75 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::SharedSettingSecret => {
             apply_shared_setting_secret(&tx, settings_cipher, operation)?
         }
-        CoreSyncResourceKind::LegacyUser => {
-            return Err(SyncLedgerError::Runtime(
-                "legacy users materialization is disabled".to_string(),
-            ));
-        }
     };
+
+    if lww_tracked {
+        upsert_resource_version(
+            &tx,
+            &operation.body.resource_type,
+            &operation.body.resource_id,
+            &operation.body.hlc_timestamp,
+        )?;
+    }
+
     tx.commit()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
     Ok(rows)
+}
+
+/// Returns true when `incoming` strictly exceeds the HLC currently recorded for
+/// `(resource_type, resource_id)` in `core_resource_versions`. A missing row
+/// (never-seen resource) always wins. Comparison uses the total HLC order from
+/// phase A (wall, logical, node_id tie-break).
+fn incoming_hlc_wins(
+    tx: &rusqlite::Transaction<'_>,
+    resource_type: &str,
+    resource_id: &str,
+    incoming: &HybridLogicalTimestamp,
+) -> LedgerResult<bool> {
+    let existing: Option<(i64, i64, String)> = tx
+        .query_row(
+            "SELECT hlc_wall, hlc_logical, hlc_node FROM core_resource_versions \
+             WHERE resource_type = ?1 AND resource_id = ?2",
+            rusqlite::params![resource_type, resource_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    match existing {
+        None => Ok(true),
+        Some((wall, logical, node)) => {
+            let current = HybridLogicalTimestamp {
+                wall_time_ms: wall,
+                logical: logical as u32,
+                node_id: node,
+            };
+            Ok(*incoming > current)
+        }
+    }
+}
+
+fn upsert_resource_version(
+    tx: &rusqlite::Transaction<'_>,
+    resource_type: &str,
+    resource_id: &str,
+    hlc: &HybridLogicalTimestamp,
+) -> LedgerResult<()> {
+    tx.execute(
+        "INSERT INTO core_resource_versions (resource_type, resource_id, hlc_wall, hlc_logical, hlc_node) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+         hlc_wall = excluded.hlc_wall, hlc_logical = excluded.hlc_logical, hlc_node = excluded.hlc_node",
+        rusqlite::params![
+            resource_type,
+            resource_id,
+            hlc.wall_time_ms,
+            hlc.logical as i64,
+            hlc.node_id,
+        ],
+    )
+    .map(|_| ())
+    .map_err(sql_error)
 }
 
 fn apply_shared_setting_secret(
@@ -162,7 +264,7 @@ fn apply_user_account(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
-    let id = resource_i64(operation)?;
+    let id = &operation.body.resource_id;
     match operation.body.action {
         ActionType::Insert => tx
             .execute(
@@ -220,7 +322,7 @@ fn apply_user_group(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
-    let id = resource_i64(operation)?;
+    let id = &operation.body.resource_id;
     match operation.body.action {
         ActionType::Insert => tx
             .execute(
@@ -255,8 +357,8 @@ fn apply_group_member(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
-    let group_id = field_i64(operation, "group_id")?;
-    let user_id = field_i64(operation, "user_id")?;
+    let group_id = field_string(operation, "group_id")?;
+    let user_id = field_string(operation, "user_id")?;
     match operation.body.action {
         ActionType::Insert => tx
             .execute(
@@ -376,7 +478,7 @@ fn apply_sync_node(
                     field_string_or(operation, "display_name", "")?,
                     field_string_or(operation, "node_kind", "unknown")?,
                     field_string_or(operation, "trust_status", "untrusted")?,
-                    optional_present_i64(operation, "owner_user_id")?,
+                    optional_present_string(operation, "owner_user_id")?,
                     field_string_or(operation, "sync_profile", "standard")?,
                 ],
             )
@@ -397,8 +499,8 @@ fn apply_sync_node(
                     optional_present_string(operation, "display_name")?,
                     optional_present_string(operation, "node_kind")?,
                     optional_present_string(operation, "trust_status")?,
-                    nullable_update_i64(operation, "owner_user_id")?.0,
-                    nullable_update_i64(operation, "owner_user_id")?.1,
+                    nullable_update_string(operation, "owner_user_id")?.0,
+                    nullable_update_string(operation, "owner_user_id")?.1,
                     optional_present_string(operation, "sync_profile")?,
                 ],
             )
@@ -427,7 +529,7 @@ fn apply_user_identity_key(
                  purpose = excluded.purpose, status = excluded.status, revoked_at = excluded.revoked_at",
                 rusqlite::params![
                     operation.body.resource_id,
-                    field_i64(operation, "user_id")?,
+                    field_string(operation, "user_id")?,
                     field_string(operation, "key_type")?,
                     field_string(operation, "public_key")?,
                     field_string_or(operation, "purpose", "sync")?,
@@ -464,7 +566,7 @@ fn apply_node_user_assignment(
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
     let node_id = field_string(operation, "node_id")?;
-    let user_id = field_i64(operation, "user_id")?;
+    let user_id = field_string(operation, "user_id")?;
     let assignment_mode = field_string(operation, "assignment_mode")?;
     match operation.body.action {
         ActionType::Insert => tx
@@ -477,7 +579,7 @@ fn apply_node_user_assignment(
                     node_id,
                     user_id,
                     assignment_mode,
-                    optional_present_i64(operation, "created_by")?,
+                    optional_present_string(operation, "created_by")?,
                 ],
             )
             .map_err(sql_error),
@@ -509,7 +611,7 @@ fn apply_sync_user_org_profile(
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
     let org_id = field_string(operation, "org_id")?;
-    let user_id = field_i64(operation, "user_id")?;
+    let user_id = field_string(operation, "user_id")?;
     match operation.body.action {
         ActionType::Insert => tx
             .execute(
@@ -523,7 +625,7 @@ fn apply_sync_user_org_profile(
                     org_id,
                     user_id,
                     field_optional_string(operation, "department_id")?,
-                    optional_present_i64(operation, "manager_user_id")?,
+                    optional_present_string(operation, "manager_user_id")?,
                     field_bool_or(operation, "is_department_manager", false)?,
                 ],
             )
@@ -540,8 +642,8 @@ fn apply_sync_user_org_profile(
                     user_id,
                     nullable_update_string(operation, "department_id")?.0,
                     nullable_update_string(operation, "department_id")?.1,
-                    nullable_update_i64(operation, "manager_user_id")?.0,
-                    nullable_update_i64(operation, "manager_user_id")?.1,
+                    nullable_update_string(operation, "manager_user_id")?.0,
+                    nullable_update_string(operation, "manager_user_id")?.1,
                     optional_present_bool(operation, "is_department_manager")?,
                 ],
             )
@@ -557,7 +659,7 @@ fn apply_sync_user_org_profile(
 }
 
 fn apply_flow(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> LedgerResult<usize> {
-    let id = resource_i64(operation)?;
+    let id = &operation.body.resource_id;
     match operation.body.action {
         ActionType::Insert => tx
             .execute(
@@ -614,49 +716,11 @@ fn apply_flow(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Ledg
     }
 }
 
-fn apply_flow_version(
-    tx: &rusqlite::Transaction<'_>,
-    operation: &SyncOperation,
-) -> LedgerResult<usize> {
-    let id = resource_i64(operation)?;
-    match operation.body.action {
-        ActionType::Insert => tx
-            .execute(
-                "INSERT INTO flow_versions \
-                 (id, flow_id, version_num, flow_json, name, description, status, created_by) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(id) DO UPDATE SET \
-                 flow_json = excluded.flow_json, name = excluded.name, description = excluded.description, \
-                 status = excluded.status, created_by = excluded.created_by",
-                rusqlite::params![
-                    id,
-                    field_i64(operation, "flow_id")?,
-                    field_i64(operation, "version_num")?,
-                    field_string(operation, "flow_json")?,
-                    field_string(operation, "name")?,
-                    field_optional_string(operation, "description")?,
-                    field_optional_string(operation, "status")?,
-                    field_optional_string(operation, "created_by")?,
-                ],
-            )
-            .map_err(sql_error),
-        ActionType::Update => Err(SyncLedgerError::Runtime(
-            "flow_versions update is not supported".to_string(),
-        )),
-        ActionType::Delete => tx
-            .execute(
-                "DELETE FROM flow_versions WHERE id = ?1",
-                rusqlite::params![id],
-            )
-            .map_err(sql_error),
-    }
-}
-
 fn apply_flow_model_binding(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
-    let id = resource_i64(operation)?;
+    let id = &operation.body.resource_id;
     match operation.body.action {
         ActionType::Insert => tx
             .execute(
@@ -666,7 +730,7 @@ fn apply_flow_model_binding(
                  flow_id = excluded.flow_id, model_pattern = excluded.model_pattern, priority = excluded.priority",
                 rusqlite::params![
                     id,
-                    field_i64(operation, "flow_id")?,
+                    field_string(operation, "flow_id")?,
                     field_string(operation, "model_pattern")?,
                     field_i64_or(operation, "priority", 0)?,
                 ],
@@ -679,7 +743,7 @@ fn apply_flow_model_binding(
                  WHERE id = ?1",
                 rusqlite::params![
                     id,
-                    optional_present_i64(operation, "flow_id")?,
+                    optional_present_string(operation, "flow_id")?,
                     optional_present_string(operation, "model_pattern")?,
                     optional_present_i64(operation, "priority")?,
                 ],
@@ -772,10 +836,10 @@ fn apply_sync_resource_acl(
                     addon_id,
                     resource_type,
                     resource_id,
-                    optional_present_i64(operation, "owner_user_id")?,
-                    optional_present_i64(operation, "assigned_user_id")?,
+                    optional_present_string(operation, "owner_user_id")?,
+                    optional_present_string(operation, "assigned_user_id")?,
                     field_optional_string(operation, "department_id")?,
-                    optional_present_i64(operation, "manager_user_id")?,
+                    optional_present_string(operation, "manager_user_id")?,
                     field_string_or(operation, "visibility_scope", "assigned")?,
                 ],
             )
@@ -794,14 +858,14 @@ fn apply_sync_resource_acl(
                     addon_id,
                     resource_type,
                     resource_id,
-                    nullable_update_i64(operation, "owner_user_id")?.0,
-                    nullable_update_i64(operation, "owner_user_id")?.1,
-                    nullable_update_i64(operation, "assigned_user_id")?.0,
-                    nullable_update_i64(operation, "assigned_user_id")?.1,
+                    nullable_update_string(operation, "owner_user_id")?.0,
+                    nullable_update_string(operation, "owner_user_id")?.1,
+                    nullable_update_string(operation, "assigned_user_id")?.0,
+                    nullable_update_string(operation, "assigned_user_id")?.1,
                     nullable_update_string(operation, "department_id")?.0,
                     nullable_update_string(operation, "department_id")?.1,
-                    nullable_update_i64(operation, "manager_user_id")?.0,
-                    nullable_update_i64(operation, "manager_user_id")?.1,
+                    nullable_update_string(operation, "manager_user_id")?.0,
+                    nullable_update_string(operation, "manager_user_id")?.1,
                     optional_present_string(operation, "visibility_scope")?,
                 ],
             )
@@ -844,7 +908,7 @@ fn apply_sync_explicit_share(
                     subject_type,
                     subject_id,
                     action,
-                    optional_present_i64(operation, "granted_by")?,
+                    optional_present_string(operation, "granted_by")?,
                 ],
             )
             .map_err(sql_error),
@@ -897,14 +961,6 @@ fn require_existing(operation: &SyncOperation) -> impl FnOnce(usize) -> LedgerRe
             Ok(rows)
         }
     }
-}
-
-fn resource_i64(operation: &SyncOperation) -> LedgerResult<i64> {
-    operation
-        .body
-        .resource_id
-        .parse::<i64>()
-        .map_err(|e| SyncLedgerError::Runtime(format!("invalid integer resource_id: {e}")))
 }
 
 fn field_string(operation: &SyncOperation, key: &str) -> LedgerResult<String> {
@@ -970,17 +1026,6 @@ fn nullable_update_i64(operation: &SyncOperation, key: &str) -> LedgerResult<(bo
         None => Ok((false, None)),
         _ => Err(SyncLedgerError::Runtime(format!(
             "core operation field has invalid nullable i64 type: {key}"
-        ))),
-    }
-}
-
-fn field_i64(operation: &SyncOperation, key: &str) -> LedgerResult<i64> {
-    match operation.body.changed_fields.get(key) {
-        Some(FieldValue::I64(value)) => Ok(*value),
-        Some(FieldValue::U64(value)) => i64::try_from(*value)
-            .map_err(|e| SyncLedgerError::Runtime(format!("invalid i64 field {key}: {e}"))),
-        _ => Err(SyncLedgerError::Runtime(format!(
-            "core operation missing i64 field: {key}"
         ))),
     }
 }

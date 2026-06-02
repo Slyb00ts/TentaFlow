@@ -297,6 +297,14 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Web research API — search, read public URLs and read search results.
+    /// Wire format is JSON so addons can pass provider-specific options
+    /// without recompiling the ABI.
+    fn web_research_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Policy / Gate API (F1c P4) — verify a DPIA / FRIA claim against a
     /// `[[gate]]` declaration before running a gated operation. Requires
     /// `policy.read` permission.
@@ -1452,6 +1460,97 @@ pub fn sql_transaction(statements: &[(&str, &[SqlValue])]) -> Result<u64, AbiErr
 }
 
 // =============================================================================
+// Wysokopoziomowe wrappery — Web Research API
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchRequest {
+    pub query: String,
+    #[serde(default = "default_web_search_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub provider: serde_json::Value,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub time_range: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebReadUrlRequest {
+    pub url: String,
+    #[serde(default = "default_web_read_chars")]
+    pub max_chars: usize,
+    #[serde(default)]
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebReadSearchResultsRequest {
+    pub query: String,
+    #[serde(default = "default_web_search_limit")]
+    pub search_limit: usize,
+    #[serde(default = "default_web_read_limit")]
+    pub read_limit: usize,
+    #[serde(default = "default_web_read_chars")]
+    pub max_chars_per_page: usize,
+    #[serde(default)]
+    pub provider: serde_json::Value,
+}
+
+fn default_web_search_limit() -> usize {
+    10
+}
+
+fn default_web_read_limit() -> usize {
+    5
+}
+
+fn default_web_read_chars() -> usize {
+    30_000
+}
+
+pub fn web_research(request: &serde_json::Value) -> Result<serde_json::Value, AbiError> {
+    let payload = serde_json::to_vec(request).map_err(|_| AbiError::Operation)?;
+    let bytes = call_sql_with_one_input_capped(web_research_v1, &payload, 8 * 1024 * 1024)?;
+    serde_json::from_slice(&bytes).map_err(|_| AbiError::Operation)
+}
+
+pub fn web_search(request: &WebSearchRequest) -> Result<serde_json::Value, AbiError> {
+    web_research(&serde_json::json!({
+        "op": "search",
+        "query": request.query,
+        "limit": request.limit,
+        "provider": request.provider,
+        "language": request.language,
+        "time_range": request.time_range,
+    }))
+}
+
+pub fn web_read_url(request: &WebReadUrlRequest) -> Result<serde_json::Value, AbiError> {
+    let mode = if request.mode.is_empty() { "auto" } else { &request.mode };
+    web_research(&serde_json::json!({
+        "op": "read_url",
+        "url": request.url,
+        "max_chars": request.max_chars,
+        "mode": mode,
+    }))
+}
+
+pub fn web_read_search_results(
+    request: &WebReadSearchResultsRequest,
+) -> Result<serde_json::Value, AbiError> {
+    web_research(&serde_json::json!({
+        "op": "read_search_results",
+        "query": request.query,
+        "search_limit": request.search_limit,
+        "read_limit": request.read_limit,
+        "max_chars_per_page": request.max_chars_per_page,
+        "provider": request.provider,
+    }))
+}
+
+// =============================================================================
 // Prelude — wygodny re-eksport dla autorow addonow
 // =============================================================================
 
@@ -1487,6 +1586,8 @@ pub mod prelude {
         recording_get_stream, recording_purge, recording_stats, frame_url,
         SavedRecordingInfo, RecordingUrl, RecordingStream, RecordingStats, FrameUrl,
         vector_upsert, vector_search, vector_delete, encode_vector_b64, VectorHit,
+        web_research, web_search, web_read_url, web_read_search_results,
+        WebSearchRequest, WebReadUrlRequest, WebReadSearchResultsRequest,
         gate_check, gate_check_scoped, GateCheckResult, GateSigner,
         flow_invoke, flow_status, flow_cancel, FlowInvocation,
         service_list, node_resources_get, ServiceInfo, NodeResources, NodeGpu,

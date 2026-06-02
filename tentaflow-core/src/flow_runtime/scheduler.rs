@@ -252,7 +252,7 @@ impl FlowScheduler {
         flow_id: &str,
         input: toml::Value,
         wait_ms: u32,
-        actor_user_id: Option<i64>,
+        actor_user_id: Option<String>,
         org_id: Option<String>,
     ) -> Result<InvocationStatus, InvokeError> {
         let flow =
