@@ -105,21 +105,33 @@ impl EmbeddedDeploy {
             return Ok(());
         }
 
-        // Embedded STT = whisper.cpp (jedyny embedded silnik STT w
-        // engine_registry; faster-whisper jest dockerowy). Model trafia do
-        // `shared_stt_manager()`, ten sam singleton z ktorego czyta
-        // `SttRuntime::transcribe`. Bez tego kroku usluga jest oznaczona
-        // `running`, ale `active_engine()` zostaje None i kazda transkrypcja
-        // konczy sie "no STT engine loaded".
+        // Embedded STT: whisper.cpp (engine.id = "whisper", plik ggml) lub
+        // mlx-whisper (engine.id = "mlx-whisper", katalog MLX safetensors).
+        // Model trafia do `shared_stt_manager()`, tego samego singletonu z
+        // ktorego czyta `SttRuntime::transcribe`. Bez tego kroku usluga jest
+        // oznaczona `running`, ale `active_engine()` zostaje None i kazda
+        // transkrypcja konczy sie "no STT engine loaded".
+        let engine_id = self.manifest.engine.id.clone();
+        let model_repo = self.selected_model_repo();
         if let Some(s) = &self.log_sink {
-            s.phase("load-model", "[stt] loading embedded whisper model");
+            s.phase(
+                "load-model",
+                &format!("[stt] loading embedded {engine_id} ({model_repo})"),
+            );
         }
         let shared = crate::stt::shared_stt_manager();
         let info = {
             let mut mgr = shared.write().await;
-            mgr.ensure_and_load(None).await
+            mgr.ensure_and_load(
+                Some(&engine_id),
+                Some(&model_repo),
+                None,
+                self.log_sink.as_ref(),
+                crate::stt::WhisperDeployParams::default(),
+            )
+            .await
         }
-        .map_err(|e| DeployError::Other(format!("load embedded whisper model: {e}")))?;
+        .map_err(|e| DeployError::Other(format!("load embedded STT '{engine_id}': {e}")))?;
         if let Some(s) = &self.log_sink {
             s.info(&format!("[stt] whisper model loaded from {}", info.path));
         }
@@ -137,7 +149,7 @@ impl EmbeddedDeploy {
         // `running`, ale `synthesize` zwraca "TTS engine '...' nie
         // zarejestrowany".
         let engine_id = self.manifest.engine.id.clone();
-        let model_repo = self.selected_tts_model_repo();
+        let model_repo = self.selected_model_repo();
         // Preset id (np. `vits-piper-pl_PL-jarvis_wg_glos-medium`) jako voice
         // hint — wielogłosowe repo musi zaladowac wlasciwy voice.
         let voice_hint = self
@@ -164,10 +176,10 @@ impl EmbeddedDeploy {
         Ok(())
     }
 
-    /// HF repo (lub voice id dla apple-tts) dla embedded TTS: jawny
+    /// HF repo (lub voice id dla apple-tts) dla embedded STT/TTS: jawny
     /// `model_repo` z configu ma priorytet, inaczej preset po
     /// `model_preset_id`, potem rekomendowany / pierwszy z manifestu.
-    fn selected_tts_model_repo(&self) -> String {
+    fn selected_model_repo(&self) -> String {
         if let Some(repo) = self
             .user_config
             .get("model_repo")

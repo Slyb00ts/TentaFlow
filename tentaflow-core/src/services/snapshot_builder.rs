@@ -86,6 +86,25 @@ pub fn project_service_row(
 
     let request_time_parameters = parse_request_time_parameters(&svc.config_json);
 
+    // Wykrycie aktualizacji: hash zrodel z deployu vs aktualny hash z manifestu
+    // (build.rs liczy go w czasie kompilacji). Roznica = wbudowany bundle
+    // zostal podbity od czasu deployu tego serwisu.
+    let update_available = {
+        use services_repo::services::DeployMethod;
+        let deployed = svc.deployed_source_hash.as_str();
+        let current = crate::services::manifest::registry()
+            .by_id(&svc.engine_id)
+            .map(|m| match svc.deploy_method {
+                DeployMethod::Docker => m.docker_source_hash.as_str(),
+                DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => {
+                    m.native_source_hash.as_str()
+                }
+                _ => "",
+            })
+            .unwrap_or("");
+        !deployed.is_empty() && !current.is_empty() && deployed != current
+    };
+
     Ok(ServiceInfo {
         id: svc.id,
         node_id: local_node_id.to_string(),
@@ -108,6 +127,7 @@ pub fn project_service_row(
         deployment_progress_pct: i32::try_from(svc.deployment_progress_pct).unwrap_or(100),
         progress_message: svc.progress_message,
         models,
+        update_available,
         created_at: svc.created_at,
         updated_at: svc.updated_at,
         request_time_parameters,

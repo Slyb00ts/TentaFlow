@@ -380,6 +380,7 @@ mod tests {
             deployment_progress_pct: 0,
             progress_message: None,
             models: Vec::new(),
+            update_available: false,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),

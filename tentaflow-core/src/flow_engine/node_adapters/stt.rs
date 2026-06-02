@@ -168,8 +168,18 @@ impl NodeAdapter for SttNodeAdapter {
         )
         .map_err(|e| anyhow!("stt adapter: {e}"))?;
         if let Some(lang) = response.detected_language {
-            out.meta
-                .insert("detected_language".into(), serde_json::Value::String(lang));
+            out.meta.insert(
+                "detected_language".into(),
+                serde_json::Value::String(lang.clone()),
+            );
+            // Wykryty jezyk niesiemy dalej jako `language` dla downstream (TTS),
+            // ale TYLKO gdy nikt go wczesniej nie przypial — preferencja usera
+            // lub jawny request (seedowane w `flow_envelope_from_inputs`) maja
+            // priorytet. Bez tego polska wypowiedz konczyla sie angielskim TTS.
+            if !out.meta.contains_key("language") {
+                out.meta
+                    .insert("language".into(), serde_json::Value::String(lang));
+            }
         }
         if let Some(dur) = response.duration {
             if let Some(num) = serde_json::Number::from_f64(dur as f64) {

@@ -22,6 +22,22 @@ platforms = ["macos"]
 runtime = "python-bundle"
 bundle_path = "tts/python/chatterbox-mlx"
 
+# Domyslny jezyk syntezy — trafia jako env CHATTERBOX_MLX_LANGUAGE (DEFAULT_LANG
+# serwera). Per-request `language` z flow/API ma priorytet (serwer normalizuje
+# ISO "pl" -> "Polish"). Ustaw "Polish" dla polskiego asystenta.
+[[parameter]]
+key = "language"
+label_pl = "Jezyk syntezy"
+label_en = "Synthesis language"
+kind = "enum"
+options = ["English", "Spanish", "French", "German", "Italian", "Portuguese", "Polish", "Turkish", "Russian", "Dutch", "Czech", "Arabic", "Chinese", "Japanese", "Hungarian", "Korean"]
+default = "English"
+
+[[parameter.bindings]]
+when = "native_python_bundle"
+type = "env"
+name = "CHATTERBOX_MLX_LANGUAGE"
+
 [[model_preset]]
 id = "chatterbox-turbo-4bit"
 display_name = "Chatterbox Turbo 4-bit (~250 MB)"

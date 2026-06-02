@@ -250,6 +250,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_restore_org_id",
             MigrationStep::Rust(cameras_restore_org_id_column),
         ),
+        (
+            52,
+            "services_deployed_source_hash",
+            MigrationStep::Sql(SERVICES_DEPLOYED_SOURCE_HASH),
+        ),
     ]
 }
 
@@ -1751,6 +1756,14 @@ ALTER TABLE flow_node_templates ADD COLUMN params_schema TEXT;
 // Progress_message jest informacyjne, NULL gdy nic do powiedzenia.
 const SERVICES_PROGRESS_MESSAGE: &str = r#"
 ALTER TABLE services ADD COLUMN progress_message TEXT;
+"#;
+
+// deployed_source_hash: sha256 drzewa zrodel bundla (docker/native) z momentu
+// deployu. build.rs liczy aktualny hash do manifestu; snapshot porownuje oba i
+// wystawia flage update_available. Pusty = serwis embedded/external lub deploy
+// sprzed tej kolumny (brak danych, brak falszywego alarmu o aktualizacji).
+const SERVICES_DEPLOYED_SOURCE_HASH: &str = r#"
+ALTER TABLE services ADD COLUMN deployed_source_hash TEXT NOT NULL DEFAULT '';
 "#;
 
 // Rename edge fieldow w flow_json: `from`/`to` -> `from_node`/`to_node`.

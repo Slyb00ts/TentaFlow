@@ -50,7 +50,7 @@ fn require_user_id(ctx: &HandlerContext) -> Result<[u8; 16], ProtocolError> {
 }
 
 /// Konwertuje 16-bajtowe user_id (z markerem 0xFF) do i64 dla DB query.
-fn user_id_to_i64(bytes: &[u8; 16]) -> Option<i64> {
+pub(super) fn user_id_to_i64(bytes: &[u8; 16]) -> Option<i64> {
     if bytes[0] != 0xFF || bytes[1..8].iter().any(|&b| b != 0) {
         return None;
     }

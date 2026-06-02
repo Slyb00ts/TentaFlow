@@ -379,6 +379,7 @@ mod tests {
                 quantization: None,
                 is_default: true,
             }],
+            update_available: false,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),

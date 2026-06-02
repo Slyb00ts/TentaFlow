@@ -26,6 +26,27 @@ SUPPORTED_LANGS = [
     "Chinese", "Japanese", "Hungarian", "Korean",
 ]
 
+# TentaFlow przekazuje jezyk jako ISO-639-1 ("pl"), a mlx-audio chce pelnej
+# nazwy ("Polish"). Mapujemy ISO -> nazwa; pelne nazwy przepuszczamy 1:1.
+ISO_TO_NAME = {
+    "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+    "it": "Italian", "pt": "Portuguese", "pl": "Polish", "tr": "Turkish",
+    "ru": "Russian", "nl": "Dutch", "cs": "Czech", "ar": "Arabic",
+    "zh": "Chinese", "ja": "Japanese", "hu": "Hungarian", "ko": "Korean",
+}
+_NAME_BY_LOWER = {n.lower(): n for n in SUPPORTED_LANGS}
+
+
+def normalize_lang(value):
+    """ISO-639-1 lub pelna nazwa (dowolna wielkosc liter) -> kanoniczna nazwa,
+    albo None gdy nierozpoznane."""
+    if not value:
+        return None
+    v = value.strip()
+    if v.lower() in _NAME_BY_LOWER:
+        return _NAME_BY_LOWER[v.lower()]
+    return ISO_TO_NAME.get(v.lower())
+
 log.info("loading chatterbox-mlx %s", MODEL_REPO)
 MODEL = load_model(MODEL_REPO)
 SAMPLE_RATE = int(getattr(MODEL, "sample_rate", 24000))
@@ -72,7 +93,7 @@ def list_voices():
 
 @app.post("/v1/audio/speech")
 def speech(req: SpeechRequest):
-    lang = req.language or DEFAULT_LANG
+    lang = normalize_lang(req.language) or normalize_lang(DEFAULT_LANG) or "English"
     try:
         kwargs = {"lang_code": lang}
         if req.voice:

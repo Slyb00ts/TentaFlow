@@ -119,6 +119,12 @@ pub struct ServiceInfo {
     /// raportowania.
     pub progress_message: Option<String>,
     pub models: Vec<ServiceModelEntry>,
+    /// True gdy hash drzewa źródeł bundla zapisany przy deployu różni się od
+    /// aktualnego hashu z manifestu — Core wykrył nowszą wersję wbudowanego
+    /// bundla (docker/native). `#[serde(default)]` zachowuje kompatybilnosc ze
+    /// starszymi peerami mesh, ktorzy tego pola nie wysylaja.
+    #[serde(default)]
+    pub update_available: bool,
     pub created_at: String,
     pub updated_at: String,
     /// Typed request-time parameters z `services.config_json.parameters`,
