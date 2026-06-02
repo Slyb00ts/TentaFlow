@@ -398,10 +398,12 @@ fn upsert_local_peer(
         Some(db) => {
             let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
             let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+            let name_map = crate::mesh::network_interfaces::ipv4_name_map();
             crate::mesh::network_interfaces::filter_advertise_ips(
                 &raw_addresses,
                 &filters,
                 &kind_map,
+                &name_map,
             )
         }
         None => raw_addresses
@@ -661,8 +663,9 @@ async fn handle_peer_connected(
                     // docker bridge, ktore sa nieosiagalne z zewnatrz hosta.
                     let filters = crate::mesh::network_interfaces::load_advertise_filters(&sec.db);
                     let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+                    let name_map = crate::mesh::network_interfaces::ipv4_name_map();
                     let filtered_ips = crate::mesh::network_interfaces::filter_advertise_ips(
-                        &addresses, &filters, &kind_map,
+                        &addresses, &filters, &kind_map, &name_map,
                     );
                     if filtered_ips.is_empty() {
                         debug!(
@@ -2724,8 +2727,9 @@ fn spawn_slow_refresh(
                     Some(db) => {
                         let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
                         let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+                        let name_map = crate::mesh::network_interfaces::ipv4_name_map();
                         crate::mesh::network_interfaces::filter_advertise_ips(
-                            &raw, &filters, &kind_map,
+                            &raw, &filters, &kind_map, &name_map,
                         )
                     }
                     None => raw.into_iter().filter(|ip| ip.is_ipv4()).collect(),

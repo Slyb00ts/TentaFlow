@@ -31,6 +31,8 @@ function defaultConfig() {
     hideCgnat: false,
     preferSameSubnet: true,
     irohRelayUrl: 'https://relay.nextapp.pl',
+    // Nazwy kart wykluczonych per-interfejs z advertise mesh.
+    excludedInterfaces: [],
   };
 }
 
@@ -148,6 +150,24 @@ export function bindMeshTab(host, _outerRerender) {
     });
   });
 
+  // Per-karta advertise toggle — odznaczenie dodaje nazwe karty do
+  // `excludedInterfaces` (utrwalane przez Save razem z reszta configu).
+  host.querySelectorAll('[data-iface-advertise]').forEach((tgl) => {
+    tgl.addEventListener('change', (e) => {
+      const name = tgl.dataset.ifaceAdvertise;
+      if (!name) return;
+      if (!Array.isArray(config.excludedInterfaces)) config.excludedInterfaces = [];
+      const on = !!e.detail?.checked;
+      const idx = config.excludedInterfaces.indexOf(name);
+      if (on && idx !== -1) {
+        config.excludedInterfaces.splice(idx, 1);
+      } else if (!on && idx === -1) {
+        config.excludedInterfaces.push(name);
+      }
+      rerender();
+    });
+  });
+
   // Relay URL input.
   host.querySelector('#relay-url')?.addEventListener('input', (e) => {
     // tf-input emituje natywny `input`; czytamy przez `.value` komponentu.
@@ -176,6 +196,7 @@ export function bindMeshTab(host, _outerRerender) {
         hideCgnat: !!config.hideCgnat,
         preferSameSubnet: !!config.preferSameSubnet,
         irohRelayUrl: config.irohRelayUrl || '',
+        excludedInterfaces: Array.isArray(config.excludedInterfaces) ? config.excludedInterfaces : [],
       });
       pendingRestart = !!(resp?.restartRequired ?? resp?.restart_required);
       toast(I18n.t('settings.mesh.save_success'), 'success');
@@ -223,6 +244,9 @@ async function loadAll() {
       hideCgnat: !!(raw.hideCgnat ?? raw.hide_cgnat),
       preferSameSubnet: !!(raw.preferSameSubnet ?? raw.prefer_same_subnet),
       irohRelayUrl: String(raw.irohRelayUrl ?? raw.iroh_relay_url ?? ''),
+      excludedInterfaces: Array.isArray(raw.excludedInterfaces ?? raw.excluded_interfaces)
+        ? (raw.excludedInterfaces ?? raw.excluded_interfaces).map(String)
+        : [],
     };
   } catch (err) {
     toast(`${I18n.t('common.error')}: ${err.message || err}`, 'error');
@@ -389,9 +413,15 @@ function renderInterfaceRow(iface) {
     ? `<span class="status-pill ok">UP</span>`
     : `<span class="status-pill off">DOWN</span>`;
 
-  const advertiseOn = iface.isUp && !isLoop && !(config.hideDocker && role === 'virt' && (iface.name || '').startsWith('docker'));
+  // Per-karta exclude (`config.excludedInterfaces`) ma priorytet: odznaczona
+  // karta = wykluczona z advertise niezaleznie od kategorii. Reszta warunkow
+  // (down/loopback/globalny hide_docker) tylko dla wyliczenia stanu wizualnego.
+  const isExcluded = Array.isArray(config.excludedInterfaces)
+    && config.excludedInterfaces.includes(iface.name);
+  const advertiseOn = iface.isUp && !isLoop && !isExcluded
+    && !(config.hideDocker && role === 'virt' && (iface.name || '').startsWith('docker'));
   const advertiseAttr = advertiseOn ? 'checked' : '';
-  const advertiseDisabled = isLoop ? 'disabled' : '';
+  const advertiseDisabled = (isLoop || !iface.isUp) ? 'disabled' : '';
 
   const rowClass = [];
   if (selected) rowClass.push('selected');
@@ -422,7 +452,7 @@ function renderInterfaceRow(iface) {
       <td>${ipCell}</td>
       <td><span class="role-pill role-${role}">${escapeHtml(roleLabel(role))}</span></td>
       <td>${statusPill}</td>
-      <td><tf-toggle ${advertiseAttr} ${advertiseDisabled}></tf-toggle></td>
+      <td><tf-toggle ${advertiseAttr} ${advertiseDisabled} data-iface-advertise="${escapeAttr(iface.name || '')}"></tf-toggle></td>
       <td class="actions-col" style="padding-right: 20px;">
         <div class="row-actions">
           <tf-button variant="ghost" size="sm" icon="info" title="${escapeAttr(I18n.t('common.details'))}"></tf-button>
