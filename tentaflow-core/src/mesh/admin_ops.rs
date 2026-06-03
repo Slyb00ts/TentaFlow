@@ -109,7 +109,7 @@ fn begin_baseline_adopt_after_confirm(
     remote_node_id: &str,
 ) {
     use crate::sync::core_baseline::{
-        local_role, store_adopt_state, BaselineAdoptState, BaselinePhase, BaselineRole,
+        begin_adopt_atomic, local_role, BaselinePhase, BaselineRole, BeginOutcome,
     };
 
     let donor_epoch = crate::sync::runtime::core_epoch();
@@ -120,19 +120,26 @@ fn begin_baseline_adopt_after_confirm(
     );
     let role = local_role(local_node_id, &donor);
 
-    let state = BaselineAdoptState {
+    // Atomowy single-flight: check+write w jednej transakcji zamiast goly zapis.
+    // Wywolywane przez OBIE strony pairingu (inicjator po confirm w
+    // `initiate_pairing`, RECEIVER po confirm w `confirm_pairing`) — kazda strona
+    // liczy te same role z `decide_roles`, wiec stan jest spojny po obu stronach.
+    match begin_adopt_atomic(
+        db,
         role,
-        peer: remote_node_id.to_string(),
-        epoch: donor_epoch,
-        phase: BaselinePhase::Elected,
-    };
-    if let Err(e) = store_adopt_state(db, &state) {
-        warn!(
-            peer = %remote_node_id,
-            "baseline adopt: zapis stanu elekcji nieudany: {}",
-            e
-        );
-        return;
+        remote_node_id,
+        &donor_epoch,
+        BaselinePhase::Elected,
+    ) {
+        Ok(BeginOutcome::Started) | Ok(BeginOutcome::Resume(_)) => {}
+        Err(e) => {
+            warn!(
+                peer = %remote_node_id,
+                "baseline adopt: atomic election failed (single-flight conflict?): {}",
+                e
+            );
+            return;
+        }
     }
     match role {
         BaselineRole::Joiner => info!(
@@ -756,6 +763,12 @@ pub async fn confirm_pairing(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         send_pairing_bootstrap(qm, security, remote_node_id, local_node_id).await?;
     }
+
+    // Receiver-side election: the initiator armed the single-flight state in
+    // `initiate_pairing`; the receiver must arm it too so both sides know the
+    // baseline roles before transport (krok 2) starts. `decide_roles` is pure, so
+    // both ends compute the identical donor/joiner split.
+    begin_baseline_adopt_after_confirm(&security.db, local_node_id, remote_node_id);
 
     let _ =
         db::repository::delete_setting(&security.db, &format!("pending_pubkey:{}", remote_node_id));
