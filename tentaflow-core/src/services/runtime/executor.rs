@@ -1398,6 +1398,15 @@ impl ModelRuntimeExecutor {
                     }
                     let text = request.input.clone();
                     let speed = request.speed.unwrap_or(1.0);
+                    // Multilingual silniki (Supertonic) potrzebuja jezyka z
+                    // requestu (per-user trafia do `TTSRequest.language` przez
+                    // TtsDispatcher); voice preset (np. `M1`) wybiera glos.
+                    let language = request.language.clone();
+                    let voice = if request.voice.is_empty() {
+                        None
+                    } else {
+                        Some(request.voice.clone())
+                    };
                     let res =
                         tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, u32)> {
                             let mgr = crate::tts::shared_tts_manager();
@@ -1414,6 +1423,8 @@ impl ModelRuntimeExecutor {
                                     text,
                                     speaker_id: 0,
                                     speed,
+                                    voice,
+                                    language,
                                 },
                             )?;
                             Ok((out.samples, out.sample_rate))

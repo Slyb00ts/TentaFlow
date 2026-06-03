@@ -19,7 +19,7 @@ gpu-metal = ["tentaflow-core/gpu-metal"]
 # whisper.cpp na CPU). Na macOS STT idzie WYLACZNIE przez mlx-whisper (GPU,
 # inference-mlx-whisper ponizej). whisper-rs zostaje tylko dla Linux/Windows.
 # `camera` re-dodane jawnie (tez bylo w default).
-tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa", "vector", "camera"] }
+tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa", "inference-supertonic", "vector", "camera"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.52.2", features = ["full"] }
 tracing = "0.1"

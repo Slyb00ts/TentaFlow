@@ -2678,6 +2678,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             if let Some(err) = end.error {
                 set(&obj, "error", err.into());
             }
+            if let Some(t) = end.text {
+                set(&obj, "text", t.into());
+            }
         }
         MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Req(req)) => {
             set(&obj, "variant", "TranslateRequest".into());
