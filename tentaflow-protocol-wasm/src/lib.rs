@@ -30,7 +30,8 @@ use tentaflow_protocol::{
         AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
         AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
         AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVisibilityListRequest,
-        AddonVisibilitySetRequest, ApiKeyCreateRequest, AuthLoginRequest, ChatMessage,
+        AddonVisibilitySetRequest, ApiKeyCreateRequest, AuthLoginRequest,
+        BaselineAdoptPhaseTag, BaselineAdoptStartRequest, ChatMessage,
         ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
         ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
         ClusterUpdateRequest, DeployVllmRecommendRequest, FlowCreateRequest, FlowUpdateRequest,
@@ -562,6 +563,31 @@ pub fn encode_mesh_services_list_request() -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen(js_name = encodeMeshTrustedListRequest)]
 pub fn encode_mesh_trusted_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MeshTrustedListRequest).map_err(|e| JsError::new(&e))
+}
+
+// ---- Sync baseline-adopt admin (FAZA C krok 3 — donor list/start/status/clear) ----
+
+#[wasm_bindgen(js_name = encodeBaselineDonorListRequest)]
+pub fn encode_baseline_donor_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BaselineDonorListRequest).map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBaselineAdoptStartRequest)]
+pub fn encode_baseline_adopt_start_request(donor_node_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BaselineAdoptStartRequestBody(
+        BaselineAdoptStartRequest { donor_node_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBaselineAdoptStatusRequest)]
+pub fn encode_baseline_adopt_status_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BaselineAdoptStatusRequest).map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBaselineAdoptClearRequest)]
+pub fn encode_baseline_adopt_clear_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BaselineAdoptClearRequest).map_err(|e| JsError::new(&e))
 }
 
 // ---- Mesh write ops (FAZA 1b — pairing/trust/connect/command/network-config) ----
@@ -5529,6 +5555,115 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::RoleCatalogBody(payload) => {
             role_catalog_payload_to_js(&obj, payload);
         }
+        MessageBody::BaselineDonorListRequest => {
+            set(&obj, "variant", "BaselineDonorListRequest".into());
+        }
+        MessageBody::BaselineDonorListResponseBody(resp) => {
+            set(&obj, "variant", "BaselineDonorListResponse".into());
+            let arr = js_sys::Array::new();
+            for c in resp.candidates {
+                let item = js_sys::Object::new();
+                set(&item, "nodeId", c.node_id.clone().into());
+                set(&item, "node_id", c.node_id.into());
+                set(&item, "displayName", c.display_name.clone().into());
+                set(&item, "display_name", c.display_name.into());
+                set(&item, "trusted", c.trusted.into());
+                if let Some(s) = c.summary {
+                    let summary = js_sys::Object::new();
+                    set(&summary, "orgName", s.org_name.clone().into());
+                    set(&summary, "org_name", s.org_name.into());
+                    set(&summary, "users", (s.users as f64).into());
+                    set(&summary, "flows", (s.flows as f64).into());
+                    set(&summary, "roles", (s.roles as f64).into());
+                    set(&item, "summary", summary.into());
+                } else {
+                    set(&item, "summary", JsValue::NULL);
+                }
+                arr.push(&item.into());
+            }
+            set(&obj, "candidates", arr.into());
+        }
+        MessageBody::BaselineAdoptStartRequestBody(req) => {
+            set(&obj, "variant", "BaselineAdoptStartRequest".into());
+            set(&obj, "donorNodeId", req.donor_node_id.clone().into());
+            set(&obj, "donor_node_id", req.donor_node_id.into());
+        }
+        MessageBody::BaselineAdoptStartResponseBody(resp) => {
+            set(&obj, "variant", "BaselineAdoptStartResponse".into());
+            set(&obj, "ok", resp.ok.into());
+            set(&obj, "started", resp.started.into());
+            set(&obj, "message", resp.message.into());
+        }
+        MessageBody::BaselineAdoptStatusRequest => {
+            set(&obj, "variant", "BaselineAdoptStatusRequest".into());
+        }
+        MessageBody::BaselineAdoptStatusResponseBody(resp) => {
+            set(&obj, "variant", "BaselineAdoptStatusResponse".into());
+            set(&obj, "phase", baseline_phase_name(resp.phase).into());
+            match resp.peer {
+                Some(p) => {
+                    set(&obj, "peer", p.clone().into());
+                }
+                None => set(&obj, "peer", JsValue::NULL),
+            }
+            match resp.is_joiner {
+                Some(j) => {
+                    set(&obj, "isJoiner", j.into());
+                    set(&obj, "is_joiner", j.into());
+                }
+                None => {
+                    set(&obj, "isJoiner", JsValue::NULL);
+                    set(&obj, "is_joiner", JsValue::NULL);
+                }
+            }
+            if let Some(r) = resp.report {
+                let report = js_sys::Object::new();
+                set(&report, "donorOrgId", r.donor_org_id.clone().into());
+                set(&report, "donor_org_id", r.donor_org_id.into());
+                set(
+                    &report,
+                    "usersMergedByEmail",
+                    (r.users_merged_by_email as f64).into(),
+                );
+                set(
+                    &report,
+                    "users_merged_by_email",
+                    (r.users_merged_by_email as f64).into(),
+                );
+                set(
+                    &report,
+                    "usersJoinedDonorOrg",
+                    (r.users_joined_donor_org as f64).into(),
+                );
+                set(
+                    &report,
+                    "users_joined_donor_org",
+                    (r.users_joined_donor_org as f64).into(),
+                );
+                set(
+                    &report,
+                    "collisionsSuffixed",
+                    (r.collisions_suffixed as f64).into(),
+                );
+                set(
+                    &report,
+                    "collisions_suffixed",
+                    (r.collisions_suffixed as f64).into(),
+                );
+                set(&obj, "report", report.into());
+            } else {
+                set(&obj, "report", JsValue::NULL);
+            }
+        }
+        MessageBody::BaselineAdoptClearRequest => {
+            set(&obj, "variant", "BaselineAdoptClearRequest".into());
+        }
+        MessageBody::BaselineAdoptClearResponseBody(resp) => {
+            set(&obj, "variant", "BaselineAdoptClearResponse".into());
+            set(&obj, "ok", resp.ok.into());
+            set(&obj, "cleared", resp.cleared.into());
+            set(&obj, "message", resp.message.into());
+        }
         MessageBody::UiChannelCbor(bytes) => {
             set(&obj, "variant", "UiChannelCbor".into());
             set(&obj, "cbor", js_sys::Uint8Array::from(&bytes[..]).into());
@@ -7271,6 +7406,17 @@ fn my_oauth_entry_to_js(e: tentaflow_protocol::message_body::MyOAuthEntry) -> js
     set(&obj, "expiresAtEpoch", e.expires_at_epoch.clone().into());
     set(&obj, "expires_at_epoch", e.expires_at_epoch.clone().into());
     obj
+}
+
+fn baseline_phase_name(tag: BaselineAdoptPhaseTag) -> &'static str {
+    match tag {
+        BaselineAdoptPhaseTag::None => "None",
+        BaselineAdoptPhaseTag::Elected => "Elected",
+        BaselineAdoptPhaseTag::Receiving => "Receiving",
+        BaselineAdoptPhaseTag::Importing => "Importing",
+        BaselineAdoptPhaseTag::Imported => "Imported",
+        BaselineAdoptPhaseTag::Completed => "Completed",
+    }
 }
 
 fn protocol_error_code_name(code: ProtocolErrorCode) -> &'static str {
