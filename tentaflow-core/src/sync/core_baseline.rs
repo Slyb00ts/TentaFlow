@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use tentaflow_protocol::mesh::{BaselineAck, BaselineChunk, BaselineEpoch};
+use tentaflow_protocol::mesh::{BaselineAck, BaselineChunk, BaselineEpoch, BaselineHeader};
 
 use crate::db::{self, DbPool};
 use crate::sync::ledger::{LedgerResult, SyncLedgerError};
@@ -56,6 +56,11 @@ pub enum BaselinePhase {
     Receiving,
     /// Snapshot kompletny, import do SQLite trwa albo zaraz ruszy.
     Importing,
+    /// Import (merge tabel) zacommitowany TRWALE, ale post-commit adopcja epocha
+    /// + reseed jeszcze nie zakonczona. Krytyczne dla idempotencji: po awarii na
+    /// kroku epoch-adopt baza jest juz scalona, wiec re-pair NIE moze importowac
+    /// drugi raz — musi tylko wznowic epoch-adopt+reseed do `Completed`.
+    Imported,
     /// Import zacommitowany, epoch zaadoptowany — adopcja zakonczona.
     Completed,
 }
@@ -94,21 +99,94 @@ pub fn clear_adopt_state(db: &DbPool) -> LedgerResult<()> {
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
 }
 
-/// Sprawdza, czy nod moze wejsc w `desired` role. Trwajaca adopcja w
-/// przeciwnej roli (z faza != Completed) jest twardym bledem — to bramka
-/// single-flight anty-split-brain. `Completed` w przeciwnej roli oznacza
-/// zakonczona poprzednia adopcje i nie blokuje nowej.
-pub fn guard_role(db: &DbPool, desired: BaselineRole) -> LedgerResult<()> {
-    if let Some(existing) = load_adopt_state(db)? {
-        if existing.role != desired && existing.phase != BaselinePhase::Completed {
+/// Czy istniejacy stan adopcji blokuje wejscie w `desired` role. Trwajaca
+/// adopcja w przeciwnej roli (faza != Completed) jest konfliktem single-flight
+/// anty-split-brain; `Completed` w przeciwnej roli to zakonczona poprzednia
+/// adopcja i nie blokuje. Czysta funkcja decyzyjna — bez I/O — uzywana przez
+/// atomowy `begin_adopt_atomic` i przez idempotentny wznawiacz importu.
+fn role_conflicts(existing: &BaselineAdoptState, desired: BaselineRole) -> bool {
+    existing.role != desired && existing.phase != BaselinePhase::Completed
+}
+
+/// Atomowy start adopcji single-flight. Sprawdzenie istniejacego stanu I zapis
+/// nowego stanu dziela jedna transakcje SQLite na wspoldzielonym (Mutex)
+/// polaczeniu, wiec dwa rownolegle starty nie moga oba przejsc bramki: pierwszy
+/// commituje stan, drugi widzi go w tej samej serializowanej transakcji i
+/// dostaje twardy blad. To zamyka okno TOCTOU miedzy "czytaj rola" a "zapisz
+/// rola", ktore w rozdzielonym guard+store pozwalalo na split-brain
+/// (A-joins-B && B-joins-A jednoczesnie).
+///
+/// Idempotencja re-pair: gdy istniejacy stan dotyczy TEGO SAMEGO peera+epocha i
+/// jest juz w fazie `Imported`/`Completed`, NIE jest to konflikt — zwracamy
+/// `BeginOutcome::Resume(existing)`, by wywolujacy wznowil (nie restartowal)
+/// adopcje. Swiezy start zwraca `BeginOutcome::Started`.
+pub enum BeginOutcome {
+    Started,
+    Resume(BaselineAdoptState),
+}
+
+pub fn begin_adopt_atomic(
+    db: &DbPool,
+    desired: BaselineRole,
+    peer: &str,
+    epoch: &BaselineEpoch,
+    phase: BaselinePhase,
+) -> LedgerResult<BeginOutcome> {
+    let mut conn = db::repository::acquire_for_baseline(db)
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+
+    let existing: Option<BaselineAdoptState> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![BASELINE_ADOPT_STATE_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|e| SyncLedgerError::Decode(format!("baseline adopt state decode: {e}")))?;
+
+    if let Some(existing) = existing {
+        // Wznowienie tej samej adopcji (same peer+epoch+rola) w fazie
+        // przetrwalej awarie post-commit lub juz zakonczonej.
+        let same_target = existing.role == desired
+            && existing.peer == peer
+            && &existing.epoch == epoch;
+        if same_target
+            && matches!(existing.phase, BaselinePhase::Imported | BaselinePhase::Completed)
+        {
+            return Ok(BeginOutcome::Resume(existing));
+        }
+        if role_conflicts(&existing, desired) {
             return Err(SyncLedgerError::Runtime(format!(
                 "baseline adopt already in progress as {:?} with peer {} (phase {:?}); \
-                 refusing to start as {:?}",
-                existing.role, existing.peer, existing.phase, desired
+                 refusing to start as {:?} with peer {}",
+                existing.role, existing.peer, existing.phase, desired, peer
             )));
         }
     }
-    Ok(())
+
+    let state = BaselineAdoptState {
+        role: desired,
+        peer: peer.to_string(),
+        epoch: epoch.clone(),
+        phase,
+    };
+    let json = serde_json::to_string(&state)
+        .map_err(|e| SyncLedgerError::Codec(format!("baseline adopt state encode: {e}")))?;
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+        params![BASELINE_ADOPT_STATE_KEY, json],
+    )
+    .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    tx.commit()
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    Ok(BeginOutcome::Started)
 }
 
 // =============================================================================
@@ -205,6 +283,15 @@ pub struct BaselineSnapshot {
     pub sync_policies: Vec<SyncPolicyRow>,
     pub sync_resource_acl: Vec<SyncResourceAclRow>,
     pub org_memberships: Vec<OrgMembershipRow>,
+    pub sync_nodes: Vec<SyncNodeRow>,
+    pub user_identity_keys: Vec<UserIdentityKeyRow>,
+    pub node_user_assignments: Vec<NodeUserAssignmentRow>,
+    pub sync_explicit_shares: Vec<SyncExplicitShareRow>,
+    /// Allowlistowane sekrety zewnetrzne (`settings` is_secret) wyslane jako
+    /// ODSZYFROWANY plaintext po juz-zaufanym kanale pairingu (donor wysyla po
+    /// uzgodnieniu rol); joiner re-encryptuje wlasnym `SettingsCipher` przy
+    /// imporcie. Donor-wins: wartosc dawcy nadpisuje lokalna.
+    pub shared_secrets: Vec<SharedSecretRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,12 +391,64 @@ pub struct OrgMembershipRow {
     pub granted_by: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncNodeRow {
+    pub node_id: String,
+    pub public_key: String,
+    pub public_key_type: String,
+    pub display_name: String,
+    pub node_kind: String,
+    pub trust_status: String,
+    pub owner_user_id: Option<String>,
+    pub sync_profile: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserIdentityKeyRow {
+    pub key_id: String,
+    pub user_id: String,
+    pub key_type: String,
+    pub public_key: String,
+    pub purpose: String,
+    pub status: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeUserAssignmentRow {
+    pub node_id: String,
+    pub user_id: String,
+    pub assignment_mode: String,
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncExplicitShareRow {
+    pub org_id: String,
+    pub addon_id: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub action: String,
+    pub granted_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedSecretRow {
+    pub key: String,
+    /// Plaintext sekretu (donor odszyfrowal swoim cipher przed wyslaniem;
+    /// joiner re-encryptuje przy imporcie). Nigdy nie persystowany w tej formie.
+    pub value: String,
+}
+
 /// Buduje snapshot baseline'u z bazy dawcy w JEDNEJ transakcji read, dzieki
 /// czemu wszystkie tabele widza spojny migawkowy stan (deferred-read snapshot
 /// izolacji SQLite).
 pub fn capture_baseline_snapshot(
     db: &DbPool,
     epoch: BaselineEpoch,
+    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineSnapshot> {
     let mut conn = db::repository::acquire_for_baseline(db)
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -317,7 +456,7 @@ pub fn capture_baseline_snapshot(
         .transaction()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
 
-    let snapshot = capture_baseline_snapshot_tx(&tx, epoch)?;
+    let snapshot = capture_baseline_snapshot_tx(&tx, epoch, cipher)?;
     // Read-only transakcja — commit zwalnia migawke bez zmian.
     tx.commit()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -327,6 +466,7 @@ pub fn capture_baseline_snapshot(
 fn capture_baseline_snapshot_tx(
     tx: &Transaction<'_>,
     epoch: BaselineEpoch,
+    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineSnapshot> {
     let map_err = |e: rusqlite::Error| SyncLedgerError::Runtime(e.to_string());
 
@@ -533,6 +673,120 @@ fn capture_baseline_snapshot_tx(
         .map_err(map_err)?;
     drop(stmt);
 
+    let mut stmt = tx
+        .prepare(
+            "SELECT node_id, public_key, public_key_type, display_name, node_kind, \
+                    trust_status, owner_user_id, sync_profile FROM sync_nodes",
+        )
+        .map_err(map_err)?;
+    let sync_nodes = stmt
+        .query_map([], |r| {
+            Ok(SyncNodeRow {
+                node_id: r.get(0)?,
+                public_key: r.get(1)?,
+                public_key_type: r.get(2)?,
+                display_name: r.get(3)?,
+                node_kind: r.get(4)?,
+                trust_status: r.get(5)?,
+                owner_user_id: r.get(6)?,
+                sync_profile: r.get(7)?,
+            })
+        })
+        .map_err(map_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+    drop(stmt);
+
+    let mut stmt = tx
+        .prepare(
+            "SELECT key_id, user_id, key_type, public_key, purpose, status, revoked_at \
+             FROM user_identity_keys",
+        )
+        .map_err(map_err)?;
+    let user_identity_keys = stmt
+        .query_map([], |r| {
+            Ok(UserIdentityKeyRow {
+                key_id: r.get(0)?,
+                user_id: r.get(1)?,
+                key_type: r.get(2)?,
+                public_key: r.get(3)?,
+                purpose: r.get(4)?,
+                status: r.get(5)?,
+                revoked_at: r.get(6)?,
+            })
+        })
+        .map_err(map_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+    drop(stmt);
+
+    let mut stmt = tx
+        .prepare(
+            "SELECT node_id, user_id, assignment_mode, created_by FROM node_user_assignments",
+        )
+        .map_err(map_err)?;
+    let node_user_assignments = stmt
+        .query_map([], |r| {
+            Ok(NodeUserAssignmentRow {
+                node_id: r.get(0)?,
+                user_id: r.get(1)?,
+                assignment_mode: r.get(2)?,
+                created_by: r.get(3)?,
+            })
+        })
+        .map_err(map_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+    drop(stmt);
+
+    let mut stmt = tx
+        .prepare(
+            "SELECT org_id, addon_id, resource_type, resource_id, subject_type, subject_id, \
+                    action, granted_by FROM sync_explicit_shares WHERE revoked_at IS NULL",
+        )
+        .map_err(map_err)?;
+    let sync_explicit_shares = stmt
+        .query_map([], |r| {
+            Ok(SyncExplicitShareRow {
+                org_id: r.get(0)?,
+                addon_id: r.get(1)?,
+                resource_type: r.get(2)?,
+                resource_id: r.get(3)?,
+                subject_type: r.get(4)?,
+                subject_id: r.get(5)?,
+                action: r.get(6)?,
+                granted_by: r.get(7)?,
+            })
+        })
+        .map_err(map_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+    drop(stmt);
+
+    // Sekrety: odszyfrowane plaintext do wyslania po juz-zaufanym kanale.
+    let mut shared_secrets = Vec::new();
+    for &key in db::repository::SHARED_SECRET_SETTING_KEYS {
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some(raw_value) = raw else { continue };
+        if raw_value.is_empty() {
+            continue;
+        }
+        let value = cipher
+            .decrypt(&raw_value)
+            .map_err(|e| SyncLedgerError::Runtime(format!("decrypt shared secret {key}: {e}")))?;
+        shared_secrets.push(SharedSecretRow {
+            key: key.to_string(),
+            value,
+        });
+    }
+
     Ok(BaselineSnapshot {
         epoch,
         organizations,
@@ -545,6 +799,11 @@ fn capture_baseline_snapshot_tx(
         sync_policies,
         sync_resource_acl,
         org_memberships,
+        sync_nodes,
+        user_identity_keys,
+        node_user_assignments,
+        sync_explicit_shares,
+        shared_secrets,
     })
 }
 
@@ -560,6 +819,11 @@ pub const BASELINE_TABLE_NAMES: &[&str] = &[
     "sync_policies",
     "sync_resource_acl",
     "org_memberships",
+    "sync_nodes",
+    "user_identity_keys",
+    "node_user_assignments",
+    "sync_explicit_shares",
+    "settings",
 ];
 
 // =============================================================================
@@ -593,18 +857,70 @@ pub fn chunk_snapshot(bytes: &[u8]) -> Vec<BaselineChunk> {
         .collect()
 }
 
-/// Sklada chunki z powrotem w surowy snapshot, weryfikujac kolejnosc `seq` oraz
-/// `content_hash` kazdego chunka. Bledny hash albo luka w sekwencji to twardy
-/// blad — joiner nigdy nie importuje czesciowego/uszkodzonego baseline'u.
-pub fn reassemble_chunks(chunks: &[BaselineChunk]) -> LedgerResult<Vec<u8>> {
+/// Gorny limit calego snapshotu (bajty surowego CBOR). Joiner odrzuca transfer,
+/// ktorego zsumowane chunki przekraczaja ten limit — chroni przed snapshotem
+/// rozdmuchanym przez zlosliwego/uszkodzonego dawce do OOM. 256 MiB to zapas
+/// rzedow wielkosci ponad realny baseline platformowy single-org noda.
+pub const BASELINE_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Buduje naglowek transferu dla danego snapshotu: limit, rzeczywisty rozmiar i
+/// hash CALOSCI. Joiner weryfikuje wszystkie trzy przy skladaniu (`reassemble_chunks`).
+pub fn build_baseline_header(snapshot: &BaselineSnapshot, raw: &[u8]) -> BaselineHeader {
+    let row_counts = vec![
+        snapshot.organizations.len() as u64,
+        snapshot.roles.len() as u64,
+        snapshot.user_accounts.len() as u64,
+        snapshot.user_groups.len() as u64,
+        snapshot.group_members.len() as u64,
+        snapshot.flows.len() as u64,
+        snapshot.flow_model_bindings.len() as u64,
+        snapshot.sync_policies.len() as u64,
+        snapshot.sync_resource_acl.len() as u64,
+        snapshot.org_memberships.len() as u64,
+        snapshot.sync_nodes.len() as u64,
+        snapshot.user_identity_keys.len() as u64,
+        snapshot.node_user_assignments.len() as u64,
+        snapshot.sync_explicit_shares.len() as u64,
+        snapshot.shared_secrets.len() as u64,
+    ];
+    BaselineHeader {
+        schema_version: 1,
+        epoch: snapshot.epoch.counter,
+        tables: BASELINE_TABLE_NAMES.iter().map(|s| s.to_string()).collect(),
+        row_counts,
+        total_bytes: raw.len() as u64,
+        max_bytes: BASELINE_MAX_TOTAL_BYTES,
+        content_hash: *blake3::hash(raw).as_bytes(),
+    }
+}
+
+/// Sklada chunki z powrotem w surowy snapshot, egzekwujac naglowek transferu.
+/// Weryfikuje: (1) ciaglosc `seq` 0..n bez luk i duplikatow, (2) `content_hash`
+/// kazdego chunka (uszkodzenie w miejscu), (3) `header.max_bytes` (suma nie moze
+/// przekroczyc limitu — odrzuca OOM-bomb), (4) `header.total_bytes` (skladniki
+/// musza dokladnie odtworzyc deklarowany rozmiar — wykrywa ucinanie/dolepianie),
+/// (5) hash CALOSCI z naglowka (wykrywa chunk z przepisanym `seq` lub
+/// przestawiony, ktorego per-chunk hash sam by nie zlapal). Joiner NIGDY nie
+/// importuje czesciowego/uszkodzonego/zmanipulowanego baseline'u.
+pub fn reassemble_chunks(
+    chunks: &[BaselineChunk],
+    header: &BaselineHeader,
+) -> LedgerResult<Vec<u8>> {
+    if header.total_bytes > header.max_bytes || header.total_bytes > BASELINE_MAX_TOTAL_BYTES {
+        return Err(SyncLedgerError::Runtime(format!(
+            "baseline snapshot too large: declared {} bytes exceeds limit {} (hard cap {})",
+            header.total_bytes, header.max_bytes, BASELINE_MAX_TOTAL_BYTES
+        )));
+    }
+
     let mut ordered: Vec<&BaselineChunk> = chunks.iter().collect();
     ordered.sort_by_key(|c| c.seq);
 
-    let mut out = Vec::new();
+    let mut out: Vec<u8> = Vec::with_capacity(header.total_bytes as usize);
     for (expected_seq, chunk) in ordered.iter().enumerate() {
         if chunk.seq != expected_seq as u64 {
             return Err(SyncLedgerError::Runtime(format!(
-                "baseline chunk sequence gap: expected seq {expected_seq}, got {}",
+                "baseline chunk sequence gap/duplicate: expected seq {expected_seq}, got {}",
                 chunk.seq
             )));
         }
@@ -615,7 +931,28 @@ pub fn reassemble_chunks(chunks: &[BaselineChunk]) -> LedgerResult<Vec<u8>> {
                 chunk.seq
             )));
         }
+        // Egzekwuj limit calosci w trakcie skladania, by uszkodzony total_bytes
+        // nie pozwolil alokowac nieograniczonej pamieci.
+        if out.len() as u64 + chunk.bytes.len() as u64 > header.max_bytes {
+            return Err(SyncLedgerError::Runtime(
+                "baseline reassembly exceeds header max_bytes".into(),
+            ));
+        }
         out.extend_from_slice(&chunk.bytes);
+    }
+
+    if out.len() as u64 != header.total_bytes {
+        return Err(SyncLedgerError::Runtime(format!(
+            "baseline reassembly size mismatch: got {} bytes, header declared {}",
+            out.len(),
+            header.total_bytes
+        )));
+    }
+    let full = *blake3::hash(&out).as_bytes();
+    if full != header.content_hash {
+        return Err(SyncLedgerError::Runtime(
+            "baseline whole-snapshot hash mismatch (reordered/rewritten transfer)".into(),
+        ));
     }
     Ok(out)
 }
@@ -658,40 +995,36 @@ pub fn import_baseline(
     db: &DbPool,
     snapshot: &BaselineSnapshot,
     donor_node_id: &str,
+    local_node_id: &str,
+    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineImportReport> {
     let donor_org_id = primary_donor_org(snapshot)?;
 
-    guard_role(db, BaselineRole::Joiner)?;
-    if let Some(existing) = load_adopt_state(db)? {
-        if existing.phase == BaselinePhase::Completed
-            && existing.peer == donor_node_id
-            && existing.epoch == snapshot.epoch
-        {
-            info!(
-                donor = %donor_node_id,
-                "baseline import already completed for this donor+epoch; skipping (idempotent re-pair)"
+    // Atomowy single-flight: sprawdzenie+zapis w jednej transakcji. `Resume`
+    // oznacza, ze ta sama adopcja jest juz `Imported`/`Completed` — DB scalony,
+    // wiec NIE importujemy drugi raz; wznawiamy tylko post-commit kroki.
+    match begin_adopt_atomic(
+        db,
+        BaselineRole::Joiner,
+        donor_node_id,
+        &snapshot.epoch,
+        BaselinePhase::Importing,
+    )? {
+        BeginOutcome::Started => {}
+        BeginOutcome::Resume(existing) => {
+            return resume_post_commit(
+                db,
+                &snapshot.epoch,
+                donor_node_id,
+                &donor_org_id,
+                existing.phase,
             );
-            return Ok(BaselineImportReport {
-                donor_org_id,
-                ..Default::default()
-            });
         }
     }
 
-    store_adopt_state(
-        db,
-        &BaselineAdoptState {
-            role: BaselineRole::Joiner,
-            peer: donor_node_id.to_string(),
-            epoch: snapshot.epoch.clone(),
-            phase: BaselinePhase::Importing,
-        },
-    )?;
-
-    // Caly import w jednej transakcji. Guard polaczenia jest scope'owany do tego
-    // bloku, by zostal zwolniony PRZED ponownym `store_adopt_state` ponizej (std
-    // Mutex nie jest reentrant — trzymanie guarda przy kolejnym `acquire`
-    // zablokowaloby watek).
+    // (a-c) Caly merge tabel w JEDNEJ transakcji: bledny krok cofa wszystko i
+    // zostawia joinera nietknietego. Guard polaczenia scope'owany do bloku, by
+    // zwolnic Mutex przed kolejnymi `acquire` (std Mutex nie jest reentrant).
     let report = {
         let mut conn = db::repository::acquire_for_baseline(db)
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -699,13 +1032,13 @@ pub fn import_baseline(
             .transaction()
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
 
-        let report = match import_baseline_tx(&tx, snapshot, &donor_org_id) {
+        let report = match import_baseline_tx(&tx, snapshot, &donor_org_id, local_node_id, cipher) {
             Ok(report) => report,
             Err(e) => {
-                // Rollback nastapi automatycznie przy drop(tx); stan adopcji NIE
-                // jest czyszczony tutaj — `Importing` przetrwa, a operator/krok 2
-                // moze ponowic. Joiner pozostaje nietkniety.
-                warn!(donor = %donor_node_id, "baseline import failed, rolling back: {e}");
+                // Rollback automatyczny przy drop(tx). Stan zostaje `Importing`
+                // (faza < Imported), co znaczy "DB jeszcze NIE scalony" — re-pair
+                // wystartuje pelny import od nowa. Joiner nietkniety.
+                warn!(donor = %donor_node_id, "baseline import failed before commit, rolling back: {e}");
                 return Err(e);
             }
         };
@@ -715,24 +1048,20 @@ pub fn import_baseline(
         report
     };
 
-    // (d) Reset partycji core + adopt epoch dawcy + reseed. Wymaga aktywnego
-    // runtime sync (Fjall ledger). W testach in-process (dwa goly DbPool bez
-    // runtime) ten krok jest no-opem — sama transakcja SQLite jest juz
-    // zatwierdzona i w pelni testowalna.
-    if let Err(e) = crate::sync::runtime::adopt_donor_baseline_epoch(&snapshot.epoch) {
-        warn!(donor = %donor_node_id, "baseline epoch adopt/reseed failed post-commit: {e}");
-        return Err(e);
-    }
-
+    // DB scalony TRWALE. Utrwalamy faze `Imported` ZANIM ruszy post-commit
+    // epoch-adopt/reseed: gdyby ten krok padl, re-pair zobaczy `Imported` i NIE
+    // zaimportuje drugi raz — wznowi tylko epoch-adopt+reseed.
     store_adopt_state(
         db,
         &BaselineAdoptState {
             role: BaselineRole::Joiner,
             peer: donor_node_id.to_string(),
             epoch: snapshot.epoch.clone(),
-            phase: BaselinePhase::Completed,
+            phase: BaselinePhase::Imported,
         },
     )?;
+
+    finish_post_commit(db, &snapshot.epoch, donor_node_id)?;
 
     info!(
         donor = %donor_node_id,
@@ -745,30 +1074,90 @@ pub fn import_baseline(
     Ok(report)
 }
 
-/// Org dawcy, do ktorej joiner dolacza. Snapshot musi miec dokladnie jedna
-/// nie-`deleted` organizacje (faza C laczy DWA single-org nody); inaczej elekcja
-/// org jest niejednoznaczna i import jest odrzucany.
+/// Wznawia adopcje, ktorej merge tabel JUZ sie zakonczyl (faza
+/// `Imported`/`Completed`). Idempotentne: dla `Completed` no-op; dla `Imported`
+/// dokancza tylko post-commit epoch-adopt+reseed. NIE dotyka tabel — baza jest
+/// juz scalona, ponowny import zdublowalby remapy i nadpisalby suffiksy.
+fn resume_post_commit(
+    db: &DbPool,
+    epoch: &BaselineEpoch,
+    donor_node_id: &str,
+    donor_org_id: &str,
+    phase: BaselinePhase,
+) -> LedgerResult<BaselineImportReport> {
+    let report = BaselineImportReport {
+        donor_org_id: donor_org_id.to_string(),
+        ..Default::default()
+    };
+    match phase {
+        BaselinePhase::Completed => {
+            info!(
+                donor = %donor_node_id,
+                "baseline already completed for this donor+epoch; no-op (idempotent re-pair)"
+            );
+            Ok(report)
+        }
+        BaselinePhase::Imported => {
+            info!(
+                donor = %donor_node_id,
+                "baseline DB already merged (phase Imported); resuming epoch-adopt/reseed only"
+            );
+            finish_post_commit(db, epoch, donor_node_id)?;
+            Ok(report)
+        }
+        other => Err(SyncLedgerError::Runtime(format!(
+            "resume_post_commit called in unexpected phase {other:?}"
+        ))),
+    }
+}
+
+/// Post-commit: adoptuj epoch dawcy + reseed, potem utrwal `Completed`. Wymaga
+/// aktywnego runtime sync (Fjall ledger). W testach in-process (gole DbPool bez
+/// runtime) `adopt_donor_baseline_epoch` jest no-opem — transakcja SQLite jest
+/// juz zatwierdzona i w pelni testowalna. Repeatable: reseed czyta scalony stan
+/// SQLite, wiec ponowne wywolanie (re-pair) emituje ten sam SCALONY baseline.
+fn finish_post_commit(
+    db: &DbPool,
+    epoch: &BaselineEpoch,
+    donor_node_id: &str,
+) -> LedgerResult<BaselineImportReport> {
+    if let Err(e) = crate::sync::runtime::adopt_donor_baseline_epoch(epoch) {
+        warn!(donor = %donor_node_id, "baseline epoch adopt/reseed failed post-commit: {e}");
+        return Err(e);
+    }
+    store_adopt_state(
+        db,
+        &BaselineAdoptState {
+            role: BaselineRole::Joiner,
+            peer: donor_node_id.to_string(),
+            epoch: epoch.clone(),
+            phase: BaselinePhase::Completed,
+        },
+    )?;
+    Ok(BaselineImportReport::default())
+}
+
+/// Org dawcy, do ktorej joiner dolacza. Snapshot MUSI miec dokladnie jedna
+/// nie-`deleted` organizacje (faza C laczy DWA single-org nody). Wiecej niz jedna
+/// jest twardym bledem: `drop_foreign_org_rows` kasuje wszystko spoza wybranej
+/// org, wiec po cichym wyborze "najnizszego org_id" import skasowalby swiezo
+/// zaimportowane wiersze pozostalych orgow dawcy. Lepiej odrzucic niz zniszczyc.
 fn primary_donor_org(snapshot: &BaselineSnapshot) -> LedgerResult<String> {
-    let mut active: Vec<&OrganizationRow> = snapshot
+    let active: Vec<&OrganizationRow> = snapshot
         .organizations
         .iter()
         .filter(|o| o.status != "deleted")
         .collect();
-    active.sort_by(|a, b| a.org_id.cmp(&b.org_id));
     match active.as_slice() {
         [only] => Ok(only.org_id.clone()),
         [] => Err(SyncLedgerError::Runtime(
             "baseline snapshot carries no active organization".into(),
         )),
-        many => {
-            // Deterministyczny wybor: org o najnizszym org_id. Logujemy, bo to
-            // sygnal, ze dawca byl juz multi-org (nieoczekiwane w fazie C).
-            warn!(
-                "baseline snapshot carries {} active orgs; adopting lowest org_id",
-                many.len()
-            );
-            Ok(many[0].org_id.clone())
-        }
+        many => Err(SyncLedgerError::Runtime(format!(
+            "baseline snapshot carries {} active organizations; phase C requires a single-org \
+             donor — refusing import (multi-org adopt would drop the other orgs' rows)",
+            many.len()
+        ))),
     }
 }
 
@@ -776,6 +1165,8 @@ fn import_baseline_tx(
     tx: &Transaction<'_>,
     snapshot: &BaselineSnapshot,
     donor_org_id: &str,
+    local_node_id: &str,
+    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineImportReport> {
     let map_err = |e: rusqlite::Error| SyncLedgerError::Runtime(e.to_string());
     let mut report = BaselineImportReport {
@@ -783,11 +1174,18 @@ fn import_baseline_tx(
         ..Default::default()
     };
 
-    // Zbior emaili joinera -> id usera dawcy, do mapowania tozsamosci ludzi.
-    // Match po DOKLADNYM (case-sensitive, przycietym) emailu.
+    // Donor user_id-y, ktore sa UPRZYWILEJOWANE: `is_admin=1` albo zwiazane z
+    // rola org-admina (membership w org dawcy z rola o uprawnieniu `org.admin`).
+    // Email-match NIE moze scalic usera joinera w takie konto — niewerifikowany
+    // email == przejecie konta admina. Tacy userzy joinera zostaja osobni.
+    let privileged_donor_ids = privileged_donor_user_ids(snapshot, donor_org_id);
+
+    // Email -> id usera dawcy do mapowania tozsamosci, Z POMINIECIEM kont
+    // uprzywilejowanych (te nie sa celem merge'a).
     let donor_email_to_id: BTreeMap<String, String> = snapshot
         .user_accounts
         .iter()
+        .filter(|u| !privileged_donor_ids.contains(u.id.as_str()))
         .filter_map(|u| {
             u.email
                 .as_deref()
@@ -810,26 +1208,41 @@ fn import_baseline_tx(
     // (a) Upsert wierszy dawcy po UUID PK. Deterministyczne seedy (np.
     // role-org-admin, org-default) zlewaja sie po tym samym id; user-created
     // dawcy sa wstawiane jako nowe.
-    upsert_donor_rows(tx, snapshot, &map_err)?;
+    upsert_donor_rows(tx, snapshot, donor_org_id, local_node_id, cipher, &map_err)?;
 
     // (c) Remap lokalnych danych joinera do org dawcy. Email-match mapuje na
     // usera dawcy; inaczej user joinera dolacza jako nowy czlonek org dawcy.
     for local in &local_users {
+        // Lokalny user dawcy (np. lokalny wpis o tym samym id) nie jest remapowany.
+        if donor_ids.contains(local.id.as_str()) {
+            continue;
+        }
         let local_email = local.email.as_deref().map(str::trim).filter(|e| !e.is_empty());
         let mapped_donor_id = local_email.and_then(|e| donor_email_to_id.get(e));
 
         if let Some(donor_id) = mapped_donor_id {
-            if donor_id.as_str() != local.id {
-                report.users_merged_by_email += 1;
-            }
-            // User joinera jest TYM SAMYM czlowiekiem co user dawcy — przepinamy
-            // dane joinera na id dawcy, lokalny wiersz znika (chyba ze to sam
-            // dawca, wtedy no-op).
+            report.users_merged_by_email += 1;
+            // User joinera jest TYM SAMYM czlowiekiem co (nie-uprzywilejowany)
+            // user dawcy — przepinamy dane joinera na id dawcy, lokalny wiersz
+            // joinera znika.
             remap_user_owned_rows(tx, &local.id, donor_id, donor_org_id, &map_err)?;
-        } else if !donor_ids.contains(local.id.as_str()) {
-            // Nowy czlowiek — zostaje wlasnym userem, ale staje sie czlonkiem
-            // org dawcy. Jego dane owner/assigned pozostaja jego, tylko org_id
-            // jest przepinany na org dawcy.
+        } else {
+            // Nowy czlowiek (rozny email, ALBO email rowny kontu uprzywilejowanemu
+            // dawcy — wtedy nie merguje, zostaje osobny; loguj WARN). Zostaje
+            // wlasnym userem, ale staje sie czlonkiem org dawcy z najmniej
+            // uprzywilejowana rola.
+            if let Some(email) = local_email {
+                if snapshot.user_accounts.iter().any(|u| {
+                    privileged_donor_ids.contains(u.id.as_str())
+                        && u.email.as_deref().map(str::trim) == Some(email)
+                }) {
+                    warn!(
+                        local_user = %local.id,
+                        "baseline import: joiner email matches a PRIVILEGED donor account; \
+                         refusing identity merge, joiner stays a separate member (admin-takeover guard)"
+                    );
+                }
+            }
             report.users_joined_donor_org += 1;
             attach_local_user_to_donor_org(tx, &local.id, donor_org_id, snapshot, &map_err)?;
         }
@@ -840,6 +1253,45 @@ fn import_baseline_tx(
     drop_foreign_org_rows(tx, donor_org_id, &map_err)?;
 
     Ok(report)
+}
+
+/// Zbior donor user_id-ow uznawanych za uprzywilejowane: `is_admin=1` LUB user
+/// ma w org dawcy czlonkostwo z rola niosaca uprawnienie `org.admin`. Match po
+/// emailu na takie konto NIE scala (chroni przed przejeciem konta admina).
+fn privileged_donor_user_ids<'a>(
+    snapshot: &'a BaselineSnapshot,
+    donor_org_id: &str,
+) -> std::collections::BTreeSet<&'a str> {
+    let admin_role_ids: std::collections::BTreeSet<&str> = snapshot
+        .roles
+        .iter()
+        .filter(|r| role_is_privileged(&r.permissions_json))
+        .map(|r| r.role_id.as_str())
+        .collect();
+
+    let mut out: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for u in &snapshot.user_accounts {
+        if u.is_admin {
+            out.insert(u.id.as_str());
+        }
+    }
+    for m in &snapshot.org_memberships {
+        if m.org_id == donor_org_id && admin_role_ids.contains(m.role_id.as_str()) {
+            // FK od memberships do user_accounts — bierzemy referencje na id usera.
+            if let Some(u) = snapshot.user_accounts.iter().find(|u| u.id == m.user_id) {
+                out.insert(u.id.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// Czy rola jest uprzywilejowana (admin). Decyduje uprawnienie `org.admin` w
+/// `permissions_json` — to klucz nadajacy pelna administracje organizacja.
+fn role_is_privileged(permissions_json: &str) -> bool {
+    serde_json::from_str::<Vec<String>>(permissions_json)
+        .map(|perms| perms.iter().any(|p| p == "org.admin"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -866,9 +1318,47 @@ fn read_local_users(tx: &Transaction<'_>) -> LedgerResult<Vec<LocalUser>> {
     Ok(rows)
 }
 
+/// Maksymalna dlugosc wartosci tekstowej dla suffixowanych kolumn UNIQUE. Bierze
+/// gorne ograniczenie z najwezszej realnej kolumny; suffix jest doklejany w
+/// granicach tego limitu, by uniknac przepelnienia (SQLite nie egzekwuje
+/// dlugosci, ale UI/inne warstwy zakladaja rozsadny limit).
+const COLLISION_VALUE_MAX_LEN: usize = 200;
+
+/// Sonduje wolna wartosc dla kolumny UNIQUE: probuje `<base>-<short_id>`, a gdy
+/// ta tez koliduje, dokleja licznik `<base>-<short_id>-<n>` az do wolnej. Nigdy
+/// nie abortuje — pierwszy wariant jest deterministyczny (stabilny per id),
+/// kolejne tylko gdy realnie wystepuja dalsze kolizje. `exists` zwraca czy dana
+/// kandydat-wartosc jest juz zajeta (przez kogokolwiek poza wlasnym wierszem).
+fn probe_free_value(
+    base: &str,
+    local_id: &str,
+    mut exists: impl FnMut(&str) -> LedgerResult<bool>,
+) -> LedgerResult<String> {
+    let short = short_id(local_id);
+    let mut candidate = truncate_value(&format!("{base}-{short}"));
+    let mut counter: u32 = 1;
+    while exists(&candidate)? {
+        candidate = truncate_value(&format!("{base}-{short}-{counter}"));
+        counter += 1;
+        if counter == u32::MAX {
+            return Err(SyncLedgerError::Runtime(format!(
+                "could not find a free unique value for base '{base}' (exhausted probes)"
+            )));
+        }
+    }
+    Ok(candidate)
+}
+
+fn truncate_value(value: &str) -> String {
+    if value.chars().count() <= COLLISION_VALUE_MAX_LEN {
+        return value.to_string();
+    }
+    value.chars().take(COLLISION_VALUE_MAX_LEN).collect()
+}
+
 /// (b) Rozsuwa kolidujace UNIQUE wartosci joinera, gdy dawca niesie rekord o
 /// innym UUID PK ale tej samej wartosci UNIQUE. Dawca wygrywa: lokalny rekord
-/// joinera dostaje deterministyczny suffix (`<value>-<short_local_id>`), a
+/// joinera dostaje sondowany wolny suffix (`<value>-<short_local_id>[-n]`), a
 /// `published_model_name` flowa joinera jest unpublishowany (NULL), bo to klucz
 /// uzywany routingowo i suffix zmienilby semantyke modelu.
 fn suffix_local_collisions(
@@ -888,7 +1378,9 @@ fn suffix_local_collisions(
             .optional()
             .map_err(map_err)?;
         if let Some(local_id) = local_id {
-            let suffixed = format!("{}-{}", donor.username, short_id(&local_id));
+            let suffixed = probe_free_value(&donor.username, &local_id, |cand| {
+                value_taken(tx, "user_accounts", "username", "id", cand, &local_id, map_err)
+            })?;
             tx.execute(
                 "UPDATE user_accounts SET username = ?1 WHERE id = ?2",
                 params![suffixed, local_id],
@@ -909,7 +1401,9 @@ fn suffix_local_collisions(
             .optional()
             .map_err(map_err)?;
         if let Some(local_id) = local_id {
-            let suffixed = format!("{}-{}", donor.slug, short_id(&local_id));
+            let suffixed = probe_free_value(&donor.slug, &local_id, |cand| {
+                value_taken(tx, "organizations", "slug", "org_id", cand, &local_id, map_err)
+            })?;
             tx.execute(
                 "UPDATE organizations SET slug = ?1 WHERE org_id = ?2",
                 params![suffixed, local_id],
@@ -930,7 +1424,9 @@ fn suffix_local_collisions(
             .optional()
             .map_err(map_err)?;
         if let Some(local_id) = local_id {
-            let suffixed = format!("{}-{}", donor.name, short_id(&local_id));
+            let suffixed = probe_free_value(&donor.name, &local_id, |cand| {
+                value_taken(tx, "roles", "name", "role_id", cand, &local_id, map_err)
+            })?;
             tx.execute(
                 "UPDATE roles SET name = ?1 WHERE role_id = ?2",
                 params![suffixed, local_id],
@@ -951,7 +1447,9 @@ fn suffix_local_collisions(
             .optional()
             .map_err(map_err)?;
         if let Some(local_id) = local_id {
-            let suffixed = format!("{}-{}", donor.name, short_id(&local_id));
+            let suffixed = probe_free_value(&donor.name, &local_id, |cand| {
+                value_taken(tx, "user_groups", "name", "id", cand, &local_id, map_err)
+            })?;
             tx.execute(
                 "UPDATE user_groups SET name = ?1 WHERE id = ?2",
                 params![suffixed, local_id],
@@ -996,7 +1494,17 @@ fn suffix_local_collisions(
             .optional()
             .map_err(map_err)?;
         if let Some(local_id) = local_id {
-            let suffixed = format!("{}-{}", donor.model_pattern, short_id(&local_id));
+            let suffixed = probe_free_value(&donor.model_pattern, &local_id, |cand| {
+                value_taken(
+                    tx,
+                    "flow_model_bindings",
+                    "model_pattern",
+                    "id",
+                    cand,
+                    &local_id,
+                    map_err,
+                )
+            })?;
             tx.execute(
                 "UPDATE flow_model_bindings SET model_pattern = ?1 WHERE id = ?2",
                 params![suffixed, local_id],
@@ -1009,6 +1517,30 @@ fn suffix_local_collisions(
     Ok(())
 }
 
+/// Czy wartosc `value` w `table.column` jest juz zajeta przez wiersz INNY niz
+/// `self_id` (kolumna PK `pk_column`). Uzywane przez `probe_free_value`, by
+/// nowy suffix nie wpadl na kolejna istniejaca kolizje (np. inny wiersz dawcy
+/// lub wczesniej wstawiony joiner).
+fn value_taken(
+    tx: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    pk_column: &str,
+    value: &str,
+    self_id: &str,
+    map_err: &impl Fn(rusqlite::Error) -> SyncLedgerError,
+) -> LedgerResult<bool> {
+    let found: Option<i64> = tx
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE {column} = ?1 AND {pk_column} <> ?2"),
+            params![value, self_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_err)?;
+    Ok(found.is_some())
+}
+
 /// (a) Wstawia/aktualizuje wiersze dawcy po UUID PK. INSERT ... ON CONFLICT(PK)
 /// DO UPDATE — deterministyczne seedy (te same UUID) sa scalane, user-created
 /// dawcy wstawiane. Kolejnosc respektuje FK: organizacje/role -> user_accounts
@@ -1016,6 +1548,9 @@ fn suffix_local_collisions(
 fn upsert_donor_rows(
     tx: &Transaction<'_>,
     snapshot: &BaselineSnapshot,
+    donor_org_id: &str,
+    local_node_id: &str,
+    cipher: &crate::crypto::SettingsCipher,
     map_err: &impl Fn(rusqlite::Error) -> SyncLedgerError,
 ) -> LedgerResult<()> {
     for o in &snapshot.organizations {
@@ -1144,6 +1679,18 @@ fn upsert_donor_rows(
     }
 
     for p in &snapshot.sync_policies {
+        // sync_policies ma DWA ograniczenia: PK(policy_id) ORAZ
+        // UNIQUE(org_id,addon_id,resource_type,resource_id). ON CONFLICT(policy_id)
+        // nie lapie joinerowego wiersza o INNYM policy_id ale tym samym kluczu
+        // logicznym (np. realny default-org). Donor-wins: kasujemy taki kolidujacy
+        // wiersz joinera ZANIM wstawimy wiersz dawcy, by INSERT nie padl na UNIQUE.
+        tx.execute(
+            "DELETE FROM sync_policies \
+             WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
+               AND policy_id <> ?5",
+            params![p.org_id, p.addon_id, p.resource_type, p.resource_id, p.policy_id],
+        )
+        .map_err(map_err)?;
         tx.execute(
             "INSERT INTO sync_policies \
                 (policy_id, org_id, addon_id, resource_type, resource_id, mode, \
@@ -1169,6 +1716,10 @@ fn upsert_donor_rows(
         .map_err(map_err)?;
     }
 
+    // sync_resource_acl: PK to (org_id,addon_id,resource_type,resource_id), wiec
+    // ON CONFLICT na PK juz realizuje donor-wins (wiersz dawcy nadpisuje joinera).
+    // Wiersze ACL dawcy MOGA wskazywac authority_node_id/owner spoza zakresu, ale
+    // FK na user_accounts jest spelnione bo userow dawcy juz wstawilismy wyzej.
     for a in &snapshot.sync_resource_acl {
         tx.execute(
             "INSERT INTO sync_resource_acl \
@@ -1192,6 +1743,133 @@ fn upsert_donor_rows(
                 a.manager_user_id,
                 a.visibility_scope
             ],
+        )
+        .map_err(map_err)?;
+    }
+
+    // sync_nodes: importujemy wezly dawcy (joiner poznaje klaster), ale ZACHOWUJEMY
+    // wlasny wpis lokalnego node joinera — nie nadpisujemy go danymi dawcy i nie
+    // kasujemy. Dawca nie zna lokalnego noda joinera, wiec brak go w snapshocie;
+    // upsert po node_id wstawia tylko wezly dawcy.
+    for n in &snapshot.sync_nodes {
+        if n.node_id == local_node_id {
+            // Teoretycznie dawca nie powinien znac lokalnego noda joinera; gdyby
+            // jednak go niosl, NIE nadpisujemy wlasnego wpisu zaufania.
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO sync_nodes \
+                (node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
+                 owner_user_id, sync_profile, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
+             ON CONFLICT(node_id) DO UPDATE SET \
+                public_key = excluded.public_key, public_key_type = excluded.public_key_type, \
+                display_name = excluded.display_name, node_kind = excluded.node_kind, \
+                trust_status = excluded.trust_status, owner_user_id = excluded.owner_user_id, \
+                sync_profile = excluded.sync_profile",
+            params![
+                n.node_id,
+                n.public_key,
+                n.public_key_type,
+                n.display_name,
+                n.node_kind,
+                n.trust_status,
+                n.owner_user_id,
+                n.sync_profile
+            ],
+        )
+        .map_err(map_err)?;
+    }
+
+    // user_identity_keys: zwiazane z userami dawcy (FK user_id -> user_accounts).
+    // Userzy dawcy sa juz wstawieni; klucze lokalnego node joinera zostaja
+    // nietkniete (nie ma ich w snapshocie dawcy). UNIQUE(user_id,key_type,
+    // public_key) — donor-wins: kasujemy kolidujacy klucz joinera o innym key_id.
+    for k in &snapshot.user_identity_keys {
+        tx.execute(
+            "DELETE FROM user_identity_keys \
+             WHERE user_id = ?1 AND key_type = ?2 AND public_key = ?3 AND key_id <> ?4",
+            params![k.user_id, k.key_type, k.public_key, k.key_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "INSERT INTO user_identity_keys \
+                (key_id, user_id, key_type, public_key, purpose, status, created_at, revoked_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%SZ','now'), ?7) \
+             ON CONFLICT(key_id) DO UPDATE SET \
+                user_id = excluded.user_id, key_type = excluded.key_type, \
+                public_key = excluded.public_key, purpose = excluded.purpose, \
+                status = excluded.status, revoked_at = excluded.revoked_at",
+            params![
+                k.key_id,
+                k.user_id,
+                k.key_type,
+                k.public_key,
+                k.purpose,
+                k.status,
+                k.revoked_at
+            ],
+        )
+        .map_err(map_err)?;
+    }
+
+    // node_user_assignments: FK na sync_nodes(node_id) i user_accounts(id). Wezly i
+    // userzy dawcy sa juz wstawieni. Przypisania lokalnego node joinera zostaja.
+    for a in &snapshot.node_user_assignments {
+        tx.execute(
+            "INSERT INTO node_user_assignments \
+                (node_id, user_id, assignment_mode, created_by, created_at) \
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
+             ON CONFLICT(node_id, user_id, assignment_mode) DO UPDATE SET \
+                created_by = excluded.created_by",
+            params![a.node_id, a.user_id, a.assignment_mode, a.created_by],
+        )
+        .map_err(map_err)?;
+    }
+
+    // sync_explicit_shares: to ACL. Importujemy share'y dawcy z remapem subject/
+    // granted_by do org dawcy. Subjekt typu 'user' i granted_by sa juz userami
+    // dawcy (z user_accounts). PK obejmuje (org,addon,type,id,subject_type,
+    // subject_id,action) — ON CONFLICT realizuje donor-wins. org_id zawsze ==
+    // donor_org_id (jedna org w snapshocie po `primary_donor_org`).
+    for s in &snapshot.sync_explicit_shares {
+        tx.execute(
+            "INSERT INTO sync_explicit_shares \
+                (org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action, \
+                 granted_by, granted_at, revoked_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%SZ','now'), NULL) \
+             ON CONFLICT(org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action) \
+             DO UPDATE SET granted_by = excluded.granted_by, revoked_at = NULL",
+            params![
+                donor_org_id,
+                s.addon_id,
+                s.resource_type,
+                s.resource_id,
+                s.subject_type,
+                s.subject_id,
+                s.action,
+                s.granted_by
+            ],
+        )
+        .map_err(map_err)?;
+    }
+
+    // shared secrets: donor-wins. Donor przyslal ODSZYFROWANY plaintext po
+    // zaufanym kanale; re-encryptujemy lokalnym cipherem i nadpisujemy wartosc.
+    // Reseed czyta z `settings`, wiec po tym imporcie emituje sekret DAWCY, nie
+    // lokalny — kluczowe, by reseed nie cofnal donor-wins.
+    for secret in &snapshot.shared_secrets {
+        if !db::repository::is_shared_secret_setting_key(&secret.key) {
+            continue;
+        }
+        let encrypted = cipher
+            .encrypt(&secret.value)
+            .map_err(|e| SyncLedgerError::Runtime(format!("encrypt shared secret: {e}")))?;
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+            params![secret.key, encrypted],
         )
         .map_err(map_err)?;
     }
@@ -1278,7 +1956,7 @@ fn attach_local_user_to_donor_org(
     snapshot: &BaselineSnapshot,
     map_err: &impl Fn(rusqlite::Error) -> SyncLedgerError,
 ) -> LedgerResult<()> {
-    let role_id = pick_member_role(snapshot);
+    let role_id = pick_member_role(snapshot)?;
     tx.execute(
         "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
          VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now'), ?2) \
@@ -1305,16 +1983,42 @@ fn attach_local_user_to_donor_org(
     Ok(())
 }
 
-/// Wybiera role dla nowego czlonka org dawcy. Preferuje `role-user` (najmniej
-/// uprzywilejowana w domyslnym seedzie); fallback do pierwszej dostepnej roli.
-fn pick_member_role(snapshot: &BaselineSnapshot) -> String {
-    snapshot
+/// Wybiera role dla nowego czlonka org dawcy. NIGDY nie nadaje roli
+/// uprzywilejowanej (z `org.admin`) — niewerifikowany joiner nie moze wpasc na
+/// konto admina przez przypadkowy fallback. Preferencja:
+///   1. `role-user`/`user` jesli istnieje i jest nieuprzywilejowana;
+///   2. inaczej rola NIEUPRZYWILEJOWANA o najmniejszej liczbie uprawnien;
+///   3. gdy zadna nieuprzywilejowana nie istnieje — twardy blad (odmowa
+///      czlonkostwa zamiast nadania admina).
+fn pick_member_role(snapshot: &BaselineSnapshot) -> LedgerResult<String> {
+    let non_privileged: Vec<&RoleRow> = snapshot
         .roles
         .iter()
+        .filter(|r| !role_is_privileged(&r.permissions_json))
+        .collect();
+
+    if let Some(user_role) = non_privileged
+        .iter()
         .find(|r| r.role_id == "role-user" || r.name == "user")
-        .or_else(|| snapshot.roles.first())
+    {
+        return Ok(user_role.role_id.clone());
+    }
+
+    non_privileged
+        .iter()
+        .min_by_key(|r| {
+            serde_json::from_str::<Vec<String>>(&r.permissions_json)
+                .map(|p| p.len())
+                .unwrap_or(usize::MAX)
+        })
         .map(|r| r.role_id.clone())
-        .unwrap_or_else(|| "role-user".to_string())
+        .ok_or_else(|| {
+            SyncLedgerError::Runtime(
+                "baseline import: no non-privileged role available for a new member; refusing to \
+                 grant a privileged role to a joiner user"
+                    .into(),
+            )
+        })
 }
 
 /// Usuwa lokalne wiersze scope'owane org inna niz dawcy. Po wchlonieciu org
@@ -1366,10 +2070,12 @@ fn short_id(id: &str) -> String {
 pub fn run_baseline_adopt(
     db: &DbPool,
     donor_node_id: &str,
+    local_node_id: &str,
     donor_snapshot_bytes: &[u8],
+    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineImportReport> {
     let snapshot = deserialize_snapshot(donor_snapshot_bytes)?;
-    import_baseline(db, &snapshot, donor_node_id)
+    import_baseline(db, &snapshot, donor_node_id, local_node_id, cipher)
 }
 
 #[cfg(test)]

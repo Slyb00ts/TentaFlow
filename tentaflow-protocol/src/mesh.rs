@@ -1111,6 +1111,11 @@ pub struct BaselineHeader {
     pub row_counts: Vec<u64>,
     pub total_bytes: u64,
     pub max_bytes: u64,
+    /// blake3 hash of the FULL reassembled snapshot. Per-chunk hashes only catch
+    /// a corrupted chunk in place; this catches a chunk reordered with a rewritten
+    /// `seq`, a truncated tail, or any whole-stream tampering the joiner cannot see
+    /// from the chunks alone.
+    pub content_hash: [u8; 32],
 }
 
 /// Pojedynczy chunk baseline'u. `content_hash` to 32-bajtowy hash `bytes`,
@@ -1477,6 +1482,7 @@ mod tests {
             row_counts: vec![3, 5],
             total_bytes: 4096,
             max_bytes: 1_048_576,
+            content_hash: [7u8; 32],
         };
         let bytes = crate::cbor::encode(&header).expect("encode");
         let decoded = crate::cbor::decode::<BaselineHeader>(&bytes).expect("decode");
