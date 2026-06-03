@@ -25,6 +25,7 @@ plans/*
 build-xcode/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
+**/.swiftpm/xcode/xcuserdata/
 DerivedData/
 
 # Wygenerowany manifest serwisow dla GUI (build.rs produkuje przy kompilacji)
@@ -33,6 +34,11 @@ tentaflow-core/wwwroot/js/generated/
 
 # Wygenerowany cbindgen header dla .NET P/Invoke
 tentaflow-client/native/include/
+
+# GStreamer iOS xcframework (pobierany przez scripts/setup.sh,
+# install_ios_gstreamer_xcframework — ~600 MB archiwum, 1.2 GB combined lib)
+tentaflow-mobile/ios/Frameworks/GStreamer.xcframework/
+tentaflow-mobile/ios/Frameworks/pkgconfig/
 
 # =============================================================================
 # Bazy danych
@@ -134,6 +140,10 @@ tentaflow-core/assets/test/sample_traffic.mp4
 *.ggml
 *.bin
 *.safetensors
+# Wagi BART (G2P fallback dla angielskiego) zwendorowanego MisakiSwift — MUSZA byc
+# w repo, inaczej Kokoro TTS crashuje force-unwrapem przy pierwszym ang. slowie OOV.
+!tentaflow-desktop/macos/swift/vendor/MisakiSwift/Resources/us_bart.safetensors
+!tentaflow-desktop/macos/swift/vendor/MisakiSwift/Resources/gb_bart.safetensors
 *.pt
 *.pth
 *.onnx

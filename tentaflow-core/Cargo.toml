@@ -31,6 +31,11 @@ inference-mlx-whisper = ["dep:libloading"]
 # Brak feature flag — uzytkownik nie ma jak go wylaczyc i nie powinien.
 # Kokoro 82M TTS przez mlx-swift port. macOS/iOS only.
 inference-mlx-kokoro = ["dep:libloading"]
+# Supertonic TTS przez ONNX Runtime (crate `ort`). Desktop: Linux/macOS/Windows.
+# `ort` z feature `load-dynamic` dlopuje onnxruntime runtime'em (nie linkuje
+# statycznie), wiec NIE koliduje z sherpa-rs (ktore tez linkuje onnxruntime
+# dynamicznie) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
+inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = []
 rdma-probe = []
@@ -222,6 +227,17 @@ whisper-rs = { version = "0.16.0", optional = true }
 # dlopen libMLXBridge.dylib — feature inference-mlx-whisper.
 libloading = { version = "0.9.0", optional = true }
 sherpa-rs = { version = "0.6.8", optional = true }
+# Supertonic TTS — ONNX Runtime przez `ort`. `download-binaries`: ort pobiera
+# i wkompilowuje WLASNY onnxruntime (~1.24, ktorego wymaga rc.12). NIE
+# `load-dynamic` — bo to dlopowalo onnxruntime 1.17.1 dostarczany przez
+# sherpa-rs, a `ort` rc.12 wymaga C API >= 24 (na 1.17.1 `GetApi(24)`=NULL =>
+# tworzenie sesji wisi/wala sie). Wlasny onnxruntime ort wspolistnieje z
+# 1.17.1 sherpy przez two-level namespace (osobne dyliby). `ndarray` daje
+# Value::from_array(Array3).
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-rustls", "ndarray", "std"], optional = true }
+ndarray = { version = "0.17", optional = true }
+rand_distr = { version = "0.6.0", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm", "wav"] }
 
 # Speaker diarization — pure Rust forward pass przez tentaflow-voice

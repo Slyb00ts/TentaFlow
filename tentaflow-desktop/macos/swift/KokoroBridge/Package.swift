@@ -27,7 +27,10 @@ let package = Package(
         // budowanie spod naszego packagea). MisakiSwift i MLXUtilsLibrary
         // zostaly jako zewnetrzne dep — sa OK.
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.29.1"),
-        .package(url: "https://github.com/mlalma/MisakiSwift.git", exact: "1.0.6"),
+        // Vendored MisakiSwift (fork 1.0.6) — upstream pinuje mlx-swift exact
+        // 0.30.2, co koliduje z 0.31.3 z mlx-swift-lm (LLM) w apce iOS. Lokalna
+        // kopia luzuje pin do range. Patrz vendor/MisakiSwift/Package.swift.
+        .package(path: "../vendor/MisakiSwift"),
         .package(url: "https://github.com/mlalma/MLXUtilsLibrary.git", from: "0.0.6"),
     ],
     targets: [

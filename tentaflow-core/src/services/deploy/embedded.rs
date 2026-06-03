@@ -105,21 +105,33 @@ impl EmbeddedDeploy {
             return Ok(());
         }
 
-        // Embedded STT = whisper.cpp (jedyny embedded silnik STT w
-        // engine_registry; faster-whisper jest dockerowy). Model trafia do
-        // `shared_stt_manager()`, ten sam singleton z ktorego czyta
-        // `SttRuntime::transcribe`. Bez tego kroku usluga jest oznaczona
-        // `running`, ale `active_engine()` zostaje None i kazda transkrypcja
-        // konczy sie "no STT engine loaded".
+        // Embedded STT: whisper.cpp (engine.id = "whisper", plik ggml) lub
+        // mlx-whisper (engine.id = "mlx-whisper", katalog MLX safetensors).
+        // Model trafia do `shared_stt_manager()`, tego samego singletonu z
+        // ktorego czyta `SttRuntime::transcribe`. Bez tego kroku usluga jest
+        // oznaczona `running`, ale `active_engine()` zostaje None i kazda
+        // transkrypcja konczy sie "no STT engine loaded".
+        let engine_id = self.manifest.engine.id.clone();
+        let model_repo = self.selected_model_repo();
         if let Some(s) = &self.log_sink {
-            s.phase("load-model", "[stt] loading embedded whisper model");
+            s.phase(
+                "load-model",
+                &format!("[stt] loading embedded {engine_id} ({model_repo})"),
+            );
         }
         let shared = crate::stt::shared_stt_manager();
         let info = {
             let mut mgr = shared.write().await;
-            mgr.ensure_and_load(None).await
+            mgr.ensure_and_load(
+                Some(&engine_id),
+                Some(&model_repo),
+                None,
+                self.log_sink.as_ref(),
+                crate::stt::WhisperDeployParams::default(),
+            )
+            .await
         }
-        .map_err(|e| DeployError::Other(format!("load embedded whisper model: {e}")))?;
+        .map_err(|e| DeployError::Other(format!("load embedded STT '{engine_id}': {e}")))?;
         if let Some(s) = &self.log_sink {
             s.info(&format!("[stt] whisper model loaded from {}", info.path));
         }
@@ -137,7 +149,7 @@ impl EmbeddedDeploy {
         // `running`, ale `synthesize` zwraca "TTS engine '...' nie
         // zarejestrowany".
         let engine_id = self.manifest.engine.id.clone();
-        let model_repo = self.selected_tts_model_repo();
+        let model_repo = self.selected_model_repo();
         // Preset id (np. `vits-piper-pl_PL-jarvis_wg_glos-medium`) jako voice
         // hint — wielogłosowe repo musi zaladowac wlasciwy voice.
         let voice_hint = self
@@ -154,17 +166,20 @@ impl EmbeddedDeploy {
         }
         crate::tts::ensure_embedded_engine_loaded(&engine_id, &model_repo, voice_hint)
             .await
-            .map_err(|e| DeployError::Other(format!("load embedded TTS '{engine_id}': {e}")))?;
+            // {e:#} — pelny lancuch przyczyn anyhow (np. "dlopen ... nieudane:
+            // Library not loaded @rpath/MLX.framework"), nie tylko zewnetrzny
+            // context. Bez tego deploy-log pokazywal generyczne "load kokoro".
+            .map_err(|e| DeployError::Other(format!("load embedded TTS '{engine_id}': {e:#}")))?;
         if let Some(s) = &self.log_sink {
             s.info(&format!("[tts] {engine_id} engine registered"));
         }
         Ok(())
     }
 
-    /// HF repo (lub voice id dla apple-tts) dla embedded TTS: jawny
+    /// HF repo (lub voice id dla apple-tts) dla embedded STT/TTS: jawny
     /// `model_repo` z configu ma priorytet, inaczej preset po
     /// `model_preset_id`, potem rekomendowany / pierwszy z manifestu.
-    fn selected_tts_model_repo(&self) -> String {
+    fn selected_model_repo(&self) -> String {
         if let Some(repo) = self
             .user_config
             .get("model_repo")
@@ -252,14 +267,24 @@ impl EmbeddedDeploy {
         }
         #[cfg(not(test))]
         {
-            let model_path = if let Some(path) = self
+            // Persisted `model_path` to absolutna sciezka zapisana po pierwszym
+            // deployu. Na iOS katalog Data aplikacji ma UUID rotowany przy
+            // reinstalacji — stara absolutna sciezka wskazuje wtedy na nieistniejacy
+            // kontener (objaw: "Sciezka nie istnieje" + load kod -1 przy boot-reload).
+            // Gdy zapisana sciezka nie istnieje, ignorujemy ja i re-resolvujemy z
+            // repo: ModelStore liczy katalog pod BIEZACYM kontenerem, a download jest
+            // idempotentny (pomija jesli model juz pobrany). Tak samo zachowuje sie
+            // embedded STT/TTS, ktore przezywaja rotacje kontenera.
+            let persisted = self
                 .user_config
                 .get("model_path")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                PathBuf::from(path)
+                .map(PathBuf::from)
+                .filter(|p| p.exists());
+            let model_path = if let Some(path) = persisted {
+                path
             } else {
                 if selection.repo.starts_with("http://") || selection.repo.starts_with("https://") {
                     return Err(DeployError::Manifest(format!(

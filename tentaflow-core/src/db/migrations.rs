@@ -45,15 +45,15 @@ pub fn run(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
 
-    // The v53 INTEGER→UUID identity flip rewrites every core PK, so every core
+    // The v54 INTEGER→UUID identity flip rewrites every core PK, so every core
     // operation a peer already holds points at a dead integer id. Upgrading ACROSS
-    // v53 this run arms a one-shot baseline reset that the sync runtime consumes
+    // v54 this run arms a one-shot baseline reset that the sync runtime consumes
     // after it is up (it owns the Fjall ledger + signer this `Connection` lacks):
     // bump the epoch, drop the stale core ledger state, and re-seed the outbox
     // from the post-flip rows. The marker is set only on the crossing boot and
     // cleared by the consumer, so a routine restart never re-bumps the epoch.
     //
-    // A FRESH install (`current_version == 0`) runs v53 against empty identity
+    // A FRESH install (`current_version == 0`) runs v54 against empty identity
     // tables and has no peers holding stale integer-keyed ops, so it must NOT
     // bump: it stays on the genesis epoch every other fresh node shares,
     // otherwise two fresh nodes could never exchange core ops (epoch is compared
@@ -105,10 +105,10 @@ pub fn run(conn: &Connection) -> Result<()> {
 
 /// Migration version of the INTEGER→UUID core identity flip. Crossing it arms
 /// the one-shot Sync Ledger baseline reset.
-pub const CORE_IDENTITY_FLIP_VERSION: i64 = 53;
+pub const CORE_IDENTITY_FLIP_VERSION: i64 = 54;
 
 /// `settings` key holding the one-shot "baseline reset pending after cutover"
-/// flag. Written by `run` when v53 is crossed, consumed (and cleared) by the
+/// flag. Written by `run` when v54 is crossed, consumed (and cleared) by the
 /// sync runtime once it owns the ledger.
 pub const CORE_BASELINE_RESET_PENDING_KEY: &str = "core_baseline_reset_pending";
 
@@ -307,16 +307,21 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (
             52,
+            "services_deployed_source_hash",
+            MigrationStep::Sql(SERVICES_DEPLOYED_SOURCE_HASH),
+        ),
+        (
+            53,
             "core_resource_versions",
             MigrationStep::Sql(CORE_RESOURCE_VERSIONS),
         ),
         (
-            53,
+            54,
             "core_identity_int_to_uuid",
             MigrationStep::RustSelfManaged(core_identity_int_to_uuid),
         ),
         (
-            54,
+            55,
             "core_sync_captures_hlc",
             MigrationStep::Sql(CORE_SYNC_CAPTURES_HLC),
         ),
@@ -324,7 +329,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 }
 
 // =============================================================================
-// v53 — core identity INTEGER -> TEXT UUID migration
+// v54 — core identity INTEGER -> TEXT UUID migration
 // =============================================================================
 //
 // The five core identity tables (`flows`, `flow_model_bindings`,
@@ -580,14 +585,14 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "flow_invocations",
             "actor_user_id",
             "TEXT user_accounts(id) FK (enforced by foreign_key_check); legacy rows \
-             held stringified-INTEGER session ids, value-remapped in place by v53 \
+             held stringified-INTEGER session ids, value-remapped in place by v54 \
              (remap_text_int_column) — resolvable ids -> UUID, unknown -> NULL so \
              the enforced FK stays satisfied; not a rebuilt table",
         ),
         t(
             "org_memberships",
             "user_id",
-            "already TEXT (CAST(id AS TEXT)); remapped in place by v53, not a rebuilt table",
+            "already TEXT (CAST(id AS TEXT)); remapped in place by v54, not a rebuilt table",
         ),
         t(
             "org_memberships",
@@ -1876,7 +1881,7 @@ CREATE INDEX IF NOT EXISTS idx_core_sync_captures_operation
     ON __tentaflow_core_sync_captures(operation_id);
 "#;
 
-// v54 — carry the pre-commit HLC stamp on each core capture row so the ledger
+// v55 — carry the pre-commit HLC stamp on each core capture row so the ledger
 // operation drained later reuses the exact timestamp recorded inside the write
 // transaction (not a fresh clock read at drain time), and so the materializer's
 // HLC-LWW comparison sees the originating order.
@@ -1936,7 +1941,7 @@ CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_operation
     ON __tentaflow_blob_sync_captures(operation_id);
 "#;
 
-// v52 — last-writer HLC bookmark per synced resource. Phase B will write the
+// v53 — last-writer HLC bookmark per synced resource. Phase B will write the
 // HLC of the most recently applied operation here so conflict resolution can
 // compare an incoming operation against the resource's current version without
 // replaying the ledger. Additive in phase A: no write path touches it yet.
@@ -2933,6 +2938,14 @@ ALTER TABLE flow_node_templates ADD COLUMN params_schema TEXT;
 // Progress_message jest informacyjne, NULL gdy nic do powiedzenia.
 const SERVICES_PROGRESS_MESSAGE: &str = r#"
 ALTER TABLE services ADD COLUMN progress_message TEXT;
+"#;
+
+// deployed_source_hash: sha256 drzewa zrodel bundla (docker/native) z momentu
+// deployu. build.rs liczy aktualny hash do manifestu; snapshot porownuje oba i
+// wystawia flage update_available. Pusty = serwis embedded/external lub deploy
+// sprzed tej kolumny (brak danych, brak falszywego alarmu o aktualizacji).
+const SERVICES_DEPLOYED_SOURCE_HASH: &str = r#"
+ALTER TABLE services ADD COLUMN deployed_source_hash TEXT NOT NULL DEFAULT '';
 "#;
 
 // Rename edge fieldow w flow_json: `from`/`to` -> `from_node`/`to_node`.
@@ -4660,7 +4673,7 @@ mod tests {
     /// guard that stops a future column from silently keeping an INTEGER id.
     ///
     /// This guard runs on a FRESH install, where INITIAL_SCHEMA declares the
-    /// remapped child columns TEXT. An UPGRADED DB intentionally differs: v53
+    /// remapped child columns TEXT. An UPGRADED DB intentionally differs: v54
     /// value-remaps those columns (INTEGER id -> UUID text) but does NOT rebuild
     /// the table to flip the declared type, so they keep INTEGER affinity while
     /// holding UUID text. That asymmetry is safe (SQLite affinity never coerces a
@@ -4740,12 +4753,13 @@ mod tests {
     }
 
     /// Seeds a DB at the pre-UUID schema (INTEGER ids) by running migrations up
-    /// to v52, then exercises v53 and verifies PK flip + referential integrity.
+    /// to the flip, then exercises the flip and verifies PK rewrite + referential
+    /// integrity.
     #[test]
     fn migration_remaps_integer_ids_to_uuid() {
         let conn = Connection::open_in_memory().unwrap();
-        // Run the historical migrations only up to v52 so identity tables still
-        // hold INTEGER ids when we seed.
+        // Run the historical migrations only up to (excluding) the flip so identity
+        // tables still hold INTEGER ids when we seed.
         seed_pre_uuid_schema(&conn);
 
         // Seed users, groups, flows and dependent children with INTEGER ids.
@@ -4794,7 +4808,7 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
         // Legacy `users` carries the only pre-mgmt language preference. Match by
-        // username so the v53 backfill can copy it into user_accounts.
+        // username so the flip backfill can copy it into user_accounts.
         conn.execute_batch(
             r#"
             INSERT INTO users (username, password_hash, role, preferred_language)
@@ -4819,8 +4833,9 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
 
-        // Run v53.
-        core_identity_int_to_uuid(&conn, 53, "core_identity_int_to_uuid").unwrap();
+        // Run the identity flip.
+        core_identity_int_to_uuid(&conn, CORE_IDENTITY_FLIP_VERSION, "core_identity_int_to_uuid")
+            .unwrap();
 
         // (a) PKs are now TEXT UUIDs.
         for table in [
@@ -5040,9 +5055,10 @@ mod tests {
         assert_eq!(joined_new, 1, "JOIN over the freshly written UUID must match");
     }
 
-    /// Builds a DB at exactly the v52 schema state (INTEGER identity ids) by
-    /// running every migration except v53. Mirrors `run` but stops before the
-    /// UUID flip so the migration test can seed legacy integer rows.
+    /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by
+    /// running every migration except the v54 UUID flip and anything after it.
+    /// Mirrors `run` but stops before the flip so the migration test can seed
+    /// legacy integer rows.
     fn seed_pre_uuid_schema(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _migrations (
@@ -5053,14 +5069,16 @@ mod tests {
         )
         .unwrap();
         for (version, name, step) in get_migrations() {
-            if version >= 53 {
+            if version >= CORE_IDENTITY_FLIP_VERSION {
                 break;
             }
             let tx = conn.unchecked_transaction().unwrap();
             match step {
                 MigrationStep::Sql(sql) => tx.execute_batch(sql).unwrap(),
                 MigrationStep::Rust(f) => f(&tx).unwrap(),
-                MigrationStep::RustSelfManaged(_) => unreachable!("no self-managed step below v53"),
+                MigrationStep::RustSelfManaged(_) => {
+                    unreachable!("no self-managed step below the identity flip")
+                }
             }
             tx.execute(
                 "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",

@@ -523,7 +523,9 @@ function renderRail() {
       ? I18n.t('chat.you')
       : (m.modelLabel || I18n.t('chat.assistant'));
     const time = formatBubbleTime(m.ts);
-    const preview = extractPlainText(m.text || '').slice(0, 200);
+    // Pelny tekst w railu prawego panelu — wczesniejszy slice(0,200) ucinal
+    // dlugie odpowiedzi (audio czytalo calosc, a panel pokazywal tylko 200 zn.).
+    const preview = extractPlainText(m.text || '');
     return `
       <div class="rail-msg ${cls}">
         <div class="who">${escapeHtml(who)} · ${escapeHtml(time)}</div>
@@ -891,8 +893,15 @@ function sendVoiceUtterance(wav, sampleRate) {
         if (endBody && endBody.error) {
           assistantMsg.text = `[error] ${endBody.error}`;
           toast(`${I18n.t('common.error')}: ${endBody.error}`, 'error');
-        } else if (assistantMsg.text === '') {
-          assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
+        } else {
+          // Pelny tekst z serwera (FlowInvokeEnd.text) jest autorytatywny — sklejane
+          // delty streamu bywaja uciete na koncu (audio leci dluzej niz dolecial tekst).
+          if (endBody && typeof endBody.text === 'string' && endBody.text.length > 0) {
+            assistantMsg.text = endBody.text;
+          }
+          if (assistantMsg.text === '') {
+            assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
+          }
         }
         conv.updatedAt = Date.now();
         saveConversations();

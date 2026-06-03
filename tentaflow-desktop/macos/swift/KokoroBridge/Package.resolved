@@ -1,22 +1,13 @@
 {
-  "originHash" : "49c86fb1022648a48da54e4b5ce7ce1f38a3cf0bf0a95ea8050c2d4b2de765ff",
+  "originHash" : "cb8261bbc2502b51faf972be3878734fbea265626c305106ead77a124113139d",
   "pins" : [
-    {
-      "identity" : "misakiswift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mlalma/MisakiSwift.git",
-      "state" : {
-        "revision" : "6835a1ce4a8854075c89f18ff75c74b13ef58e15",
-        "version" : "1.0.6"
-      }
-    },
     {
       "identity" : "mlx-swift",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ml-explore/mlx-swift",
       "state" : {
-        "revision" : "f58bd2c2b3b84316da69182f436db4219aff30b9",
-        "version" : "0.30.2"
+        "revision" : "61b9e011e09a62b489f6bd647958f1555bdf2896",
+        "version" : "0.31.3"
       }
     },
     {

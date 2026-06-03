@@ -26,6 +26,9 @@ pub mod apple_tts;
 #[cfg(feature = "inference-mlx-kokoro")]
 pub mod mlx_kokoro;
 
+#[cfg(feature = "inference-supertonic")]
+pub mod supertonic;
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -56,6 +59,13 @@ pub struct SynthesizeParams {
     pub text: String,
     pub speaker_id: i32,
     pub speed: f32,
+    /// Voice preset (np. `M1`/`F2` dla Supertonic, `af_heart` dla Kokoro).
+    /// `None` => silnik bierze swoj domyslny glos. Niezalezne od `speaker_id`,
+    /// ktore VITS Piper uzywa jako numeryczny indeks mowcy.
+    pub voice: Option<String>,
+    /// Jezyk syntezy (ISO-639-1: "pl", "en", ...). Multilingual silniki
+    /// (Supertonic) owijaja tekst tagiem jezyka; jednojezyczne ignoruja.
+    pub language: Option<String>,
 }
 
 impl Default for SynthesizeParams {
@@ -64,6 +74,8 @@ impl Default for SynthesizeParams {
             text: String::new(),
             speaker_id: 0,
             speed: 1.0,
+            voice: None,
+            language: None,
         }
     }
 }
@@ -164,6 +176,7 @@ impl Default for TtsManager {
     not(any(
         feature = "inference-sherpa",
         feature = "inference-mlx-kokoro",
+        feature = "inference-supertonic",
         target_os = "macos",
         target_os = "ios"
     )),
@@ -172,10 +185,13 @@ impl Default for TtsManager {
 pub async fn ensure_embedded_engine_loaded(
     engine_id: &str,
     model_repo: &str,
-    // Uzywany tylko przez arm sherpa-onnx (wybor voice z wielogłosowego repo).
-    #[cfg_attr(not(feature = "inference-sherpa"), allow(unused_variables))] voice_hint: Option<
-        &str,
-    >,
+    // Wybor voice z wielogłosowego repo: sherpa (`<voice>.onnx`) oraz
+    // supertonic (preset `M1`/`F2`).
+    #[cfg_attr(
+        not(any(feature = "inference-sherpa", feature = "inference-supertonic")),
+        allow(unused_variables)
+    )]
+    voice_hint: Option<&str>,
 ) -> anyhow::Result<()> {
     if shared_tts_manager().read().await.has(engine_id) {
         return Ok(());
@@ -205,6 +221,20 @@ pub async fn ensure_embedded_engine_loaded(
             let mut e = mlx_kokoro::MlxKokoroEngine::new();
             <mlx_kokoro::MlxKokoroEngine as TtsEngine>::load_model(&mut e, &dir)
                 .context("load kokoro")?;
+            Box::new(e)
+        }
+        #[cfg(feature = "inference-supertonic")]
+        "supertonic" => {
+            use anyhow::Context;
+            let dir = supertonic::prepare_model(model_repo)
+                .await
+                .with_context(|| format!("prepare supertonic model '{model_repo}'"))?;
+            let mut e = supertonic::SupertonicTtsEngine::new();
+            // Voice preset (M1/F2/...) z presetu deployu — bez podpowiedzi
+            // silnik bierze pierwszy dostepny voice_style z dysku.
+            e.set_voice_hint(voice_hint);
+            <supertonic::SupertonicTtsEngine as TtsEngine>::load_model(&mut e, &dir)
+                .context("load supertonic ONNX model")?;
             Box::new(e)
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
