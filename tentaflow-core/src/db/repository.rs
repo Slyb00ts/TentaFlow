@@ -763,71 +763,7 @@ pub fn list_settings_with_prefix(pool: &DbPool, prefix: &str) -> Result<Vec<(Str
     Ok(rows)
 }
 
-// --- Users ---
-
-pub fn get_user_by_username(pool: &DbPool, username: &str) -> Result<Option<DbUser>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, username, password_hash, role, created_at, last_login_at, must_change_password FROM users WHERE username = ?1",
-    )?;
-    let result = stmt
-        .query_row(rusqlite::params![username], |row| {
-            Ok(DbUser {
-                id: row.get(0)?,
-                username: row.get(1)?,
-                password_hash: row.get(2)?,
-                role: row.get(3)?,
-                created_at: row.get(4)?,
-                last_login_at: row.get(5)?,
-                must_change_password: row.get(6)?,
-            })
-        })
-        .optional()?;
-    Ok(result)
-}
-
-pub fn create_user(pool: &DbPool, username: &str, password_hash: &str, role: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO users (username, password_hash, role) VALUES (?1, ?2, ?3)",
-        rusqlite::params![username, password_hash, role],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-pub fn update_user_last_login(pool: &DbPool, user_id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "UPDATE users SET last_login_at = datetime('now') WHERE id = ?1",
-        rusqlite::params![user_id],
-    )?;
-    Ok(())
-}
-
-pub fn update_user_password(pool: &DbPool, user_id: i64, password_hash: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "UPDATE users SET password_hash = ?1 WHERE id = ?2",
-        rusqlite::params![password_hash, user_id],
-    )?;
-    Ok(())
-}
-
-pub fn clear_must_change_password(pool: &DbPool, user_id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "UPDATE users SET must_change_password = 0 WHERE id = ?1",
-        rusqlite::params![user_id],
-    )?;
-    // VULN-003: Wyczysc tez w tabeli user_accounts
-    let _ = conn.execute(
-        "UPDATE user_accounts SET must_change_password = 0 WHERE id = ?1",
-        rusqlite::params![user_id],
-    );
-    Ok(())
-}
-
-/// Lista jezykow akceptowanych w `users.preferred_language` i w polu
+/// Lista jezykow akceptowanych w `user_accounts.preferred_language` i w polu
 /// `language` requestu TTS. Trzymana w jednym miejscu, bo walidacja zapisu
 /// preferencji i walidacja body'ego endpointu musza wzajemnie sie zgadzac.
 pub const SUPPORTED_USER_LANGUAGES: &[&str] = &["pl", "en", "fr", "es", "de"];
