@@ -255,6 +255,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "services_deployed_source_hash",
             MigrationStep::Sql(SERVICES_DEPLOYED_SOURCE_HASH),
         ),
+        (
+            53,
+            "addon_vector_namespaces_fields",
+            MigrationStep::Sql(ADDON_VECTOR_NAMESPACES_FIELDS),
+        ),
+        (
+            54,
+            "addon_vector_namespaces_sparse",
+            MigrationStep::Sql(ADDON_VECTOR_NAMESPACES_SPARSE),
+        ),
     ]
 }
 
@@ -1207,6 +1217,22 @@ CREATE TABLE IF NOT EXISTS addon_vector_namespaces (
     PRIMARY KEY (addon_id, namespace)
 );
 CREATE INDEX IF NOT EXISTS idx_addon_vector_ns_addon ON addon_vector_namespaces(addon_id);
+"#;
+
+// v52 — declared metadata field schema for a vector namespace, stored as a JSON
+// array of {name, type, indexed} (the universal FieldSpec). Persisting it lets
+// any access path (get / get_or_create) reconstruct the backend with the right
+// column types, and lets reconciliation diff the manifest against the live
+// collection on addon update. Default '[]' = no metadata fields (back-compat).
+const ADDON_VECTOR_NAMESPACES_FIELDS: &str = r#"
+ALTER TABLE addon_vector_namespaces ADD COLUMN fields_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
+// v53 — whether the namespace carries a sparse vector field (hybrid search).
+// Fixed at namespace creation: the backend collection gets a sparse column only
+// when this is 1. 0 = dense-only (default, back-compat).
+const ADDON_VECTOR_NAMESPACES_SPARSE: &str = r#"
+ALTER TABLE addon_vector_namespaces ADD COLUMN sparse INTEGER NOT NULL DEFAULT 0;
 "#;
 
 // F1c P2 — admin-managed allowlist of Ed25519 public keys that may sign

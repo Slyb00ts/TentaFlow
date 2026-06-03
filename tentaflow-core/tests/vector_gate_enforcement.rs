@@ -63,6 +63,8 @@ fn vector_spec(name: &str, gate_id: Option<&str>) -> VectorNamespaceSpec {
         distance: "cosine".to_string(),
         data_class: "B".to_string(),
         gate: gate_id.map(String::from),
+        fields: Vec::new(),
+        sparse: false,
     }
 }
 

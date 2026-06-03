@@ -39,13 +39,17 @@ impl Metric {
     }
 }
 
+pub use tentaflow_sdk_spec::{Field, FieldSpec, FieldValue, Filter, Fusion, SparseVector};
+
 /// One result row from a k-NN search. `score` is the raw metric distance
 /// returned by the backend (lower = closer for cosine/euclidean; `1 - dot`
-/// for dot). Callers that want a 0..1 similarity must convert per metric.
-#[derive(Debug, Clone, Copy)]
+/// for dot). `fields` carries the metadata requested via `output_fields`
+/// (empty when none requested).
+#[derive(Debug, Clone)]
 pub struct SearchHit {
     pub ref_id: u64,
     pub score: f32,
+    pub fields: Vec<Field>,
 }
 
 /// Per-namespace backend. Implementations must be cheap to clone (typically
@@ -54,13 +58,42 @@ pub struct SearchHit {
 /// and run in O(log N) time on a single thread — fast enough that we do not
 /// need to ship them off to a blocking pool for F1c scale (<=1M vectors).
 pub trait VectorBackend: Send + Sync {
-    /// Insert or replace the vector under `ref_id`. usearch enforces unique
-    /// keys when the index is created with `multi=false` (our default).
-    fn upsert(&self, ref_id: u64, vector: &[f32]) -> Result<()>;
+    /// Insert or replace the vector under `ref_id`, with optional typed metadata
+    /// `fields` (their names/types must be in the namespace's declared schema)
+    /// and an optional `sparse` vector (only valid when the namespace was created
+    /// with sparse support, for hybrid search).
+    fn upsert(
+        &self,
+        ref_id: u64,
+        vector: &[f32],
+        fields: &[Field],
+        sparse: Option<&SparseVector>,
+    ) -> Result<()>;
 
-    /// Top-k k-NN search; returns at most `k` hits ordered by ascending
-    /// distance (closest first).
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchHit>>;
+    /// Top-k k-NN search; returns at most `k` hits ordered by ascending distance
+    /// (closest first). `filter` restricts results by metadata (the backend
+    /// translates the universal AST to its native syntax); `output_fields` lists
+    /// metadata field names to return on each hit.
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&Filter>,
+        output_fields: &[String],
+    ) -> Result<Vec<SearchHit>>;
+
+    /// Hybrid dense + sparse search fused with `fusion` (RRF or weighted). Only
+    /// valid when the namespace was created with sparse support. `filter` and
+    /// `output_fields` behave as in `search`.
+    fn hybrid_search(
+        &self,
+        dense: &[f32],
+        sparse: &SparseVector,
+        k: usize,
+        filter: Option<&Filter>,
+        output_fields: &[String],
+        fusion: Fusion,
+    ) -> Result<Vec<SearchHit>>;
 
     /// Remove the vector under `ref_id`. Returns `true` if the key existed.
     /// Implementations MUST persist to disk before returning Ok so that a
@@ -80,6 +113,15 @@ pub trait VectorBackend: Send + Sync {
     /// internally before returning success, so external callers only need
     /// this for explicit flush points (tests, shutdown hooks).
     fn save(&self) -> Result<()>;
+
+    /// Make the live collection's metadata schema equal `desired` (schema
+    /// reconciliation on addon update). `stored` is the schema currently
+    /// recorded for the namespace. Implementations apply this however their
+    /// engine allows — embedded zvec rebuilds the collection (its online DDL is
+    /// numeric-only), external Milvus adds the new columns online (and errors on
+    /// a field removal, which Milvus cannot do online). A no-op `Ok` when the
+    /// schema already matches.
+    fn reconcile_fields(&self, stored: &[FieldSpec], desired: &[FieldSpec]) -> Result<()>;
 
     /// Geometry of this index — used by the namespace manager to validate
     /// that addon-supplied vectors match the declared dimension.
