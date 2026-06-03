@@ -1017,6 +1017,49 @@ pub(crate) fn resolve_model_repo(
     Some(chosen.repo.clone())
 }
 
+/// Resolves the name the service advertises for its default model — the same
+/// value `models_from_manifest` writes as `model_name` and the executor
+/// rewrites `request.model` to before dispatch. For OpenAI-compatible HTTP
+/// engines (vLLM) this MUST be passed to the backend as `--served-model-name`,
+/// otherwise vLLM serves the model under its repo path (`--model ${MODEL}`)
+/// while we route by the preset id slug — a guaranteed 404 whenever
+/// `preset.id != preset.repo`. Selection mirrors `resolve_model_repo`:
+///   1. custom `model_repo` → the repo (model_name == repo in that path).
+///   2. `model_preset_id` → `preset.id`.
+///   3. recommended (or first) preset → `preset.id`.
+pub(crate) fn resolve_served_model_name(
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+) -> Option<String> {
+    if let Some(repo) = user_config
+        .get("model_repo")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(repo.to_string());
+    }
+    if let Some(id) = user_config
+        .get("model_preset_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(p) = manifest.model_presets.iter().find(|m| m.id == id) {
+            return Some(p.id.clone());
+        }
+    }
+    if manifest.model_presets.is_empty() {
+        return None;
+    }
+    let chosen = manifest
+        .model_presets
+        .iter()
+        .find(|p| p.recommended)
+        .unwrap_or(&manifest.model_presets[0]);
+    Some(chosen.id.clone())
+}
+
 /// Builds the canonical base URL we persist as `services.endpoint_url` for
 /// HTTP transports. `BackendClient` (in `services/backend/client.rs`) appends
 /// `/chat/completions`, `/embeddings`, `/audio/{transcriptions,speech}` to
