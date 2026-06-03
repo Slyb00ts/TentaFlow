@@ -129,17 +129,17 @@ fn validate_readable_content_type(content_type: &str) -> Result<()> {
     )))
 }
 
-fn truncate_chars(input: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars).collect()
 }
 
-fn count_words(text: &str) -> usize {
+pub(crate) fn count_words(text: &str) -> usize {
     text.split_whitespace()
         .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
         .count()
 }
 
-fn unix_time() -> i64 {
+pub(crate) fn unix_time() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

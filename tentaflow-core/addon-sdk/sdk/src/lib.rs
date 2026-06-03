@@ -1496,6 +1496,8 @@ pub struct WebReadSearchResultsRequest {
     pub max_chars_per_page: usize,
     #[serde(default)]
     pub provider: serde_json::Value,
+    #[serde(default)]
+    pub mode: String,
 }
 
 fn default_web_search_limit() -> usize {
@@ -1540,6 +1542,7 @@ pub fn web_read_url(request: &WebReadUrlRequest) -> Result<serde_json::Value, Ab
 pub fn web_read_search_results(
     request: &WebReadSearchResultsRequest,
 ) -> Result<serde_json::Value, AbiError> {
+    let mode = if request.mode.is_empty() { "auto" } else { &request.mode };
     web_research(&serde_json::json!({
         "op": "read_search_results",
         "query": request.query,
@@ -1547,6 +1550,7 @@ pub fn web_read_search_results(
         "read_limit": request.read_limit,
         "max_chars_per_page": request.max_chars_per_page,
         "provider": request.provider,
+        "mode": mode,
     }))
 }
 

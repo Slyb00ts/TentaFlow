@@ -1,0 +1,23 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle uruchamiajacy Playwright Chromium renderer.
+# Przykład: TentaFlow startuje server.py, a Core wysyla POST /render.
+# =============================================================================
+
+[bundle]
+engine = "browser-renderer"
+description = "Playwright Chromium renderer with per-user persistent contexts"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "playwright==1.60.0"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8092}"]
+internal_port = 8092
+
+[requires]
+gpu_memory_gb = 0
+disk_gb = 3
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
