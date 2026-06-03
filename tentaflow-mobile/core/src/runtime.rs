@@ -176,6 +176,30 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
     router.start();
     info!("Router uruchomiony");
 
+    // Lazy-load + memory guard dla embedded modeli (unpinned = domyslne na
+    // mobile). Modele laduja sie na pierwsze zadanie (executor.ensure_resident),
+    // single-resident eviction trzyma max jeden naraz, idle-unload zwalnia po
+    // 60s bezczynnosci. Bez tego mobile ladowalby wszystkie modele rezydentnie
+    // i przekraczal limit pamieci.
+    if let Some(ports) = services_port_allocator.clone() {
+        let residency = Arc::new(
+            tentaflow_core::services::model_residency::ModelResidency::new(
+                db.clone(),
+                ports,
+                std::time::Duration::from_secs(60),
+            ),
+        );
+        residency.clone().spawn_idle_unloader();
+        // Globalna rejestracja + handle runtime — pozwala memory guard
+        // (lifecycle.on_memory_warning, wolany z watku iOS) wyladowac modele.
+        tentaflow_core::services::model_residency::register_global(
+            residency.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        router.plant_model_residency(residency);
+        info!("Model residency (lazy-load + memory guard) aktywny (idle 60s)");
+    }
+
     // Zainstaluj wbudowane addony (WASM — wasmi interpreter na mobile)
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
         tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);

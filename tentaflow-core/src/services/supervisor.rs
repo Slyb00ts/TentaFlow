@@ -428,8 +428,16 @@ impl Supervisor {
             if svc.paused || svc.transport != Transport::Embedded {
                 continue;
             }
-            // Only services the user expected to be up. Stopped/Failed/Interrupted
-            // are left alone (pinned ones are handled by auto_start_pinned).
+            // Tylko PINNED embedded reloadujemy na boocie. UNPINNED (domyslne na
+            // mobile) sa lazy — ladowane na pierwsze zadanie przez executor, NIE
+            // przy starcie; memory guard zwalnia je gdy idle. Bez tego mobile
+            // ladowalby wszystkie modele naraz i przekraczal limit pamieci.
+            if !svc.pinned {
+                continue;
+            }
+            // Pinned w stanach Stopped/Failed/Interrupted obsluguje
+            // auto_start_pinned; tu bierzemy te ktore byly "up" (stan in-process
+            // stracony przy restarcie procesu).
             if !matches!(
                 svc.status,
                 ServiceStatus::Running

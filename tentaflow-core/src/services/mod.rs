@@ -7,6 +7,7 @@
 pub mod gpu_snapshot;
 pub mod manifest;
 pub mod model_download;
+pub mod model_residency;
 pub mod models;
 pub mod nim;
 pub mod portainer;

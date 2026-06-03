@@ -89,6 +89,10 @@ class MLXSwiftEngine: @unchecked Sendable {
         print("[MLXSwift] Wyladowywanie modelu")
         modelContainer = nil
         modelPath = nil
+        // Zwolnij globalny MLX GPU cache (zwolnione bufory trzymane do reuse).
+        // Bez tego wymiana modeli (residency eviction) zostawia bufory w cache —
+        // przy wielokrotnych przeladowaniach pamiec rosnie az do jetsam.
+        MLX.GPU.clearCache()
     }
 
     /// Generuje tekst z callbackiem na kazdy token. Zwraca kod: 0=OK,

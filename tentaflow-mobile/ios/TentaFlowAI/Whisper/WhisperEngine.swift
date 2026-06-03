@@ -179,6 +179,8 @@ public final class MLXWhisperEngine {
         self.model = nil
         self.tokenizer = nil
         self.modelPath = nil
+        // Zwolnij globalny MLX GPU cache po wyladowaniu (patrz MLXSwiftEngine).
+        MLX.GPU.clearCache()
     }
 
     /// Transkrybuje audio dowolnej dlugosci. Dziala w trybie chunked: dzieli
