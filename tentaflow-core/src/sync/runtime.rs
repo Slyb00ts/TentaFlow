@@ -522,8 +522,9 @@ impl SyncRuntime {
         // row; draining records them under the just-bumped epoch. Because the
         // outbox was wiped by `reset_core_partitions`, this is repeatable: a
         // crash-and-retry re-emits the same snapshot into an empty outbox.
-        let emitted = repository::reseed_core_state_from_current_rows(&self.db)
-            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        let emitted =
+            repository::reseed_core_state_from_current_rows(&self.db, &self.settings_cipher)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         crate::sync::core_capture::drain_pending_core_captures_with(
             &self.db,
             usize::MAX,
@@ -6848,6 +6849,76 @@ mod tests {
                 (later.wall_time_ms, later.logical)
                     > (reseed_a_hlc.wall_time_ms, reseed_a_hlc.logical),
                 "post-cutover update HLC {later:?} must exceed reseed HLC {reseed_a_hlc:?}"
+            );
+        });
+    }
+
+    /// A baseline cutover must re-emit stored shared secrets. The pre-cutover
+    /// enqueue creates a `core.shared_setting_secret` capture, the cutover wipes
+    /// the whole journal, and the reseed is the only path that restores it — so
+    /// after cutover the outbox must hold a fresh secret op under the NEW epoch
+    /// with a real (non-zero) HLC, or the secret would silently vanish.
+    #[test]
+    fn baseline_cutover_reseeds_stored_shared_secret() {
+        with_tmp_home(|| {
+            let node = make_runtime(170);
+            seed_core_authority_target(
+                &node.runtime.db,
+                "core.shared_setting_secret",
+                "peer-authority",
+            );
+
+            repository::set_shared_secret_setting_secure(
+                &node.runtime.db,
+                "hf_token",
+                "hf_baseline_secret",
+                &node.runtime.settings_cipher,
+                None,
+            )
+            .expect("store shared secret");
+
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "1",
+            )
+            .expect("arm marker");
+
+            node.runtime
+                .run_pending_baseline_cutover()
+                .expect("cutover runs")
+                .expect("cutover pending");
+
+            let new_epoch = node.runtime.ledger.current_epoch().expect("epoch");
+            let push = node
+                .runtime
+                .build_push_payload_for_target("peer-authority", 256)
+                .expect("push")
+                .expect("payload");
+
+            let mut secret_hlcs: Vec<HybridLogicalTimestamp> = Vec::new();
+            for wire in &push.operations {
+                let op = node
+                    .runtime
+                    .ledger
+                    .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
+                    .expect("op");
+                if op.body.resource_type == "core.shared_setting_secret"
+                    && op.body.resource_id == "hf_token"
+                {
+                    assert_eq!(op.body.epoch, new_epoch, "secret reseed carries new epoch");
+                    secret_hlcs.push(op.body.hlc_timestamp.clone());
+                }
+            }
+            assert_eq!(
+                secret_hlcs.len(),
+                1,
+                "exactly one fresh shared-secret op after cutover"
+            );
+            let hlc = &secret_hlcs[0];
+            assert!(
+                hlc.wall_time_ms > 0 || hlc.logical > 0,
+                "secret reseed must mint a real HLC, got {hlc:?}"
             );
         });
     }
