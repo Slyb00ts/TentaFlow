@@ -267,14 +267,24 @@ impl EmbeddedDeploy {
         }
         #[cfg(not(test))]
         {
-            let model_path = if let Some(path) = self
+            // Persisted `model_path` to absolutna sciezka zapisana po pierwszym
+            // deployu. Na iOS katalog Data aplikacji ma UUID rotowany przy
+            // reinstalacji — stara absolutna sciezka wskazuje wtedy na nieistniejacy
+            // kontener (objaw: "Sciezka nie istnieje" + load kod -1 przy boot-reload).
+            // Gdy zapisana sciezka nie istnieje, ignorujemy ja i re-resolvujemy z
+            // repo: ModelStore liczy katalog pod BIEZACYM kontenerem, a download jest
+            // idempotentny (pomija jesli model juz pobrany). Tak samo zachowuje sie
+            // embedded STT/TTS, ktore przezywaja rotacje kontenera.
+            let persisted = self
                 .user_config
                 .get("model_path")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                PathBuf::from(path)
+                .map(PathBuf::from)
+                .filter(|p| p.exists());
+            let model_path = if let Some(path) = persisted {
+                path
             } else {
                 if selection.repo.starts_with("http://") || selection.repo.starts_with("https://") {
                     return Err(DeployError::Manifest(format!(

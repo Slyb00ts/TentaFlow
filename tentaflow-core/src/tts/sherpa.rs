@@ -94,20 +94,79 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
     Ok(target)
 }
 
-/// Sciaga pliki z HF i normalizuje katalog do formatu wymaganego przez
-/// `SherpaTtsEngine::load_model`. Wykonywane w `spawn_blocking` bo hf-hub
-/// sync API blokuje, a synchroniczne IO jest tu prostsze niz async wariant.
-fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
-    use hf_hub::api::sync::Api;
+/// Klient HTTP do pobierania modeli z HF. Bez hf-hub (patrz `download_and_prepare`
+/// — symlinki hf-hub padaja EPERM na iOS). User-agent jak reszta naszych downloadow.
+fn hf_blocking_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("tentaflow/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build reqwest blocking client")
+}
 
-    let api = Api::new().context("hf-hub Api::new")?;
-    let r = api.model(repo.to_string());
-    let info_repo = r.info().with_context(|| format!("hf-hub info({})", repo))?;
-    let files: Vec<String> = info_repo
-        .siblings
-        .into_iter()
-        .map(|s| s.rfilename)
-        .collect();
+/// Lista plikow w repo HF przez publiczne API (`/api/models/<repo>`). Zwraca
+/// `siblings[].rfilename`. Tylko HTTP GET — nic nie pisze na dysk (iOS-safe).
+fn hf_list_files(client: &reqwest::blocking::Client, repo: &str) -> Result<Vec<String>> {
+    let url = format!("https://huggingface.co/api/models/{repo}");
+    let json: serde_json::Value = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HF API info({repo})"))?
+        .json()
+        .with_context(|| format!("parse HF model info ({repo})"))?;
+    let files = json
+        .get("siblings")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("rfilename").and_then(|v| v.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(files)
+}
+
+/// Pobiera pojedynczy plik z repo HF (`resolve/main/<rfilename>`) wprost do
+/// `dest`, streamingiem. Tworzy katalogi rodzica. Bez symlinkow — dziala na iOS.
+fn hf_download_file(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+    rfilename: &str,
+    dest: &Path,
+) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
+    }
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{rfilename}");
+    let mut resp = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("download {rfilename}"))?;
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+    std::io::copy(&mut resp, &mut file)
+        .with_context(|| format!("write {}", dest.display()))?;
+    Ok(())
+}
+
+/// Sciaga pliki z HF i normalizuje katalog do formatu wymaganego przez
+/// `SherpaTtsEngine::load_model`. Wykonywane w `spawn_blocking` bo uzywamy
+/// `reqwest::blocking` (proste streaming IO bez async wariantu).
+///
+/// Pobieranie idzie przez `reqwest` (publiczne HF API + `resolve/main`), NIE
+/// przez hf-hub: hf-hub linkuje snapshot->blob `std::os::unix::fs::symlink`,
+/// a iOS sandbox zwraca na `symlink()` EPERM ("Operation not permitted") —
+/// pobranie padalo i mylacy bail "nie zawiera pliku .onnx" leciał mimo ze plik
+/// w repo jest. reqwest pisze plik wprost, bez symlinkow — dziala na iOS i wszedzie.
+fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
+    let client = hf_blocking_client()?;
+    let files = hf_list_files(&client, repo)?;
 
     // Wybieramy pojedynczy voice: alfabetycznie pierwszy `.onnx` w repo.
     // Subdir tego pliku staje sie prefixem ktory zdejmujemy ze sciezek
@@ -124,6 +183,16 @@ fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
         Some(idx) => onnx_path[..=idx].to_string(),
         None => String::new(),
     };
+    // Stem wybranego voice bez ".onnx" (np. "pl_PL-jarvis_wg_glos-medium").
+    // W PLASKICH multi-voice repo (WitoldG: jarvis/justyna/meski/zenski w
+    // korzeniu, voice_subdir="") filtruje pliki .onnx/.onnx.json do JEDNEGO
+    // glosu — bez tego pobieralibysmy wszystkie cztery, a tokens.txt
+    // generowalby sie z losowego `.onnx.json` (objaw: wybrano jarvisa, tokeny
+    // z zenski). Pliki wspoldzielone (tokens.txt, lexicon, espeak) przechodza.
+    let voice_stem: String = onnx_path
+        .strip_suffix(".onnx")
+        .unwrap_or(onnx_path)
+        .to_string();
     info!(
         "[sherpa-onnx] wybrany voice: {} (subdir: '{}')",
         onnx_path, voice_subdir
@@ -164,23 +233,23 @@ fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
             continue;
         }
 
-        let src = match r.get(fname) {
-            Ok(p) => p,
-            Err(e) => {
-                info!("[sherpa-onnx] pomijam {}: {}", fname, e);
-                continue;
-            }
-        };
+        // Plaskie multi-voice repo: odrzuc .onnx/.onnx.json INNEGO glosu niz
+        // wybrany (voice_stem). Pliki wspoldzielone (tokens.txt, lexicon,
+        // espeak) nie sa voice-specyficzne — przechodza.
+        let is_voice_file = rel.ends_with(".onnx") || rel.ends_with(".onnx.json");
+        if voice_subdir.is_empty() && is_voice_file && !fname.starts_with(&voice_stem) {
+            continue;
+        }
+
         // Splaszczamy: pliki z voice_subdir trafiaja do korzenia target,
-        // espeak-ng-data zachowuje swoja strukture katalogu.
+        // espeak-ng-data zachowuje swoja strukture katalogu. Pobieramy wprost
+        // do docelowej sciezki (reqwest, bez symlinkow hf-hub).
         let dst_rel = if is_espeak { fname.as_str() } else { rel };
         let dst = target.join(dst_rel);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {}", parent.display()))?;
+        if let Err(e) = hf_download_file(&client, repo, fname, &dst) {
+            info!("[sherpa-onnx] pomijam {}: {}", fname, e);
+            continue;
         }
-        std::fs::copy(&src, &dst)
-            .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
 
         if rel.ends_with(".onnx") && !rel.ends_with(".onnx.json") {
             got_onnx = true;
@@ -428,8 +497,6 @@ fn pb_len_field(buf: &mut Vec<u8>, field: u64, data: &[u8]) {
 /// repo i zwraca sciezke do lokalnego shared cache. Kolejne wywolania zwracaja
 /// istniejacy katalog bez ruchu sieciowego.
 fn ensure_shared_espeak_data() -> Result<PathBuf> {
-    use hf_hub::api::sync::Api;
-
     let shared_root = sherpa_cache_dir().join("_shared");
     let shared = shared_root.join("espeak-ng-data");
     if shared.is_dir()
@@ -446,32 +513,21 @@ fn ensure_shared_espeak_data() -> Result<PathBuf> {
         ESPEAK_FALLBACK_REPO
     );
 
-    let api = Api::new().context("hf-hub Api::new (shared)")?;
-    let r = api.model(ESPEAK_FALLBACK_REPO.to_string());
-    let info_repo = r
-        .info()
-        .with_context(|| format!("hf-hub info({})", ESPEAK_FALLBACK_REPO))?;
+    // reqwest zamiast hf-hub — symlinki hf-hub padaja EPERM na iOS (patrz
+    // `download_and_prepare`).
+    let client = hf_blocking_client()?;
+    let files = hf_list_files(&client, ESPEAK_FALLBACK_REPO)?;
 
     let mut copied_any = false;
-    for s in info_repo.siblings {
-        let fname = s.rfilename;
+    for fname in files {
         if !fname.starts_with("espeak-ng-data/") {
             continue;
         }
-        let src = match r.get(&fname) {
-            Ok(p) => p,
-            Err(e) => {
-                info!("[sherpa-onnx] pomijam shared {}: {}", fname, e);
-                continue;
-            }
-        };
         let dst = shared_root.join(&fname);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {}", parent.display()))?;
+        if let Err(e) = hf_download_file(&client, ESPEAK_FALLBACK_REPO, &fname, &dst) {
+            info!("[sherpa-onnx] pomijam shared {}: {}", fname, e);
+            continue;
         }
-        std::fs::copy(&src, &dst)
-            .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
         copied_any = true;
     }
     if !copied_any {

@@ -130,4 +130,32 @@ void tentaflow_register_kokoro(
     void* context
 );
 
+// =============================================================================
+// MLX Whisper bridge — WhisperEngine.swift (MLX). Na iOS brak libMLXBridge.dylib;
+// Swift rejestruje wskazniki + context (MLXWhisperEngine.shared) przy starcie.
+// =============================================================================
+
+// Zaladuj model z katalogu. Zwraca 0=OK, <0=blad.
+typedef int (*mlx_whisper_load_model_fn_t)(const char* model_path, void* context);
+
+// Wyladuj model.
+typedef void (*mlx_whisper_unload_model_fn_t)(void* context);
+
+// Transkrypcja PCM Float32 mono 16 kHz -> strdup'd UTF-8 string (Rust zwalnia
+// przez libc free). NULL przy bledzie.
+typedef char* (*mlx_whisper_transcribe_fn_t)(
+    const float* pcm,
+    int n_samples,
+    const char* language,
+    void* context
+);
+
+// Rejestracja callbackow MLX Whisper — wywolywane z Swift przy starcie aplikacji.
+void tentaflow_register_whisper(
+    mlx_whisper_load_model_fn_t load_fn,
+    mlx_whisper_unload_model_fn_t unload_fn,
+    mlx_whisper_transcribe_fn_t transcribe_fn,
+    void* context
+);
+
 #endif
