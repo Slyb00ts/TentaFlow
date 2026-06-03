@@ -515,6 +515,14 @@ pub struct AddonManager {
     /// Cache of raw validated CBOR bytes from `ui_render_cbor`, keyed by
     /// (user_id, addon_id, slot). Frontend receives CBOR via event bus push.
     ui_panels: Arc<PlRwLock<HashMap<(String, String, String), Vec<u8>>>>,
+    /// Per-instance (addon_id) lock serializing lifecycle ops — uninstall_instance,
+    /// update_instance — and `start_addon` against each other, so a hot update
+    /// can't interleave with a concurrent start of the SAME instance. The hot
+    /// invoke path (invoke_block/call_tool) intentionally does NOT take this lock;
+    /// a call landing inside the brief update swap may transiently fail with
+    /// "tool not found" until re-register completes — acceptable for a hot update
+    /// (no corruption), and keeping it lock-free avoids penalizing invocations.
+    addon_op_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// Returns the subset of `owned` alias names that should be activated on
@@ -568,7 +576,19 @@ impl AddonManager {
             flow_blocks_registry: Arc::new(flow_blocks::AddonFlowRegistry::new()),
             service_tasks: Arc::new(Mutex::new(HashMap::new())),
             ui_panels: Arc::new(PlRwLock::new(HashMap::new())),
+            addon_op_locks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Zwraca per-instancyjny mutex operacji lifecycle (lazy-create po addon_id).
+    /// Trzymany przez uninstall_instance/update_instance i start_addon, zeby
+    /// serializowac operacje na tej samej instancji.
+    fn addon_op_lock(&self, addon_id: &str) -> Arc<Mutex<()>> {
+        self.addon_op_locks
+            .lock()
+            .entry(addon_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Handle to the raw validated CBOR bytes cache written by `ui_render_cbor`.
@@ -652,13 +672,28 @@ impl AddonManager {
         // Parsuj manifest i zainstaluj
         let manifest = lifecycle::install(addon_path, &self.db)?;
 
-        // Zarejestruj narzedzia z manifestu
-        self.register_tools_from_manifest(&manifest)?;
+        // Rejestracja runtime (toole, flow bloki, aliasy, [runtime] overrides).
+        // blocks.json czytamy z katalogu zrodlowego addonu.
+        self.register_addon_runtime(&manifest, addon_path)?;
 
-        // Zarejestruj custom flow blocks (jesli addon dostarcza blocks.json
-        // obok manifest.toml). Brak blocks.json = addon nie deklaruje
-        // bloków — graceful skip.
-        match flow_blocks::load_blocks_from_addon(&manifest.addon_id, addon_path) {
+        info!(
+            "Addon '{}' v{} zainstalowany pomyslnie",
+            manifest.addon_id, manifest.version
+        );
+        Ok(())
+    }
+
+    /// Rejestruje w pamieci managera wszystkie runtime'owe artefakty addonu/
+    /// instancji z manifestu: toole, custom flow bloki (z `source_dir`), aliasy
+    /// i [runtime] overrides. Wspolne dla install_addon, install_instance i
+    /// re-rejestracji po update_instance. `source_dir` to katalog z plikami
+    /// addonu (dla instancji: katalog wersjonowanego pakietu).
+    fn register_addon_runtime(&self, manifest: &AddonManifest, source_dir: &Path) -> Result<()> {
+        self.register_tools_from_manifest(manifest)?;
+
+        // Custom flow bloki (jesli addon dostarcza blocks.json obok manifestu).
+        // Brak blocks.json = addon ich nie deklaruje — graceful skip.
+        match flow_blocks::load_blocks_from_addon(&manifest.addon_id, source_dir) {
             Ok(blocks) if !blocks.is_empty() => {
                 let count = blocks.len();
                 self.flow_blocks_registry
@@ -675,24 +710,17 @@ impl AddonManager {
             ),
         }
 
-        // Generic alias registration from [[alias]] manifest sections plus
-        // consumer-side `[[uses_alias]]` / `[[uses_model]]` declarations and
-        // reconciliation of pending grants. All run in a single SQLite tx
-        // so a partial install rolls back cleanly. Trigger when any of the
-        // three sections is present — uses_* alone is enough for a pure
-        // consumer addon.
+        // Aliasy z [[alias]] + consumer-side [[uses_alias]]/[[uses_model]].
+        // Jeden SQLite tx — czesciowa rejestracja rolluje sie czysto.
         if !manifest.aliases.is_empty()
             || !manifest.uses_aliases.is_empty()
             || !manifest.uses_models.is_empty()
         {
-            self.install_manifest_aliases(&manifest)?;
+            self.install_manifest_aliases(manifest)?;
         }
 
-        // F2-P3 — push [runtime] overrides into the scheduler and the
-        // service_call rate limiter so the cap/rate-limit per addon actually
-        // takes effect from the next invocation (instead of waiting for a
-        // process restart or a manual API call). 0 sentinel = no override
-        // (clear back to default), Some(n>0) = apply.
+        // [runtime] overrides → scheduler concurrency cap + service_call rate
+        // limiter, zeby cap/limit dzialal od nastepnego wywolania. 0 = clear.
         if let Some(rt) = manifest.runtime_overrides.as_ref() {
             let sched = crate::flow_runtime::scheduler::FlowScheduler::global();
             match rt.max_concurrency {
@@ -705,11 +733,6 @@ impl AddonManager {
                 _ => rl.clear_addon_rate_limit(&manifest.addon_id),
             }
         }
-
-        info!(
-            "Addon '{}' v{} zainstalowany pomyslnie",
-            manifest.addon_id, manifest.version
-        );
         Ok(())
     }
 
@@ -911,8 +934,35 @@ impl AddonManager {
     /// Odinstalowuje addon — usuwa z DB, czysci storage, zatrzymuje instancje
     pub fn uninstall_addon(&self, addon_id: &str) -> Result<()> {
         info!("Odinstalowanie addonu: {}", addon_id);
+        self.unregister_addon_runtime(addon_id);
+        lifecycle::uninstall(addon_id, &self.db)?;
+        self.event_bus.unsubscribe_all(addon_id);
+        info!("Addon '{}' odinstalowany pomyslnie", addon_id);
+        Ok(())
+    }
 
-        // Zatrzymaj wszystkie instancje tego addonu
+    /// Odinstalowuje INSTANCJE — jak uninstall_addon, ale dodatkowo usuwa
+    /// katalog danych instancji (orgs/<org>/addons/<addon_id>/). Dane instancji
+    /// sa jej wlasnoscia i nie powinny zostawac po deinstalacji. Nie rusza
+    /// wspoldzielonego store'u pakietow.
+    pub fn uninstall_instance(&self, addon_id: &str) -> Result<()> {
+        info!("Odinstalowanie instancji: {}", addon_id);
+        let op = self.addon_op_lock(addon_id);
+        let _guard = op.lock();
+        self.unregister_addon_runtime(addon_id);
+        lifecycle::uninstall_instance(addon_id, &self.db)?;
+        self.event_bus.unsubscribe_all(addon_id);
+        info!("Instancja '{}' odinstalowana", addon_id);
+        Ok(())
+    }
+
+    /// Zdejmuje z pamieci managera wszystkie runtime'owe artefakty addonu:
+    /// zatrzymuje uruchomione instancje wasm, czysci cache modulu, wyrejestrowuje
+    /// toole i flow bloki, invaliduje FlowCache i deaktywuje aliasy. NIE rusza
+    /// DB ani danych — to robi caller (uninstall/update). Wspolne dla
+    /// uninstall_addon, uninstall_instance i update_instance (hot reload).
+    fn unregister_addon_runtime(&self, addon_id: &str) {
+        // Zatrzymaj wszystkie instancje wasm tego addonu.
         let instance_ids: Vec<String> = {
             let instances = self.instances.lock();
             instances
@@ -920,50 +970,158 @@ impl AddonManager {
                 .map(|v| v.iter().map(|i| i.instance_id.clone()).collect())
                 .unwrap_or_default()
         };
-
         for instance_id in &instance_ids {
             if let Err(e) = self.stop_addon(instance_id) {
                 warn!("Blad przy zatrzymywaniu instancji '{}': {}", instance_id, e);
             }
         }
 
-        // Usun skompilowany modul z cache
+        // Usun skompilowany modul z cache (nastepny start skompiluje aktualny
+        // wasm — istotne dla update_instance).
         self.compiled_modules.write().remove(addon_id);
 
-        // Usun zarejestrowane narzedzia
+        // Usun zarejestrowane narzedzia.
         self.registered_tools
             .write()
             .retain(|t| t.addon_id != addon_id);
 
-        // Usun custom flow blocks — adapter resolver natychmiast przestanie
-        // ich znajdowac, kompilacje flow w trakcie zostawiamy w spokoju (mają
-        // własną kopię flow definition, executor po prostu zwroci "no
-        // adapter for node" przy nastepnym uzyciu).
+        // Usun custom flow bloki — adapter resolver natychmiast przestanie ich
+        // znajdowac.
         self.flow_blocks_registry.unregister_addon_blocks(addon_id);
 
-        // Wymus invalidate FlowCache — flow z cached `CompiledFlow` moze
-        // miec dangling reference do bloku tego addonu, ktory wlasnie znika
-        // z resolvera. Executor i tak by zwrocil "no adapter for node"
-        // przy nastepnym uzyciu, ale clean cache produkuje czytelniejszy
-        // blad przy compile (R2 "no adapter").
+        // Invalidate FlowCache — cached `CompiledFlow` moze miec dangling
+        // reference do bloku tego addonu, ktory wlasnie znika z resolvera.
         if let Some(router) = self.router.read().clone() {
             if let Some(dispatcher) = router.flow_dispatcher() {
                 dispatcher.invalidate_cache();
             }
         }
 
-        // Deactivate aliases owned by this addon before uninstall — read
-        // owner table directly (manifest may already be unreachable). Owner
-        // rows stay so the audit trail and future reinstall match.
+        // Deaktywuj aliasy posiadane przez addon — czytamy owner table wprost
+        // (manifest moze byc juz nieosiagalny). Owner rows zostaja dla audytu.
         self.deactivate_aliases_owned_by_addon(addon_id);
+    }
 
-        // Usun z DB
-        lifecycle::uninstall(addon_id, &self.db)?;
+    /// Instaluje NOWA instancje pakietu z katalogu pod wlasnym addon_id i
+    /// rejestruje jej runtime (toole, flow bloki z katalogu pakietu, aliasy).
+    /// Zwraca addon_id utworzonej instancji. Nie startuje jej — start jest
+    /// osobna akcja (jak przy install_addon).
+    pub fn install_instance(
+        &self,
+        package_id: &str,
+        version: &str,
+        display_name: &str,
+    ) -> Result<String> {
+        info!(
+            "Instalacja instancji pakietu '{}' v{} jako '{}'",
+            package_id, version, display_name
+        );
+        let instance_id = lifecycle::install_instance(&self.db, package_id, version, display_name)?;
+        let manifest = self.load_addon_manifest(&instance_id)?;
+        let pkg_dir = bundled::package_dir(package_id, version);
+        self.register_addon_runtime(&manifest, &pkg_dir)?;
+        info!(
+            "Instancja '{}' (pakiet '{}' v{}) zainstalowana",
+            instance_id, package_id, version
+        );
+        Ok(instance_id)
+    }
 
-        // Odsubskrybuj z event bus
-        self.event_bus.unsubscribe_all(addon_id);
+    /// Duplikuje istniejaca instancje: nowa instancja tego samego pakietu i
+    /// wersji pod nowa nazwa, z pustymi danymi.
+    pub fn duplicate_instance(
+        &self,
+        source_addon_id: &str,
+        new_display_name: &str,
+    ) -> Result<String> {
+        let (package_id, version) =
+            crate::db::repository::get_addon_instance_package_ref(&self.db, source_addon_id)?
+                .ok_or_else(|| anyhow::anyhow!("instancja '{source_addon_id}' nie istnieje"))?;
+        self.install_instance(&package_id, &version, new_display_name)
+    }
 
-        info!("Addon '{}' odinstalowany pomyslnie", addon_id);
+    /// Hot-update instancji do innej (juz skatalogowanej) wersji jej pakietu,
+    /// bez restartu glownego procesu TentaFlow i bez ruszania innych instancji.
+    /// Zatrzymuje wasm instancji, podbija wersje + aplikuje brakujace migracje do
+    /// jej wlasnego SQLite, przerejestrowuje toole/flow bloki/metadane z nowej
+    /// wersji i restartuje instancje w trybie service (on-demand wstana leniwie
+    /// z nowym modulem).
+    pub fn update_instance(&self, addon_id: &str, target_version: &str) -> Result<()> {
+        let (package_id, current) =
+            crate::db::repository::get_addon_instance_package_ref(&self.db, addon_id)?
+                .ok_or_else(|| anyhow::anyhow!("instancja '{addon_id}' nie istnieje"))?;
+        if current == target_version {
+            info!(
+                "Instancja '{}' juz na wersji {} — pomijam update",
+                addon_id, target_version
+            );
+            return Ok(());
+        }
+        info!(
+            "Hot-update instancji '{}': v{} -> v{}",
+            addon_id, current, target_version
+        );
+
+        // Sekcja krytyczna pod per-instancyjnym lockiem: serializuje update
+        // wzgledem rownoleglego startu/innego update tej samej instancji.
+        // Restart service-mode robimy PO zwolnieniu locka, bo start_addon sam go
+        // bierze (parking_lot Mutex nie jest reentrant).
+        let manifest = {
+            let op = self.addon_op_lock(addon_id);
+            let _guard = op.lock();
+
+            // Manifest sprzed update — do rollbacku gdy lifecycle zawiedzie.
+            let old_manifest = self.load_addon_manifest(addon_id).ok();
+            let old_pkg_dir = bundled::package_dir(&package_id, &current);
+
+            // 1. Zdejmij runtime: stop wasm instancji + czysc cache modulu +
+            //    wyrejestruj toole/flow bloki + invalidate FlowCache.
+            self.unregister_addon_runtime(addon_id);
+
+            // 2. DB: podbij wersje, zaaplikuj brakujace migracje, zsynchronizuj
+            //    metadane i flow templates. Zwraca docelowy manifest. Przy bledzie
+            //    wiersz addons zostaje na starej wersji (migracje leca przed tx) —
+            //    re-rejestrujemy stary runtime, zeby instancja nie zostala martwa.
+            let updated = match lifecycle::update_instance(&self.db, addon_id, target_version) {
+                Ok(m) => m,
+                Err(e) => {
+                    if let Some(om) = old_manifest {
+                        if let Err(re) = self.register_addon_runtime(&om, &old_pkg_dir) {
+                            warn!(
+                                "Rollback re-rejestracji instancji '{}' po nieudanym update: {}",
+                                addon_id, re
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            // 3. Zarejestruj runtime z nowej wersji (flow bloki z nowego katalogu
+            //    pakietu). Gdy to zawiedzie, DB jest juz na nowej wersji —
+            //    propagujemy blad; kolejny start/boot zarejestruje z DB.
+            let pkg_dir = bundled::package_dir(&package_id, target_version);
+            self.register_addon_runtime(&updated, &pkg_dir)?;
+            updated
+        };
+
+        // 4. Restart service-mode (on-demand instancje wstana leniwie przy
+        //    nastepnym wywolaniu, juz z nowym modulem).
+        if let Some(service) = manifest.service.as_ref() {
+            if service.enabled && service.tick_interval_ms.map(|i| i > 0).unwrap_or(false) {
+                if let Err(e) = self.start_addon(addon_id, None, None) {
+                    warn!(
+                        "Restart service instancji '{}' po update nie powiodl sie: {}",
+                        addon_id, e
+                    );
+                }
+            }
+        }
+
+        info!(
+            "Instancja '{}' zaktualizowana do v{}",
+            addon_id, target_version
+        );
         Ok(())
     }
 
@@ -979,6 +1137,14 @@ impl AddonManager {
         org_id: Option<String>,
     ) -> Result<String> {
         let t_total = std::time::Instant::now();
+
+        // Serializuj start wzgledem hot-update/uninstall tej samej instancji
+        // (per-instancyjny lock). Zapobiega skompilowaniu/uruchomieniu starego
+        // modulu w trakcie wymiany wersji. Update bierze ten lock tylko w swojej
+        // sekcji krytycznej i zwalnia go przed wywolaniem start_addon, wiec brak
+        // reentrancy.
+        let op = self.addon_op_lock(addon_id);
+        let _op_guard = op.lock();
 
         let t0 = std::time::Instant::now();
         let module = self.get_or_compile_module(addon_id)?;

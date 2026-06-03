@@ -105,21 +105,6 @@ pub fn install_instance(
     Ok(instance_id)
 }
 
-/// Duplikuje istniejaca instancje: nowa instancja tego samego pakietu i wersji
-/// pod nowa nazwa, z pustymi danymi (bez kopiowania data.db zrodla — decyzja
-/// produktowa: duplikat zawsze startuje pusty).
-pub fn duplicate_instance(
-    db: &DbPool,
-    source_addon_id: &str,
-    new_display_name: &str,
-) -> Result<String> {
-    let (package_id, package_version) =
-        crate::db::repository::get_addon_instance_package_ref(db, source_addon_id)?.ok_or_else(
-            || anyhow::anyhow!("instancja '{source_addon_id}' nie istnieje"),
-        )?;
-    install_instance(db, &package_id, &package_version, new_display_name)
-}
-
 /// Odinstalowuje instancje: usuwa wpisy DB (uninstall) ORAZ katalog danych
 /// instancji (orgs/<org>/addons/<addon_id>/), bo instancja jest wlascicielem
 /// swoich danych. Nie rusza wspoldzielonego store'u pakietow.
@@ -322,18 +307,22 @@ fn install_core(
     // dostarczaja addon_dir w katalogu tymczasowym, wiec kopiujemy pliki do
     // store'u i katalogizujemy wersje, inaczej runtime nie znajdzie wasm.
     let package_dir = crate::addon::bundled::package_dir(package_id, package_version);
-    let needs_materialize = materialize
-        && match (addon_dir.canonicalize(), package_dir.canonicalize()) {
+    if materialize {
+        // Kopiujemy tylko gdy zrodlo rozni sie od katalogu wersji w store'ie.
+        let needs_copy = match (addon_dir.canonicalize(), package_dir.canonicalize()) {
             (Ok(a), Ok(b)) => a != b,
             _ => addon_dir != package_dir.as_path(),
         };
-    if needs_materialize {
-        // Katalog wersji jest immutable (jedna wersja = jeden niezmienny zestaw
-        // plikow), wiec czyscimy go przed kopiowaniem — inaczej re-upload tej
-        // samej wersji albo nieudany wczesniejszy install zostawilby nieaktualne
-        // pliki (np. usuniete migracje SQL, ktore teraz leca z package_dir).
-        let _ = std::fs::remove_dir_all(&package_dir);
-        copy_package_into_store(addon_dir, &package_dir)?;
+        if needs_copy {
+            // Katalog wersji jest immutable (jedna wersja = jeden niezmienny
+            // zestaw plikow), wiec czyscimy go przed kopiowaniem — inaczej
+            // re-upload tej samej wersji albo nieudany wczesniejszy install
+            // zostawilby nieaktualne pliki (np. usuniete migracje SQL).
+            let _ = std::fs::remove_dir_all(&package_dir);
+            copy_package_into_store(addon_dir, &package_dir)?;
+        }
+        // Katalogizacja wersji jest niezalezna od kopiowania — robimy ja zawsze
+        // przy materialize, tez gdy pliki juz byly w store'ie.
         crate::db::repository::upsert_addon_package(
             db,
             package_id,
@@ -879,6 +868,39 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     let new_manifest = parse_manifest_toml(&manifest_content)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie sparsowac nowego manifest.toml: {e}"))?;
 
+    // Model 1:1: package_id == addon_id, materializuj nowa wersje do store'u.
+    let package_id = addon_id.to_string();
+    let package_version = new_manifest.version.clone();
+    upgrade_core(
+        addon_id,
+        new_dir,
+        db,
+        new_manifest,
+        &manifest_content,
+        &package_id,
+        &package_version,
+        true,
+    )
+    .map(|_| ())
+}
+
+/// Rdzen aktualizacji instancji/addona do nowej wersji. `new_dir` to katalog
+/// zrodlowy z nowymi plikami; `new_manifest`/`manifest_content` niosa tozsamosc
+/// docelowa (`new_manifest.addon_id` == `addon_id`). `package_id`/
+/// `package_version` wskazuja wersjonowany pakiet (resolucja wasm/migracji +
+/// kolumny `addons.package_*`). `materialize=true` kopiuje `new_dir` do store'u
+/// i katalogizuje (1:1/upload); `update_instance` reuzywa istniejacy pakiet z
+/// katalogu i wola z false. Zwraca docelowy manifest (do re-rejestracji runtime).
+fn upgrade_core(
+    addon_id: &str,
+    new_dir: &Path,
+    db: &DbPool,
+    new_manifest: AddonManifest,
+    manifest_content: &str,
+    package_id: &str,
+    package_version: &str,
+    materialize: bool,
+) -> Result<AddonManifest> {
     validate_manifest(&new_manifest)?;
 
     if new_manifest.addon_id != addon_id {
@@ -913,24 +935,27 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     // get_or_compile_module rozwiazuje wasm po (package_id, package_version)
     // ustawianym ponizej. upgrade() dotyczy modelu 1:1, gdzie package_id ==
     // addon_id. (Faza 2 zastapi to update_instance dla modelu wieloinstancyjnego.)
-    let package_dir = crate::addon::bundled::package_dir(addon_id, &new_manifest.version);
-    let needs_materialize = match (new_dir.canonicalize(), package_dir.canonicalize()) {
-        (Ok(a), Ok(b)) => a != b,
-        _ => new_dir != package_dir.as_path(),
-    };
-    if needs_materialize {
-        let _ = std::fs::remove_dir_all(&package_dir);
-        copy_package_into_store(new_dir, &package_dir)?;
+    let package_dir = crate::addon::bundled::package_dir(package_id, package_version);
+    if materialize {
+        let needs_copy = match (new_dir.canonicalize(), package_dir.canonicalize()) {
+            (Ok(a), Ok(b)) => a != b,
+            _ => new_dir != package_dir.as_path(),
+        };
+        if needs_copy {
+            let _ = std::fs::remove_dir_all(&package_dir);
+            copy_package_into_store(new_dir, &package_dir)?;
+        }
+        // Katalogizacja zawsze przy materialize (niezaleznie od kopiowania).
+        crate::db::repository::upsert_addon_package(
+            db,
+            package_id,
+            package_version,
+            &new_manifest.display_name,
+            manifest_content,
+            "",
+            "uploaded",
+        )?;
     }
-    crate::db::repository::upsert_addon_package(
-        db,
-        addon_id,
-        &new_manifest.version,
-        &new_manifest.display_name,
-        &manifest_content,
-        "",
-        "uploaded",
-    )?;
 
     // F1c P5 — compile the new flow templates BEFORE touching the DB. Any
     // compile error (cycle, schema, missing file) aborts the upgrade with the
@@ -987,7 +1012,7 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
             &new_manifest.display_name,
             &new_manifest.description.as_deref().unwrap_or(""),
             &new_manifest.author.as_deref().unwrap_or(""),
-            &manifest_content,
+            manifest_content,
             &platforms_json,
             category,
             icon,
@@ -995,7 +1020,7 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
             wasm_size,
             license,
             show_in_catalog,
-            &new_manifest.version,
+            package_version,
             addon_id,
         ],
     )?;
@@ -1057,7 +1082,65 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
         addon_id, new_manifest.version
     );
 
-    Ok(())
+    Ok(new_manifest)
+}
+
+/// Aktualizuje INSTANCJE do innej (juz skatalogowanej) wersji jej pakietu.
+/// W przeciwienstwie do `upgrade` (model 1:1, materializacja z `new_dir`) tu
+/// wersja docelowa jest juz w katalogu i w store'ie (zasilona przez reconciler),
+/// a `package_id` rozni sie od `addon_id`. Nie kopiuje plikow — reuzywa istniejacy
+/// katalog pakietu, aplikuje brakujace migracje do wlasnego SQLite instancji i
+/// zwraca docelowy manifest (manager re-rejestruje toole/flow bloki). NIE rusza
+/// uruchomionych instancji wasm — to robi warstwa managera (hot reload).
+pub fn update_instance(
+    db: &DbPool,
+    addon_id: &str,
+    target_version: &str,
+) -> Result<AddonManifest> {
+    let (package_id, current_version) =
+        crate::db::repository::get_addon_instance_package_ref(db, addon_id)?
+            .ok_or_else(|| anyhow::anyhow!("instancja '{addon_id}' nie istnieje"))?;
+
+    let pkg = crate::db::repository::get_addon_package(db, &package_id, target_version)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "wersja '{target_version}' pakietu '{package_id}' nie istnieje w katalogu"
+            )
+        })?;
+    let pkg_dir = crate::addon::bundled::package_dir(&package_id, target_version);
+    if !pkg_dir.join("manifest.toml").exists() {
+        bail!(
+            "pliki wersji '{target_version}' pakietu '{package_id}' nie istnieja w store ({:?})",
+            pkg_dir
+        );
+    }
+
+    // Zachowaj nazwe instancji nadana przez usera (kolumna addons.name ==
+    // display_name instancji), zeby update nie nadpisal jej nazwa pakietu.
+    let display_name = crate::db::repository::get_addon(db, addon_id)?
+        .map(|a| a.name)
+        .unwrap_or_else(|| addon_id.to_string());
+
+    // Manifest docelowy = manifest wersji pakietu z tozsamoscia instancji.
+    let instance_manifest = rewrite_manifest_identity(&pkg.manifest_json, addon_id, &display_name)?;
+    let new_manifest = parse_manifest_toml(&instance_manifest)
+        .map_err(|e| anyhow::anyhow!("manifest docelowej wersji niepoprawny: {e}"))?;
+
+    info!(
+        "Aktualizacja instancji '{}' ({}): v{} -> v{}",
+        addon_id, package_id, current_version, target_version
+    );
+
+    upgrade_core(
+        addon_id,
+        &pkg_dir,
+        db,
+        new_manifest,
+        &instance_manifest,
+        &package_id,
+        target_version,
+        false,
+    )
 }
 
 // =============================================================================
