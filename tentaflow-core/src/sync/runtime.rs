@@ -205,28 +205,6 @@ pub fn observe_core_hlc(remote: &HybridLogicalTimestamp) {
     }
 }
 
-/// Rebuilds the local core baseline: wipes every `core/...` ledger partition,
-/// advances the baseline epoch, and re-emits the full core write journal under
-/// the fresh epoch so peers adopt a clean, post-cutover baseline.
-///
-/// WHERE this is called: by the migration cutover path once the v53 INTEGER→UUID
-/// flip has rewritten the identity tables, and again during the phase C adopt
-/// flow when a node must re-seed its core baseline. It is NOT called on every
-/// startup — only when a baseline rebuild is required — because bumping the epoch
-/// invalidates every previously-shipped core operation across the mesh.
-///
-/// The re-seed reuses the canonical capture journal (`__tentaflow_core_sync_captures`):
-/// every core row ever written through the repository left a capture row whose
-/// `changed_fields`/`resource_id` are already canonical, so re-draining them
-/// under the new epoch reproduces the exact operations without a parallel
-/// extractor that could drift from the write path.
-pub fn perform_core_baseline_reset() -> LedgerResult<Option<usize>> {
-    let Some(runtime) = SYNC_RUNTIME.get() else {
-        return Ok(None);
-    };
-    runtime.perform_core_baseline_reset().map(Some)
-}
-
 /// Consumes the one-shot baseline-reset flag set by the v53 cutover migration.
 ///
 /// WHERE this is called: once at startup, immediately after the sync runtime is
@@ -245,6 +223,15 @@ pub fn run_pending_baseline_cutover() -> LedgerResult<Option<usize>> {
         return Ok(None);
     };
     runtime.run_pending_baseline_cutover()
+}
+
+/// Parses the baseline-cutover marker. Returns the recorded pre-cutover epoch
+/// counter when the marker has been upgraded to `pre_cutover_epoch=<n>`, or
+/// `None` for the migration's initial `"1"` sentinel (no counter recorded yet).
+fn parse_cutover_marker(marker: &str) -> Option<u64> {
+    marker
+        .strip_prefix("pre_cutover_epoch=")
+        .and_then(|n| n.trim().parse::<u64>().ok())
 }
 
 fn genesis_epoch() -> BaselineEpoch {
@@ -454,16 +441,36 @@ impl SyncRuntime {
     }
 
     fn run_pending_baseline_cutover(&self) -> LedgerResult<Option<usize>> {
-        let pending = repository::get_setting(
+        let marker = repository::get_setting(
             &self.db,
             crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
         )
-        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
-        .is_some_and(|v| v == "1");
-        if !pending {
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        let Some(marker) = marker else {
             return Ok(None);
-        }
-        let reseeded = self.perform_core_baseline_reset()?;
+        };
+
+        // The marker records the epoch counter observed BEFORE the cutover so a
+        // crash between `bump_epoch` and clearing the marker cannot double-bump.
+        // The migration arms it with the sentinel "1" (it runs before the ledger
+        // exists and cannot read the epoch); on the first cutover pass we replace
+        // it with the live pre-cutover counter and persist that BEFORE touching
+        // the epoch. On a retry the marker already encodes the counter, so we
+        // compare against it and skip a second bump.
+        let pre_cutover_counter = match parse_cutover_marker(&marker) {
+            Some(counter) => counter,
+            None => {
+                let counter = self.ledger.current_epoch()?.counter;
+                repository::set_setting(
+                    &self.db,
+                    crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                    &format!("pre_cutover_epoch={counter}"),
+                )
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+                counter
+            }
+        };
+        let reseeded = self.perform_core_baseline_reset(Some(pre_cutover_counter))?;
         repository::delete_setting(
             &self.db,
             crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
@@ -472,25 +479,61 @@ impl SyncRuntime {
         Ok(Some(reseeded))
     }
 
-    fn perform_core_baseline_reset(&self) -> LedgerResult<usize> {
+    /// Rebuilds the local core baseline idempotently. `pre_cutover_counter` is
+    /// the epoch counter recorded in the marker before the cutover began; the
+    /// epoch is bumped only when the current counter has not already advanced
+    /// past it, so a crash-and-retry cannot double-bump. The reseed always re-
+    /// emits the CURRENT SQLite snapshot into the freshly-wiped outbox, which is
+    /// repeatable.
+    fn perform_core_baseline_reset(&self, pre_cutover_counter: Option<u64>) -> LedgerResult<usize> {
         self.ledger.reset_core_partitions()?;
-        let epoch = self.ledger.bump_epoch(&self.local_node_id)?;
-        warn!(
-            "sync runtime: core baseline reset, new epoch counter={} origin={}",
-            epoch.counter, epoch.origin_node
-        );
-        // Re-arm the entire core capture journal so every row re-emits under the
-        // new epoch through the proven capture→operation path. Record through
-        // `self` (not the global runtime) so the re-seed cannot drift to a
-        // different runtime than the one that just bumped the epoch.
-        crate::sync::core_capture::requeue_all_core_captures(&self.db)
+
+        let current = self.ledger.current_epoch()?;
+        let already_bumped = match pre_cutover_counter {
+            Some(pre) => current.counter > pre,
+            // No recorded baseline (legacy marker): always bump from current.
+            None => false,
+        };
+        if already_bumped {
+            warn!(
+                "sync runtime: core baseline cutover resuming after crash, epoch already at \
+                 counter={} origin={} (recorded pre-cutover={:?}); skipping second bump",
+                current.counter, current.origin_node, pre_cutover_counter
+            );
+        } else {
+            let epoch = self.ledger.bump_epoch(&self.local_node_id)?;
+            warn!(
+                "sync runtime: core baseline reset, new epoch counter={} origin={}",
+                epoch.counter, epoch.origin_node
+            );
+        }
+
+        // Discard the historical core capture journal: the entries that survived
+        // the v54 ALTER carry zeroed HLCs and replaying them would resurrect old
+        // versions and tie multiple writes of one resource to identical (zero)
+        // timestamps, which LWW cannot order. The reseed below re-derives the
+        // present state instead.
+        crate::sync::core_capture::clear_core_capture_journal(&self.db)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+
+        // Re-emit the CURRENT state of every core table as fresh INSERT captures.
+        // `reseed_core_state_from_current_rows` writes the snapshot into the
+        // (now empty) capture journal with one freshly-minted, monotonic HLC per
+        // row; draining records them under the just-bumped epoch. Because the
+        // outbox was wiped by `reset_core_partitions`, this is repeatable: a
+        // crash-and-retry re-emits the same snapshot into an empty outbox.
+        let emitted = repository::reseed_core_state_from_current_rows(&self.db)
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         crate::sync::core_capture::drain_pending_core_captures_with(
             &self.db,
             usize::MAX,
-            |capture| self.record_core_capture(capture).map(|record| Some(record.op_id)),
+            |capture| {
+                self.record_core_capture(capture)
+                    .map(|record| Some(record.op_id))
+            },
         )
-        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        Ok(emitted)
     }
 
     fn record_blob_capture(
@@ -2682,6 +2725,18 @@ mod tests {
             rusqlite::params![actor_id],
         )
         .expect("seed actor user");
+    }
+
+    /// Inserts a live `flows` row so a baseline reset has current state to
+    /// re-seed from. The capture journal is intentionally left untouched.
+    fn seed_flow_row(db: &DbPool, id: &str, name: &str) {
+        let conn = db.lock().expect("db");
+        conn.execute(
+            "INSERT INTO flows (id, name, is_default, flow_json, status) \
+             VALUES (?1, ?2, 0, '{\"nodes\":[]}', 'active')",
+            rusqlite::params![id, name],
+        )
+        .expect("seed flow row");
     }
 
     fn open_contacts_table(addon_id: &str) {
@@ -6564,16 +6619,9 @@ mod tests {
             seed_core_authority_target(&node.runtime.db, "core.flow", "peer-authority");
             seed_actor_user(&node.runtime.db, "test-actor");
 
-            // Persist a core capture row exactly as the repository write path
-            // would, so the cutover re-seed has a real journal to drain.
-            let capture = complete_core_flow_capture("cutover-flow", "Cutover Flow");
-            {
-                let conn = node.runtime.db.lock().expect("db");
-                let tx = conn.unchecked_transaction().expect("tx");
-                crate::sync::core_capture::record_core_write_capture(&tx, &capture)
-                    .expect("persist capture row");
-                tx.commit().expect("commit capture row");
-            }
+            // Seed a live flow row: the cutover re-seeds from CURRENT SQLite
+            // state, not from the historical capture journal.
+            seed_flow_row(&node.runtime.db, "cutover-flow", "Cutover Flow");
 
             // Genesis epoch before the cutover.
             let genesis = node.runtime.ledger.current_epoch().expect("genesis epoch");
@@ -6592,7 +6640,10 @@ mod tests {
                 .run_pending_baseline_cutover()
                 .expect("cutover runs")
                 .expect("cutover was pending");
-            assert!(reseeded >= 1, "the persisted capture must re-seed at least one op");
+            assert!(
+                reseeded >= 1,
+                "the persisted capture must re-seed at least one op"
+            );
 
             // Epoch advanced to counter 1 with this node as origin.
             let new_epoch = node.runtime.ledger.current_epoch().expect("new epoch");
@@ -6612,14 +6663,21 @@ mod tests {
                     .ledger
                     .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
                     .expect("operation");
-                assert_eq!(op.body.epoch, new_epoch, "re-seeded op must carry new epoch");
+                assert_eq!(
+                    op.body.epoch, new_epoch,
+                    "re-seeded op must carry new epoch"
+                );
             }
 
             // An operation minted at the stale genesis epoch (the pre-cutover
             // baseline a peer would still hold) is rejected on the way in.
             let stale_peer = make_runtime(151);
             assert_eq!(
-                stale_peer.runtime.ledger.current_epoch().expect("peer epoch"),
+                stale_peer
+                    .runtime
+                    .ledger
+                    .current_epoch()
+                    .expect("peer epoch"),
                 genesis
             );
             let stale_op_id = stale_peer
@@ -6652,8 +6710,206 @@ mod tests {
                 .expect("second pass runs")
                 .is_none());
             assert_eq!(
-                node.runtime.ledger.current_epoch().expect("epoch unchanged"),
+                node.runtime
+                    .ledger
+                    .current_epoch()
+                    .expect("epoch unchanged"),
                 new_epoch
+            );
+        });
+    }
+
+    /// CRITICAL 1: the cutover re-seeds the CURRENT snapshot with strictly
+    /// increasing, distinct, non-zero HLCs (one per live row), and a later
+    /// update of the same resource still wins under LWW.
+    #[test]
+    fn baseline_cutover_reseeds_current_state_with_distinct_increasing_hlc() {
+        with_tmp_home(|| {
+            let node = make_runtime(160);
+            seed_core_authority_target(&node.runtime.db, "core.flow", "peer-authority");
+            seed_actor_user(&node.runtime.db, "test-actor");
+
+            // Three live flows. A historical journal full of zeroed-HLC versions
+            // must NOT influence the reseed — emulate the post-v54 state.
+            seed_flow_row(&node.runtime.db, "flow-a", "Alpha");
+            seed_flow_row(&node.runtime.db, "flow-b", "Beta");
+            seed_flow_row(&node.runtime.db, "flow-c", "Gamma");
+            {
+                let conn = node.runtime.db.lock().expect("db");
+                let tx = conn.unchecked_transaction().expect("tx");
+                // Several historical capture rows for flow-a with zeroed HLCs,
+                // exactly what survives the v54 ALTER.
+                for name in ["Alpha v1", "Alpha v2", "Alpha v3"] {
+                    let mut capture = complete_core_flow_capture("flow-a", name);
+                    capture.hlc = HybridLogicalTimestamp {
+                        wall_time_ms: 0,
+                        logical: 0,
+                        node_id: String::new(),
+                    };
+                    crate::sync::core_capture::record_core_write_capture(&tx, &capture)
+                        .expect("persist stale capture");
+                }
+                tx.commit().expect("commit stale captures");
+            }
+
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "1",
+            )
+            .expect("arm marker");
+
+            let reseeded = node
+                .runtime
+                .run_pending_baseline_cutover()
+                .expect("cutover runs")
+                .expect("cutover pending");
+            // The snapshot reseeds every core table (org, roles, flows, ...); at
+            // minimum the three live flows plus the default org/roles seeded by
+            // the migrations.
+            assert!(reseeded >= 3, "reseed must emit the current snapshot");
+
+            let new_epoch = node.runtime.ledger.current_epoch().expect("epoch");
+            assert_eq!(new_epoch.counter, 1);
+
+            // Collect the reseeded FLOW operations' HLCs from the outbox.
+            let push = node
+                .runtime
+                .build_push_payload_for_target("peer-authority", 256)
+                .expect("push")
+                .expect("payload");
+            let mut hlcs: Vec<HybridLogicalTimestamp> = Vec::new();
+            for wire in &push.operations {
+                let op = node
+                    .runtime
+                    .ledger
+                    .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
+                    .expect("op");
+                assert_eq!(op.body.epoch, new_epoch, "reseed op carries new epoch");
+                if op.body.resource_type == "core.flow" {
+                    hlcs.push(op.body.hlc_timestamp.clone());
+                }
+            }
+            assert_eq!(
+                hlcs.len(),
+                3,
+                "exactly one reseed op per live flow — no history"
+            );
+            // No zeroed HLCs survived into the reseed.
+            for hlc in &hlcs {
+                assert!(
+                    hlc.wall_time_ms > 0 || hlc.logical > 0,
+                    "reseed must mint a real HLC, got {hlc:?}"
+                );
+            }
+            // All distinct.
+            let mut sorted = hlcs.clone();
+            sorted.sort_by(|a, b| (a.wall_time_ms, a.logical).cmp(&(b.wall_time_ms, b.logical)));
+            sorted.dedup_by(|a, b| a.wall_time_ms == b.wall_time_ms && a.logical == b.logical);
+            assert_eq!(sorted.len(), 3, "reseed HLCs must be distinct");
+
+            // A later update of flow-a, recorded post-cutover under the new
+            // epoch, carries a strictly greater HLC than its reseed insert — LWW
+            // will not drop it.
+            let reseed_a_hlc = {
+                // The reseed insert for flow-a is the one whose resource_id is
+                // flow-a.
+                let mut found = None;
+                for wire in &push.operations {
+                    let op = node
+                        .runtime
+                        .ledger
+                        .get_operation(operation_id_from_wire(&wire.op_id).expect("op"))
+                        .expect("op");
+                    if op.body.resource_id == "flow-a" {
+                        found = Some(op.body.hlc_timestamp.clone());
+                    }
+                }
+                found.expect("flow-a reseed op")
+            };
+            // Mint the update HLC from the SAME clock the reseed used
+            // (`core_hlc_now`) so it is guaranteed strictly later.
+            let later_hlc = crate::sync::runtime::core_hlc_now();
+            let mut update = core_flow_update_capture("flow-a", "Alpha repaired");
+            update.hlc = later_hlc;
+            update.epoch = new_epoch.clone();
+            let update_op_id = node
+                .runtime
+                .record_core_capture(update)
+                .expect("record update")
+                .op_id;
+            let update_op = node
+                .runtime
+                .ledger
+                .get_operation(update_op_id)
+                .expect("update op");
+            let later = update_op.body.hlc_timestamp;
+            assert!(
+                (later.wall_time_ms, later.logical)
+                    > (reseed_a_hlc.wall_time_ms, reseed_a_hlc.logical),
+                "post-cutover update HLC {later:?} must exceed reseed HLC {reseed_a_hlc:?}"
+            );
+        });
+    }
+
+    /// CRITICAL 2: a crash between `bump_epoch` and clearing the marker must not
+    /// double-bump. Re-arming the marker with the counter the runtime persisted
+    /// (the crash-resume state) and re-running leaves the epoch bumped exactly
+    /// once and re-seeds into the wiped outbox.
+    #[test]
+    fn baseline_cutover_is_idempotent_across_crash_retry() {
+        with_tmp_home(|| {
+            let node = make_runtime(161);
+            seed_core_authority_target(&node.runtime.db, "core.flow", "peer-authority");
+            seed_flow_row(&node.runtime.db, "flow-x", "Xi");
+
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "1",
+            )
+            .expect("arm marker");
+
+            node.runtime
+                .run_pending_baseline_cutover()
+                .expect("first cutover")
+                .expect("pending");
+            let after_first = node.runtime.ledger.current_epoch().expect("epoch");
+            assert_eq!(after_first.counter, 1, "first cutover bumps to 1");
+
+            // Simulate a crash AFTER bump_epoch but BEFORE the marker clear: the
+            // runtime had already rewritten the marker to record the pre-cutover
+            // counter (0). Re-arm exactly that state and re-run.
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "pre_cutover_epoch=0",
+            )
+            .expect("re-arm crash-resume marker");
+
+            let reseeded = node
+                .runtime
+                .run_pending_baseline_cutover()
+                .expect("retry cutover")
+                .expect("still pending");
+            assert!(reseeded >= 1, "retry re-seeds the snapshot");
+
+            let after_retry = node.runtime.ledger.current_epoch().expect("epoch");
+            assert_eq!(
+                after_retry.counter, 1,
+                "retry must NOT bump the epoch a second time"
+            );
+            assert_eq!(after_retry, after_first);
+
+            // Marker cleared; a routine restart is a no-op.
+            assert!(node
+                .runtime
+                .run_pending_baseline_cutover()
+                .expect("third pass")
+                .is_none());
+            assert_eq!(
+                node.runtime.ledger.current_epoch().expect("epoch"),
+                after_first
             );
         });
     }
