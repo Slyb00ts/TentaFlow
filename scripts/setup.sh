@@ -322,8 +322,6 @@ install_base() {
                 openssl
                 vulkan-icd-loader
                 sqlite
-                # protoc dla prost-build (feature vector-milvus).
-                protobuf
                 # Profiling: perf zbiera CPU samples + PMU counters + uncore IMC.
                 # which jest potrzebne dla collectors/permissions auto-discovery.
                 perf
@@ -333,6 +331,16 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged pacman -S --needed --noconfirm "${pkgs[@]}"
+
+            # protoc (prost-build, feature vector-milvus) to narzedzie build-time.
+            # Na rolling-release repo'wy protobuf moze wyprzedzac wersje wymagana
+            # przez AUR python-protobuf (protobuf=34.1) — wymuszenie upgrade'u przez
+            # --needed wywala transakcje. Instalujemy tylko gdy protoc faktycznie
+            # brakuje, zamiast bumpic juz dzialajaca wersje.
+            if ! command -v protoc &>/dev/null; then
+                run_privileged pacman -S --needed --noconfirm protobuf
+                INSTALLED+=("protobuf")
+            fi
             INSTALLED+=("base-devel" "cmake" "clang" "lld" "glib2" "gstreamer" "gst-plugins-base-libs" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
