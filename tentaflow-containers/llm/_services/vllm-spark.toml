@@ -53,3 +53,16 @@ repo = "google/gemma-4-31B-it"
 speculator_repo = "RedHatAI/gemma-4-31B-it-speculator.dflash"
 speculator_method = "dflash"
 speculator_num_tokens = 8
+
+# Bielik PL Minitron 7B NVFP4 + draft 1.5B — gotowy bloczek turnkey (TentaFlow),
+# wariant DGX Spark (vLLM budowany ze zrodel dla sm_121). featured = wlasny
+# kafelek; speculative (draft_model) wlacza sie automatycznie dla featured.
+[[model_preset]]
+id = "bielik-pl-minitron-7b-nvfp4"
+display_name = "Bielik PL Minitron 7B (NVFP4 + draft 1.5B)"
+repo = "TentaFlow/Bielik-PL-Minitron-7B-NVFP4"
+quantization = "nvfp4"
+speculator_repo = "TentaFlow/Bielik-1.5B-NVFP4"
+speculator_method = "draft_model"
+speculator_num_tokens = 3
+featured = true

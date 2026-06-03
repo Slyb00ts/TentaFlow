@@ -185,8 +185,11 @@ function applySpeculatorPreset(preset) {
     sp.model = preset.speculator_repo;
     sp.method = preset.speculator_method || 'dflash';
     sp.num_tokens = preset.speculator_num_tokens || 8;
-    // Nie wlaczamy automatycznie — to user-opt-in. Pre-fill ma tylko
-    // ulatwic wybor jak user kliknie toggle.
+    // Featured presety to gotowe, turnkey bloczki (np. Bielik NVFP4 + draft) —
+    // speculative wlacza sie automatycznie, zeby deploy nie wymagal recznego
+    // toggle. Zwykle (nie-featured) presety ze sparowanym draftem zostaja
+    // user-opt-in jak dotad.
+    sp.enabled = !!preset.featured;
   } else {
     sp.enabled = false;
     sp.model = '';
