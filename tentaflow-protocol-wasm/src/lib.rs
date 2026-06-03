@@ -4023,8 +4023,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::DashboardMetricsResponse(s) => {
             set(&obj, "variant", "DashboardMetricsResponse".into());
             set(&obj, "cpuUsagePercent", s.cpu_usage_percent.clone().into());
-            set(&obj, "ramUsedMb", s.ram_used_mb.into());
-            set(&obj, "ramTotalMb", s.ram_total_mb.into());
+            set(&obj, "ramUsedMb", (s.ram_used_mb as f64).into());
+            set(&obj, "ramTotalMb", (s.ram_total_mb as f64).into());
             set(&obj, "activeRequests", s.active_requests.into());
             set(&obj, "totalRequests", s.total_requests.into());
             set(&obj, "totalErrors", s.total_errors.into());
@@ -6915,21 +6915,21 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&item, "numa_node", v.into());
         }
         if let Some(v) = i.rx_bytes_per_sec {
-            set(&item, "rxBytesPerSec", v.clone().into());
-            set(&item, "rx_bytes_per_sec", v.clone().into());
+            set(&item, "rxBytesPerSec", (v as f64).into());
+            set(&item, "rx_bytes_per_sec", (v as f64).into());
             total_rx += v;
         }
         if let Some(v) = i.tx_bytes_per_sec {
-            set(&item, "txBytesPerSec", v.clone().into());
-            set(&item, "tx_bytes_per_sec", v.clone().into());
+            set(&item, "txBytesPerSec", (v as f64).into());
+            set(&item, "tx_bytes_per_sec", (v as f64).into());
             total_tx += v;
         }
         ifs.push(&item.into());
     }
     set(&obj, "networkInterfaces", ifs.clone().into());
     set(&obj, "network_interfaces", ifs.into());
-    set(&obj, "network_rx_bytes", total_rx.clone().into());
-    set(&obj, "network_tx_bytes", total_tx.clone().into());
+    set(&obj, "network_rx_bytes", (total_rx as f64).into());
+    set(&obj, "network_tx_bytes", (total_tx as f64).into());
     if let Some(v) = n.cpu_count {
         set(&obj, "cpuCount", v.into());
         set(&obj, "cpu_count", v.into());
@@ -6940,20 +6940,20 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         set(&obj, "cpu_usage", v.clone().into());
     }
     if let Some(v) = n.ram_total_mb {
-        set(&obj, "ramTotalMb", v.clone().into());
-        set(&obj, "ram_total_mb", v.clone().into());
+        set(&obj, "ramTotalMb", (v as f64).into());
+        set(&obj, "ram_total_mb", (v as f64).into());
     }
     if let Some(v) = n.ram_used_mb {
-        set(&obj, "ramUsedMb", v.clone().into());
-        set(&obj, "ram_used_mb", v.clone().into());
+        set(&obj, "ramUsedMb", (v as f64).into());
+        set(&obj, "ram_used_mb", (v as f64).into());
     }
     if let Some(v) = n.vram_total_mb {
-        set(&obj, "vramTotalMb", v.clone().into());
-        set(&obj, "vram_total_mb", v.clone().into());
+        set(&obj, "vramTotalMb", (v as f64).into());
+        set(&obj, "vram_total_mb", (v as f64).into());
     }
     if let Some(v) = n.vram_used_mb {
-        set(&obj, "vramUsedMb", v.clone().into());
-        set(&obj, "vram_used_mb", v.clone().into());
+        set(&obj, "vramUsedMb", (v as f64).into());
+        set(&obj, "vram_used_mb", (v as f64).into());
     }
     if let Some(v) = n.gpu_load_percent {
         set(&obj, "gpuLoadPercent", v.clone().into());
@@ -7067,11 +7067,11 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         let item = js_sys::Object::new();
         set(&item, "vendor", g.vendor.clone().into());
         set(&item, "name", g.name.clone().into());
-        set(&item, "vramTotalMb", g.vram_total_mb.clone().into());
-        set(&item, "vram_total_mb", g.vram_total_mb.clone().into());
+        set(&item, "vramTotalMb", (g.vram_total_mb as f64).into());
+        set(&item, "vram_total_mb", (g.vram_total_mb as f64).into());
         if let Some(v) = g.vram_used_mb {
-            set(&item, "vramUsedMb", v.clone().into());
-            set(&item, "vram_used_mb", v.clone().into());
+            set(&item, "vramUsedMb", (v as f64).into());
+            set(&item, "vram_used_mb", (v as f64).into());
         }
         if let Some(v) = g.utilization_percent {
             set(&item, "utilizationPercent", v.clone().into());
@@ -7131,8 +7131,8 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&item, "cpu_percent", v.clone().into());
         }
         if let Some(v) = c.memory_mb {
-            set(&item, "memoryMb", v.clone().into());
-            set(&item, "memory_mb", v.clone().into());
+            set(&item, "memoryMb", (v as f64).into());
+            set(&item, "memory_mb", (v as f64).into());
         }
         if let Some(v) = c.memory_limit_mb {
             set(&item, "memoryLimitMb", v.clone().into());
