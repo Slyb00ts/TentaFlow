@@ -1443,7 +1443,7 @@ pub struct RequestTimeParameters {
     /// Klucz=wartosc dla Ollama API `options` mapy.
     pub ollama_options: HashMap<String, serde_json::Value>,
     /// Pola POST body do generic Python wrappera (qwen-asr, kyutai-tts,
-    /// xtts, voxcpm, chatterbox).
+    /// xtts, voxcpm).
     pub python_request: HashMap<String, serde_json::Value>,
     /// Whisper deploy defaults z `request_override = true` — backend
     /// przy `transcribe()` uzywa jako baseline; klient API moze nadpisac.

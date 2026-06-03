@@ -138,7 +138,7 @@ pub struct ServiceInfo {
 ///   * `ollama_options` → klucz=wartosc dla Ollama API `options` mapy w
 ///     POST `/api/generate`/`/api/chat`.
 ///   * `python_request` → pola POST body dla generic Python wrapperow
-///     (qwen-asr, kyutai-tts, xtts, voxcpm, chatterbox).
+///     (qwen-asr, kyutai-tts, xtts, voxcpm).
 ///   * `whisper_overridable` → deploy defaults dla whisper z
 ///     `request_override = true`; backend uzywa jako baseline, klient API
 ///     moze nadpisac per request.
@@ -660,6 +660,11 @@ pub enum FlowInvokeChunk {
 pub struct FlowInvokeEnd {
     pub finish_reason: String,
     pub error: Option<String>,
+    /// Pelny zakumulowany tekst odpowiedzi. Front nadpisuje nim wiadomosc, bo
+    /// delty streamu bywaja ucinane gdy audio leci dluzej niz tekst.
+    /// `#[serde(default)]` zachowuje kompatybilnosc ze starszymi peerami.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 // =============================================================================
