@@ -612,8 +612,13 @@ pub fn set_setting_secure(
     }
 }
 
+/// Allowlist of `settings` keys that replicate as `core.shared_setting_secret`
+/// (re-encrypted per node). Single source of truth for the secret capture path,
+/// the upgrade-time enqueue, and the baseline-reset reseed.
+pub const SHARED_SECRET_SETTING_KEYS: &[&str] = &["hf_token", "ngc_api_key"];
+
 pub fn is_shared_secret_setting_key(key: &str) -> bool {
-    matches!(key, "hf_token" | "ngc_api_key")
+    SHARED_SECRET_SETTING_KEYS.contains(&key)
 }
 
 fn shared_secret_setting_fields(
@@ -665,7 +670,7 @@ pub fn enqueue_existing_shared_secret_settings(
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
     let mut count = 0usize;
-    for key in ["hf_token", "ngc_api_key"] {
+    for &key in SHARED_SECRET_SETTING_KEYS {
         let raw: Option<String> = tx
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
@@ -2696,9 +2701,18 @@ fn flow_binding_changed_fields(
 /// Reseed must reproduce the exact `(resource_id, changed_fields)` shape the live
 /// repository writes, because peers materialize these operations through the same
 /// `apply_*` paths; the per-kind blocks below mirror those Insert field sets.
-pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
+///
+/// Allowlisted shared-secret settings are included: the baseline reset clears the
+/// whole capture journal, so this reseed is the only path that re-emits them. The
+/// `cipher` decrypts each stored secret into the canonical shared-secret capture
+/// (the receiver re-encrypts per node). Each descriptor is reseeded exactly once,
+/// so no resource is duplicated.
+pub fn reseed_core_state_from_current_rows(
+    pool: &DbPool,
+    cipher: &crate::crypto::SettingsCipher,
+) -> Result<usize> {
     use crate::sync::core_registry::{CoreSyncResourceKind as K, CORE_SYNC_DESCRIPTORS};
-    use crate::sync::runtime::SqlWriteAction::Insert;
+    use crate::sync::runtime::SqlWriteAction::{Insert, Update};
 
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
@@ -3280,11 +3294,42 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
                 }
             }
             K::SharedSettingSecret => {
-                // External-credential secrets are encrypted at rest and re-keyed
-                // per node by the sync materializer from the live `settings` row;
-                // the baseline reset re-emits them through the dedicated secret
-                // path (`set_setting_secure`), not this snapshot, so they are not
-                // re-seeded generically here.
+                // Allowlisted external-credential secrets are stored encrypted in
+                // `settings`. The baseline reset wipes the whole capture journal,
+                // so this snapshot is the ONLY source that re-emits them — re-seed
+                // them here through the canonical shared-secret capture path
+                // (decrypted plaintext in the capture; the receiver re-encrypts
+                // per node). Matches the field shape of
+                // `set_shared_secret_setting_secure` / set/enqueue: Update action,
+                // `shared_secret_setting_fields`. Without this, a cutover would
+                // drop every stored secret from the outbox.
+                for &key in SHARED_SECRET_SETTING_KEYS {
+                    let raw: Option<String> = tx
+                        .query_row(
+                            "SELECT value FROM settings WHERE key = ?1",
+                            rusqlite::params![key],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let Some(raw_value) = raw else {
+                        continue;
+                    };
+                    if raw_value.is_empty() {
+                        continue;
+                    }
+                    let value = cipher
+                        .decrypt(&raw_value)
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        key,
+                        Update,
+                        shared_secret_setting_fields(key, &value),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
             }
         }
     }
