@@ -27,11 +27,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 hex = "0.4"
 data-encoding = "2"
 
+# iOS (device + symulator): MLX bridge to lekkie FFI po stronie Rust (Swift
+# dostarcza implementacje w apce), wiec dziala na obu.
 [target.'cfg(target_os = "ios")'.dependencies]
-# inference-sherpa: sherpa-onnx + onnxruntime jako embedded TTS/STT. sherpa-rs-sys
-# pobiera prebuilt statyczne libsherpa-onnx.a + libonnxruntime.a dla aarch64-apple-ios
-# (download-binaries) — linkowanie domyka Xcode (libc++, CoreML.framework).
-tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "inference-mlx-kokoro", "inference-sherpa", "dashboard-api"] }
+tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro", "dashboard-api"] }
+
+# inference-sherpa TYLKO na device (nie symulator). sherpa-rs-sys pobiera prebuilt
+# onnxruntime.a; slice symulatora to FAT archive (arm64+x86_64), ktorego cargo
+# nie potrafi zlinkowac ("Unsupported archive identifier"). Symulator i tak nie
+# uruchamia MLX, wiec sherpa jest tam zbedny. target_abi="sim" odroznia symulator.
+[target.'cfg(all(target_os = "ios", not(target_abi = "sim")))'.dependencies]
+tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["inference-sherpa"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15.1"

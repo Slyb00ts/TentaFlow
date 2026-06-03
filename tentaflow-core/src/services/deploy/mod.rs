@@ -576,6 +576,30 @@ pub async fn stop(
         }
     }
 
+    // Embedded shutdown: in-process STT/TTS engines zyja w shared managerach —
+    // nie maja kontenera ani PID. Bez wyladowania tutaj delete usuwa tylko row
+    // z DB, a silnik dalej obsluguje requesty (objaw: "usunalem serwis a dalej
+    // dzialal"). Backend routingu STT zdejmuje supervisor (`unregister_backend`),
+    // ale sam zaladowany model embedded trzeba zwolnic tu.
+    if svc.deploy_method == DM::NativeEmbedded {
+        match svc.category.as_str() {
+            "tts" => {
+                crate::tts::shared_tts_manager()
+                    .write()
+                    .await
+                    .unregister(&svc.engine_id);
+            }
+            "stt" => {
+                let _ = crate::stt::shared_stt_manager()
+                    .write()
+                    .await
+                    .unload_model()
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
     // NIE zwalniamy portow przy stop(). Port to permanentny atrybut serwisu
     // — przyznany przy `deploy()`, zwalniany dopiero przy delete (gdy row
     // znika z DB). Restart / pause / crash zostawia port w `leased`,

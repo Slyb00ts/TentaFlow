@@ -117,10 +117,24 @@ public final class MLXWhisperEngine {
     /// Laduje model z katalogu HF snapshot. Synchroniczne (uzywamy
     /// DispatchSemaphore zeby Rust mogl czekac na koniec).
     public func loadModel(path: String) -> Bool {
+        // Idempotencja: ten sam model juz zaladowany -> nie przeladowuj. Re-load
+        // (np. boot pinned-load + reczny redeploy) trzymalby chwilowo 2 kopie wag
+        // w unified memory i robil race na self.model z innego watku — co konczy
+        // sie crashem/kill aplikacji.
+        if model != nil, modelPath == path {
+            print("[MLXWhisper] Model juz zaladowany: \(path)")
+            return true
+        }
         let url = URL(filePath: path)
         guard FileManager.default.fileExists(atPath: path) else {
             print("[MLXWhisper] Sciezka nie istnieje: \(path)")
             return false
+        }
+        // Zwolnij poprzedni model PRZED zaladowaniem nowego — inaczej szczyt
+        // pamieci to 2x wagi (stary trzymany do przypisania self.model = m).
+        if model != nil {
+            unloadModel()
+            MLX.GPU.clearCache()
         }
         let semaphore = DispatchSemaphore(value: 0)
         var success = false
