@@ -426,6 +426,125 @@ function Configure-Gstreamer {
     $script:Installed += "GStreamer SDK = $root"
 }
 
+# --- zvec (wbudowana baza wektorowa — natywna biblioteka per platforma) ---
+
+# zvec FTS/hybrid-search API (zvec_fts_*, reranker, multi_query) wszedl po tagu
+# v0.4.0 (commit 02bfb31 #408) i nie ma go w zadnym tagu. Wrapper tentaflow-zvec
+# go uzywa, wiec pinujemy konkretny commit main, ktorego c_api.h zgadza sie z
+# zwendorowanym naglowkiem. Musi byc zgodny z ZVEC_REF w scripts/build-zvec.sh.
+$ZvecRef = 'f562bdd636d454f18128cb18b41578128d1415a4'
+
+function Install-Zvec {
+    Log-Section "zvec (wbudowana baza wektorowa)"
+
+    # Windows buduje tylko x86_64-pc-windows-msvc -> katalog windows-x86_64.
+    $platform = 'windows-x86_64'
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $sysCrate = Join-Path $repoRoot 'tentaflow-zvec-sys'
+    $libDir   = Join-Path $sysCrate "vendor\lib\$platform"
+    $includeDir = Join-Path $sysCrate 'vendor\include\zvec'
+    $importLib = Join-Path $libDir 'zvec_c_api.lib'
+
+    # Skip jezeli import lib juz zwendorowany (jak w bash install_zvec).
+    if (Test-Path $importLib) {
+        Log-Ok "zvec juz zbudowany ($platform) — pomijam"
+        return
+    }
+
+    # zvec linkuje sie MSVC-em (cl.exe). cl jest w PATH tylko w "x64 Native
+    # Tools Command Prompt" / Developer PowerShell for VS. Bez tego CMake pada
+    # na "No CMAKE_C_COMPILER could be found" — dajemy czytelny blad.
+    if (-not (Test-Command 'cl')) {
+        Log-Error "cl.exe (kompilator MSVC) nie jest w PATH — nie moge zbudowac zvec."
+        Log-Error "Uruchom setup.ps1 z 'x64 Native Tools Command Prompt for VS 2022'"
+        Log-Error "albo z 'Developer PowerShell for VS 2022', potem ponow."
+        return
+    }
+    foreach ($tool in 'cmake','ninja','git') {
+        if (-not (Test-Command $tool)) {
+            Log-Error "$tool nie znalezione — wymagane do budowy zvec. Uruchom Install-Base najpierw."
+            return
+        }
+    }
+
+    $srcDir = Join-Path $env:TEMP 'zvec-build'
+    Log-Info "Buduje zvec ($platform) — dlugi build (RocksDB+Arrow), jednorazowo na maszyne..."
+
+    try {
+        # 1. Zrodlo + submodule (RocksDB/Arrow/protobuf/...) na przypietym commicie.
+        if (-not (Test-Path (Join-Path $srcDir '.git'))) {
+            & git clone 'https://github.com/alibaba/zvec' $srcDir
+            if ($LASTEXITCODE -ne 0) { throw "git clone zvec nieudany (exit $LASTEXITCODE)" }
+        }
+        Push-Location $srcDir
+        try {
+            & git fetch origin
+            & git checkout $ZvecRef
+            if ($LASTEXITCODE -ne 0) { throw "git checkout $ZvecRef nieudany" }
+            & git submodule update --init --recursive --depth 1
+            if ($LASTEXITCODE -ne 0) { throw "git submodule update nieudany" }
+        } finally {
+            Pop-Location
+        }
+
+        # 2. CMake (Ninja + MSVC) — buduje samowystarczalny zvec_c_api.dll + import .lib.
+        $buildDir = Join-Path $srcDir 'build_zvec'
+        if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        # zvec submoduly (googletest/RocksDB/Arrow) wymagaja CMake<4: CMake 4 usunal
+        # kompatybilnosc z cmake_minimum_required<3.5, a wymuszenie starej polityki psuje
+        # eksport include-dirs Arrow. Pinujemy cmake 3.x w lokalnym venv (jak Linux w Dockerze).
+        $python = $null
+        foreach ($cand in 'python','py') {
+            if (Test-Command $cand) { $python = $cand; break }
+        }
+        if (-not $python) {
+            throw "python/py nie znaleziony — wymagany do przypiecia cmake<4 dla buildu zvec."
+        }
+        $cmakePin = Join-Path $srcDir '.cmake-pin'
+        $cmakePinScripts = Join-Path $cmakePin 'Scripts'
+        if (-not (Test-Path (Join-Path $cmakePinScripts 'cmake.exe'))) {
+            & $python -m venv $cmakePin
+            if ($LASTEXITCODE -ne 0) { throw "python -m venv ($cmakePin) nieudany (exit $LASTEXITCODE)" }
+            & (Join-Path $cmakePinScripts 'pip.exe') install -q "cmake<4"
+            if ($LASTEXITCODE -ne 0) { throw "pip install 'cmake<4' nieudany (exit $LASTEXITCODE)" }
+        }
+        $prevPath = $env:Path
+        $env:Path = "$cmakePinScripts;$env:Path"
+        Push-Location $buildDir
+        try {
+            & cmake -G Ninja -DCMAKE_BUILD_TYPE=Release `
+                -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+                -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_C_BINDINGS=ON ..
+            if ($LASTEXITCODE -ne 0) { throw "cmake configure zvec nieudany (exit $LASTEXITCODE)" }
+            & ninja zvec_c_api
+            if ($LASTEXITCODE -ne 0) { throw "ninja zvec_c_api nieudany (exit $LASTEXITCODE)" }
+        } finally {
+            Pop-Location
+            $env:Path = $prevPath
+        }
+
+        # 3. Zwendoruj dll + import lib + naglowek (jak build-zvec.sh).
+        New-Item -ItemType Directory -Path $libDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $includeDir -Force | Out-Null
+
+        $builtDll = Get-ChildItem -Path $buildDir -Recurse -Filter 'zvec_c_api.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+        $builtLib = Get-ChildItem -Path $buildDir -Recurse -Filter 'zvec_c_api.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $builtDll -or -not $builtLib) {
+            throw "ninja zakonczyl OK, ale brak zvec_c_api.dll/.lib w $buildDir"
+        }
+        Copy-Item $builtDll.FullName (Join-Path $libDir 'zvec_c_api.dll') -Force
+        Copy-Item $builtLib.FullName $importLib -Force
+        Copy-Item (Join-Path $srcDir 'src\include\zvec\c_api.h') (Join-Path $includeDir 'c_api.h') -Force
+
+        Log-Ok "zvec zbudowany ($platform): $libDir"
+        $script:Installed += "zvec ($platform dll + import lib)"
+    } catch {
+        Log-Warn "Build zvec nieudany: $_"
+        Log-Warn "Sprobuj recznie z 'x64 Native Tools Command Prompt for VS 2022'."
+    }
+}
+
 # --- Rust toolchain ---
 
 function Install-Rust {
@@ -751,6 +870,18 @@ function Verify-Installation {
     Check-Tool 'git'        'git'        { & git --version }        -Required
     Check-Tool 'wasm-bindgen' 'wasm-bindgen' { & wasm-bindgen --version }
 
+    # zvec — binarka tentaflow zawsze wlacza feature `vector`, wiec natywna
+    # biblioteka jest obowiazkowa do kazdego buildu serwera.
+    $zvecLibDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'tentaflow-zvec-sys\vendor\lib\windows-x86_64'
+    $zvecLib = Join-Path $zvecLibDir 'zvec_c_api.lib'
+    $zvecDll = Join-Path $zvecLibDir 'zvec_c_api.dll'
+    if ((Test-Path $zvecLib) -and (Test-Path $zvecDll)) {
+        Log-Ok "zvec: zwendorowany (zvec_c_api.lib + zvec_c_api.dll)"
+    } else {
+        Log-Error "zvec: BRAK zvec_c_api.lib/.dll w $zvecLibDir — feature `vector` nie zlinkuje"
+        $ok = $false
+    }
+
     if ($env:LIBCLANG_PATH -and (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
         Log-Ok "LIBCLANG_PATH: $env:LIBCLANG_PATH (libclang.dll obecny)"
     } else {
@@ -872,6 +1003,7 @@ function Main {
     Get-SileroVad
 
     Install-Base
+    Install-Zvec
     Install-Rust
     Install-WasmTargets
     Install-WasmBindgenCli

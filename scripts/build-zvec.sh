@@ -23,22 +23,26 @@ SYS_CRATE="$ROOT/tentaflow-zvec-sys"
 VENDOR_INCLUDE="$SYS_CRATE/vendor/include/zvec"
 
 ZVEC_REPO="https://github.com/alibaba/zvec"
-ZVEC_TAG="${ZVEC_TAG:-v0.4.0}"
+# zvec FTS/hybrid-search API (zvec_fts_*, reranker, multi_query) wszedl po tagu
+# v0.4.0 (commit 02bfb31 #408) i nie ma go w zadnym tagu. Wrapper tentaflow-zvec
+# go uzywa, wiec pinujemy konkretny commit main, ktorego c_api.h zgadza sie z
+# zwendorowanym naglowkiem.
+ZVEC_REF="${ZVEC_REF:-f562bdd636d454f18128cb18b41578128d1415a4}"
 PLATFORM="${1:-linux-x86_64}"
 
 SRC_DIR="${ZVEC_SRC_DIR:-/tmp/zvec-build}"
 
 echo "=========================================="
 echo "  Build zvec static archive (model B)"
-echo "  Platform: $PLATFORM | tag: $ZVEC_TAG"
+echo "  Platform: $PLATFORM | ref: $ZVEC_REF"
 echo "  Source:   $SRC_DIR"
 echo "=========================================="
 
 # 1. Source + submodules (RocksDB/Arrow/protobuf/...) at the pinned tag.
 if [ ! -d "$SRC_DIR/.git" ]; then
-    git clone --branch "$ZVEC_TAG" "$ZVEC_REPO" "$SRC_DIR"
+    git clone "$ZVEC_REPO" "$SRC_DIR"
 fi
-( cd "$SRC_DIR" && git fetch --tags && git checkout "$ZVEC_TAG" \
+( cd "$SRC_DIR" && git fetch origin -q && git checkout "$ZVEC_REF" \
   && git submodule update --init --recursive --depth 1 )
 
 OUT_LIB_DIR="$SYS_CRATE/vendor/lib/$PLATFORM"
@@ -66,6 +70,19 @@ case "$PLATFORM" in
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.so"
     ;;
   macos-arm64)
+    # zvec submoduly (googletest/RocksDB/Arrow) wymagaja CMake<4: CMake 4 usunal
+    # kompatybilnosc z cmake_minimum_required<3.5, a wymuszenie starej polityki psuje
+    # eksport include-dirs Arrow. Pinujemy cmake 3.x w lokalnym venv (jak Linux w Dockerze).
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 nie znaleziony — wymagany do przypiecia cmake<4 (zainstaluj Xcode Command Line Tools)."
+        exit 1
+    fi
+    CMAKE_PIN="$SRC_DIR/.cmake-pin"
+    if [ ! -x "$CMAKE_PIN/bin/cmake" ]; then
+        python3 -m venv "$CMAKE_PIN"
+        "$CMAKE_PIN/bin/pip" install -q "cmake<4"
+    fi
+    PATH="$CMAKE_PIN/bin:$PATH"
     ( cd "$SRC_DIR" && rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
       cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_C_BINDINGS=ON ..
       ninja zvec_c_api -j"$(sysctl -n hw.ncpu)" )
