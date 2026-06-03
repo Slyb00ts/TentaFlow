@@ -359,7 +359,7 @@ impl MeshCommandExecutor {
                     &deploy_method,
                     &config_json,
                 )
-                    .await
+                .await
             }
             MeshCommandType::ServiceUpdateRemote {
                 service_id,
@@ -411,7 +411,7 @@ impl MeshCommandExecutor {
                 }
             };
         let result = tokio::task::spawn_blocking(move || {
-            crate::web_research::execute_with_local_searxng(request, &ctx.db)
+            crate::web_research::execute_with_local_services(request, &ctx.db)
         })
         .await;
         let response = match result {

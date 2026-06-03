@@ -145,9 +145,11 @@ disabled, no independent HTTP client) against the already fetched HTML. If Reada
 produce useful text, Core falls back to local semantic block scoring (`article`/`main`/content
 classes, link-density penalty, boilerplate cleanup). Responses include extraction method,
 character count, word count and `quality_score` so flows/LLMs can rank or reject weak pages.
-`read_search_results` now treats `search_limit` as the candidate pool and keeps reading until it
-gets `read_limit` successful pages or runs out of search results. Bundled addon `deep-research`
-is only the LLM tool / Flow Builder facade over that SDK.
+Addon calls use Browser Renderer for `mode="auto"` when a local or visible remote
+`browser-renderer` service exists; `mode="browser"` requires it and `mode="static"` keeps the
+pure HTTP/readability path. `read_search_results` now treats `search_limit` as the candidate pool
+and keeps reading until it gets `read_limit` successful pages or runs out of search results.
+Bundled addon `deep-research` is only the LLM tool / Flow Builder facade over that SDK.
 
 ## Service Containers
 
@@ -156,6 +158,17 @@ for public-web search. It has a Docker deployment based on the official
 `searxng/searxng` image and a native `python-bundle` deployment from the upstream git repo.
 Both variants enable JSON search output for `web_research`; iOS does not run this service
 natively because SearXNG is a Python web application, not an embedded Rust engine.
+
+`tentaflow-containers/tools/_services/browser-renderer.toml` registers the Playwright
+Chromium renderer used for JS-heavy page reading. Docker runs from
+`tools/docker/browser-renderer/` on the official Playwright Python image; native deploy uses
+`tools/python/browser-renderer/` as a `python-bundle`. The service exposes `/render`,
+`/contexts`, and `/health`, keeps one persistent headless browser context per `user_id`,
+evicts idle contexts by `BROWSER_RENDERER_CONTEXT_TTL_SECONDS`, and caps active contexts with
+`BROWSER_RENDERER_MAX_CONTEXTS`. Each profile has isolated cookies/localStorage/sessionStorage.
+The renderer validates public URLs before navigation and aborts private/local subresource
+requests inside Playwright routing, so Core can use it without exposing local node networks to
+web pages.
 
 ## Admin Scheduler
 
