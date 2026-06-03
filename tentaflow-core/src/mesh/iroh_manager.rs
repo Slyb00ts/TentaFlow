@@ -29,7 +29,7 @@ use crate::net::iroh::{
         endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
         merge_contact_hints, PairingContactHints, PairingHandler,
     },
-    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_MESH, ALPN_PAIRING,
+    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_BASELINE, ALPN_MESH, ALPN_PAIRING,
 };
 
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
@@ -659,6 +659,35 @@ impl IrohMeshManager {
                     Err(e) => warn!("iroh_mesh: pairing accept blad: {}", e),
                 }
             }
+            a if a == ALPN_BASELINE => {
+                // Strona dawcy baseline-adopt: joiner dialuje, my akceptujemy
+                // bidirectional stream i wykonujemy sekwencje dawcy. remote_id z
+                // polaczenia jest autorytatywnym node_id peera (anti-spoof).
+                let security = Arc::clone(&self.security);
+                let local_node_id = self.node_id();
+                tokio::spawn(async move {
+                    let (send, recv) = match connection.accept_bi().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(peer = %remote_hex, "baseline: accept_bi nieudane: {}", e);
+                            return;
+                        }
+                    };
+                    let mut stream =
+                        crate::sync::baseline_transport::IrohFrameStream::new(send, recv);
+                    match crate::sync::baseline_transport::run_donor_session(
+                        &mut stream,
+                        &security,
+                        &local_node_id,
+                        &remote_hex,
+                    )
+                    .await
+                    {
+                        Ok(()) => info!(peer = %remote_hex, "baseline: donor session OK"),
+                        Err(e) => warn!(peer = %remote_hex, "baseline: donor session blad: {}", e),
+                    }
+                });
+            }
             a if a == ALPN_API => {
                 debug!(
                     "iroh_mesh: ALPN_API otrzymane — delegacja do dashboard layer (zadanie #56)"
@@ -972,6 +1001,58 @@ impl IrohMeshManager {
                 Ok(())
             }
         }
+    }
+
+    /// Joiner baseline-adopt: dialuje dawce na ALPN_BASELINE i wykonuje pelna
+    /// sekwencje pobrania snapshotu (Elect -> Ack -> Header -> chunki -> import).
+    /// Dial uzywa zapisanych trusted contact hints dawcy (adres + relay), bo
+    /// pairing juz potwierdzony. Po sukcesie joiner ma stan org dawcy.
+    ///
+    /// Wywolywane przez `begin_baseline_adopt_after_confirm` (po confirm) gdy
+    /// lokalny nod jest joinerem, oraz przez crash-recovery przy starcie.
+    pub async fn pull_baseline_from_donor(
+        &self,
+        donor_node_id: &str,
+        epoch_seen: u64,
+    ) -> Result<()> {
+        let local_node_id = self.node_id();
+        if donor_node_id == local_node_id {
+            return Err(anyhow::anyhow!(
+                "baseline pull: donor == local node — nothing to pull"
+            ));
+        }
+
+        let hints = load_trusted_contact_hints(&self.security.db, donor_node_id)
+            .map_err(|e| anyhow::anyhow!("baseline pull: load donor hints: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("baseline pull: no trusted contact hints for donor {donor_node_id}")
+            })?;
+        let hints_resolved = hints_with_relay_fallback(self.endpoint.inner(), &hints);
+        let addr = endpoint_addr_from_hints(&hints_resolved)
+            .map_err(|e| anyhow::anyhow!("baseline pull: donor addr: {e}"))?;
+
+        let connection = self
+            .endpoint
+            .connect(addr, ALPN_BASELINE)
+            .await
+            .map_err(|e| anyhow::anyhow!("baseline pull: connect ALPN_BASELINE: {e:?}"))?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("baseline pull: open_bi: {e}"))?;
+        let mut stream = crate::sync::baseline_transport::IrohFrameStream::new(send, recv);
+        let cipher = Arc::clone(self.security.settings_cipher_ref());
+        crate::sync::baseline_transport::run_joiner_session(
+            &mut stream,
+            &self.security.db,
+            &local_node_id,
+            donor_node_id,
+            &cipher,
+            epoch_seen,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("baseline pull: joiner session: {e}"))?;
+        Ok(())
     }
 
     /// Wysyla ramke `[disc][data]` na uni streamie do peera.
