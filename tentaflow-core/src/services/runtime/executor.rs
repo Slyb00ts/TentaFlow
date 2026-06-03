@@ -125,6 +125,12 @@ pub struct ModelRuntimeExecutor {
     /// Per-alias round-robin state keyed by alias name. `DashMap` so we
     /// can mutate per-key without serialising the whole map.
     strategy_state: Arc<dashmap::DashMap<String, Arc<StrategyState>>>,
+    /// Lazy-load + memory guard dla embedded modeli (unpinned). Planted przez
+    /// `Router::start` (potrzebuje db+ports). `None` na nodach bez residency —
+    /// wtedy `ensure_resident` to no-op (model musi byc juz zaladowany jak dotad).
+    model_residency: Arc<
+        parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>,
+    >,
 }
 
 impl ModelRuntimeExecutor {
@@ -137,6 +143,9 @@ impl ModelRuntimeExecutor {
         mesh_manager: Arc<
             parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>,
         >,
+        model_residency: Arc<
+            parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>,
+        >,
     ) -> Self {
         Self {
             catalog,
@@ -146,7 +155,30 @@ impl ModelRuntimeExecutor {
             stt_runtime,
             mesh_manager,
             strategy_state: Arc::new(dashmap::DashMap::new()),
+            model_residency,
         }
+    }
+
+    /// Lazy-load embedded model do pamieci przed dispatch (no-op gdy residency
+    /// nie podpiete, target nie jest Local/Embedded, albo serwis pinned/nie-embedded).
+    async fn ensure_resident(
+        &self,
+        target: &ResolvedExecutionTarget,
+    ) -> Result<(), ExecutorError> {
+        if let ResolvedExecutionTarget::Local {
+            model_name, handle, ..
+        } = target
+        {
+            if matches!(handle, BackendHandle::Embedded { .. }) {
+                let residency = self.model_residency.read().clone();
+                if let Some(res) = residency {
+                    res.ensure_loaded(model_name)
+                        .await
+                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Non-streaming chat completion. Resolves the requested model into a
@@ -316,6 +348,7 @@ impl ModelRuntimeExecutor {
         use futures::StreamExt;
         use tentaflow_protocol::*;
 
+        self.ensure_resident(target).await?;
         if let ResolvedExecutionTarget::Local { model_name, .. } = target {
             if request.model != *model_name {
                 request.model = model_name.clone();
@@ -649,6 +682,7 @@ impl ModelRuntimeExecutor {
         mut request: ChatCompletionRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<ChatCompletionResponse, ExecutorError> {
+        self.ensure_resident(target).await?;
         if let ResolvedExecutionTarget::Local { model_name, .. } = target {
             if request.model != *model_name {
                 tracing::debug!(
@@ -1053,6 +1087,7 @@ impl ModelRuntimeExecutor {
     ) -> Result<EmbeddingResponse, ExecutorError> {
         use tentaflow_protocol::*;
 
+        self.ensure_resident(target).await?;
         if let ResolvedExecutionTarget::Local { model_name, .. } = target {
             if request.model != *model_name {
                 request.model = model_name.clone();
@@ -1376,6 +1411,25 @@ impl ModelRuntimeExecutor {
                     let engine_id_owned = engine_id.clone();
                     let model_name_owned = model_name.clone();
 
+                    // Lazy-load + memory guard: dla unpinned embedded TTS zaladuj
+                    // przez residency (evict innych rezydentnych + tracking +
+                    // idle-unload). Best-effort — przy bledzie self-heal blok
+                    // ponizej i tak zaladuje (zero regresji). Pinned / brak
+                    // residency → no-op.
+                    // Bind clone do zmiennej PRZED await — inaczej temporary
+                    // guard parking_lot (`*mut`, !Send) zylby przez await
+                    // (if-let temporary lifetime) i future przestawalby byc Send.
+                    let tts_residency = self.model_residency.read().clone();
+                    if let Some(res) = tts_residency {
+                        if let Err(e) = res.ensure_loaded(&model_name_owned).await {
+                            tracing::warn!(
+                                "TTS residency ensure_loaded '{}': {}",
+                                model_name_owned,
+                                e
+                            );
+                        }
+                    }
+
                     // Self-heal: po restarcie procesu `TtsManager` startuje pusty
                     // mimo `status=running` uslugi (deploy laduje przy prepare,
                     // nie ma boot-reloadu). Leniwie laduje + rejestruje silnik
@@ -1644,7 +1698,24 @@ impl ModelRuntimeExecutor {
 
         for target in ranked {
             match target {
-                ResolvedExecutionTarget::Local { service_id, .. } => {
+                ResolvedExecutionTarget::Local {
+                    service_id,
+                    model_name,
+                    ..
+                } => {
+                    // Lazy-load + memory guard (best-effort): zaladuj embedded STT
+                    // przez residency (evict innych rezydentnych). Przy bledzie
+                    // transcribe_for_service i tak ma wlasny lazy-load — bez regresji.
+                    let stt_residency = self.model_residency.read().clone();
+                    if let Some(res) = stt_residency {
+                        if let Err(e) = res.ensure_loaded(&model_name).await {
+                            tracing::warn!(
+                                "STT residency ensure_loaded '{}': {}",
+                                model_name,
+                                e
+                            );
+                        }
+                    }
                     return runtime
                         .transcribe_for_service(service_id, request)
                         .await
@@ -2203,6 +2274,7 @@ mod tests {
             local_inference,
             stt_slot,
             mesh_slot,
+            Arc::new(parking_lot::RwLock::new(None)),
         )
     }
 
