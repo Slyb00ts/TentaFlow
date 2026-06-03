@@ -459,30 +459,64 @@ install_zvec() {
     fi
 
     # Linux: RocksDB 8.1 (zaleznosc zvec) nie kompiluje sie pod gcc>=13, wiec build
-    # leci w kontenerze Ubuntu 22.04/gcc-11 — wymaga Dockera. Setup ma "zrobic
-    # wszystko", wiec gdy Dockera brak — probujemy go doinstalowac przez menedzer
-    # pakietow dystrybucji (best-effort), a nie po cichu odpuszczamy.
-    if [[ "$DISTRO" != "macos" ]] && ! command -v docker &>/dev/null; then
-        log_info "Docker wymagany do zbudowania zvec na Linux — probuje zainstalowac..."
-        case "$DISTRO" in
-            arch)   run_privileged pacman -S --needed --noconfirm docker ;;
-            debian) run_privileged apt-get install -y docker.io ;;
-            fedora) run_privileged dnf install -y docker || run_privileged dnf install -y moby-engine ;;
-        esac
-        run_privileged systemctl enable --now docker 2>/dev/null || true
+    # leci w kontenerze Ubuntu 22.04/gcc-11 — wymaga Dockera. Docker musi byc
+    # zainstalowany ORAZ dostepny dla biezacego usera (socket). Wczesniej setup
+    # sprawdzal tylko "czy docker jest w PATH" — gdy byl zainstalowany, ale user
+    # nie nalezal do grupy docker, leciał build bez sudo i po cichu padał.
+    #
+    # Preferujemy NATYWNY build (gcc-11 + ninja + cmake<4) — bez Dockera, bez
+    # root-owned artefaktow. RocksDB 8.1 nie kompiluje sie pod gcc>=13, a host
+    # ma zwykle nowszy gcc, wiec doinstalowujemy gcc-11 obok (apt: Debian/Ubuntu).
+    # Docker zostaje fallbackiem gdy natywny toolchain nie wchodzi (Arch/Fedora,
+    # cmake>=4 itd.). need_sudo=true tylko dla fallbacku, gdy user nie siega
+    # socketu dockera wprost (build leci przez sudo, artefakty root-owned).
+    local need_sudo=false
+    if [[ "$DISTRO" != "macos" ]]; then
+        if [[ "$DISTRO" == "debian" ]]; then
+            log_info "Instaluje natywny toolchain zvec (gcc-11, g++-11, ninja)..."
+            run_privileged apt-get install -y gcc-11 g++-11 ninja-build >/dev/null 2>&1 || true
+        fi
 
-        if ! run_privileged docker info &>/dev/null; then
-            log_error "Docker zainstalowany, ale daemon/uprawnienia nie dzialaja."
-            log_error "  Moze wymagac wylogowania albo: sudo usermod -aG docker \$USER"
-            log_error "  Potem zbuduj zvec recznie: ./scripts/build-zvec.sh $plat"
-            ZVEC_OK=false
-            return
+        local cmake_major
+        cmake_major="$(cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9][0-9]*\).*/\1/p')"
+        if command -v gcc-11 &>/dev/null && command -v g++-11 &>/dev/null \
+           && command -v ninja &>/dev/null \
+           && [[ -n "$cmake_major" && "$cmake_major" -lt 4 ]]; then
+            log_ok "Natywny gcc-11 gotowy — zvec zbuduje sie bez Dockera."
+        else
+            log_info "Natywny gcc-11<13/ninja/cmake<4 niedostepny — uzyje Dockera (Ubuntu 22.04/gcc-11)."
+            if ! command -v docker &>/dev/null; then
+                log_info "Instaluje Docker..."
+                case "$DISTRO" in
+                    arch)   run_privileged pacman -S --needed --noconfirm docker ;;
+                    debian) run_privileged apt-get install -y docker.io ;;
+                    fedora) run_privileged dnf install -y docker || run_privileged dnf install -y moby-engine ;;
+                esac
+            fi
+            run_privileged systemctl enable --now docker 2>/dev/null || true
+            if docker info &>/dev/null; then
+                : # biezacy user ma dostep do socketu
+            elif run_privileged docker info &>/dev/null; then
+                need_sudo=true
+            else
+                log_error "Ani natywny gcc-11, ani Docker (nawet przez sudo) nie sa dostepne."
+                log_error "  Doinstaluj gcc-11/ninja albo uruchom daemon dockera, potem: ./scripts/build-zvec.sh $plat"
+                ZVEC_OK=false
+                return
+            fi
         fi
     fi
 
     log_info "Buduje zvec ($plat) — dlugi build (RocksDB+Arrow), jednorazowo na maszyne..."
-    if bash "$(dirname "$0")/build-zvec.sh" "$plat"; then
-        INSTALLED+=("zvec ($plat static lib)")
+    local build_sh="$(dirname "$0")/build-zvec.sh"
+    local built=false
+    if [[ "$need_sudo" == true ]]; then
+        run_privileged bash "$build_sh" "$plat" && built=true
+    else
+        bash "$build_sh" "$plat" && built=true
+    fi
+    if [[ "$built" == true ]]; then
+        INSTALLED+=("zvec ($plat)")
     else
         log_error "Build zvec nieudany — sprobuj recznie: ./scripts/build-zvec.sh $plat"
         ZVEC_OK=false
