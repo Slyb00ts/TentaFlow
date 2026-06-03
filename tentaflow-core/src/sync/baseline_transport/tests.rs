@@ -518,6 +518,171 @@ async fn joiner_detects_corrupted_chunk() {
 }
 
 #[tokio::test]
+async fn joiner_rejects_header_over_hard_cap_without_buffering() {
+    let (joiner_node_id, _) = gen_identity();
+    let joiner_pool = new_pool();
+    seed_joiner_org(&joiner_pool);
+    let cipher = test_cipher();
+
+    let donor_node_id = loop {
+        let (cand, _) = gen_identity();
+        if cand < joiner_node_id {
+            break cand;
+        }
+    };
+
+    let (mut joiner_stream, mut fake_donor) = DuplexFrameStream::pair();
+
+    // Fake donor sends a valid Elect/Ack then a header declaring a total ABOVE the
+    // local hard cap. If the joiner trusted the donor-declared limits it would start
+    // buffering 64 KiB chunks; instead it must reject at the header and never read a
+    // single chunk. We assert that by NEVER sending a chunk and checking the joiner
+    // still aborts (so it cannot be blocked waiting for chunk bytes).
+    let fake = {
+        let donor_node_id = donor_node_id.clone();
+        let joiner_node_id = joiner_node_id.clone();
+        tokio::spawn(async move {
+            let _elect: BaselineElect = read_frame(&mut fake_donor, "elect").await.unwrap();
+            let ack = BaselineAck {
+                accepted: true,
+                donor: donor_node_id.clone(),
+                joiner: joiner_node_id.clone(),
+                epoch: 0,
+            };
+            write_frame(&mut fake_donor, &ack, "ack").await.unwrap();
+            let header = BaselineHeader {
+                schema_version: 1,
+                epoch: 0,
+                tables: Vec::new(),
+                row_counts: Vec::new(),
+                total_bytes: BASELINE_MAX_TOTAL_BYTES + 1,
+                max_bytes: BASELINE_MAX_TOTAL_BYTES + 1,
+                content_hash: [0u8; 32],
+            };
+            write_frame(&mut fake_donor, &header, "header").await.unwrap();
+            // Intentionally send NO chunks; the joiner must already be aborting.
+        })
+    };
+
+    let res = run_joiner_session(
+        &mut joiner_stream,
+        &joiner_pool,
+        &joiner_node_id,
+        &donor_node_id,
+        &cipher,
+        0,
+    )
+    .await;
+    fake.await.unwrap();
+
+    let err = res.expect_err("oversized header must abort");
+    assert!(
+        format!("{err}").contains("local hard cap"),
+        "expected local hard cap rejection, got: {err}"
+    );
+
+    // Joiner imported nothing — own org untouched, donor org absent.
+    let conn = joiner_pool.lock().unwrap();
+    let has_joiner_org: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM organizations WHERE org_id = 'org-joiner')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(has_joiner_org, "joiner org must be untouched on abort");
+}
+
+#[tokio::test]
+async fn joiner_aborts_when_stream_overshoots_declared_total() {
+    let (joiner_node_id, _) = gen_identity();
+    let joiner_pool = new_pool();
+    seed_joiner_org(&joiner_pool);
+    let cipher = test_cipher();
+
+    let donor_node_id = loop {
+        let (cand, _) = gen_identity();
+        if cand < joiner_node_id {
+            break cand;
+        }
+    };
+
+    // Header declares a tiny total (1 chunk worth) but the donor streams a SECOND
+    // chunk. The joiner must abort the moment the running byte count passes the
+    // declared total — before it buffers the overshoot — proving memory is bounded
+    // during reception, not only at reassembly.
+    let chunk_bytes = vec![0xABu8; 4 * 1024];
+    // Declare a total between one and two chunks so the receive loop keeps reading
+    // after the first chunk and then overshoots on the second — exercising the
+    // in-loop byte-count abort (memory bounded during reception), not reassembly.
+    let declared_total = chunk_bytes.len() as u64 + 1;
+    let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
+    let chunk0 = BaselineChunk {
+        seq: 0,
+        content_hash: chunk_hash,
+        bytes: chunk_bytes.clone(),
+    };
+    let chunk1 = BaselineChunk {
+        seq: 1,
+        content_hash: chunk_hash,
+        bytes: chunk_bytes,
+    };
+    let header = BaselineHeader {
+        schema_version: 1,
+        epoch: 0,
+        tables: Vec::new(),
+        row_counts: Vec::new(),
+        total_bytes: declared_total,
+        max_bytes: BASELINE_MAX_TOTAL_BYTES,
+        content_hash: [0u8; 32],
+    };
+
+    let (mut joiner_stream, mut fake_donor) = DuplexFrameStream::pair();
+
+    let fake = {
+        let donor_node_id = donor_node_id.clone();
+        let joiner_node_id = joiner_node_id.clone();
+        tokio::spawn(async move {
+            let _elect: BaselineElect = read_frame(&mut fake_donor, "elect").await.unwrap();
+            let ack = BaselineAck {
+                accepted: true,
+                donor: donor_node_id.clone(),
+                joiner: joiner_node_id.clone(),
+                epoch: 0,
+            };
+            write_frame(&mut fake_donor, &ack, "ack").await.unwrap();
+            write_frame(&mut fake_donor, &header, "header").await.unwrap();
+            // First chunk fills the declared total and is ACKed.
+            write_frame(&mut fake_donor, &chunk0, "chunk").await.unwrap();
+            let _ack: BaselineChunkAck =
+                read_frame(&mut fake_donor, "chunk_ack").await.unwrap();
+            // Second chunk overshoots — joiner must NACK and abort.
+            write_frame(&mut fake_donor, &chunk1, "chunk").await.unwrap();
+            let nack: BaselineChunkAck =
+                read_frame(&mut fake_donor, "chunk_ack").await.unwrap();
+            assert!(!nack.ok, "joiner must NACK the overshooting chunk");
+        })
+    };
+
+    let res = run_joiner_session(
+        &mut joiner_stream,
+        &joiner_pool,
+        &joiner_node_id,
+        &donor_node_id,
+        &cipher,
+        0,
+    )
+    .await;
+    fake.await.unwrap();
+
+    let err = res.expect_err("stream overshoot must abort");
+    assert!(
+        format!("{err}").contains("exceeds header total_bytes"),
+        "expected total_bytes overshoot rejection, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn donor_rejects_untrusted_peer() {
     let (joiner_node_id, joiner_pubkey) = gen_identity();
     let donor_pool = new_pool();
