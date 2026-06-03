@@ -2163,17 +2163,12 @@ tf-section-card { display: block; }
   border-radius: var(--tf-radius);
   overflow: hidden;
   transition:
-    transform 0.2s var(--tf-spring-smooth),
     box-shadow 0.25s ease,
     border-color 0.2s ease;
 }
 .tf-section-card:hover {
-  transform: translateY(-3px);
   box-shadow: var(--tf-shadow), 0 0 20px rgba(99, 102, 241, 0.08);
   border-color: var(--tf-border-hover);
-}
-.tf-section-card:active {
-  transform: scale(0.98);
 }
 
 .tf-section-card-head {
