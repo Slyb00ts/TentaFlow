@@ -335,6 +335,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "core_sync_captures_hlc",
             MigrationStep::Sql(CORE_SYNC_CAPTURES_HLC),
         ),
+        (
+            58,
+            "repair_admin_non_uuid_id",
+            MigrationStep::RustSelfManaged(repair_admin_non_uuid_id),
+        ),
     ]
 }
 
@@ -812,6 +817,92 @@ fn core_identity_int_to_uuid(conn: &Connection, version: i64, name: &str) -> Res
                 "INSERT OR REPLACE INTO settings (key, value) VALUES \
                  ('migration_phase', ?1)",
                 rusqlite::params![format!("core_identity_int_to_uuid:failed:{e}")],
+            );
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            Err(e)
+        }
+    }
+}
+
+// =============================================================================
+// v58 — naprawa admina zaseedowanego z nie-UUID id ('1')
+// =============================================================================
+//
+// Seed domyslnego admina historycznie wstawial literal id '1' do user_accounts.id
+// (TEXT, ma trzymac UUID). Login pakuje id do 16-bajtowej formy wire i odrzuca
+// wszystko co nie jest UUID-em ("user id is not a valid UUID"). Remapujemy stray
+// '1' na staly UUID admina, kaskadujac kazda kolumne-dziecko user_accounts.
+// '1' nie jest poprawnym UUID, wiec WHERE col = '1' trafia wylacznie w zepsute
+// referencje admina (grupy/node'y uzywaja UUID).
+const REPAIRED_ADMIN_ID: &str = "00000000-0000-4000-8000-000000000002";
+
+fn repair_admin_non_uuid_id(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    let needs_repair: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM user_accounts WHERE id = '1'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !needs_repair {
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        // Najpierw kolumny-dzieci (dopoki rodzic dalej trzyma '1'), potem PK rodzica.
+        for remap in child_remaps() {
+            if remap.parent != IdentityTable::UserAccounts {
+                continue;
+            }
+            if !table_exists(&tx, remap.table)? {
+                continue;
+            }
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET {} = ?1 WHERE {} = '1'",
+                    remap.table, remap.column, remap.column
+                ),
+                rusqlite::params![REPAIRED_ADMIN_ID],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE user_accounts SET id = ?1 WHERE id = '1'",
+            rusqlite::params![REPAIRED_ADMIN_ID],
+        )?;
+
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "repair_admin_non_uuid_id: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('migration_phase', ?1)",
+                rusqlite::params![format!("repair_admin_non_uuid_id:failed:{e}")],
             );
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             Err(e)
@@ -5079,6 +5170,128 @@ mod tests {
             )
             .unwrap();
         assert_eq!(joined_new, 1, "JOIN over the freshly written UUID must match");
+    }
+
+    /// Regresja v58: migracja repair_admin_non_uuid_id naprawia stara instalacje,
+    /// w ktorej seed wstawil literal '1' do user_accounts.id (zamiast UUID).
+    /// Budujemy czysty schemat przez run(), cofamy wersje ponizej 58, recznie
+    /// odtwarzamy zepsuty stan (id='1' + group_members.user_id='1'), po czym
+    /// uruchamiamy repair i weryfikujemy remap + brak naruszen FK + idempotencje.
+    #[test]
+    fn migration_v58_repairs_non_uuid_admin_id() {
+        const REPAIRED: &str = "00000000-0000-4000-8000-000000000002";
+
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Cofnij stan migracji ponizej 58, tak jak wygladalaby stara instalacja
+        // sprzed wprowadzenia naprawy.
+        conn.execute("DELETE FROM _migrations WHERE version >= 58", [])
+            .unwrap();
+
+        // Odtworz zepsuty stan: admin z id='1' oraz jego czlonkostwo w grupie z
+        // user_id='1'. FK wylaczone, bo '1' nie jest poprawnym UUID rodzica i przy
+        // wlaczonych FK insert dziecka by sie nie powiodl (dokladnie stan, jaki
+        // realnie istnial po wadliwym seedzie).
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO user_accounts (id, username, password_hash, display_name, is_admin) \
+             VALUES ('1', 'admin', 'h', 'Administrator', 1)",
+            [],
+        )
+        .unwrap();
+        let admins_group_id: String = conn
+            .query_row(
+                "SELECT id FROM user_groups WHERE name = 'admins'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?1, '1')",
+            rusqlite::params![admins_group_id],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Stan przed naprawa: faktycznie istnieje zepsuty wiersz id='1'.
+        let broken_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_accounts WHERE id = '1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(broken_before, 1, "stan testowy: powinien byc wiersz id='1'");
+
+        // Uruchom naprawe.
+        repair_admin_non_uuid_id(&conn, 58, "repair_admin_non_uuid_id").unwrap();
+
+        // (a) brak wiersza id='1'.
+        let broken_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_accounts WHERE id = '1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(broken_after, 0, "id='1' powinno zniknac po naprawie");
+
+        // (b) istnieje wiersz admina z poprawnym, stalym UUID.
+        let admin_id: String = conn
+            .query_row(
+                "SELECT id FROM user_accounts WHERE username = 'admin'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(admin_id, REPAIRED, "id admina musi byc REPAIRED_ADMIN_ID");
+        uuid::Uuid::parse_str(&admin_id)
+            .unwrap_or_else(|e| panic!("naprawione id '{admin_id}' nie jest UUID: {e}"));
+
+        // (c) group_members.user_id zaktualizowane na ten sam UUID.
+        let member_user_id: String = conn
+            .query_row(
+                "SELECT user_id FROM group_members WHERE group_id = ?1",
+                rusqlite::params![admins_group_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            member_user_id, REPAIRED,
+            "group_members.user_id musi zostac zremapowane na UUID admina"
+        );
+
+        // (d) brak naruszen integralnosci referencyjnej.
+        let violations = foreign_key_check(&conn).unwrap();
+        assert!(violations.is_empty(), "naruszenia FK po naprawie: {violations:?}");
+
+        // (e) migracja zostala oznaczona jako wykonana.
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 58",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1, "v58 powinno byc zapisane w _migrations");
+
+        // (f) idempotencja: drugie wywolanie na juz naprawionej bazie nie wybucha
+        // i nie zmienia stanu.
+        repair_admin_non_uuid_id(&conn, 58, "repair_admin_non_uuid_id").unwrap();
+        let admin_id_again: String = conn
+            .query_row(
+                "SELECT id FROM user_accounts WHERE username = 'admin'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(admin_id_again, REPAIRED);
+        let violations_again = foreign_key_check(&conn).unwrap();
+        assert!(
+            violations_again.is_empty(),
+            "powtorne wywolanie nie moze wprowadzic naruszen FK: {violations_again:?}"
+        );
     }
 
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by
