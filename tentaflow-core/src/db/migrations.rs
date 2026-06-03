@@ -45,15 +45,15 @@ pub fn run(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
 
-    // The v54 INTEGER→UUID identity flip rewrites every core PK, so every core
+    // The v56 INTEGER→UUID identity flip rewrites every core PK, so every core
     // operation a peer already holds points at a dead integer id. Upgrading ACROSS
-    // v54 this run arms a one-shot baseline reset that the sync runtime consumes
+    // v56 this run arms a one-shot baseline reset that the sync runtime consumes
     // after it is up (it owns the Fjall ledger + signer this `Connection` lacks):
     // bump the epoch, drop the stale core ledger state, and re-seed the outbox
     // from the post-flip rows. The marker is set only on the crossing boot and
     // cleared by the consumer, so a routine restart never re-bumps the epoch.
     //
-    // A FRESH install (`current_version == 0`) runs v54 against empty identity
+    // A FRESH install (`current_version == 0`) runs v56 against empty identity
     // tables and has no peers holding stale integer-keyed ops, so it must NOT
     // bump: it stays on the genesis epoch every other fresh node shares,
     // otherwise two fresh nodes could never exchange core ops (epoch is compared
@@ -105,10 +105,10 @@ pub fn run(conn: &Connection) -> Result<()> {
 
 /// Migration version of the INTEGER→UUID core identity flip. Crossing it arms
 /// the one-shot Sync Ledger baseline reset.
-pub const CORE_IDENTITY_FLIP_VERSION: i64 = 54;
+pub const CORE_IDENTITY_FLIP_VERSION: i64 = 56;
 
 /// `settings` key holding the one-shot "baseline reset pending after cutover"
-/// flag. Written by `run` when v54 is crossed, consumed (and cleared) by the
+/// flag. Written by `run` when v56 is crossed, consumed (and cleared) by the
 /// sync runtime once it owns the ledger.
 pub const CORE_BASELINE_RESET_PENDING_KEY: &str = "core_baseline_reset_pending";
 
@@ -312,16 +312,26 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (
             53,
+            "addon_vector_namespaces_fields",
+            MigrationStep::Sql(ADDON_VECTOR_NAMESPACES_FIELDS),
+        ),
+        (
+            54,
+            "addon_vector_namespaces_sparse",
+            MigrationStep::Sql(ADDON_VECTOR_NAMESPACES_SPARSE),
+        ),
+        (
+            55,
             "core_resource_versions",
             MigrationStep::Sql(CORE_RESOURCE_VERSIONS),
         ),
         (
-            54,
+            56,
             "core_identity_int_to_uuid",
             MigrationStep::RustSelfManaged(core_identity_int_to_uuid),
         ),
         (
-            55,
+            57,
             "core_sync_captures_hlc",
             MigrationStep::Sql(CORE_SYNC_CAPTURES_HLC),
         ),
@@ -329,7 +339,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 }
 
 // =============================================================================
-// v54 — core identity INTEGER -> TEXT UUID migration
+// v56 — core identity INTEGER -> TEXT UUID migration
 // =============================================================================
 //
 // The five core identity tables (`flows`, `flow_model_bindings`,
@@ -585,14 +595,14 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "flow_invocations",
             "actor_user_id",
             "TEXT user_accounts(id) FK (enforced by foreign_key_check); legacy rows \
-             held stringified-INTEGER session ids, value-remapped in place by v54 \
+             held stringified-INTEGER session ids, value-remapped in place by v56 \
              (remap_text_int_column) — resolvable ids -> UUID, unknown -> NULL so \
              the enforced FK stays satisfied; not a rebuilt table",
         ),
         t(
             "org_memberships",
             "user_id",
-            "already TEXT (CAST(id AS TEXT)); remapped in place by v54, not a rebuilt table",
+            "already TEXT (CAST(id AS TEXT)); remapped in place by v56, not a rebuilt table",
         ),
         t(
             "org_memberships",
@@ -1881,7 +1891,7 @@ CREATE INDEX IF NOT EXISTS idx_core_sync_captures_operation
     ON __tentaflow_core_sync_captures(operation_id);
 "#;
 
-// v55 — carry the pre-commit HLC stamp on each core capture row so the ledger
+// v57 — carry the pre-commit HLC stamp on each core capture row so the ledger
 // operation drained later reuses the exact timestamp recorded inside the write
 // transaction (not a fresh clock read at drain time), and so the materializer's
 // HLC-LWW comparison sees the originating order.
@@ -1941,7 +1951,7 @@ CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_operation
     ON __tentaflow_blob_sync_captures(operation_id);
 "#;
 
-// v53 — last-writer HLC bookmark per synced resource. Phase B will write the
+// v55 — last-writer HLC bookmark per synced resource. Phase B will write the
 // HLC of the most recently applied operation here so conflict resolution can
 // compare an incoming operation against the resource's current version without
 // replaying the ledger. Additive in phase A: no write path touches it yet.
@@ -2389,6 +2399,22 @@ CREATE TABLE IF NOT EXISTS addon_vector_namespaces (
     PRIMARY KEY (addon_id, namespace)
 );
 CREATE INDEX IF NOT EXISTS idx_addon_vector_ns_addon ON addon_vector_namespaces(addon_id);
+"#;
+
+// v52 — declared metadata field schema for a vector namespace, stored as a JSON
+// array of {name, type, indexed} (the universal FieldSpec). Persisting it lets
+// any access path (get / get_or_create) reconstruct the backend with the right
+// column types, and lets reconciliation diff the manifest against the live
+// collection on addon update. Default '[]' = no metadata fields (back-compat).
+const ADDON_VECTOR_NAMESPACES_FIELDS: &str = r#"
+ALTER TABLE addon_vector_namespaces ADD COLUMN fields_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
+// v53 — whether the namespace carries a sparse vector field (hybrid search).
+// Fixed at namespace creation: the backend collection gets a sparse column only
+// when this is 1. 0 = dense-only (default, back-compat).
+const ADDON_VECTOR_NAMESPACES_SPARSE: &str = r#"
+ALTER TABLE addon_vector_namespaces ADD COLUMN sparse INTEGER NOT NULL DEFAULT 0;
 "#;
 
 // F1c P2 — admin-managed allowlist of Ed25519 public keys that may sign
@@ -4673,7 +4699,7 @@ mod tests {
     /// guard that stops a future column from silently keeping an INTEGER id.
     ///
     /// This guard runs on a FRESH install, where INITIAL_SCHEMA declares the
-    /// remapped child columns TEXT. An UPGRADED DB intentionally differs: v54
+    /// remapped child columns TEXT. An UPGRADED DB intentionally differs: v56
     /// value-remaps those columns (INTEGER id -> UUID text) but does NOT rebuild
     /// the table to flip the declared type, so they keep INTEGER affinity while
     /// holding UUID text. That asymmetry is safe (SQLite affinity never coerces a
@@ -5056,7 +5082,7 @@ mod tests {
     }
 
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by
-    /// running every migration except the v54 UUID flip and anything after it.
+    /// running every migration except the v56 UUID flip and anything after it.
     /// Mirrors `run` but stops before the flip so the migration test can seed
     /// legacy integer rows.
     fn seed_pre_uuid_schema(conn: &Connection) {

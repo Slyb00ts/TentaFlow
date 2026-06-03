@@ -32,6 +32,7 @@ QWEN_LORA_MODELS = {
 
 # Sciezki do modeli GGUF (kwantyzowane Q5_K_M)
 GGUF_MODELS = {
+    "guard-full": os.path.join(ROOT, "output", "qwen-guard-Q5_K_M.gguf"),
     "guard-low": os.path.join(ROOT, "output", "qwen-guard-qlora-low-Q5_K_M.gguf"),
     "guard-medium": os.path.join(ROOT, "output", "qwen-guard-qlora-medium-Q5_K_M.gguf"),
     "guard-high": os.path.join(ROOT, "output", "qwen-guard-qlora-high-Q5_K_M.gguf"),
@@ -487,6 +488,7 @@ def run_benchmark(model_name, predict_fn, test_data):
 ALL_MODELS = [
     "base",
     "llama-guard-base", "llama-guard",
+    "guard-full",
     "guard-low", "guard-medium", "guard-high",
     "all-lora", "all-qlora", "all-dora", "all-full",
     "haiku", "sonnet", "opus",

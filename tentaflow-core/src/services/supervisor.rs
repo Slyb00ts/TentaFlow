@@ -329,9 +329,12 @@ impl Supervisor {
                 }
             }
 
-            let health = self
-                .check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
-                .await;
+            let health = if Self::engine_is_infra(&svc.engine_id) {
+                    HealthStatus::Ok
+                } else {
+                    self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
+                        .await
+                };
             self.apply_health(svc, health, /*allow_restart=*/ false)
                 .await;
         }
@@ -428,8 +431,16 @@ impl Supervisor {
             if svc.paused || svc.transport != Transport::Embedded {
                 continue;
             }
-            // Only services the user expected to be up. Stopped/Failed/Interrupted
-            // are left alone (pinned ones are handled by auto_start_pinned).
+            // Tylko PINNED embedded reloadujemy na boocie. UNPINNED (domyslne na
+            // mobile) sa lazy — ladowane na pierwsze zadanie przez executor, NIE
+            // przy starcie; memory guard zwalnia je gdy idle. Bez tego mobile
+            // ladowalby wszystkie modele naraz i przekraczal limit pamieci.
+            if !svc.pinned {
+                continue;
+            }
+            // Pinned w stanach Stopped/Failed/Interrupted obsluguje
+            // auto_start_pinned; tu bierzemy te ktore byly "up" (stan in-process
+            // stracony przy restarcie procesu).
             if !matches!(
                 svc.status,
                 ServiceStatus::Running
@@ -588,9 +599,12 @@ impl Supervisor {
                 if svc.status == ServiceStatus::Starting {
                     continue;
                 }
-                let health = self
-                    .check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
-                    .await;
+                let health = if Self::engine_is_infra(&svc.engine_id) {
+                        HealthStatus::Ok
+                    } else {
+                        self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
+                            .await
+                    };
                 self.apply_health(svc, health, /*allow_restart=*/ true)
                     .await;
             }
@@ -800,14 +814,15 @@ impl Supervisor {
                 matches!(svc.transport.as_str(), "sidecar_quic" | "external_http")
             })
             // Pomin handle build dla serwisow bez aktywnego runtime. HTTP
-            // transports (http_direct / external_http) wymagaja
-            // `endpoint_url` z DB; gdy NULL (serwis Stopped/Failed albo
-            // Starting przed pierwszym deploy_writeback), `build_handle`
-            // i tak by zwrocil "endpoint_url missing" co tickiem zalewa
-            // logi WARN. Embedded i SidecarQuic budujemy zawsze — embedded
-            // nie ma URLa, sidecar bierze port z DB.
+            // transports (http_direct / external_http) wymagaja `endpoint_url`
+            // z DB, a `sidecar_quic` wymaga `sidecar_quic_port`; gdy te sa NULL
+            // (serwis Stopped/Failed albo Starting przed pierwszym
+            // deploy_writeback — np. nieudany deploy stacka compose), `build_handle`
+            // i tak zwrocilby "... missing" co tickiem zalewajac logi WARN.
+            // Embedded budujemy zawsze (nie ma URLa ani portu).
             .filter(|svc| match svc.transport.as_str() {
                 "http_direct" | "external_http" => svc.endpoint_url.is_some(),
+                "sidecar_quic" => svc.sidecar_quic_port.is_some(),
                 _ => true,
             })
             .map(|svc| ((svc.node_id.clone(), svc.id), svc))
@@ -942,6 +957,21 @@ impl Supervisor {
     }
 
     // ---- Health-check dispatch --------------------------------------------
+
+    /// True when the engine is declared `resource_kind = "infra"` in its
+    /// manifest (Milvus, iroh-relay, …). Such services are supporting
+    /// infrastructure, not inference backends: TentaFlow talks to them
+    /// out-of-band (e.g. the vector backend uses Milvus via `__milvus_uri`), so
+    /// the inference-style HTTP health probe does not apply and would spuriously
+    /// mark them `Degraded` (a DB on a gRPC port answers an HTTP GET with 404).
+    fn engine_is_infra(engine_id: &str) -> bool {
+        crate::services::manifest::registry()
+            .by_id(engine_id)
+            .map(|m| {
+                m.engine.resource_kind == Some(crate::services::manifest::ResourceKind::Infra)
+            })
+            .unwrap_or(false)
+    }
 
     async fn check_health(
         &self,

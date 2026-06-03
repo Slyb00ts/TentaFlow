@@ -1426,15 +1426,15 @@ function renderStepRuntime() {
     `;
   }
 
-  // Pole portu pokazujemy TYLKO dla docker (single-container) — host port w
-  // mapowaniu host:container jest editable i ma sens uzytkownikowi. Dla
-  // native (python-bundle / binary / embedded) i compose backend zawsze sam
-  // alokuje port z puli (config.services_runtime.port_range, domyslnie
-  // 5000-6000) — pokazywanie pola wprowadzaloby w blad bo wartosc i tak
-  // jest ignorowana przez `python_bundle.rs::prepare`. Zamiast tego
-  // pokazujemy informacyjny opis.
-  const isDockerSingle = selection.deployMethod === 'docker' && !composeMode;
-  const portField = isDockerSingle
+  // Pole portu pokazujemy dla KAZDEGO docker deploy (single-container i compose
+  // stack) — host port w mapowaniu host:container jest editable. Wartosc jest
+  // wstepnie wypelniana pierwszym wolnym portem ktory przydzielilby serwer
+  // (patrz bindStepRuntimeInputs -> suggestServicePortRequest), z mozliwoscia
+  // zmiany. Dla native (python-bundle / binary / embedded) backend zawsze sam
+  // alokuje port z puli i ignoruje wartosc z formularza, wiec tam pokazujemy
+  // tylko informacyjny opis.
+  const isDocker = selection.deployMethod === 'docker';
+  const portField = isDocker
     ? `
       <div class="form-group">
         <tf-input type="number" id="edw-port"
@@ -1743,7 +1743,27 @@ function bindStepRuntimeInputs() {
       const raw = e.detail?.value ?? portInput.value;
       const v = parseInt(raw, 10);
       selection.port = isNaN(v) ? raw : v;
+      // Mark as user-chosen so the async suggestion below never overwrites it.
+      selection.portUserEdited = true;
     });
+  }
+  // Pre-fill the (editable) port with the first free host port the server would
+  // assign — instead of the static manifest default. Docker only (native
+  // ignores the port). Fire-and-forget; updates the field when it returns.
+  if (selection.deployMethod === 'docker' && !selection.portUserEdited) {
+    ApiBinary.action('suggestServicePortRequest', {
+      deploy_method: selection.deployMethod,
+    })
+      .then((r) => {
+        if (r && r.available && r.port && !selection.portUserEdited) {
+          selection.port = r.port;
+          const pin = document.getElementById('edw-port');
+          if (pin) pin.value = String(r.port);
+        }
+      })
+      .catch(() => {
+        /* suggestion is advisory; the deploy re-allocates authoritatively */
+      });
   }
   const cnameInput = document.getElementById('edw-cname');
   if (cnameInput) {
@@ -1920,11 +1940,11 @@ async function startDeploy() {
     model_preset_id: selection.modelPresetId || null,
     model_repo: selection.modelRepo || null,
     // Native (python-bundle / binary / embedded) zawsze dostaje port z
-    // PortAllocatora — wartosc z formularza i tak jest ignorowana po
-    // stronie backendu, wiec wysylamy null zeby uniknac mylacych logow.
-    // Docker single-container honoruje user-provided host port; compose
-    // sterujemy z bundlu, tu null.
-    port: (selection.deployMethod === 'docker' && !usesDockerCompose())
+    // PortAllocatora — wartosc z formularza jest ignorowana po stronie
+    // backendu, wiec wysylamy null. Docker honoruje user-provided host port:
+    // single-container mapuje go bezposrednio, compose przekazuje jako
+    // MILVUS_GRPC_PORT (a gdy zajety, backend bierze nastepny wolny).
+    port: selection.deployMethod === 'docker'
       ? (selection.port || eng.default_port)
       : null,
     container_name: selection.containerName || null,

@@ -287,6 +287,13 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             .func_wrap("tentaflow", "vector_search_v1", vector::vector_search_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja vector_search_v1: {e}"))?;
         linker
+            .func_wrap(
+                "tentaflow",
+                "vector_hybrid_search_v1",
+                vector::vector_hybrid_search_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja vector_hybrid_search_v1: {e}"))?;
+        linker
             .func_wrap("tentaflow", "vector_delete_v1", vector::vector_delete_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja vector_delete_v1: {e}"))?;
     }

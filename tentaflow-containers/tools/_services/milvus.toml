@@ -1,0 +1,24 @@
+# Manifest serwisu Milvus — zewnetrzna baza wektorowa dla TentaFlow.
+# Backend `milvus` w services/vector wybierany per-addon (klucz __vector_backend
+# = milvus + __milvus_uri = http://<host>:19530 w ustawieniach addona).
+# Standalone = etcd + minio + milvus (jeden stack Compose).
+
+[engine]
+id = "milvus"
+category = "tools"
+name = "Milvus"
+description_pl = "Zewnetrzna baza wektorowa (standalone: etcd + minio + milvus). Backend hybrydowy dense+sparse dla RAG."
+description_en = "External vector database (standalone: etcd + minio + milvus). Dense+sparse hybrid backend for RAG."
+homepage = "https://milvus.io/"
+license = "Apache-2.0"
+resource_kind = "infra"
+default_port = 19530
+api = "custom"
+version = "2.5.4"
+requires_model = false
+gpu_supported = false
+
+[deploy.docker]
+compose_path = "tools/docker/milvus/stack.yml"
+platforms = ["linux"]
+transport = "direct-http"

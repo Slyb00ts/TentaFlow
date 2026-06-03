@@ -30,6 +30,10 @@ args = [
     "--host", "127.0.0.1",
     "--port", "${PORT:-8000}",
     "--model", "${MODEL}",
+    # Serve under the slug the core routes by (`models_from_manifest` model_name
+    # = preset id), not the repo path `${MODEL}`. Without this vllm advertises
+    # the model as its HF repo and every dispatch 404s when preset id != repo.
+    "--served-model-name", "${SERVED_MODEL_NAME}",
     "--dtype", "auto",
     "--max-model-len", "${MAX_MODEL_LEN:-8192}",
     "--max-num-batched-tokens", "${MAX_NUM_BATCHED_TOKENS:-8192}",

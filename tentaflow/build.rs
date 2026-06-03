@@ -42,6 +42,11 @@ fn set_linux_rpath() {
         "linux" => {
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
             println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
+            // zvec ships as a shared lib in tentaflow-zvec-sys/vendor/lib/<platform>
+            // (not copied next to the binary). $ORIGIN finds it only in a packaged
+            // layout; for `cargo run` from the repo, add the vendored dir to rpath
+            // by absolute path so the loader resolves libzvec_c_api.so.
+            add_zvec_vendor_rpath();
         }
         "windows" => {
             // MSVC odpowiednik --allow-multiple-definition. whisper-rs-sys i
@@ -55,6 +60,26 @@ fn set_linux_rpath() {
             // nie blocker, zostaje).
         }
         _ => {}
+    }
+}
+
+/// Emit an absolute rpath to the vendored zvec shared lib so `cargo run` from the
+/// repo finds `libzvec_c_api.so` without `LD_LIBRARY_PATH`. Platform mapping
+/// mirrors `tentaflow-zvec-sys/build.rs`. No-op if the dir is absent (e.g. zvec
+/// not vendored for this arch) — the rpath entry is then simply unused.
+fn add_zvec_vendor_rpath() {
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let platform = match arch.as_str() {
+        "x86_64" => "linux-x86_64",
+        "aarch64" => "linux-aarch64",
+        _ => return,
+    };
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let lib_dir = manifest
+        .join("../tentaflow-zvec-sys/vendor/lib")
+        .join(platform);
+    if let Ok(abs) = lib_dir.canonicalize() {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", abs.display());
     }
 }
 
