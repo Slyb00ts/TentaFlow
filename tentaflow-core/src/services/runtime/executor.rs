@@ -131,6 +131,9 @@ pub struct ModelRuntimeExecutor {
     model_residency: Arc<
         parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>,
     >,
+    /// DbPool dla czyszczenia tekstu TTS (`clean_cache::clean` — substytucja z
+    /// `tts_cleaning_rules` + strip emoji/punktuacji). `None` w testach DB-less.
+    db: Option<crate::db::DbPool>,
 }
 
 impl ModelRuntimeExecutor {
@@ -146,6 +149,7 @@ impl ModelRuntimeExecutor {
         model_residency: Arc<
             parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>,
         >,
+        db: Option<crate::db::DbPool>,
     ) -> Self {
         Self {
             catalog,
@@ -156,6 +160,7 @@ impl ModelRuntimeExecutor {
             mesh_manager,
             strategy_state: Arc::new(dashmap::DashMap::new()),
             model_residency,
+            db,
         }
     }
 
@@ -1444,7 +1449,26 @@ impl ModelRuntimeExecutor {
                         .await
                         .map_err(|e| ExecutorError::Internal(format!("embedded TTS load: {e:#}")))?;
                     }
-                    let text = request.input.clone();
+                    // Czysci tekst przed synteza: substytucja z `tts_cleaning_rules`
+                    // (cache) + strip emoji/punktuacji. Robione TU (nie w
+                    // node `tts_clean`) zeby kazda synteza TTS we flow czyscila
+                    // — niezaleznie czy flow ma osobny node tts_clean. Galaz
+                    // tekstu (odpowiedz) idzie inna sciezka i NIE jest czyszczona.
+                    let text = {
+                        let raw = request.input.clone();
+                        match &self.db {
+                            Some(db) => {
+                                let db = db.clone();
+                                let raw_fallback = raw.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    crate::tts::clean_cache::clean(&raw, &db)
+                                })
+                                .await
+                                .unwrap_or(raw_fallback)
+                            }
+                            None => raw,
+                        }
+                    };
                     let speed = request.speed.unwrap_or(1.0);
                     // Multilingual silniki (Supertonic) potrzebuja jezyka z
                     // requestu (per-user trafia do `TTSRequest.language` przez
@@ -2269,6 +2293,7 @@ mod tests {
             stt_slot,
             mesh_slot,
             Arc::new(parking_lot::RwLock::new(None)),
+            None,
         )
     }
 

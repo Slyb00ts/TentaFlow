@@ -979,7 +979,13 @@
     "tab_tts": "TTS",
     "tab_pii": "PII",
     "tab_fastpath": "Fast-path",
-    "error_prefix": "Błąd"
+    "error_prefix": "Błąd",
+    "col_replacement": "Zamiennik",
+    "add": "Dodaj",
+    "added_ok": "Dodano",
+    "pattern_required": "Wzorzec jest wymagany",
+    "no_tts_model": "Brak wdrożonego modelu TTS",
+    "play_title": "Odtwórz"
   },
   "flows_builder": {
     "back": "Wstecz",

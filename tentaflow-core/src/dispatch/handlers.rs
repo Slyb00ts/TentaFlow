@@ -2243,9 +2243,14 @@ pub fn tts_rule_create(
         _ => return Err(ProtocolError::bad_request("expected TtsRuleCreateRequest")),
     };
 
+    // Reguly z dashboardu to SUBSTYTUCJA tekstu pod TTS (pattern -> zamiennik),
+    // typ `phonetic` (String::replace w clean_cache). Pole `voice_id` w
+    // protokole TtsRule niesie tekst zamiennika (historyczna nazwa — UI pokazuje
+    // "zamiennik"). Wczesniej tworzylo martwy `voice_assignment` ktory nigdzie
+    // nie byl czytany ani stosowany.
     let rule_id = repository::create_tts_cleaning_rule(
         &ctx.state.db,
-        "voice_assignment",
+        "phonetic",
         &payload.pattern,
         Some(&payload.voice_id),
         "pl",
@@ -2277,6 +2282,44 @@ pub fn tts_rule_delete(
     repository::delete_tts_cleaning_rule(&ctx.state.db, rule_id).map_err(db_err)?;
     crate::tts::clean_cache::refresh(&ctx.state.db);
     Ok(MessageBody::TtsRuleDeleteResponse { deleted: true })
+}
+
+/// Podglad TTS: syntezuje `text` (po czyszczeniu/substytucji w `synthesize_speech`)
+/// na audio i zwraca bajty, zeby admin uslyszal jak regula wyjdzie. Binary CBOR.
+#[handler(variant = "TtsPreviewRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn tts_preview(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let (text, model, voice) = match req {
+        MessageBody::TtsPreviewRequest { text, model, voice } => {
+            (text.clone(), model.clone(), voice.clone())
+        }
+        _ => return Err(ProtocolError::bad_request("expected TtsPreviewRequest")),
+    };
+    if text.trim().is_empty() {
+        return Err(ProtocolError::bad_request("text wymagany"));
+    }
+    let tts_req = crate::api::openai::types::TTSRequest {
+        model,
+        input: text,
+        voice,
+        response_format: Some("wav".to_string()),
+        speed: None,
+        language: None,
+    };
+    let result = ctx
+        .state
+        .router
+        .synthesize_speech(&tts_req, None)
+        .await
+        .map_err(|e| ProtocolError::internal(format!("tts preview: {e}")))?;
+    Ok(MessageBody::TtsPreviewResponse {
+        bytes: result.response.bytes,
+        format: result.response.format,
+    })
 }
 
 #[handler(variant = "PiiRuleListRequest", since = (1, 0))]
