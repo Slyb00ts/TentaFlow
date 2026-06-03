@@ -9,6 +9,12 @@ use tracing::{debug, info};
 
 use crate::crypto;
 
+/// Staly UUID domyslnego admina. id w user_accounts musi byc UUID, bo login
+/// pakuje je do 16-bajtowej formy wire (literal '1' bylby odrzucony jako
+/// niepoprawny UUID). Konwencja jak w INITIAL_SCHEMA, gdzie grupa 'admins'
+/// ma staly '00000000-0000-4000-8000-000000000001'.
+const DEFAULT_ADMIN_ID: &str = "00000000-0000-4000-8000-000000000002";
+
 /// Seeduje domyslne dane jesli baza jest pusta.
 /// Caly seed w jednej transakcji (jedno fsync zamiast wielu).
 pub fn seed_defaults(conn: &Connection) -> Result<()> {
@@ -108,16 +114,17 @@ fn seed_user_accounts(conn: &Connection) -> Result<()> {
         let password_hash = crypto::hash_password("admin")?;
         conn.execute(
             "INSERT INTO user_accounts (id, username, password_hash, display_name, is_admin, must_change_password) \
-             VALUES (1, 'admin', ?1, 'Administrator', 1, 1)",
-            rusqlite::params![password_hash],
+             VALUES (?1, 'admin', ?2, 'Administrator', 1, 1)",
+            rusqlite::params![DEFAULT_ADMIN_ID, password_hash],
         )?;
         // Dodaj admina do grupy admins. Po migracji v53 identyfikatory grup i
         // userow sa TEXT UUID, wiec wiazemy po realnych id (grupa 'admins' ma
-        // staly UUID seedowany w INITIAL_SCHEMA, admin to user_accounts.id = '1').
+        // staly UUID seedowany w INITIAL_SCHEMA, admin uzywa stalego UUID
+        // DEFAULT_ADMIN_ID).
         conn.execute(
             "INSERT OR IGNORE INTO group_members (group_id, user_id) \
-             SELECT g.id, '1' FROM user_groups g WHERE g.name = 'admins'",
-            [],
+             SELECT g.id, ?1 FROM user_groups g WHERE g.name = 'admins'",
+            rusqlite::params![DEFAULT_ADMIN_ID],
         )?;
         info!("Utworzono domyslne konto admina w user_accounts");
     }
@@ -926,6 +933,52 @@ mod tests {
             .find(|n| n["type"] == "llm")
             .unwrap();
         assert_eq!(llm_node["config"]["model_alias"], "teams-summarization");
+    }
+
+    /// Regresja: po pelnym migrations::run + seed_defaults na swiezej bazie
+    /// wiersz admina w user_accounts musi miec id ktore parsuje sie jako UUID,
+    /// a wiersz group_members admina musi wskazywac na ten sam UUID. To dokladnie
+    /// ta sciezka, ktora wczesniej dawala "user id is not a valid UUID" (seed
+    /// wstawial literal '1' do user_accounts.id zamiast UUID).
+    #[test]
+    fn seeded_admin_user_account_id_is_a_valid_uuid() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.lock().unwrap();
+
+        // id admina w user_accounts musi byc poprawnym UUID-em.
+        let admin_id: String = conn
+            .query_row(
+                "SELECT id FROM user_accounts WHERE username = 'admin'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("wiersz admina istnieje w user_accounts");
+        uuid::Uuid::parse_str(&admin_id)
+            .unwrap_or_else(|e| panic!("user_accounts.id '{admin_id}' nie jest UUID: {e}"));
+
+        // Seed uzywa stalego DEFAULT_ADMIN_ID — potwierdzamy ze to wlasnie ten UUID.
+        assert_eq!(
+            admin_id,
+            super::DEFAULT_ADMIN_ID,
+            "admin powinien miec staly DEFAULT_ADMIN_ID"
+        );
+
+        // group_members admina musi wskazywac na ten sam UUID (po stronie user_id).
+        let member_user_id: String = conn
+            .query_row(
+                "SELECT gm.user_id FROM group_members gm \
+                 JOIN user_groups g ON g.id = gm.group_id \
+                 WHERE g.name = 'admins'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("admin nalezy do grupy 'admins'");
+        assert_eq!(
+            member_user_id, admin_id,
+            "group_members.user_id musi byc tym samym UUID co user_accounts.id admina"
+        );
+        uuid::Uuid::parse_str(&member_user_id)
+            .unwrap_or_else(|e| panic!("group_members.user_id '{member_user_id}' nie jest UUID: {e}"));
     }
 
     /// find_prompt z fallback na 'pl' gdy dany jezyk nie istnieje.
