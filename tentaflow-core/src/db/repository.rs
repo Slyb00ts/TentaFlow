@@ -5162,6 +5162,66 @@ pub fn get_addon(pool: &DbPool, addon_id: &str) -> Result<Option<Addon>> {
     Ok(result)
 }
 
+/// Upsert wersji pakietu do katalogu `addon_packages`. Idempotentne po
+/// (package_id, version) — reconciler wbudowanych addonow woła to przy kazdym
+/// starcie; ponowne wrzucenie tej samej wersji odswieza manifest/hash.
+pub fn upsert_addon_package(
+    pool: &DbPool,
+    package_id: &str,
+    version: &str,
+    name: &str,
+    manifest_json: &str,
+    bundle_hash: &str,
+    source: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO addon_packages (package_id, version, name, manifest_json, bundle_hash, source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(package_id, version) DO UPDATE SET \
+             name = excluded.name, \
+             manifest_json = excluded.manifest_json, \
+             bundle_hash = excluded.bundle_hash, \
+             source = excluded.source",
+        rusqlite::params![package_id, version, name, manifest_json, bundle_hash, source],
+    )?;
+    Ok(())
+}
+
+/// Jeden wpis katalogu pakietow (jedna wersja jednego pakietu).
+pub struct AddonPackageRow {
+    pub package_id: String,
+    pub version: String,
+    pub name: String,
+    pub manifest_json: String,
+    pub bundle_hash: String,
+    pub source: String,
+    pub created_at: String,
+}
+
+/// Lista wszystkich wersji wszystkich pakietow w katalogu, najnowsze najpierw.
+pub fn list_addon_packages(pool: &DbPool) -> Result<Vec<AddonPackageRow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT package_id, version, name, manifest_json, bundle_hash, source, created_at \
+         FROM addon_packages ORDER BY package_id ASC, created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(AddonPackageRow {
+                package_id: row.get(0)?,
+                version: row.get(1)?,
+                name: row.get(2)?,
+                manifest_json: row.get(3)?,
+                bundle_hash: row.get(4)?,
+                source: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Aktualizuje wersje i manifest addonu.
 pub fn update_addon(
     pool: &DbPool,

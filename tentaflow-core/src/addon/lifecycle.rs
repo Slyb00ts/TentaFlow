@@ -160,6 +160,36 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
 
     let wasm_size = wasm_bytes.len() as i64;
 
+    // Materializuj pakiet do wersjonowanego store'u packages/{id}/{version}/.
+    // Runtime (get_or_compile_module) oraz migracje rozwiazuja wasm/migracje
+    // wylacznie z tego katalogu, niezaleznie od callera. Bundled reconcile pisze
+    // juz bezposrednio do package_dir (addon_dir == package_dir) i sam wpisuje
+    // wersje do `addon_packages`; inni callerzy (upload przez dashboard)
+    // dostarczaja addon_dir w katalogu tymczasowym, wiec kopiujemy pliki do
+    // store'u i katalogizujemy wersje, inaczej runtime nie znajdzie wasm.
+    let package_dir = crate::addon::bundled::package_dir(&manifest.addon_id, &manifest.version);
+    let needs_materialize = match (addon_dir.canonicalize(), package_dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a != b,
+        _ => addon_dir != package_dir.as_path(),
+    };
+    if needs_materialize {
+        // Katalog wersji jest immutable (jedna wersja = jeden niezmienny zestaw
+        // plikow), wiec czyscimy go przed kopiowaniem — inaczej re-upload tej
+        // samej wersji albo nieudany wczesniejszy install zostawilby nieaktualne
+        // pliki (np. usuniete migracje SQL, ktore teraz leca z package_dir).
+        let _ = std::fs::remove_dir_all(&package_dir);
+        copy_package_into_store(addon_dir, &package_dir)?;
+        crate::db::repository::upsert_addon_package(
+            db,
+            &manifest.addon_id,
+            &manifest.version,
+            &manifest.display_name,
+            &manifest_content,
+            "",
+            "uploaded",
+        )?;
+    }
+
     // 5-9. Zarejestruj w DB (w jednej transakcji)
     let conn = db.lock().unwrap();
 
@@ -201,12 +231,18 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // 5. Tabela addons — schemat z migracji 14 + 25 + 26 + 43 + 44
     // (skill_md, keywords_json, category, disambiguation_json, icon, runtime,
     //  wasm_size_bytes, license, show_in_catalog)
+    // Faza 0: instancja 1:1 z pakietem — package_id == addon_id,
+    // package_version == manifest.version. Faza 1 wprowadzi syntetyczne id
+    // instancji rozne od package_id (install_instance).
     conn.execute(
-        "INSERT INTO addons (addon_id, name, version, description, author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT INTO addons (addon_id, name, display_name, version, package_id, package_version, description, author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         rusqlite::params![
             &manifest.addon_id,
             &manifest.display_name,
+            &manifest.display_name,
+            &manifest.version,
+            &manifest.addon_id,
             &manifest.version,
             &manifest.description.as_deref().unwrap_or(""),
             &manifest.author.as_deref().unwrap_or(""),
@@ -286,7 +322,7 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // Bez deklaracji storage.sql nic sie nie dzieje — backward compat z istniejacymi
     // addonami (test-app, teams-bot).
     if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
-        apply_addon_sql_migrations(&manifest, addon_dir, db)?;
+        apply_addon_sql_migrations(&manifest, &package_dir, db)?;
     }
 
     // F1c P5 — publish compiled flows as the final install step. Done after
@@ -326,6 +362,29 @@ pub fn ensure_sql_storage(addon_dir: &Path, db: &DbPool) -> Result<()> {
     validate_manifest(&manifest)?;
     if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
         apply_addon_sql_migrations(&manifest, addon_dir, db)?;
+    }
+    Ok(())
+}
+
+/// Kopiuje cala zawartosc katalogu zrodlowego addonu (wasm, manifest.toml,
+/// migrations/, pliki pomocnicze) do wersjonowanego store'u pakietow. Nadpisuje
+/// istniejace pliki, zeby ponowny install tej samej wersji byl spójny.
+fn copy_package_into_store(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc katalogu pakietu {:?}: {e}", dst))?;
+    for entry in std::fs::read_dir(src)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac katalogu addonu {:?}: {e}", src))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_package_into_store(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).map_err(|e| {
+                anyhow::anyhow!("Nie udalo sie skopiowac {:?} -> {:?}: {e}", from, to)
+            })?;
+        }
     }
     Ok(())
 }
@@ -742,8 +801,8 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
         "UPDATE addons SET version = ?1, name = ?2, description = ?3, author = ?4, \
          manifest_json = ?5, platforms = ?6, category = ?7, icon = ?8, runtime = ?9, \
          wasm_size_bytes = ?10, license = ?11, show_in_catalog = ?12, \
-         updated_at = datetime('now') \
-         WHERE addon_id = ?13",
+         package_version = ?13, updated_at = datetime('now') \
+         WHERE addon_id = ?14",
         rusqlite::params![
             &new_manifest.version,
             &new_manifest.display_name,
@@ -757,6 +816,7 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
             wasm_size,
             license,
             show_in_catalog,
+            &new_manifest.version,
             addon_id,
         ],
     )?;

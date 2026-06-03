@@ -2292,13 +2292,14 @@ impl AddonManager {
         }
 
         // Tabela `addon_wasm` jest martwa od pierwszego commita — lifecycle
-        // nigdy do niej nie zapisuje. WASM zyje na dysku w
-        // bundled_addons_dir()/{addon_id}/{manifest.wasm_file}. Czytamy
-        // sciezke z manifestu (pole `wasm_file` z [addon]).
+        // nigdy do niej nie zapisuje. WASM zyje na dysku w wersjonowanym
+        // pakiecie: packages/{package_id}/{package_version}/{wasm_file}.
+        // Instancja przypina (package_id, package_version) w tabeli `addons`;
+        // czytamy je i sciezke wasm z manifestu.
         let manifest = self.load_addon_manifest(addon_id)?;
-        let wasm_path = bundled::bundled_addons_dir()
-            .join(addon_id)
-            .join(&manifest.wasm_file);
+        let (package_id, package_version) = self.addon_package_ref(addon_id)?;
+        let wasm_path =
+            bundled::package_dir(&package_id, &package_version).join(&manifest.wasm_file);
         let wasm_bytes = std::fs::read(&wasm_path).with_context(|| {
             format!(
                 "Nie znaleziono WASM dla addonu '{}' (oczekiwana sciezka: {:?})",
@@ -2335,6 +2336,28 @@ impl AddonManager {
             "Nie udalo sie sparsowac manifestu addonu '{}'",
             addon_id
         ))
+    }
+
+    /// Zwraca (package_id, package_version) dla instancji — okresla z ktorej
+    /// wersji pakietu na dysku zaladowac wasm/migracje. Fallback na
+    /// (addon_id, version) gdy kolumny puste (defensywnie; backfill v60 wypelnia
+    /// istniejace wiersze, a install ustawia je dla nowych).
+    fn addon_package_ref(&self, addon_id: &str) -> Result<(String, String)> {
+        let conn = self.db.lock().unwrap();
+        let (pkg, ver, version): (String, String, String) = conn
+            .query_row(
+                "SELECT package_id, package_version, version FROM addons WHERE addon_id = ?1",
+                rusqlite::params![addon_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .context(format!("Nie znaleziono instancji addonu '{}'", addon_id))?;
+        let package_id = if pkg.is_empty() {
+            addon_id.to_string()
+        } else {
+            pkg
+        };
+        let package_version = if ver.is_empty() { version } else { ver };
+        Ok((package_id, package_version))
     }
 
     /// Zwraca uprawnienia deklarowane przez addon — zarowno kategorie (prefix

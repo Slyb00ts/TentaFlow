@@ -345,8 +345,42 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "drop_legacy_users_table",
             MigrationStep::Sql(DROP_LEGACY_USERS_TABLE),
         ),
+        (
+            60,
+            "addon_packages_and_instance_versioning",
+            MigrationStep::Sql(ADDON_PACKAGES_AND_INSTANCE_VERSIONING),
+        ),
     ]
 }
+
+// Multi-instance addons: split the single `addons.addon_id` identity into a
+// versioned PACKAGE (the template — wasm + manifest + migrations, catalogued in
+// `addon_packages`) and an INSTANCE (a row in `addons`, the durable scoping key
+// for storage/config/permissions/flow-blocks/sync). Each instance pins one
+// package version so instances update independently (test before prod).
+//
+// Backfill keeps existing single installs working: every addon becomes an
+// instance of a same-named package at its current version, display_name = name.
+const ADDON_PACKAGES_AND_INSTANCE_VERSIONING: &str = "
+CREATE TABLE addon_packages (
+    package_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    manifest_json TEXT NOT NULL DEFAULT '{}',
+    bundle_hash TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'bundled' CHECK(source IN ('bundled','uploaded')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (package_id, version)
+);
+
+ALTER TABLE addons ADD COLUMN package_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE addons ADD COLUMN package_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE addons ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
+
+UPDATE addons SET package_id = addon_id WHERE package_id = '';
+UPDATE addons SET package_version = version WHERE package_version = '';
+UPDATE addons SET display_name = name WHERE display_name = '';
+";
 
 // The legacy `users` table (F1a auth) is dead weight: dashboard login,
 // session identity and every FK go through `user_accounts` (F2). v38/v56
