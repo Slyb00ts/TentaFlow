@@ -46,13 +46,12 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
             .sum::<usize>()
     );
 
-    let data_dir = bundled_addons_dir();
-    std::fs::create_dir_all(&data_dir).map_err(|e| {
-        anyhow::anyhow!("Nie udalo sie utworzyc katalogu dla wbudowanych addonow: {e}")
+    std::fs::create_dir_all(packages_root()).map_err(|e| {
+        anyhow::anyhow!("Nie udalo sie utworzyc katalogu pakietow addonow: {e}")
     })?;
 
     for addon in BUNDLED_ADDONS {
-        if let Err(e) = install_single_bundled_addon(addon, db, &data_dir) {
+        if let Err(e) = install_single_bundled_addon(addon, db) {
             error!("Blad instalacji wbudowanego addonu '{}': {}", addon.name, e);
             // Kontynuuj z nastepnym addonem — nie przerywaj calego procesu
         }
@@ -62,11 +61,7 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
 }
 
 /// Instaluje pojedynczy wbudowany addon
-fn install_single_bundled_addon(
-    addon: &BundledAddon,
-    db: &DbPool,
-    data_dir: &std::path::Path,
-) -> Result<()> {
+fn install_single_bundled_addon(addon: &BundledAddon, db: &DbPool) -> Result<()> {
     // Parsuj manifest — wyciagnij addon_id i wersje
     let (addon_id, bundled_version) = match parse_addon_id_and_version(addon.manifest_toml) {
         Ok(v) => v,
@@ -84,8 +79,21 @@ fn install_single_bundled_addon(
     let existing = crate::db::repository::get_addon(db, &addon_id)?;
     let stored_bundle_hash =
         crate::db::repository::get_setting(db, &bundle_hash_setting_key(&addon_id))?;
-    let addon_dir = data_dir.join(&addon_id);
+
+    // Pakiet (szablon) zyje na dysku wersjonowany: packages/{id}/{version}/.
+    // Dzieki temu instancje moga przypiac konkretna wersje i aktualizowac sie
+    // niezaleznie. Katalog `addon_packages` indeksuje dostepne wersje.
+    let addon_dir = package_dir(&addon_id, &bundled_version);
     write_bundled_addon_files(&addon_dir, addon)?;
+    crate::db::repository::upsert_addon_package(
+        db,
+        &addon_id,
+        &bundled_version,
+        &addon.name,
+        addon.manifest_toml,
+        &bundle_hash,
+        "bundled",
+    )?;
 
     match existing {
         Some(ref existing_addon)
@@ -260,12 +268,19 @@ fn hash_chunk(hasher: &mut Sha256, name: &[u8], bytes: &[u8]) {
 // Sciezka do katalogu wbudowanych addonow
 // =============================================================================
 
-/// Zwraca sciezke do katalogu gdzie rozpakowane sa wbudowane addony
-pub fn bundled_addons_dir() -> PathBuf {
+/// Korzen katalogu pakietow addonow (szablonow) na dysku. Kazdy pakiet ma
+/// podkatalog `{package_id}/{version}/` z addon.wasm + manifest.toml +
+/// migrations/. Wersjonowanie pozwala instancjom przypiac konkretna wersje.
+pub fn packages_root() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tentaflow-ai")
-        .join("bundled-addons")
+        .join("packages")
+}
+
+/// Sciezka do konkretnej wersji pakietu: `packages/{package_id}/{version}/`.
+pub fn package_dir(package_id: &str, version: &str) -> PathBuf {
+    packages_root().join(package_id).join(version)
 }
 
 // =============================================================================
