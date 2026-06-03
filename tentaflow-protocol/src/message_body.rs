@@ -119,6 +119,12 @@ pub struct ServiceInfo {
     /// raportowania.
     pub progress_message: Option<String>,
     pub models: Vec<ServiceModelEntry>,
+    /// True gdy hash drzewa źródeł bundla zapisany przy deployu różni się od
+    /// aktualnego hashu z manifestu — Core wykrył nowszą wersję wbudowanego
+    /// bundla (docker/native). `#[serde(default)]` zachowuje kompatybilnosc ze
+    /// starszymi peerami mesh, ktorzy tego pola nie wysylaja.
+    #[serde(default)]
+    pub update_available: bool,
     pub created_at: String,
     pub updated_at: String,
     /// Typed request-time parameters z `services.config_json.parameters`,
@@ -132,7 +138,7 @@ pub struct ServiceInfo {
 ///   * `ollama_options` → klucz=wartosc dla Ollama API `options` mapy w
 ///     POST `/api/generate`/`/api/chat`.
 ///   * `python_request` → pola POST body dla generic Python wrapperow
-///     (qwen-asr, kyutai-tts, xtts, voxcpm, chatterbox).
+///     (qwen-asr, kyutai-tts, xtts, voxcpm).
 ///   * `whisper_overridable` → deploy defaults dla whisper z
 ///     `request_override = true`; backend uzywa jako baseline, klient API
 ///     moze nadpisac per request.
@@ -654,6 +660,11 @@ pub enum FlowInvokeChunk {
 pub struct FlowInvokeEnd {
     pub finish_reason: String,
     pub error: Option<String>,
+    /// Pelny zakumulowany tekst odpowiedzi. Front nadpisuje nim wiadomosc, bo
+    /// delty streamu bywaja ucinane gdy audio leci dluzej niz tekst.
+    /// `#[serde(default)]` zachowuje kompatybilnosc ze starszymi peerami.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 // =============================================================================
@@ -1687,6 +1698,11 @@ pub struct NetworkConfig {
     pub hide_cgnat: bool,
     pub prefer_same_subnet: bool,
     pub iroh_relay_url: String,
+    /// Nazwy interfejsow wykluczonych z advertise mesh per-karta (np. "eth3").
+    /// `#[serde(default)]` zachowuje kompatybilnosc ze starszymi peerami ktorzy
+    /// tego pola nie wysylaja. Pusta lista = nic nie wykluczone.
+    #[serde(default)]
+    pub excluded_interfaces: Vec<String>,
 }
 
 /// Snapshot zdrowia relay iroh — co backend wie o aktualnym stanie polaczenia

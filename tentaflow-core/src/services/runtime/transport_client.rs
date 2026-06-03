@@ -283,6 +283,7 @@ mod tests {
             extra_config: HashMap::new(),
             progress_message: None,
             health_last_err: None,
+            deployed_source_hash: String::new(),
         }
     }
 

@@ -51,7 +51,7 @@ fn require_user_id(ctx: &HandlerContext) -> Result<[u8; 16], ProtocolError> {
 
 /// Session user_id travels the wire as 16 raw UUID bytes; decode them back into
 /// the canonical UUID string used by every `user_accounts`-keyed DB query.
-fn user_id_to_uuid(bytes: &[u8; 16]) -> String {
+pub(crate) fn user_id_to_uuid(bytes: &[u8; 16]) -> String {
     uuid::Uuid::from_bytes(*bytes).to_string()
 }
 
@@ -5566,6 +5566,16 @@ fn load_network_config(
             .map_err(db_err)?
             .unwrap_or_else(|| crate::net::iroh::relay::DEFAULT_RELAY_URL.to_string());
 
+    // Per-karta exclude — ten sam klucz/format (JSON array) co czyta
+    // `load_advertise_filters`, zeby GUI i mesh widzialy to samo.
+    let excluded_interfaces = repository::get_setting(
+        pool,
+        crate::mesh::network_interfaces::SETTING_EXCLUDED_INTERFACES,
+    )
+    .map_err(db_err)?
+    .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+    .unwrap_or_default();
+
     Ok(tentaflow_protocol::NetworkConfig {
         bind_mode,
         bind_ipv4,
@@ -5575,6 +5585,7 @@ fn load_network_config(
         hide_cgnat,
         prefer_same_subnet,
         iroh_relay_url,
+        excluded_interfaces,
     })
 }
 
@@ -5684,6 +5695,16 @@ pub fn network_dispatch(
                 pool,
                 crate::net::iroh::relay::RELAY_URL_SETTING_KEY,
                 &new_cfg.iroh_relay_url,
+            )
+            .map_err(db_err)?;
+            // Per-karta exclude jako JSON array (zero CSV). Filtrowanie advertise
+            // czyta to dynamicznie przez `load_advertise_filters`, bez restartu.
+            let excluded_json = serde_json::to_string(&new_cfg.excluded_interfaces)
+                .unwrap_or_else(|_| "[]".to_string());
+            repository::set_setting(
+                pool,
+                crate::mesh::network_interfaces::SETTING_EXCLUDED_INTERFACES,
+                &excluded_json,
             )
             .map_err(db_err)?;
 

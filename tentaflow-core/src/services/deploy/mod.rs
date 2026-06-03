@@ -583,6 +583,30 @@ pub async fn stop(
         }
     }
 
+    // Embedded shutdown: in-process STT/TTS engines zyja w shared managerach —
+    // nie maja kontenera ani PID. Bez wyladowania tutaj delete usuwa tylko row
+    // z DB, a silnik dalej obsluguje requesty (objaw: "usunalem serwis a dalej
+    // dzialal"). Backend routingu STT zdejmuje supervisor (`unregister_backend`),
+    // ale sam zaladowany model embedded trzeba zwolnic tu.
+    if svc.deploy_method == DM::NativeEmbedded {
+        match svc.category.as_str() {
+            "tts" => {
+                crate::tts::shared_tts_manager()
+                    .write()
+                    .await
+                    .unregister(&svc.engine_id);
+            }
+            "stt" => {
+                let _ = crate::stt::shared_stt_manager()
+                    .write()
+                    .await
+                    .unload_model()
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
     // NIE zwalniamy portow przy stop(). Port to permanentny atrybut serwisu
     // — przyznany przy `deploy()`, zwalniany dopiero przy delete (gdy row
     // znika z DB). Restart / pause / crash zostawia port w `leased`,
@@ -695,6 +719,19 @@ fn mark_service_deploy_failed(
 
 /// Builds the canonical `NewService` row from the prepared state.
 pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus) -> NewService {
+    // Zapamietujemy hash drzewa zrodel z momentu deployu, aby pozniej wykryc, ze
+    // wbudowany bundle zostal zaktualizowany (snapshot porownuje go z aktualnym
+    // hashem manifestu). embedded/external nie maja buildowalnego drzewa -> pusty.
+    let deployed_source_hash = crate::services::manifest::registry()
+        .by_id(&prepared.engine_id)
+        .map(|m| match prepared.deploy_method {
+            DeployMethod::Docker => m.docker_source_hash.clone(),
+            DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => {
+                m.native_source_hash.clone()
+            }
+            _ => String::new(),
+        })
+        .unwrap_or_default();
     NewService {
         engine_id: prepared.engine_id.clone(),
         category: prepared.category.clone(),
@@ -716,11 +753,8 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         config_json: prepared.config_json.clone(),
         active_deploy_id: String::new(),
         last_deploy_id: String::new(),
-        deployment_progress_pct: if status == ServiceStatus::Running {
-            100
-        } else {
-            0
-        },
+        deployment_progress_pct: if status == ServiceStatus::Running { 100 } else { 0 },
+        deployed_source_hash,
     }
 }
 
@@ -747,6 +781,7 @@ fn build_placeholder_service(
         active_deploy_id: deploy_id.to_string(),
         last_deploy_id: deploy_id.to_string(),
         deployment_progress_pct: 0,
+        deployed_source_hash: String::new(),
     }
 }
 
@@ -1535,7 +1570,7 @@ pub struct RequestTimeParameters {
     /// Klucz=wartosc dla Ollama API `options` mapy.
     pub ollama_options: HashMap<String, serde_json::Value>,
     /// Pola POST body do generic Python wrappera (qwen-asr, kyutai-tts,
-    /// xtts, voxcpm, chatterbox).
+    /// xtts, voxcpm).
     pub python_request: HashMap<String, serde_json::Value>,
     /// Whisper deploy defaults z `request_override = true` — backend
     /// przy `transcribe()` uzywa jako baseline; klient API moze nadpisac.

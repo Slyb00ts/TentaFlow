@@ -270,6 +270,20 @@ function bindTabEvents() {
       });
     };
   });
+  body.querySelectorAll('[data-svc-redeploy]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const engineId = b.dataset.svcEngine;
+      const nodeId = b.dataset.svcNode || undefined;
+      const deployMethod = b.dataset.svcMethod || undefined;
+      if (!engineId) return;
+      // Ten sam kreator wdrozenia co w katalogu — pozwala wybrac model/parametry
+      // i wdrozyc serwis ponownie ze zaktualizowanego zrodla bundla.
+      import('/js/modules/catalog/engine-deploy-wizard.js').then((mod) => {
+        mod.openDeployWizard(engineId, { nodeId, deployMethod });
+      });
+    };
+  });
   body.querySelectorAll('[data-svc-deploy-log]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
@@ -664,6 +678,15 @@ function renderRow(s) {
     ? `<tf-chip status="warn" ${restartTitle}>${restartCount}</tf-chip>`
     : '<span style="color:var(--text-3);">0</span>';
 
+  // update_available (snake_case z protokolu binarnego) = zdeployowany bundle
+  // rozni sie od aktualnego zrodla w binarce, wiec serwis trzeba wdrozyc ponownie.
+  const updateAvailable = !!s.update_available;
+  const updateBadge = updateAvailable
+    ? `<tf-chip status="warn" icon="alert"
+          style="margin-top:4px;"
+          title="${escapeAttr(I18n.t('services.update_available_tooltip'))}">${escapeHtml(I18n.t('services.update_available'))}</tf-chip>`
+    : '';
+
   const displayName = s.display_name || s.engine_id || '';
   const engineLabel = s.engine_id || '';
   const category = s.category || '';
@@ -698,6 +721,16 @@ function renderRow(s) {
   const svcNodeLabel = escapeAttr(nodeInfo.label);
   const rowKey = escapeAttr(`svc-${serviceNodeId || 'unknown'}-${s.id}`);
   const svcActionKey = escapeAttr(`${serviceNodeId || 'unknown'}:${s.id}`);
+  // Akcja redeploy widoczna tylko gdy zrodlo bundla sie zmienilo — otwiera ten
+  // sam kreator wdrozenia co katalog, dla danego silnika i wezla.
+  const redeployAction = updateAvailable
+    ? `<tf-button variant="ghost" size="sm" icon="rotate"
+          data-svc-redeploy="${svcId}"
+          data-svc-engine="${escapeAttr(s.engine_id || '')}"
+          data-svc-method="${escapeAttr(s.deploy_method || '')}"
+          data-svc-node="${svcNodeId}"
+          title="${escapeAttr(I18n.t('services.btn_redeploy'))}"></tf-button>`
+    : '';
   const deployId = s.active_deploy_id || s.activeDeployId || s.last_deploy_id || s.lastDeployId || '';
   const deployAction = deployId
     ? `<tf-button variant="ghost" size="sm" icon="terminal"
@@ -721,6 +754,7 @@ function renderRow(s) {
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
         <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
+        ${updateBadge}
         ${progressBadge}
         ${deployProgress}
       </td>
@@ -749,6 +783,7 @@ function renderRow(s) {
           data-svc-engine="${escapeAttr(s.engine_id || '')}"
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(I18n.t('services.btn_edit') || 'Edit')}"></tf-button>
+        ${redeployAction}
         ${deployAction}
         <tf-button variant="danger" size="sm" icon="trash"
           data-svc-delete="${svcId}"

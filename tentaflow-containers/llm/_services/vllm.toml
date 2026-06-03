@@ -40,3 +40,18 @@ recommended = true
 id = "llama-3-1-8b-instruct"
 display_name = "Llama 3.1 8B Instruct"
 repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+# Bielik PL Minitron 7B NVFP4 + draft 1.5B — gotowy, prekonfigurowany bloczek
+# (TentaFlow). `featured` = wlasny kafelek w katalogu; speculative (draft_model)
+# wlacza sie automatycznie dla featured blokow, wiec deploy jest turnkey
+# (vLLM + NVFP4 + draft, bez konfiguracji w kreatorze). NVFP4 dziala na kazdej
+# karcie NVIDIA — HW-accelerated na Blackwell, software-dequant na starszych.
+[[model_preset]]
+id = "bielik-pl-minitron-7b-nvfp4"
+display_name = "Bielik PL Minitron 7B (NVFP4 + draft 1.5B)"
+repo = "TentaFlow/Bielik-PL-Minitron-7B-NVFP4"
+quantization = "nvfp4"
+speculator_repo = "TentaFlow/Bielik-1.5B-NVFP4"
+speculator_method = "draft_model"
+speculator_num_tokens = 3
+featured = true

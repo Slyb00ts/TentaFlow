@@ -229,6 +229,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
                     finish_reason: "error".into(),
                     error: Some("bad request body".into()),
+                    text: None,
                 })),
             );
             return;
@@ -238,6 +239,26 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
     let router = ctx.state.router.clone();
     let correlation_id = ctx.correlation_id;
 
+    // Rozwiazanie jezyka TTS per-request, w kolejnosci priorytetow:
+    //  1. jawny `language` z requestu klienta,
+    //  2. preferowany jezyk zalogowanego usera (ustawienie programu),
+    //  3. (gdy oba puste) jezyk wykryty przez STT w samym flow,
+    //  4. fallback po stronie silnika TTS.
+    // Kroki 1-2 rozstrzygamy tutaj. Gdy oba sa puste zostawiamy `None`, by nie
+    // nadpisac jezyka wykrytego przez STT (krok 3) sztywnym fallbackiem.
+    let resolved_language = match invoke.language.clone() {
+        Some(lang) => Some(lang),
+        None => match &ctx.session {
+            SessionAuth::UserSession { user_id, .. } => {
+                let uid = super::handlers::user_id_to_uuid(user_id);
+                crate::db::repository::get_user_preferred_language(&ctx.state.db, &uid)
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        },
+    };
+
     tokio::spawn(async move {
         let Some(fd) = router.flow_dispatcher().cloned() else {
             let _ = push_end(
@@ -245,6 +266,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
                     finish_reason: "error".into(),
                     error: Some("flow dispatcher unavailable".into()),
+                    text: None,
                 })),
             );
             return;
@@ -252,7 +274,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
         let blobs = fd.blobs();
         let envelope =
-            match flow_envelope_from_inputs(invoke.inputs, invoke.language.clone(), &blobs).await {
+            match flow_envelope_from_inputs(invoke.inputs, resolved_language, &blobs).await {
                 Ok(e) => e,
                 Err(e) => {
                     let _ = push_end(
@@ -260,6 +282,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                         Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
                             finish_reason: "error".into(),
                             error: Some(format!("input build failed: {e}")),
+                            text: None,
                         })),
                     );
                     return;
@@ -288,6 +311,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                     Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
                         finish_reason: "error".into(),
                         error: Some(format!("dispatch failed: {e}")),
+                        text: None,
                     })),
                 );
                 return;
@@ -295,12 +319,16 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         };
 
         let mut stream = exec.stream;
+        // Akumulujemy pelny tekst po stronie serwera (autorytatywne zrodlo) — delty
+        // streamu moga zostac uciete u klienta gdy audio leci dluzej niz tekst.
+        let mut full_text = String::new();
         while let Some(item) = stream.next().await {
             let chunk = match item {
                 Ok(EnvelopeDelta::Llm(c)) => {
                     if c.text_delta.is_empty() {
                         continue;
                     }
+                    full_text.push_str(&c.text_delta);
                     FlowInvokeChunk::Text {
                         choice_index: c.choice_index,
                         delta: c.text_delta,
@@ -323,6 +351,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                         Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
                             finish_reason: "error".into(),
                             error: Some(format!("stream error: {e}")),
+                            text: None,
                         })),
                     )
                     .await;
@@ -351,6 +380,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
                 finish_reason,
                 error,
+                text: Some(full_text),
             })),
         )
         .await;

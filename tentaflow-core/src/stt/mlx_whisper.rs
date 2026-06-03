@@ -19,7 +19,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use libloading::{Library, Symbol};
+use libloading::Library;
+#[cfg(not(target_os = "ios"))]
+use libloading::Symbol;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -31,6 +33,7 @@ use super::{
 // FFI kontrakt — odpowiada @_cdecl symbolom w WhisperEngine.swift
 // =============================================================================
 
+#[cfg(not(target_os = "ios"))]
 type GetContextFn = unsafe extern "C" fn() -> *mut c_void;
 type LoadModelFn = unsafe extern "C" fn(*const c_char, *mut c_void) -> i32;
 type UnloadModelFn = unsafe extern "C" fn(*mut c_void);
@@ -52,7 +55,10 @@ extern "C" {
 /// (Copy) zamiast `Symbol<'static, _>`, zeby mozna bylo skopiowac do
 /// `spawn_blocking` bez `move out of shared reference`.
 struct Bridge {
-    _lib: &'static Library,
+    // macOS trzyma `Library` zywa (dlopen libMLXBridge.dylib). iOS nie ma
+    // dylib — Swift (WhisperEngine.swift) rejestruje wskazniki + context przy
+    // starcie (tentaflow_register_whisper), wiec tam _lib = None.
+    _lib: Option<&'static Library>,
     load_fn: LoadModelFn,
     unload_fn: UnloadModelFn,
     transcribe_fn: TranscribeFn,
@@ -97,8 +103,13 @@ fn tokenizer_repo_for(mlx_model_id: &str) -> &'static str {
 /// `tokenizer_repo_for`).
 ///
 /// Zwraca sciezke do scalonego katalogu, ktora mozna podac do `MLXWhisper_loadModel`.
-pub async fn prepare_model(mlx_repo_id: &str) -> Result<PathBuf> {
-    use hf_hub::api::sync::Api;
+/// `log_sink` (opcjonalny) raportuje postep pobierania do okienka deploy.
+pub async fn prepare_model(
+    mlx_repo_id: &str,
+    log_sink: Option<&crate::services::deploy::LogSink>,
+) -> Result<PathBuf> {
+    use crate::services::model_download::download_with_progress;
+
     let target = mlx_whisper_cache_dir().join(
         mlx_repo_id
             .replace('/', "_")
@@ -122,74 +133,87 @@ pub async fn prepare_model(mlx_repo_id: &str) -> Result<PathBuf> {
         return Ok(target);
     }
 
-    let mlx_id = mlx_repo_id.to_string();
-    let oai_id = tokenizer_repo_for(mlx_repo_id).to_string();
-    let target_clone = target.clone();
+    let oai_id = tokenizer_repo_for(mlx_repo_id);
     info!(
         "[mlx-whisper] pobieranie {} + tokenizer z {}",
-        mlx_id, oai_id
+        mlx_repo_id, oai_id
     );
+    if let Some(sink) = log_sink {
+        sink.phase(
+            "downloading-stt",
+            &format!("Pobieram {} …", mlx_repo_id),
+        );
+    }
 
-    let result = tokio::task::spawn_blocking(move || -> Result<()> {
-        let api = Api::new().context("hf-hub Api::new")?;
+    // Pliki MLX (wymagane) — blad propaguje. Tokenizer (opcjonalny) — brak/404
+    // ignorujemy, bo nie kazde repo zawiera wszystkie pliki tokenizera.
+    let mlx_files = ["config.json", "model.safetensors"];
+    let oai_files = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "added_tokens.json",
+        "special_tokens_map.json",
+        "generation_config.json",
+        "vocab.json",
+        "merges.txt",
+        "normalizer.json",
+    ];
 
-        // Lista plikow do pobrania z kazdego repo. Tokeny + JSON-y maja staly
-        // zestaw nazw — jezeli ktores nie istnieje, ignorujemy (nie wszystkie
-        // repo zawieraja `added_tokens.json`).
-        let mlx_files = ["config.json", "model.safetensors"];
-        let oai_files = [
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "added_tokens.json",
-            "special_tokens_map.json",
-            "generation_config.json",
-            "vocab.json",
-            "merges.txt",
-            "normalizer.json",
-        ];
+    for f in mlx_files.iter() {
+        let url = format!("https://huggingface.co/{}/resolve/main/{}", mlx_repo_id, f);
+        let dst = target.join(f);
+        download_with_progress(&url, &dst, f, progress_for_sink(log_sink, f))
+            .await
+            .with_context(|| format!("download {}/{}", mlx_repo_id, f))?;
+    }
 
-        let mlx_repo = api.model(mlx_id.clone());
-        for f in mlx_files.iter() {
-            let src = mlx_repo
-                .get(f)
-                .with_context(|| format!("download {}/{}", mlx_id, f))?;
-            let dst = target_clone.join(f);
-            std::fs::copy(&src, &dst)
-                .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-        }
-
-        let oai_repo = api.model(oai_id.clone());
-        for f in oai_files.iter() {
-            // Tokenizer files — niektore opcjonalne. Brak nie jest bledem.
-            let src = match oai_repo.get(f) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let dst = target_clone.join(f);
-            std::fs::copy(&src, &dst).with_context(|| {
-                format!("copy tokenizer {} -> {}", src.display(), dst.display())
-            })?;
-        }
-        Ok(())
-    })
-    .await
-    .context("blocking task panic")?;
-    result?;
+    for f in oai_files.iter() {
+        let url = format!("https://huggingface.co/{}/resolve/main/{}", oai_id, f);
+        let dst = target.join(f);
+        let _ = download_with_progress(&url, &dst, f, progress_for_sink(log_sink, f)).await;
+    }
 
     info!("[mlx-whisper] gotowy: {}", target.display());
     Ok(target)
 }
 
+/// Buduje progress callback emitujacy do `LogSink::progress` w fazie
+/// `downloading-stt`. Kazdy plik potrzebuje swiezego `ProgressFn`, bo
+/// `download_with_progress` konsumuje go przez wartosc.
+fn progress_for_sink(
+    log_sink: Option<&crate::services::deploy::LogSink>,
+    label: &str,
+) -> Option<crate::services::model_download::ProgressFn> {
+    let sink = log_sink.cloned()?;
+    let label = label.to_string();
+    Some(Box::new(move |downloaded: u64, total: u64, _l: &str| {
+        let pct: u8 = if total > 0 {
+            (((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)) as u8
+        } else {
+            0
+        };
+        let line = if total > 0 {
+            format!("{}: {}/{} KB ({}%)", label, downloaded / 1024, total / 1024, pct)
+        } else {
+            format!("{}: {} KB", label, downloaded / 1024)
+        };
+        sink.progress("downloading-stt", pct, &line);
+    }))
+}
+
 // Helpery `locate_dylib` + `ensure_metallib_next_to` zostaly przeniesione do
 // `crate::macos_ffi` zeby mogly z nich korzystac inne moduly Apple-specific
 // (apple_tts, mlx_kokoro). Lokalne fn ponizej deleguja do wspoldzielonego.
+#[cfg(not(target_os = "ios"))]
 fn locate_dylib() -> Option<PathBuf> {
     crate::macos_ffi::locate_mlx_bridge_dylib()
 }
+#[cfg(not(target_os = "ios"))]
 fn ensure_metallib_next_to(dylib: &std::path::Path) {
     crate::macos_ffi::ensure_mlx_metallib_next_to(dylib)
 }
 
+#[cfg(not(target_os = "ios"))]
 fn open_bridge() -> Result<Bridge> {
     let path = locate_dylib().context(
         "Nie znaleziono libMLXBridge.dylib — zbuduj projekt cargo build (build.rs odpala swift build)",
@@ -227,12 +251,66 @@ fn open_bridge() -> Result<Bridge> {
     // Symbol -> raw fn pointer. Symbol referencuje `_lib` (`'static`), wiec
     // pointer pozostaje wazny do konca procesu.
     Ok(Bridge {
-        _lib: lib,
+        _lib: Some(lib),
         load_fn: *load_fn,
         unload_fn: *unload_fn,
         transcribe_fn: *transcribe_fn,
         context,
     })
+}
+
+// iOS: brak libMLXBridge.dylib. WhisperEngine.swift (MLX) jest wkompilowany w
+// apke i przy starcie rejestruje wskazniki + context przez
+// tentaflow_register_whisper. Mirror tentaflow_register_kokoro / _apple_tts.
+#[cfg(target_os = "ios")]
+fn open_bridge() -> Result<Bridge> {
+    let reg = WHISPER_REG.get().context(
+        "MLX Whisper nie zarejestrowany ze Swift — tentaflow_register_whisper \
+         nie zostalo wywolane przy starcie aplikacji",
+    )?;
+    Ok(Bridge {
+        _lib: None,
+        load_fn: reg.load_fn,
+        unload_fn: reg.unload_fn,
+        transcribe_fn: reg.transcribe_fn,
+        context: reg.context,
+    })
+}
+
+#[cfg(target_os = "ios")]
+struct WhisperRegistration {
+    load_fn: LoadModelFn,
+    unload_fn: UnloadModelFn,
+    transcribe_fn: TranscribeFn,
+    context: *mut c_void,
+}
+
+#[cfg(target_os = "ios")]
+unsafe impl Send for WhisperRegistration {}
+#[cfg(target_os = "ios")]
+unsafe impl Sync for WhisperRegistration {}
+
+#[cfg(target_os = "ios")]
+static WHISPER_REG: std::sync::OnceLock<WhisperRegistration> = std::sync::OnceLock::new();
+
+/// Rejestruje wskazniki MLX Whisper ze strony Swift (iOS). Swift sam tworzy
+/// context (MLXWhisperEngine.shared) i podaje go tutaj — odpowiednik
+/// `MLXWhisper_getContext` z dylib na macOS.
+#[cfg(target_os = "ios")]
+#[no_mangle]
+pub extern "C" fn tentaflow_register_whisper(
+    load_fn: LoadModelFn,
+    unload_fn: UnloadModelFn,
+    transcribe_fn: TranscribeFn,
+    context: *mut c_void,
+) {
+    let _ = WHISPER_REG.set(WhisperRegistration {
+        load_fn,
+        unload_fn,
+        transcribe_fn,
+        context,
+    });
+    tracing::info!("[mlx-whisper] Swift callbacks zarejestrowane");
 }
 
 // =============================================================================
@@ -291,7 +369,7 @@ impl SttEngine for MlxWhisperEngine {
                 .context("Sciezka modelu zawiera nieprawidlowe znaki UTF-8")?;
             if s.contains('/') && !s.starts_with('/') && !s.starts_with('.') {
                 info!("[mlx-whisper] traktuje '{}' jako HF repo_id", s);
-                prepare_model(s).await?
+                prepare_model(s, None).await?
             } else {
                 anyhow::bail!("Sciezka modelu nie istnieje: {}", s);
             }

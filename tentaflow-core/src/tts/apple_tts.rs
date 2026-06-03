@@ -12,7 +12,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use libloading::{Library, Symbol};
+use libloading::Library;
+#[cfg(target_os = "macos")]
+use libloading::Symbol;
 use tracing::info;
 
 use super::{SynthesizeParams, SynthesizeResult, TtsEngine, TtsModelInfo};
@@ -34,7 +36,10 @@ extern "C" {
 }
 
 struct Bridge {
-    _lib: &'static Library,
+    // macOS trzyma `Library` zywa przez caly czas (dlopen libMLXBridge.dylib).
+    // iOS nie ma dylib do dlopen — Swift rejestruje wskazniki funkcji przy
+    // starcie (tentaflow_register_apple_tts), wiec tam _lib = None.
+    _lib: Option<&'static Library>,
     list_voices: ListVoicesFn,
     synthesize: SynthesizeFn,
     free_buffer: FreeBufferFn,
@@ -43,6 +48,7 @@ struct Bridge {
 unsafe impl Send for Bridge {}
 unsafe impl Sync for Bridge {}
 
+#[cfg(target_os = "macos")]
 fn open_bridge() -> Result<Bridge> {
     let path = crate::macos_ffi::locate_mlx_bridge_dylib()
         .context("Nie znaleziono libMLXBridge.dylib (Apple TTS)")?;
@@ -65,11 +71,61 @@ fn open_bridge() -> Result<Bridge> {
         )
     };
     Ok(Bridge {
-        _lib: lib,
+        _lib: Some(lib),
         list_voices: *lv,
         synthesize: *syn,
         free_buffer: *fb,
     })
+}
+
+// iOS: brak libMLXBridge.dylib. Symbole AVSpeechSynthesizer sa wkompilowane w
+// binarke aplikacji (AppleTTSEngine.swift), a Swift przekazuje ich wskazniki
+// przez `tentaflow_register_apple_tts` przy starcie (AppDelegate).
+#[cfg(target_os = "ios")]
+fn open_bridge() -> Result<Bridge> {
+    let reg = APPLE_TTS_REG.get().context(
+        "Apple TTS nie zarejestrowany ze Swift — tentaflow_register_apple_tts \
+         nie zostalo wywolane przy starcie aplikacji",
+    )?;
+    Ok(Bridge {
+        _lib: None,
+        list_voices: reg.list_voices,
+        synthesize: reg.synthesize,
+        free_buffer: reg.free_buffer,
+    })
+}
+
+#[cfg(target_os = "ios")]
+struct AppleTtsRegistration {
+    list_voices: ListVoicesFn,
+    synthesize: SynthesizeFn,
+    free_buffer: FreeBufferFn,
+}
+
+#[cfg(target_os = "ios")]
+unsafe impl Send for AppleTtsRegistration {}
+#[cfg(target_os = "ios")]
+unsafe impl Sync for AppleTtsRegistration {}
+
+#[cfg(target_os = "ios")]
+static APPLE_TTS_REG: std::sync::OnceLock<AppleTtsRegistration> = std::sync::OnceLock::new();
+
+/// Rejestruje wskazniki cdecl Apple TTS ze strony Swift (iOS). Wywolywane raz
+/// z AppDelegate przed `tentaflow_mobile_start()`. Mirror
+/// `tentaflow_register_mlx_swift` dla LLM.
+#[cfg(target_os = "ios")]
+#[no_mangle]
+pub extern "C" fn tentaflow_register_apple_tts(
+    list_voices: ListVoicesFn,
+    synthesize: SynthesizeFn,
+    free_buffer: FreeBufferFn,
+) {
+    let _ = APPLE_TTS_REG.set(AppleTtsRegistration {
+        list_voices,
+        synthesize,
+        free_buffer,
+    });
+    tracing::info!("[apple-tts] Swift callbacks zarejestrowane");
 }
 
 pub struct AppleTtsEngine {

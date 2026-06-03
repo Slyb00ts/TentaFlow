@@ -19,7 +19,7 @@ platforms = ["linux", "windows"]
 transport = "sidecar-quic"
 
 [deploy.native]
-platforms = ["linux", "macos", "windows"]
+platforms = ["linux", "macos", "windows", "ios"]
 # Embedded: sherpa-onnx C++ + onnxruntime wkompilowany do binarki tentaflow
 # przez crate `sherpa-rs` (Rust bindings do sherpa-onnx). Cargo feature
 # `inference-sherpa` musi byc wlaczone przy buildzie. Dziala na wszystkich

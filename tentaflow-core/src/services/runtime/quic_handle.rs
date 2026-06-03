@@ -820,6 +820,7 @@ mod snapshot_helpers_tests {
             extra_config,
             progress_message: None,
             health_last_err: None,
+            deployed_source_hash: String::new(),
         }
     }
 
@@ -943,6 +944,7 @@ mod snapshot_helpers_tests {
                     quantization: None,
                     is_default: true,
                 }],
+                update_available: false,
                 created_at: "2026-01-01 00:00:00".into(),
                 updated_at: "2026-01-01 00:00:00".into(),
                 request_time_parameters: Default::default(),
@@ -1010,6 +1012,7 @@ mod snapshot_helpers_tests {
                     quantization: None,
                     is_default: true,
                 }],
+                update_available: false,
                 created_at: "2026-01-01 00:00:00".into(),
                 updated_at: "2026-01-01 00:00:00".into(),
                 request_time_parameters: Default::default(),

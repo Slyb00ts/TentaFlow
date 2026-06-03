@@ -559,9 +559,16 @@ require_full_xcode() {
         return
     fi
 
+    # `|| true` chroni przed pipefail — gdy xcodebuild -version padnie
+    # (np. nieakceptowana licencja albo brak iOS SDK), `set -e` cicho wybijal
+    # caly setup.sh w tym miejscu bez zadnego komunikatu dla uzytkownika.
     local xcv
-    xcv=$(xcodebuild -version 2>/dev/null | head -1)
-    log_ok "Xcode: $xcv"
+    xcv=$(xcodebuild -version 2>/dev/null | head -1 || true)
+    if [[ -n "$xcv" ]]; then
+        log_ok "Xcode: $xcv"
+    else
+        log_warn "xcodebuild dostepny, ale -version padlo. Sprawdz licencje: sudo xcodebuild -license"
+    fi
 }
 
 # --- Metal Toolchain (macOS only) ---
@@ -649,7 +656,7 @@ install_ios_platform() {
     # numer wersji clang sie zmienia, wiec find/glob.
     local rt_lib
     rt_lib=$(find "$xcode_dev/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang" \
-        -name "libclang_rt.ios.a" 2>/dev/null | head -n1)
+        -name "libclang_rt.ios.a" 2>/dev/null | head -n1 || true)
 
     if [[ -n "$rt_lib" ]] && xcrun --show-sdk-path --sdk iphoneos &>/dev/null; then
         log_ok "iOS Platform juz zainstalowana"
@@ -671,6 +678,94 @@ install_ios_platform() {
         log_warn "Nie udalo sie pobrac iOS Platform."
         log_warn "Uruchom recznie: xcodebuild -downloadPlatform iOS"
     fi
+}
+
+# --- GStreamer iOS xcframework (macOS only) ---
+
+# Apka iOS linkuje sie z combined libGStreamer.a (camera feature w
+# tentaflow-core). Upstream dystrybuuje gotowy xcframework jako tar.xz —
+# pobieramy do repo-local Frameworks/ (gitignored) i generujemy syntetyczny
+# pkg-config zeby gstreamer-rs/cargo dla aarch64-apple-ios mogl linkowac.
+install_ios_gstreamer_xcframework() {
+    if [[ "$DISTRO" != "macos" ]]; then
+        return
+    fi
+
+    log_section "GStreamer iOS xcframework (camera feature)"
+
+    local gst_version="1.28.3"
+    local archive_url="https://gstreamer.freedesktop.org/data/pkg/ios/${gst_version}/gstreamer-${gst_version}-xcframework.tar.xz"
+    local repo_root
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local target_dir="$repo_root/tentaflow-mobile/ios/Frameworks"
+    local xcframework_dir="$target_dir/GStreamer.xcframework"
+    local pkgconfig_dir="$target_dir/pkgconfig"
+    local marker="$xcframework_dir/ios-arm64/libGStreamer.a"
+
+    if [[ -f "$marker" ]]; then
+        log_ok "GStreamer iOS xcframework juz pobrany: $xcframework_dir"
+    else
+        log_info "Pobieranie GStreamer iOS xcframework ${gst_version} (~600 MB)..."
+        mkdir -p "$target_dir"
+        local tmp_archive
+        tmp_archive="$(mktemp -t gstios.XXXXXX).tar.xz"
+        if ! curl -fL --progress-bar -o "$tmp_archive" "$archive_url"; then
+            log_error "Nie udalo sie pobrac $archive_url"
+            rm -f "$tmp_archive"
+            return 1
+        fi
+        log_info "Wypakowuje xcframework (moze potrwac, archiwum waży kilkaset MB)..."
+        rm -rf "$xcframework_dir"
+        if ! tar -xJf "$tmp_archive" -C "$target_dir"; then
+            log_error "Nie udalo sie wypakowac $tmp_archive"
+            rm -f "$tmp_archive"
+            return 1
+        fi
+        rm -f "$tmp_archive"
+        if [[ ! -f "$marker" ]]; then
+            log_error "Po wypakowaniu brakuje $marker — sprawdz strukture archiwum"
+            return 1
+        fi
+        log_ok "GStreamer iOS xcframework zainstalowany"
+        INSTALLED+=("GStreamer iOS xcframework $gst_version")
+    fi
+
+    # Syntetyczne pkg-config wskazujace na repo-local xcframework. Wszystkie
+    # moduly glib/gstreamer maja ten sam combined .a — kazdy .pc rozni sie
+    # tylko nazwa i wersja. gstreamer-rs build script wola pkg-config dla
+    # konkretnych modulow podczas linkowania aarch64-apple-ios.
+    mkdir -p "$pkgconfig_dir"
+    local headers="$xcframework_dir/ios-arm64/Headers"
+    local libdir="$xcframework_dir/ios-arm64"
+    local glib_version="2.84.0"
+
+    local pc_entries=(
+        "glib-2.0:$glib_version"
+        "gobject-2.0:$glib_version"
+        "gmodule-2.0:$glib_version"
+        "gmodule-no-export-2.0:$glib_version"
+        "gio-2.0:$glib_version"
+        "gstreamer-1.0:$gst_version"
+        "gstreamer-app-1.0:$gst_version"
+        "gstreamer-audio-1.0:$gst_version"
+        "gstreamer-base-1.0:$gst_version"
+        "gstreamer-pbutils-1.0:$gst_version"
+    )
+
+    local entry name ver
+    for entry in "${pc_entries[@]}"; do
+        name="${entry%:*}"
+        ver="${entry##*:}"
+        cat > "$pkgconfig_dir/${name}.pc" <<EOF
+prefix=$libdir
+Name: $name
+Description: GStreamer iOS xcframework (synthetic pc -> combined libGStreamer.a)
+Version: $ver
+Cflags: -I$headers
+Libs: -L$libdir -lGStreamer
+EOF
+    done
+    log_ok "pkg-config dla iOS xcframework: $pkgconfig_dir"
 }
 
 # --- CUDA ---
@@ -1141,8 +1236,10 @@ main() {
     echo -e "${BOLD}Instalator zaleznosci${NC}"
     echo ""
 
-    check_sudo
+    # detect_distro MUSI byc przed check_sudo — inaczej $DISTRO jest pusty
+    # i check_sudo wchodzi w branch sudo nawet na macOS (gdzie uzywamy brew).
     detect_distro
+    check_sudo
 
     # Silero VAD dla teams-bot (Docker COPY w Dockerfile + native build.sh
     # fallback download). Vision i audio (silero/wespeaker) modele aplikacji
@@ -1158,6 +1255,7 @@ main() {
     require_full_xcode
     install_metal_toolchain
     install_ios_platform
+    install_ios_gstreamer_xcframework
 
     if [[ "$INSTALL_CUDA" == true ]]; then
         install_cuda
@@ -1175,4 +1273,8 @@ main() {
     print_summary
 }
 
-main
+# Auto-run main tylko gdy skrypt jest wywolany bezposrednio (./setup.sh).
+# Gdy source'owany z innego skryptu/sesji — udostepnia funkcje bez efektu ubocznego.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
