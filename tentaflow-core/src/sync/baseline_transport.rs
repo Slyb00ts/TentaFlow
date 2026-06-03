@@ -499,3 +499,6 @@ pub fn pending_joiner_resume(db: &DbPool) -> LedgerResult<Option<(String, u64)>>
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod e2e_tests;
