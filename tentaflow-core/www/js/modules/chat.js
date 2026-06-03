@@ -523,7 +523,9 @@ function renderRail() {
       ? I18n.t('chat.you')
       : (m.modelLabel || I18n.t('chat.assistant'));
     const time = formatBubbleTime(m.ts);
-    const preview = extractPlainText(m.text || '').slice(0, 200);
+    // Pelny tekst w railu prawego panelu — wczesniejszy slice(0,200) ucinal
+    // dlugie odpowiedzi (audio czytalo calosc, a panel pokazywal tylko 200 zn.).
+    const preview = extractPlainText(m.text || '');
     return `
       <div class="rail-msg ${cls}">
         <div class="who">${escapeHtml(who)} · ${escapeHtml(time)}</div>
