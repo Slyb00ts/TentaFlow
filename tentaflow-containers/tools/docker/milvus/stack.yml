@@ -1,0 +1,91 @@
+# =============================================================================
+# File: stack.yml
+# Description: Milvus standalone stack (etcd + minio + milvus) for TentaFlow.
+# Deploy it when an admin wants the external `milvus` vector backend instead of
+# the embedded zvec default. Mirrors the official Milvus standalone compose,
+# pinned to 2.5.x (required for sparse vectors + online add-field used by the
+# hybrid search and schema reconciliation paths).
+#
+# MULTI-INSTANCE BY DESIGN: TentaFlow launches each deploy as its own compose
+# PROJECT (`docker compose -p tentaflow-milvus-<port> ...`). Nothing here is
+# hard-named — no `container_name`, no explicit volume `name:` — so compose
+# prefixes every container, volume and network with the project name. That means
+# N independent Milvus instances coexist on one host, each with its OWN data
+# volumes (no sharing/mixing). The only host-exposed port is the gRPC API, taken
+# from `MILVUS_GRPC_PORT` (TentaFlow allocates a free one per deploy); minio and
+# the health port stay internal to each project's network.
+#
+# Manual run (single instance): MILVUS_GRPC_PORT=19530 docker compose -f stack.yml up -d --wait
+# =============================================================================
+
+services:
+
+  # Metadata store for Milvus (collections, segments, channels).
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.16
+    restart: unless-stopped
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd-data:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Object storage for vector/index data (S3-compatible). Internal to the
+  # project network only — no host port binding (avoids cross-instance clashes).
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    restart: unless-stopped
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - minio-data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # The Milvus standalone server — the only host-exposed surface (gRPC). The
+  # health port (9091) stays internal; the container healthcheck below probes it
+  # on localhost inside the container, so `--wait` still gates readiness.
+  milvus:
+    image: milvusdb/milvus:v2.5.4
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus-data:/var/lib/milvus
+    ports:
+      - "${MILVUS_GRPC_PORT:-19530}:19530"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+# No explicit `name:` — compose prefixes these with the project name, so each
+# deployed instance keeps its data in its own volumes (no cross-instance mixing).
+volumes:
+  etcd-data:
+  minio-data:
+  milvus-data:

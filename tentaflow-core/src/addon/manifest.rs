@@ -292,6 +292,28 @@ pub struct VectorNamespaceSpec {
     /// Opcjonalny gate ograniczajacy uzycie namespace (np. d4-historical dla "faces").
     #[serde(default)]
     pub gate: Option<String>,
+    /// Zadeklarowane pola metadanych (kolumny typowane), filtrowalne. Core tworzy
+    /// na ich podstawie schemat kolekcji w zvec/Milvus. Pusta lista = brak metadanych.
+    #[serde(default)]
+    pub fields: Vec<VectorFieldSpec>,
+    /// Czy namespace przechowuje tez wektor sparse (do wyszukiwania hybrydowego
+    /// dense+sparse). Domyslnie false. Gdy true, kolekcja dostaje dodatkowe pole
+    /// sparse, a addon moze uzywac vector_hybrid_search.
+    #[serde(default)]
+    pub sparse: bool,
+}
+
+/// Deklaracja pola metadanych w `[[vector_namespace]].fields`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorFieldSpec {
+    /// Nazwa pola (identyfikator: `[a-zA-Z_][a-zA-Z0-9_]*`).
+    pub name: String,
+    /// Typ: "str" | "int" | "float" | "bool".
+    #[serde(rename = "type")]
+    pub field_type: String,
+    /// Czy budowac indeks skalarny (do filtrowania). Domyslnie false.
+    #[serde(default)]
+    pub indexed: bool,
 }
 
 // =============================================================================

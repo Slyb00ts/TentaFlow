@@ -557,7 +557,30 @@ pub async fn stop(
     // deterministic name pattern used at create time (see DockerDeploy::run).
     #[cfg(feature = "docker")]
     if svc.deploy_method == DM::Docker {
-        if let (Ok(docker), Some(port)) = (
+        // Compose stacks (infra like Milvus / iroh-relay) are torn down as a
+        // whole project, not a single named container.
+        let is_compose = crate::services::manifest::registry()
+            .by_id(&svc.engine_id)
+            .and_then(|m| m.deploy.docker.as_ref())
+            .map(|d| d.compose_path.is_some() && d.context_path.is_none())
+            .unwrap_or(false);
+        if is_compose {
+            // Per-instance project name (engine + host port), matching
+            // prepare_compose, so the right stack is torn down. `down` (no `-v`)
+            // removes the containers but keeps the project's named volumes, so a
+            // later restart preserves data — same contract as the single-container
+            // path which leaves Docker volumes intact.
+            if let Some(port) = svc.runtime_port {
+                let project = docker::compose_project_name(&svc.engine_id, port);
+                let _ = tokio::process::Command::new("docker")
+                    .arg("compose")
+                    .arg("-p")
+                    .arg(&project)
+                    .arg("down")
+                    .output()
+                    .await;
+            }
+        } else if let (Ok(docker), Some(port)) = (
             bollard::Docker::connect_with_local_defaults(),
             svc.runtime_port,
         ) {
@@ -739,12 +762,12 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         deploy_method: prepared.deploy_method,
         transport: prepared.transport,
         status,
-        // Domyslnie pinned: po Ctrl+C tentaflow stop_all_supervised terminuje
-        // procesy (zwalnia VRAM/porty), a przy starcie supervisor.first_tick
-        // → auto_start_pinned respawnuje serwis. Bez pin user musialby recznie
-        // klikac Start po kazdym restarcie. Odpinanie zostaje pod kontrola
-        // usera (przycisk pin w GUI).
-        pinned: true,
+        // Domyslnie pinned na desktop/serwerze: po Ctrl+C stop_all_supervised
+        // terminuje procesy (zwalnia VRAM/porty), a przy starcie
+        // supervisor.first_tick → auto_start_pinned respawnuje serwis. Na mobile
+        // domyslnie UNPINNED (lazy load + memory guard) — patrz default_pinned().
+        // Odpinanie/przypinanie zostaje pod kontrola usera (przycisk pin w GUI).
+        pinned: default_pinned(),
         paused: false,
         runtime_pid: prepared.runtime.pid,
         runtime_port: prepared.runtime.port,
@@ -756,6 +779,20 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         deployment_progress_pct: if status == ServiceStatus::Running { 100 } else { 0 },
         deployed_source_hash,
     }
+}
+
+/// Domyslny `pinned` przy deployu zalezny od platformy.
+///
+/// Mobile (iOS/Android) → `false`: pamiec aplikacji jest ograniczona, wiec
+/// modele domyslnie sa UNPINNED — przygotowane (pobrane, routowalne) ale NIE
+/// ladowane przy boocie. Laduja sie leniwie na pierwsze zadanie, a memory guard
+/// zwalnia je gdy idle / przy wymianie (supervisor boot = pinned-only +
+/// eviction single-resident). User moze recznie przypiac.
+///
+/// Pozostale nody → `true`: zachowanie jak dotad (boot-load + rezydentnie).
+/// Lazy loading dziala tam tez, ale wlaczany recznie przez odpiecie serwisu.
+pub(crate) fn default_pinned() -> bool {
+    !cfg!(any(target_os = "ios", target_os = "android"))
 }
 
 fn build_placeholder_service(
@@ -771,7 +808,7 @@ fn build_placeholder_service(
         deploy_method: method,
         transport: placeholder_transport(method),
         status: ServiceStatus::Deploying,
-        pinned: true,
+        pinned: default_pinned(),
         paused: false,
         runtime_pid: None,
         runtime_port: None,
@@ -1052,6 +1089,49 @@ pub(crate) fn resolve_selected_preset<'a>(
             .find(|p| p.recommended)
             .unwrap_or(&manifest.model_presets[0]),
     )
+}
+
+/// Resolves the name the service advertises for its default model — the same
+/// value `models_from_manifest` writes as `model_name` and the executor
+/// rewrites `request.model` to before dispatch. For OpenAI-compatible HTTP
+/// engines (vLLM) this MUST be passed to the backend as `--served-model-name`,
+/// otherwise vLLM serves the model under its repo path (`--model ${MODEL}`)
+/// while we route by the preset id slug — a guaranteed 404 whenever
+/// `preset.id != preset.repo`. Selection mirrors `resolve_model_repo`:
+///   1. custom `model_repo` → the repo (model_name == repo in that path).
+///   2. `model_preset_id` → `preset.id`.
+///   3. recommended (or first) preset → `preset.id`.
+pub(crate) fn resolve_served_model_name(
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+) -> Option<String> {
+    if let Some(repo) = user_config
+        .get("model_repo")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(repo.to_string());
+    }
+    if let Some(id) = user_config
+        .get("model_preset_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(p) = manifest.model_presets.iter().find(|m| m.id == id) {
+            return Some(p.id.clone());
+        }
+    }
+    if manifest.model_presets.is_empty() {
+        return None;
+    }
+    let chosen = manifest
+        .model_presets
+        .iter()
+        .find(|p| p.recommended)
+        .unwrap_or(&manifest.model_presets[0]);
+    Some(chosen.id.clone())
 }
 
 /// Maps a preset's `speculator_method` to the vLLM container's `VLLM_SPEC_METHOD`

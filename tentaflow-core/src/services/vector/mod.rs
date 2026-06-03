@@ -1,16 +1,24 @@
-// ============ File: services/vector/mod.rs — embedded HNSW vector storage (F1c P3) ============
+// ============ File: services/vector/mod.rs — embedded vector storage (zvec) ============
 //
-// Per-addon per-namespace vector indexes backed by usearch (HNSW + mmap on
-// disk). Addon-facing API is in `addon::host_functions::vector` (vector_*_v1).
-// This module owns the trait abstraction, the usearch implementation, the
-// (addon_id, namespace) -> Backend cache, and per-addon quotas.
+// Per-addon per-namespace vector indexes backed by the embedded zvec engine
+// (one zvec collection per namespace, persisted on disk). Addon-facing API is in
+// `addon::host_functions::vector` (vector_*_v1). This module owns the trait
+// abstraction, the zvec implementation, the (org, addon, namespace) -> Backend
+// cache, and per-addon quotas.
 
 pub mod backend;
 pub mod error;
+pub mod filter;
+#[cfg(feature = "vector-milvus")]
+pub mod milvus_backend;
 pub mod namespace;
-pub mod usearch_backend;
+pub mod zvec_backend;
 
 pub use backend::{Metric, SearchHit, VectorBackend};
 pub use error::{Result as VectorResult, VectorError};
-pub use namespace::{NamespaceManager, MAX_NAMESPACES_PER_ADDON, MAX_VECTORS_PER_ADDON};
-pub use usearch_backend::UsearchBackend;
+pub use namespace::{
+    NamespaceManager, ReconcileReport, MAX_NAMESPACES_PER_ADDON, MAX_VECTORS_PER_ADDON,
+};
+pub use zvec_backend::ZvecBackend;
+#[cfg(feature = "vector-milvus")]
+pub use milvus_backend::MilvusBackend;

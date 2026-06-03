@@ -507,6 +507,18 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
         print(f"  Zapisano adapter ({method})")
     tokenizer.save_pretrained(output_dir)
     save_fingerprint(output_dir, current_fp)
+
+    # Qwen3.5 to multimodalny Qwen3_5ForConditionalGeneration — pelny zapis
+    # zagniezdza dekoder tekstowy pod powtorzonymi `language_model.` i dolacza
+    # wieze wizyjna, czego tekstowe loadery/eksportery nie akceptuja. Dla full FT
+    # splaszczamy zapis w miejscu do plaskiego tekstowego CausalLM. (Adaptery
+    # splaszcza retrain.sh po merge.)
+    if method == "full":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from flatten_guard import flatten_checkpoint
+        flatten_checkpoint(output_dir)
+        print("  Splaszczono do plaskiego tekstowego CausalLM")
+
     print(f"Qwen trening zakonczony! (method={method})")
 
 

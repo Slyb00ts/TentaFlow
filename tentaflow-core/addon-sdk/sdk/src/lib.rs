@@ -292,6 +292,11 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    fn vector_hybrid_search_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     fn vector_delete_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
@@ -1589,7 +1594,9 @@ pub mod prelude {
         recording_save_snapshot, recording_save_segment, recording_get_url,
         recording_get_stream, recording_purge, recording_stats, frame_url,
         SavedRecordingInfo, RecordingUrl, RecordingStream, RecordingStats, FrameUrl,
-        vector_upsert, vector_search, vector_delete, encode_vector_b64, VectorHit,
+        vector_upsert, vector_upsert_sparse, vector_search, vector_hybrid_search, vector_delete,
+        encode_vector_b64, VectorHit,
+        VectorField, VectorFieldType, VectorFieldValue, VectorFilter, VectorFusion, SparseVector,
         web_research, web_search, web_read_url, web_read_search_results,
         WebSearchRequest, WebReadUrlRequest, WebReadSearchResultsRequest,
         gate_check, gate_check_scoped, GateCheckResult, GateSigner,
@@ -2495,13 +2502,24 @@ pub fn frame_url(frame_ref: &str, ttl_secs: u64) -> Result<FrameUrl, AbiError> {
 // Vector API wrappers (F1c P3) — embedded HNSW per-namespace storage
 // =============================================================================
 
+/// Backend-agnostic vector metadata + filter types, re-exported under `Vector*`
+/// names so addons build typed fields and filters "our way" without depending
+/// on `tentaflow-sdk-spec` directly. The core translates a [`VectorFilter`] to
+/// the selected backend (zvec / Milvus).
+pub use tentaflow_sdk_spec::{
+    Field as VectorField, FieldType as VectorFieldType, FieldValue as VectorFieldValue,
+    Filter as VectorFilter, Fusion as VectorFusion, SparseVector,
+};
+
 /// One hit returned by `vector_search`. `ref_id` is the key the addon supplied
 /// during `vector_upsert`; `score` is the raw metric distance (lower = closer
-/// for cosine/euclidean; `1 - dot` for dot).
-#[derive(Debug, Clone, Deserialize)]
+/// for cosine/euclidean; `1 - dot` for dot). `fields` carries the metadata
+/// values requested via `output_fields` (empty when none requested).
+#[derive(Debug, Clone)]
 pub struct VectorHit {
     pub ref_id: u64,
     pub score: f32,
+    pub fields: Vec<tentaflow_sdk_spec::Field>,
 }
 
 /// Encode a `&[f32]` slice as base64(little-endian f32 bytes) for the vector
@@ -2515,35 +2533,101 @@ pub fn encode_vector_b64(vector: &[f32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(&raw)
 }
 
-/// Insert or replace a vector under `ref_id` in `namespace`. Returns the
-/// total vector count after the upsert. Requires `vector.write` permission
-/// and the namespace must be declared in the addon manifest under
-/// `[[vector_namespace]]`.
-pub fn vector_upsert(namespace: &str, ref_id: u64, vector: &[f32]) -> Result<u64, AbiError> {
+/// Insert or replace a vector under `ref_id` in `namespace`, with optional
+/// typed metadata `fields`. Returns the total vector count after the upsert.
+/// Requires `vector.write` permission and the namespace must be declared in the
+/// addon manifest under `[[vector_namespace]]`; every field's name + type must
+/// match that namespace's declared `fields` schema. Pass `&[]` for no metadata.
+pub fn vector_upsert(
+    namespace: &str,
+    ref_id: u64,
+    vector: &[f32],
+    fields: &[tentaflow_sdk_spec::Field],
+) -> Result<u64, AbiError> {
+    vector_upsert_sparse(namespace, ref_id, vector, fields, None)
+}
+
+/// Like [`vector_upsert`] but also stores a sparse vector for hybrid search.
+/// Only valid when the namespace declares `sparse = true` in the manifest.
+pub fn vector_upsert_sparse(
+    namespace: &str,
+    ref_id: u64,
+    vector: &[f32],
+    fields: &[tentaflow_sdk_spec::Field],
+    sparse: Option<&SparseVector>,
+) -> Result<u64, AbiError> {
     let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorUpsertInput {
         namespace: namespace.to_string(),
         ref_id,
         vector_b64: encode_vector_b64(vector),
+        fields: (!fields.is_empty()).then(|| fields.to_vec()),
+        sparse: sparse.cloned(),
     })?;
     let bytes = call_sql_with_one_input(vector_upsert_v1, &payload)?;
     let resp: tentaflow_sdk_spec::VectorUpsertOutput = decode_cbor(&bytes)?;
     Ok(resp.count)
 }
 
+/// Hybrid dense + sparse k-NN over a namespace declared with `sparse = true`.
+/// `fusion = None` uses RRF (rank constant 60), the robust default for RAG.
+/// `filter` and `output_fields` behave as in [`vector_search`].
+#[allow(clippy::too_many_arguments)]
+pub fn vector_hybrid_search(
+    namespace: &str,
+    dense: &[f32],
+    sparse: &SparseVector,
+    k: u32,
+    gate_claim_id: Option<&str>,
+    filter: Option<&tentaflow_sdk_spec::Filter>,
+    output_fields: &[&str],
+    fusion: Option<VectorFusion>,
+) -> Result<Vec<VectorHit>, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorHybridSearchInput {
+        namespace: namespace.to_string(),
+        dense_b64: encode_vector_b64(dense),
+        sparse: sparse.clone(),
+        k,
+        gate_claim_id: gate_claim_id.map(str::to_string),
+        filter: filter.cloned(),
+        output_fields: (!output_fields.is_empty())
+            .then(|| output_fields.iter().map(|s| s.to_string()).collect()),
+        fusion,
+    })?;
+    let bytes = call_sql_with_one_input(vector_hybrid_search_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::VectorSearchOutput = decode_cbor(&bytes)?;
+    Ok(resp
+        .hits
+        .into_iter()
+        .map(|h| VectorHit {
+            ref_id: h.ref_id,
+            score: h.score,
+            fields: h.fields.unwrap_or_default(),
+        })
+        .collect())
+}
+
 /// Top-k k-NN search. Pass `gate_claim_id = Some(...)` when the namespace
 /// declares a `gate` in the manifest (P4 policy/claims engine validates the
-/// claim; P3 only enforces the structural presence).
+/// claim; P3 only enforces the structural presence). `filter` restricts results
+/// by metadata using the backend-agnostic [`tentaflow_sdk_spec::Filter`] AST
+/// (the core translates it to the selected backend); `output_fields` lists the
+/// declared metadata fields to return on each hit (empty = ref_id + score only).
 pub fn vector_search(
     namespace: &str,
     query: &[f32],
     k: u32,
     gate_claim_id: Option<&str>,
+    filter: Option<&tentaflow_sdk_spec::Filter>,
+    output_fields: &[&str],
 ) -> Result<Vec<VectorHit>, AbiError> {
     let payload = encode_cbor_input(&tentaflow_sdk_spec::VectorSearchInput {
         namespace: namespace.to_string(),
         query_b64: encode_vector_b64(query),
         k,
         gate_claim_id: gate_claim_id.map(str::to_string),
+        filter: filter.cloned(),
+        output_fields: (!output_fields.is_empty())
+            .then(|| output_fields.iter().map(|s| s.to_string()).collect()),
     })?;
     let bytes = call_sql_with_one_input(vector_search_v1, &payload)?;
     let resp: tentaflow_sdk_spec::VectorSearchOutput = decode_cbor(&bytes)?;
@@ -2553,6 +2637,7 @@ pub fn vector_search(
         .map(|h| VectorHit {
             ref_id: h.ref_id,
             score: h.score,
+            fields: h.fields.unwrap_or_default(),
         })
         .collect())
 }

@@ -2387,6 +2387,29 @@ pub struct DeployVllmRecommendResponse {
     pub at_limit: bool,
 }
 
+/// Ask the server which host port a fresh deploy would be assigned (the first
+/// free port in the services range, skipping leased / OS-bound / docker-bound
+/// ports). The deploy wizard pre-fills the editable port field with it.
+#[derive(
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct SuggestServicePortRequest {
+    /// Deploy method the wizard is targeting ("docker", "native", …) — purely
+    /// informational for now; the suggestion comes from the shared allocator.
+    pub deploy_method: String,
+}
+
+/// Response to [`SuggestServicePortRequest`]. `available = false` (port 0) when
+/// the whole range is exhausted. Advisory: the deploy re-allocates at commit, so
+/// the value can change if another deploy grabs it first.
+#[derive(
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct SuggestServicePortResponse {
+    pub port: u32,
+    pub available: bool,
+}
+
 /// Generyczne wywolanie auto-tunera dla dowolnego silnika z `[[parameter]]`
 /// schema w manifescie. Backend dispatchuje per `engine_id` (vllm/sglang/
 /// tensorrt-llm uzywaja `auto_fit_config` z mapowaniem do typed pol; inne
@@ -4234,6 +4257,8 @@ pub enum MessageBody {
     NimCatalogListResponseBody(NimCatalogListResponse),
     DeployVllmRecommendRequestBody(DeployVllmRecommendRequest),
     DeployVllmRecommendResponseBody(DeployVllmRecommendResponse),
+    SuggestServicePortRequestBody(SuggestServicePortRequest),
+    SuggestServicePortResponseBody(SuggestServicePortResponse),
     EngineRecommendRequestBody(EngineRecommendRequest),
     EngineRecommendResponseBody(EngineRecommendResponse),
     // ServiceManifestDeployRequest/Response przeniesione do DeploymentPayload

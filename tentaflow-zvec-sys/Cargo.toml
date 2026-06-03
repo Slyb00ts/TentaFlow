@@ -1,0 +1,10 @@
+[package]
+name = "tentaflow-zvec-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Raw FFI bindings to the zvec embedded vector database C API (single self-contained static archive per platform)."
+license = "Apache-2.0"
+links = "zvec_c_api"
+
+[build-dependencies]
+bindgen = "0.71"
