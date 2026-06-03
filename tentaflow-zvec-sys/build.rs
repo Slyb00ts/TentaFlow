@@ -88,12 +88,40 @@ fn main() {
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed=wrapper.h");
 
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", include.display()))
         .allowlist_function("zvec_.*")
         .allowlist_type("zvec_.*")
-        .allowlist_var("ZVEC_.*")
+        .allowlist_var("ZVEC_.*");
+
+    // Cross-compiling to iOS: bindgen domyslnie podaje clangowi rustowy triple
+    // (np. `aarch64-apple-ios-sim`), ktorego clang nie akceptuje ("version 'sim'
+    // is invalid"), a bez sysroota nie znajduje naglowkow systemowych (string.h).
+    // Podajemy clangowi poprawny triple + -isysroot wlasciwego SDK (xcrun), zeby
+    // FFI dla device i symulatora dzialalo niezaleznie od env z build-rust.sh.
+    if target.contains("apple-ios") {
+        let (sdk, clang_triple) = if target.contains("-sim") {
+            ("iphonesimulator", "arm64-apple-ios-simulator")
+        } else {
+            ("iphoneos", "arm64-apple-ios")
+        };
+        let out = std::process::Command::new("xcrun")
+            .args(["--sdk", sdk, "--show-sdk-path"])
+            .output()
+            .unwrap_or_else(|e| panic!("tentaflow-zvec-sys: xcrun --sdk {sdk} --show-sdk-path: {e}"));
+        if !out.status.success() {
+            panic!("tentaflow-zvec-sys: xcrun --sdk {sdk} --show-sdk-path failed");
+        }
+        let sdk_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        builder = builder
+            .clang_arg("-target")
+            .clang_arg(clang_triple)
+            .clang_arg("-isysroot")
+            .clang_arg(sdk_path);
+    }
+
+    let bindings = builder
         .generate()
         .expect("bindgen failed to generate zvec FFI bindings");
 

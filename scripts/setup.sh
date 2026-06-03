@@ -525,30 +525,34 @@ install_zvec() {
 
 # --- zvec dla iOS (statyczne archiwa do buildu tentaflow-mobile/ios) ---
 
-# Binarka tentaflow-mobile (aarch64-apple-ios) linkuje dwa statyczne archiwa zvec
-# (libzvec_c_api.a + libzvec_deps.a), bo appka iOS nie moze wozic luznego .dylib.
-# Cross-build leci na hoscie macOS przez Xcode SDK — patrz build-zvec.sh ios-arm64.
+# Binarka tentaflow-mobile linkuje dwa statyczne archiwa zvec (libzvec_c_api.a +
+# libzvec_deps.a), bo appka iOS nie moze wozic luznego .dylib. Vector jest
+# OBOWIAZKOWY (nie feature), wiec build.rs wymaga archiwum dla KAZDEGO targetu iOS,
+# ktory budujemy: device (ios-arm64) ORAZ symulator (ios-sim-arm64) — bez sim build
+# tentaflow-mobile na symulator panikuje w build.rs. Cross-build leci na hoscie
+# macOS przez odpowiednie SDK (iphoneos / iphonesimulator) — patrz build-zvec.sh.
 install_zvec_ios() {
     if [[ "$DISTRO" != "macos" ]]; then
         return
     fi
-    log_section "zvec dla iOS (ios-arm64)"
+    log_section "zvec dla iOS (device + symulator)"
 
-    local plat="ios-arm64"
-    local lib_dir="$(dirname "$0")/../tentaflow-zvec-sys/vendor/lib/$plat"
-    if [[ -f "$lib_dir/libzvec_c_api.a" && -f "$lib_dir/libzvec_deps.a" ]]; then
-        log_ok "zvec juz zbudowany ($plat) — pomijam"
-        return
-    fi
-
-    log_info "Buduje zvec ($plat) — cross-build na iOS SDK (RocksDB+Arrow+protoc), jednorazowo..."
     local build_sh="$(dirname "$0")/build-zvec.sh"
-    if bash "$build_sh" "$plat"; then
-        INSTALLED+=("zvec ($plat)")
-    else
-        log_error "Build zvec ($plat) nieudany — sprobuj recznie: ./scripts/build-zvec.sh $plat"
-        ZVEC_OK=false
-    fi
+    local plat
+    for plat in ios-arm64 ios-sim-arm64; do
+        local lib_dir="$(dirname "$0")/../tentaflow-zvec-sys/vendor/lib/$plat"
+        if [[ -f "$lib_dir/libzvec_c_api.a" && -f "$lib_dir/libzvec_deps.a" ]]; then
+            log_ok "zvec juz zbudowany ($plat) — pomijam"
+            continue
+        fi
+        log_info "Buduje zvec ($plat) — cross-build na iOS SDK (RocksDB+Arrow+protoc), jednorazowo..."
+        if bash "$build_sh" "$plat"; then
+            INSTALLED+=("zvec ($plat)")
+        else
+            log_error "Build zvec ($plat) nieudany — sprobuj recznie: ./scripts/build-zvec.sh $plat"
+            ZVEC_OK=false
+        fi
+    done
 }
 
 # --- Rust toolchain ---
@@ -1349,17 +1353,20 @@ verify_installation() {
         [[ "$DISTRO" != "macos" ]] && log_error "  (na Linux wymagany dzialajacy Docker — RocksDB buduje sie w kontenerze gcc-11)"
         ok=false
     fi
-    # zvec dla iOS — tentaflow-mobile/ios linkuje statyczne archiwa; bez nich
-    # build aarch64-apple-ios nie zlinkuje feature 'vector'.
+    # zvec dla iOS — tentaflow-mobile linkuje statyczne archiwa; vector jest
+    # obowiazkowy, wiec build.rs wymaga ich dla device ORAZ symulatora.
     if [[ "$DISTRO" == "macos" ]]; then
-        local ios_dir="$(dirname "$0")/../tentaflow-zvec-sys/vendor/lib/ios-arm64"
-        if [[ -f "$ios_dir/libzvec_c_api.a" && -f "$ios_dir/libzvec_deps.a" ]]; then
-            log_ok "zvec (ios-arm64): libzvec_c_api.a + libzvec_deps.a"
-        else
-            log_error "zvec (ios-arm64): BRAK statycznych archiwow — build tentaflow-mobile/ios nie zlinkuje"
-            log_error "  Zbuduj: ./scripts/build-zvec.sh ios-arm64"
-            ok=false
-        fi
+        local iplat
+        for iplat in ios-arm64 ios-sim-arm64; do
+            local ios_dir="$(dirname "$0")/../tentaflow-zvec-sys/vendor/lib/$iplat"
+            if [[ -f "$ios_dir/libzvec_c_api.a" && -f "$ios_dir/libzvec_deps.a" ]]; then
+                log_ok "zvec ($iplat): libzvec_c_api.a + libzvec_deps.a"
+            else
+                log_error "zvec ($iplat): BRAK statycznych archiwow — build tentaflow-mobile ($iplat) nie zlinkuje"
+                log_error "  Zbuduj: ./scripts/build-zvec.sh $iplat"
+                ok=false
+            fi
+        done
     fi
 
     if [[ "$ZVEC_OK" != true ]]; then
