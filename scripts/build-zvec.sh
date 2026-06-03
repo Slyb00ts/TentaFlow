@@ -98,15 +98,15 @@ if [ ! -d "$SRC_DIR/.git" ]; then
     git clone "$ZVEC_REPO" "$SRC_DIR"
 fi
 ( cd "$SRC_DIR" && git fetch origin -q
-  # Inny ZVEC_REF niz obecny checkout moze ciagnac inne wersje thirdparty/
-  # submodulow; zostawione untracked pliki (rozpakowane zaleznosci, np. CRoaring)
-  # blokuja checkout. Sprobuj normalnie; gdy sie nie uda — wyczysc drzewo +
-  # submoduly (untracked tez) i ponow.
-  if ! git checkout "$ZVEC_REF" 2>/dev/null; then
-    git submodule foreach --recursive 'git reset --hard -q; git clean -ffdxq' 2>/dev/null || true
-    git reset --hard -q 2>/dev/null || true
+  # Inny ZVEC_REF niz obecny checkout zostawia nieśledzone pliki w katalogach
+  # submodulow thirdparty/ pod wersjonowanymi sciezkami (np. CRoaring-2.0.4/
+  # LICENSE), ktore blokuja checkout. `git clean` pomija granice zainicjalizowanych
+  # submodulow, wiec samo czyszczenie nie wystarcza — najpierw deinit (odrejestrowanie
+  # + usuniecie ich working tree), potem clean, potem wymuszony checkout.
+  if ! git checkout -f "$ZVEC_REF" 2>/dev/null; then
+    git submodule deinit -f --all 2>/dev/null || true
     git clean -ffdxq 2>/dev/null || true
-    git checkout "$ZVEC_REF"
+    git checkout -f "$ZVEC_REF"
   fi
   git submodule update --init --recursive --depth 1 --force
   # zvec laplikuje patche na thirdparty (glog/arrow/antlr) przez apply_patch_once,
