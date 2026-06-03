@@ -715,6 +715,14 @@ pub async fn confirm_pairing(
         pending_hints.as_ref(),
     );
 
+    // Receiver-side election: arm the single-flight baseline-adopt state BEFORE any
+    // unreliable network send/bootstrap below. The peer is already trusted and the
+    // pending row is cleared, so if a send fails afterwards the receiver still has a
+    // durable `Elected` row that krok 2 can resume from — instead of a trusted peer
+    // with no adopt state and no retry. `decide_roles` is pure, so both ends compute
+    // the identical donor/joiner split.
+    begin_baseline_adopt_after_confirm(&security.db, local_node_id, remote_node_id);
+
     if let Some(ref qm) = quic_mesh {
         if let Some(ref hints) = pending_hints {
             qm.connect_to_peer_with_hints(hints).await.map_err(|e| {
@@ -763,12 +771,6 @@ pub async fn confirm_pairing(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         send_pairing_bootstrap(qm, security, remote_node_id, local_node_id).await?;
     }
-
-    // Receiver-side election: the initiator armed the single-flight state in
-    // `initiate_pairing`; the receiver must arm it too so both sides know the
-    // baseline roles before transport (krok 2) starts. `decide_roles` is pure, so
-    // both ends compute the identical donor/joiner split.
-    begin_baseline_adopt_after_confirm(&security.db, local_node_id, remote_node_id);
 
     let _ =
         db::repository::delete_setting(&security.db, &format!("pending_pubkey:{}", remote_node_id));
