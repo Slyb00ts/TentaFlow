@@ -2065,6 +2065,18 @@ pub fn encode_tts_rule_delete_request(rule_id: String) -> Result<Vec<u8>, JsErro
     encode_body_inner(&MessageBody::TtsRuleDeleteRequest { rule_id }).map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::TtsPreviewRequest { text, model, voice } — podglad TTS
+/// (synteza tekstu po czyszczeniu do audio, odtwarzane w panelu).
+#[wasm_bindgen(js_name = encodeTtsPreviewRequest)]
+pub fn encode_tts_preview_request(
+    text: String,
+    model: String,
+    voice: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TtsPreviewRequest { text, model, voice })
+        .map_err(|e| JsError::new(&e))
+}
+
 // --- PII rules ------------------------------------------------------------
 
 /// MessageBody::PiiRuleBody(ListRequest) — wire-compat z dawnym
@@ -3799,6 +3811,17 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::TtsRuleDeleteResponse { deleted } => {
             set(&obj, "variant", "TtsRuleDeleteResponse".into());
             set(&obj, "deleted", deleted.into());
+        }
+        MessageBody::TtsPreviewRequest { text, model, voice } => {
+            set(&obj, "variant", "TtsPreviewRequest".into());
+            set(&obj, "text", text.into());
+            set(&obj, "model", model.into());
+            set(&obj, "voice", voice.into());
+        }
+        MessageBody::TtsPreviewResponse { bytes, format } => {
+            set(&obj, "variant", "TtsPreviewResponse".into());
+            set(&obj, "bytes", js_sys::Uint8Array::from(&bytes[..]).into());
+            set(&obj, "format", format.into());
         }
         MessageBody::PiiRuleBody(p) => match p {
             tentaflow_protocol::PiiRulePayload::ListRequest => {

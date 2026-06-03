@@ -124,13 +124,37 @@ pub fn clean(text: &str, db: &DbPool) -> String {
                     out = re.replace_all(&out, rule.replacement.as_str()).to_string();
                 }
             }
+            // `voice_assignment` nie jest regula czyszczenia tekstu (przypisuje
+            // glos po wzorcu, ta sama tabela) — pomijamy cicho, NIE jako blad.
+            "voice_assignment" => {}
             other => {
                 tracing::trace!(rule_type = other, "TTS clean: nieznany typ — pomijam");
             }
         }
     }
 
-    out
+    // Strip ASCII/symbol punktuacji — PO regulach (zeby regex_remove/substytucja
+    // mogly targetowac te znaki zanim znikna). Tylko dla TTS: usuwamy znaki
+    // ktorych TTS nie wymawia sensownie; w tekscie odpowiedzi (inna galaz flow)
+    // zostaja.
+    strip_tts_punctuation(&out)
+}
+
+/// Znaki usuwane przed TTS (Sherpa/Apple/Kokoro nie wymawiaja ich sensownie).
+/// NIE zawiera `.`,`,`,`?`,`!`,`-` — te niosa prozodie/intonacje.
+const TTS_STRIP_CHARS: &[char] = &[
+    ':', '*', '@', '#', '$', '%', '^', '&', '(', ')', '£', '`', '~', '<', '>', '/', '\\', '|', '{',
+    '}', '[', ']', ';', '\'', '"', '§',
+];
+
+/// Zamienia znaki z `TTS_STRIP_CHARS` na spacje i scala wielokrotne biale znaki
+/// w jedna spacje ("a/b" → "a b", nie "ab"; bez podwojnych spacji).
+fn strip_tts_punctuation(s: &str) -> String {
+    let replaced: String = s
+        .chars()
+        .map(|c| if TTS_STRIP_CHARS.contains(&c) { ' ' } else { c })
+        .collect();
+    replaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Usuwa znaki Unicode z blokow emoji / symbol / dingbat — niezaleznie od
@@ -190,5 +214,26 @@ mod tests {
     #[test]
     fn strip_emoji_dingbats_i_symbols() {
         assert_eq!(strip_emoji("OK ✓ done ✅"), "OK  done ");
+    }
+
+    #[test]
+    fn strip_punktuacji_usuwa_liste_znakow() {
+        assert_eq!(
+            strip_tts_punctuation("cena: 100$ (brutto) #1 @ktos & ja"),
+            "cena 100 brutto 1 ktos ja"
+        );
+    }
+
+    #[test]
+    fn strip_punktuacji_nie_glue_slow_i_scala_spacje() {
+        // `/` miedzy slowami → spacja (nie sklejenie), podwojne spacje scalone.
+        assert_eq!(strip_tts_punctuation("tak/nie  ok"), "tak nie ok");
+    }
+
+    #[test]
+    fn strip_punktuacji_zostawia_prozodie() {
+        // `.`,`,`,`?`,`!`,`-` NIE sa usuwane (niosa intonacje TTS).
+        let s = "Cześć, jak się masz? Świetnie! Auto-pilot.";
+        assert_eq!(strip_tts_punctuation(s), s);
     }
 }

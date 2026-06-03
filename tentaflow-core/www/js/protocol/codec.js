@@ -1462,6 +1462,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::TtsPreviewRequest { text, model, voice } — podglad audio TTS */
+  ttsPreviewRequest(correlationId, { text, model, voice }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTtsPreviewRequest(text, model, voice);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // PII rules
   // -------------------------------------------------------------------------

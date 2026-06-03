@@ -842,7 +842,13 @@
     "tab_tts": "TTS",
     "tab_pii": "PII",
     "tab_fastpath": "Fast-path",
-    "error_prefix": "Fehler"
+    "error_prefix": "Fehler",
+    "col_replacement": "Ersatz",
+    "add": "Hinzufügen",
+    "added_ok": "Hinzugefügt",
+    "pattern_required": "Muster erforderlich",
+    "no_tts_model": "Kein TTS-Modell bereitgestellt",
+    "play_title": "Abspielen"
   },
   "flows_builder": {
     "back": "Zurück",

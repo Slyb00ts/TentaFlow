@@ -959,7 +959,13 @@
     "tab_tts": "TTS",
     "tab_pii": "PII",
     "tab_fastpath": "Fast-path",
-    "error_prefix": "Error"
+    "error_prefix": "Error",
+    "col_replacement": "Replacement",
+    "add": "Add",
+    "added_ok": "Added",
+    "pattern_required": "Pattern is required",
+    "no_tts_model": "No TTS model deployed",
+    "play_title": "Play"
   },
   "flows_builder": {
     "back": "Back",

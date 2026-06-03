@@ -325,6 +325,7 @@ impl Router {
                 router.stt_runtime.clone(),
                 router.mesh_manager.clone(),
                 router.model_residency.clone(),
+                router.db.clone(),
             ));
             *executor_slot.write() = Some(executor);
         }

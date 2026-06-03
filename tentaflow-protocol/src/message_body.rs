@@ -1141,9 +1141,11 @@ pub struct VoiceProfileSummary {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct TtsRule {
     pub id: String,
-    /// Regex pattern w treści wiadomości.
+    /// Wzorzec do dopasowania w tekscie (substring).
     pub pattern: String,
-    /// Voice ID do uzycia gdy pattern matchuje.
+    /// Tekst zamiennika — `pattern` zamieniany na to przed TTS. Historyczna
+    /// nazwa pola (`voice_id`); funkcjonalnie to ZAMIENNIK substytucji TTS, nie
+    /// glos. UI pokazuje jako "Zamiennik".
     pub voice_id: String,
     pub priority: i32,
 }
@@ -4113,6 +4115,17 @@ pub enum MessageBody {
     },
     TtsRuleDeleteResponse {
         deleted: bool,
+    },
+    // Podglad TTS — synteza tekstu (po czyszczeniu/substytucji) do audio,
+    // zeby admin uslyszal jak regula wyjdzie. Binary CBOR (jak cala reszta).
+    TtsPreviewRequest {
+        text: String,
+        model: String,
+        voice: String,
+    },
+    TtsPreviewResponse {
+        bytes: Vec<u8>,
+        format: String,
     },
 
     // ---- PII rules (spakowane w inner enum dla oszczednosci slotu) ----

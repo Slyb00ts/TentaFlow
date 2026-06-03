@@ -702,6 +702,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::TtsRuleCreateResponse { .. } => "TtsRuleCreateResponse",
         MessageBody::TtsRuleDeleteRequest { .. } => "TtsRuleDeleteRequest",
         MessageBody::TtsRuleDeleteResponse { .. } => "TtsRuleDeleteResponse",
+        MessageBody::TtsPreviewRequest { .. } => "TtsPreviewRequest",
+        MessageBody::TtsPreviewResponse { .. } => "TtsPreviewResponse",
         MessageBody::PiiRuleBody(p) => match p {
             tentaflow_protocol::PiiRulePayload::ListRequest => "PiiRuleListRequest",
             tentaflow_protocol::PiiRulePayload::ListResponse { .. } => "PiiRuleListResponse",

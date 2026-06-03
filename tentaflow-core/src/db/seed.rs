@@ -434,6 +434,20 @@ fn seed_tts_cleaning_rules(conn: &Connection) -> Result<()> {
             debug!("Regula TTS '{}' juz istnieje, pominieto", pattern);
         }
     }
+    drop(stmt);
+
+    // Konwersja martwego typu `voice_assignment` -> `phonetic`. Dashboard
+    // zapisywal reguly jako voice_assignment (niedokonczone "przypisanie glosu",
+    // nigdzie nie czytane) — przez co substytucja z dashboardu NIE dzialala.
+    // Konwersja sprawia ze te reguly zaczynaja substytuowac (intencja usera).
+    // Idempotentne — po pierwszym uruchomieniu brak wierszy voice_assignment.
+    let converted = conn.execute(
+        "UPDATE tts_cleaning_rules SET rule_type='phonetic' WHERE rule_type='voice_assignment'",
+        [],
+    )?;
+    if converted > 0 {
+        debug!("TTS: skonwertowano {converted} regul voice_assignment -> phonetic");
+    }
 
     Ok(())
 }

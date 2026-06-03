@@ -6,6 +6,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import '/js/components/tf-input.js';
 
 let activeTab = 'tts';
 
@@ -44,27 +45,89 @@ async function loadActive() {
   } catch (err) { toast(`${I18n.t('rules.error_prefix')}: ${err.message}`, 'error'); }
 }
 
+// Syntetyzuje `text` przez TTS (akcja binarna ttsPreviewRequest -> bajty audio)
+// i odtwarza w przegladarce, zeby uslyszec jak zamiennik wyjdzie. Uzywa
+// pierwszego wdrozonego modelu TTS; voice puste -> silnik bierze domyslny.
+async function playTts(text, ttsModels) {
+  const t = (text || '').trim();
+  if (!t) { toast(I18n.t('rules.pattern_required'), 'error'); return; }
+  if (!ttsModels.length) { toast(I18n.t('rules.no_tts_model'), 'error'); return; }
+  try {
+    const resp = await ApiBinary.action('ttsPreviewRequest', {
+      text: t, model: ttsModels[0].model_name, voice: '',
+    });
+    if (!resp || !resp.bytes || !resp.bytes.length) {
+      toast(I18n.t('rules.error_prefix'), 'error');
+      return;
+    }
+    const blob = new Blob([resp.bytes], { type: `audio/${resp.format || 'wav'}` });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.addEventListener('ended', () => URL.revokeObjectURL(url));
+    await audio.play();
+  } catch (err) { toast(`${I18n.t('rules.error_prefix')}: ${err.message}`, 'error'); }
+}
+
 async function loadTts(host) {
   const rules = await ApiBinary.list('ttsRuleListRequest');
-  if (rules.length === 0) {
-    host.innerHTML = `<div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('rules.empty_tts'))}</div></div>`;
-    return;
-  }
-  host.innerHTML = `
-    <table class="data-table">
-      <thead><tr>
-        <th>${escapeHtml(I18n.t('rules.col_pattern'))}</th>
-        <th>${escapeHtml(I18n.t('rules.col_voice'))}</th>
-        <th>${escapeHtml(I18n.t('rules.col_priority'))}</th>
-        <th></th>
-      </tr></thead>
-      <tbody>${rules.map((r) => `<tr>
-        <td><code>${escapeHtml(r.pattern)}</code></td>
-        <td>${escapeHtml(r.voiceId)}</td>
-        <td>${r.priority}</td>
-        <td style="text-align:right;"><tf-button variant="danger" size="sm" icon="trash" data-rm="${escapeHtml(r.id)}" title="${escapeHtml(I18n.t('rules.delete_title'))}"></tf-button></td>
-      </tr>`).join('')}</tbody>
-    </table>`;
+  // Modele TTS (do podgladu play). Filtr po kategorii — jak chat.js.
+  const allModels = (await ApiBinary.list('modelListRequest', { arrayKey: 'models' })) || [];
+  const ttsModels = allModels.filter(
+    (m) => (m.category || m.service_type || '').toLowerCase() === 'tts',
+  );
+  // Formularz dodawania substytucji (pattern -> zamiennik). Reguly sa
+  // stosowane przed TTS (clean_cache): kazde wystapienie `pattern` w tekscie
+  // czytanym przez TTS zamieniane jest na `replacement`. Tekst odpowiedzi
+  // (bąbel) NIE jest zmieniany — czyszczenie dotyczy wylacznie galezi TTS.
+  const form = `
+    <div style="display:flex; gap: var(--space-2); flex-wrap: wrap; align-items: flex-end; padding: var(--space-4); border-bottom: 1px solid var(--border);">
+      <tf-input id="tts-pattern" label="${escapeHtml(I18n.t('rules.col_pattern'))}" placeholder="WWW"></tf-input>
+      <tf-input id="tts-replacement" label="${escapeHtml(I18n.t('rules.col_replacement'))}" placeholder="w u w u"></tf-input>
+      <tf-input id="tts-priority" type="number" label="${escapeHtml(I18n.t('rules.col_priority'))}" value="100" style="max-width:120px;"></tf-input>
+      <tf-button id="tts-play" variant="secondary" icon="play" title="${escapeHtml(I18n.t('rules.play_title'))}"></tf-button>
+      <tf-button id="tts-add" variant="primary" icon="plus">${escapeHtml(I18n.t('rules.add'))}</tf-button>
+    </div>`;
+  const table = rules.length === 0
+    ? `<div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('rules.empty_tts'))}</div></div>`
+    : `<table class="data-table">
+        <thead><tr>
+          <th>${escapeHtml(I18n.t('rules.col_pattern'))}</th>
+          <th>${escapeHtml(I18n.t('rules.col_replacement'))}</th>
+          <th>${escapeHtml(I18n.t('rules.col_priority'))}</th>
+          <th></th>
+        </tr></thead>
+        <tbody>${rules.map((r) => `<tr>
+          <td><code>${escapeHtml(r.pattern)}</code></td>
+          <td>${escapeHtml(r.voiceId)}</td>
+          <td>${r.priority}</td>
+          <td style="text-align:right; white-space:nowrap;">
+            <tf-button variant="secondary" size="sm" icon="play" data-play="${escapeHtml(r.voiceId)}" title="${escapeHtml(I18n.t('rules.play_title'))}"></tf-button>
+            <tf-button variant="danger" size="sm" icon="trash" data-rm="${escapeHtml(r.id)}" title="${escapeHtml(I18n.t('rules.delete_title'))}"></tf-button>
+          </td>
+        </tr>`).join('')}</tbody>
+      </table>`;
+  host.innerHTML = form + table;
+
+  byId('tts-play').addEventListener('click', () => playTts(byId('tts-replacement').value, ttsModels));
+
+  byId('tts-add').addEventListener('click', async () => {
+    const pattern = (byId('tts-pattern').value || '').trim();
+    const replacement = (byId('tts-replacement').value || '').trim();
+    const priority = parseInt(byId('tts-priority').value, 10) || 100;
+    if (!pattern) { toast(I18n.t('rules.pattern_required'), 'error'); return; }
+    try {
+      // Pole `voiceId` w protokole TtsRule niesie tekst zamiennika (historyczna
+      // nazwa) — handler zapisuje regule typu `phonetic` (substytucja).
+      await ApiBinary.action('ttsRuleCreateRequest', { pattern, voiceId: replacement, priority });
+      toast(I18n.t('rules.added_ok'), 'success');
+      await loadTts(host);
+    } catch (err) { toast(`${I18n.t('rules.error_prefix')}: ${err.message}`, 'error'); }
+  });
+
+  host.querySelectorAll('[data-play]').forEach((b) => {
+    b.addEventListener('click', () => playTts(b.dataset.play, ttsModels));
+  });
+
   host.querySelectorAll('[data-rm]').forEach((b) => {
     b.addEventListener('click', async () => {
       try {
