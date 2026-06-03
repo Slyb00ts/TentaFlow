@@ -7026,4 +7026,367 @@ mod tests {
             );
         });
     }
+
+    // =========================================================================
+    // E2E phase D: cross-node LWW convergence + baseline epoch fencing
+    // =========================================================================
+
+    /// HLC with a caller-chosen wall time and origin node — lets a test order two
+    /// concurrent edits deterministically and exercise the node_id tie-break.
+    fn hlc_at(wall_ms: i64, logical: u32, node_id: &str) -> HybridLogicalTimestamp {
+        HybridLogicalTimestamp {
+            wall_time_ms: wall_ms,
+            logical,
+            node_id: node_id.to_string(),
+        }
+    }
+
+    /// Builds a complete `core.flow` INSERT capture carrying an explicit HLC, so
+    /// the materializer's last-writer-wins comparison sees the order the test
+    /// intends rather than wall-clock noise.
+    fn flow_capture_with_hlc(
+        resource_id: &str,
+        name: &str,
+        hlc: HybridLogicalTimestamp,
+    ) -> crate::sync::core_capture::CoreWriteCapture {
+        let mut fields = BTreeMap::new();
+        fields.insert("name".to_string(), FieldValue::String(name.to_string()));
+        fields.insert("is_default".to_string(), FieldValue::Bool(false));
+        fields.insert(
+            "flow_json".to_string(),
+            FieldValue::String(r#"{"nodes":[]}"#.to_string()),
+        );
+        fields.insert(
+            "status".to_string(),
+            FieldValue::String("active".to_string()),
+        );
+        crate::sync::core_capture::CoreWriteCapture::new(
+            crate::sync::core_registry::CoreSyncResourceKind::Flow,
+            "org-default",
+            resource_id,
+            SqlWriteAction::Insert,
+            fields,
+            Some("test-actor".to_string()),
+            hlc,
+            test_epoch(),
+        )
+    }
+
+    fn flow_name(db: &DbPool, id: &str) -> Option<String> {
+        repository::get_flow(db, id).expect("get flow").map(|f| f.name)
+    }
+
+    /// Records a flow capture on `node` (signs + queues it) and returns the
+    /// resulting signed `SyncOperation` ready to apply on a peer.
+    fn signed_flow_op(
+        node: &RuntimeHarness,
+        capture: crate::sync::core_capture::CoreWriteCapture,
+    ) -> SyncOperation {
+        let recorded = node
+            .runtime
+            .record_core_capture(capture)
+            .expect("record core capture");
+        node.runtime
+            .ledger
+            .get_operation(recorded.op_id)
+            .expect("operation")
+    }
+
+    /// Cross-node LWW: the SAME flow is edited concurrently on two nodes with
+    /// different HLCs. Applying both operations in OPPOSITE orders on two separate
+    /// databases must converge to the newer-HLC value — proving the winner is the
+    /// higher HLC (not whichever arrived last) and that the two nodes do not
+    /// diverge. The materializer is the LWW decision point reached by every
+    /// inbound operation.
+    #[test]
+    fn e2e_cross_node_lww_converges_to_newer_hlc_regardless_of_apply_order() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(91);
+            let node_b = make_runtime(92);
+
+            // Two concurrent INSERT edits of flow "1": A older, B newer. Distinct
+            // origin node_ids so the comparison never depends on a tie.
+            let older = flow_capture_with_hlc("1", "from-A", hlc_at(1_000, 0, "node-a"));
+            let newer = flow_capture_with_hlc("1", "from-B", hlc_at(2_000, 0, "node-b"));
+            let op_older = signed_flow_op(&node_a, older);
+            let op_newer = signed_flow_op(&node_b, newer);
+
+            // DB 1 applies older THEN newer; DB 2 applies newer THEN older.
+            let db1 = make_db();
+            let db2 = make_db();
+            let cipher = make_settings_cipher(91);
+
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_older)
+                .expect("db1 older");
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_newer)
+                .expect("db1 newer");
+
+            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_newer)
+                .expect("db2 newer");
+            // The older op arriving last must be DROPPED by the LWW gate (applies
+            // 0 rows), not clobber the newer value.
+            let stale_rows =
+                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_older)
+                    .expect("db2 older");
+            assert_eq!(stale_rows, 0, "stale older op must be dropped by LWW");
+
+            // Both databases converge to the newer-HLC value.
+            assert_eq!(flow_name(&db1, "1").as_deref(), Some("from-B"));
+            assert_eq!(flow_name(&db2, "1").as_deref(), Some("from-B"));
+        });
+    }
+
+    /// LWW tie-break: equal wall time + logical, differing origin node_id. The
+    /// total HLC order from phase A breaks the tie by node_id, and it must do so
+    /// the SAME way on both databases regardless of apply order.
+    #[test]
+    fn e2e_cross_node_lww_node_id_tiebreak_is_deterministic() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(93);
+            let node_b = make_runtime(94);
+
+            // Identical wall+logical; tie-break decides. "node-z" > "node-a", so
+            // the "node-z" edit wins the total order deterministically.
+            let lower = flow_capture_with_hlc("1", "from-a", hlc_at(5_000, 0, "node-a"));
+            let higher = flow_capture_with_hlc("1", "from-z", hlc_at(5_000, 0, "node-z"));
+            let op_lower = signed_flow_op(&node_a, lower);
+            let op_higher = signed_flow_op(&node_b, higher);
+
+            let db1 = make_db();
+            let db2 = make_db();
+            let cipher = make_settings_cipher(93);
+
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_lower)
+                .expect("db1 lower");
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_higher)
+                .expect("db1 higher");
+
+            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_higher)
+                .expect("db2 higher");
+            let stale =
+                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_lower)
+                    .expect("db2 lower");
+            assert_eq!(stale, 0, "lower node_id loses the tie-break and is dropped");
+
+            assert_eq!(flow_name(&db1, "1").as_deref(), Some("from-z"));
+            assert_eq!(flow_name(&db2, "1").as_deref(), Some("from-z"));
+        });
+    }
+
+    /// Cross-node LWW through the FULL outbox -> push -> inbox -> materialize path
+    /// (in-process, no iroh). The source records a flow op; the receiver, set up
+    /// as a permission target for itself and the source, ingests the push and
+    /// materializes the flow row — demonstrating the realistic transport reaches
+    /// the same materializer that enforces LWW.
+    #[test]
+    fn e2e_cross_node_push_inbox_materializes_flow() {
+        with_tmp_home(|| {
+            let source = make_runtime(95);
+            let receiver = make_runtime(96);
+
+            // Authority-write policy on both sides with the receiver as the
+            // authority target: the source queues to the receiver, and the
+            // receiver accepts inbound ops for itself.
+            seed_core_authority_target(
+                &source.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target(
+                &receiver.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+
+            source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("1", "Pushed Flow"))
+                .expect("record core flow");
+
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("build push")
+                .expect("pending push");
+            let ack = receiver
+                .runtime
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect("handle push");
+            assert_eq!(ack.operation_ids.len(), 1, "one op accepted into inbox");
+
+            // The inbound op materialized into the receiver's flows table.
+            assert_eq!(flow_name(&receiver.runtime.db, "1").as_deref(), Some("Pushed Flow"));
+        });
+    }
+
+    /// ACL gating inside the merged org: a `core.flow` resource assigned to one
+    /// user replicates ONLY to that user's node. The other node, present in the
+    /// same logical organization but lacking permission, is NOT a push target.
+    /// This is the phase-A fix verified end-to-end: a denied node receives no push.
+    #[test]
+    fn e2e_acl_replicates_flow_only_to_permitted_node_in_merged_org() {
+        with_tmp_home(|| {
+            let source = make_runtime(99);
+            let permitted = make_runtime(100);
+            let denied = make_runtime(101);
+
+            let permitted_user = repository::create_user_account(
+                &source.runtime.db,
+                "permitted-user",
+                "hash",
+                "Permitted User",
+                "permitted@example.com",
+            )
+            .expect("permitted user");
+            let denied_user = repository::create_user_account(
+                &source.runtime.db,
+                "denied-user",
+                "hash",
+                "Denied User",
+                "denied@example.com",
+            )
+            .expect("denied user");
+
+            for (node_id, user_id, display) in [
+                (
+                    permitted.runtime.local_node_id.as_str(),
+                    permitted_user.as_str(),
+                    "Permitted Node",
+                ),
+                (
+                    denied.runtime.local_node_id.as_str(),
+                    denied_user.as_str(),
+                    "Denied Node",
+                ),
+            ] {
+                repository::upsert_sync_node_identity(
+                    &source.runtime.db,
+                    node_id,
+                    "pub",
+                    "ed25519",
+                    display,
+                    "laptop",
+                    "trusted",
+                    Some(user_id),
+                    "standard",
+                )
+                .expect("sync node");
+                repository::assign_node_to_user(&source.runtime.db, node_id, user_id, "primary", None)
+                    .expect("assign node");
+            }
+            repository::upsert_sync_policy(
+                &source.runtime.db,
+                "policy-core-flow-permission",
+                "org-default",
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                Some("core.flow"),
+                None,
+                "replicated_by_permission",
+                None,
+                None,
+                true,
+            )
+            .expect("sync policy");
+            // The flow is assigned to the permitted user only.
+            repository::upsert_sync_resource_acl(
+                &source.runtime.db,
+                "org-default",
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                "core.flow",
+                "1",
+                Some(permitted_user.as_str()),
+                Some(permitted_user.as_str()),
+                None,
+                None,
+                "assigned",
+            )
+            .expect("resource acl");
+
+            let recorded = source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("1", "ACL Gated Flow"))
+                .expect("record core capture");
+
+            let permitted_push = source
+                .runtime
+                .build_push_payload_for_target(&permitted.runtime.local_node_id, 16)
+                .expect("permitted push");
+            let denied_push = source
+                .runtime
+                .build_push_payload_for_target(&denied.runtime.local_node_id, 16)
+                .expect("denied push");
+
+            assert!(permitted_push.is_some(), "permitted node must receive the push");
+            assert!(denied_push.is_none(), "denied node must NOT receive any push");
+            assert_eq!(recorded.queued_targets, 1, "exactly one permitted target queued");
+        });
+    }
+
+    /// Epoch fencing after baseline adopt: an operation minted under the OLD
+    /// (pre-adopt) epoch is rejected by the receiver's inbox once the receiver has
+    /// adopted a newer epoch. `put_verified_in_inbox` returns `EpochMismatch` and
+    /// nothing materializes — stale-epoch writes from before the merge cannot leak
+    /// into the merged organization.
+    #[test]
+    fn e2e_epoch_fencing_rejects_pre_adopt_operation() {
+        with_tmp_home(|| {
+            let source = make_runtime(97);
+            let receiver = make_runtime(98);
+            seed_core_authority_target(
+                &source.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target(
+                &receiver.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+
+            // Source mints an op under the genesis epoch (counter 0).
+            let recorded = source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("1", "Stale Epoch Flow"))
+                .expect("record core flow");
+            let stale_op = source
+                .runtime
+                .ledger
+                .get_operation(recorded.op_id)
+                .expect("operation");
+            assert_eq!(stale_op.body.epoch.counter, 0, "op stamped under genesis epoch");
+
+            // Receiver adopts a NEWER baseline epoch (as it would after pairing).
+            let new_epoch = BaselineEpoch {
+                counter: 7,
+                origin_node: receiver.runtime.local_node_id.clone(),
+            };
+            receiver.runtime.ledger.set_epoch(new_epoch.clone()).expect("set epoch");
+
+            // The push carries the stale-epoch op; the receiver's inbox fences it.
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("build push")
+                .expect("pending push");
+            let err = receiver
+                .runtime
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect_err("stale-epoch push must be fenced");
+            match err {
+                SyncLedgerError::EpochMismatch { expected, actual } => {
+                    assert_eq!(expected, new_epoch, "fence expects the adopted epoch");
+                    assert_eq!(actual.counter, 0, "rejected op carried the old epoch");
+                }
+                other => panic!("expected EpochMismatch, got: {other:?}"),
+            }
+
+            // Nothing materialized: the receiver has no such flow row.
+            assert!(
+                repository::get_flow(&receiver.runtime.db, "1")
+                    .expect("get flow")
+                    .is_none(),
+                "stale-epoch op must not materialize after fencing"
+            );
+        });
+    }
 }
