@@ -393,6 +393,56 @@ export const encode = {
     );
   },
 
+  // ---- Sync baseline-adopt admin (FAZA C krok 3) ----
+
+  /** MessageBody::BaselineDonorListRequest (unit) — kandydaci na dawce. */
+  baselineDonorListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBaselineDonorListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::BaselineAdoptStartRequest { donorNodeId } */
+  baselineAdoptStartRequest(correlationId, { donorNodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBaselineAdoptStartRequest(String(donorNodeId || ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::BaselineAdoptStatusRequest (unit) — faza + raport. */
+  baselineAdoptStatusRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBaselineAdoptStatusRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::BaselineAdoptClearRequest (unit) — odblokuj zawieszony stan. */
+  baselineAdoptClearRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBaselineAdoptClearRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MeshConnectRequest { address } */
   meshConnectRequest(correlationId, { address }, sequence = 1) {
     assertReady();
