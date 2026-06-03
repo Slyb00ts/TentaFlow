@@ -239,6 +239,31 @@ pub async fn start_mesh_pipeline(
                 });
             }
 
+            // Crash-recovery baseline-adopt: jesli przy starcie istnieje trwaly
+            // stan joinera w fazie Elected/Receiving (transfer nie dobiegl konca
+            // przed awaria/restartem), wznow pobranie snapshotu. Faza Imported/
+            // Completed jest wznawiana post-commit przez sam import (bez sieci),
+            // wiec tu obslugujemy tylko stany wymagajace ponownego strumienia.
+            {
+                let qm = quic_mesh.clone();
+                let db = mesh_security.db.clone();
+                tokio::spawn(async move {
+                    match crate::sync::baseline_transport::pending_joiner_resume(&db) {
+                        Ok(Some((donor, epoch_seen))) => {
+                            if let Err(e) = qm.pull_baseline_from_donor(&donor, epoch_seen).await {
+                                warn!(
+                                    donor = %donor,
+                                    "baseline adopt: wznowienie pull przy starcie nieudane: {}",
+                                    e
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => warn!("baseline adopt: odczyt stanu wznowienia nieudany: {}", e),
+                    }
+                });
+            }
+
             // Reconnect do trusted peerow po EndpointId — iroh sam rozwiazuje adres.
             {
                 let sec = mesh_security.clone();

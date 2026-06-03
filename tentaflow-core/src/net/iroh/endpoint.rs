@@ -22,7 +22,7 @@ use iroh::{
 };
 use std::time::Duration;
 
-use super::{ALPN_API, ALPN_MESH, ALPN_PAIRING};
+use super::{ALPN_API, ALPN_BASELINE, ALPN_MESH, ALPN_PAIRING};
 
 /// Konfiguracja uruchomienia iroh endpointa dla daemona.
 #[derive(Clone)]
@@ -101,6 +101,7 @@ impl IrohEndpoint {
             .alpns(vec![
                 ALPN_MESH.to_vec(),
                 ALPN_PAIRING.to_vec(),
+                ALPN_BASELINE.to_vec(),
                 ALPN_API.to_vec(),
             ])
             .transport_config(transport_config)
