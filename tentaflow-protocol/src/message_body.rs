@@ -1548,6 +1548,97 @@ pub struct MeshNodeNetworkConfigResponse {
 }
 
 // =============================================================================
+// Sync baseline-adopt admin (R-LIST + W-ACTION). Admin wskazuje dawce baseline'u
+// i steruje pojedyncza adopcja single-flight: lista kandydatow, start, status,
+// odblokowanie zawieszonego stanu. Donorow widac tylko sposrod zaufanych peerow.
+// =============================================================================
+
+/// Lokalnie znane podsumowanie baseline'u kandydata. Pelne liczby dawcy poznaje
+/// sie dopiero z naglowka transferu (`BaselineHeader`), wiec dla listy to pole
+/// jest opcjonalne — `None` gdy lokalnie nic nie wiadomo o zawartosci dawcy.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineDonorSummary {
+    pub org_name: String,
+    pub users: u64,
+    pub flows: u64,
+    pub roles: u64,
+}
+
+/// Kandydat na dawce baseline'u: zaufany sparowany peer. `trusted` jest zawsze
+/// `true` na wyjsciu (filtrujemy nie-zaufanych po stronie hosta) — pole zostaje,
+/// by frontend mogl jawnie pokazac status zaufania bez zgadywania.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineDonorCandidate {
+    pub node_id: String,
+    pub display_name: String,
+    pub trusted: bool,
+    pub summary: Option<BaselineDonorSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineDonorListResponse {
+    pub candidates: Vec<BaselineDonorCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptStartRequest {
+    /// node_id (hex) wskazanego dawcy. Musi byc zaufanym sparowanym peerem.
+    pub donor_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptStartResponse {
+    pub ok: bool,
+    /// `true` gdy adopcja faktycznie wystartowala (rola joiner, pull w tle).
+    pub started: bool,
+    /// Komunikat diagnostyczny (np. powod odmowy single-flight).
+    pub message: String,
+}
+
+/// Faza adopcji widziana przez admina. `None` = brak trwajacej/zakonczonej
+/// adopcji. Pozostale warianty mapuja `core_baseline::BaselinePhase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum BaselineAdoptPhaseTag {
+    None,
+    Elected,
+    Receiving,
+    Importing,
+    Imported,
+    Completed,
+}
+
+/// Raport importu baseline'u (dostepny dopiero po `Completed`). Lustro
+/// `core_baseline::BaselineImportReport` w ksztalcie wire.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptReport {
+    pub donor_org_id: String,
+    pub users_merged_by_email: u64,
+    pub users_joined_donor_org: u64,
+    pub collisions_suffixed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptStatusResponse {
+    pub phase: BaselineAdoptPhaseTag,
+    /// node_id (hex) drugiej strony adopcji, jesli stan istnieje.
+    pub peer: Option<String>,
+    /// Czy lokalny nod jest joinerem (`true`) czy dawca (`false`); `None` gdy
+    /// brak stanu.
+    pub is_joiner: Option<bool>,
+    /// Raport dostepny tylko gdy faza == Completed; inaczej `None`.
+    pub report: Option<BaselineAdoptReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptClearResponse {
+    pub ok: bool,
+    /// `true` gdy stan zostal wyczyszczony; `false` gdy nic nie bylo do
+    /// wyczyszczenia albo czyszczenie bylo niedozwolone (aktywny import).
+    pub cleared: bool,
+    pub message: String,
+}
+
+// =============================================================================
 // Settings (R-LIST + W-UPDATE archetypy, migration-map #147-#148)
 // =============================================================================
 
@@ -3912,6 +4003,16 @@ pub enum MessageBody {
     MeshNodeNetworkConfigRequestBody(MeshNodeNetworkConfigRequest),
     MeshNodeNetworkConfigResponseBody(MeshNodeNetworkConfigResponse),
 
+    // ---- Sync baseline-adopt admin (donor list + start/status/clear) ----
+    BaselineDonorListRequest,
+    BaselineDonorListResponseBody(BaselineDonorListResponse),
+    BaselineAdoptStartRequestBody(BaselineAdoptStartRequest),
+    BaselineAdoptStartResponseBody(BaselineAdoptStartResponse),
+    BaselineAdoptStatusRequest,
+    BaselineAdoptStatusResponseBody(BaselineAdoptStatusResponse),
+    BaselineAdoptClearRequest,
+    BaselineAdoptClearResponseBody(BaselineAdoptClearResponse),
+
     // ---- Prompts (R-LIST + R-ONE) ----
     PromptListRequest,
     PromptListResponse {
@@ -4993,6 +5094,126 @@ mod tests {
                 assert_eq!(req.name_translations, translations);
             }
             _ => panic!("expected RoleCatalogBody::CreateRequest"),
+        }
+    }
+
+    #[test]
+    fn baseline_donor_list_response_round_trip() {
+        let body = MessageBody::BaselineDonorListResponseBody(BaselineDonorListResponse {
+            candidates: vec![
+                BaselineDonorCandidate {
+                    node_id: "aabbccdd".to_string(),
+                    display_name: "donor-host".to_string(),
+                    trusted: true,
+                    summary: Some(BaselineDonorSummary {
+                        org_name: "Acme".to_string(),
+                        users: 12,
+                        flows: 4,
+                        roles: 3,
+                    }),
+                },
+                BaselineDonorCandidate {
+                    node_id: "11223344".to_string(),
+                    display_name: "11223344".to_string(),
+                    trusted: true,
+                    summary: None,
+                },
+            ],
+        });
+        match round_trip(body.clone()) {
+            MessageBody::BaselineDonorListResponseBody(r) => {
+                assert_eq!(r.candidates.len(), 2);
+                assert_eq!(r.candidates[0].node_id, "aabbccdd");
+                assert_eq!(
+                    r.candidates[0].summary.as_ref().map(|s| s.users),
+                    Some(12)
+                );
+                assert!(r.candidates[1].summary.is_none());
+            }
+            other => panic!("expected BaselineDonorListResponseBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_adopt_start_round_trip() {
+        let req = MessageBody::BaselineAdoptStartRequestBody(BaselineAdoptStartRequest {
+            donor_node_id: "aabbccdd".to_string(),
+        });
+        match round_trip(req) {
+            MessageBody::BaselineAdoptStartRequestBody(r) => {
+                assert_eq!(r.donor_node_id, "aabbccdd");
+            }
+            other => panic!("expected BaselineAdoptStartRequestBody, got {other:?}"),
+        }
+
+        let resp = MessageBody::BaselineAdoptStartResponseBody(BaselineAdoptStartResponse {
+            ok: true,
+            started: true,
+            message: "adopcja rozpoczeta".to_string(),
+        });
+        match round_trip(resp) {
+            MessageBody::BaselineAdoptStartResponseBody(r) => {
+                assert!(r.ok && r.started);
+            }
+            other => panic!("expected BaselineAdoptStartResponseBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_adopt_status_round_trip_with_report() {
+        let body = MessageBody::BaselineAdoptStatusResponseBody(BaselineAdoptStatusResponse {
+            phase: BaselineAdoptPhaseTag::Completed,
+            peer: Some("aabbccdd".to_string()),
+            is_joiner: Some(true),
+            report: Some(BaselineAdoptReport {
+                donor_org_id: "org-1".to_string(),
+                users_merged_by_email: 2,
+                users_joined_donor_org: 5,
+                collisions_suffixed: 1,
+            }),
+        });
+        match round_trip(body) {
+            MessageBody::BaselineAdoptStatusResponseBody(r) => {
+                assert_eq!(r.phase, BaselineAdoptPhaseTag::Completed);
+                assert_eq!(r.peer.as_deref(), Some("aabbccdd"));
+                assert_eq!(r.is_joiner, Some(true));
+                let report = r.report.expect("report present");
+                assert_eq!(report.users_joined_donor_org, 5);
+                assert_eq!(report.collisions_suffixed, 1);
+            }
+            other => panic!("expected BaselineAdoptStatusResponseBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_adopt_status_round_trip_none() {
+        let body = MessageBody::BaselineAdoptStatusResponseBody(BaselineAdoptStatusResponse {
+            phase: BaselineAdoptPhaseTag::None,
+            peer: None,
+            is_joiner: None,
+            report: None,
+        });
+        match round_trip(body) {
+            MessageBody::BaselineAdoptStatusResponseBody(r) => {
+                assert_eq!(r.phase, BaselineAdoptPhaseTag::None);
+                assert!(r.peer.is_none() && r.report.is_none());
+            }
+            other => panic!("expected BaselineAdoptStatusResponseBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_adopt_clear_round_trip() {
+        let body = MessageBody::BaselineAdoptClearResponseBody(BaselineAdoptClearResponse {
+            ok: true,
+            cleared: false,
+            message: "brak stanu adopcji do wyczyszczenia".to_string(),
+        });
+        match round_trip(body) {
+            MessageBody::BaselineAdoptClearResponseBody(r) => {
+                assert!(r.ok && !r.cleared);
+            }
+            other => panic!("expected BaselineAdoptClearResponseBody, got {other:?}"),
         }
     }
 
