@@ -407,6 +407,14 @@ impl DeployStrategy for DockerDeploy {
         if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
             env.insert("MODEL".into(), model);
         }
+        // See python_bundle.rs: the served name must equal the advertised slug
+        // (`models_from_manifest` model_name) or dispatch 404s when preset id
+        // differs from the repo. entrypoint.sh reads `$SERVED_MODEL_NAME`.
+        if let Some(served) =
+            super::resolve_served_model_name(&self.manifest, &self.user_config)
+        {
+            env.insert("SERVED_MODEL_NAME".into(), served);
+        }
         if let Some(raw_args) = self
             .user_config
             .get("vllm_args")
