@@ -34,6 +34,8 @@ pub struct ReadUrlRequest {
     pub max_chars: usize,
     #[serde(default)]
     pub mode: ReadMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,10 @@ pub struct ReadSearchResultsRequest {
     pub max_chars_per_page: usize,
     #[serde(default)]
     pub provider: Option<SearchProviderConfig>,
+    #[serde(default)]
+    pub mode: ReadMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +84,7 @@ pub enum SearchProviderConfig {
 pub enum ReadMode {
     Auto,
     Static,
+    Browser,
 }
 
 impl Default for ReadMode {

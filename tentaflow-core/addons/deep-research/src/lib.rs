@@ -129,6 +129,7 @@ fn handle_read_search_results(params: &Value) -> Value {
         read_limit: bounded_usize(params, "read_limit", 5, 1, 25),
         max_chars_per_page: bounded_usize(params, "max_chars_per_page", 30_000, 500, 200_000),
         provider: provider_from_params(params),
+        mode: optional_string(params, "mode").unwrap_or_else(|| "auto".to_string()),
     };
 
     call_sdk(|| web_read_search_results(&request))

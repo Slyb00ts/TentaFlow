@@ -1,0 +1,31 @@
+# =============================================================================
+# Plik: settings.yml
+# Opis: Minimalna konfiguracja SearXNG pod lokalny backend wyszukiwania TentaFlow.
+# Przykład: SEARXNG_SECRET=$(openssl rand -hex 32) docker run -p 8080:8080 obraz
+# =============================================================================
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "TentaFlow SearXNG"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "ultrasecretkey"
+  limiter: false
+  image_proxy: false
+
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 15.0
+  pool_connections: 100
+  pool_maxsize: 20
+  useragent_suffix: "TentaFlow"

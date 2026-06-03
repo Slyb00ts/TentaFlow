@@ -41,10 +41,19 @@ RUN pip install --no-cache-dir \
       torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
     && pip install --no-cache-dir vllm==0.21.0
 
+# llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI
+# do pobierania zrodel safetensors. hf_transfer = szybsze rownolegle pobieranie.
+RUN pip install --no-cache-dir llm-compressor "huggingface_hub[cli,hf_transfer]"
+ENV HF_HUB_ENABLE_HF_TRANSFER=1 \
+    QUANT_SCRIPT=/app/quantize_nvfp4.py
+
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
 COPY tentaflow-containers/llm/docker/vllm/config.default.toml /app/config.default.toml
 COPY tentaflow-containers/llm/docker/vllm/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY tentaflow-containers/llm/docker/_shared/quantize_nvfp4.py /app/quantize_nvfp4.py
+COPY tentaflow-containers/llm/docker/_shared/prepare-vllm-model.sh /app/prepare-vllm-model.sh
+COPY tentaflow-containers/llm/docker/_shared/vllm-spec-prep.sh /app/vllm-spec-prep.sh
+RUN chmod +x /app/entrypoint.sh /app/prepare-vllm-model.sh
 
 EXPOSE 5000/udp
 

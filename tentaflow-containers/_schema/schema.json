@@ -197,6 +197,21 @@
           "minimum": 1,
           "maximum": 32,
           "description": "Default num_speculative_tokens. Brak = 8."
+        },
+        "vllm": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Provisioning vLLM dla tego presetu — self-kwantyzacja NVFP4 przed serwowaniem (llm-compressor).",
+          "properties": {
+            "quantize": {
+              "type": "string",
+              "description": "Schemat kwantyzacji modelu glownego: 'NVFP4' (W4A4, kalibracja) albo 'NVFP4A16' (wagi-only, data-free). Brak = serwuj repo bez zmian."
+            },
+            "quantize_draft": {
+              "type": "string",
+              "description": "Schemat kwantyzacji modelu draftu (speculator_repo). Te same wartosci co `quantize`."
+            }
+          }
         }
       }
     }
