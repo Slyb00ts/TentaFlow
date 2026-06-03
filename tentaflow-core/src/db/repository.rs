@@ -2684,6 +2684,642 @@ fn flow_binding_changed_fields(
     fields
 }
 
+/// Re-emits the CURRENT state of every core-synced table as a fresh INSERT
+/// capture, one per live row, through the canonical capture path
+/// (`record_core_capture_for_org_tx`). Each capture mints a fresh monotonic HLC
+/// and inherits the live baseline epoch, so the baseline reset replicates the
+/// present snapshot — not the historical write journal — with strictly
+/// increasing, distinct timestamps. The reset wipes the ledger first, so this is
+/// idempotent: a re-run after a crash simply re-emits the same snapshot into an
+/// empty outbox. Returns the number of captures written.
+///
+/// Reseed must reproduce the exact `(resource_id, changed_fields)` shape the live
+/// repository writes, because peers materialize these operations through the same
+/// `apply_*` paths; the per-kind blocks below mirror those Insert field sets.
+pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
+    use crate::sync::core_registry::{CoreSyncResourceKind as K, CORE_SYNC_DESCRIPTORS};
+    use crate::sync::runtime::SqlWriteAction::Insert;
+
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let mut emitted = 0usize;
+
+    for descriptor in CORE_SYNC_DESCRIPTORS {
+        match descriptor.kind {
+            K::Organization => {
+                let mut stmt = tx.prepare(
+                    "SELECT org_id, name, slug, contact_email, dpo_contact, \
+                            retention_policy_json, status FROM organizations",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, String>(6)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (org_id, name, slug, email, dpo, retention, status) in rows {
+                    let fields = organization_reseed_fields(
+                        &name,
+                        &slug,
+                        email.as_deref(),
+                        dpo.as_deref(),
+                        retention.as_deref(),
+                        &status,
+                    );
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        org_id.clone(),
+                        Insert,
+                        fields,
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::UserAccount => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, username, display_name, email, is_active, is_admin, role \
+                     FROM user_accounts",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, bool>(4)?,
+                            r.get::<_, bool>(5)?,
+                            r.get::<_, String>(6)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, username, display_name, email, is_active, is_admin, role) in rows {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("username".to_string(), field_string(&username));
+                    fields.insert("display_name".to_string(), field_string(&display_name));
+                    fields.insert("email".to_string(), field_optional_string(email.as_deref()));
+                    fields.insert(
+                        "is_active".to_string(),
+                        crate::sync::ledger::FieldValue::Bool(is_active),
+                    );
+                    fields.insert(
+                        "is_admin".to_string(),
+                        crate::sync::ledger::FieldValue::Bool(is_admin),
+                    );
+                    fields.insert("role".to_string(), field_string(&role));
+                    record_core_capture_tx(&tx, descriptor.kind, id, Insert, fields, None)?;
+                    emitted += 1;
+                }
+            }
+            K::UserGroup => {
+                let mut stmt = tx.prepare("SELECT id, name, description FROM user_groups")?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, name, description) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        id,
+                        Insert,
+                        group_changed_fields(
+                            Some(&name),
+                            Some(description.as_deref().unwrap_or("")),
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::GroupMember => {
+                let mut stmt = tx.prepare("SELECT group_id, user_id FROM group_members")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (group_id, user_id) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        group_member_resource_id(&group_id, &user_id),
+                        Insert,
+                        group_member_changed_fields(&group_id, &user_id),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::Role => {
+                let mut stmt = tx.prepare("SELECT role_id, name, permissions_json FROM roles")?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (role_id, name, permissions_json) in rows {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("name".to_string(), field_string(&name));
+                    fields.insert(
+                        "permissions_json".to_string(),
+                        field_string(&permissions_json),
+                    );
+                    record_core_capture_tx(&tx, descriptor.kind, role_id, Insert, fields, None)?;
+                    emitted += 1;
+                }
+            }
+            K::OrgMembership => {
+                let mut stmt =
+                    tx.prepare("SELECT org_id, user_id, role_id, granted_by FROM org_memberships")?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (org_id, user_id, role_id, granted_by) in rows {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("org_id".to_string(), field_string(&org_id));
+                    fields.insert("user_id".to_string(), field_string(&user_id));
+                    fields.insert("role_id".to_string(), field_string(&role_id));
+                    fields.insert("granted_by".to_string(), field_string(&granted_by));
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        crate::sync::resource_id::composite_resource_id(&[&org_id, &user_id]),
+                        Insert,
+                        fields,
+                        Some(user_id),
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::SyncNode => {
+                let mut stmt = tx.prepare(
+                    "SELECT node_id, public_key, public_key_type, display_name, node_kind, \
+                            trust_status, owner_user_id, sync_profile FROM sync_nodes",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, String>(7)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (node_id, pk, pk_type, name, kind, trust, owner, profile) in rows {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("public_key".to_string(), field_string(&pk));
+                    fields.insert("public_key_type".to_string(), field_string(&pk_type));
+                    fields.insert("display_name".to_string(), field_string(&name));
+                    fields.insert("node_kind".to_string(), field_string(&kind));
+                    fields.insert("trust_status".to_string(), field_string(&trust));
+                    fields.insert(
+                        "owner_user_id".to_string(),
+                        field_optional_string(owner.as_deref()),
+                    );
+                    fields.insert("sync_profile".to_string(), field_string(&profile));
+                    record_core_capture_tx(&tx, descriptor.kind, node_id, Insert, fields, owner)?;
+                    emitted += 1;
+                }
+            }
+            K::UserIdentityKey => {
+                let mut stmt = tx.prepare(
+                    "SELECT key_id, user_id, key_type, public_key, purpose, status, revoked_at \
+                     FROM user_identity_keys",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (key_id, user_id, key_type, public_key, purpose, status, revoked_at) in rows {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("user_id".to_string(), field_string(&user_id));
+                    fields.insert("key_type".to_string(), field_string(&key_type));
+                    fields.insert("public_key".to_string(), field_string(&public_key));
+                    fields.insert("purpose".to_string(), field_string(&purpose));
+                    fields.insert("status".to_string(), field_string(&status));
+                    fields.insert(
+                        "revoked_at".to_string(),
+                        field_optional_string(revoked_at.as_deref()),
+                    );
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        key_id,
+                        Insert,
+                        fields,
+                        Some(user_id),
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::NodeUserAssignment => {
+                let mut stmt = tx.prepare(
+                    "SELECT node_id, user_id, assignment_mode, created_by \
+                     FROM node_user_assignments",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (node_id, user_id, mode, created_by) in rows {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("node_id".to_string(), field_string(&node_id));
+                    fields.insert("user_id".to_string(), field_string(&user_id));
+                    fields.insert("assignment_mode".to_string(), field_string(&mode));
+                    fields.insert(
+                        "created_by".to_string(),
+                        field_optional_string(created_by.as_deref()),
+                    );
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        node_user_assignment_core_id(&node_id, &user_id, &mode),
+                        Insert,
+                        fields,
+                        created_by,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::SyncUserOrgProfile => {
+                let mut stmt = tx.prepare(
+                    "SELECT org_id, user_id, department_id, manager_user_id, is_department_manager \
+                     FROM sync_user_org_profiles",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, bool>(4)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (org_id, user_id, department_id, manager_user_id, is_mgr) in rows {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("org_id".to_string(), field_string(&org_id));
+                    fields.insert("user_id".to_string(), field_string(&user_id));
+                    fields.insert(
+                        "department_id".to_string(),
+                        field_optional_string(department_id.as_deref()),
+                    );
+                    fields.insert(
+                        "manager_user_id".to_string(),
+                        field_optional_string(manager_user_id.as_deref()),
+                    );
+                    fields.insert(
+                        "is_department_manager".to_string(),
+                        crate::sync::ledger::FieldValue::Bool(is_mgr),
+                    );
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        sync_user_org_profile_core_id(&org_id, &user_id),
+                        Insert,
+                        fields,
+                        Some(user_id),
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::Flow => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, name, description, is_default, service_type, flow_json, status, \
+                            published_model_name FROM flows",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, bool>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, name, description, is_default, service_type, flow_json, status, model) in
+                    rows
+                {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("name".to_string(), field_string(&name));
+                    fields.insert(
+                        "description".to_string(),
+                        field_optional_string(description.as_deref()),
+                    );
+                    fields.insert(
+                        "is_default".to_string(),
+                        crate::sync::ledger::FieldValue::Bool(is_default),
+                    );
+                    fields.insert(
+                        "service_type".to_string(),
+                        field_optional_string(service_type.as_deref()),
+                    );
+                    fields.insert("flow_json".to_string(), field_string(&flow_json));
+                    fields.insert("status".to_string(), field_string(&status));
+                    fields.insert(
+                        "published_model_name".to_string(),
+                        field_optional_string(model.as_deref()),
+                    );
+                    record_core_capture_tx(&tx, descriptor.kind, id, Insert, fields, None)?;
+                    emitted += 1;
+                }
+            }
+            K::FlowModelBinding => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, flow_id, model_pattern, priority FROM flow_model_bindings",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, flow_id, model_pattern, priority) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        id,
+                        Insert,
+                        flow_binding_changed_fields(&flow_id, &model_pattern, priority),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::SyncPolicy => {
+                let mut stmt = tx.prepare(
+                    "SELECT policy_id, org_id, addon_id, resource_type, resource_id, mode, \
+                            authority_node_id, retention_days, is_enabled FROM sync_policies",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<i64>>(7)?,
+                            r.get::<_, bool>(8)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    policy_id,
+                    org_id,
+                    addon_id,
+                    resource_type,
+                    resource_id,
+                    mode,
+                    authority,
+                    retention,
+                    enabled,
+                ) in rows
+                {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("org_id".to_string(), field_string(&org_id));
+                    fields.insert("addon_id".to_string(), field_string(&addon_id));
+                    fields.insert(
+                        "resource_type".to_string(),
+                        field_string(resource_type.as_deref().unwrap_or("")),
+                    );
+                    fields.insert(
+                        "resource_id".to_string(),
+                        field_string(resource_id.as_deref().unwrap_or("")),
+                    );
+                    fields.insert("mode".to_string(), field_string(&mode));
+                    fields.insert(
+                        "authority_node_id".to_string(),
+                        field_optional_string(authority.as_deref()),
+                    );
+                    fields.insert("retention_days".to_string(), field_optional_i64(retention));
+                    fields.insert(
+                        "is_enabled".to_string(),
+                        crate::sync::ledger::FieldValue::Bool(enabled),
+                    );
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        policy_id,
+                        Insert,
+                        fields,
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::SyncResourceAcl => {
+                let mut stmt = tx.prepare(
+                    "SELECT org_id, addon_id, resource_type, resource_id, owner_user_id, \
+                            assigned_user_id, department_id, manager_user_id, visibility_scope \
+                     FROM sync_resource_acl",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, String>(8)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (org_id, addon_id, rtype, rid, owner, assigned, dept, manager, scope) in rows {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("org_id".to_string(), field_string(&org_id));
+                    fields.insert("addon_id".to_string(), field_string(&addon_id));
+                    fields.insert("resource_type".to_string(), field_string(&rtype));
+                    fields.insert("resource_id".to_string(), field_string(&rid));
+                    fields.insert(
+                        "owner_user_id".to_string(),
+                        field_optional_string(owner.as_deref()),
+                    );
+                    fields.insert(
+                        "assigned_user_id".to_string(),
+                        field_optional_string(assigned.as_deref()),
+                    );
+                    fields.insert(
+                        "department_id".to_string(),
+                        field_optional_string(dept.as_deref()),
+                    );
+                    fields.insert(
+                        "manager_user_id".to_string(),
+                        field_optional_string(manager.as_deref()),
+                    );
+                    fields.insert("visibility_scope".to_string(), field_string(&scope));
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        sync_resource_acl_core_id(&org_id, &addon_id, &rtype, &rid),
+                        Insert,
+                        fields,
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::SyncExplicitShare => {
+                let mut stmt = tx.prepare(
+                    "SELECT org_id, addon_id, resource_type, resource_id, subject_type, \
+                            subject_id, action, granted_by FROM sync_explicit_shares \
+                     WHERE revoked_at IS NULL",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (org_id, addon_id, rtype, rid, subject_type, subject_id, action, granted_by) in
+                    rows
+                {
+                    let mut fields = BTreeMap::new();
+                    fields.insert("org_id".to_string(), field_string(&org_id));
+                    fields.insert("addon_id".to_string(), field_string(&addon_id));
+                    fields.insert("resource_type".to_string(), field_string(&rtype));
+                    fields.insert("resource_id".to_string(), field_string(&rid));
+                    fields.insert("subject_type".to_string(), field_string(&subject_type));
+                    fields.insert("subject_id".to_string(), field_string(&subject_id));
+                    fields.insert("action".to_string(), field_string(&action));
+                    fields.insert(
+                        "granted_by".to_string(),
+                        field_optional_string(granted_by.as_deref()),
+                    );
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        sync_explicit_share_core_id(
+                            &org_id,
+                            &addon_id,
+                            &rtype,
+                            &rid,
+                            &subject_type,
+                            &subject_id,
+                            &action,
+                        ),
+                        Insert,
+                        fields,
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::SharedSettingSecret => {
+                // External-credential secrets are encrypted at rest and re-keyed
+                // per node by the sync materializer from the live `settings` row;
+                // the baseline reset re-emits them through the dedicated secret
+                // path (`set_setting_secure`), not this snapshot, so they are not
+                // re-seeded generically here.
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(emitted)
+}
+
+fn organization_reseed_fields(
+    name: &str,
+    slug: &str,
+    contact_email: Option<&str>,
+    dpo_contact: Option<&str>,
+    retention_policy_json: Option<&str>,
+    status: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert("slug".to_string(), field_string(slug));
+    fields.insert(
+        "contact_email".to_string(),
+        field_optional_string(contact_email),
+    );
+    fields.insert(
+        "dpo_contact".to_string(),
+        field_optional_string(dpo_contact),
+    );
+    fields.insert(
+        "retention_policy_json".to_string(),
+        field_optional_string(retention_policy_json),
+    );
+    fields.insert("status".to_string(), field_string(status));
+    fields
+}
+
 fn record_core_capture_tx(
     tx: &rusqlite::Transaction<'_>,
     kind: crate::sync::core_registry::CoreSyncResourceKind,
