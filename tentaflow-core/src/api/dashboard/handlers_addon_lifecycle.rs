@@ -153,8 +153,67 @@ fn extract_config_schema(manifest: &toml::Value) -> Vec<AddonConfigField> {
             secret,
         });
     }
+    // Addons that declare vector namespaces get framework-managed settings to
+    // pick their vector backend (zvec by default, or an external Milvus). These
+    // are NOT declared per-addon in the manifest — they are injected here so the
+    // admin GUI shows them and the set handler accepts them.
+    if manifest
+        .get("vector_namespace")
+        .and_then(|v| v.as_array())
+        .map_or(false, |a| !a.is_empty())
+    {
+        out.extend(vector_backend_config_fields());
+    }
+
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// Reserved per-addon config fields for vector-backend selection. Keys are
+/// `__`-prefixed to avoid clashing with addon-declared config ids.
+fn vector_backend_config_fields() -> Vec<AddonConfigField> {
+    vec![
+        AddonConfigField {
+            id: "__vector_backend".to_string(),
+            label: "Baza wektorowa".to_string(),
+            field_type: "select".to_string(),
+            description: "Wbudowany zvec (domyslny) lub zewnetrzny Milvus.".to_string(),
+            default_value: "zvec".to_string(),
+            options: vec!["zvec".to_string(), "milvus".to_string()],
+            required: false,
+            secret: false,
+        },
+        AddonConfigField {
+            id: "__milvus_uri".to_string(),
+            label: "Milvus URI".to_string(),
+            field_type: "text".to_string(),
+            description: "np. http://milvus-host:19530 (wymagane gdy wybrano Milvus).".to_string(),
+            default_value: String::new(),
+            options: Vec::new(),
+            required: false,
+            secret: false,
+        },
+        AddonConfigField {
+            id: "__milvus_user".to_string(),
+            label: "Milvus user".to_string(),
+            field_type: "text".to_string(),
+            description: "Opcjonalny uzytkownik Milvus.".to_string(),
+            default_value: String::new(),
+            options: Vec::new(),
+            required: false,
+            secret: false,
+        },
+        AddonConfigField {
+            id: "__milvus_password".to_string(),
+            label: "Milvus password".to_string(),
+            field_type: "password".to_string(),
+            description: "Opcjonalne haslo Milvus.".to_string(),
+            default_value: String::new(),
+            options: Vec::new(),
+            required: false,
+            secret: true,
+        },
+    ]
 }
 
 // =============================================================================

@@ -207,6 +207,17 @@ impl DeployStrategy for PythonBundleDeploy {
         if let Some(model) = model_repo {
             env.insert("MODEL".into(), model);
         }
+        // OpenAI-compatible backends serve the model under `--served-model-name`
+        // (falling back to `--model` = repo path). The executor rewrites
+        // `request.model` to the advertised slug from `models_from_manifest`, so
+        // the served name MUST equal that slug or every dispatch 404s when the
+        // preset id differs from its repo. bundle.toml `[launch] args` reference
+        // it via `${SERVED_MODEL_NAME}`; non-vllm engines simply ignore the var.
+        if let Some(served) =
+            super::resolve_served_model_name(&self.manifest, &self.user_config)
+        {
+            env.insert("SERVED_MODEL_NAME".into(), served);
+        }
         let is_cuda_vllm = is_cuda_vllm_engine(&engine_id);
         apply_vllm_user_args(&engine_id, &self.user_config, &mut env);
         // vLLM featured presets (Bielik draft, Qwen MTP): append the preset's

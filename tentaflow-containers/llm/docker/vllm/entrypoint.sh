@@ -58,6 +58,7 @@ echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (${#VLLM_ARG_ARR[@]
 vllm serve "$MODEL" \
   --host 127.0.0.1 \
   --port "$VLLM_PORT" \
+  --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
   "${VLLM_ARG_ARR[@]}" 2>&1 \
   | sed -u 's/^/[vllm] /' &
 VLLM_PID=$!

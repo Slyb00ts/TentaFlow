@@ -2391,6 +2391,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::SuggestServicePortRequest — first free host port for the deploy form. */
+  suggestServicePortRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSuggestServicePortRequest(JSON.stringify(payload));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::AddonInstallRequest — instaluje addon z ZIP (Uint8Array content). */
   addonInstallRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

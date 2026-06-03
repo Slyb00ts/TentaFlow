@@ -134,7 +134,7 @@ fn vector_namespace_get_returns_not_found_for_cross_org_lookup() {
     let dir = tempfile::TempDir::new().unwrap();
     let mgr = NamespaceManager::with_root(pool, dir.path().to_path_buf());
 
-    mgr.get_or_create("org-a", "addon-rag", "docs", 8, Metric::Cosine)
+    mgr.get_or_create("org-a", "addon-rag", "docs", 8, Metric::Cosine, &[], false)
         .expect("create");
     // Org B asking for the same (addon, namespace) tuple must NOT see it —
     // the SQL filter on `addon_vector_namespaces.org_id` blocks the read.

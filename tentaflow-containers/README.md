@@ -170,3 +170,5 @@ Nic nie trzeba klonowac ani budowac recznie.
 | image-gen | comfyui | `image-gen/docker/comfyui/` + `image-gen/python/comfyui/` |
 | image-gen | stable-diffusion-cpp | `image-gen/native/stable-diffusion-cpp/` |
 | agents | teams-bot | `agents/docker/teams-bot/` |
+| tools | iroh-relay | `tools/docker/iroh-relay/` |
+| tools | milvus | `tools/docker/milvus/` |

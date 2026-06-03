@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Stan cyklu zycia aplikacji mobilnej
 pub struct MobileLifecycle {
@@ -47,25 +47,14 @@ impl MobileLifecycle {
     ///
     /// Automatycznie wyladowuje zaladowany model aby zwolnic pamiec.
     pub fn on_memory_warning(&self) {
-        warn!("Ostrzezenie o niskiej pamieci — wyladowywanie modelu");
+        warn!("Ostrzezenie o niskiej pamieci — wyladowywanie modeli (residency)");
         self.memory_warning.store(true, Ordering::SeqCst);
 
-        // Wyladuj model w tle przez wspoldzielony InferenceManager
-        let inference = tentaflow_core::inference::shared_inference_manager();
-
-        // Uzyj tokio runtime handle do wywolania async unload
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let mut mgr = inference.write().await;
-                if let Err(e) = mgr.unload_model().await {
-                    error!("Blad wyladowywania modelu przy memory warning: {}", e);
-                } else {
-                    info!("Model wyladowany z powodu ostrzezenia o pamieci");
-                }
-            });
-        } else {
-            warn!("Brak tokio runtime — nie mozna wyladowac modelu asynchronicznie");
-        }
+        // Memory guard przez ModelResidency: wyladowuje WSZYSTKIE unpinned
+        // modele (LLM/STT/TTS), nie tylko LLM. Dziala z tego watku (iOS main)
+        // bo spawnuje na handlu runtime zapisanym przy starcie — wczesniej
+        // `Handle::try_current()` tu failowal ("Brak tokio runtime").
+        tentaflow_core::services::model_residency::trigger_memory_unload();
     }
 
     pub fn is_foreground(&self) -> bool {

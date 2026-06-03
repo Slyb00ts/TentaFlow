@@ -63,11 +63,13 @@ gpu-vulkan = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/vulkan", "
 # instalator setup.ps1 -Vulkan to obsluguje).
 gpu-rocm = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/rocm", "whisper-rs/vulkan"]
 gpu-metal = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/metal", "whisper-rs/metal"]
-# Embedded vector storage (F1c P3). Opt-in because usearch ships a C++ core
-# (cxx) — cross-compile to ios/android requires extra toolchain wiring that
-# we have not validated yet. Server bin enables this explicitly; mobile and
-# desktop crates stay slim until the C++ toolchain is in place.
-vector = ["dep:usearch"]
+# Embedded vector storage backed by the zvec engine. Opt-in because zvec links a
+# heavy native lib (RocksDB/Arrow/protobuf, vendored per platform by
+# scripts/build-zvec.sh). Server bin enables this explicitly; mobile/desktop
+# crates stay slim until the platform artifact is in place.
+vector = ["dep:tentaflow-zvec"]
+# External Milvus backend (gRPC) selectable per addon alongside the embedded zvec.
+vector-milvus = ["vector", "dep:milvus-sdk-rust"]
 
 [dependencies]
 # Protocol (zawsze)
@@ -169,12 +171,13 @@ flate2 = "1.1.9"
 tar = "0.4.45"
 tempfile = "3.27.0"
 
-# Vector storage (F1c P3 — embedded HNSW + mmap)
-# Cross-compile uwaga: usearch ma C++ core (cxx). Buduje sie na desktop
-# (linux/macos/windows) bez problemu — wymaga toolchainu cc/c++. Mobile
-# (ios/android) potrzebuje weryfikacji w F1c P3.1 (opcjonalnie fallback
-# `hnsw_rs` pure-Rust). Domyslne features wystarcza (HNSW + save/load).
-usearch = { version = "2.25", optional = true }
+# Vector storage — embedded zvec engine (safe wrapper over the vendored C API).
+# Desktop links zvec's self-contained shared lib; mobile uses a static archive.
+tentaflow-zvec = { path = "../tentaflow-zvec", optional = true }
+# External vector DB — official Milvus gRPC client (pure Rust). Only pulled in
+# when the `vector-milvus` feature is enabled. Pinned to a git rev: the published
+# 0.1.0 predates the query/flush/stats API this backend uses.
+milvus-sdk-rust = { git = "https://github.com/milvus-io/milvus-sdk-rust", rev = "cce570b53d540e6a0ad7f9cf2c47c033857152ae", optional = true }
 
 # Synchronizacja
 parking_lot = "0.12.5"

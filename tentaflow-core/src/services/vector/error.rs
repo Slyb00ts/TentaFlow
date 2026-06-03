@@ -59,7 +59,10 @@ pub enum VectorError {
         source: std::io::Error,
     },
 
-    #[error("usearch error: {0}")]
+    #[error("invalid filter: {0}")]
+    InvalidFilter(String),
+
+    #[error("vector backend error: {0}")]
     Backend(String),
 
     #[error("database error: {0}")]

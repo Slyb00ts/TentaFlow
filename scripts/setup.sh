@@ -322,6 +322,8 @@ install_base() {
                 openssl
                 vulkan-icd-loader
                 sqlite
+                # protoc dla prost-build (feature vector-milvus).
+                protobuf
                 # Profiling: perf zbiera CPU samples + PMU counters + uncore IMC.
                 # which jest potrzebne dla collectors/permissions auto-discovery.
                 perf
@@ -349,6 +351,7 @@ install_base() {
                 libssl-dev
                 libvulkan1
                 libsqlite3-dev
+                protobuf-compiler
                 # Profiling: linux-tools dostarcza perf, sysstat dostarcza iostat.
                 # linux-tools-generic to meta-package ktory dociaga linux-tools-<kernel>
                 # pasujace do biezacego kernela (Ubuntu 24.04+).
@@ -377,6 +380,7 @@ install_base() {
                 openssl-devel
                 vulkan-loader
                 sqlite-devel
+                protobuf-compiler
                 # Profiling: perf jest w pakiecie 'perf' na Fedora 38+.
                 # sysstat dostarcza iostat dla linux.iostat.disk collector.
                 perf
@@ -405,6 +409,7 @@ install_base() {
                 gst-plugins-base
                 openssl@3
                 sqlite
+                protobuf
             )
             log_info "Instalacja: ${pkgs[*]}"
             brew install "${pkgs[@]}"
@@ -415,6 +420,46 @@ install_base() {
     esac
 
     log_ok "Bazowe zaleznosci zainstalowane"
+}
+
+# --- zvec (wbudowana baza wektorowa — statyczny artefakt per platforma) ---
+
+install_zvec() {
+    log_section "zvec (wbudowana baza wektorowa)"
+
+    # Mapowanie hosta na zvendorowany artefakt tentaflow-zvec-sys.
+    local plat
+    if [[ "$DISTRO" == "macos" ]]; then
+        plat="macos-arm64"
+    elif [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
+        plat="linux-aarch64"
+    else
+        plat="linux-x86_64"
+    fi
+
+    # Desktop links the shared lib; mobile would use a static archive.
+    local artifact="libzvec_c_api.so"
+    [[ "$DISTRO" == "macos" ]] && artifact="libzvec_c_api.dylib"
+    local lib="$(dirname "$0")/../tentaflow-zvec-sys/vendor/lib/$plat/$artifact"
+    if [[ -f "$lib" ]]; then
+        log_ok "zvec juz zbudowany ($plat) — pomijam"
+        return
+    fi
+
+    # Linux: RocksDB 8.1 (zaleznosc zvec) nie kompiluje sie pod gcc>=13, wiec build
+    # leci w kontenerze Ubuntu 22.04/gcc-11 — wymaga Dockera.
+    if [[ "$DISTRO" != "macos" ]] && ! command -v docker &>/dev/null; then
+        log_warn "Docker wymagany do zbudowania zvec na Linux. Zainstaluj go i uruchom:"
+        log_warn "  ./scripts/build-zvec.sh $plat"
+        return
+    fi
+
+    log_info "Buduje zvec ($plat) — dlugi build (RocksDB+Arrow), jednorazowo na maszyne..."
+    if bash "$(dirname "$0")/build-zvec.sh" "$plat"; then
+        INSTALLED+=("zvec ($plat static lib)")
+    else
+        log_warn "Build zvec nieudany — sprobuj recznie: ./scripts/build-zvec.sh $plat"
+    fi
 }
 
 # --- Rust toolchain ---
@@ -1248,6 +1293,7 @@ main() {
     download_meeting_bot_assets
 
     install_base
+    install_zvec
     install_rust
     install_wasm_target
     install_wasm_bindgen_cli

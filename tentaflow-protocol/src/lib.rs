@@ -195,6 +195,8 @@ pub use message_body::{
     DeployVllmModelSpecSummary,
     DeployVllmRecommendRequest,
     DeployVllmRecommendResponse,
+    SuggestServicePortRequest,
+    SuggestServicePortResponse,
     DeployVllmVramEstimate,
     DeploymentListRequest,
     DeploymentListResponse,
