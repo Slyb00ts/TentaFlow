@@ -27,6 +27,11 @@ use crate::sync::ledger::{LedgerResult, SyncLedgerError};
 /// moze byc w danym momencie albo dawca, albo joinerem, nigdy obojgiem.
 pub const BASELINE_ADOPT_STATE_KEY: &str = "baseline_adopt_state";
 
+/// Klucz w `settings` trzymajacy ostatni raport importu baseline'u. Zapisywany
+/// po `finish_post_commit` (faza `Completed`), zeby admin mogl odpytac wynik
+/// adopcji przez protokol nawet po restarcie. Czyszczony razem ze stanem adopcji.
+pub const BASELINE_ADOPT_REPORT_KEY: &str = "baseline_adopt_report";
+
 /// Maksymalny rozmiar pojedynczego chunka baseline'u (bajty surowego CBOR).
 /// Dobrany pod limit ramki iroh pairingu (64 KiB) z zapasem na naglowek CBOR
 /// `BaselineChunk` (seq + 32-bajtowy hash + length-prefix bytes).
@@ -116,7 +121,29 @@ pub fn load_adopt_state(db: &DbPool) -> LedgerResult<Option<BaselineAdoptState>>
 
 pub fn clear_adopt_state(db: &DbPool) -> LedgerResult<()> {
     db::repository::delete_setting(db, BASELINE_ADOPT_STATE_KEY)
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    db::repository::delete_setting(db, BASELINE_ADOPT_REPORT_KEY)
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
+}
+
+/// Persystuje raport importu po zakonczonej adopcji, by admin mogl go odpytac
+/// przez protokol nawet po restarcie noda.
+pub fn store_adopt_report(db: &DbPool, report: &BaselineImportReport) -> LedgerResult<()> {
+    let json = serde_json::to_string(report)
+        .map_err(|e| SyncLedgerError::Codec(format!("baseline adopt report encode: {e}")))?;
+    db::repository::set_setting(db, BASELINE_ADOPT_REPORT_KEY, &json)
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
+}
+
+pub fn load_adopt_report(db: &DbPool) -> LedgerResult<Option<BaselineImportReport>> {
+    let Some(json) = db::repository::get_setting(db, BASELINE_ADOPT_REPORT_KEY)
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let report = serde_json::from_str(&json)
+        .map_err(|e| SyncLedgerError::Decode(format!("baseline adopt report decode: {e}")))?;
+    Ok(Some(report))
 }
 
 /// Czy istniejacy stan adopcji blokuje nowy start celujacy w
@@ -1006,7 +1033,7 @@ pub fn reassemble_chunks(
 
 /// Wynik importu — co dokladnie zostalo zmapowane/scalone. Uzywane przez UX
 /// kroku 3 do pokazania podsumowania adopcji.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaselineImportReport {
     pub donor_org_id: String,
     /// Lokalni userzy joinera zmapowani na usera dawcy (match po dokladnym emailu).
@@ -1107,6 +1134,13 @@ pub fn import_baseline(
     };
 
     finish_post_commit(db, &snapshot.epoch, donor_node_id)?;
+
+    // Persist the completed report so admin can query the adoption outcome via
+    // the binary protocol after the run (and across restarts). Failure here is
+    // non-fatal: the destructive merge already committed.
+    if let Err(e) = store_adopt_report(db, &report) {
+        warn!("baseline import: persisting adopt report failed: {}", e);
+    }
 
     info!(
         donor = %donor_node_id,
