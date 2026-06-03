@@ -30,7 +30,7 @@ pub struct LlmRequest {
     /// User context propagated z `ExecutionContext.user_id` / `user_role`.
     /// Wrapper przekazuje to do `RuntimeContext` żeby resolver/strategy nie
     /// widziały `user=None` mimo że request przyszedł od zalogowanego usera.
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub user_role: Option<String>,
 }
 

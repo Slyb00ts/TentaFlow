@@ -107,6 +107,11 @@ export async function openDeployWizard(engineId, opts = {}) {
       kv_cache_dtype: 'auto',
       gpu_memory_utilization: 0.9,
       gpu_memory_touched: false,
+      // Quantization override do kalkulatora VRAM (`quantization_override`).
+      // Pre-fillsuje sie z presetu: `model_preset.vllm.quantize` (self-quant,
+      // np. NVFP4) albo `model_preset.quantization`. Pusty = dtype ze zrodla
+      // (config.json). User moze zmienic w trybie manual i przeliczyc.
+      quantization: null,
       // MLX-only: budzet pamieci (MB) dla Apple unified memory. Kalkulator
       // przelicza go na "max kontekst (tokeny)" client-side z model_spec.
       mlx_max_memory_mb: 8192,
@@ -196,6 +201,13 @@ function applySpeculatorPreset(preset) {
     sp.method = 'dflash';
     sp.num_tokens = 8;
   }
+  // Quantization presetu — self-quant (vllm.quantize, np. NVFP4) ma priorytet
+  // nad statyczna etykieta `quantization`. Bez tego kalkulator liczyl wagi w
+  // dtype zrodla (BF16) i odrzucal NVFP4-owy model na GPU ktory by go zmiescil.
+  const presetQuant = (preset && preset.vllm && preset.vllm.quantize)
+    || (preset && preset.quantization)
+    || null;
+  selection.advanced.quantization = presetQuant;
 }
 
 export function close() {
@@ -1052,6 +1064,24 @@ function renderAdvancedManualControls(adv, rec) {
     ? tAdv('ctx_hint_max_with_vram', { model: modelMaxCtx ? modelMaxCtx.toLocaleString() : '?', vram: vramMaxCtx.toLocaleString() })
     : tAdv('ctx_hint_max', { model: modelMaxCtx ? modelMaxCtx.toLocaleString() : '?' });
 
+  // Quantization wag — wejscie do kalkulatora VRAM (`quantization_override`).
+  // Domyslnie z presetu (vllm.quantize / quantization); user moze nadpisac.
+  const quant = (adv.quantization || '').toLowerCase();
+  const QUANT_OPTS = ['nvfp4', 'mxfp4', 'fp8', 'int8', 'awq', 'gptq'];
+  const quantOpts = [`<option value="">${escapeHtml(tAdv('quant_opt_source'))}</option>`];
+  if (quant && !QUANT_OPTS.includes(quant)) {
+    quantOpts.push(`<option value="${escapeAttr(quant)}">${escapeHtml(quant.toUpperCase())}</option>`);
+  }
+  QUANT_OPTS.forEach((q) => quantOpts.push(`<option value="${q}">${q.toUpperCase()}</option>`));
+  const quantRowHtml = `
+    <div class="adv-form-row">
+      <label>${escapeHtml(tAdv('quant_label'))}</label>
+      <tf-select id="edw-adv-quant" value="${escapeAttr(quant)}">
+        ${quantOpts.join('')}
+      </tf-select>
+      <div class="adv-hint">${escapeHtml(tAdv('quant_hint'))}</div>
+    </div>`;
+
   return `
     <div class="adv-form-row">
       <label>
@@ -1094,6 +1124,8 @@ function renderAdvancedManualControls(adv, rec) {
     </div>
 
     ${liveKvHint}
+
+    ${quantRowHtml}
 
     <div class="adv-form-row">
       <label>${escapeHtml(tAdv('kv_label'))}</label>
@@ -1165,6 +1197,7 @@ function bindAdvancedHandlers() {
       max_num_seqs: a.max_num_seqs || undefined,
       kv_cache_dtype: a.kv_cache_dtype !== 'auto' ? a.kv_cache_dtype : undefined,
       gpu_memory_utilization: a.gpu_memory_utilization || undefined,
+      quantization_override: a.quantization || undefined,
       lock_max_model_len: lock === 'max_model_len' || undefined,
       lock_max_num_seqs: lock === 'max_num_seqs' || undefined,
       lock_tensor_parallel: lock === 'tensor_parallel' || undefined,
@@ -1270,6 +1303,18 @@ function bindAdvancedHandlers() {
     });
   }
 
+  // Quantization wag — zmiana przelicza wagi w kalkulatorze VRAM (pusta
+  // wartosc = dtype ze zrodla). To pozwala dopasowac model do GPU bez
+  // czekania na pre-quant — kalkulator od razu pokazuje docelowy rozmiar.
+  const quantSelect = document.getElementById('edw-adv-quant');
+  if (quantSelect) {
+    quantSelect.addEventListener('change', (e) => {
+      const v = e.detail?.value ?? quantSelect.value;
+      selection.advanced.quantization = v || null;
+      debounceRecompute(buildOverrides());
+    });
+  }
+
   // Speculative Decoding — toggle, model repo, method, num_tokens.
   // Recompute VRAM nie jest wywolywane bo backend recommender (auto_fit_config)
   // nie modeluje pamieci speculatora. To swiadomy trade-off — drafter to
@@ -1329,13 +1374,16 @@ function bindAdvancedHandlers() {
       a.gpu_memory_utilization = 0.9;
       a.gpu_memory_touched = false;
       a.kv_cache_dtype = 'auto';
-      debounceRecompute({});
+      // Quantization NIE jest tuningiem — to wlasciwosc presetu modelu. Reset
+      // czysci tylko auto-fit, kwantyzacja zostaje (buildOverrides ja niesie).
+      debounceRecompute(buildOverrides());
     });
   }
 
-  // Initial fetch gdy jeszcze nie ma rekomendacji.
+  // Initial fetch gdy jeszcze nie ma rekomendacji — z quantization_override
+  // presetu (inaczej kalkulator liczy wagi w dtype zrodla, nie NVFP4).
   if (!advancedRecommendation) {
-    debounceRecompute({});
+    debounceRecompute(buildOverrides());
   }
 }
 
@@ -1646,6 +1694,10 @@ function bindStepModelInputs() {
       it.classList.add('selected');
       const preset = Manifest.modelPresets(engineEntry).find((p) => p?.id === selection.modelPresetId);
       if (preset) applySpeculatorPreset(preset);
+      // Zmiana modelu uniewaznia estymacje VRAM — wymus ponowny /recommend
+      // (z nowa quantization presetu) przy wejsciu na krok Advanced.
+      advancedRecommendation = null;
+      cachedModelSpec = null;
     });
   });
 
@@ -1678,6 +1730,8 @@ function bindHfResultClicks() {
       // Free-form HF model nie ma sparowanego speculatora w manifescie —
       // reset, niech user wpisze recznie jak chce.
       applySpeculatorPreset(null);
+      advancedRecommendation = null;
+      cachedModelSpec = null;
     });
   });
 }

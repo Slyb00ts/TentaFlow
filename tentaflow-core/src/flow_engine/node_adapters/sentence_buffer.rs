@@ -262,12 +262,7 @@ mod tests {
         let got = collect_text(
             &SentenceBufferNodeAdapter,
             &node(json!({})),
-            vec![
-                llm("Hello"),
-                llm(" world."),
-                llm(" How"),
-                llm(" are you?"),
-            ],
+            vec![llm("Hello"), llm(" world."), llm(" How"), llm(" are you?")],
         )
         .await;
         let sentences: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();

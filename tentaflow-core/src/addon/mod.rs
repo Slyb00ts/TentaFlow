@@ -419,7 +419,7 @@ pub struct ToolDefinition {
 pub struct AddonState {
     pub addon_id: String,
     pub instance_id: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     /// F2 P1.b — owning organization for this addon instance. Threaded through
     /// audit emits and per-org filesystem sandbox paths. `None` for system /
     /// boot starts that pre-date a real org context (treated as `org-default`
@@ -449,8 +449,7 @@ pub struct AddonState {
     pub oauth_refresh_guard: Arc<oauth_refresh_guard::OAuthRefreshGuard>,
     /// Shared cache of raw validated CBOR bytes from `ui_render_cbor`.
     /// `None` in isolated event_bus tests.
-    pub ui_panels:
-        Option<Arc<PlRwLock<HashMap<(i64, String, String), Vec<u8>>>>>,
+    pub ui_panels: Option<Arc<PlRwLock<HashMap<(String, String, String), Vec<u8>>>>>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
@@ -472,7 +471,7 @@ pub struct AddonState {
 pub struct AddonInstance {
     pub addon_id: String,
     pub instance_id: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub store: WasmStore<AddonState>,
     pub instance: WasmInstance,
     /// Language-specific export name mapping (Rust / .NET / Python).
@@ -515,7 +514,7 @@ pub struct AddonManager {
     service_tasks: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Cache of raw validated CBOR bytes from `ui_render_cbor`, keyed by
     /// (user_id, addon_id, slot). Frontend receives CBOR via event bus push.
-    ui_panels: Arc<PlRwLock<HashMap<(i64, String, String), Vec<u8>>>>,
+    ui_panels: Arc<PlRwLock<HashMap<(String, String, String), Vec<u8>>>>,
 }
 
 /// Returns the subset of `owned` alias names that should be activated on
@@ -573,9 +572,7 @@ impl AddonManager {
     }
 
     /// Handle to the raw validated CBOR bytes cache written by `ui_render_cbor`.
-    pub fn ui_panels(
-        &self,
-    ) -> Arc<PlRwLock<HashMap<(i64, String, String), Vec<u8>>>> {
+    pub fn ui_panels(&self) -> Arc<PlRwLock<HashMap<(String, String, String), Vec<u8>>>> {
         self.ui_panels.clone()
     }
 
@@ -978,7 +975,7 @@ impl AddonManager {
     pub fn start_addon(
         &self,
         addon_id: &str,
-        user_id: Option<i64>,
+        user_id: Option<String>,
         org_id: Option<String>,
     ) -> Result<String> {
         let t_total = std::time::Instant::now();
@@ -992,20 +989,24 @@ impl AddonManager {
         let manifest = self.load_addon_manifest(addon_id)?;
         let dt_db = t0.elapsed();
 
-        let rt_id = manifest.runtime.clone().unwrap_or_else(|| "wasmtime".to_string());
+        let rt_id = manifest
+            .runtime
+            .clone()
+            .unwrap_or_else(|| "wasmtime".to_string());
         let instance_id = uuid::Uuid::new_v4().to_string();
 
+        let is_system_call = user_id.is_none();
         let state = AddonState {
             addon_id: addon_id.to_string(),
             instance_id: instance_id.clone(),
-            user_id,
+            user_id: user_id.clone(),
             org_id: org_id.clone(),
             db: self.db.clone(),
             permissions,
             event_bus: self.event_bus.clone(),
             permission_checker: self.permission_checker.clone(),
             fuel_consumed: 0,
-            is_system_call: user_id.is_none(),
+            is_system_call,
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(
                 host_functions::network::NetworkConnectionManager::new(),
@@ -1036,8 +1037,8 @@ impl AddonManager {
         let dt_instantiate = t0.elapsed();
 
         // Resolve language adapter from manifest runtime field
-        let adapter = runtime::adapter_for_runtime(&rt_id)
-            .unwrap_or_else(|| Box::new(runtime::RustAdapter));
+        let adapter =
+            runtime::adapter_for_runtime(&rt_id).unwrap_or_else(|| Box::new(runtime::RustAdapter));
 
         // .NET NativeAOT / CPython need _start or _initialize to bootstrap
         // their managed runtime (GC, interpreter) before any lifecycle call.
@@ -1049,7 +1050,11 @@ impl AddonManager {
             let wasi_start = instance
                 .get_typed_func::<(), ()>(&mut store, "_start")
                 .ok()
-                .or_else(|| instance.get_typed_func::<(), ()>(&mut store, "_initialize").ok());
+                .or_else(|| {
+                    instance
+                        .get_typed_func::<(), ()>(&mut store, "_initialize")
+                        .ok()
+                });
             if let Some(f) = wasi_start {
                 f.call(&mut store, ())
                     .map_err(|e| anyhow::anyhow!("WASI _start/_initialize failed: {e}"))?;
@@ -1064,9 +1069,9 @@ impl AddonManager {
             .get_typed_func::<(), i32>(&mut store, adapter.export_on_start())
             .ok()
         {
-            let result = on_start
-                .call(&mut store, ())
-                .map_err(|e| anyhow::anyhow!("Blad wywolania {}(): {e}", adapter.export_on_start()))?;
+            let result = on_start.call(&mut store, ()).map_err(|e| {
+                anyhow::anyhow!("Blad wywolania {}(): {e}", adapter.export_on_start())
+            })?;
             if result != 0 {
                 bail!("{}() zwrocil blad: {}", adapter.export_on_start(), result);
             }
@@ -1091,7 +1096,7 @@ impl AddonManager {
         let addon_instance = AddonInstance {
             addon_id: addon_id.to_string(),
             instance_id: instance_id.clone(),
-            user_id,
+            user_id: user_id.clone(),
             store,
             instance,
             language_adapter: adapter,
@@ -1449,7 +1454,7 @@ impl AddonManager {
         addon_id: &str,
         panel_id: &str,
         epoch: u64,
-        user_id: Option<i64>,
+        user_id: Option<String>,
     ) -> Result<bool> {
         // Extract instance from map (brief lock)
         let mut addon_instance = {
@@ -1618,7 +1623,10 @@ impl AddonManager {
             .ok()
         {
             if let Err(e) = on_stop.call(&mut addon_instance.store, ()) {
-                warn!("Blad wywolania {}() dla '{}': {}", stop_export, instance_id, e);
+                warn!(
+                    "Blad wywolania {}() dla '{}': {}",
+                    stop_export, instance_id, e
+                );
             }
         }
 
@@ -1666,7 +1674,7 @@ impl AddonManager {
         addon_id: &str,
         tool_name: &str,
         params: serde_json::Value,
-        user_id: i64,
+        user_id: &str,
     ) -> Result<serde_json::Value> {
         info!(
             "Wywolanie narzedzia '{}.{}' przez user_id={}",
@@ -1784,7 +1792,9 @@ impl AddonManager {
                     &mut addon_instance.store,
                     req_export,
                 )
-                .map_err(|e| anyhow::anyhow!("Addon nie eksportuje funkcji {}(): {e}", req_export))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("Addon nie eksportuje funkcji {}(): {e}", req_export)
+                })?;
 
             let result_code = on_request
                 .call(
@@ -1890,7 +1900,7 @@ impl AddonManager {
         addon_id: &str,
         block_type: &str,
         envelope_json: &[u8],
-        user_id: Option<i64>,
+        user_id: Option<String>,
         org_id: Option<String>,
         fuel_budget: u64,
         deadline: Option<std::time::Instant>,
@@ -1902,7 +1912,7 @@ impl AddonManager {
 
         // Permission: addon musi miec "flow_blocks" (opcjonalnie z resource =
         // block_type, ale dla MVP wystarczy ogolne). Brak uprawnien = bail.
-        if let Some(uid) = user_id {
+        if let Some(uid) = user_id.as_deref() {
             let perm =
                 self.permission_checker
                     .check(addon_id, uid, "flow_blocks", Some(block_type));
@@ -1918,7 +1928,10 @@ impl AddonManager {
         let module = self.get_or_compile_module(addon_id)?;
         let permissions = self.load_addon_permissions(addon_id)?;
         let manifest = self.load_addon_manifest(addon_id)?;
-        let block_rt_id = manifest.runtime.clone().unwrap_or_else(|| "wasmtime".to_string());
+        let block_rt_id = manifest
+            .runtime
+            .clone()
+            .unwrap_or_else(|| "wasmtime".to_string());
 
         let instance_id = format!("block-{}", uuid::Uuid::new_v4());
 
@@ -1926,7 +1939,7 @@ impl AddonManager {
         let state = AddonState {
             addon_id: addon_id.to_string(),
             instance_id: instance_id.clone(),
-            user_id,
+            user_id: user_id.clone(),
             org_id: org_id.clone(),
             db: self.db.clone(),
             permissions,
@@ -1999,7 +2012,11 @@ impl AddonManager {
             let wasi_start = instance
                 .get_typed_func::<(), ()>(&mut store, "_start")
                 .ok()
-                .or_else(|| instance.get_typed_func::<(), ()>(&mut store, "_initialize").ok());
+                .or_else(|| {
+                    instance
+                        .get_typed_func::<(), ()>(&mut store, "_initialize")
+                        .ok()
+                });
             if let Some(f) = wasi_start {
                 f.call(&mut store, ())
                     .map_err(|e| anyhow::anyhow!("WASI _start/_initialize failed: {e}"))?;
@@ -2119,11 +2136,10 @@ impl AddonManager {
             drop(handle);
         }
 
-        // Loguj do audit. user_id=0 = system call (None mapuje na 0,
-        // konwencja z call_tool gdzie sygnatura jest i64).
+        // Loguj do audit. Pusty user_id = system call (None mapuje na "").
         self.log_audit(
             addon_id,
-            user_id.unwrap_or(0),
+            user_id.as_deref().unwrap_or(""),
             "flow_block.invoke",
             Some(block_type),
             None,
@@ -2366,7 +2382,7 @@ impl AddonManager {
     fn log_audit(
         &self,
         addon_id: &str,
-        user_id: i64,
+        user_id: &str,
         action: &str,
         resource_id: Option<&str>,
         error_message: Option<&str>,

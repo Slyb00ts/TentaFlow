@@ -254,7 +254,7 @@ pub enum CatalogEntryKind {
     /// A flow exposed under `published_model_name` — clients call it like
     /// any other model; the flow engine handles dispatch internally.
     Flow {
-        flow_id: i64,
+        flow_id: String,
         published_name: String,
     },
     /// An alias mapping one name onto a primary target plus optional

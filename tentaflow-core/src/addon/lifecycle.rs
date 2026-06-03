@@ -453,7 +453,7 @@ pub fn sync_manifest_metadata(db: &crate::db::DbPool, manifest: &AddonManifest) 
         repository::set_addon_admin_only(db, addon_id, v.admin_only)?;
         for group_name in &v.default_groups {
             if let Some(gid) = repository::get_group_id_by_name(db, group_name)? {
-                repository::set_addon_visibility(db, addon_id, gid, true, None)?;
+                repository::set_addon_visibility(db, addon_id, &gid, true, None)?;
             }
         }
     }
@@ -904,6 +904,15 @@ fn validate_manifest(manifest: &AddonManifest) -> Result<()> {
         }
         if rule.host.is_empty() {
             bail!("network_rule '{}': host is empty", rule.id);
+        }
+        if rule.host.contains('*')
+            && rule.host != "*"
+            && !(rule.host.starts_with("*.") && !rule.host[2..].contains('*'))
+        {
+            bail!(
+                "network_rule '{}': wildcard host must be '*' or '*.domain'",
+                rule.id
+            );
         }
         if rule.port == 0 {
             bail!("network_rule '{}': port must be 1-65535", rule.id);

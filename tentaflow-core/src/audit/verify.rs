@@ -86,7 +86,7 @@ pub fn verify_chain(conn: &Connection) -> Result<VerifyReport, AuditVerifyError>
         report.total += 1;
 
         let id: i64 = row.get(0)?;
-        let user_id: Option<i64> = row.get(1)?;
+        let user_id: Option<String> = row.get(1)?;
         let addon_id: Option<String> = row.get(2)?;
         let instance_id: Option<String> = row.get(3)?;
         let action: String = row.get(4)?;
@@ -159,7 +159,7 @@ pub fn verify_chain(conn: &Connection) -> Result<VerifyReport, AuditVerifyError>
         }
 
         let input = AuditRowHashInput {
-            user_id,
+            user_id: user_id.as_deref(),
             addon_id: addon_id.as_deref(),
             instance_id: instance_id.as_deref(),
             action: &action,
@@ -224,7 +224,7 @@ mod tests {
         let ts = format!("2026-05-16 10:00:{:02}", action.len() % 60);
 
         let input = AuditRowHashInput {
-            user_id: Some(1),
+            user_id: Some("00000000-0000-0000-0000-000000000001"),
             addon_id: Some("com.test"),
             instance_id: Some("inst"),
             action,
@@ -251,7 +251,7 @@ mod tests {
                 timestamp, prev_hash, hash) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
-                1i64,
+                "00000000-0000-0000-0000-000000000001",
                 "com.test",
                 "inst",
                 action,

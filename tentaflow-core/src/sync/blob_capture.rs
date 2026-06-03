@@ -17,7 +17,7 @@ pub struct BlobWriteCapture {
     pub mime: String,
     pub size_bytes: u64,
     pub file_path: String,
-    pub actor_user_id: Option<i64>,
+    pub actor_user_id: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -29,7 +29,7 @@ impl BlobWriteCapture {
         mime: impl Into<String>,
         size_bytes: u64,
         file_path: impl Into<String>,
-        actor_user_id: Option<i64>,
+        actor_user_id: Option<String>,
     ) -> Self {
         let org_id = org_id.into();
         let blob_id = blob_id.into();

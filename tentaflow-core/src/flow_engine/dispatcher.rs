@@ -57,9 +57,9 @@ const FLOW_TIMEOUT_SECS: u64 = 120;
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
     #[error("flow {flow_id} ACL denied for user")]
-    Denied { flow_id: i64 },
+    Denied { flow_id: String },
     #[error("flow {flow_id} compile failed: {msg}")]
-    CompileFailed { flow_id: i64, msg: String },
+    CompileFailed { flow_id: String, msg: String },
     #[error("synthetic dispatch unsupported for service_type='{service_type}', model='{model}'")]
     Unsupported { service_type: String, model: String },
     #[error("flow dispatch internal: {0}")]
@@ -91,7 +91,7 @@ enum ResolvedFlow {
 pub struct FlowRequestMeta {
     pub request_id: String,
     pub session_id: Option<String>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub user_role: Option<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
@@ -146,7 +146,7 @@ impl ContextFactory {
             request_id: meta.request_id.clone(),
             execution_id: 0,
             session_id: meta.session_id.clone(),
-            user_id: meta.user_id,
+            user_id: meta.user_id.clone(),
             user_role: meta.user_role.clone(),
             deadline: meta.deadline,
             cancel_token: meta.cancel_token.clone(),
@@ -297,9 +297,9 @@ impl FlowDispatcher {
             .map_err(DispatchError::from)?
         {
             ResolvedFlow::Found(cached) => {
-                if !self.acl_allow(cached.flow.id, &meta) {
+                if !self.acl_allow(&cached.flow.id, &meta) {
                     return Err(DispatchError::Denied {
-                        flow_id: cached.flow.id,
+                        flow_id: cached.flow.id.clone(),
                     });
                 }
                 self.run_blocking(cached.compiled.clone(), initial, meta)
@@ -314,7 +314,7 @@ impl FlowDispatcher {
                     .map_err(DispatchError::from)
             }
             ResolvedFlow::CompileFailed => Err(DispatchError::CompileFailed {
-                flow_id: 0,
+                flow_id: String::new(),
                 msg: format!("user-defined flow for '{model_name}/{service_type}'"),
             }),
         }
@@ -322,17 +322,18 @@ impl FlowDispatcher {
 
     pub async fn dispatch_by_flow_id(
         &self,
-        flow_id: i64,
+        flow_id: String,
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let pool = self.db.clone();
-        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, flow_id))
+        let lookup_id = flow_id.clone();
+        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, &lookup_id))
             .await
             .map_err(|e| DispatchError::Internal(e.to_string()))?
             .map_err(|e| DispatchError::Internal(e.to_string()))?;
         let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
-            flow_id,
+            flow_id: flow_id.clone(),
             msg: "flow id nie istnieje w DB".to_string(),
         })?;
         if flow.status != "active" {
@@ -342,14 +343,10 @@ impl FlowDispatcher {
                 msg: format!("flow status='{}' (nie active)", flow.status),
             });
         }
-        if !self.acl_allow(flow_id, &meta) {
+        if !self.acl_allow(&flow_id, &meta) {
             return Err(DispatchError::Denied { flow_id });
         }
-        let compiled = match CompiledFlow::from_json(
-            flow.id,
-            &flow.flow_json,
-            &self.registry,
-        ) {
+        let compiled = match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 warn!(flow_id, "compile failed: {e}");
@@ -369,17 +366,18 @@ impl FlowDispatcher {
     /// model/service_type. Blocking-only flow opakowany w single-chunk stream.
     pub async fn dispatch_by_flow_id_streaming(
         &self,
-        flow_id: i64,
+        flow_id: String,
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
     ) -> std::result::Result<StreamingExecution, DispatchError> {
         let pool = self.db.clone();
-        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, flow_id))
+        let lookup_id = flow_id.clone();
+        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, &lookup_id))
             .await
             .map_err(|e| DispatchError::Internal(e.to_string()))?
             .map_err(|e| DispatchError::Internal(e.to_string()))?;
         let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
-            flow_id,
+            flow_id: flow_id.clone(),
             msg: "flow id nie istnieje w DB".to_string(),
         })?;
         if flow.status != "active" {
@@ -388,10 +386,10 @@ impl FlowDispatcher {
                 msg: format!("flow status='{}' (nie active)", flow.status),
             });
         }
-        if !self.acl_allow(flow_id, &meta) {
+        if !self.acl_allow(&flow_id, &meta) {
             return Err(DispatchError::Denied { flow_id });
         }
-        let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry) {
+        let compiled = match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 return Err(DispatchError::CompileFailed {
@@ -435,9 +433,9 @@ impl FlowDispatcher {
             .map_err(DispatchError::from)?
         {
             ResolvedFlow::Found(cached) => {
-                if !self.acl_allow(cached.flow.id, &meta) {
+                if !self.acl_allow(&cached.flow.id, &meta) {
                     return Err(DispatchError::Denied {
-                        flow_id: cached.flow.id,
+                        flow_id: cached.flow.id.clone(),
                     });
                 }
                 if !cached.compiled.is_streaming {
@@ -454,7 +452,7 @@ impl FlowDispatcher {
             ResolvedFlow::NotFound => self.compile_synthetic_streaming(service_type, model_name)?,
             ResolvedFlow::CompileFailed => {
                 return Err(DispatchError::CompileFailed {
-                    flow_id: 0,
+                    flow_id: String::new(),
                     msg: format!("user-defined streaming flow for '{model_name}/{service_type}'"),
                 });
             }
@@ -479,7 +477,7 @@ impl FlowDispatcher {
         meta: FlowRequestMeta,
     ) -> Result<FlowExecutionOutcome> {
         let ctx = self.ctx_factory.make_context(&meta);
-        let flow_id = compiled.flow_id;
+        let flow_id = compiled.flow_id.clone();
         match timeout(
             Duration::from_secs(FLOW_TIMEOUT_SECS),
             execute_blocking(
@@ -506,12 +504,12 @@ impl FlowDispatcher {
         }
     }
 
-    fn acl_allow(&self, flow_id: i64, meta: &FlowRequestMeta) -> bool {
-        let Some(uid) = meta.user_id else {
+    fn acl_allow(&self, flow_id: &str, meta: &FlowRequestMeta) -> bool {
+        let Some(uid) = meta.user_id.as_deref() else {
             return true;
         };
         let role = meta.user_role.clone().unwrap_or_else(|| "user".into());
-        let allowed = acl::check_access_safe(&self.db, "flow", &flow_id.to_string(), uid, &role);
+        let allowed = acl::check_access_safe(&self.db, "flow", flow_id, uid, &role);
         if !allowed {
             tracing::warn!(user_id = uid, flow_id, "ACL denied flow execution");
         }
@@ -541,21 +539,18 @@ impl FlowDispatcher {
         .await??;
         match resolved {
             Some(flow) => {
-                let compiled = match CompiledFlow::from_json(
-                    flow.id,
-                    &flow.flow_json,
-                    &self.registry,
-                ) {
-                    Ok(c) => Arc::new(c),
-                    Err(e) => {
-                        warn!(cache_key, "compile failed for flow id={}: {e}", flow.id);
-                        // Negative cache TYLKO dla compile failure. Admin musi
-                        // naprawić flow_json — synthetic fallback NIE aktywuje
-                        // tutaj (admin chciał konkretny flow).
-                        self.cache.set(cache_key, None);
-                        return Ok(ResolvedFlow::CompileFailed);
-                    }
-                };
+                let compiled =
+                    match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
+                        Ok(c) => Arc::new(c),
+                        Err(e) => {
+                            warn!(cache_key, "compile failed for flow id={}: {e}", flow.id);
+                            // Negative cache TYLKO dla compile failure. Admin musi
+                            // naprawić flow_json — synthetic fallback NIE aktywuje
+                            // tutaj (admin chciał konkretny flow).
+                            self.cache.set(cache_key, None);
+                            return Ok(ResolvedFlow::CompileFailed);
+                        }
+                    };
                 let cached = Arc::new(CachedFlow { flow, compiled });
                 self.cache.set(cache_key, Some(cached.clone()));
                 Ok(ResolvedFlow::Found(cached))
@@ -623,16 +618,12 @@ impl FlowDispatcher {
             ("embeddings", _) => synthetic::synthetic_embeddings(model),
             _ => unreachable!("kind matched powyżej"),
         };
-        let compiled = match CompiledFlow::compile(
-            0,
-            definition,
-            &self.registry,
-        ) {
+        let compiled = match CompiledFlow::compile("", definition, &self.registry) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 warn!(kind, model, "synthetic compile failed: {e}");
                 return Err(DispatchError::CompileFailed {
-                    flow_id: 0,
+                    flow_id: String::new(),
                     msg: format!("synthetic '{kind}' compile: {e}"),
                 });
             }

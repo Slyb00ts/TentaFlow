@@ -140,7 +140,7 @@ impl fmt::Display for UiAuditOutcome {
 pub struct UiAuditEntry {
     pub ts_ms: i64,
     pub session_id: Option<String>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: String,
     pub panel_id: Option<String>,
     pub action: UiAuditAction,
@@ -220,7 +220,7 @@ impl UiAuditWriter {
         outcome: UiAuditOutcome,
         risk_class: RiskClass,
         session_id: Option<String>,
-        user_id: Option<i64>,
+        user_id: Option<String>,
         panel_id: Option<String>,
         details: HashMap<String, String>,
     ) -> UiAuditEntry {
@@ -309,12 +309,7 @@ impl UiAuditWriter {
         self.insert_audit_row(&synthetic, None, db);
     }
 
-    fn insert_audit_row(
-        &self,
-        entry: &UiAuditEntry,
-        denied_count: Option<u64>,
-        db: &DbPool,
-    ) {
+    fn insert_audit_row(&self, entry: &UiAuditEntry, denied_count: Option<u64>, db: &DbPool) {
         let action_str = format!("ui.{}", entry.action);
         let result_str = entry.outcome.to_string();
         let risk_class = entry.risk_class.to_audit_risk();
@@ -352,7 +347,7 @@ impl UiAuditWriter {
         let instance_id = entry.session_id.as_deref();
 
         let hash_input = AuditRowHashInput {
-            user_id: entry.user_id,
+            user_id: entry.user_id.as_deref(),
             addon_id: Some(&entry.addon_id),
             instance_id,
             action: &action_str,
@@ -436,8 +431,14 @@ mod tests {
     #[test]
     fn audit_action_display() {
         let cases = [
-            (UiAuditAction::SlotOwnershipViolation, "slot_ownership_violation"),
-            (UiAuditAction::ReservedNamespaceViolation, "reserved_namespace_violation"),
+            (
+                UiAuditAction::SlotOwnershipViolation,
+                "slot_ownership_violation",
+            ),
+            (
+                UiAuditAction::ReservedNamespaceViolation,
+                "reserved_namespace_violation",
+            ),
             (UiAuditAction::RevisionMismatch, "revision_mismatch"),
             (UiAuditAction::ActionNotDeclared, "action_not_declared"),
             (UiAuditAction::EpochMismatch, "epoch_mismatch"),
@@ -452,7 +453,10 @@ mod tests {
             (UiAuditAction::PanelClose, "panel_close"),
             (UiAuditAction::StreamCancel, "stream_cancel"),
             (UiAuditAction::CreditsExhausted, "credits_exhausted"),
-            (UiAuditAction::ShellAlreadyRegistered, "shell_already_registered"),
+            (
+                UiAuditAction::ShellAlreadyRegistered,
+                "shell_already_registered",
+            ),
             (UiAuditAction::ReservedSlotPrefix, "reserved_slot_prefix"),
         ];
         for (action, expected) in &cases {
@@ -471,7 +475,7 @@ mod tests {
             UiAuditOutcome::Rejected,
             RiskClass::A,
             Some("sess-1".to_string()),
-            Some(42),
+            Some("00000000-0000-0000-0000-000000000042".to_string()),
             Some("panel-main".to_string()),
             details,
         );
@@ -481,7 +485,10 @@ mod tests {
         assert_eq!(entry.outcome, UiAuditOutcome::Rejected);
         assert_eq!(entry.risk_class, RiskClass::A);
         assert_eq!(entry.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(entry.user_id, Some(42));
+        assert_eq!(
+            entry.user_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000042")
+        );
         assert_eq!(entry.panel_id.as_deref(), Some("panel-main"));
         assert_eq!(entry.details.get("key").map(|v| v.as_str()), Some("val"));
         assert!(entry.ts_ms > 0);

@@ -27,5 +27,12 @@ pub const ALPN_MESH: &[u8] = b"tentaflow-mesh/v1";
 /// ALPN dla pairing handshake pierwszego kontaktu. Payload jest CBOR.
 pub const ALPN_PAIRING: &[u8] = b"tentaflow-pairing/v2";
 
+/// ALPN dla transferu baseline-adopt po juz-zaufanym pairingu. Joiner dialuje,
+/// donor akceptuje; sekwencja `BaselineElect` -> `BaselineAck` ->
+/// `BaselineHeader` -> `BaselineChunk`* (z `BaselineChunkAck` per chunk). Ramki
+/// to len-prefixed CBOR. Osobny ALPN (nie pairing) bo to inna faza zycia peera
+/// (po confirm), inna maszyna stanow, i moze biec rownolegle do mesh heartbeatow.
+pub const ALPN_BASELINE: &[u8] = b"tentaflow-baseline/v1";
+
 /// ALPN dla API/browser (GUI, SDK). CBOR `MessageBody` bez mesh discriminantow.
 pub const ALPN_API: &[u8] = b"tentaflow-api/v1";

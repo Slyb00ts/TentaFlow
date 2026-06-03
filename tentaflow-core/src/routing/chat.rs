@@ -41,11 +41,11 @@ impl Router {
                     db,
                     "model",
                     &request.model,
-                    u.user_id,
+                    &u.user_id,
                     &u.role,
                 ) {
                     tracing::warn!(
-                        user_id = u.user_id,
+                        user_id = %u.user_id,
                         model = %request.model,
                         "ACL denied chat model"
                     );

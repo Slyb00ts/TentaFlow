@@ -47,7 +47,7 @@ pub fn user_get_current(
         return ABI_ERR_PERMISSION;
     }
 
-    let user_id = match caller.data().user_id {
+    let user_id = match caller.data().user_id.clone() {
         Some(id) => id,
         None => {
             // Brak uzytkownika — instancja systemowa
@@ -70,7 +70,7 @@ pub fn user_get_current(
                 // Pobierz uzytkownika
                 let user_data: Option<(String, Option<String>, Option<String>)> = conn
                     .query_row(
-                        "SELECT username, display_name, email FROM users WHERE id = ?1",
+                        "SELECT username, display_name, email FROM user_accounts WHERE id = ?1",
                         rusqlite::params![user_id],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
@@ -81,9 +81,9 @@ pub fn user_get_current(
                         // Pobierz grupy uzytkownika
                         let groups: Vec<String> = {
                             let mut stmt = match conn.prepare(
-                                "SELECT g.name FROM groups g \
-                                 JOIN user_groups ug ON g.id = ug.group_id \
-                                 WHERE ug.user_id = ?1",
+                                "SELECT g.name FROM user_groups g \
+                                 JOIN group_members gm ON g.id = gm.group_id \
+                                 WHERE gm.user_id = ?1",
                             ) {
                                 Ok(s) => s,
                                 Err(_) => return ABI_ERR_OPERATION,
@@ -172,7 +172,7 @@ pub fn user_check_permission(
 
     // access_level ignorowany — uprawnienia sa boolean (przyznane/nieprzyznane)
 
-    let user_id = match caller.data().user_id {
+    let user_id = match caller.data().user_id.clone() {
         Some(id) => id,
         None => return ABI_OK, // Systemowe wywolanie — zawsze przyznane
     };
@@ -182,7 +182,7 @@ pub fn user_check_permission(
         .permission_checker
         .check(
             &caller.data().addon_id,
-            user_id,
+            &user_id,
             &permission_type,
             resource.as_deref(),
         )

@@ -171,7 +171,7 @@ function filtersAreEmpty() {
 // Buduje payload dla binary requesta. Wartosci puste = null po stronie protokolu.
 function buildFilterPayload() {
   const f = {
-    userId: filters.userId !== '' ? Number(filters.userId) || null : null,
+    userId: filters.userId !== '' ? String(filters.userId) || null : null,
     addonId: null,
     action: filters.action || null,
     fromDate: filters.fromDate ? new Date(filters.fromDate).toISOString() : null,

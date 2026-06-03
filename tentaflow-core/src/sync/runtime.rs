@@ -16,8 +16,9 @@ use crate::addon::storage_sql_exec::{SyncConflictResolution, SyncConflictResolve
 use crate::db::{repository, DbPool};
 use crate::mesh::security::MeshSecurity;
 use crate::paths;
+use crate::sync::hlc::HlcClock;
 use crate::sync::ledger::{
-    ActionType, FieldValue, FjallSyncLedgerStore, HexNodeIdOperationVerifier,
+    ActionType, BaselineEpoch, FieldValue, FjallSyncLedgerStore, HexNodeIdOperationVerifier,
     HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, OperationId,
     OperationQuery, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
     SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
@@ -39,6 +40,7 @@ pub struct SyncRuntime {
     signer: RuntimeSigner,
     local_node_id: String,
     settings_cipher: Arc<crate::crypto::SettingsCipher>,
+    hlc: HlcClock,
 }
 
 struct RuntimeSigner {
@@ -59,7 +61,7 @@ pub struct SqlWriteCapture {
     pub params: Vec<JsonValue>,
     pub rows_affected: u64,
     pub last_insert_id: i64,
-    pub actor_user_id: Option<i64>,
+    pub actor_user_id: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -112,6 +114,13 @@ pub fn init(
     let ledger_path = paths::tentaflow_home().join("sync").join("ledger");
     let ledger = Arc::new(FjallSyncLedgerStore::open(&ledger_path)?);
     let local_node_id = signer.ed25519_public_key_hex();
+    repository::ensure_local_node_in_sync_identity(&db, &local_node_id, &local_node_id)
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    // Resume the HLC from the persisted ledger state so monotonicity survives a
+    // restart: the first post-restart `now()` is strictly later than the last
+    // timestamp this node minted or observed before shutting down.
+    let initial_hlc = ledger.current_hlc()?;
+    let hlc = HlcClock::new(local_node_id.clone(), initial_hlc);
     let runtime = Arc::new(SyncRuntime {
         db,
         ledger,
@@ -121,6 +130,7 @@ pub fn init(
         },
         local_node_id,
         settings_cipher,
+        hlc,
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
     Ok(SYNC_RUNTIME
@@ -161,6 +171,98 @@ pub fn record_kv_capture(capture: KvWriteCapture) -> LedgerResult<Option<SqlCapt
         return Ok(None);
     };
     runtime.record_kv_capture(capture).map(Some)
+}
+
+/// Mints the next HLC stamp from the live runtime clock and persists the new
+/// state. When the runtime is not yet initialized (early bootstrap or unit
+/// tests that write before `init`), it falls back to a process-local clock so
+/// captures still receive a monotonic timestamp inside their write transaction.
+pub fn core_hlc_now() -> HybridLogicalTimestamp {
+    match SYNC_RUNTIME.get() {
+        Some(runtime) => runtime.hlc_now(),
+        None => fallback_hlc().now(),
+    }
+}
+
+/// Returns the locally-active baseline epoch used to stamp newly-minted core
+/// operations. Defaults to genesis before the runtime exists.
+pub fn core_epoch() -> BaselineEpoch {
+    match SYNC_RUNTIME.get() {
+        Some(runtime) => runtime
+            .ledger
+            .current_epoch()
+            .unwrap_or_else(|_| genesis_epoch()),
+        None => genesis_epoch(),
+    }
+}
+
+/// Folds an incoming (remote) HLC into the local clock so the next locally
+/// minted stamp is strictly later than anything observed from the mesh.
+pub fn observe_core_hlc(remote: &HybridLogicalTimestamp) {
+    if let Some(runtime) = SYNC_RUNTIME.get() {
+        runtime.hlc.observe(remote);
+        let _ = runtime.ledger.save_hlc(&runtime.hlc.now());
+    }
+}
+
+/// Consumes the one-shot baseline-reset flag set by the v53 cutover migration.
+///
+/// WHERE this is called: once at startup, immediately after the sync runtime is
+/// initialized and BEFORE the routine core-capture drain (see `main.rs`). The
+/// flag (`settings.core_baseline_reset_pending`) is written by `migrations::run`
+/// only on the boot that crosses v53. When present, this performs the full
+/// baseline reset (bump epoch, wipe stale core ledger state, re-seed the outbox
+/// from the post-flip rows) and then clears the flag in the SAME action, so a
+/// routine restart finds no flag and never re-bumps the epoch — a second bump
+/// would invalidate the post-cutover operations peers have already adopted.
+///
+/// Returns `Some(reseeded_ops)` when the cutover ran, `None` when there was
+/// nothing to do (no flag, or runtime not initialized).
+pub fn run_pending_baseline_cutover() -> LedgerResult<Option<usize>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    runtime.run_pending_baseline_cutover()
+}
+
+/// Adopts the donor's baseline epoch after a baseline-adopt import committed the
+/// donor snapshot into SQLite (see `sync::core_baseline::import_baseline`). The
+/// local epoch is set to the donor's, then core ledger partitions are wiped and
+/// re-seeded from the freshly-imported SQLite state so the joiner's outbox emits
+/// every adopted row under the donor's epoch.
+///
+/// When the runtime is not initialized (in-process unit tests that exercise the
+/// pure SQLite import with two bare `DbPool`s), this is a no-op: the SQLite
+/// transaction is already committed and fully testable on its own.
+pub fn adopt_donor_baseline_epoch(donor_epoch: &BaselineEpoch) -> LedgerResult<()> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(());
+    };
+    runtime.adopt_donor_baseline_epoch(donor_epoch)
+}
+
+/// Parses the baseline-cutover marker. Returns the recorded pre-cutover epoch
+/// counter when the marker has been upgraded to `pre_cutover_epoch=<n>`, or
+/// `None` for the migration's initial `"1"` sentinel (no counter recorded yet).
+fn parse_cutover_marker(marker: &str) -> Option<u64> {
+    marker
+        .strip_prefix("pre_cutover_epoch=")
+        .and_then(|n| n.trim().parse::<u64>().ok())
+}
+
+fn genesis_epoch() -> BaselineEpoch {
+    BaselineEpoch {
+        counter: 0,
+        origin_node: String::new(),
+    }
+}
+
+/// Process-local HLC used only before the runtime is initialized. The node id is
+/// stable per process so timestamps minted during bootstrap stay self-consistent
+/// until the persisted clock takes over.
+fn fallback_hlc() -> &'static HlcClock {
+    static FALLBACK: OnceLock<HlcClock> = OnceLock::new();
+    FALLBACK.get_or_init(|| HlcClock::new("bootstrap", None))
 }
 
 pub fn record_sql_capture_outbox_only(
@@ -346,6 +448,137 @@ impl SyncRuntime {
         })
     }
 
+    /// Mints the next HLC stamp and persists the advanced clock state so a
+    /// restart resumes strictly after this timestamp.
+    fn hlc_now(&self) -> HybridLogicalTimestamp {
+        let timestamp = self.hlc.now();
+        let _ = self.ledger.save_hlc(&timestamp);
+        timestamp
+    }
+
+    fn run_pending_baseline_cutover(&self) -> LedgerResult<Option<usize>> {
+        let marker = repository::get_setting(
+            &self.db,
+            crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        let Some(marker) = marker else {
+            return Ok(None);
+        };
+
+        // The marker records the epoch counter observed BEFORE the cutover so a
+        // crash between `bump_epoch` and clearing the marker cannot double-bump.
+        // The migration arms it with the sentinel "1" (it runs before the ledger
+        // exists and cannot read the epoch); on the first cutover pass we replace
+        // it with the live pre-cutover counter and persist that BEFORE touching
+        // the epoch. On a retry the marker already encodes the counter, so we
+        // compare against it and skip a second bump.
+        let pre_cutover_counter = match parse_cutover_marker(&marker) {
+            Some(counter) => counter,
+            None => {
+                let counter = self.ledger.current_epoch()?.counter;
+                repository::set_setting(
+                    &self.db,
+                    crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                    &format!("pre_cutover_epoch={counter}"),
+                )
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+                counter
+            }
+        };
+        let reseeded = self.perform_core_baseline_reset(Some(pre_cutover_counter))?;
+        repository::delete_setting(
+            &self.db,
+            crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        Ok(Some(reseeded))
+    }
+
+    /// Rebuilds the local core baseline idempotently. `pre_cutover_counter` is
+    /// the epoch counter recorded in the marker before the cutover began; the
+    /// epoch is bumped only when the current counter has not already advanced
+    /// past it, so a crash-and-retry cannot double-bump. The reseed always re-
+    /// emits the CURRENT SQLite snapshot into the freshly-wiped outbox, which is
+    /// repeatable.
+    fn perform_core_baseline_reset(&self, pre_cutover_counter: Option<u64>) -> LedgerResult<usize> {
+        self.ledger.reset_core_partitions()?;
+
+        let current = self.ledger.current_epoch()?;
+        let already_bumped = match pre_cutover_counter {
+            Some(pre) => current.counter > pre,
+            // No recorded baseline (legacy marker): always bump from current.
+            None => false,
+        };
+        if already_bumped {
+            warn!(
+                "sync runtime: core baseline cutover resuming after crash, epoch already at \
+                 counter={} origin={} (recorded pre-cutover={:?}); skipping second bump",
+                current.counter, current.origin_node, pre_cutover_counter
+            );
+        } else {
+            let epoch = self.ledger.bump_epoch(&self.local_node_id)?;
+            warn!(
+                "sync runtime: core baseline reset, new epoch counter={} origin={}",
+                epoch.counter, epoch.origin_node
+            );
+        }
+
+        // Discard the historical core capture journal: the entries that survived
+        // the v54 ALTER carry zeroed HLCs and replaying them would resurrect old
+        // versions and tie multiple writes of one resource to identical (zero)
+        // timestamps, which LWW cannot order. The reseed below re-derives the
+        // present state instead.
+        crate::sync::core_capture::clear_core_capture_journal(&self.db)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+
+        // Re-emit the CURRENT state of every core table as fresh INSERT captures.
+        // `reseed_core_state_from_current_rows` writes the snapshot into the
+        // (now empty) capture journal with one freshly-minted, monotonic HLC per
+        // row; draining records them under the just-bumped epoch. Because the
+        // outbox was wiped by `reset_core_partitions`, this is repeatable: a
+        // crash-and-retry re-emits the same snapshot into an empty outbox.
+        let emitted =
+            repository::reseed_core_state_from_current_rows(&self.db, &self.settings_cipher)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        crate::sync::core_capture::drain_pending_core_captures_with(
+            &self.db,
+            usize::MAX,
+            |capture| {
+                self.record_core_capture(capture)
+                    .map(|record| Some(record.op_id))
+            },
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        Ok(emitted)
+    }
+
+    /// Sets the local epoch to the donor's and re-seeds core partitions from the
+    /// just-imported SQLite snapshot. Called by `adopt_donor_baseline_epoch`
+    /// after the baseline-adopt import transaction has committed.
+    fn adopt_donor_baseline_epoch(&self, donor_epoch: &BaselineEpoch) -> LedgerResult<()> {
+        self.ledger.set_epoch(donor_epoch.clone())?;
+        self.ledger.reset_core_partitions()?;
+        crate::sync::core_capture::clear_core_capture_journal(&self.db)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        repository::reseed_core_state_from_current_rows(&self.db, &self.settings_cipher)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        crate::sync::core_capture::drain_pending_core_captures_with(
+            &self.db,
+            usize::MAX,
+            |capture| {
+                self.record_core_capture(capture)
+                    .map(|record| Some(record.op_id))
+            },
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        warn!(
+            "sync runtime: adopted donor baseline epoch counter={} origin={}",
+            donor_epoch.counter, donor_epoch.origin_node
+        );
+        Ok(())
+    }
+
     fn record_blob_capture(
         &self,
         capture: crate::sync::blob_capture::BlobWriteCapture,
@@ -450,6 +683,9 @@ impl SyncRuntime {
         .map_err(|e| crate::sync::ledger::SyncLedgerError::Runtime(e.to_string()))?;
         let mut queued = 0usize;
         for target in targets {
+            if target.node_id == self.local_node_id {
+                continue;
+            }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
                     self.ledger.put_in_outbox(sync_target, op_id)?;
@@ -476,6 +712,9 @@ impl SyncRuntime {
         .map_err(|e| crate::sync::ledger::SyncLedgerError::Runtime(e.to_string()))?;
         let mut queued = 0usize;
         for target in targets {
+            if target.node_id == self.local_node_id {
+                continue;
+            }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
                     self.ledger.put_in_outbox(sync_target, op_id)?;
@@ -499,7 +738,23 @@ impl SyncRuntime {
         }
         let mut pending = Vec::with_capacity(entries.len());
         for entry in entries {
-            let operation = self.ledger.get_operation(entry.op_id)?;
+            let operation = match self.ledger.get_operation(entry.op_id) {
+                Ok(operation) => operation,
+                // Orphaned outbox row: the backing operation was compacted away
+                // (reset_partitions_with_prefix intentionally leaves orphans of
+                // unknown partition). Skip it and reap it lazily instead of
+                // failing the whole push.
+                Err(SyncLedgerError::OperationNotFound(_)) => {
+                    warn!(
+                        "sync runtime: pomijam osierocony wpis outbox op_id={} (operacja skompaktowana), usuwam",
+                        entry.op_id
+                    );
+                    self.ledger
+                        .remove_outbox_entry(target.clone(), entry.op_id)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if !self.outbox_target_still_allowed(target.as_str(), &operation)? {
                 self.ledger.mark_acknowledged(target.clone(), entry.op_id)?;
                 continue;
@@ -1240,7 +1495,8 @@ impl SyncRuntime {
         );
         Ok(NewSyncOperation {
             org_id: capture.org_id.clone(),
-            partition_id: descriptor.partition_id(&capture.org_id, capture.actor_user_id)?,
+            partition_id: descriptor
+                .partition_id(&capture.org_id, capture.actor_user_id.as_deref())?,
             addon_id: crate::sync::core_registry::CORE_SYNC_ADDON_ID.to_string(),
             resource_type: capture.resource_type.clone(),
             resource_id: capture.resource_id.clone(),
@@ -1256,15 +1512,14 @@ impl SyncRuntime {
             after_hash: Some(payload_hash),
             actor_user_id: capture
                 .actor_user_id
-                .map(|id| id.to_string())
+                .clone()
                 .unwrap_or_else(|| "system".to_string()),
             actor_device_id: self.local_node_id.clone(),
             actor_node_id: self.local_node_id.clone(),
-            hlc_timestamp: HybridLogicalTimestamp {
-                wall_time_ms: capture.created_at_ms,
-                logical: 0,
-                node_id: self.local_node_id.clone(),
-            },
+            // Reuse the HLC minted inside the write transaction (stored on the
+            // capture row) so the operation carries the originating instant.
+            hlc_timestamp: capture.hlc.clone(),
+            epoch: self.ledger.current_epoch()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!(
@@ -1325,7 +1580,7 @@ impl SyncRuntime {
             after_hash: Some(payload_hash),
             actor_user_id: capture
                 .actor_user_id
-                .map(|id| id.to_string())
+                .clone()
                 .unwrap_or_else(|| "system".to_string()),
             actor_device_id: self.local_node_id.clone(),
             actor_node_id: self.local_node_id.clone(),
@@ -1334,6 +1589,7 @@ impl SyncRuntime {
                 logical: 0,
                 node_id: self.local_node_id.clone(),
             },
+            epoch: self.ledger.current_epoch()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!(
@@ -1492,7 +1748,7 @@ impl SyncRuntime {
             after_hash: Some(hex_sha_to_bytes(&capture.sha256)?),
             actor_user_id: capture
                 .actor_user_id
-                .map(|id| id.to_string())
+                .clone()
                 .unwrap_or_else(|| "system".to_string()),
             actor_device_id: self.local_node_id.clone(),
             actor_node_id: self.local_node_id.clone(),
@@ -1501,6 +1757,7 @@ impl SyncRuntime {
                 logical: 0,
                 node_id: self.local_node_id.clone(),
             },
+            epoch: self.ledger.current_epoch()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!("{}:{}:{}", capture.org_id, "core.blob", capture.sha256).as_bytes(),
@@ -1557,7 +1814,7 @@ impl SyncRuntime {
             after_hash: Some(chunk_hash),
             actor_user_id: capture
                 .actor_user_id
-                .map(|id| id.to_string())
+                .clone()
                 .unwrap_or_else(|| "system".to_string()),
             actor_device_id: self.local_node_id.clone(),
             actor_node_id: self.local_node_id.clone(),
@@ -1566,6 +1823,7 @@ impl SyncRuntime {
                 logical: chunk_index as u32,
                 node_id: self.local_node_id.clone(),
             },
+            epoch: self.ledger.current_epoch()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!("{}:{}:{}", capture.org_id, "core.blob", capture.sha256).as_bytes(),
@@ -1615,7 +1873,7 @@ impl SyncRuntime {
             after_hash: capture.value.as_ref().map(|value| sha256(value)),
             actor_user_id: capture
                 .actor_user_id
-                .map(|id| id.to_string())
+                .clone()
                 .unwrap_or_else(|| "system".to_string()),
             actor_device_id: self.local_node_id.clone(),
             actor_node_id: self.local_node_id.clone(),
@@ -1624,6 +1882,7 @@ impl SyncRuntime {
                 logical: 0,
                 node_id: self.local_node_id.clone(),
             },
+            epoch: self.ledger.current_epoch()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!(
@@ -1771,8 +2030,7 @@ fn core_apply_priority(operation: &SyncOperation) -> u8 {
         "group_members" => 5,
         "org_memberships" => 6,
         "flows" => 7,
-        "flow_versions" => 8,
-        "flow_model_bindings" => 9,
+        "flow_model_bindings" => 8,
         _ => 20,
     }
 }
@@ -1956,7 +2214,10 @@ pub(crate) fn capture_from_operation(operation: &SyncOperation) -> LedgerResult<
         params,
         rows_affected,
         last_insert_id,
-        actor_user_id: operation.body.actor_user_id.parse::<i64>().ok(),
+        actor_user_id: match operation.body.actor_user_id.as_str() {
+            "" | "system" => None,
+            uid => Some(uid.to_string()),
+        },
         created_at_ms: operation.body.hlc_timestamp.wall_time_ms,
     })
 }
@@ -2085,6 +2346,7 @@ mod tests {
         let security = make_security(db.clone(), key_seed);
         let local_node_id = security.ed25519_public_key_hex();
         let ledger = Arc::new(FjallSyncLedgerStore::open(ledger_dir.path()).expect("ledger"));
+        let hlc = HlcClock::new(local_node_id.clone(), None);
         RuntimeHarness {
             runtime: SyncRuntime {
                 db,
@@ -2095,6 +2357,7 @@ mod tests {
                 },
                 local_node_id,
                 settings_cipher: make_settings_cipher(key_seed),
+                hlc,
             },
             _ledger_dir: ledger_dir,
         }
@@ -2105,6 +2368,7 @@ mod tests {
         let security = make_security(db.clone(), key_seed);
         let local_node_id = security.ed25519_public_key_hex();
         let ledger = Arc::new(FjallSyncLedgerStore::open(ledger_path).expect("ledger"));
+        let hlc = HlcClock::new(local_node_id.clone(), None);
         SyncRuntime {
             db,
             ledger,
@@ -2114,6 +2378,7 @@ mod tests {
             },
             local_node_id,
             settings_cipher: make_settings_cipher(key_seed),
+            hlc,
         }
     }
 
@@ -2233,8 +2498,7 @@ mod tests {
         receiver_events: &mut tokio::sync::broadcast::Receiver<IrohMeshEvent>,
         push: MeshSyncPushPayload,
     ) -> MeshSyncAckPayload {
-        let push_bytes = tentaflow_protocol::cbor::encode(&push)
-            .expect("encode push");
+        let push_bytes = tentaflow_protocol::cbor::encode(&push).expect("encode push");
         source_mesh
             .send_ufp2_to_peer(
                 &receiver.local_node_id,
@@ -2258,13 +2522,14 @@ mod tests {
         })
         .await
         .expect("sync push event");
-        let received_push = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&received_push)
+        let received_push = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPushPayload,
+        >(&received_push)
         .expect("decode push");
         let ack = receiver
             .handle_push_payload(&source.local_node_id, received_push)
             .expect("handle push");
-        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
-            .expect("encode ack");
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack).expect("encode ack");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.local_node_id,
@@ -2288,7 +2553,9 @@ mod tests {
         })
         .await
         .expect("sync ack event");
-        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+        >(&received_ack)
         .expect("decode ack");
         source
             .handle_ack_payload(&receiver.local_node_id, received_ack.clone())
@@ -2303,6 +2570,32 @@ mod tests {
         }
     }
 
+    fn test_hlc() -> HybridLogicalTimestamp {
+        HybridLogicalTimestamp {
+            wall_time_ms: now_ms(),
+            logical: 0,
+            node_id: "test-node".to_string(),
+        }
+    }
+
+    /// HLC strictly later than `test_hlc()` regardless of wall-clock granularity.
+    /// A real write transaction mints a monotonic HLC, so an update always stamps
+    /// after the insert it follows; LWW materialization relies on that ordering.
+    fn test_hlc_later() -> HybridLogicalTimestamp {
+        HybridLogicalTimestamp {
+            wall_time_ms: now_ms() + 1,
+            logical: 0,
+            node_id: "test-node".to_string(),
+        }
+    }
+
+    fn test_epoch() -> BaselineEpoch {
+        BaselineEpoch {
+            counter: 0,
+            origin_node: String::new(),
+        }
+    }
+
     fn core_capture_for(
         kind: crate::sync::core_registry::CoreSyncResourceKind,
         resource_id: &str,
@@ -2314,7 +2607,9 @@ mod tests {
             resource_id,
             SqlWriteAction::Insert,
             fields,
-            Some(7),
+            Some("test-actor".to_string()),
+            test_hlc(),
+            test_epoch(),
         )
     }
 
@@ -2430,7 +2725,7 @@ mod tests {
             instance_id,
             key,
             Some(value.to_vec()),
-            Some(7),
+            Some("00000000-0000-0000-0000-000000000007".to_string()),
         )
     }
 
@@ -2462,6 +2757,31 @@ mod tests {
         .expect("sync policy");
     }
 
+    /// Inserts the `test-actor` user the capture helpers reference. Required only
+    /// when a test persists a capture row into SQLite (`record_core_write_capture`),
+    /// because `__tentaflow_core_sync_captures.actor_user_id` is FK-bound to
+    /// `user_accounts(id)`. The in-memory ledger path skips this SQL constraint.
+    fn seed_actor_user(db: &DbPool, actor_id: &str) {
+        let conn = db.lock().expect("db");
+        conn.execute(
+            "INSERT INTO user_accounts (id, username, password_hash) VALUES (?1, ?1, 'h')",
+            rusqlite::params![actor_id],
+        )
+        .expect("seed actor user");
+    }
+
+    /// Inserts a live `flows` row so a baseline reset has current state to
+    /// re-seed from. The capture journal is intentionally left untouched.
+    fn seed_flow_row(db: &DbPool, id: &str, name: &str) {
+        let conn = db.lock().expect("db");
+        conn.execute(
+            "INSERT INTO flows (id, name, is_default, flow_json, status) \
+             VALUES (?1, ?2, 0, '{\"nodes\":[]}', 'active')",
+            rusqlite::params![id, name],
+        )
+        .expect("seed flow row");
+    }
+
     fn open_contacts_table(addon_id: &str) {
         let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
             .expect("open addon db");
@@ -2486,7 +2806,7 @@ mod tests {
             params: vec![JsonValue::from(1), JsonValue::String(name.to_string())],
             rows_affected: 1,
             last_insert_id: 1,
-            actor_user_id: Some(7),
+            actor_user_id: Some("00000000-0000-0000-0000-000000000007".to_string()),
             created_at_ms: now_ms(),
         }
     }
@@ -2504,7 +2824,7 @@ mod tests {
             params: vec![JsonValue::String(name.to_string()), JsonValue::from(1)],
             rows_affected: 1,
             last_insert_id: 1,
-            actor_user_id: Some(7),
+            actor_user_id: Some("00000000-0000-0000-0000-000000000007".to_string()),
             created_at_ms: now_ms(),
         }
     }
@@ -2521,7 +2841,9 @@ mod tests {
             resource_id,
             SqlWriteAction::Insert,
             fields,
-            Some(7),
+            Some("test-actor".to_string()),
+            test_hlc(),
+            test_epoch(),
         )
     }
 
@@ -2564,7 +2886,9 @@ mod tests {
             resource_id,
             SqlWriteAction::Update,
             fields,
-            Some(7),
+            Some("test-actor".to_string()),
+            test_hlc_later(),
+            test_epoch(),
         )
     }
 
@@ -2661,6 +2985,68 @@ mod tests {
     }
 
     #[test]
+    fn push_skips_and_reaps_orphaned_outbox_entry() {
+        with_tmp_home(|| {
+            let source = make_runtime(221);
+            let receiver = make_runtime(222);
+            seed_core_authority_target(
+                &source.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+
+            // Two captures land in the same core/flows partition (sequences 1 and
+            // 2). Both get queued to the receiver's outbox.
+            let first = source
+                .runtime
+                .record_core_capture(core_flow_capture("flow-orphan", "Orphan"))
+                .expect("record first");
+            let second = source
+                .runtime
+                .record_core_capture(core_flow_capture("flow-live", "Live"))
+                .expect("record second");
+
+            // Compact away sequence 1: its operation + op_id index disappear, but
+            // its outbox row stays — turning it into an orphan.
+            source
+                .runtime
+                .ledger
+                .compact(CompactionPolicy {
+                    partition_id: PartitionId::new("core/org/org-default/flows").unwrap(),
+                    keep_operations_after_sequence: Some(2),
+                })
+                .expect("compact");
+            assert!(source.runtime.ledger.get_operation(first.op_id).is_err());
+
+            // The push path must skip the orphan and still emit the live op,
+            // rather than erroring out on the missing operation.
+            let payload = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("build push must not fail on orphan")
+                .expect("live operation should produce a payload");
+            assert_eq!(payload.operations.len(), 1);
+
+            // The orphaned outbox row was reaped during the push.
+            let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
+            assert!(
+                source
+                    .runtime
+                    .ledger
+                    .get_outbox_entry(target.clone(), first.op_id)
+                    .is_err(),
+                "orphaned outbox entry must be removed by the push path"
+            );
+            // The live entry was marked delivered, not removed.
+            assert!(source
+                .runtime
+                .ledger
+                .get_outbox_entry(target, second.op_id)
+                .is_ok());
+        });
+    }
+
+    #[test]
     fn core_inbox_materializer_applies_flow_insert() {
         with_tmp_home(|| {
             let source = make_runtime(23);
@@ -2701,7 +3087,7 @@ mod tests {
                 &operation,
             )
             .expect("apply core operation");
-            let flow = repository::get_flow(&receiver.runtime.db, 41)
+            let flow = repository::get_flow(&receiver.runtime.db, "41")
                 .expect("get flow")
                 .expect("flow");
 
@@ -2753,7 +3139,7 @@ mod tests {
                 &operation,
             )
             .expect("merge core operation");
-            let flow = repository::get_flow(&receiver.runtime.db, 43)
+            let flow = repository::get_flow(&receiver.runtime.db, "43")
                 .expect("get flow")
                 .expect("flow");
 
@@ -2865,7 +3251,7 @@ mod tests {
                 .handle_ack_payload(&receiver.runtime.local_node_id, ack)
                 .expect("ack");
 
-            let flow = repository::get_flow(&receiver.runtime.db, 42)
+            let flow = repository::get_flow(&receiver.runtime.db, "42")
                 .expect("get flow")
                 .expect("flow");
             let outbox = source
@@ -3050,7 +3436,7 @@ mod tests {
                 "application/octet-stream",
                 bytes.len() as u64,
                 blob_source_path.to_string_lossy().to_string(),
-                Some(7),
+                Some("00000000-0000-0000-0000-000000000007".to_string()),
             );
 
             let result = source
@@ -3123,7 +3509,7 @@ mod tests {
                 "application/octet-stream",
                 bytes.len() as u64,
                 blob_source_path.to_string_lossy().to_string(),
-                Some(7),
+                Some("00000000-0000-0000-0000-000000000007".to_string()),
             );
 
             let result = source
@@ -3199,12 +3585,12 @@ mod tests {
             for (node_id, user_id, display_name) in [
                 (
                     receiver_allowed.runtime.local_node_id.as_str(),
-                    allowed_user_id,
+                    allowed_user_id.as_str(),
                     "Allowed Node",
                 ),
                 (
                     receiver_denied.runtime.local_node_id.as_str(),
-                    denied_user_id,
+                    denied_user_id.as_str(),
                     "Denied Node",
                 ),
             ] {
@@ -3248,8 +3634,8 @@ mod tests {
                 crate::sync::core_registry::CORE_SYNC_ADDON_ID,
                 "core.flow",
                 "44",
-                Some(allowed_user_id),
-                Some(allowed_user_id),
+                Some(allowed_user_id.as_str()),
+                Some(allowed_user_id.as_str()),
                 None,
                 None,
                 "assigned",
@@ -3300,12 +3686,12 @@ mod tests {
             for (node_id, user_id, display_name) in [
                 (
                     receiver_allowed.runtime.local_node_id.as_str(),
-                    allowed_user_id,
+                    allowed_user_id.as_str(),
                     "Revoked Node",
                 ),
                 (
                     receiver_new_owner.runtime.local_node_id.as_str(),
-                    new_owner_id,
+                    new_owner_id.as_str(),
                     "New Owner Node",
                 ),
             ] {
@@ -3349,8 +3735,8 @@ mod tests {
                 crate::sync::core_registry::CORE_SYNC_ADDON_ID,
                 "core.flow",
                 "46",
-                Some(allowed_user_id),
-                Some(allowed_user_id),
+                Some(allowed_user_id.as_str()),
+                Some(allowed_user_id.as_str()),
                 None,
                 None,
                 "assigned",
@@ -3368,8 +3754,8 @@ mod tests {
                 crate::sync::core_registry::CORE_SYNC_ADDON_ID,
                 "core.flow",
                 "46",
-                Some(new_owner_id),
-                Some(new_owner_id),
+                Some(new_owner_id.as_str()),
+                Some(new_owner_id.as_str()),
                 None,
                 None,
                 "assigned",
@@ -3407,7 +3793,7 @@ mod tests {
                 "admin@example.com",
             )
             .expect("admin user");
-            repository::set_user_role(&source.runtime.db, admin_user_id, "admin")
+            repository::set_user_role(&source.runtime.db, &admin_user_id, "admin")
                 .expect("admin role");
             repository::upsert_sync_node_identity(
                 &source.runtime.db,
@@ -3417,14 +3803,14 @@ mod tests {
                 "Admin Node",
                 "laptop",
                 "trusted",
-                Some(admin_user_id),
+                Some(&admin_user_id),
                 "standard",
             )
             .expect("sync node");
             repository::assign_node_to_user(
                 &source.runtime.db,
                 &receiver.runtime.local_node_id,
-                admin_user_id,
+                &admin_user_id,
                 "primary",
                 None,
             )
@@ -3766,7 +4152,7 @@ mod tests {
                 .handle_ack_payload(&receiver.runtime.local_node_id, ack)
                 .expect("ack repair");
 
-            let flow = repository::get_flow(&receiver.runtime.db, 61)
+            let flow = repository::get_flow(&receiver.runtime.db, "61")
                 .expect("get flow")
                 .expect("flow");
             let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
@@ -3819,8 +4205,7 @@ mod tests {
             .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
             .expect("build push")
             .expect("pending push");
-        let bytes = tentaflow_protocol::cbor::encode(&push)
-            .expect("encode push");
+        let bytes = tentaflow_protocol::cbor::encode(&push).expect("encode push");
         source_mesh
             .send_ufp2_to_peer(
                 &receiver.runtime.local_node_id,
@@ -3844,14 +4229,15 @@ mod tests {
         })
         .await
         .expect("sync push event");
-        let received_push = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&received_push)
+        let received_push = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPushPayload,
+        >(&received_push)
         .expect("decode push");
         let ack = receiver
             .runtime
             .handle_push_payload(&source.runtime.local_node_id, received_push)
             .expect("handle push");
-        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
-            .expect("encode ack");
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack).expect("encode ack");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.runtime.local_node_id,
@@ -3875,14 +4261,16 @@ mod tests {
         })
         .await
         .expect("sync ack event");
-        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+        >(&received_ack)
         .expect("decode ack");
         source
             .runtime
             .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
             .expect("handle ack");
 
-        let flow = repository::get_flow(&receiver.runtime.db, 71)
+        let flow = repository::get_flow(&receiver.runtime.db, "71")
             .expect("get flow")
             .expect("flow");
         let outbox = source
@@ -3929,14 +4317,14 @@ mod tests {
                 &format!("Fanout Node {idx}"),
                 "laptop",
                 "trusted",
-                Some(user_id),
+                Some(user_id.as_str()),
                 "standard",
             )
             .expect("fanout node");
             repository::assign_node_to_user(
                 &source.runtime.db,
                 &receiver.runtime.local_node_id,
-                user_id,
+                &user_id,
                 "primary",
                 None,
             )
@@ -3968,8 +4356,8 @@ mod tests {
             crate::sync::core_registry::CORE_SYNC_ADDON_ID,
             "core.flow",
             "86",
-            receiver_user_ids.first().copied(),
-            receiver_user_ids.first().copied(),
+            receiver_user_ids.first().map(|s| s.as_str()),
+            receiver_user_ids.first().map(|s| s.as_str()),
             None,
             None,
             "all",
@@ -4020,7 +4408,7 @@ mod tests {
         }
 
         for receiver in receivers {
-            let flow = repository::get_flow(&receiver.runtime.db, 86)
+            let flow = repository::get_flow(&receiver.runtime.db, "86")
                 .expect("get fanout flow")
                 .expect("fanout flow");
             let outbox = source
@@ -4093,14 +4481,14 @@ mod tests {
                     &format!("Restart Fanout Node {idx}"),
                     "laptop",
                     "trusted",
-                    Some(user_id),
+                    Some(user_id.as_str()),
                     "standard",
                 )
                 .expect("restart fanout node");
                 repository::assign_node_to_user(
                     &source.db,
                     &receiver.local_node_id,
-                    user_id,
+                    &user_id,
                     "primary",
                     None,
                 )
@@ -4128,8 +4516,8 @@ mod tests {
                 crate::sync::core_registry::CORE_SYNC_ADDON_ID,
                 "core.flow",
                 "11101",
-                receiver_user_ids.first().copied(),
-                receiver_user_ids.first().copied(),
+                receiver_user_ids.first().map(|s| s.as_str()),
+                receiver_user_ids.first().map(|s| s.as_str()),
                 None,
                 None,
                 "all",
@@ -4226,7 +4614,7 @@ mod tests {
 
         for (idx, receiver) in receivers.iter().enumerate() {
             assert_eq!(receiver.local_node_id, receiver_node_ids[idx]);
-            let flow = repository::get_flow(&receiver.db, 11101)
+            let flow = repository::get_flow(&receiver.db, "11101")
                 .expect("get persisted restart fanout flow")
                 .expect("persisted restart fanout flow");
             let outbox = source
@@ -4303,14 +4691,15 @@ mod tests {
         })
         .await
         .expect("restart push event");
-        let received_push = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&received_push)
+        let received_push = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPushPayload,
+        >(&received_push)
         .expect("decode restart push");
         let ack = receiver
             .runtime
             .handle_push_payload(&source.local_node_id, received_push)
             .expect("handle restart push");
-        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
-            .expect("encode restart ack");
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack).expect("encode restart ack");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.local_node_id,
@@ -4334,13 +4723,15 @@ mod tests {
         })
         .await
         .expect("restart ack event");
-        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+        >(&received_ack)
         .expect("decode restart ack");
         source
             .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
             .expect("handle restart ack");
 
-        let flow = repository::get_flow(&receiver.runtime.db, 91)
+        let flow = repository::get_flow(&receiver.runtime.db, "91")
             .expect("get restart flow")
             .expect("restart flow");
         let outbox = source
@@ -4400,8 +4791,8 @@ mod tests {
             from_sequence: update_operation.body.partition_sequence,
             operations: vec![operation_to_wire(&update_operation).expect("wire update")],
         };
-        let gap_bytes = tentaflow_protocol::cbor::encode(&gap_payload)
-            .expect("encode gap response");
+        let gap_bytes =
+            tentaflow_protocol::cbor::encode(&gap_payload).expect("encode gap response");
         source_mesh
             .send_ufp2_to_peer(
                 &receiver.runtime.local_node_id,
@@ -4425,7 +4816,9 @@ mod tests {
         })
         .await
         .expect("gap response event");
-        let received_gap = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&received_gap)
+        let received_gap = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+        >(&received_gap)
         .expect("decode gap response");
         receiver
             .runtime
@@ -4437,8 +4830,8 @@ mod tests {
             .expect("repair pulls");
         assert_eq!(repair_pulls.len(), 1);
         assert_eq!(repair_pulls[0].from_sequence, 1);
-        let pull_bytes = tentaflow_protocol::cbor::encode(&repair_pulls[0])
-            .expect("encode repair pull");
+        let pull_bytes =
+            tentaflow_protocol::cbor::encode(&repair_pulls[0]).expect("encode repair pull");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.runtime.local_node_id,
@@ -4462,7 +4855,9 @@ mod tests {
         })
         .await
         .expect("repair pull event");
-        let received_pull = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullPayload>(&received_pull)
+        let received_pull = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPullPayload,
+        >(&received_pull)
         .expect("decode repair pull");
         let repair_response = source
             .runtime
@@ -4472,8 +4867,8 @@ mod tests {
             panic!("expected operations repair response");
         };
         assert_eq!(repair_response.operations.len(), 2);
-        let repair_response_bytes = tentaflow_protocol::cbor::encode(&repair_response)
-            .expect("encode repair response");
+        let repair_response_bytes =
+            tentaflow_protocol::cbor::encode(&repair_response).expect("encode repair response");
         source_mesh
             .send_ufp2_to_peer(
                 &receiver.runtime.local_node_id,
@@ -4497,14 +4892,15 @@ mod tests {
         })
         .await
         .expect("repair response event");
-        let received_repair = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&received_repair)
+        let received_repair = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+        >(&received_repair)
         .expect("decode repair response");
         let ack = receiver
             .runtime
             .handle_pull_response_payload(&source.runtime.local_node_id, received_repair)
             .expect("handle repair response");
-        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
-            .expect("encode repair ack");
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack).expect("encode repair ack");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.runtime.local_node_id,
@@ -4528,14 +4924,16 @@ mod tests {
         })
         .await
         .expect("repair ack event");
-        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+        >(&received_ack)
         .expect("decode repair ack");
         source
             .runtime
             .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
             .expect("handle repair ack");
 
-        let flow = repository::get_flow(&receiver.runtime.db, 73)
+        let flow = repository::get_flow(&receiver.runtime.db, "73")
             .expect("get flow")
             .expect("flow");
         let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
@@ -4611,8 +5009,8 @@ mod tests {
             from_sequence: update_operation.body.partition_sequence,
             operations: vec![operation_to_wire(&update_operation).expect("wire update")],
         };
-        let gap_bytes = tentaflow_protocol::cbor::encode(&gap_payload)
-            .expect("encode gap response");
+        let gap_bytes =
+            tentaflow_protocol::cbor::encode(&gap_payload).expect("encode gap response");
         source_mesh
             .send_ufp2_to_peer(
                 &receiver.runtime.local_node_id,
@@ -4636,7 +5034,9 @@ mod tests {
         })
         .await
         .expect("gap response event");
-        let received_gap = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&received_gap)
+        let received_gap = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+        >(&received_gap)
         .expect("decode gap response");
         receiver
             .runtime
@@ -4695,7 +5095,9 @@ mod tests {
         })
         .await
         .expect("scheduler repair pull event");
-        let received_pull = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullPayload>(&received_pull)
+        let received_pull = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPullPayload,
+        >(&received_pull)
         .expect("decode scheduler repair pull");
         assert_eq!(received_pull.from_sequence, 1);
         let repair_response = source
@@ -4730,14 +5132,16 @@ mod tests {
         })
         .await
         .expect("scheduler repair response event");
-        let received_repair = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&received_repair)
+        let received_repair = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+        >(&received_repair)
         .expect("decode scheduler repair response");
         let ack = receiver
             .runtime
             .handle_pull_response_payload(&source.runtime.local_node_id, received_repair)
             .expect("handle scheduler repair response");
-        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
-            .expect("encode scheduler repair ack");
+        let ack_bytes =
+            tentaflow_protocol::cbor::encode(&ack).expect("encode scheduler repair ack");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.runtime.local_node_id,
@@ -4761,14 +5165,16 @@ mod tests {
         })
         .await
         .expect("scheduler repair ack event");
-        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+        >(&received_ack)
         .expect("decode scheduler repair ack");
         source
             .runtime
             .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
             .expect("handle scheduler repair ack");
 
-        let flow = repository::get_flow(&receiver.runtime.db, 84)
+        let flow = repository::get_flow(&receiver.runtime.db, "84")
             .expect("get flow")
             .expect("flow");
         let queued_repairs = receiver
@@ -4828,12 +5234,12 @@ mod tests {
         for (node_id, user_id, display_name) in [
             (
                 receiver.runtime.local_node_id.as_str(),
-                allowed_user_id,
+                allowed_user_id.as_str(),
                 "Mesh Revoked Node",
             ),
             (
                 new_owner_node.runtime.local_node_id.as_str(),
-                new_owner_id,
+                new_owner_id.as_str(),
                 "Mesh New Owner Node",
             ),
         ] {
@@ -4871,8 +5277,8 @@ mod tests {
             crate::sync::core_registry::CORE_SYNC_ADDON_ID,
             "core.flow",
             "77",
-            Some(allowed_user_id),
-            Some(allowed_user_id),
+            Some(allowed_user_id.as_str()),
+            Some(allowed_user_id.as_str()),
             None,
             None,
             "assigned",
@@ -4897,8 +5303,7 @@ mod tests {
             .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
             .expect("build initial push")
             .expect("initial push");
-        let push_bytes = tentaflow_protocol::cbor::encode(&push)
-            .expect("encode initial push");
+        let push_bytes = tentaflow_protocol::cbor::encode(&push).expect("encode initial push");
         source_mesh
             .send_ufp2_to_peer(
                 &receiver.runtime.local_node_id,
@@ -4922,14 +5327,15 @@ mod tests {
         })
         .await
         .expect("initial push event");
-        let received_push = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&received_push)
+        let received_push = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPushPayload,
+        >(&received_push)
         .expect("decode initial push");
         let ack = receiver
             .runtime
             .handle_push_payload(&source.runtime.local_node_id, received_push)
             .expect("handle initial push");
-        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
-            .expect("encode initial ack");
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack).expect("encode initial ack");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.runtime.local_node_id,
@@ -4953,7 +5359,9 @@ mod tests {
         })
         .await
         .expect("initial ack event");
-        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+        >(&received_ack)
         .expect("decode initial ack");
         source
             .runtime
@@ -4966,8 +5374,8 @@ mod tests {
             crate::sync::core_registry::CORE_SYNC_ADDON_ID,
             "core.flow",
             "77",
-            Some(new_owner_id),
-            Some(new_owner_id),
+            Some(new_owner_id.as_str()),
+            Some(new_owner_id.as_str()),
             None,
             None,
             "assigned",
@@ -4982,7 +5390,7 @@ mod tests {
             .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
             .expect("build revoked push");
 
-        let flow = repository::get_flow(&receiver.runtime.db, 77)
+        let flow = repository::get_flow(&receiver.runtime.db, "77")
             .expect("get flow")
             .expect("flow");
         let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
@@ -5115,7 +5523,7 @@ mod tests {
             "application/octet-stream",
             bytes.len() as u64,
             blob_source_path.to_string_lossy().to_string(),
-            Some(7),
+            Some("00000000-0000-0000-0000-000000000007".to_string()),
         );
 
         let result = source
@@ -5237,8 +5645,7 @@ mod tests {
             from_sequence: 1,
             limit: 64,
         };
-        let pull_bytes = tentaflow_protocol::cbor::encode(&pull)
-            .expect("encode snapshot pull");
+        let pull_bytes = tentaflow_protocol::cbor::encode(&pull).expect("encode snapshot pull");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.runtime.local_node_id,
@@ -5262,7 +5669,9 @@ mod tests {
         })
         .await
         .expect("snapshot pull event");
-        let received_pull = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullPayload>(&received_pull)
+        let received_pull = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncPullPayload,
+        >(&received_pull)
         .expect("decode snapshot pull");
         let response = source
             .runtime
@@ -5273,8 +5682,8 @@ mod tests {
         };
         assert_eq!(snapshot_response.snapshot_id, snapshot.snapshot_id.as_str());
         assert_eq!(snapshot_response.operations_after_snapshot.len(), 1);
-        let response_bytes = tentaflow_protocol::cbor::encode(&snapshot_response)
-            .expect("encode snapshot response");
+        let response_bytes =
+            tentaflow_protocol::cbor::encode(&snapshot_response).expect("encode snapshot response");
         source_mesh
             .send_ufp2_to_peer(
                 &receiver.runtime.local_node_id,
@@ -5298,14 +5707,15 @@ mod tests {
         })
         .await
         .expect("snapshot response event");
-        let received_response = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload>(&received_response)
+        let received_response = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload,
+        >(&received_response)
         .expect("decode snapshot response");
         let ack = receiver
             .runtime
             .handle_snapshot_response_payload(&source.runtime.local_node_id, received_response)
             .expect("handle snapshot response");
-        let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
-            .expect("encode snapshot ack");
+        let ack_bytes = tentaflow_protocol::cbor::encode(&ack).expect("encode snapshot ack");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.runtime.local_node_id,
@@ -5329,7 +5739,9 @@ mod tests {
         })
         .await
         .expect("snapshot ack event");
-        let received_ack = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&received_ack)
+        let received_ack = tentaflow_protocol::cbor::decode::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+        >(&received_ack)
         .expect("decode snapshot ack");
         source
             .runtime
@@ -5547,7 +5959,7 @@ mod tests {
             .expect("ack after restart");
         let conn = receiver.db.lock().expect("db");
         let name: String = conn
-            .query_row("SELECT name FROM flows WHERE id = 9101", [], |row| {
+            .query_row("SELECT name FROM flows WHERE id = '9101'", [], |row| {
                 row.get(0)
             })
             .expect("flow");
@@ -5593,7 +6005,7 @@ mod tests {
             "application/octet-stream",
             bytes.len() as u64,
             source_path.to_string_lossy().to_string(),
-            Some(7),
+            Some("00000000-0000-0000-0000-000000000007".to_string()),
         );
         let result = source
             .runtime
@@ -5871,14 +6283,14 @@ mod tests {
                 &format!("Partial Fanout Node {idx}"),
                 "laptop",
                 "trusted",
-                Some(user_id),
+                Some(user_id.as_str()),
                 "standard",
             )
             .expect("partial fanout node");
             repository::assign_node_to_user(
                 &source.runtime.db,
                 &receiver.runtime.local_node_id,
-                user_id,
+                &user_id,
                 "primary",
                 None,
             )
@@ -5910,8 +6322,8 @@ mod tests {
             crate::sync::core_registry::CORE_SYNC_ADDON_ID,
             "core.flow",
             "9701",
-            receiver_user_ids.first().copied(),
-            receiver_user_ids.first().copied(),
+            receiver_user_ids.first().map(|s| s.as_str()),
+            receiver_user_ids.first().map(|s| s.as_str()),
             None,
             None,
             "all",
@@ -5991,7 +6403,7 @@ mod tests {
         .await;
         let conn = receiver_c.runtime.db.lock().expect("db");
         let name: String = conn
-            .query_row("SELECT name FROM flows WHERE id = 9701", [], |row| {
+            .query_row("SELECT name FROM flows WHERE id = '9701'", [], |row| {
                 row.get(0)
             })
             .expect("flow on c");
@@ -6088,8 +6500,14 @@ mod tests {
             .record_core_capture(core_capture_for(K::UserGroup, "10102", group))
             .expect("record group");
         let mut group_member = BTreeMap::new();
-        group_member.insert("group_id".to_string(), FieldValue::I64(10102));
-        group_member.insert("user_id".to_string(), FieldValue::I64(10101));
+        group_member.insert(
+            "group_id".to_string(),
+            FieldValue::String("10102".to_string()),
+        );
+        group_member.insert(
+            "user_id".to_string(),
+            FieldValue::String("10101".to_string()),
+        );
         source
             .runtime
             .record_core_capture(core_capture_for(
@@ -6128,7 +6546,10 @@ mod tests {
             .record_core_capture(complete_core_flow_capture("10103", "Scoped flow"))
             .expect("record flow");
         let mut binding = BTreeMap::new();
-        binding.insert("flow_id".to_string(), FieldValue::I64(10103));
+        binding.insert(
+            "flow_id".to_string(),
+            FieldValue::String("10103".to_string()),
+        );
         binding.insert(
             "model_pattern".to_string(),
             FieldValue::String("sync-model".to_string()),
@@ -6155,8 +6576,14 @@ mod tests {
         )
         .await;
         let mut group_member_retry = BTreeMap::new();
-        group_member_retry.insert("group_id".to_string(), FieldValue::I64(10102));
-        group_member_retry.insert("user_id".to_string(), FieldValue::I64(10101));
+        group_member_retry.insert(
+            "group_id".to_string(),
+            FieldValue::String("10102".to_string()),
+        );
+        group_member_retry.insert(
+            "user_id".to_string(),
+            FieldValue::String("10101".to_string()),
+        );
         source
             .runtime
             .record_core_capture(core_capture_for(
@@ -6183,14 +6610,14 @@ mod tests {
         let conn = receiver.runtime.db.lock().expect("db");
         let username: String = conn
             .query_row(
-                "SELECT username FROM user_accounts WHERE id = 10101",
+                "SELECT username FROM user_accounts WHERE id = '10101'",
                 [],
                 |row| row.get(0),
             )
             .expect("user");
         let group_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM group_members WHERE group_id = 10102 AND user_id = 10101",
+                "SELECT COUNT(*) FROM group_members WHERE group_id = '10102' AND user_id = '10101'",
                 [],
                 |row| row.get(0),
             )
@@ -6207,7 +6634,7 @@ mod tests {
             .expect("membership");
         let binding_pattern: String = conn
             .query_row(
-                "SELECT model_pattern FROM flow_model_bindings WHERE id = 10104",
+                "SELECT model_pattern FROM flow_model_bindings WHERE id = '10104'",
                 [],
                 |row| row.get(0),
             )
@@ -6222,5 +6649,744 @@ mod tests {
         assert_eq!(role_name, "Sync Role");
         assert_eq!(membership_count, 1);
         assert_eq!(binding_pattern, "sync-model");
+    }
+
+    /// After the v53 cutover marker is consumed: the epoch is bumped, the core
+    /// outbox is re-seeded from the persisted capture journal under the new
+    /// epoch, an operation stamped at the old (genesis) epoch is rejected by the
+    /// inbox, and the one-shot marker is cleared so a second pass is a no-op.
+    #[test]
+    fn baseline_cutover_bumps_epoch_reseeds_outbox_and_rejects_stale_ops() {
+        with_tmp_home(|| {
+            let node = make_runtime(150);
+            seed_core_authority_target(&node.runtime.db, "core.flow", "peer-authority");
+            seed_actor_user(&node.runtime.db, "test-actor");
+
+            // Seed a live flow row: the cutover re-seeds from CURRENT SQLite
+            // state, not from the historical capture journal.
+            seed_flow_row(&node.runtime.db, "cutover-flow", "Cutover Flow");
+
+            // Genesis epoch before the cutover.
+            let genesis = node.runtime.ledger.current_epoch().expect("genesis epoch");
+            assert_eq!(genesis.counter, 0);
+
+            // Arm the one-shot marker the v53 migration would have written.
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "1",
+            )
+            .expect("arm marker");
+
+            let reseeded = node
+                .runtime
+                .run_pending_baseline_cutover()
+                .expect("cutover runs")
+                .expect("cutover was pending");
+            assert!(
+                reseeded >= 1,
+                "the persisted capture must re-seed at least one op"
+            );
+
+            // Epoch advanced to counter 1 with this node as origin.
+            let new_epoch = node.runtime.ledger.current_epoch().expect("new epoch");
+            assert_eq!(new_epoch.counter, 1);
+            assert_eq!(new_epoch.origin_node, node.runtime.local_node_id);
+
+            // The re-seeded operation carries the NEW epoch and a live outbox row.
+            let push = node
+                .runtime
+                .build_push_payload_for_target("peer-authority", 16)
+                .expect("build push")
+                .expect("re-seeded op produces a payload");
+            assert!(!push.operations.is_empty());
+            for wire in &push.operations {
+                let op = node
+                    .runtime
+                    .ledger
+                    .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
+                    .expect("operation");
+                assert_eq!(
+                    op.body.epoch, new_epoch,
+                    "re-seeded op must carry new epoch"
+                );
+            }
+
+            // An operation minted at the stale genesis epoch (the pre-cutover
+            // baseline a peer would still hold) is rejected on the way in.
+            let stale_peer = make_runtime(151);
+            assert_eq!(
+                stale_peer
+                    .runtime
+                    .ledger
+                    .current_epoch()
+                    .expect("peer epoch"),
+                genesis
+            );
+            let stale_op_id = stale_peer
+                .runtime
+                .record_core_capture(complete_core_flow_capture("stale-flow", "Stale Flow"))
+                .expect("record stale op")
+                .op_id;
+            let stale_op = stale_peer
+                .runtime
+                .ledger
+                .get_operation(stale_op_id)
+                .expect("stale operation");
+            assert_eq!(stale_op.body.epoch, genesis);
+
+            let rejected = node.runtime.ledger.put_verified_in_inbox(
+                PeerId::new("peer-authority".to_string()).expect("peer"),
+                stale_op,
+                &HexNodeIdOperationVerifier,
+            );
+            assert!(
+                matches!(rejected, Err(SyncLedgerError::EpochMismatch { .. })),
+                "stale-epoch op must be rejected after the cutover bump, got {rejected:?}"
+            );
+
+            // The one-shot marker is cleared, so a second pass is a no-op and the
+            // epoch is not bumped again.
+            assert!(node
+                .runtime
+                .run_pending_baseline_cutover()
+                .expect("second pass runs")
+                .is_none());
+            assert_eq!(
+                node.runtime
+                    .ledger
+                    .current_epoch()
+                    .expect("epoch unchanged"),
+                new_epoch
+            );
+        });
+    }
+
+    /// CRITICAL 1: the cutover re-seeds the CURRENT snapshot with strictly
+    /// increasing, distinct, non-zero HLCs (one per live row), and a later
+    /// update of the same resource still wins under LWW.
+    #[test]
+    fn baseline_cutover_reseeds_current_state_with_distinct_increasing_hlc() {
+        with_tmp_home(|| {
+            let node = make_runtime(160);
+            seed_core_authority_target(&node.runtime.db, "core.flow", "peer-authority");
+            seed_actor_user(&node.runtime.db, "test-actor");
+
+            // Three live flows. A historical journal full of zeroed-HLC versions
+            // must NOT influence the reseed — emulate the post-v54 state.
+            seed_flow_row(&node.runtime.db, "flow-a", "Alpha");
+            seed_flow_row(&node.runtime.db, "flow-b", "Beta");
+            seed_flow_row(&node.runtime.db, "flow-c", "Gamma");
+            {
+                let conn = node.runtime.db.lock().expect("db");
+                let tx = conn.unchecked_transaction().expect("tx");
+                // Several historical capture rows for flow-a with zeroed HLCs,
+                // exactly what survives the v54 ALTER.
+                for name in ["Alpha v1", "Alpha v2", "Alpha v3"] {
+                    let mut capture = complete_core_flow_capture("flow-a", name);
+                    capture.hlc = HybridLogicalTimestamp {
+                        wall_time_ms: 0,
+                        logical: 0,
+                        node_id: String::new(),
+                    };
+                    crate::sync::core_capture::record_core_write_capture(&tx, &capture)
+                        .expect("persist stale capture");
+                }
+                tx.commit().expect("commit stale captures");
+            }
+
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "1",
+            )
+            .expect("arm marker");
+
+            let reseeded = node
+                .runtime
+                .run_pending_baseline_cutover()
+                .expect("cutover runs")
+                .expect("cutover pending");
+            // The snapshot reseeds every core table (org, roles, flows, ...); at
+            // minimum the three live flows plus the default org/roles seeded by
+            // the migrations.
+            assert!(reseeded >= 3, "reseed must emit the current snapshot");
+
+            let new_epoch = node.runtime.ledger.current_epoch().expect("epoch");
+            assert_eq!(new_epoch.counter, 1);
+
+            // Collect the reseeded FLOW operations' HLCs from the outbox.
+            let push = node
+                .runtime
+                .build_push_payload_for_target("peer-authority", 256)
+                .expect("push")
+                .expect("payload");
+            let mut hlcs: Vec<HybridLogicalTimestamp> = Vec::new();
+            for wire in &push.operations {
+                let op = node
+                    .runtime
+                    .ledger
+                    .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
+                    .expect("op");
+                assert_eq!(op.body.epoch, new_epoch, "reseed op carries new epoch");
+                if op.body.resource_type == "core.flow" {
+                    hlcs.push(op.body.hlc_timestamp.clone());
+                }
+            }
+            assert_eq!(
+                hlcs.len(),
+                3,
+                "exactly one reseed op per live flow — no history"
+            );
+            // No zeroed HLCs survived into the reseed.
+            for hlc in &hlcs {
+                assert!(
+                    hlc.wall_time_ms > 0 || hlc.logical > 0,
+                    "reseed must mint a real HLC, got {hlc:?}"
+                );
+            }
+            // All distinct.
+            let mut sorted = hlcs.clone();
+            sorted.sort_by(|a, b| (a.wall_time_ms, a.logical).cmp(&(b.wall_time_ms, b.logical)));
+            sorted.dedup_by(|a, b| a.wall_time_ms == b.wall_time_ms && a.logical == b.logical);
+            assert_eq!(sorted.len(), 3, "reseed HLCs must be distinct");
+
+            // A later update of flow-a, recorded post-cutover under the new
+            // epoch, carries a strictly greater HLC than its reseed insert — LWW
+            // will not drop it.
+            let reseed_a_hlc = {
+                // The reseed insert for flow-a is the one whose resource_id is
+                // flow-a.
+                let mut found = None;
+                for wire in &push.operations {
+                    let op = node
+                        .runtime
+                        .ledger
+                        .get_operation(operation_id_from_wire(&wire.op_id).expect("op"))
+                        .expect("op");
+                    if op.body.resource_id == "flow-a" {
+                        found = Some(op.body.hlc_timestamp.clone());
+                    }
+                }
+                found.expect("flow-a reseed op")
+            };
+            // Mint the update HLC from the SAME clock the reseed used
+            // (`core_hlc_now`) so it is guaranteed strictly later.
+            let later_hlc = crate::sync::runtime::core_hlc_now();
+            let mut update = core_flow_update_capture("flow-a", "Alpha repaired");
+            update.hlc = later_hlc;
+            update.epoch = new_epoch.clone();
+            let update_op_id = node
+                .runtime
+                .record_core_capture(update)
+                .expect("record update")
+                .op_id;
+            let update_op = node
+                .runtime
+                .ledger
+                .get_operation(update_op_id)
+                .expect("update op");
+            let later = update_op.body.hlc_timestamp;
+            assert!(
+                (later.wall_time_ms, later.logical)
+                    > (reseed_a_hlc.wall_time_ms, reseed_a_hlc.logical),
+                "post-cutover update HLC {later:?} must exceed reseed HLC {reseed_a_hlc:?}"
+            );
+        });
+    }
+
+    /// A baseline cutover must re-emit stored shared secrets. The pre-cutover
+    /// enqueue creates a `core.shared_setting_secret` capture, the cutover wipes
+    /// the whole journal, and the reseed is the only path that restores it — so
+    /// after cutover the outbox must hold a fresh secret op under the NEW epoch
+    /// with a real (non-zero) HLC, or the secret would silently vanish.
+    #[test]
+    fn baseline_cutover_reseeds_stored_shared_secret() {
+        with_tmp_home(|| {
+            let node = make_runtime(170);
+            seed_core_authority_target(
+                &node.runtime.db,
+                "core.shared_setting_secret",
+                "peer-authority",
+            );
+
+            repository::set_shared_secret_setting_secure(
+                &node.runtime.db,
+                "hf_token",
+                "hf_baseline_secret",
+                &node.runtime.settings_cipher,
+                None,
+            )
+            .expect("store shared secret");
+
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "1",
+            )
+            .expect("arm marker");
+
+            node.runtime
+                .run_pending_baseline_cutover()
+                .expect("cutover runs")
+                .expect("cutover pending");
+
+            let new_epoch = node.runtime.ledger.current_epoch().expect("epoch");
+            let push = node
+                .runtime
+                .build_push_payload_for_target("peer-authority", 256)
+                .expect("push")
+                .expect("payload");
+
+            let mut secret_hlcs: Vec<HybridLogicalTimestamp> = Vec::new();
+            for wire in &push.operations {
+                let op = node
+                    .runtime
+                    .ledger
+                    .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
+                    .expect("op");
+                if op.body.resource_type == "core.shared_setting_secret"
+                    && op.body.resource_id == "hf_token"
+                {
+                    assert_eq!(op.body.epoch, new_epoch, "secret reseed carries new epoch");
+                    secret_hlcs.push(op.body.hlc_timestamp.clone());
+                }
+            }
+            assert_eq!(
+                secret_hlcs.len(),
+                1,
+                "exactly one fresh shared-secret op after cutover"
+            );
+            let hlc = &secret_hlcs[0];
+            assert!(
+                hlc.wall_time_ms > 0 || hlc.logical > 0,
+                "secret reseed must mint a real HLC, got {hlc:?}"
+            );
+        });
+    }
+
+    /// CRITICAL 2: a crash between `bump_epoch` and clearing the marker must not
+    /// double-bump. Re-arming the marker with the counter the runtime persisted
+    /// (the crash-resume state) and re-running leaves the epoch bumped exactly
+    /// once and re-seeds into the wiped outbox.
+    #[test]
+    fn baseline_cutover_is_idempotent_across_crash_retry() {
+        with_tmp_home(|| {
+            let node = make_runtime(161);
+            seed_core_authority_target(&node.runtime.db, "core.flow", "peer-authority");
+            seed_flow_row(&node.runtime.db, "flow-x", "Xi");
+
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "1",
+            )
+            .expect("arm marker");
+
+            node.runtime
+                .run_pending_baseline_cutover()
+                .expect("first cutover")
+                .expect("pending");
+            let after_first = node.runtime.ledger.current_epoch().expect("epoch");
+            assert_eq!(after_first.counter, 1, "first cutover bumps to 1");
+
+            // Simulate a crash AFTER bump_epoch but BEFORE the marker clear: the
+            // runtime had already rewritten the marker to record the pre-cutover
+            // counter (0). Re-arm exactly that state and re-run.
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "pre_cutover_epoch=0",
+            )
+            .expect("re-arm crash-resume marker");
+
+            let reseeded = node
+                .runtime
+                .run_pending_baseline_cutover()
+                .expect("retry cutover")
+                .expect("still pending");
+            assert!(reseeded >= 1, "retry re-seeds the snapshot");
+
+            let after_retry = node.runtime.ledger.current_epoch().expect("epoch");
+            assert_eq!(
+                after_retry.counter, 1,
+                "retry must NOT bump the epoch a second time"
+            );
+            assert_eq!(after_retry, after_first);
+
+            // Marker cleared; a routine restart is a no-op.
+            assert!(node
+                .runtime
+                .run_pending_baseline_cutover()
+                .expect("third pass")
+                .is_none());
+            assert_eq!(
+                node.runtime.ledger.current_epoch().expect("epoch"),
+                after_first
+            );
+        });
+    }
+
+    // =========================================================================
+    // E2E phase D: cross-node LWW convergence + baseline epoch fencing
+    // =========================================================================
+
+    /// HLC with a caller-chosen wall time and origin node — lets a test order two
+    /// concurrent edits deterministically and exercise the node_id tie-break.
+    fn hlc_at(wall_ms: i64, logical: u32, node_id: &str) -> HybridLogicalTimestamp {
+        HybridLogicalTimestamp {
+            wall_time_ms: wall_ms,
+            logical,
+            node_id: node_id.to_string(),
+        }
+    }
+
+    /// Builds a complete `core.flow` INSERT capture carrying an explicit HLC, so
+    /// the materializer's last-writer-wins comparison sees the order the test
+    /// intends rather than wall-clock noise.
+    fn flow_capture_with_hlc(
+        resource_id: &str,
+        name: &str,
+        hlc: HybridLogicalTimestamp,
+    ) -> crate::sync::core_capture::CoreWriteCapture {
+        let mut fields = BTreeMap::new();
+        fields.insert("name".to_string(), FieldValue::String(name.to_string()));
+        fields.insert("is_default".to_string(), FieldValue::Bool(false));
+        fields.insert(
+            "flow_json".to_string(),
+            FieldValue::String(r#"{"nodes":[]}"#.to_string()),
+        );
+        fields.insert(
+            "status".to_string(),
+            FieldValue::String("active".to_string()),
+        );
+        crate::sync::core_capture::CoreWriteCapture::new(
+            crate::sync::core_registry::CoreSyncResourceKind::Flow,
+            "org-default",
+            resource_id,
+            SqlWriteAction::Insert,
+            fields,
+            Some("test-actor".to_string()),
+            hlc,
+            test_epoch(),
+        )
+    }
+
+    fn flow_name(db: &DbPool, id: &str) -> Option<String> {
+        repository::get_flow(db, id).expect("get flow").map(|f| f.name)
+    }
+
+    /// Records a flow capture on `node` (signs + queues it) and returns the
+    /// resulting signed `SyncOperation` ready to apply on a peer.
+    fn signed_flow_op(
+        node: &RuntimeHarness,
+        capture: crate::sync::core_capture::CoreWriteCapture,
+    ) -> SyncOperation {
+        let recorded = node
+            .runtime
+            .record_core_capture(capture)
+            .expect("record core capture");
+        node.runtime
+            .ledger
+            .get_operation(recorded.op_id)
+            .expect("operation")
+    }
+
+    /// Cross-node LWW: the SAME flow is edited concurrently on two nodes with
+    /// different HLCs. Applying both operations in OPPOSITE orders on two separate
+    /// databases must converge to the newer-HLC value — proving the winner is the
+    /// higher HLC (not whichever arrived last) and that the two nodes do not
+    /// diverge. The materializer is the LWW decision point reached by every
+    /// inbound operation.
+    #[test]
+    fn e2e_cross_node_lww_converges_to_newer_hlc_regardless_of_apply_order() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(91);
+            let node_b = make_runtime(92);
+
+            // Two concurrent INSERT edits of flow "1": A older, B newer. Distinct
+            // origin node_ids so the comparison never depends on a tie.
+            let older = flow_capture_with_hlc("1", "from-A", hlc_at(1_000, 0, "node-a"));
+            let newer = flow_capture_with_hlc("1", "from-B", hlc_at(2_000, 0, "node-b"));
+            let op_older = signed_flow_op(&node_a, older);
+            let op_newer = signed_flow_op(&node_b, newer);
+
+            // DB 1 applies older THEN newer; DB 2 applies newer THEN older.
+            let db1 = make_db();
+            let db2 = make_db();
+            let cipher = make_settings_cipher(91);
+
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_older)
+                .expect("db1 older");
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_newer)
+                .expect("db1 newer");
+
+            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_newer)
+                .expect("db2 newer");
+            // The older op arriving last must be DROPPED by the LWW gate (applies
+            // 0 rows), not clobber the newer value.
+            let stale_rows =
+                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_older)
+                    .expect("db2 older");
+            assert_eq!(stale_rows, 0, "stale older op must be dropped by LWW");
+
+            // Both databases converge to the newer-HLC value.
+            assert_eq!(flow_name(&db1, "1").as_deref(), Some("from-B"));
+            assert_eq!(flow_name(&db2, "1").as_deref(), Some("from-B"));
+        });
+    }
+
+    /// LWW tie-break: equal wall time + logical, differing origin node_id. The
+    /// total HLC order from phase A breaks the tie by node_id, and it must do so
+    /// the SAME way on both databases regardless of apply order.
+    #[test]
+    fn e2e_cross_node_lww_node_id_tiebreak_is_deterministic() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(93);
+            let node_b = make_runtime(94);
+
+            // Identical wall+logical; tie-break decides. "node-z" > "node-a", so
+            // the "node-z" edit wins the total order deterministically.
+            let lower = flow_capture_with_hlc("1", "from-a", hlc_at(5_000, 0, "node-a"));
+            let higher = flow_capture_with_hlc("1", "from-z", hlc_at(5_000, 0, "node-z"));
+            let op_lower = signed_flow_op(&node_a, lower);
+            let op_higher = signed_flow_op(&node_b, higher);
+
+            let db1 = make_db();
+            let db2 = make_db();
+            let cipher = make_settings_cipher(93);
+
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_lower)
+                .expect("db1 lower");
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_higher)
+                .expect("db1 higher");
+
+            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_higher)
+                .expect("db2 higher");
+            let stale =
+                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_lower)
+                    .expect("db2 lower");
+            assert_eq!(stale, 0, "lower node_id loses the tie-break and is dropped");
+
+            assert_eq!(flow_name(&db1, "1").as_deref(), Some("from-z"));
+            assert_eq!(flow_name(&db2, "1").as_deref(), Some("from-z"));
+        });
+    }
+
+    /// Cross-node LWW through the FULL outbox -> push -> inbox -> materialize path
+    /// (in-process, no iroh). The source records a flow op; the receiver, set up
+    /// as a permission target for itself and the source, ingests the push and
+    /// materializes the flow row — demonstrating the realistic transport reaches
+    /// the same materializer that enforces LWW.
+    #[test]
+    fn e2e_cross_node_push_inbox_materializes_flow() {
+        with_tmp_home(|| {
+            let source = make_runtime(95);
+            let receiver = make_runtime(96);
+
+            // Authority-write policy on both sides with the receiver as the
+            // authority target: the source queues to the receiver, and the
+            // receiver accepts inbound ops for itself.
+            seed_core_authority_target(
+                &source.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target(
+                &receiver.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+
+            source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("1", "Pushed Flow"))
+                .expect("record core flow");
+
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("build push")
+                .expect("pending push");
+            let ack = receiver
+                .runtime
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect("handle push");
+            assert_eq!(ack.operation_ids.len(), 1, "one op accepted into inbox");
+
+            // The inbound op materialized into the receiver's flows table.
+            assert_eq!(flow_name(&receiver.runtime.db, "1").as_deref(), Some("Pushed Flow"));
+        });
+    }
+
+    /// ACL gating inside the merged org: a `core.flow` resource assigned to one
+    /// user replicates ONLY to that user's node. The other node, present in the
+    /// same logical organization but lacking permission, is NOT a push target.
+    /// This is the phase-A fix verified end-to-end: a denied node receives no push.
+    #[test]
+    fn e2e_acl_replicates_flow_only_to_permitted_node_in_merged_org() {
+        with_tmp_home(|| {
+            let source = make_runtime(99);
+            let permitted = make_runtime(100);
+            let denied = make_runtime(101);
+
+            let permitted_user = repository::create_user_account(
+                &source.runtime.db,
+                "permitted-user",
+                "hash",
+                "Permitted User",
+                "permitted@example.com",
+            )
+            .expect("permitted user");
+            let denied_user = repository::create_user_account(
+                &source.runtime.db,
+                "denied-user",
+                "hash",
+                "Denied User",
+                "denied@example.com",
+            )
+            .expect("denied user");
+
+            for (node_id, user_id, display) in [
+                (
+                    permitted.runtime.local_node_id.as_str(),
+                    permitted_user.as_str(),
+                    "Permitted Node",
+                ),
+                (
+                    denied.runtime.local_node_id.as_str(),
+                    denied_user.as_str(),
+                    "Denied Node",
+                ),
+            ] {
+                repository::upsert_sync_node_identity(
+                    &source.runtime.db,
+                    node_id,
+                    "pub",
+                    "ed25519",
+                    display,
+                    "laptop",
+                    "trusted",
+                    Some(user_id),
+                    "standard",
+                )
+                .expect("sync node");
+                repository::assign_node_to_user(&source.runtime.db, node_id, user_id, "primary", None)
+                    .expect("assign node");
+            }
+            repository::upsert_sync_policy(
+                &source.runtime.db,
+                "policy-core-flow-permission",
+                "org-default",
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                Some("core.flow"),
+                None,
+                "replicated_by_permission",
+                None,
+                None,
+                true,
+            )
+            .expect("sync policy");
+            // The flow is assigned to the permitted user only.
+            repository::upsert_sync_resource_acl(
+                &source.runtime.db,
+                "org-default",
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                "core.flow",
+                "1",
+                Some(permitted_user.as_str()),
+                Some(permitted_user.as_str()),
+                None,
+                None,
+                "assigned",
+            )
+            .expect("resource acl");
+
+            let recorded = source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("1", "ACL Gated Flow"))
+                .expect("record core capture");
+
+            let permitted_push = source
+                .runtime
+                .build_push_payload_for_target(&permitted.runtime.local_node_id, 16)
+                .expect("permitted push");
+            let denied_push = source
+                .runtime
+                .build_push_payload_for_target(&denied.runtime.local_node_id, 16)
+                .expect("denied push");
+
+            assert!(permitted_push.is_some(), "permitted node must receive the push");
+            assert!(denied_push.is_none(), "denied node must NOT receive any push");
+            assert_eq!(recorded.queued_targets, 1, "exactly one permitted target queued");
+        });
+    }
+
+    /// Epoch fencing after baseline adopt: an operation minted under the OLD
+    /// (pre-adopt) epoch is rejected by the receiver's inbox once the receiver has
+    /// adopted a newer epoch. `put_verified_in_inbox` returns `EpochMismatch` and
+    /// nothing materializes — stale-epoch writes from before the merge cannot leak
+    /// into the merged organization.
+    #[test]
+    fn e2e_epoch_fencing_rejects_pre_adopt_operation() {
+        with_tmp_home(|| {
+            let source = make_runtime(97);
+            let receiver = make_runtime(98);
+            seed_core_authority_target(
+                &source.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target(
+                &receiver.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+
+            // Source mints an op under the genesis epoch (counter 0).
+            let recorded = source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("1", "Stale Epoch Flow"))
+                .expect("record core flow");
+            let stale_op = source
+                .runtime
+                .ledger
+                .get_operation(recorded.op_id)
+                .expect("operation");
+            assert_eq!(stale_op.body.epoch.counter, 0, "op stamped under genesis epoch");
+
+            // Receiver adopts a NEWER baseline epoch (as it would after pairing).
+            let new_epoch = BaselineEpoch {
+                counter: 7,
+                origin_node: receiver.runtime.local_node_id.clone(),
+            };
+            receiver.runtime.ledger.set_epoch(new_epoch.clone()).expect("set epoch");
+
+            // The push carries the stale-epoch op; the receiver's inbox fences it.
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("build push")
+                .expect("pending push");
+            let err = receiver
+                .runtime
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect_err("stale-epoch push must be fenced");
+            match err {
+                SyncLedgerError::EpochMismatch { expected, actual } => {
+                    assert_eq!(expected, new_epoch, "fence expects the adopted epoch");
+                    assert_eq!(actual.counter, 0, "rejected op carried the old epoch");
+                }
+                other => panic!("expected EpochMismatch, got: {other:?}"),
+            }
+
+            // Nothing materialized: the receiver has no such flow row.
+            assert!(
+                repository::get_flow(&receiver.runtime.db, "1")
+                    .expect("get flow")
+                    .is_none(),
+                "stale-epoch op must not materialize after fencing"
+            );
+        });
     }
 }

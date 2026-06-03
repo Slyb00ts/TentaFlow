@@ -34,15 +34,10 @@ fn parse_epoch(s: &str) -> u64 {
     0
 }
 
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -69,7 +64,7 @@ fn audit(
     let node_id = ctx.state.local_node_id.as_ref();
     if let Err(e) = repository::log_audit_full(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         Some(resource_id),
         action,
         Some(resource_type),
@@ -108,7 +103,7 @@ pub fn addon_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         let uid = current_user_id(ctx).ok_or_else(|| {
             ProtocolError::new(ProtocolErrorCode::AuthRequired, "brak user_id w sesji")
         })?;
-        if !repository::is_addon_visible_to_user(&ctx.state.db, &payload.addon_id, uid)
+        if !repository::is_addon_visible_to_user(&ctx.state.db, &payload.addon_id, &uid)
             .map_err(db_err)?
         {
             return Err(ProtocolError::not_found("addon nie istnieje"));
@@ -256,18 +251,18 @@ pub fn addon_visibility_set(
     };
     // Snapshot starych wartosci przed upsert — potrzebne do audytu.
     let visible_old =
-        repository::get_addon_visibility(&ctx.state.db, &payload.addon_id, payload.group_id)
+        repository::get_addon_visibility(&ctx.state.db, &payload.addon_id, &payload.group_id)
             .map_err(db_err)?;
-    let group_name = repository::get_group_name_by_id(&ctx.state.db, payload.group_id)
+    let group_name = repository::get_group_name_by_id(&ctx.state.db, &payload.group_id)
         .map_err(db_err)?
         .unwrap_or_default();
     let updated_by = current_user_id(ctx);
     repository::set_addon_visibility(
         &ctx.state.db,
         &payload.addon_id,
-        payload.group_id,
+        &payload.group_id,
         payload.visible,
-        updated_by,
+        updated_by.as_deref(),
     )
     .map_err(db_err)?;
     audit(
@@ -286,13 +281,13 @@ pub fn addon_visibility_set(
     addon_perm_broadcast::publish(AddonPermissionChangedEvent {
         addon_id: payload.addon_id.clone(),
         subject_type: Some("group".to_string()),
-        subject_id: Some(payload.group_id),
+        subject_id: Some(payload.group_id.clone()),
         permission_id: None,
     });
     Ok(MessageBody::AddonVisibilitySetResponseBody(
         AddonVisibilitySetResponse {
             addon_id: payload.addon_id.clone(),
-            group_id: payload.group_id,
+            group_id: payload.group_id.clone(),
             visible: payload.visible,
         },
     ))
@@ -476,7 +471,7 @@ pub fn addon_permission_set(
         &ctx.state.db,
         &payload.addon_id,
         &payload.subject_type,
-        payload.subject_id,
+        &payload.subject_id,
         &payload.permission_id,
     )
     .map_err(db_err)?;
@@ -488,11 +483,11 @@ pub fn addon_permission_set(
     .map_err(db_err)?
     .unwrap_or_else(|| "low".to_string());
     let subject_name = match payload.subject_type.as_str() {
-        "user" => repository::get_user_account_by_id(&ctx.state.db, payload.subject_id)
+        "user" => repository::get_user_account_by_id(&ctx.state.db, &payload.subject_id)
             .map_err(db_err)?
             .map(|u| u.username)
             .unwrap_or_default(),
-        "group" => repository::get_group_name_by_id(&ctx.state.db, payload.subject_id)
+        "group" => repository::get_group_name_by_id(&ctx.state.db, &payload.subject_id)
             .map_err(db_err)?
             .unwrap_or_default(),
         _ => String::new(),
@@ -502,10 +497,10 @@ pub fn addon_permission_set(
         &ctx.state.db,
         &payload.addon_id,
         &payload.subject_type,
-        payload.subject_id,
+        &payload.subject_id,
         &payload.permission_id,
         &payload.grant_mode,
-        updated_by,
+        updated_by.as_deref(),
     )
     .map_err(db_err)?;
     let severity = if matches!(risk.as_str(), "high" | "critical") {
@@ -532,14 +527,14 @@ pub fn addon_permission_set(
     addon_perm_broadcast::publish(AddonPermissionChangedEvent {
         addon_id: payload.addon_id.clone(),
         subject_type: Some(payload.subject_type.clone()),
-        subject_id: Some(payload.subject_id),
+        subject_id: Some(payload.subject_id.clone()),
         permission_id: Some(payload.permission_id.clone()),
     });
     Ok(MessageBody::AddonPermissionSetResponseBody(
         AddonPermissionSetResponse {
             addon_id: payload.addon_id.clone(),
             subject_type: payload.subject_type.clone(),
-            subject_id: payload.subject_id,
+            subject_id: payload.subject_id.clone(),
             permission_id: payload.permission_id.clone(),
             grant_mode: payload.grant_mode.clone(),
         },
@@ -580,7 +575,7 @@ pub fn addon_permission_default_set(
         &payload.addon_id,
         &payload.permission_id,
         &payload.grant_mode,
-        updated_by,
+        updated_by.as_deref(),
     )
     .map_err(db_err)?;
     audit(
@@ -633,7 +628,7 @@ pub fn addon_permission_check(
     let my_id = current_user_id(ctx).ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "brak user_id w sesji")
     })?;
-    let target_id = payload.user_id.unwrap_or(my_id);
+    let target_id = payload.user_id.clone().unwrap_or_else(|| my_id.clone());
     if target_id != my_id && !is_admin(ctx) {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
@@ -642,7 +637,7 @@ pub fn addon_permission_check(
     }
     // Visibility enforcement: non-admin pytajacy o ukryty addon dostaje NotFound.
     if !is_admin(ctx)
-        && !repository::is_addon_visible_to_user(&ctx.state.db, &payload.addon_id, my_id)
+        && !repository::is_addon_visible_to_user(&ctx.state.db, &payload.addon_id, &my_id)
             .map_err(db_err)?
     {
         return Err(ProtocolError::not_found("addon nie istnieje"));
@@ -651,7 +646,7 @@ pub fn addon_permission_check(
         &ctx.state.db,
         &payload.addon_id,
         &payload.permission_id,
-        target_id,
+        &target_id,
     )
     .map_err(db_err)?;
     Ok(MessageBody::AddonPermissionCheckResponseBody(

@@ -1,0 +1,26 @@
+[engine]
+id = "searxng"
+category = "tools"
+name = "SearXNG"
+description_pl = "Prywatny metasearch engine dla web research i addonow LLM."
+description_en = "Private metasearch engine for web research and LLM addons."
+homepage = "https://docs.searxng.org/"
+license = "AGPL-3.0-or-later"
+resource_kind = "infra"
+default_port = 8080
+api = "custom"
+version = "2026.5.17"
+requires_model = false
+gpu_supported = false
+
+[deploy.docker]
+context_path = "tools/docker/searxng"
+platforms = ["linux", "windows"]
+transport = "direct-http"
+download_image = "searxng/searxng:2026.5.17-d7e8b7cd1"
+download_size_mb = 240
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "python-bundle"
+bundle_path = "tools/python/searxng"

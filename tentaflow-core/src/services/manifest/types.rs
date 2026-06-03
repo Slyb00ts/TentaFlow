@@ -476,4 +476,23 @@ pub struct ModelPreset {
     /// when absent.
     #[serde(default)]
     pub speculator_num_tokens: Option<u32>,
+    /// vLLM-specific provisioning for this preset — self-quantization to NVFP4
+    /// before serving. Ignored by non-vLLM engines.
+    #[serde(default)]
+    pub vllm: Option<VllmPreset>,
+}
+
+/// vLLM self-quantization knobs for a `[[model_preset]]`. When `quantize` is
+/// set the container downloads the source weights and runs `llm-compressor`
+/// (NVFP4 / NVFP4A16) before serving, deleting the source. `quantize_draft`
+/// does the same for the `speculator_repo` draft model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VllmPreset {
+    /// Quantize the main model to this scheme (`"NVFP4"` = W4A4 with calibration,
+    /// `"NVFP4A16"` = weight-only, data-free). `None` serves the repo as-is.
+    #[serde(default)]
+    pub quantize: Option<String>,
+    /// Quantize the `speculator_repo` draft model to this scheme.
+    #[serde(default)]
+    pub quantize_draft: Option<String>,
 }

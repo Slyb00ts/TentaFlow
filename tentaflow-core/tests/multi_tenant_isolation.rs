@@ -68,7 +68,7 @@ fn make_state(db: DbPool, addon_id: &str, org_id: Option<&str>) -> AddonState {
     AddonState {
         addon_id: addon_id.to_string(),
         instance_id: "i-1".to_string(),
-        user_id: Some(42),
+        user_id: Some("00000000-0000-0000-0000-000000000042".to_string()),
         org_id: org_id.map(String::from),
         db: db.clone(),
         permissions: vec!["sql".to_string()],

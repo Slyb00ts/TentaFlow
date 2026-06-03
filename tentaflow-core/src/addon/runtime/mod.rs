@@ -6,8 +6,7 @@
 
 pub mod language_adapter;
 pub use language_adapter::{
-    adapter_for_runtime, DotnetAdapter, LanguageAdapter, PythonAdapter, RustAdapter,
-    KNOWN_RUNTIMES,
+    adapter_for_runtime, DotnetAdapter, LanguageAdapter, PythonAdapter, RustAdapter, KNOWN_RUNTIMES,
 };
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]

@@ -23,8 +23,8 @@ use tentaflow_protocol::{
 use super::HandlerContext;
 use crate::db::repository;
 use crate::services::camera_ingest::credentials::credentials_cipher;
-use crate::services::camera_ingest::onvif_discovery::{DiscoveryOptions, discover as ws_discover};
-use crate::services::camera_ingest::onvif_media::{OnvifCredentials, OnvifError, derive_rtsp_uri};
+use crate::services::camera_ingest::onvif_discovery::{discover as ws_discover, DiscoveryOptions};
+use crate::services::camera_ingest::onvif_media::{derive_rtsp_uri, OnvifCredentials, OnvifError};
 use crate::services::rbac::OrgContext;
 
 const PERM_DISCOVER: &str = "camera.discover";
@@ -203,21 +203,15 @@ fn user_id_str(ctx: &HandlerContext) -> Option<&str> {
 }
 
 fn audit_row(ctx: &HandlerContext, action: &str, resource: Option<&str>, details: &str) {
-    let user_i64 = match &ctx.session {
+    let user_uuid = match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] == 0xFF {
-                let mut le = [0u8; 8];
-                le.copy_from_slice(&user_id[8..]);
-                Some(i64::from_le_bytes(le))
-            } else {
-                None
-            }
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     };
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_i64,
+        user_uuid.as_deref(),
         None,
         action,
         resource,
@@ -240,22 +234,16 @@ fn audit_frame_url(
     resource_id: Option<&str>,
     details: &serde_json::Value,
 ) {
-    let user_i64 = match &ctx.session {
+    let user_uuid = match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] == 0xFF {
-                let mut le = [0u8; 8];
-                le.copy_from_slice(&user_id[8..]);
-                Some(i64::from_le_bytes(le))
-            } else {
-                None
-            }
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     };
     let details_str = details.to_string();
     let _ = repository::log_audit_full(
         &ctx.state.db,
-        user_i64,
+        user_uuid.as_deref(),
         None,
         "camera.frame_url",
         Some("camera"),

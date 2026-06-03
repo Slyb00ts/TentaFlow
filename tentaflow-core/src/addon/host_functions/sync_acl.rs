@@ -6,19 +6,17 @@
 
 use serde::Deserialize;
 
-use super::{
-    AddonState, WasmCaller, audit_log, check_permission, get_memory, read_guest_bytes,
-};
+use super::{audit_log, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller};
 use crate::addon::errors::AbiError;
 
 #[derive(Debug, Deserialize)]
 struct SyncAclUpsertRequest {
     resource_type: String,
     resource_id: String,
-    owner_user_id: Option<i64>,
-    assigned_user_id: Option<i64>,
+    owner_user_id: Option<String>,
+    assigned_user_id: Option<String>,
     department_id: Option<String>,
-    manager_user_id: Option<i64>,
+    manager_user_id: Option<String>,
     visibility_scope: String,
 }
 
@@ -75,10 +73,10 @@ pub fn sync_acl_upsert_v1(
         &caller.data().addon_id,
         &payload.resource_type,
         &payload.resource_id,
-        payload.owner_user_id,
-        payload.assigned_user_id,
+        payload.owner_user_id.as_deref(),
+        payload.assigned_user_id.as_deref(),
         department_id,
-        payload.manager_user_id,
+        payload.manager_user_id.as_deref(),
         &payload.visibility_scope,
     ) {
         Ok(()) => {
@@ -207,7 +205,7 @@ fn sync_share_apply(state: &AddonState, payload: SyncShareRequest, grant: bool) 
             &payload.subject_type,
             &payload.subject_id,
             &payload.action,
-            state.user_id,
+            state.user_id.as_deref(),
         )
     } else {
         crate::db::repository::revoke_sync_explicit_share(
@@ -235,8 +233,7 @@ fn read_payload<T: for<'de> Deserialize<'de>>(
     let memory = get_memory(caller).ok_or_else(|| AbiError::Operation.as_i32())?;
     let bytes = read_guest_bytes(&memory, caller, payload_ptr, payload_len)
         .ok_or_else(|| AbiError::Operation.as_i32())?;
-    ciborium::de::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|_| AbiError::Operation.as_i32())
+    ciborium::de::from_reader(std::io::Cursor::new(bytes)).map_err(|_| AbiError::Operation.as_i32())
 }
 
 fn validate_resource(resource_type: &str, resource_id: &str) -> Result<(), ()> {
@@ -252,8 +249,8 @@ fn validate_resource(resource_type: &str, resource_id: &str) -> Result<(), ()> {
 
 fn validate_scope(scope: &str) -> Result<(), ()> {
     match scope {
-        "private" | "own" | "assigned" | "department" | "manager_subtree"
-        | "explicit_share" | "all" => Ok(()),
+        "private" | "own" | "assigned" | "department" | "manager_subtree" | "explicit_share"
+        | "all" => Ok(()),
         _ => Err(()),
     }
 }

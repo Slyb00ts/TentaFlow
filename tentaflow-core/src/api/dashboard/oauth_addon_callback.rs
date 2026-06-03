@@ -97,7 +97,7 @@ async fn handle_callback_inner(db: &DbPool, query: &str) -> Result<CallbackResul
 
     repository::upsert_user_oauth_account(
         db,
-        pending.user_id,
+        pending.user_id.as_deref(),
         &pending.addon_id,
         &pending.provider_id,
         &ext_id,

@@ -615,7 +615,7 @@ pub enum FlowInputValue {
 pub struct FlowInvokeRequest {
     /// Gdy ustawione — odpal KONKRETNY flow po ID (wybrany przez usera). Ma
     /// priorytet nad model/service_type (np. audio chat uruchamia wybrany flow).
-    pub flow_id: Option<i64>,
+    pub flow_id: Option<String>,
     /// Nazwa modelu — używana do rozwiązania flow przez model/service_type gdy
     /// `flow_id` nie jest podany.
     pub model: String,
@@ -834,7 +834,7 @@ pub struct AuditEvent {
 /// Optional filters for audit log list/export — all fields nullable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AuditLogFilters {
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: Option<String>,
     pub action: Option<String>,
     pub from_date: Option<String>,
@@ -848,7 +848,7 @@ pub struct AuditLogEntry {
     pub id: i64,
     pub timestamp: String,
     pub action: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: Option<String>,
     pub resource: Option<String>,
     pub details: Option<String>,
@@ -1559,6 +1559,97 @@ pub struct MeshNodeNetworkConfigResponse {
 }
 
 // =============================================================================
+// Sync baseline-adopt admin (R-LIST + W-ACTION). Admin wskazuje dawce baseline'u
+// i steruje pojedyncza adopcja single-flight: lista kandydatow, start, status,
+// odblokowanie zawieszonego stanu. Donorow widac tylko sposrod zaufanych peerow.
+// =============================================================================
+
+/// Lokalnie znane podsumowanie baseline'u kandydata. Pelne liczby dawcy poznaje
+/// sie dopiero z naglowka transferu (`BaselineHeader`), wiec dla listy to pole
+/// jest opcjonalne — `None` gdy lokalnie nic nie wiadomo o zawartosci dawcy.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineDonorSummary {
+    pub org_name: String,
+    pub users: u64,
+    pub flows: u64,
+    pub roles: u64,
+}
+
+/// Kandydat na dawce baseline'u: zaufany sparowany peer. `trusted` jest zawsze
+/// `true` na wyjsciu (filtrujemy nie-zaufanych po stronie hosta) — pole zostaje,
+/// by frontend mogl jawnie pokazac status zaufania bez zgadywania.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineDonorCandidate {
+    pub node_id: String,
+    pub display_name: String,
+    pub trusted: bool,
+    pub summary: Option<BaselineDonorSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineDonorListResponse {
+    pub candidates: Vec<BaselineDonorCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptStartRequest {
+    /// node_id (hex) wskazanego dawcy. Musi byc zaufanym sparowanym peerem.
+    pub donor_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptStartResponse {
+    pub ok: bool,
+    /// `true` gdy adopcja faktycznie wystartowala (rola joiner, pull w tle).
+    pub started: bool,
+    /// Komunikat diagnostyczny (np. powod odmowy single-flight).
+    pub message: String,
+}
+
+/// Faza adopcji widziana przez admina. `None` = brak trwajacej/zakonczonej
+/// adopcji. Pozostale warianty mapuja `core_baseline::BaselinePhase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum BaselineAdoptPhaseTag {
+    None,
+    Elected,
+    Receiving,
+    Importing,
+    Imported,
+    Completed,
+}
+
+/// Raport importu baseline'u (dostepny dopiero po `Completed`). Lustro
+/// `core_baseline::BaselineImportReport` w ksztalcie wire.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptReport {
+    pub donor_org_id: String,
+    pub users_merged_by_email: u64,
+    pub users_joined_donor_org: u64,
+    pub collisions_suffixed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptStatusResponse {
+    pub phase: BaselineAdoptPhaseTag,
+    /// node_id (hex) drugiej strony adopcji, jesli stan istnieje.
+    pub peer: Option<String>,
+    /// Czy lokalny nod jest joinerem (`true`) czy dawca (`false`); `None` gdy
+    /// brak stanu.
+    pub is_joiner: Option<bool>,
+    /// Raport dostepny tylko gdy faza == Completed; inaczej `None`.
+    pub report: Option<BaselineAdoptReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BaselineAdoptClearResponse {
+    pub ok: bool,
+    /// `true` gdy stan zostal wyczyszczony; `false` gdy nic nie bylo do
+    /// wyczyszczenia albo czyszczenie bylo niedozwolone (aktywny import).
+    pub cleared: bool,
+    pub message: String,
+}
+
+// =============================================================================
 // Settings (R-LIST + W-UPDATE archetypy, migration-map #147-#148)
 // =============================================================================
 
@@ -1957,7 +2048,7 @@ pub struct SsoProviderEntry {
     pub discovery_url: String,
     pub enabled: bool,
     pub auto_create_users: bool,
-    pub default_group_id: Option<i64>,
+    pub default_group_id: Option<String>,
     pub created_at: String,
 }
 
@@ -1977,7 +2068,7 @@ pub struct SsoProviderCreateRequest {
     pub client_secret: String,
     pub discovery_url: String,
     pub auto_create_users: bool,
-    pub default_group_id: Option<i64>,
+    pub default_group_id: Option<String>,
 }
 
 /// Response: potwierdzenie utworzenia providera SSO.
@@ -2042,7 +2133,7 @@ pub enum CatalogEntryKindWire {
         instances: Vec<CatalogModelInstance>,
     },
     Flow {
-        flow_id: i64,
+        flow_id: String,
         published_name: String,
     },
     Alias {
@@ -2590,7 +2681,7 @@ pub struct AddonLogEntry {
     pub level: String,
     pub action: String,
     pub message: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub user_name: Option<String>,
     pub details: String,
 }
@@ -2703,7 +2794,7 @@ pub struct AddonNetworkRulesSetResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilityRow {
     pub addon_id: String,
-    pub group_id: i64,
+    pub group_id: String,
     pub group_name: String,
     pub visible: bool,
     pub group_description: String,
@@ -2725,14 +2816,14 @@ pub struct AddonVisibilityListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilitySetRequest {
     pub addon_id: String,
-    pub group_id: i64,
+    pub group_id: String,
     pub visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonVisibilitySetResponse {
     pub addon_id: String,
-    pub group_id: i64,
+    pub group_id: String,
     pub visible: bool,
 }
 
@@ -2776,7 +2867,7 @@ pub struct AddonPermissionCatalogResponse {
 pub struct AddonPermissionRow {
     pub addon_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub permission_id: String,
     pub grant_mode: String,
     pub updated_at_epoch: u64,
@@ -2809,7 +2900,7 @@ pub struct AddonPermissionMatrixResponse {
 pub struct AddonPermissionSetRequest {
     pub addon_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub permission_id: String,
     pub grant_mode: String,
 }
@@ -2818,7 +2909,7 @@ pub struct AddonPermissionSetRequest {
 pub struct AddonPermissionSetResponse {
     pub addon_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub permission_id: String,
     pub grant_mode: String,
 }
@@ -2841,7 +2932,7 @@ pub struct AddonPermissionDefaultSetResponse {
 pub struct AddonPermissionCheckRequest {
     pub addon_id: String,
     pub permission_id: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -2857,7 +2948,7 @@ pub struct AddonPermissionCheckResponse {
 pub struct AddonPermissionChangedEvent {
     pub addon_id: String,
     pub subject_type: Option<String>,
-    pub subject_id: Option<i64>,
+    pub subject_id: Option<String>,
     pub permission_id: Option<String>,
 }
 
@@ -2937,7 +3028,7 @@ pub struct AddonOAuthAuthorizeStartResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct UserOAuthAccountRow {
     pub id: i64,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: String,
     pub provider_id: String,
     pub external_account_id: String,
@@ -3148,7 +3239,7 @@ pub struct DeploymentSummary {
     pub finished_at: String,
     pub error_message: String,
     pub log_tail: String,
-    pub user_id: i64,
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -3274,7 +3365,7 @@ pub struct MeetingSessionDescriptor {
     pub novnc_port: i32,
     pub bot_endpoint_id: String,
     pub container_name: String,
-    pub owner_user_id: i64,
+    pub owner_user_id: String,
     /// Aktualny etap lifecycle bota (patrz `LIFECYCLE_*` w `types.rs`).
     /// Pusty string gdy sesja jeszcze nie dotknęła żadnego etapu.
     pub lifecycle_stage: String,
@@ -3680,7 +3771,7 @@ pub enum TranslatePayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct UserInfo {
-    pub id: i64,
+    pub id: String,
     pub username: String,
     pub display_name: String,
     pub email: String,
@@ -3692,7 +3783,7 @@ pub struct UserInfo {
     /// "user" | "power_user" | "admin". Default "user" przy deserializacji
     /// starego payloadu.
     pub role: String,
-    pub group_ids: Vec<i64>,
+    pub group_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -3702,7 +3793,7 @@ pub struct UsersListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct GroupInfo {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub description: String,
     pub member_count: u32,
@@ -3713,7 +3804,7 @@ pub struct PermissionEntry {
     pub resource_type: String,
     pub resource_id: String,
     pub subject_type: String,
-    pub subject_id: i64,
+    pub subject_id: String,
     pub access_level: String,
 }
 
@@ -3727,7 +3818,7 @@ pub enum IamPayload {
         users: Vec<UserInfo>,
     },
     ReqGetUser {
-        user_id: i64,
+        user_id: String,
     },
     ResGetUser {
         user: UserInfo,
@@ -3738,27 +3829,27 @@ pub enum IamPayload {
         display_name: String,
         email: String,
         role: String,
-        group_ids: Vec<i64>,
+        group_ids: Vec<String>,
     },
     ResCreateUser {
-        user_id: i64,
+        user_id: String,
     },
     ReqUpdateUser {
-        user_id: i64,
+        user_id: String,
         display_name: String,
         email: String,
         is_active: bool,
         role: String,
     },
     ReqDeleteUser {
-        user_id: i64,
+        user_id: String,
     },
     ReqSetUserGroups {
-        user_id: i64,
-        group_ids: Vec<i64>,
+        user_id: String,
+        group_ids: Vec<String>,
     },
     ReqResetUserPassword {
-        user_id: i64,
+        user_id: String,
         new_password: String,
     },
 
@@ -3772,18 +3863,18 @@ pub enum IamPayload {
         description: String,
     },
     ResCreateGroup {
-        group_id: i64,
+        group_id: String,
     },
     ReqUpdateGroup {
-        group_id: i64,
+        group_id: String,
         name: String,
         description: String,
     },
     ReqDeleteGroup {
-        group_id: i64,
+        group_id: String,
     },
     ReqGroupMembers {
-        group_id: i64,
+        group_id: String,
     },
     ResGroupMembers {
         members: Vec<UserInfo>,
@@ -3797,14 +3888,14 @@ pub enum IamPayload {
         resource_type: String,
         resource_id: String,
         subject_type: String,
-        subject_id: i64,
+        subject_id: String,
         access_level: String,
     },
     ReqClearPermission {
         resource_type: String,
         resource_id: String,
         subject_type: String,
-        subject_id: i64,
+        subject_id: String,
     },
     ReqListPermsForResource {
         resource_type: String,
@@ -3812,7 +3903,7 @@ pub enum IamPayload {
     },
     ReqListPermsForSubject {
         subject_type: String,
-        subject_id: i64,
+        subject_id: String,
     },
     ResListPermissions {
         entries: Vec<PermissionEntry>,
@@ -3950,6 +4041,16 @@ pub enum MessageBody {
     MeshNodeCommandResponseBody(MeshNodeCommandResponse),
     MeshNodeNetworkConfigRequestBody(MeshNodeNetworkConfigRequest),
     MeshNodeNetworkConfigResponseBody(MeshNodeNetworkConfigResponse),
+
+    // ---- Sync baseline-adopt admin (donor list + start/status/clear) ----
+    BaselineDonorListRequest,
+    BaselineDonorListResponseBody(BaselineDonorListResponse),
+    BaselineAdoptStartRequestBody(BaselineAdoptStartRequest),
+    BaselineAdoptStartResponseBody(BaselineAdoptStartResponse),
+    BaselineAdoptStatusRequest,
+    BaselineAdoptStatusResponseBody(BaselineAdoptStatusResponse),
+    BaselineAdoptClearRequest,
+    BaselineAdoptClearResponseBody(BaselineAdoptClearResponse),
 
     // ---- Prompts (R-LIST + R-ONE) ----
     PromptListRequest,
@@ -5034,6 +5135,126 @@ mod tests {
                 assert_eq!(req.name_translations, translations);
             }
             _ => panic!("expected RoleCatalogBody::CreateRequest"),
+        }
+    }
+
+    #[test]
+    fn baseline_donor_list_response_round_trip() {
+        let body = MessageBody::BaselineDonorListResponseBody(BaselineDonorListResponse {
+            candidates: vec![
+                BaselineDonorCandidate {
+                    node_id: "aabbccdd".to_string(),
+                    display_name: "donor-host".to_string(),
+                    trusted: true,
+                    summary: Some(BaselineDonorSummary {
+                        org_name: "Acme".to_string(),
+                        users: 12,
+                        flows: 4,
+                        roles: 3,
+                    }),
+                },
+                BaselineDonorCandidate {
+                    node_id: "11223344".to_string(),
+                    display_name: "11223344".to_string(),
+                    trusted: true,
+                    summary: None,
+                },
+            ],
+        });
+        match round_trip(body.clone()) {
+            MessageBody::BaselineDonorListResponseBody(r) => {
+                assert_eq!(r.candidates.len(), 2);
+                assert_eq!(r.candidates[0].node_id, "aabbccdd");
+                assert_eq!(
+                    r.candidates[0].summary.as_ref().map(|s| s.users),
+                    Some(12)
+                );
+                assert!(r.candidates[1].summary.is_none());
+            }
+            other => panic!("expected BaselineDonorListResponseBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_adopt_start_round_trip() {
+        let req = MessageBody::BaselineAdoptStartRequestBody(BaselineAdoptStartRequest {
+            donor_node_id: "aabbccdd".to_string(),
+        });
+        match round_trip(req) {
+            MessageBody::BaselineAdoptStartRequestBody(r) => {
+                assert_eq!(r.donor_node_id, "aabbccdd");
+            }
+            other => panic!("expected BaselineAdoptStartRequestBody, got {other:?}"),
+        }
+
+        let resp = MessageBody::BaselineAdoptStartResponseBody(BaselineAdoptStartResponse {
+            ok: true,
+            started: true,
+            message: "adopcja rozpoczeta".to_string(),
+        });
+        match round_trip(resp) {
+            MessageBody::BaselineAdoptStartResponseBody(r) => {
+                assert!(r.ok && r.started);
+            }
+            other => panic!("expected BaselineAdoptStartResponseBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_adopt_status_round_trip_with_report() {
+        let body = MessageBody::BaselineAdoptStatusResponseBody(BaselineAdoptStatusResponse {
+            phase: BaselineAdoptPhaseTag::Completed,
+            peer: Some("aabbccdd".to_string()),
+            is_joiner: Some(true),
+            report: Some(BaselineAdoptReport {
+                donor_org_id: "org-1".to_string(),
+                users_merged_by_email: 2,
+                users_joined_donor_org: 5,
+                collisions_suffixed: 1,
+            }),
+        });
+        match round_trip(body) {
+            MessageBody::BaselineAdoptStatusResponseBody(r) => {
+                assert_eq!(r.phase, BaselineAdoptPhaseTag::Completed);
+                assert_eq!(r.peer.as_deref(), Some("aabbccdd"));
+                assert_eq!(r.is_joiner, Some(true));
+                let report = r.report.expect("report present");
+                assert_eq!(report.users_joined_donor_org, 5);
+                assert_eq!(report.collisions_suffixed, 1);
+            }
+            other => panic!("expected BaselineAdoptStatusResponseBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_adopt_status_round_trip_none() {
+        let body = MessageBody::BaselineAdoptStatusResponseBody(BaselineAdoptStatusResponse {
+            phase: BaselineAdoptPhaseTag::None,
+            peer: None,
+            is_joiner: None,
+            report: None,
+        });
+        match round_trip(body) {
+            MessageBody::BaselineAdoptStatusResponseBody(r) => {
+                assert_eq!(r.phase, BaselineAdoptPhaseTag::None);
+                assert!(r.peer.is_none() && r.report.is_none());
+            }
+            other => panic!("expected BaselineAdoptStatusResponseBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_adopt_clear_round_trip() {
+        let body = MessageBody::BaselineAdoptClearResponseBody(BaselineAdoptClearResponse {
+            ok: true,
+            cleared: false,
+            message: "brak stanu adopcji do wyczyszczenia".to_string(),
+        });
+        match round_trip(body) {
+            MessageBody::BaselineAdoptClearResponseBody(r) => {
+                assert!(r.ok && !r.cleared);
+            }
+            other => panic!("expected BaselineAdoptClearResponseBody, got {other:?}"),
         }
     }
 

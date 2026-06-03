@@ -22,15 +22,10 @@ use crate::dispatch::HandlerContext;
 // budget; we give the wire path ~2s of slack before giving up on the reply.
 const CAPTURE_BUDGET: Duration = Duration::from_secs(12);
 
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -114,7 +109,7 @@ pub async fn browser_capture(
             ));
         }
     };
-    if !is_admin(ctx) && desc.owner_user_id != Some(me) {
+    if !is_admin(ctx) && desc.owner_user_id.as_deref() != Some(me.as_str()) {
         return Ok(MessageBody::BrowserCaptureBody(
             BrowserCapturePayload::Response(failure(
                 &kind,

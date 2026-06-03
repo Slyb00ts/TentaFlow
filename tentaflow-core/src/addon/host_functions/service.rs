@@ -59,7 +59,7 @@ pub fn service_request(
     let req = ServiceCallRequest {
         caller: CallerContext {
             addon_id: state.addon_id.clone(),
-            user_id: state.user_id,
+            user_id: state.user_id.clone(),
             instance_id: Some(state.instance_id.clone()),
             is_system_call: state.is_system_call,
             org_id: state.org_id.clone(),
@@ -159,7 +159,7 @@ mod tests {
     fn create_test_addon_state(
         addon_id: &str,
         permissions: Vec<String>,
-        user_id: Option<i64>,
+        user_id: Option<String>,
         is_system_call: bool,
     ) -> AddonState {
         let db = create_test_db();

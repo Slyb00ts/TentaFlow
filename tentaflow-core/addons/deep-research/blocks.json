@@ -1,0 +1,46 @@
+[
+  {
+    "type": "deep-research.search_web",
+    "title": "Szukaj w internecie",
+    "category": "Research",
+    "description": "Wyszukuje publiczne strony i zwraca liste wynikow.",
+    "inputs": [
+      { "name": "query", "type": "string", "required": true },
+      { "name": "limit", "type": "number", "required": false },
+      { "name": "provider", "type": "object", "required": false }
+    ],
+    "outputs": [
+      { "name": "results", "type": "array" }
+    ]
+  },
+  {
+    "type": "deep-research.fetch_url",
+    "title": "Pobierz strone",
+    "category": "Research",
+    "description": "Pobiera URL i ekstrahuje czytelny tekst.",
+    "inputs": [
+      { "name": "url", "type": "string", "required": true },
+      { "name": "max_chars", "type": "number", "required": false }
+    ],
+    "outputs": [
+      { "name": "page", "type": "object" }
+    ]
+  },
+  {
+    "type": "deep-research.read_search_results",
+    "title": "Czytaj wyniki wyszukiwania",
+    "category": "Research",
+    "description": "Wyszukuje, czyta strony i zwraca tekst zrodel do dalszej analizy.",
+    "inputs": [
+      { "name": "query", "type": "string", "required": true },
+      { "name": "read_limit", "type": "number", "required": false },
+      { "name": "max_chars_per_page", "type": "number", "required": false },
+      { "name": "provider", "type": "object", "required": false }
+    ],
+    "outputs": [
+      { "name": "pages", "type": "array" },
+      { "name": "search", "type": "object" },
+      { "name": "skipped", "type": "array" }
+    ]
+  }
+]

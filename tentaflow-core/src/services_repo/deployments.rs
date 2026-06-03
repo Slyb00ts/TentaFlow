@@ -264,8 +264,13 @@ mod tests {
         let db = open_db();
         let conn = db.lock().unwrap();
         let service_id = insert_service(&conn);
-        create_with_slug(&conn, "vllm", "docker", "abc123", "node-a", service_id, "{}").unwrap();
-        let dup = create_with_slug(&conn, "vllm", "docker", "abc123", "node-a", service_id, "{}");
+        create_with_slug(
+            &conn, "vllm", "docker", "abc123", "node-a", service_id, "{}",
+        )
+        .unwrap();
+        let dup = create_with_slug(
+            &conn, "vllm", "docker", "abc123", "node-a", service_id, "{}",
+        );
         assert!(dup.is_err(), "duplicate slug must violate unique index");
     }
 
@@ -275,8 +280,10 @@ mod tests {
         {
             let conn = db.lock().unwrap();
             let service_id = insert_service(&conn);
-            create_with_slug(&conn, "vllm", "docker", "slug-aa", "node-a", service_id, "{}")
-                .unwrap();
+            create_with_slug(
+                &conn, "vllm", "docker", "slug-aa", "node-a", service_id, "{}",
+            )
+            .unwrap();
         }
         append_log_line(&db, "slug-aa", "hello").unwrap();
         append_log_line(&db, "slug-aa", "world").unwrap();
@@ -298,13 +305,7 @@ mod tests {
             let conn = db.lock().unwrap();
             let service_id = insert_service(&conn);
             create_with_slug(
-                &conn,
-                "ollama",
-                "external",
-                "slug-bb",
-                "node-a",
-                service_id,
-                "{}",
+                &conn, "ollama", "external", "slug-bb", "node-a", service_id, "{}",
             )
             .unwrap()
         };

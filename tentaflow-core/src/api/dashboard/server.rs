@@ -794,7 +794,7 @@ pub async fn handle_request(
 
         // Extract (user_id, role) z JWT claims + DB lookup zeby propagowac
         // do dispatch ctx. Role z DB jest Zero Trust (nie z JWT).
-        let (user_id, role) = match extract_ws_user_session(&req, &db, &settings_cipher) {
+        let (user_id, role) = match extract_ws_user_session(req.headers(), &db, &settings_cipher) {
             Some((id, r)) => (Some(id), r),
             None => (None, None),
         };
@@ -1830,16 +1830,15 @@ fn validate_ws_upgrade_optional_auth(
 /// reparsujemy claims i wzbogacamy o role z DB.
 /// Zwraca None gdy nie udalo sie extract (degraduje do anonymous session).
 fn extract_ws_user_session(
-    req: &Request<Incoming>,
+    headers: &hyper::HeaderMap,
     db: &DbPool,
     settings_cipher: &crate::crypto::SettingsCipher,
-) -> Option<(i64, Option<String>)> {
+) -> Option<(String, Option<String>)> {
     let jwt_secret = db::repository::get_setting_secure(db, "jwt_secret", settings_cipher)
         .ok()
         .flatten()?;
 
-    let proto_header = req
-        .headers()
+    let proto_header = headers
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())?;
 
@@ -1851,17 +1850,78 @@ fn extract_ws_user_session(
     let claims = auth::validate_jwt(token, &jwt_secret).ok()?;
 
     // Zero Trust: role z DB lookup, nie z JWT (chroni przed token-replay z
-    // odebranymi uprawnieniami).
-    let role = db::repository::get_user_account_by_id(db, claims.user_id)
+    // odebranymi uprawnieniami). A still-valid JWT must NOT mint a session when
+    // the backing account was deleted or deactivated — resolve the account and
+    // reject (no session) unless it exists AND is active.
+    let account = db::repository::get_user_account_by_id(db, &claims.user_id)
         .ok()
-        .flatten()
-        .map(|acc| {
-            if acc.is_admin {
-                "admin".to_string()
-            } else {
-                "user".to_string()
-            }
-        });
+        .flatten()?;
+    if !account.is_active {
+        return None;
+    }
+    let role = if account.is_admin {
+        "admin".to_string()
+    } else {
+        "user".to_string()
+    };
 
-    Some((claims.user_id, role))
+    Some((claims.user_id, Some(role)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn header_map_with_bearer(token: &str) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            format!("bearer.{token}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn ws_session_rejected_for_unknown_and_inactive_accounts() {
+        let dir = tempdir().expect("tempdir");
+        let db = db::init(&dir.path().join("core.db")).expect("db init");
+        let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]));
+
+        let secret = "test-jwt-secret-please-rotate";
+        db::repository::set_setting_secure(&db, "jwt_secret", secret, &cipher)
+            .expect("store jwt secret");
+
+        // A valid JWT whose user_id matches no account must NOT mint a session.
+        let unknown_id = uuid::Uuid::new_v4().to_string();
+        let unknown_token = auth::generate_jwt(&unknown_id, "ghost", secret, 1).expect("jwt");
+        assert!(
+            extract_ws_user_session(&header_map_with_bearer(&unknown_token), &db, &cipher)
+                .is_none(),
+            "deleted/unknown user must not get a session"
+        );
+
+        // An existing but deactivated account must also be rejected.
+        let active_id =
+            db::repository::create_user_account(&db, "alice", "hash", "Alice", "a@example.com")
+                .expect("create user");
+        db::repository::update_user_account(&db, &active_id, "Alice", "a@example.com", false)
+            .expect("deactivate user");
+        let inactive_token = auth::generate_jwt(&active_id, "alice", secret, 1).expect("jwt");
+        assert!(
+            extract_ws_user_session(&header_map_with_bearer(&inactive_token), &db, &cipher)
+                .is_none(),
+            "inactive user must not get a session"
+        );
+
+        // Re-activating the account restores the session.
+        db::repository::update_user_account(&db, &active_id, "Alice", "a@example.com", true)
+            .expect("reactivate user");
+        let active_token = auth::generate_jwt(&active_id, "alice", secret, 1).expect("jwt");
+        let session = extract_ws_user_session(&header_map_with_bearer(&active_token), &db, &cipher)
+            .expect("active user gets a session");
+        assert_eq!(session.0, active_id);
+        assert_eq!(session.1.as_deref(), Some("user"));
+    }
 }

@@ -126,7 +126,7 @@ pub fn open_addon_db(org_id: &str, addon_id: &str) -> Result<AddonDbPool, AbiErr
                     params_json TEXT NOT NULL,
                     rows_affected INTEGER NOT NULL,
                     last_insert_id INTEGER NOT NULL,
-                    actor_user_id INTEGER NULL,
+                    actor_user_id TEXT NULL,
                     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
                     operation_id TEXT NULL,
                     error_message TEXT NULL,

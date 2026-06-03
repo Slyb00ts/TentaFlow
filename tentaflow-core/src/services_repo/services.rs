@@ -439,7 +439,10 @@ pub fn update_deploy_progress(
         params![id, progress_pct as i64, message],
     )?;
     if n == 0 {
-        return Err(anyhow!("update_deploy_progress: service id={} not found", id));
+        return Err(anyhow!(
+            "update_deploy_progress: service id={} not found",
+            id
+        ));
     }
     Ok(())
 }

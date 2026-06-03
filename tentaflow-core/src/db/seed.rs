@@ -111,9 +111,12 @@ fn seed_user_accounts(conn: &Connection) -> Result<()> {
              VALUES (1, 'admin', ?1, 'Administrator', 1, 1)",
             rusqlite::params![password_hash],
         )?;
-        // Dodaj admina do grupy admins
+        // Dodaj admina do grupy admins. Po migracji v53 identyfikatory grup i
+        // userow sa TEXT UUID, wiec wiazemy po realnych id (grupa 'admins' ma
+        // staly UUID seedowany w INITIAL_SCHEMA, admin to user_accounts.id = '1').
         conn.execute(
-            "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (1, 1)",
+            "INSERT OR IGNORE INTO group_members (group_id, user_id) \
+             SELECT g.id, '1' FROM user_groups g WHERE g.name = 'admins'",
             [],
         )?;
         info!("Utworzono domyslne konto admina w user_accounts");
@@ -683,8 +686,8 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
          )",
     )?;
     let mut insert_stmt = conn.prepare(
-        "INSERT INTO flows (name, description, service_type, flow_json, status, is_default) \
-         SELECT ?1, ?2, ?3, ?4, 'active', ?5 \
+        "INSERT INTO flows (id, name, description, service_type, flow_json, status, is_default) \
+         SELECT ?6, ?1, ?2, ?3, ?4, 'active', ?5 \
          WHERE NOT EXISTS (SELECT 1 FROM flows WHERE name = ?1)",
     )?;
 
@@ -712,7 +715,8 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
             description,
             service_type,
             flow_json,
-            is_default
+            is_default,
+            uuid::Uuid::new_v4().to_string()
         ])?;
         if inserted > 0 {
             debug!("Utworzono domyslny flow: {}", name);

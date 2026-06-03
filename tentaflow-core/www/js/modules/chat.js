@@ -607,7 +607,7 @@ function bindAudioStageHandlers() {
     const conv = activeConv();
     if (!conv) return;
     const v = byId('flow-select')?.value;
-    conv.audioConfig.flowId = v ? Number(v) : null;
+    conv.audioConfig.flowId = v || null;
     saveConversations();
   });
 
@@ -857,7 +857,7 @@ function sendVoiceUtterance(wav, sampleRate) {
   // Źródło prawdy dla wyboru flow = aktualna wartość selecta (fallback config).
   const flowSelEl = byId('flow-select');
   const flowId = (flowSelEl && flowSelEl.value)
-    ? Number(flowSelEl.value)
+    ? flowSelEl.value
     : (conv.audioConfig?.flowId ?? null);
 
   ApiBinary.subscribe(

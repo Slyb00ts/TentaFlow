@@ -39,32 +39,6 @@ const MAX_FRAME_SIZE: usize = 1_048_576;
 /// UI SessionRegistry so panel lifecycle state is scoped per WS socket.
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Mapuje SQLite i64 user_id do 16-bajtowego SessionAuth user_id.
-/// Format zeby odroznic od stub `[0u8; 16]` (system user / nieuwierzytelniony):
-///   bajt 0    = 0xFF (marker "i64-derived")
-///   bajt 1-7  = 0x00 (reserved)
-///   bajt 8-15 = LE u64 reprezentacja i64 (sign-extended)
-/// Real UUIDv4 nigdy nie ma 0xFF na pozycji 0 (variant=10xx, version=4xxx),
-/// wiec konflikt z UUID space wykluczony.
-fn user_id_to_bytes(user_id: i64) -> [u8; 16] {
-    let mut buf = [0u8; 16];
-    buf[0] = 0xFF;
-    buf[8..].copy_from_slice(&(user_id as u64).to_le_bytes());
-    buf
-}
-
-/// Odwrotnosc `user_id_to_bytes` — przy walidacji ze user_id ma marker 0xFF.
-/// Zwraca None gdy bajty nie sa formatu i64-derived (system stub lub real UUID).
-#[allow(dead_code)]
-pub fn bytes_to_user_id(bytes: &[u8; 16]) -> Option<i64> {
-    if bytes[0] != 0xFF || bytes[1..8].iter().any(|&b| b != 0) {
-        return None;
-    }
-    let mut le = [0u8; 8];
-    le.copy_from_slice(&bytes[8..]);
-    Some(i64::from_le_bytes(le))
-}
-
 /// Obsluguje pojedyncze polaczenie binary-WS. Single-threaded loop read/write,
 /// kazdy frame dispatch synchroniczny (dla streamingu bedzie osobny task per stream).
 ///
@@ -75,7 +49,7 @@ pub fn bytes_to_user_id(bytes: &[u8; 16]) -> Option<i64> {
 /// IS_STREAM_END (zwykle reuse jwt_secret).
 pub async fn handle_ws_connection<S>(
     stream: S,
-    user_id: Option<i64>,
+    user_id: Option<String>,
     role: Option<String>,
     resume_secret: std::sync::Arc<Vec<u8>>,
     app_state: std::sync::Arc<AppState>,
@@ -84,9 +58,12 @@ pub async fn handle_ws_connection<S>(
 {
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
 
-    let session = match user_id {
-        Some(id) => SessionAuth::UserSession {
-            user_id: user_id_to_bytes(id),
+    let session = match user_id
+        .as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+    {
+        Some(uuid) => SessionAuth::UserSession {
+            user_id: *uuid.as_bytes(),
             role: role.clone(),
         },
         None => SessionAuth::Anonymous,
@@ -180,7 +157,7 @@ pub async fn handle_ws_connection<S>(
     // zalogowanych — zgodne z list_sessions(owner_user_id=Some(uid)) ktory tez
     // pokazuje OR IS NULL. Anonimowe polaczenia i connecty bez user_id nie
     // dostaja niczego.
-    if let Some(uid) = user_id {
+    if let Some(uid) = user_id.clone() {
         let sink_meet = Arc::clone(&sink);
         let seq_meet = Arc::clone(&next_server_sequence);
         let db = app_state.db.clone();
@@ -225,7 +202,7 @@ pub async fn handle_ws_connection<S>(
 
     // Spawnuj task pushujacy UI CBOR messages (addon→frontend) jako unsolicited
     // UiChannelCbor frames. Filtr: source_user musi odpowiadac user_id polaczenia.
-    if let Some(uid) = user_id {
+    if let Some(uid) = user_id.clone() {
         let sink_ui = Arc::clone(&sink);
         let seq_ui = Arc::clone(&next_server_sequence);
         let mut ui_rx = crate::dispatch::ui_cbor_broadcast::subscribe();
@@ -282,7 +259,10 @@ pub async fn handle_ws_connection<S>(
                         warn!("binary-WS: malformed envelope: {}", e);
                         let mut guard = sink.lock().await;
                         let _ = guard
-                            .send(Message::Close(Some(close_frame(1002, "malformed envelope"))))
+                            .send(Message::Close(Some(close_frame(
+                                1002,
+                                "malformed envelope",
+                            ))))
                             .await;
                         break;
                     }
@@ -326,27 +306,27 @@ pub async fn handle_ws_connection<S>(
                 if envelope.sequence <= last_client_sequence {
                     tracing::debug!(
                         "binary-WS: sequence {} <= {} (out-of-order, przetwarzam mimo to)",
-                        envelope.sequence, last_client_sequence
+                        envelope.sequence,
+                        last_client_sequence
                     );
                 }
                 last_client_sequence = last_client_sequence.max(envelope.sequence);
 
-                let body =
-                    match tentaflow_protocol::cbor::decode::<MessageBody>(&envelope.body) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!("binary-WS: malformed body: {}", e);
-                            let _ = send_protocol_error(
-                                &sink,
-                                envelope.correlation_id,
-                                next_seq(&next_server_sequence),
-                                ProtocolErrorCode::InvalidFrame,
-                                "malformed body",
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
+                let body = match tentaflow_protocol::cbor::decode::<MessageBody>(&envelope.body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("binary-WS: malformed body: {}", e);
+                        let _ = send_protocol_error(
+                            &sink,
+                            envelope.correlation_id,
+                            next_seq(&next_server_sequence),
+                            ProtocolErrorCode::InvalidFrame,
+                            "malformed body",
+                        )
+                        .await;
+                        continue;
+                    }
+                };
 
                 if !handshake_done {
                     match body {
@@ -396,15 +376,11 @@ pub async fn handle_ws_connection<S>(
                 // Resolution attaches the user's default org for binary
                 // WS in P1.b; X-Org-Id / subprotocol pinning lands with
                 // the org-switcher UI in P1.c. The session's 16-byte
-                // user_id carries the i64 user id in its trailing 8 bytes
-                // (see auth_login marker `0xFF`); we reuse that encoding
-                // as the stringified key into `org_memberships`.
+                // user_id is the raw `user_accounts` UUID; decode it to its
+                // canonical string form to key into `org_memberships`.
                 let org_context = match &session {
                     SessionAuth::UserSession { user_id, .. } => {
-                        let mut buf = [0u8; 8];
-                        buf.copy_from_slice(&user_id[8..]);
-                        let uid = u64::from_le_bytes(buf) as i64;
-                        let user_id_str = uid.to_string();
+                        let user_id_str = uuid::Uuid::from_bytes(*user_id).to_string();
                         match crate::services::rbac::resolve_org_context(
                             &app_state.db,
                             &user_id_str,

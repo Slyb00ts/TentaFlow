@@ -63,7 +63,7 @@ pub struct StartSessionRequest {
     pub meeting_url: String,
     pub title: Option<String>,
     pub platform: String,
-    pub owner_user_id: Option<i64>,
+    pub owner_user_id: Option<String>,
     pub bot_name: String,
     pub stt_alias: Option<String>,
     pub summarization_alias: Option<String>,
@@ -111,7 +111,7 @@ pub struct SessionDescriptor {
     pub novnc_port: Option<u16>,
     pub bot_endpoint_id: Option<String>,
     pub container_name: Option<String>,
-    pub owner_user_id: Option<i64>,
+    pub owner_user_id: Option<String>,
     /// Aliasy przekazane do kontenera w env vars (efektywne — po zastosowaniu
     /// defaultów). Widoczne w dashboardzie żeby user wiedział co bot używa.
     pub stt_alias: String,
@@ -184,7 +184,7 @@ impl MeetingManager {
         .context("create meeting_sessions row")?;
 
         // Przypisz owner_user_id od razu (get_or_create nie przyjmuje go).
-        if let Some(uid) = req.owner_user_id {
+        if let Some(uid) = req.owner_user_id.as_deref() {
             let conn = self.db.lock().unwrap();
             let _ = conn.execute(
                 "UPDATE meeting_sessions SET owner_user_id = ?2 WHERE id = ?1",
@@ -251,7 +251,7 @@ impl MeetingManager {
                     &bot_endpoint_id,
                     &secret_key_hex,
                     &req.platform,
-                    req.owner_user_id,
+                    req.owner_user_id.as_deref(),
                 )?;
 
                 let spawn_req = SpawnRequest {
@@ -306,7 +306,7 @@ impl MeetingManager {
                     &bot_endpoint_id,
                     &secret_key_hex,
                     &req.platform,
-                    req.owner_user_id,
+                    req.owner_user_id.as_deref(),
                 )?;
 
                 let spawn_req = native::SpawnRequest {
@@ -439,12 +439,12 @@ impl MeetingManager {
         Ok(Some(row_to_descriptor(&row)))
     }
 
-    pub fn session_list(&self, owner_user_id: Option<i64>) -> Result<Vec<SessionDescriptor>> {
+    pub fn session_list(&self, owner_user_id: Option<&str>) -> Result<Vec<SessionDescriptor>> {
         let rows = repository::transcripts::list_sessions(&self.db, owner_user_id)?;
         Ok(rows.iter().map(row_to_descriptor).collect())
     }
 
-    pub fn active_for_user(&self, user_id: i64) -> Result<Option<SessionDescriptor>> {
+    pub fn active_for_user(&self, user_id: &str) -> Result<Option<SessionDescriptor>> {
         let row = repository::transcripts::active_session_for_user(&self.db, user_id)?;
         Ok(row.as_ref().map(row_to_descriptor))
     }
@@ -471,7 +471,7 @@ fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescri
         novnc_port: row.novnc_port.map(|p| p as u16),
         bot_endpoint_id: row.bot_endpoint_id.clone(),
         container_name: row.container_name.clone(),
-        owner_user_id: row.owner_user_id,
+        owner_user_id: row.owner_user_id.clone(),
         // Aliasy nie są persystowane w meeting_sessions — dla listy/detail
         // zwracamy defaulty. Rzeczywiste wartości są znane tylko w odpowiedzi
         // start_session (tuż po spawnie kontenera).

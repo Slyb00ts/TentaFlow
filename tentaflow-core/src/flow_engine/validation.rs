@@ -474,21 +474,13 @@ mod tests {
         let def = parse(
             r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o","from_port":"text","to_port":"text"}]}"#,
         );
-        validate(
-            &def,
-            &registry(),
-        )
-        .unwrap();
+        validate(&def, &registry()).unwrap();
     }
 
     #[test]
     fn rejects_no_trigger() {
         let def = parse(r#"{"nodes":[{"id":"o","type":"output","config":{}}],"edges":[]}"#);
-        let err = validate(
-            &def,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::TriggerCount { actual: 0 }
@@ -500,11 +492,7 @@ mod tests {
         let def = parse(
             r#"{"nodes":[{"id":"t1","type":"trigger","config":{}},{"id":"t2","type":"trigger","config":{}}],"edges":[]}"#,
         );
-        let err = validate(
-            &def,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::TriggerCount { actual: 2 }
@@ -531,11 +519,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(
-            &def,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(err, FlowValidationError::MultipleInputs { .. }));
     }
 
@@ -544,11 +528,7 @@ mod tests {
         let def = parse(
             r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"x","type":"mystery","config":{}}],"edges":[{"from":"t","to":"x","from_port":"text"}]}"#,
         );
-        let err = validate(
-            &def,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(err, FlowValidationError::UnknownAdapter { .. }));
     }
 
@@ -569,11 +549,7 @@ mod tests {
                 ]
             }"#,
         );
-        validate(
-            &def,
-            &registry(),
-        )
-        .unwrap();
+        validate(&def, &registry()).unwrap();
     }
 
     #[test]
@@ -591,11 +567,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(
-            &def,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::StreamingNotToOutput { .. }
@@ -617,11 +589,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(
-            &def,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::StreamingOutputModeMismatch { .. }
@@ -657,11 +625,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(
-            &def,
-            &r,
-        )
-        .unwrap_err();
+        let err = validate(&def, &r).unwrap_err();
         assert!(
             matches!(err, FlowValidationError::EdgePortTypesMismatch { .. }),
             "got {:?}",
@@ -692,11 +656,7 @@ mod tests {
                 ]
             }"#,
         );
-        validate(
-            &def,
-            &r,
-        )
-        .unwrap();
+        validate(&def, &r).unwrap();
     }
 
     #[test]
@@ -722,11 +682,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(
-            &def,
-            &r,
-        )
-        .unwrap_err();
+        let err = validate(&def, &r).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -763,10 +719,7 @@ mod tests {
                 ]
             }"#,
         );
-        let res = validate(
-            &def,
-            &r,
-        );
+        let res = validate(&def, &r);
         assert!(
             res.is_ok(),
             "expected chain to pass R7, got: {:?}",
@@ -801,11 +754,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(
-            &def,
-            &r,
-        )
-        .unwrap_err();
+        let err = validate(&def, &r).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::MultipleStreamingBranches { .. }
@@ -852,11 +801,7 @@ mod tests {
                 ]
             }"#,
         );
-        validate(
-            &def,
-            &r,
-        )
-        .expect("multi-producer streaming should validate");
+        validate(&def, &r).expect("multi-producer streaming should validate");
     }
 
     /// Chain bez output sink (pii_filter na końcu) odrzucony przez R7.
@@ -882,11 +827,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(
-            &def,
-            &r,
-        )
-        .unwrap_err();
+        let err = validate(&def, &r).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::StreamingNotToOutput { .. }
@@ -906,11 +847,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(
-            &def,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::ConditionEdgeFromNonCondition { .. }
