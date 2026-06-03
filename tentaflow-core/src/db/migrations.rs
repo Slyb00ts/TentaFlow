@@ -579,9 +579,10 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
         t(
             "flow_invocations",
             "actor_user_id",
-            "TEXT user_accounts(id) ref; legacy rows held stringified-INTEGER \
-             session ids, value-remapped in place by v53 (remap_text_int_column), \
-             not a rebuilt table",
+            "TEXT user_accounts(id) FK (enforced by foreign_key_check); legacy rows \
+             held stringified-INTEGER session ids, value-remapped in place by v53 \
+             (remap_text_int_column) — resolvable ids -> UUID, unknown -> NULL so \
+             the enforced FK stays satisfied; not a rebuilt table",
         ),
         t(
             "org_memberships",
@@ -712,44 +713,47 @@ fn core_identity_int_to_uuid(conn: &Connection, version: i64, name: &str) -> Res
         // by v32/v38). Remap those textual integer values through the same map
         // so memberships keep pointing at the right user.
         if table_exists(&tx, "org_memberships")? {
-            remap_text_int_column(&tx, "org_memberships", "user_id", &users_map)?;
+            remap_text_int_column(
+                &tx,
+                "org_memberships",
+                "user_id",
+                &users_map,
+                UnresolvedTextInt::Keep,
+            )?;
         }
 
         // flow_invocations.actor_user_id is declared TEXT REFERENCES
-        // user_accounts(id), but legacy rows stored the session user id as a
-        // stringified INTEGER (the pre-UUID account id). It is a runtime table,
-        // so a row whose actor was since deleted must not abort the migration:
-        // best-effort `remap_text_int_column` rewrites the ids it can resolve
-        // and leaves UUIDs / unresolved ids untouched (the column carries no
-        // enforced FK, so a stale actor id is an audit artifact, not corruption).
+        // user_accounts(id), and that FK is enforced by the Phase 4
+        // `foreign_key_check` gate. Legacy rows stored the session user id as a
+        // stringified INTEGER (the pre-UUID account id). It is a runtime log, so
+        // an actor whose account was deleted before the migration cannot abort
+        // it: resolvable ids are rewritten to the new UUID, and an id missing
+        // from the user map is set to NULL (the column is nullable). Dropping the
+        // attribution of an already-deleted actor in a log keeps the enforced FK
+        // satisfied — the alternative (a dangling stringified-int) would make
+        // foreign_key_check fail.
         if table_exists(&tx, "flow_invocations")? {
-            remap_text_int_column(&tx, "flow_invocations", "actor_user_id", &users_map)?;
+            remap_text_int_column(
+                &tx,
+                "flow_invocations",
+                "actor_user_id",
+                &users_map,
+                UnresolvedTextInt::SetNull,
+            )?;
         }
 
-        // Phase 3b: align declared types on upgraded DBs. A child column that
-        // references one of the flipped parents was value-remapped in place, but
-        // on a legacy DB its declared affinity is still INTEGER while it now
-        // stores UUID text. Rebuild each such column to TEXT so an upgraded
-        // schema is byte-for-byte identical to a fresh install (the allowlist
-        // guard then holds for both paths). Fresh installs already declare TEXT,
-        // so this is a no-op there. Grouped per table so a multi-column table
-        // (e.g. group_members) is rebuilt once.
-        let mut text_targets: std::collections::BTreeMap<&'static str, Vec<&'static str>> =
-            std::collections::BTreeMap::new();
-        for remap in child_remaps() {
-            if !table_exists(&tx, remap.table)? {
-                continue;
-            }
-            if !column_is_text(&tx, remap.table, remap.column)? {
-                text_targets
-                    .entry(remap.table)
-                    .or_default()
-                    .push(remap.column);
-            }
-        }
-        for (table, columns) in text_targets {
-            convert_columns_to_text(&tx, table, &columns)?;
-        }
+        // On an upgraded DB a value-remapped child column keeps its declared
+        // INTEGER affinity even though it now stores UUID text. We deliberately
+        // do NOT rebuild it to TEXT: SQLite has dynamic typing, and an INTEGER
+        // affinity column stores a UUID string (hex with hyphens) verbatim — the
+        // affinity rule only coerces strings that are valid integer literals, and
+        // a UUID never is. Rebuilding the table to flip the declared type was
+        // over-engineering that risked dropping CHECK / UNIQUE constraints and
+        // indexes. The remapped values are correct and FKs resolve, so the
+        // INTEGER-affinity-holding-UUID column is left in place. A fresh install
+        // declares these columns TEXT (INITIAL_SCHEMA); the resulting asymmetry
+        // (fresh=TEXT, upgraded=INTEGER-affinity-holding-UUID) is intentional and
+        // safe because affinity does not change the stored bytes.
 
         // Drop AUTOINCREMENT bookkeeping for the rebuilt tables.
         if table_exists(&tx, "sqlite_sequence")? {
@@ -811,233 +815,6 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-/// Rebuilds `table` so each column in `columns` is declared TEXT, preserving
-/// every other column, constraint and index. Used by the v53 upgrade path to
-/// align a value-remapped FK column's declared affinity with a fresh install
-/// (SQLite cannot change a column's type in place). Must run with
-/// `foreign_keys = OFF` (the caller owns that pragma).
-fn convert_columns_to_text(conn: &Connection, table: &str, columns: &[&str]) -> Result<()> {
-    // PRAGMA table_info gives column order, declared types, NOT NULL, default
-    // and the PK position — enough to rebuild a column list with the target
-    // columns forced to TEXT. Table-level constraints (composite PK, UNIQUE,
-    // CHECK, FK) are reconstructed from the original CREATE statement's body.
-    struct Col {
-        name: String,
-        decl_type: String,
-        not_null: bool,
-        default: Option<String>,
-        pk: i64,
-    }
-    let mut cols: Vec<Col> = Vec::new();
-    {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            cols.push(Col {
-                name: row.get(1)?,
-                decl_type: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                not_null: row.get::<_, i64>(3)? != 0,
-                default: row.get::<_, Option<String>>(4)?,
-                pk: row.get(5)?,
-            });
-        }
-    }
-    if cols.is_empty() {
-        anyhow::bail!("convert_columns_to_text: table {table} has no columns");
-    }
-
-    // Original CREATE statement, used to recover table-level constraints
-    // (composite PRIMARY KEY, UNIQUE, CHECK) that PRAGMA table_info omits.
-    let create_sql: String = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
-        rusqlite::params![table],
-        |r| r.get(0),
-    )?;
-    let mut table_constraints = extract_table_constraints(&create_sql);
-    // Foreign keys (column-level or table-level) are recovered from
-    // PRAGMA foreign_key_list and re-emitted as table-level clauses, so an
-    // inline `REFERENCES` on a rebuilt column is preserved rather than lost.
-    table_constraints.extend(foreign_key_clauses(conn, table)?);
-
-    let pk_cols: Vec<&Col> = {
-        let mut v: Vec<&Col> = cols.iter().filter(|c| c.pk > 0).collect();
-        v.sort_by_key(|c| c.pk);
-        v
-    };
-    // A single-column INTEGER PRIMARY KEY is a rowid alias; keep it inline.
-    let inline_single_pk = pk_cols.len() == 1;
-
-    let mut col_defs: Vec<String> = Vec::new();
-    for c in &cols {
-        let decl_type = if columns.contains(&c.name.as_str()) {
-            "TEXT".to_string()
-        } else if c.decl_type.is_empty() {
-            "TEXT".to_string()
-        } else {
-            c.decl_type.clone()
-        };
-        let mut def = format!("\"{}\" {}", c.name, decl_type);
-        if inline_single_pk && c.pk == 1 {
-            def.push_str(" PRIMARY KEY");
-        }
-        if c.not_null {
-            def.push_str(" NOT NULL");
-        }
-        if let Some(d) = &c.default {
-            def.push_str(&format!(" DEFAULT {d}"));
-        }
-        col_defs.push(def);
-    }
-    if !inline_single_pk && !pk_cols.is_empty() {
-        let names: Vec<String> = pk_cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
-        col_defs.push(format!("PRIMARY KEY ({})", names.join(", ")));
-    }
-    for constraint in &table_constraints {
-        col_defs.push(constraint.clone());
-    }
-
-    let new_table = format!("{table}__text_rebuild");
-    conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{new_table}\";"))?;
-    conn.execute_batch(&format!(
-        "CREATE TABLE \"{new_table}\" (\n{}\n);",
-        col_defs.join(",\n")
-    ))?;
-
-    let col_list: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
-    let col_csv = col_list.join(", ");
-    conn.execute(
-        &format!("INSERT INTO \"{new_table}\" ({col_csv}) SELECT {col_csv} FROM \"{table}\""),
-        [],
-    )?;
-    conn.execute_batch(&format!("DROP TABLE \"{table}\";"))?;
-    conn.execute_batch(&format!(
-        "ALTER TABLE \"{new_table}\" RENAME TO \"{table}\";"
-    ))?;
-
-    // Recreate the indexes the dropped table owned (sqlite drops them with it).
-    let index_sqls: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![table], |r| r.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    for sql in index_sqls {
-        conn.execute_batch(&format!("{sql};"))?;
-    }
-    Ok(())
-}
-
-/// Reconstructs every foreign key on `table` as a table-level `FOREIGN KEY`
-/// clause from PRAGMA foreign_key_list, so a column-rebuild keeps inline
-/// `REFERENCES` constraints that PRAGMA table_info does not expose. Composite
-/// FKs (multi-row same `id`) are grouped by their `id`.
-fn foreign_key_clauses(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    struct FkPart {
-        seq: i64,
-        parent_table: String,
-        from: String,
-        to: Option<String>,
-        on_update: String,
-        on_delete: String,
-    }
-    let mut by_id: std::collections::BTreeMap<i64, Vec<FkPart>> = std::collections::BTreeMap::new();
-    {
-        let mut stmt = conn.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            by_id.entry(id).or_default().push(FkPart {
-                seq: row.get(1)?,
-                parent_table: row.get(2)?,
-                from: row.get(3)?,
-                to: row.get::<_, Option<String>>(4)?,
-                on_update: row.get(5)?,
-                on_delete: row.get(6)?,
-            });
-        }
-    }
-    let mut clauses = Vec::new();
-    for (_id, mut parts) in by_id {
-        parts.sort_by_key(|p| p.seq);
-        let parent = parts[0].parent_table.clone();
-        let from_cols: Vec<String> = parts.iter().map(|p| format!("\"{}\"", p.from)).collect();
-        let to_cols: Vec<String> = parts
-            .iter()
-            .filter_map(|p| p.to.as_ref().map(|t| format!("\"{t}\"")))
-            .collect();
-        let mut clause = format!(
-            "FOREIGN KEY ({}) REFERENCES \"{}\"",
-            from_cols.join(", "),
-            parent
-        );
-        if !to_cols.is_empty() {
-            clause.push_str(&format!(" ({})", to_cols.join(", ")));
-        }
-        if parts[0].on_update != "NO ACTION" {
-            clause.push_str(&format!(" ON UPDATE {}", parts[0].on_update));
-        }
-        if parts[0].on_delete != "NO ACTION" {
-            clause.push_str(&format!(" ON DELETE {}", parts[0].on_delete));
-        }
-        clauses.push(clause);
-    }
-    Ok(clauses)
-}
-
-/// Extracts table-level non-FK constraint clauses (composite PRIMARY KEY,
-/// UNIQUE, CHECK) from a CREATE TABLE statement. Foreign keys are handled
-/// separately via `foreign_key_clauses`. These live as top-level items in the
-/// parenthesised body that do NOT start with a column name; the column
-/// definitions are rebuilt separately from PRAGMA table_info.
-fn extract_table_constraints(create_sql: &str) -> Vec<String> {
-    let open = match create_sql.find('(') {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    let close = match create_sql.rfind(')') {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    if close <= open {
-        return Vec::new();
-    }
-    let body = &create_sql[open + 1..close];
-
-    // Split on top-level commas (depth 0 outside parens).
-    let mut items: Vec<String> = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    for (i, ch) in body.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                items.push(body[start..i].trim().to_string());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    items.push(body[start..].trim().to_string());
-
-    items
-        .into_iter()
-        .filter(|item| {
-            let upper = item.to_ascii_uppercase();
-            // Foreign keys are re-emitted from PRAGMA foreign_key_list and the
-            // PRIMARY KEY is rebuilt from PRAGMA table_info's pk columns, so skip
-            // both here to avoid declaring them twice.
-            if upper.contains("FOREIGN KEY") || upper.contains("PRIMARY KEY") {
-                return false;
-            }
-            upper.starts_with("UNIQUE")
-                || upper.starts_with("CHECK")
-                || upper.starts_with("CONSTRAINT")
-        })
-        .collect()
 }
 
 /// True when `table.column` has declared type affinity TEXT (per PRAGMA).
@@ -1151,15 +928,32 @@ fn remap_child_column(
     Ok(())
 }
 
+/// What to do with a legacy stringified-INTEGER value that has no entry in the
+/// id map (its parent row was deleted before the migration).
+#[derive(Clone, Copy)]
+enum UnresolvedTextInt {
+    /// Leave the value as-is. Used for columns without an enforced FK, where a
+    /// stale id is an audit artifact rather than corruption (`org_memberships`).
+    Keep,
+    /// Set the value to NULL. Required for columns with a `REFERENCES` clause:
+    /// `foreign_key_check` would otherwise abort the migration on the dangling
+    /// id. The column must be nullable (`flow_invocations.actor_user_id`).
+    SetNull,
+}
+
 /// Remaps a column that already stores the old integer id as TEXT
-/// (`CAST(id AS TEXT)`), e.g. `org_memberships.user_id`.
+/// (`CAST(id AS TEXT)`), e.g. `org_memberships.user_id`. Values that are already
+/// UUIDs are left untouched (idempotent). Legacy integer values missing from the
+/// map are handled per `unresolved`.
 fn remap_text_int_column(
     conn: &Connection,
     table: &str,
     column: &str,
     map: &std::collections::HashMap<i64, String>,
+    unresolved: UnresolvedTextInt,
 ) -> Result<()> {
-    let mut to_update: Vec<(i64, String)> = Vec::new();
+    let mut to_set_uuid: Vec<(i64, String)> = Vec::new();
+    let mut to_null: Vec<i64> = Vec::new();
     {
         let mut stmt = conn.prepare(&format!(
             "SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
@@ -1168,19 +962,29 @@ fn remap_text_int_column(
         while let Some(row) = rows.next()? {
             let rowid: i64 = row.get(0)?;
             let cur: String = row.get(1)?;
-            // Only remap values that are still legacy integers; UUIDs are left
-            // untouched (idempotent if a value was already converted).
+            // Only legacy integers are candidates; UUIDs stay untouched.
             if let Ok(old_int) = cur.parse::<i64>() {
-                if let Some(new_uuid) = map.get(&old_int) {
-                    to_update.push((rowid, new_uuid.clone()));
+                match map.get(&old_int) {
+                    Some(new_uuid) => to_set_uuid.push((rowid, new_uuid.clone())),
+                    None => {
+                        if matches!(unresolved, UnresolvedTextInt::SetNull) {
+                            to_null.push(rowid);
+                        }
+                    }
                 }
             }
         }
     }
-    for (rowid, new_uuid) in to_update {
+    for (rowid, new_uuid) in to_set_uuid {
         conn.execute(
             &format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2"),
             rusqlite::params![new_uuid, rowid],
+        )?;
+    }
+    for rowid in to_null {
+        conn.execute(
+            &format!("UPDATE {table} SET {column} = NULL WHERE rowid = ?1"),
+            rusqlite::params![rowid],
         )?;
     }
     Ok(())
@@ -4854,6 +4658,14 @@ mod tests {
     /// flagged intentionally-local INTEGER. A column matching the pattern that
     /// is neither TEXT-allowlisted nor exempt fails the build — this is the
     /// guard that stops a future column from silently keeping an INTEGER id.
+    ///
+    /// This guard runs on a FRESH install, where INITIAL_SCHEMA declares the
+    /// remapped child columns TEXT. An UPGRADED DB intentionally differs: v53
+    /// value-remaps those columns (INTEGER id -> UUID text) but does NOT rebuild
+    /// the table to flip the declared type, so they keep INTEGER affinity while
+    /// holding UUID text. That asymmetry is safe (SQLite affinity never coerces a
+    /// UUID string) and is verified separately by
+    /// `migration_remaps_integer_ids_to_uuid`.
     #[test]
     fn allowlist_guard_no_unaccounted_identity_integer() {
         let conn = Connection::open_in_memory().unwrap();
@@ -4966,6 +4778,20 @@ mod tests {
             "#,
         )
         .unwrap();
+
+        // inv-3 models a row whose actor account ('999') was hard-deleted before
+        // the migration: a dangling stringified-int the legacy schema never
+        // enforced. Seed it with FK enforcement off (the migration itself runs
+        // with `foreign_keys = OFF`) so the dangling value can exist pre-flip.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO flow_invocations \
+             (id, addon_id, flow_id, started_at, status, operators_total, actor_user_id) \
+             VALUES ('inv-3', 'a', '5', 'now', 'running', 1, '999')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
         // Legacy `users` carries the only pre-mgmt language preference. Match by
         // username so the v53 backfill can copy it into user_accounts.
@@ -5126,6 +4952,19 @@ mod tests {
             )
             .unwrap();
         assert!(inv_null.is_none(), "NULL-actor invocation stays NULL");
+        // inv-3 referenced a deleted actor ('999', no matching user_accounts row):
+        // its enforced FK forces the unresolved id to NULL, not a dangling string.
+        let inv_unresolved: Option<String> = conn
+            .query_row(
+                "SELECT actor_user_id FROM flow_invocations WHERE id='inv-3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            inv_unresolved.is_none(),
+            "unresolved actor id must be set to NULL to satisfy the enforced FK"
+        );
 
         // preferred_language backfilled from legacy users (matched by username).
         let alice_lang: Option<String> = conn
@@ -5141,20 +4980,64 @@ mod tests {
             "alice's language preference must survive the UUID flip"
         );
 
-        // MEDIUM 7: every value-remapped column without a declared FK must end up
-        // declared TEXT, so the upgraded schema matches a fresh install and the
-        // allowlist guard holds for both paths.
-        for remap in child_remaps() {
-            if !table_exists(&conn, remap.table).unwrap() {
-                continue;
-            }
-            assert!(
-                column_is_text(&conn, remap.table, remap.column).unwrap(),
-                "{}.{} must be TEXT after the upgrade-path migration",
-                remap.table,
-                remap.column
-            );
-        }
+        // Upgrade path keeps a value-remapped child column at its declared
+        // INTEGER affinity (we no longer rebuild the table to flip the type).
+        // Assert the VALUES are correct, not the declared type: the remapped
+        // value is a parent UUID and a JOIN over the column resolves even though
+        // the column affinity is still INTEGER. flow_executions is NOT a rebuilt
+        // identity table, so its `flow_id` (INTEGER REFERENCES flows(id) in the
+        // pre-UUID schema) is the canonical INTEGER-affinity-holding-UUID case.
+        assert!(
+            !column_is_text(&conn, "flow_executions", "flow_id").unwrap(),
+            "upgrade path leaves flow_executions.flow_id at INTEGER affinity"
+        );
+        let f1_id: String = conn
+            .query_row("SELECT id FROM flows WHERE name='f1'", [], |r| r.get(0))
+            .unwrap();
+        let exec_flow: String = conn
+            .query_row(
+                "SELECT f.id FROM flow_executions e JOIN flows f ON f.id = e.flow_id \
+                 WHERE e.status='success'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exec_flow, f1_id,
+            "JOIN over an INTEGER-affinity column holding UUID text must resolve"
+        );
+
+        // Writing a fresh UUID into the INTEGER-affinity column and reading it
+        // back must round-trip losslessly (no integer coercion), and a JOIN over
+        // the new value must find the parent (its enforced FK must accept it).
+        let f2_id: String = conn
+            .query_row("SELECT id FROM flows WHERE name='f2'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO flow_executions (flow_id, status) VALUES (?1, 'completed')",
+            rusqlite::params![f2_id],
+        )
+        .unwrap();
+        let roundtrip: String = conn
+            .query_row(
+                "SELECT flow_id FROM flow_executions WHERE status='completed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            roundtrip, f2_id,
+            "UUID text written to an INTEGER-affinity column must read back verbatim"
+        );
+        let joined_new: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_executions e JOIN flows f ON f.id = e.flow_id \
+                 WHERE e.status='completed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined_new, 1, "JOIN over the freshly written UUID must match");
     }
 
     /// Builds a DB at exactly the v52 schema state (INTEGER identity ids) by
