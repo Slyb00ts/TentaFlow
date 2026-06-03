@@ -14,7 +14,13 @@ CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 
 MODEL_PATH="${MODEL_PATH:-/data/models/model.gguf}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
-LLAMA_ARGS="${LLAMA_ARGS:---n-gpu-layers 99 --ctx-size 8192}"
+
+# Argi silnika jako "$@" (bollard Cmd array z Rust), bez re-tokenizacji. Pusto
+# → bezpieczny baseline.
+ENGINE_ARGS=("$@")
+if [[ "${#ENGINE_ARGS[@]}" -eq 0 ]]; then
+  ENGINE_ARGS=(--n-gpu-layers 99 --ctx-size 8192)
+fi
 
 if [[ ! -f "$MODEL_PATH" ]]; then
   echo "[entrypoint] ERROR: MODEL_PATH=$MODEL_PATH nie istnieje - zamontuj /data/models z plikiem GGUF"
@@ -27,13 +33,12 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-echo "[entrypoint] start llama"
-# shellcheck disable=SC2086
+echo "[entrypoint] start llama (${#ENGINE_ARGS[@]} args)"
 llama-server \
   --host 127.0.0.1 \
   --port "$LLAMA_PORT" \
   --model "$MODEL_PATH" \
-  $LLAMA_ARGS 2>&1 \
+  "${ENGINE_ARGS[@]}" 2>&1 \
   | sed -u 's/^/[llama] /' &
 ENGINE_PID=$!
 echo "[entrypoint] llama PID=$ENGINE_PID"

@@ -61,8 +61,8 @@ docker run -d --name "$CONTAINER" \
   -v "$DATA_DIR:/data" \
   -v "$HF_CACHE:/root/.cache/huggingface" \
   -e MODEL="$MODEL" \
-  -e VLLM_ARGS="--dtype auto --gpu-memory-utilization 0.5 --max-model-len 4096 --enforce-eager" \
-  tentaflow/vllm:latest >/dev/null
+  tentaflow/vllm:latest \
+  --dtype auto --gpu-memory-utilization 0.5 --max-model-len 4096 --enforce-eager >/dev/null
 
 echo "[test] kontener wystartowal: $CONTAINER"
 

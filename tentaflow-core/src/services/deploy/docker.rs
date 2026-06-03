@@ -444,6 +444,7 @@ mod backend {
         name: &str,
         ports: &[(u16, u16, &str)], // (host, container, proto: "tcp"|"udp")
         env: &HashMap<String, String>,
+        cmd: &[String], // dolaczane do ENTRYPOINT jako "$@" (argv silnika)
         binds: &[(PathBuf, String, bool)],
         labels: &HashMap<String, String>,
     ) -> DeployResult<String> {
@@ -484,6 +485,11 @@ mod backend {
         };
         let body = ContainerCreateBody {
             image: Some(image.into()),
+            cmd: if cmd.is_empty() {
+                None
+            } else {
+                Some(cmd.to_vec())
+            },
             env: if env_vec.is_empty() {
                 None
             } else {
@@ -663,6 +669,20 @@ impl DeployStrategy for DockerDeploy {
         {
             env.insert("SERVED_MODEL_NAME".into(), served);
         }
+        // Argumenty CLI silnika budowane jako strukturalny Vec<String> i
+        // przekazywane do kontenera jako bollard `Cmd` (array) → entrypoint
+        // odbiera je jako `"$@"`. Nie ma round-tripu przez stringowy VLLM_ARGS
+        // env + xargs, wiec kompaktowy JSON `--speculative-config {...}` plynie
+        // jako pojedynczy nietkniety element. Identyczna sciezka jak native.
+        let mut engine_args: Vec<String> = Vec::new();
+        // Native bierze ten baseline z bundle.toml [launch] args; docker nie ma
+        // bundle.toml, wiec musimy zasiac te same defaulty Rust-side jako POCZATEK
+        // argv. Bez tego kontener startuje vLLM z pelnokontekstowymi defaultami
+        // (brak --max-model-len / --max-num-batched-tokens) → OOM. Baseline idzie
+        // PRZED user/spec/gpu, wiec dedup_cli_args_last_wins pozwala je nadpisac.
+        engine_args.extend(vllm_docker_baseline_args(&self.manifest.engine.id));
+        // User-typed `vllm_args` (wizard Advanced) — user sam cytuje, wiec
+        // shlex split jest poprawny dla niego (np. JSON w single-quotes).
         if let Some(raw_args) = self
             .user_config
             .get("vllm_args")
@@ -670,44 +690,43 @@ impl DeployStrategy for DockerDeploy {
             .map(str::trim)
             .filter(|v| !v.is_empty())
         {
-            env.insert("VLLM_ARGS".into(), raw_args.to_string());
+            match shlex::split(raw_args) {
+                Some(parts) => engine_args.extend(parts),
+                None => engine_args.extend(raw_args.split_whitespace().map(String::from)),
+            }
+        }
+        // Speculative-config: flaga + JSON jako dwa osobne elementy argv.
+        if let Some(spec_args) =
+            super::vllm_native_speculative_arg(&self.manifest, &self.user_config)
+        {
+            engine_args.extend(spec_args);
         }
         if super::is_cuda_vllm_engine(&self.manifest.engine.id) {
             let user_explicit_ratio = self
                 .user_config
                 .get("gpu_memory_utilization")
                 .and_then(|v| v.as_f64());
-            let from_vllm_args = env
-                .get("VLLM_ARGS")
-                .and_then(|raw| super::parse_gpu_memory_utilization_arg(raw));
+            let from_args = super::parse_gpu_memory_utilization_arg(&engine_args.join(" "));
             let ratio = user_explicit_ratio
-                .or(from_vllm_args)
+                .or(from_args)
                 .or_else(super::auto_gpu_memory_utilization);
             if let Some(ratio) = ratio {
-                if let Some(raw) = env.get("VLLM_ARGS").cloned() {
-                    let cleaned = super::strip_gpu_memory_utilization(&raw);
-                    let mut merged = Vec::new();
-                    if !cleaned.is_empty() {
-                        merged.push(cleaned);
-                    }
-                    merged.push(format!("--gpu-memory-utilization {:.2}", ratio));
-                    let mut final_args = merged.join(" ");
-                    if self.manifest.engine.id == "vllm-spark" {
-                        final_args = super::normalize_vllm_spark_args(&final_args);
-                    }
-                    env.insert("VLLM_ARGS".into(), final_args);
-                }
+                engine_args.push("--gpu-memory-utilization".to_string());
+                engine_args.push(format!("{:.2}", ratio));
                 env.insert("GPU_MEMORY_UTILIZATION".into(), format!("{:.2}", ratio));
                 if let Some(s) = &self.log_sink {
                     s.info(&format!("[docker] gpu_memory_utilization={:.2}", ratio));
                 }
             }
             if self.manifest.engine.id == "vllm-spark" {
-                if let Some(raw) = env.get("VLLM_ARGS").cloned() {
-                    env.insert("VLLM_ARGS".into(), super::normalize_vllm_spark_args(&raw));
-                }
+                // Spark wymaga wylaczenia flashinfer autotune; dedup last-wins
+                // skasuje ewentualny `--enable-...` z user args.
+                engine_args.push("--no-enable-flashinfer-autotune".to_string());
             }
         }
+        // Dedup last-wins (extra/user args wygrywaja nad bundle/manifest base).
+        // entrypoint.sh dorzuca tylko AUTO_PARALLEL gdy brak TP/PP w tych argach.
+        let engine_args = crate::deploy::python_venv::dedup_cli_args_last_wins(engine_args);
 
         let mut labels = HashMap::new();
         labels.insert(
@@ -758,6 +777,7 @@ impl DeployStrategy for DockerDeploy {
             &container_name,
             &port_map,
             &env,
+            &engine_args,
             &binds,
             &labels,
         )
@@ -958,6 +978,34 @@ impl DeployStrategy for DockerDeploy {
     }
 }
 
+/// Baseline argv dla silnikow vLLM przy deployu docker. Native bierze te same
+/// flagi z bundle.toml `[launch] args`; docker bundle.toml nie ma, wiec
+/// odtwarzamy je tu jako single source of truth Rust-side. Dotyczy WYLACZNIE
+/// rodziny vLLM (vllm / vllm-spark / vllm-metal) — sglang / llama.cpp / trt
+/// maja inny zestaw flag i nie dostaja tego baseline. `--enable-flashinfer-autotune`
+/// jest w baseline; dla vllm-spark `prepare` dorzuca pozniej
+/// `--no-enable-flashinfer-autotune`, ktore wygrywa przez dedup last-wins.
+#[cfg(feature = "docker")]
+fn vllm_docker_baseline_args(engine_id: &str) -> Vec<String> {
+    if !matches!(engine_id, "vllm" | "vllm-spark" | "vllm-metal") {
+        return Vec::new();
+    }
+    [
+        "--dtype",
+        "auto",
+        "--max-model-len",
+        "8192",
+        "--max-num-batched-tokens",
+        "8192",
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--enable-flashinfer-autotune",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,6 +1086,56 @@ mod tests {
             None,
         );
         assert_eq!(s.pick_transport(), Transport::HttpDirect);
+    }
+
+    /// Bez user-args silnik vllm musi dostac komplet baseline flag (te same co
+    /// native z bundle.toml) zasiane Rust-side, inaczej kontener leci na
+    /// pelnokontekstowych defaultach vLLM → OOM.
+    #[cfg(feature = "docker")]
+    #[test]
+    fn docker_baseline_seeded_for_vllm() {
+        let base = vllm_docker_baseline_args("vllm");
+        let args = crate::deploy::python_venv::dedup_cli_args_last_wins(base);
+        let joined = args.join(" ");
+        assert!(joined.contains("--dtype auto"), "got: {joined}");
+        assert!(joined.contains("--max-model-len 8192"), "got: {joined}");
+        assert!(
+            joined.contains("--max-num-batched-tokens 8192"),
+            "got: {joined}"
+        );
+        assert!(args.iter().any(|a| a == "--enable-prefix-caching"));
+        assert!(args.iter().any(|a| a == "--enable-chunked-prefill"));
+        assert!(args.iter().any(|a| a == "--enable-flashinfer-autotune"));
+    }
+
+    /// vllm-spark: baseline ma `--enable-flashinfer-autotune`, ale prepare
+    /// dorzuca `--no-enable-flashinfer-autotune`; dedup last-wins musi zostawic
+    /// WYLACZONY autotune (spark wymaga off) i zero duplikatow tej flagi.
+    #[cfg(feature = "docker")]
+    #[test]
+    fn docker_spark_disables_flashinfer_autotune_after_dedup() {
+        let mut base = vllm_docker_baseline_args("vllm-spark");
+        // Symuluj normalizacje z prepare (engine_args.push po user/spec/gpu).
+        base.push("--no-enable-flashinfer-autotune".to_string());
+        let args = crate::deploy::python_venv::dedup_cli_args_last_wins(base);
+        assert!(
+            args.iter().any(|a| a == "--no-enable-flashinfer-autotune"),
+            "autotune musi byc wylaczony: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--enable-flashinfer-autotune"),
+            "duplikat enable nie moze zostac: {args:?}"
+        );
+    }
+
+    /// Silniki spoza rodziny vLLM nie dostaja vllm baseline.
+    #[cfg(feature = "docker")]
+    #[test]
+    fn docker_baseline_empty_for_non_vllm() {
+        assert!(vllm_docker_baseline_args("sglang").is_empty());
+        assert!(vllm_docker_baseline_args("llama-cpp").is_empty());
+        assert!(vllm_docker_baseline_args("trt-llm").is_empty());
+        assert!(!vllm_docker_baseline_args("vllm-metal").is_empty());
     }
 
     /// Live docker test — gated on a running daemon. Skipped silently when

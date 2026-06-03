@@ -16,27 +16,38 @@ CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen2.5-0.5B-Instruct'}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 
+# Argumenty silnika przychodza jako "$@" (bollard Cmd array zbudowany przez
+# Rust docker.rs). JSON `--speculative-config {...}` jest pojedynczym argv-em i
+# zostaje nietkniety — zadnej re-tokenizacji (xargs zdejmowal wewnetrzne
+# cudzyslowy -> zepsuty JSON). Defaulty (--dtype, --max-model-len, gpu-memory)
+# pochodza teraz z Rust/bundle, nie z tego skryptu.
+ENGINE_ARGS=("$@")
+
 # Auto-detect liczby GPU widzialnych dla kontenera (CUDA_VISIBLE_DEVICES albo
-# wszystkie z --gpus all). Ustawia TP automatycznie gdy user nie wymusil.
-GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
-[[ "$GPU_COUNT" -lt 1 ]] && GPU_COUNT=1
-echo "[entrypoint] wykryto $GPU_COUNT GPU widocznych dla kontenera"
-
-# Default TP/PP wedlug GPU count. User moze nadpisac w VLLM_ARGS.
-# Uwaga: TP musi dzielic num_attention_heads modelu, PP musi dzielic
-# num_hidden_layers. Dla 3/6/12 GPU lepiej uzyc TP=2 x PP=3 niz TP=3.
-case "$GPU_COUNT" in
-  1) AUTO_PARALLEL="--tensor-parallel-size 1" ;;
-  2) AUTO_PARALLEL="--tensor-parallel-size 2" ;;
-  3) AUTO_PARALLEL="--tensor-parallel-size 1 --pipeline-parallel-size 3" ;;
-  4) AUTO_PARALLEL="--tensor-parallel-size 4" ;;
-  6) AUTO_PARALLEL="--tensor-parallel-size 2 --pipeline-parallel-size 3" ;;
-  8) AUTO_PARALLEL="--tensor-parallel-size 8" ;;
-  *) AUTO_PARALLEL="--tensor-parallel-size $GPU_COUNT" ;;
-esac
-
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
-VLLM_ARGS="${VLLM_ARGS:---dtype auto --gpu-memory-utilization $GPU_MEMORY_UTILIZATION --max-model-len 8192 --max-num-batched-tokens 8192 --enable-chunked-prefill --enable-prefix-caching --enable-flashinfer-autotune $AUTO_PARALLEL}"
+# wszystkie z --gpus all). Default TP/PP dorzucamy TYLKO gdy user nie podal
+# --tensor-parallel-size / --pipeline-parallel-size w przekazanych argach.
+HAS_PARALLEL=0
+for _a in "${ENGINE_ARGS[@]}"; do
+  case "$_a" in
+    --tensor-parallel-size|--tensor-parallel-size=*|-tp|--pipeline-parallel-size|--pipeline-parallel-size=*) HAS_PARALLEL=1 ;;
+  esac
+done
+if [[ "$HAS_PARALLEL" -eq 0 ]]; then
+  GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
+  [[ "$GPU_COUNT" -lt 1 ]] && GPU_COUNT=1
+  echo "[entrypoint] wykryto $GPU_COUNT GPU — auto TP/PP"
+  # TP musi dzielic num_attention_heads, PP musi dzielic num_hidden_layers.
+  # Dla 3/6 GPU lepiej TP=2 x PP=3 niz TP=3.
+  case "$GPU_COUNT" in
+    1) ENGINE_ARGS+=(--tensor-parallel-size 1) ;;
+    2) ENGINE_ARGS+=(--tensor-parallel-size 2) ;;
+    3) ENGINE_ARGS+=(--tensor-parallel-size 1 --pipeline-parallel-size 3) ;;
+    4) ENGINE_ARGS+=(--tensor-parallel-size 4) ;;
+    6) ENGINE_ARGS+=(--tensor-parallel-size 2 --pipeline-parallel-size 3) ;;
+    8) ENGINE_ARGS+=(--tensor-parallel-size 8) ;;
+    *) ENGINE_ARGS+=(--tensor-parallel-size "$GPU_COUNT") ;;
+  esac
+fi
 
 echo "[entrypoint] sidecar config=$CONFIG_PATH"
 NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
@@ -44,22 +55,12 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-# Tokenizacja VLLM_ARGS respektujaca cudzyslowy — IDENTYCZNIE jak native
-# (python_venv::build_engine_args uzywa shlex::split). VLLM_ARGS moze zawierac
-# --speculative-config '{...}' (JSON w single-quotes). Surowe `$VLLM_ARGS` w
-# bashu word-splituje, ale NIE zdejmuje literalnych apostrofow -> vLLM dostawal
-# zepsuty JSON. `xargs` zdejmuje cudzyslowy i NIE wykonuje podstawien
-# ($(...) zostaja literalne) -> bezpieczne, bez `eval`. Dziala dla wszystkich
-# kombinacji: z/bez speculative, 1/wiele GPU, --tensor-parallel-size itd.
-VLLM_ARG_ARR=()
-while IFS= read -r _a; do VLLM_ARG_ARR+=("$_a"); done < <(xargs -n1 printf '%s\n' <<< "$VLLM_ARGS")
-
-echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (${#VLLM_ARG_ARR[@]} args)"
+echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (${#ENGINE_ARGS[@]} args)"
 vllm serve "$MODEL" \
   --host 127.0.0.1 \
   --port "$VLLM_PORT" \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
-  "${VLLM_ARG_ARR[@]}" 2>&1 \
+  "${ENGINE_ARGS[@]}" 2>&1 \
   | sed -u 's/^/[vllm] /' &
 VLLM_PID=$!
 echo "[entrypoint] vllm PID=$VLLM_PID"

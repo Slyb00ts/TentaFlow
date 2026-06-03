@@ -14,7 +14,14 @@ CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 
 MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen2.5-0.5B-Instruct'}"
 SGLANG_PORT="${SGLANG_PORT:-30000}"
-SGLANG_ARGS="${SGLANG_ARGS:---tp 1 --mem-fraction-static 0.85}"
+
+# Argi silnika jako "$@" (bollard Cmd array z Rust). JSON-owe argi (np.
+# speculative) zostaja nietkniete — zadnej re-tokenizacji. Gdy Rust nie podal
+# nic, uzywamy bezpiecznego baseline single-GPU.
+ENGINE_ARGS=("$@")
+if [[ "${#ENGINE_ARGS[@]}" -eq 0 ]]; then
+  ENGINE_ARGS=(--tp 1 --mem-fraction-static 0.85)
+fi
 
 echo "[entrypoint] sidecar config=$CONFIG_PATH"
 NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
@@ -22,19 +29,12 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-# Tokenizacja SGLANG_ARGS respektujaca cudzyslowy — jak native (shlex::split).
-# `xargs` zdejmuje single-quotes (np. wokol JSON speculative) i NIE wykonuje
-# podstawien -> bezpieczne, bez `eval`. Surowe `$SGLANG_ARGS` zostawialo
-# literalne apostrofy. Dziala z/bez speculative, 1/wiele GPU, --tp itd.
-SGLANG_ARG_ARR=()
-while IFS= read -r _a; do SGLANG_ARG_ARR+=("$_a"); done < <(xargs -n1 printf '%s\n' <<< "$SGLANG_ARGS")
-
-echo "[entrypoint] start sglang (${#SGLANG_ARG_ARR[@]} args)"
+echo "[entrypoint] start sglang (${#ENGINE_ARGS[@]} args)"
 python3 -m sglang.launch_server \
   --model-path "$MODEL" \
   --host 127.0.0.1 \
   --port "$SGLANG_PORT" \
-  "${SGLANG_ARG_ARR[@]}" 2>&1 \
+  "${ENGINE_ARGS[@]}" 2>&1 \
   | sed -u 's/^/[sglang] /' &
 ENGINE_PID=$!
 echo "[entrypoint] sglang PID=$ENGINE_PID"

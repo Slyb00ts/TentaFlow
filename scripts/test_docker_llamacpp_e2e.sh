@@ -48,8 +48,8 @@ docker run -d --name "$CONTAINER" \
   -p "${HOST_PORT}:5000/udp" \
   -v "$DATA_DIR:/data" \
   -e MODEL_PATH=/data/models/model.gguf \
-  -e LLAMA_ARGS="--n-gpu-layers 99 --ctx-size 4096" \
-  tentaflow/llama-cpp:latest >/dev/null
+  tentaflow/llama-cpp:latest \
+  --n-gpu-layers 99 --ctx-size 4096 >/dev/null
 
 echo "[test] kontener up"
 

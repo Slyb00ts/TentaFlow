@@ -21,19 +21,25 @@ CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen3.5-0.8B'}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 
-GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
-[[ "$GPU_COUNT" -lt 1 ]] && GPU_COUNT=1
-echo "[entrypoint] DGX Spark vllm — GPU widocznych: $GPU_COUNT"
+# Argi silnika jako "$@" (bollard Cmd z Rust). JSON --speculative-config
+# nietkniety, bez re-tokenizacji. Defaulty (--no-enable-flashinfer-autotune,
+# gpu-memory) dodaje Rust docker.rs.
+ENGINE_ARGS=("$@")
 
-# DGX Spark to single-GPU SoC (jeden GB10) — TP=1 to default. Multi-Spark
-# mesh nie idzie przez jeden kontener, wiec nie kombinujemy z PP.
-case "$GPU_COUNT" in
-  1) AUTO_PARALLEL="--tensor-parallel-size 1" ;;
-  *) AUTO_PARALLEL="--tensor-parallel-size $GPU_COUNT" ;;
-esac
-
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
-VLLM_ARGS="${VLLM_ARGS:---dtype auto --gpu-memory-utilization $GPU_MEMORY_UTILIZATION --max-model-len 8192 --max-num-batched-tokens 8192 --enable-chunked-prefill --enable-prefix-caching --no-enable-flashinfer-autotune $AUTO_PARALLEL}"
+# DGX Spark to single-GPU SoC (jeden GB10) — TP=1 default. Dorzucamy tylko gdy
+# user nie podal TP/PP. Multi-Spark mesh nie idzie przez jeden kontener.
+HAS_PARALLEL=0
+for _a in "${ENGINE_ARGS[@]}"; do
+  case "$_a" in
+    --tensor-parallel-size|--tensor-parallel-size=*|-tp|--pipeline-parallel-size|--pipeline-parallel-size=*) HAS_PARALLEL=1 ;;
+  esac
+done
+if [[ "$HAS_PARALLEL" -eq 0 ]]; then
+  GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
+  [[ "$GPU_COUNT" -lt 1 ]] && GPU_COUNT=1
+  echo "[entrypoint] DGX Spark vllm — GPU widocznych: $GPU_COUNT"
+  ENGINE_ARGS+=(--tensor-parallel-size "$GPU_COUNT")
+fi
 
 echo "[entrypoint] sidecar config=$CONFIG_PATH"
 NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
@@ -41,19 +47,12 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-# Tokenizacja VLLM_ARGS respektujaca cudzyslowy — jak native (shlex::split).
-# `xargs` zdejmuje single-quotes wokol --speculative-config '{...}' i NIE
-# wykonuje podstawien -> bezpieczne, bez `eval`. Surowe `$VLLM_ARGS` zostawialo
-# literalne apostrofy -> zepsuty JSON. Dziala z/bez speculative, 1/wiele GPU, TP.
-VLLM_ARG_ARR=()
-while IFS= read -r _a; do VLLM_ARG_ARR+=("$_a"); done < <(xargs -n1 printf '%s\n' <<< "$VLLM_ARGS")
-
-echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (sm_121a, ${#VLLM_ARG_ARR[@]} args)"
+echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (sm_121a, ${#ENGINE_ARGS[@]} args)"
 vllm serve "$MODEL" \
   --host 127.0.0.1 \
   --port "$VLLM_PORT" \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
-  "${VLLM_ARG_ARR[@]}" 2>&1 \
+  "${ENGINE_ARGS[@]}" 2>&1 \
   | sed -u 's/^/[vllm] /' &
 VLLM_PID=$!
 echo "[entrypoint] vllm PID=$VLLM_PID"
