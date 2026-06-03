@@ -91,6 +91,61 @@ pub fn mirror_trusted_peer_to_registry(
     }
 }
 
+/// Po potwierdzonym parowaniu inicjator (joiner) decyduje role baseline-adopt i
+/// utrwala single-flight stan adopcji. Gdy lokalny nod wychodzi jako JOINER,
+/// zapisuje stan w fazie `Elected` — KROK 2 (transport iroh) odczyta ten stan,
+/// otworzy strumien baseline do dawcy (`BaselineElect` -> `BaselineAck` ->
+/// `BaselineHeader` + `BaselineChunk`*), zlozy chunki przez
+/// `core_baseline::reassemble_chunks` i zawola `core_baseline::run_baseline_adopt`
+/// (pelna, juz zaimplementowana, atomowa logika importu). Gdy lokalny nod jest
+/// DAWCA, nie robi nic poza zapisem roli — to dawca odpowiada na `BaselineElect`
+/// snapshotem (`core_baseline::capture_baseline_snapshot` + `chunk_snapshot`).
+///
+/// Tu NIE ma transferu sieciowego (krok 2); elekcja i stan single-flight sa
+/// realne i potrzebne natychmiast, by zablokowac rownolegly split-brain.
+fn begin_baseline_adopt_after_confirm(
+    db: &DbPool,
+    local_node_id: &str,
+    remote_node_id: &str,
+) {
+    use crate::sync::core_baseline::{
+        local_role, store_adopt_state, BaselineAdoptState, BaselinePhase, BaselineRole,
+    };
+
+    let donor_epoch = crate::sync::runtime::core_epoch();
+    let (donor, _joiner) = crate::sync::core_baseline::decide_roles(
+        local_node_id,
+        remote_node_id,
+        None,
+    );
+    let role = local_role(local_node_id, &donor);
+
+    let state = BaselineAdoptState {
+        role,
+        peer: remote_node_id.to_string(),
+        epoch: donor_epoch,
+        phase: BaselinePhase::Elected,
+    };
+    if let Err(e) = store_adopt_state(db, &state) {
+        warn!(
+            peer = %remote_node_id,
+            "baseline adopt: zapis stanu elekcji nieudany: {}",
+            e
+        );
+        return;
+    }
+    match role {
+        BaselineRole::Joiner => info!(
+            peer = %remote_node_id,
+            "baseline adopt: lokalny nod jest JOINEREM — krok 2 pobierze snapshot dawcy"
+        ),
+        BaselineRole::Donor => info!(
+            peer = %remote_node_id,
+            "baseline adopt: lokalny nod jest DAWCA — odpowie na BaselineElect snapshotem"
+        ),
+    }
+}
+
 async fn send_pairing_bootstrap(
     qm: &Arc<IrohMeshManager>,
     security: &Arc<MeshSecurity>,
@@ -526,6 +581,11 @@ pub async fn initiate_pairing(
                         )
                     })?;
                 send_pairing_bootstrap(qm, security, &remote_hints.node_id, local_node_id).await?;
+                begin_baseline_adopt_after_confirm(
+                    &security.db,
+                    local_node_id,
+                    &remote_hints.node_id,
+                );
                 completed = true;
             }
             Ok(PairingAttemptOutcome::Pending) => {
