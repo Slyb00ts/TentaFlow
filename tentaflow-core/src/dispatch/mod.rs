@@ -796,6 +796,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::NimCatalogListResponseBody(_) => "NimCatalogListResponse",
         MessageBody::DeployVllmRecommendRequestBody(_) => "DeployVllmRecommendRequest",
         MessageBody::DeployVllmRecommendResponseBody(_) => "DeployVllmRecommendResponse",
+        MessageBody::SuggestServicePortRequestBody(_) => "SuggestServicePortRequest",
+        MessageBody::SuggestServicePortResponseBody(_) => "SuggestServicePortResponse",
         MessageBody::EngineRecommendRequestBody(_) => "EngineRecommendRequest",
         MessageBody::EngineRecommendResponseBody(_) => "EngineRecommendResponse",
         // ServiceManifestDeploy przeniesione do DeploymentPayload::ReqStart/ResStart.

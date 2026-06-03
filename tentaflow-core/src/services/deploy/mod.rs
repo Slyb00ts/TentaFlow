@@ -550,7 +550,30 @@ pub async fn stop(
     // deterministic name pattern used at create time (see DockerDeploy::run).
     #[cfg(feature = "docker")]
     if svc.deploy_method == DM::Docker {
-        if let (Ok(docker), Some(port)) = (
+        // Compose stacks (infra like Milvus / iroh-relay) are torn down as a
+        // whole project, not a single named container.
+        let is_compose = crate::services::manifest::registry()
+            .by_id(&svc.engine_id)
+            .and_then(|m| m.deploy.docker.as_ref())
+            .map(|d| d.compose_path.is_some() && d.context_path.is_none())
+            .unwrap_or(false);
+        if is_compose {
+            // Per-instance project name (engine + host port), matching
+            // prepare_compose, so the right stack is torn down. `down` (no `-v`)
+            // removes the containers but keeps the project's named volumes, so a
+            // later restart preserves data — same contract as the single-container
+            // path which leaves Docker volumes intact.
+            if let Some(port) = svc.runtime_port {
+                let project = docker::compose_project_name(&svc.engine_id, port);
+                let _ = tokio::process::Command::new("docker")
+                    .arg("compose")
+                    .arg("-p")
+                    .arg(&project)
+                    .arg("down")
+                    .output()
+                    .await;
+            }
+        } else if let (Ok(docker), Some(port)) = (
             bollard::Docker::connect_with_local_defaults(),
             svc.runtime_port,
         ) {

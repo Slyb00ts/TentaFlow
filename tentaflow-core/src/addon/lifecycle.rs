@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use anyhow::{bail, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{
     AddonDeclaredPermission, AddonManifest, AddonOAuthProviderSection, AddonVisibilitySection,
@@ -799,6 +799,12 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
 
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &new_manifest)?;
+
+    // Reconcile vector-namespace metadata schemas against the new manifest:
+    // add/drop typed columns on collections that already exist so a declared
+    // schema change in `[[vector_namespace]].fields` is applied on upgrade.
+    #[cfg(feature = "vector")]
+    reconcile_vector_namespaces(db, &new_manifest);
 
     // F1c P5 — atomically swap compiled flows: drop every previous-version
     // entry for this addon and publish the new set under a single write lock,
@@ -1754,6 +1760,79 @@ fn parse_claim_requirement(val: &toml::Value) -> Result<crate::addon::manifest::
     })
 }
 
+/// On addon upgrade, bring every already-materialized vector namespace in line
+/// with the new manifest's declared `[[vector_namespace]].fields`. Iterates all
+/// orgs that hold a row for each declared namespace (an addon may be installed
+/// in several tenants) and reconciles each. Best-effort: a reconciliation
+/// failure for one (org, namespace) is logged and the upgrade still completes —
+/// the schema mismatch surfaces later as a clear filter/insert error rather
+/// than aborting an otherwise-valid upgrade.
+#[cfg(feature = "vector")]
+fn reconcile_vector_namespaces(db: &DbPool, manifest: &AddonManifest) {
+    use tentaflow_sdk_spec::{FieldSpec, FieldType};
+
+    if manifest.vector_namespaces.is_empty() {
+        return;
+    }
+    let mgr = crate::services::vector::NamespaceManager::new(db.clone());
+    for ns in &manifest.vector_namespaces {
+        let desired: Vec<FieldSpec> = ns
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let field_type = match f.field_type.as_str() {
+                    "str" => FieldType::Str,
+                    "int" => FieldType::Int,
+                    "float" => FieldType::Float,
+                    "bool" => FieldType::Bool,
+                    _ => return None,
+                };
+                Some(FieldSpec {
+                    name: f.name.clone(),
+                    field_type,
+                    indexed: f.indexed,
+                })
+            })
+            .collect();
+
+        let orgs: Vec<String> = {
+            let conn = match db.lock() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT org_id FROM addon_vector_namespaces WHERE addon_id = ?1 AND namespace = ?2",
+            ) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rows = stmt
+                .query_map(rusqlite::params![manifest.addon_id, ns.name], |r| {
+                    r.get::<_, String>(0)
+                })
+                .and_then(|m| m.collect::<std::result::Result<Vec<_>, _>>());
+            match rows {
+                Ok(v) => v,
+                Err(_) => continue,
+            }
+        };
+
+        for org_id in orgs {
+            match mgr.reconcile_namespace(&org_id, &manifest.addon_id, &ns.name, &desired) {
+                Ok(report) if !report.is_noop() => info!(
+                    "vector namespace '{}' (org {}, addon {}) reconciled: +{:?} -{:?}",
+                    ns.name, org_id, manifest.addon_id, report.added, report.dropped
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    "vector namespace '{}' (org {}, addon {}) reconcile failed: {e}",
+                    ns.name, org_id, manifest.addon_id
+                ),
+            }
+        }
+    }
+}
+
 fn parse_vector_namespaces(
     val: Option<&toml::Value>,
 ) -> Result<Vec<crate::addon::manifest::VectorNamespaceSpec>> {
@@ -1783,12 +1862,50 @@ fn parse_vector_namespaces(
             .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'data_class'"))?
             .to_string();
         let gate = item.get("gate").and_then(|v| v.as_str()).map(String::from);
+        let mut fields = Vec::new();
+        if let Some(field_arr) = item.get("fields").and_then(|v| v.as_array()) {
+            for (fidx, f) in field_arr.iter().enumerate() {
+                let fname = f
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "[[vector_namespace]][{idx}].fields[{fidx}] missing 'name'"
+                        )
+                    })?
+                    .to_string();
+                let ftype = f
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "[[vector_namespace]][{idx}].fields[{fidx}] missing 'type'"
+                        )
+                    })?
+                    .to_string();
+                if !matches!(ftype.as_str(), "str" | "int" | "float" | "bool") {
+                    return Err(anyhow::anyhow!(
+                        "[[vector_namespace]][{idx}].fields[{fidx}] invalid type '{ftype}' \
+                         (expected str|int|float|bool)"
+                    ));
+                }
+                let indexed = f.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false);
+                fields.push(crate::addon::manifest::VectorFieldSpec {
+                    name: fname,
+                    field_type: ftype,
+                    indexed,
+                });
+            }
+        }
+        let sparse = item.get("sparse").and_then(|v| v.as_bool()).unwrap_or(false);
         out.push(crate::addon::manifest::VectorNamespaceSpec {
             name,
             dimensions,
             distance,
             data_class,
             gate,
+            fields,
+            sparse,
         });
     }
     Ok(out)

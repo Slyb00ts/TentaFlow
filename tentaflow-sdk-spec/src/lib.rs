@@ -171,7 +171,8 @@ pub use protocol::{
     },
     value::Value,
     vector::{
-        VectorDeleteInput, VectorDeleteOutput, VectorSearchHit, VectorSearchInput,
-        VectorSearchOutput, VectorUpsertInput, VectorUpsertOutput,
+        VectorDeleteInput, VectorDeleteOutput, VectorHybridSearchInput, VectorSearchHit,
+        VectorSearchInput, VectorSearchOutput, VectorUpsertInput, VectorUpsertOutput,
     },
+    vector_query::{Field, FieldSpec, FieldType, FieldValue, Filter, Fusion, SparseVector},
 };

@@ -33,7 +33,8 @@ use tentaflow_protocol::{
         AddonVisibilitySetRequest, ApiKeyCreateRequest, AuthLoginRequest, ChatMessage,
         ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
         ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
-        ClusterUpdateRequest, DeployVllmRecommendRequest, FlowCreateRequest, FlowUpdateRequest,
+        ClusterUpdateRequest, DeployVllmRecommendRequest, SuggestServicePortRequest,
+        FlowCreateRequest, FlowUpdateRequest,
         FlowVersionGetRequest, FlowVersionListRequest, FlowVersionRestoreRequest,
         MePreferencesGetRequest, MePreferencesUpdateRequest, MeshConnectRequest,
         MeshNodeCommandRequest, MeshNodeNetworkConfigRequest, MeshPairInitRequest,
@@ -5324,6 +5325,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
             set(&obj, "json", json.into());
         }
+        MessageBody::SuggestServicePortRequestBody(_) => {
+            set(&obj, "variant", "SuggestServicePortRequest".into());
+        }
+        MessageBody::SuggestServicePortResponseBody(payload) => {
+            set(&obj, "variant", "SuggestServicePortResponse".into());
+            set(&obj, "port", payload.port.into());
+            set(&obj, "available", payload.available.into());
+        }
         MessageBody::EngineRecommendRequestBody(_) => {
             set(&obj, "variant", "EngineRecommendRequest".into());
         }
@@ -7331,6 +7340,14 @@ pub fn encode_deploy_vllm_recommend_request(payload_json: String) -> Result<Vec<
     let payload: DeployVllmRecommendRequest = serde_json::from_str(&payload_json)
         .map_err(|e| JsError::new(&format!("payload parse: {e}")))?;
     encode_body_inner(&MessageBody::DeployVllmRecommendRequestBody(payload))
+        .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSuggestServicePortRequest)]
+pub fn encode_suggest_service_port_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    let payload: SuggestServicePortRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("payload parse: {e}")))?;
+    encode_body_inner(&MessageBody::SuggestServicePortRequestBody(payload))
         .map_err(|e| JsError::new(&e))
 }
 

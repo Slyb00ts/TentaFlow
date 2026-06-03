@@ -20,10 +20,78 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use super::backend::{Metric, VectorBackend};
+use super::backend::{Field, FieldSpec, Metric, SparseVector, VectorBackend};
 use super::error::{Result, VectorError};
-use super::usearch_backend::UsearchBackend;
+use super::zvec_backend::ZvecBackend;
 use crate::db::DbPool;
+use tentaflow_sdk_spec::FieldType;
+
+/// Stable string form of a `FieldType` for the `fields_json` DB column.
+fn field_type_str(t: FieldType) -> &'static str {
+    match t {
+        FieldType::Str => "str",
+        FieldType::Int => "int",
+        FieldType::Float => "float",
+        FieldType::Bool => "bool",
+    }
+}
+
+fn field_type_from_str(s: &str) -> Option<FieldType> {
+    match s {
+        "str" => Some(FieldType::Str),
+        "int" => Some(FieldType::Int),
+        "float" => Some(FieldType::Float),
+        "bool" => Some(FieldType::Bool),
+        _ => None,
+    }
+}
+
+/// Serialize a declared field schema to the JSON stored in
+/// `addon_vector_namespaces.fields_json` (a `[{name,type,indexed}]` array). The
+/// universal `FieldSpec` (minicbor, no serde) is mapped to a small serde mirror.
+fn serialize_field_specs(fields: &[FieldSpec]) -> String {
+    #[derive(serde::Serialize)]
+    struct Stored<'a> {
+        name: &'a str,
+        #[serde(rename = "type")]
+        ty: &'a str,
+        indexed: bool,
+    }
+    let stored: Vec<Stored> = fields
+        .iter()
+        .map(|f| Stored {
+            name: &f.name,
+            ty: field_type_str(f.field_type),
+            indexed: f.indexed,
+        })
+        .collect();
+    serde_json::to_string(&stored).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Inverse of [`serialize_field_specs`]. An unknown type string is dropped (the
+/// schema is reconstructed best-effort; the backend column would be missing,
+/// surfacing as a clear filter/insert error rather than a silent wrong type).
+fn parse_field_specs(json: &str) -> Vec<FieldSpec> {
+    #[derive(serde::Deserialize)]
+    struct Stored {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+        #[serde(default)]
+        indexed: bool,
+    }
+    let stored: Vec<Stored> = serde_json::from_str(json).unwrap_or_default();
+    stored
+        .into_iter()
+        .filter_map(|s| {
+            field_type_from_str(&s.ty).map(|field_type| FieldSpec {
+                name: s.name,
+                field_type,
+                indexed: s.indexed,
+            })
+        })
+        .collect()
+}
 
 /// Hard cap on namespaces per (org, addon). Each open namespace holds a
 /// usearch handle (mmap + connectivity graph), so we keep this modest in F1c.
@@ -102,6 +170,42 @@ fn namespace_file_path(org_id: &str, addon_id: &str, namespace: &str) -> Result<
         .join(format!("{namespace}.usearch")))
 }
 
+/// Reserved per-addon config keys (set by an admin in the addon settings GUI,
+/// not declared in the manifest) that pick the vector backend for the addon.
+const CFG_BACKEND: &str = "__vector_backend";
+const CFG_MILVUS_URI: &str = "__milvus_uri";
+const CFG_MILVUS_USER: &str = "__milvus_user";
+const CFG_MILVUS_PASSWORD: &str = "__milvus_password";
+
+/// Stable, charset-safe Milvus collection name for a namespace. Milvus requires
+/// `^[A-Za-z_][A-Za-z0-9_]{0,254}$`; we compose `v_<org>_<addon>_<namespace>` and
+/// sanitize so the same addon in two tenants never shares a collection.
+fn milvus_collection_name(org_id: &str, addon_id: &str, namespace: &str) -> String {
+    let raw = format!("{org_id}_{addon_id}_{namespace}");
+    let mut s: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    s.insert_str(0, "v_");
+    s.truncate(255);
+    s
+}
+
+/// Result of [`NamespaceManager::reconcile_namespace`] — the metadata columns
+/// added and dropped to bring the live collection in line with the manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub added: Vec<String>,
+    pub dropped: Vec<String>,
+}
+
+impl ReconcileReport {
+    /// True when nothing changed (schema already matched).
+    pub fn is_noop(&self) -> bool {
+        self.added.is_empty() && self.dropped.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct NamespaceKey {
     org_id: String,
@@ -149,6 +253,94 @@ impl NamespaceManager {
         }
     }
 
+    /// Read one reserved per-addon config value from `addon_config`. Returns
+    /// `None` if absent or empty.
+    fn addon_cfg(&self, addon_id: &str, key: &str) -> Option<String> {
+        let conn = self.pool.lock().ok()?;
+        conn.query_row(
+            "SELECT value FROM addon_config WHERE addon_id = ?1 AND key = ?2",
+            rusqlite::params![addon_id, key],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|s| !s.is_empty())
+    }
+
+    /// Build the backend an addon's namespace should use. zvec (embedded, files
+    /// at `file_path`) is the default; an admin can switch a specific addon to an
+    /// external Milvus by setting the reserved `__vector_backend` config key.
+    fn build_backend(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        dim: u32,
+        metric: Metric,
+        file_path: PathBuf,
+        fields: &[FieldSpec],
+        sparse: bool,
+    ) -> Result<Arc<dyn VectorBackend>> {
+        let backend = self
+            .addon_cfg(addon_id, CFG_BACKEND)
+            .unwrap_or_else(|| "zvec".to_string());
+        match backend.as_str() {
+            "milvus" => self.build_milvus(org_id, addon_id, namespace, dim, metric, fields, sparse),
+            _ => Ok(Arc::new(ZvecBackend::open_or_create(
+                file_path, dim, metric, fields, sparse,
+            )?)),
+        }
+    }
+
+    #[cfg(feature = "vector-milvus")]
+    fn build_milvus(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        dim: u32,
+        metric: Metric,
+        fields: &[FieldSpec],
+        sparse: bool,
+    ) -> Result<Arc<dyn VectorBackend>> {
+        let uri = self.addon_cfg(addon_id, CFG_MILVUS_URI).ok_or_else(|| {
+            VectorError::Backend(format!(
+                "addon {addon_id}: vector backend 'milvus' selected but {CFG_MILVUS_URI} is not set"
+            ))
+        })?;
+        let user = self.addon_cfg(addon_id, CFG_MILVUS_USER);
+        let password = self.addon_cfg(addon_id, CFG_MILVUS_PASSWORD);
+        let collection = milvus_collection_name(org_id, addon_id, namespace);
+        let be = super::milvus_backend::MilvusBackend::connect(
+            &uri,
+            user.as_deref(),
+            password.as_deref(),
+            &collection,
+            dim,
+            metric,
+            fields,
+            sparse,
+        )?;
+        Ok(Arc::new(be))
+    }
+
+    #[cfg(not(feature = "vector-milvus"))]
+    fn build_milvus(
+        &self,
+        _org_id: &str,
+        _addon_id: &str,
+        _namespace: &str,
+        _dim: u32,
+        _metric: Metric,
+        _fields: &[FieldSpec],
+        _sparse: bool,
+    ) -> Result<Arc<dyn VectorBackend>> {
+        Err(VectorError::Backend(
+            "vector backend 'milvus' selected but this binary was built without the \
+             'vector-milvus' feature"
+                .to_string(),
+        ))
+    }
+
     /// Returns the namespace handle, opening (or creating) the backing index
     /// on first access. If a DB row for `(org_id, addon_id, namespace)`
     /// exists, its dim/metric must match the caller-supplied values —
@@ -161,6 +353,8 @@ impl NamespaceManager {
         namespace: &str,
         dim: u32,
         metric: Metric,
+        fields: &[FieldSpec],
+        sparse: bool,
     ) -> Result<Arc<dyn VectorBackend>> {
         validate_org_id(org_id)?;
         validate_addon_id(addon_id)?;
@@ -193,35 +387,45 @@ impl NamespaceManager {
         }
 
         let existing = self.load_row(org_id, addon_id, namespace)?;
-        let (resolved_dim, resolved_metric, file_path) = match existing {
-            Some((existing_dim, existing_metric, existing_path)) => {
-                if existing_dim != dim {
-                    return Err(VectorError::DimMismatch {
-                        expected: existing_dim,
-                        actual: dim,
-                    });
+        let (resolved_dim, resolved_metric, file_path, resolved_fields, resolved_sparse) =
+            match existing {
+                Some((existing_dim, existing_metric, existing_path, existing_fields, existing_sparse)) => {
+                    if existing_dim != dim {
+                        return Err(VectorError::DimMismatch {
+                            expected: existing_dim,
+                            actual: dim,
+                        });
+                    }
+                    if existing_metric != metric {
+                        return Err(VectorError::MetricMismatch {
+                            expected: existing_metric.as_str(),
+                            actual: metric.as_str().to_string(),
+                        });
+                    }
+                    // The stored schema is authoritative; declaring a different field
+                    // set on reopen does not silently reshape the collection.
+                    // Reconciliation (add/drop column on addon update) is a separate,
+                    // explicit operation.
+                    (existing_dim, existing_metric, existing_path, existing_fields, existing_sparse)
                 }
-                if existing_metric != metric {
-                    return Err(VectorError::MetricMismatch {
-                        expected: existing_metric.as_str(),
-                        actual: metric.as_str().to_string(),
-                    });
+                None => {
+                    self.check_namespace_quota(org_id, addon_id)?;
+                    let path = self.file_path_for(org_id, addon_id, namespace)?;
+                    self.insert_row(org_id, addon_id, namespace, dim, metric, &path, fields, sparse)?;
+                    (dim, metric, path, fields.to_vec(), sparse)
                 }
-                (existing_dim, existing_metric, existing_path)
-            }
-            None => {
-                self.check_namespace_quota(org_id, addon_id)?;
-                let path = self.file_path_for(org_id, addon_id, namespace)?;
-                self.insert_row(org_id, addon_id, namespace, dim, metric, &path)?;
-                (dim, metric, path)
-            }
-        };
+            };
 
-        let backend: Arc<dyn VectorBackend> = Arc::new(UsearchBackend::open_or_create(
-            file_path,
+        let backend = self.build_backend(
+            org_id,
+            addon_id,
+            namespace,
             resolved_dim,
             resolved_metric,
-        )?);
+            file_path,
+            &resolved_fields,
+            resolved_sparse,
+        )?;
 
         let entry = self.backends.entry(key).or_insert(backend);
         Ok(entry.value().clone())
@@ -246,14 +450,15 @@ impl NamespaceManager {
             return Ok(be.clone());
         }
         let row = self.load_row(org_id, addon_id, namespace)?;
-        let Some((dim, metric, file_path)) = row else {
+        let Some((dim, metric, file_path, fields, sparse)) = row else {
             return Err(VectorError::NamespaceNotFound {
                 addon_id: addon_id.to_string(),
                 namespace: namespace.to_string(),
             });
         };
-        let backend: Arc<dyn VectorBackend> =
-            Arc::new(UsearchBackend::open_or_create(file_path, dim, metric)?);
+        let backend = self.build_backend(
+            org_id, addon_id, namespace, dim, metric, file_path, &fields, sparse,
+        )?;
         let entry = self.backends.entry(key).or_insert(backend);
         Ok(entry.value().clone())
     }
@@ -274,8 +479,13 @@ impl NamespaceManager {
         vector: &[f32],
         dim: u32,
         metric: Metric,
+        field_specs: &[FieldSpec],
+        field_values: &[Field],
+        sparse_flag: bool,
+        sparse_value: Option<&SparseVector>,
     ) -> Result<u64> {
-        let backend = self.get_or_create(org_id, addon_id, namespace, dim, metric)?;
+        let backend =
+            self.get_or_create(org_id, addon_id, namespace, dim, metric, field_specs, sparse_flag)?;
         let is_replace = backend.has_ref(ref_id);
 
         let conn = self
@@ -306,7 +516,7 @@ impl NamespaceManager {
             });
         }
 
-        if let Err(e) = backend.upsert(ref_id, vector) {
+        if let Err(e) = backend.upsert(ref_id, vector, field_values, sparse_value) {
             let _ = conn.execute("ROLLBACK", []);
             return Err(e);
         }
@@ -349,35 +559,38 @@ impl NamespaceManager {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn load_row(
         &self,
         org_id: &str,
         addon_id: &str,
         namespace: &str,
-    ) -> Result<Option<(u32, Metric, PathBuf)>> {
+    ) -> Result<Option<(u32, Metric, PathBuf, Vec<FieldSpec>, bool)>> {
         let conn = self
             .pool
             .lock()
             .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
         let row = conn
             .query_row(
-                "SELECT dim, metric, file_path FROM addon_vector_namespaces \
+                "SELECT dim, metric, file_path, fields_json, sparse FROM addon_vector_namespaces \
                  WHERE addon_id = ?1 AND namespace = ?2 AND org_id = ?3",
                 rusqlite::params![addon_id, namespace, org_id],
                 |r| {
                     let dim: i64 = r.get(0)?;
                     let metric: String = r.get(1)?;
                     let path: String = r.get(2)?;
-                    Ok((dim as u32, metric, PathBuf::from(path)))
+                    let fields_json: String = r.get(3)?;
+                    let sparse: i64 = r.get(4)?;
+                    Ok((dim as u32, metric, PathBuf::from(path), fields_json, sparse != 0))
                 },
             )
             .ok();
-        let Some((dim, metric_str, path)) = row else {
+        let Some((dim, metric_str, path, fields_json, sparse)) = row else {
             return Ok(None);
         };
         let metric = Metric::parse(&metric_str)
             .ok_or_else(|| VectorError::Db(format!("invalid metric '{metric_str}' in DB row")))?;
-        Ok(Some((dim, metric, path)))
+        Ok(Some((dim, metric, path, parse_field_specs(&fields_json), sparse)))
     }
 
     fn insert_row(
@@ -388,6 +601,8 @@ impl NamespaceManager {
         dim: u32,
         metric: Metric,
         file_path: &PathBuf,
+        fields: &[FieldSpec],
+        sparse: bool,
     ) -> Result<()> {
         let conn = self
             .pool
@@ -396,8 +611,8 @@ impl NamespaceManager {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         conn.execute(
             "INSERT INTO addon_vector_namespaces \
-             (addon_id, namespace, dim, metric, count, file_path, created_at, updated_at, org_id) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?6, ?7)",
+             (addon_id, namespace, dim, metric, count, file_path, created_at, updated_at, org_id, fields_json, sparse) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 addon_id,
                 namespace,
@@ -406,6 +621,8 @@ impl NamespaceManager {
                 file_path.to_string_lossy().to_string(),
                 now,
                 org_id,
+                serialize_field_specs(fields),
+                sparse as i64,
             ],
         )
         .map_err(|e| VectorError::Db(e.to_string()))?;
@@ -431,6 +648,96 @@ impl NamespaceManager {
             "UPDATE addon_vector_namespaces SET count = ?1, updated_at = ?2 \
              WHERE addon_id = ?3 AND namespace = ?4 AND org_id = ?5",
             rusqlite::params![new_count as i64, now, addon_id, namespace, org_id],
+        )
+        .map_err(|e| VectorError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Reconcile the live schema of one namespace against the addon's currently
+    /// declared `[[vector_namespace]].fields`. Called on addon update. Adds new
+    /// columns, drops removed ones, and rebuilds a column whose type changed
+    /// (drop + add — the stored values are incompatible with the new type). A
+    /// namespace with no DB row yet is a no-op: it will be created with the new
+    /// schema on first use. Returns the applied diff for auditing.
+    pub fn reconcile_namespace(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        desired: &[FieldSpec],
+    ) -> Result<ReconcileReport> {
+        validate_org_id(org_id)?;
+        validate_addon_id(addon_id)?;
+        validate_namespace_name(namespace)?;
+
+        let Some((_dim, _metric, _path, stored, _sparse)) =
+            self.load_row(org_id, addon_id, namespace)?
+        else {
+            return Ok(ReconcileReport::default());
+        };
+
+        let stored_type = |name: &str| stored.iter().find(|f| f.name == name).map(|f| f.field_type);
+        let desired_type =
+            |name: &str| desired.iter().find(|f| f.name == name).map(|f| f.field_type);
+
+        let mut to_drop: Vec<String> = Vec::new();
+        let mut to_add: Vec<FieldSpec> = Vec::new();
+
+        for s in &stored {
+            match desired_type(&s.name) {
+                None => to_drop.push(s.name.clone()),
+                Some(dt) if dt != s.field_type => to_drop.push(s.name.clone()),
+                Some(_) => {}
+            }
+        }
+        for d in desired {
+            match stored_type(&d.name) {
+                None => to_add.push(d.clone()),
+                Some(st) if st != d.field_type => to_add.push(d.clone()),
+                Some(_) => {}
+            }
+        }
+
+        if to_drop.is_empty() && to_add.is_empty() {
+            return Ok(ReconcileReport::default());
+        }
+
+        // The backend applies the change however its engine allows (zvec
+        // rebuilds the collection; Milvus adds columns online and errors on a
+        // removal). Only on success do we record the new schema, so a failed
+        // reconcile leaves `fields_json` matching the live collection.
+        let backend = self.get(org_id, addon_id, namespace)?;
+        backend.reconcile_fields(&stored, desired)?;
+
+        self.update_fields_json(org_id, addon_id, namespace, desired)?;
+        Ok(ReconcileReport {
+            added: to_add.into_iter().map(|f| f.name).collect(),
+            dropped: to_drop,
+        })
+    }
+
+    fn update_fields_json(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        fields: &[FieldSpec],
+    ) -> Result<()> {
+        let conn = self
+            .pool
+            .lock()
+            .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        conn.execute(
+            "UPDATE addon_vector_namespaces SET fields_json = ?1, updated_at = ?2 \
+             WHERE addon_id = ?3 AND namespace = ?4 AND org_id = ?5",
+            rusqlite::params![
+                serialize_field_specs(fields),
+                now,
+                addon_id,
+                namespace,
+                org_id,
+            ],
         )
         .map_err(|e| VectorError::Db(e.to_string()))?;
         Ok(())
@@ -475,7 +782,13 @@ impl NamespaceManager {
 
         if let Some(p) = path {
             if p.exists() {
-                std::fs::remove_file(&p).map_err(|e| VectorError::Io {
+                // A zvec namespace is a collection *directory* on disk.
+                let res = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+                res.map_err(|e| VectorError::Io {
                     path: Some(p),
                     source: e,
                 })?;
@@ -516,10 +829,10 @@ mod tests {
     fn test_get_or_create_first_call_creates_row() {
         let (_dir, mgr) = mgr();
         let be = mgr
-            .get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine)
+            .get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine, &[], false)
             .unwrap();
         assert_eq!(be.count(), 0);
-        be.upsert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        be.upsert(1, &[1.0, 0.0, 0.0, 0.0], &[], None).unwrap();
         assert_eq!(be.count(), 1);
     }
 
@@ -527,10 +840,10 @@ mod tests {
     fn test_get_or_create_idempotent() {
         let (_dir, mgr) = mgr();
         let a = mgr
-            .get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine)
+            .get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine, &[], false)
             .unwrap();
         let b = mgr
-            .get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine)
+            .get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine, &[], false)
             .unwrap();
         assert!(Arc::ptr_eq(&a, &b));
     }
@@ -538,9 +851,9 @@ mod tests {
     #[test]
     fn test_dim_mismatch_on_reopen_rejected() {
         let (_dir, mgr) = mgr();
-        mgr.get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine)
+        mgr.get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine, &[], false)
             .unwrap();
-        let res = mgr.get_or_create(ORG_A, "addon_a", "faces", 8, Metric::Cosine);
+        let res = mgr.get_or_create(ORG_A, "addon_a", "faces", 8, Metric::Cosine, &[], false);
         assert!(matches!(res, Err(VectorError::DimMismatch { .. })));
     }
 
@@ -548,10 +861,10 @@ mod tests {
     fn test_quota_exceeded_at_max_namespaces() {
         let (_dir, mgr) = mgr();
         for i in 0..MAX_NAMESPACES_PER_ADDON {
-            mgr.get_or_create(ORG_A, "addon_a", &format!("ns{i}"), 4, Metric::Cosine)
+            mgr.get_or_create(ORG_A, "addon_a", &format!("ns{i}"), 4, Metric::Cosine, &[], false)
                 .unwrap();
         }
-        let res = mgr.get_or_create(ORG_A, "addon_a", "overflow", 4, Metric::Cosine);
+        let res = mgr.get_or_create(ORG_A, "addon_a", "overflow", 4, Metric::Cosine, &[], false);
         assert!(matches!(
             res,
             Err(VectorError::NamespaceQuotaExceeded { .. })
@@ -562,9 +875,9 @@ mod tests {
     fn test_delete_namespace_removes_file_and_db_row() {
         let (_dir, mgr) = mgr();
         let be = mgr
-            .get_or_create(ORG_A, "addon_a", "faces", 3, Metric::Cosine)
+            .get_or_create(ORG_A, "addon_a", "faces", 3, Metric::Cosine, &[], false)
             .unwrap();
-        be.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
+        be.upsert(1, &[1.0, 0.0, 0.0], &[], None).unwrap();
         be.save().unwrap();
         let file_path = {
             let conn = mgr.pool.lock().unwrap();
@@ -599,12 +912,12 @@ mod tests {
     fn test_cross_addon_namespace_isolation() {
         let (_dir, mgr) = mgr();
         let a = mgr
-            .get_or_create(ORG_A, "addon_a", "faces", 3, Metric::Cosine)
+            .get_or_create(ORG_A, "addon_a", "faces", 3, Metric::Cosine, &[], false)
             .unwrap();
         let b = mgr
-            .get_or_create(ORG_A, "addon_b", "faces", 3, Metric::Cosine)
+            .get_or_create(ORG_A, "addon_b", "faces", 3, Metric::Cosine, &[], false)
             .unwrap();
-        a.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
+        a.upsert(1, &[1.0, 0.0, 0.0], &[], None).unwrap();
         assert_eq!(a.count(), 1);
         assert_eq!(b.count(), 0);
         assert!(!Arc::ptr_eq(&a, &b));
@@ -622,7 +935,7 @@ mod tests {
         // org_id filter directly: even with the row physically present in
         // org A, a lookup under org B sees nothing.
         let (_dir, mgr) = mgr();
-        mgr.get_or_create(ORG_A, "addon_x_query", "faces", 3, Metric::Cosine)
+        mgr.get_or_create(ORG_A, "addon_x_query", "faces", 3, Metric::Cosine, &[], false)
             .unwrap();
         let res = mgr.get(ORG_B, "addon_x_query", "faces");
         assert!(matches!(res, Err(VectorError::NamespaceNotFound { .. })));
@@ -638,7 +951,7 @@ mod tests {
     #[test]
     fn test_invalid_namespace_name_rejected() {
         let (_dir, mgr) = mgr();
-        let res = mgr.get_or_create(ORG_A, "addon_a", "bad/name", 3, Metric::Cosine);
+        let res = mgr.get_or_create(ORG_A, "addon_a", "bad/name", 3, Metric::Cosine, &[], false);
         assert!(matches!(res, Err(VectorError::InvalidNamespaceName(_))));
     }
 
@@ -654,6 +967,10 @@ mod tests {
                 &[1.0, 0.0, 0.0],
                 3,
                 Metric::Cosine,
+                &[],
+                &[],
+                false,
+                None,
             )
             .unwrap();
         assert_eq!(c1, 1);
@@ -666,9 +983,246 @@ mod tests {
                 &[0.0, 1.0, 0.0],
                 3,
                 Metric::Cosine,
+                &[],
+                &[],
+                false,
+                None,
             )
             .unwrap();
         assert_eq!(c2, 1);
+    }
+
+    #[test]
+    fn test_declared_fields_persist_and_filter_through_manager() {
+        use tentaflow_sdk_spec::{FieldValue, Filter};
+        let dir = TempDir::new().unwrap();
+        let pool = in_memory_db_with_v27();
+        let specs = vec![FieldSpec {
+            name: "source".to_string(),
+            field_type: FieldType::Str,
+            indexed: true,
+        }];
+        let values_inbox = vec![Field {
+            name: "source".to_string(),
+            value: FieldValue::Str("inbox".to_string()),
+        }];
+        let values_web = vec![Field {
+            name: "source".to_string(),
+            value: FieldValue::Str("web".to_string()),
+        }];
+
+        {
+            let mgr = NamespaceManager::with_root(pool.clone(), dir.path().to_path_buf());
+            mgr.upsert_with_quota(
+                ORG_A,
+                "addon_meta",
+                "docs",
+                1,
+                &[1.0, 0.0, 0.0],
+                3,
+                Metric::Cosine,
+                &specs,
+                &values_inbox,
+                false,
+                None,
+            )
+            .unwrap();
+            mgr.upsert_with_quota(
+                ORG_A,
+                "addon_meta",
+                "docs",
+                2,
+                &[0.0, 1.0, 0.0],
+                3,
+                Metric::Cosine,
+                &specs,
+                &values_web,
+                false,
+                None,
+            )
+            .unwrap();
+
+            // The schema must round-trip through the DB column.
+            let conn = pool.lock().unwrap();
+            let fields_json: String = conn
+                .query_row(
+                    "SELECT fields_json FROM addon_vector_namespaces \
+                     WHERE addon_id='addon_meta' AND namespace='docs' AND org_id='org-a'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(fields_json.contains("\"source\""));
+            assert!(fields_json.contains("\"str\""));
+        }
+
+        // Reopen with a fresh manager (empty backend cache): the schema is
+        // reconstructed from `fields_json`, so a filtered search still works.
+        let mgr2 = NamespaceManager::with_root(pool, dir.path().to_path_buf());
+        let be = mgr2.get(ORG_A, "addon_meta", "docs").unwrap();
+        let hits = be
+            .search(
+                &[1.0, 0.0, 0.0],
+                10,
+                Some(&Filter::Eq(
+                    "source".to_string(),
+                    FieldValue::Str("inbox".to_string()),
+                )),
+                &["source".to_string()],
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1, "filter source='inbox' should match one vector");
+        assert_eq!(hits[0].ref_id, 1);
+        assert_eq!(
+            hits[0].fields.first().map(|f| &f.value),
+            Some(&FieldValue::Str("inbox".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_reconcile_namespace_adds_and_drops_fields() {
+        use tentaflow_sdk_spec::{FieldValue, Filter};
+        let (_dir, mgr) = mgr();
+
+        // Create with one field "source" and a vector tagged with it.
+        let initial = vec![FieldSpec {
+            name: "source".to_string(),
+            field_type: FieldType::Str,
+            indexed: true,
+        }];
+        mgr.upsert_with_quota(
+            ORG_A,
+            "addon_r",
+            "docs",
+            1,
+            &[1.0, 0.0, 0.0],
+            3,
+            Metric::Cosine,
+            &initial,
+            &[Field {
+                name: "source".to_string(),
+                value: FieldValue::Str("inbox".to_string()),
+            }],
+            false,
+            None,
+        )
+        .unwrap();
+
+        // New manifest: drop "source", add "score" (Int). Reconcile.
+        let desired = vec![FieldSpec {
+            name: "score".to_string(),
+            field_type: FieldType::Int,
+            indexed: true,
+        }];
+        let report = mgr
+            .reconcile_namespace(ORG_A, "addon_r", "docs", &desired)
+            .unwrap();
+        assert_eq!(report.added, vec!["score".to_string()]);
+        assert_eq!(report.dropped, vec!["source".to_string()]);
+
+        // fields_json now reflects the new schema.
+        {
+            let conn = mgr.pool.lock().unwrap();
+            let json: String = conn
+                .query_row(
+                    "SELECT fields_json FROM addon_vector_namespaces \
+                     WHERE addon_id='addon_r' AND namespace='docs' AND org_id='org-a'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(json.contains("\"score\""));
+            assert!(!json.contains("\"source\""));
+        }
+
+        // The new column is now usable: upsert with "score" and filter on it.
+        let be = mgr.get(ORG_A, "addon_r", "docs").unwrap();
+        be.upsert(
+            2,
+            &[0.0, 1.0, 0.0],
+            &[Field {
+                name: "score".to_string(),
+                value: FieldValue::Int(99),
+            }],
+            None,
+        )
+        .unwrap();
+        let hits = be
+            .search(
+                &[0.0, 1.0, 0.0],
+                5,
+                Some(&Filter::Gt("score".to_string(), FieldValue::Int(50))),
+                &["score".to_string()],
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ref_id, 2);
+    }
+
+    #[test]
+    fn test_hybrid_search_through_manager() {
+        use tentaflow_sdk_spec::Fusion;
+        let (_dir, mgr) = mgr();
+        // Create a sparse-enabled namespace via get_or_create (sparse = true).
+        let be = mgr
+            .get_or_create(ORG_A, "addon_h", "docs", 4, Metric::Cosine, &[], true)
+            .unwrap();
+        be.upsert(
+            1,
+            &[1.0, 0.0, 0.0, 0.0],
+            &[],
+            Some(&SparseVector { indices: vec![100], values: vec![0.9] }),
+        )
+        .unwrap();
+        be.upsert(
+            2,
+            &[0.0, 1.0, 0.0, 0.0],
+            &[],
+            Some(&SparseVector { indices: vec![300], values: vec![0.8] }),
+        )
+        .unwrap();
+
+        // Hybrid query: dense near doc 1, sparse term 300 (doc 2). Both surface.
+        let hits = be
+            .hybrid_search(
+                &[0.9, 0.1, 0.0, 0.0],
+                &SparseVector { indices: vec![300], values: vec![1.0] },
+                5,
+                None,
+                &[],
+                Fusion::Rrf(60),
+            )
+            .unwrap();
+        let ids: std::collections::HashSet<u64> = hits.iter().map(|h| h.ref_id).collect();
+        assert!(ids.contains(&1) && ids.contains(&2));
+
+        // A dense-only namespace rejects sparse upsert + hybrid search.
+        let dense_only = mgr
+            .get_or_create(ORG_A, "addon_h", "dense", 4, Metric::Cosine, &[], false)
+            .unwrap();
+        assert!(dense_only
+            .upsert(
+                1,
+                &[1.0, 0.0, 0.0, 0.0],
+                &[],
+                Some(&SparseVector { indices: vec![1], values: vec![1.0] })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_reconcile_namespace_noop_when_absent() {
+        let (_dir, mgr) = mgr();
+        // No DB row yet → reconcile is a no-op (created with new schema on first use).
+        let desired = vec![FieldSpec {
+            name: "x".to_string(),
+            field_type: FieldType::Int,
+            indexed: false,
+        }];
+        let report = mgr
+            .reconcile_namespace(ORG_A, "addon_none", "ghost", &desired)
+            .unwrap();
+        assert!(report.is_noop());
     }
 
     #[test]
@@ -682,6 +1236,10 @@ mod tests {
             &[1.0, 0.0, 0.0],
             3,
             Metric::Cosine,
+                &[],
+                &[],
+                false,
+                None,
         )
         .unwrap();
         {
@@ -702,6 +1260,10 @@ mod tests {
                 &[0.0, 0.0, 1.0],
                 3,
                 Metric::Cosine,
+                &[],
+                &[],
+                false,
+                None,
             )
             .unwrap_err();
         assert!(matches!(err, VectorError::VectorQuotaExceeded { .. }));

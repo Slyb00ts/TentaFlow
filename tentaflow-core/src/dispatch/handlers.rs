@@ -3835,6 +3835,38 @@ fn effective_hf_token(ctx: &HandlerContext, request_token: Option<&str>) -> Opti
         .or_else(|| setting_hf_token(ctx))
 }
 
+#[handler(variant = "SuggestServicePortRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn suggest_service_port(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let _payload = match req {
+        MessageBody::SuggestServicePortRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SuggestServicePortRequest",
+            ));
+        }
+    };
+    // First free port the allocator would hand out (own ledger + OS probe). The
+    // actual deploy re-allocates at commit, so this is just the suggested
+    // default for the editable port field in the wizard.
+    let port = ctx
+        .state
+        .port_allocator
+        .as_ref()
+        .and_then(|a| a.peek_free())
+        .unwrap_or(0);
+    Ok(MessageBody::SuggestServicePortResponseBody(
+        tentaflow_protocol::SuggestServicePortResponse {
+            port: u32::from(port),
+            available: port != 0,
+        },
+    ))
+}
+
 #[handler(variant = "DeployVllmRecommendRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]

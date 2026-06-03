@@ -24,8 +24,8 @@
 
 use base64::Engine;
 use tentaflow_sdk_spec::{
-    VectorDeleteInput, VectorDeleteOutput, VectorSearchHit, VectorSearchInput, VectorSearchOutput,
-    VectorUpsertInput, VectorUpsertOutput,
+    FieldSpec, FieldType, Fusion, VectorDeleteInput, VectorDeleteOutput, VectorHybridSearchInput,
+    VectorSearchHit, VectorSearchInput, VectorSearchOutput, VectorUpsertInput, VectorUpsertOutput,
 };
 
 use super::abi_helpers::PayloadKind;
@@ -135,6 +135,30 @@ fn spec_metric(spec: &VectorNamespaceSpec) -> Result<Metric, &'static str> {
     Metric::parse(&spec.distance).ok_or("invalid_metric_in_manifest")
 }
 
+/// Translate the manifest's declared metadata fields into the universal
+/// `FieldSpec` schema the backend understands. An unknown `type` string is a
+/// manifest error surfaced to the caller (so a typo fails loudly at runtime
+/// rather than silently dropping the column).
+fn spec_fields(spec: &VectorNamespaceSpec) -> Result<Vec<FieldSpec>, &'static str> {
+    spec.fields
+        .iter()
+        .map(|f| {
+            let field_type = match f.field_type.as_str() {
+                "str" => FieldType::Str,
+                "int" => FieldType::Int,
+                "float" => FieldType::Float,
+                "bool" => FieldType::Bool,
+                _ => return Err("invalid_field_type_in_manifest"),
+            };
+            Ok(FieldSpec {
+                name: f.name.clone(),
+                field_type,
+                indexed: f.indexed,
+            })
+        })
+        .collect()
+}
+
 /// Structural gate check — kept as the first defence so callers always
 /// supply `gate_claim_id` for a gated namespace before we even touch the
 /// policy DB. Full claim validation (DPIA / FRIA / signers / validity
@@ -228,6 +252,7 @@ pub fn map_vector_error(e: VectorError) -> (AbiError, &'static str) {
         VectorError::InvalidNamespaceName(_) => (AbiError::Operation, "invalid_namespace_name"),
         VectorError::InvalidRefId => (AbiError::Operation, "invalid_ref_id"),
         VectorError::EmptyVector => (AbiError::Operation, "empty_vector"),
+        VectorError::InvalidFilter(_) => (AbiError::Operation, "invalid_filter"),
         VectorError::NamespaceQuotaExceeded { .. } => {
             (AbiError::QuotaExceeded, "namespace_quota_exceeded")
         }
@@ -341,6 +366,22 @@ pub fn vector_upsert_v1(
         }
     };
 
+    let field_specs = match spec_fields(&spec) {
+        Ok(f) => f,
+        Err(reason) => {
+            audit(
+                caller.data(),
+                "vector.upsert",
+                Some(&input.namespace),
+                RiskClass::B,
+                "error",
+                Some(reason),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    let field_values = input.fields.unwrap_or_default();
+
     let vector = match decode_vector(&input.vector_b64) {
         Ok(v) => v,
         Err(reason) => {
@@ -376,6 +417,10 @@ pub fn vector_upsert_v1(
         &vector,
         spec.dimensions,
         metric,
+        &field_specs,
+        &field_values,
+        spec.sparse,
+        input.sparse.as_ref(),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -608,7 +653,13 @@ pub fn vector_search_v1(
         );
     };
 
-    let hits = match backend.search(&query, input.k as usize) {
+    let output_fields = input.output_fields.unwrap_or_default();
+    let hits = match backend.search(
+        &query,
+        input.k as usize,
+        input.filter.as_ref(),
+        &output_fields,
+    ) {
         Ok(h) => h,
         Err(e) => {
             let (abi, reason) = map_vector_error(e);
@@ -640,6 +691,256 @@ pub fn vector_search_v1(
             .map(|h| VectorSearchHit {
                 ref_id: h.ref_id,
                 score: h.score,
+                fields: if h.fields.is_empty() {
+                    None
+                } else {
+                    Some(h.fields)
+                },
+            })
+            .collect(),
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::VectorItem,
+    )
+}
+
+// =============================================================================
+// Host function: vector_hybrid_search_v1
+// =============================================================================
+
+/// ABI: (input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+///
+/// Hybrid dense + sparse k-NN. Input CBOR: `namespace`, `dense_b64`, `sparse`,
+/// `k`, optional `gate_claim_id`, `filter`, `output_fields`, `fusion`. Output is
+/// the same `VectorSearchOutput` as `vector_search_v1`. Requires `vector.read`
+/// and the namespace must declare `sparse = true`. Risk class B.
+pub fn vector_hybrid_search_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+
+    if !check_permission(caller.data(), PERM_VECTOR_READ, None) {
+        audit(
+            caller.data(),
+            "vector.hybrid_search",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+
+    let input: VectorHybridSearchInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::VectorItem) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "vector.hybrid_search",
+                    None,
+                    RiskClass::B,
+                    "denied",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        };
+
+    if input.k == 0 || input.k > MAX_SEARCH_K {
+        audit(
+            caller.data(),
+            "vector.hybrid_search",
+            Some(&input.namespace),
+            RiskClass::B,
+            "denied",
+            Some("invalid_k"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+
+    if validate_namespace_name(&input.namespace).is_err() {
+        audit(
+            caller.data(),
+            "vector.hybrid_search",
+            Some(&input.namespace),
+            RiskClass::B,
+            "denied",
+            Some("invalid_namespace_name"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+
+    let spec = match lookup_namespace_spec(caller.data(), &input.namespace) {
+        Some(s) => s.clone(),
+        None => {
+            audit(
+                caller.data(),
+                "vector.hybrid_search",
+                Some(&input.namespace),
+                RiskClass::B,
+                "denied",
+                Some("namespace_not_declared_in_manifest"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+    };
+
+    if !spec.sparse {
+        audit(
+            caller.data(),
+            "vector.hybrid_search",
+            Some(&input.namespace),
+            RiskClass::B,
+            "denied",
+            Some("namespace_not_sparse"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+
+    if let Err(denial) =
+        enforce_gate_with_policy(caller.data(), &spec, input.gate_claim_id.as_deref())
+    {
+        audit_with_claim(
+            caller.data(),
+            "vector.hybrid_search",
+            Some(&input.namespace),
+            RiskClass::B,
+            "gate_denied",
+            Some(denial.reason),
+            denial.attempted_claim_id.as_deref(),
+        );
+        return denial.abi.as_i32();
+    }
+
+    let dense = match decode_vector(&input.dense_b64) {
+        Ok(v) => v,
+        Err(reason) => {
+            audit(
+                caller.data(),
+                "vector.hybrid_search",
+                Some(&input.namespace),
+                RiskClass::B,
+                "denied",
+                Some(reason),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+
+    let addon_id = caller.data().addon_id.clone();
+    let org_id_for_query = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+    let mgr = manager(caller.data()).clone();
+
+    let backend = match mgr.get(&org_id_for_query, &addon_id, &input.namespace) {
+        Ok(b) => Some(b),
+        Err(VectorError::NamespaceNotFound { .. }) => None,
+        Err(e) => {
+            let (abi, reason) = map_vector_error(e);
+            audit(
+                caller.data(),
+                "vector.hybrid_search",
+                Some(&input.namespace),
+                RiskClass::B,
+                "denied",
+                Some(reason),
+            );
+            return abi.as_i32();
+        }
+    };
+
+    let Some(backend) = backend else {
+        audit(
+            caller.data(),
+            "vector.hybrid_search",
+            Some(&input.namespace),
+            RiskClass::B,
+            "ok",
+            Some("namespace_empty"),
+        );
+        let out = VectorSearchOutput {
+            namespace: input.namespace,
+            hits: Vec::new(),
+        };
+        return write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::VectorItem,
+        );
+    };
+
+    let output_fields = input.output_fields.unwrap_or_default();
+    let fusion = input.fusion.unwrap_or(Fusion::Rrf(60));
+    let hits = match backend.hybrid_search(
+        &dense,
+        &input.sparse,
+        input.k as usize,
+        input.filter.as_ref(),
+        &output_fields,
+        fusion,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            let (abi, reason) = map_vector_error(e);
+            audit(
+                caller.data(),
+                "vector.hybrid_search",
+                Some(&input.namespace),
+                RiskClass::B,
+                "denied",
+                Some(reason),
+            );
+            return abi.as_i32();
+        }
+    };
+
+    audit(
+        caller.data(),
+        "vector.hybrid_search",
+        Some(&input.namespace),
+        RiskClass::B,
+        "ok",
+        None,
+    );
+
+    let out = VectorSearchOutput {
+        namespace: input.namespace,
+        hits: hits
+            .into_iter()
+            .map(|h| VectorSearchHit {
+                ref_id: h.ref_id,
+                score: h.score,
+                fields: if h.fields.is_empty() {
+                    None
+                } else {
+                    Some(h.fields)
+                },
             })
             .collect(),
     };
