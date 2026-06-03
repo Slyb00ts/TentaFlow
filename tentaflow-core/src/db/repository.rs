@@ -15,6 +15,14 @@ fn acquire(pool: &DbPool) -> Result<std::sync::MutexGuard<'_, rusqlite::Connecti
         .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))
 }
 
+/// Public connection handle for the baseline-adopt path, which drives its whole
+/// snapshot/import inside a single externally-managed transaction.
+pub fn acquire_for_baseline(
+    pool: &DbPool,
+) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+    acquire(pool)
+}
+
 #[cfg(test)]
 mod core_sync_repository_tests {
     use super::*;
