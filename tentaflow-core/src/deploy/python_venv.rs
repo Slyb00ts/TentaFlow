@@ -1506,6 +1506,13 @@ fn copy_bundle_files(bundle_src: &Path, venv: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Wewnetrzne klucze arg-carrier: przenosza user-typed argi z deploy wizard
+/// do build_engine_args (tam konsumowane do argv przez shlex). NIE sa realnymi
+/// zmiennymi srodowiskowymi silnika — spawn_engine pomija je przy `cmd.env`,
+/// inaczej vLLM warnuje "Unknown vLLM environment variable detected: VLLM_ARGS".
+pub(crate) const EXTRA_ARGS_ENV_KEYS: [&str; 4] =
+    ["VLLM_ARGS", "SGLANG_ARGS", "TRTLLM_ARGS", "EXTRA_ARGS"];
+
 /// Wyodrebniona logika budowania listy args dla spawn_engine. Pozwala
 /// jednostkowo testowac VLLM_ARGS/SGLANG_ARGS passthrough bez spawn'owania
 /// realnego procesu.
@@ -1533,8 +1540,7 @@ pub(crate) fn build_engine_args(
     // user-typed string, wiec shlex split honoruje cudzyslowy ktore USER sam
     // postawil (np. --override-generation-config '{"max_tokens":100}'). To
     // jest jedyna sciezka ktora powinna tokenizowac przez shlex.
-    let extra_args_env_keys = ["VLLM_ARGS", "SGLANG_ARGS", "TRTLLM_ARGS", "EXTRA_ARGS"];
-    for key in extra_args_env_keys {
+    for key in EXTRA_ARGS_ENV_KEYS {
         if let Some(extra) = env.get(key) {
             let trimmed = extra.trim();
             if trimmed.is_empty() {
@@ -1813,6 +1819,12 @@ fn spawn_engine(
         cmd.arg(arg);
     }
     for (k, v) in &req.env {
+        // Klucze arg-carrier sa juz skonsumowane do argv przez build_engine_args
+        // wyzej; nie wolno ich przekazac do env procesu silnika (vLLM warnuje
+        // "Unknown vLLM environment variable detected: VLLM_ARGS").
+        if EXTRA_ARGS_ENV_KEYS.contains(&k.as_str()) {
+            continue;
+        }
         cmd.env(k, v);
     }
     // Statyczne env z bundle.toml [launch.env] — wymuszane PO req.env zeby
@@ -2489,6 +2501,31 @@ mod tests {
         assert!(args.contains(&"16384".to_string()));
         assert!(args.contains(&"--kv-cache-dtype".to_string()));
         assert!(args.contains(&"fp8".to_string()));
+    }
+
+    #[test]
+    fn arg_carrier_keys_consumed_to_argv_not_passed_as_env() {
+        // VLLM_ARGS jest skonsumowane do argv przez build_engine_args, ale spawn_engine
+        // pomija je przy cmd.env (filtr po EXTRA_ARGS_ENV_KEYS), zeby vLLM nie warnowal
+        // "Unknown vLLM environment variable detected: VLLM_ARGS".
+        let spec = vllm_bundle_spec();
+        let mut env = HashMap::new();
+        env.insert("MODEL".to_string(), "test".into());
+        env.insert("VLLM_ARGS".to_string(), "--tensor-parallel-size 2".into());
+
+        // build_engine_args nadal czyta VLLM_ARGS i buduje argv.
+        let args = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
+        assert!(args.contains(&"--tensor-parallel-size".to_string()));
+        assert!(args.contains(&"2".to_string()));
+
+        // Filtr env z spawn_engine usuwa klucze arg-carrier, zostawia reszte.
+        let spawn_env: HashMap<&str, &str> = env
+            .iter()
+            .filter(|(k, _)| !EXTRA_ARGS_ENV_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert!(!spawn_env.contains_key("VLLM_ARGS"));
+        assert_eq!(spawn_env.get("MODEL"), Some(&"test"));
     }
 
     #[test]

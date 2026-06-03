@@ -1083,11 +1083,14 @@ pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> St
                 parts.push("--quantization".into());
                 parts.push("auto_round".into());
             }
-            // NVIDIA Modelopt NVFP4/FP4/MXFP4 - vllm rozpoznaje "modelopt_fp4".
-            "nvfp4" | "fp4" | "mxfp4" => {
-                parts.push("--quantization".into());
-                parts.push("modelopt_fp4".into());
-            }
+            // Label nvfp4/fp4/mxfp4 jest dwuznaczny: repo moze byc spakowane jako
+            // NVIDIA ModelOpt (quant_method=modelopt) ALBO jako compressed-tensors
+            // (llm-compressor, quant_method=compressed-tensors). Wymuszenie
+            // --quantization modelopt_fp4 odrzuca repo compressed-tensors (vLLM
+            // czyta prawdziwa metode z config.json i porownuje). Nie emitujemy
+            // flagi — vLLM auto-wykrywa kwantyzacje z quantization_config i obsluguje
+            // oba warianty FP4 poprawnie.
+            "nvfp4" | "fp4" | "mxfp4" => {}
             "compressed_tensors_4bit" | "w4a16" | "w8a8" | "w8a16" => {
                 parts.push("--quantization".into());
                 parts.push("compressed-tensors".into());
@@ -1178,6 +1181,28 @@ mod tests {
             num_parameters: 31_000_000_000,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn nvfp4_does_not_force_quantization_flag() {
+        // Label nvfp4 jest dwuznaczny (modelopt vs compressed-tensors); vLLM
+        // sam wykrywa metode z config.json, wiec NIE wolno wymuszac --quantization.
+        let mut m = qwen_05b();
+        m.quantization = Some("nvfp4".into());
+        let input = VramEstimateInput {
+            gpu_count: 1,
+            gpu_memory_gb_each: 24.0,
+            ..Default::default()
+        };
+        let out = build_vllm_args_string(&m, &input);
+        assert!(
+            !out.contains("--quantization"),
+            "nvfp4 nie powinno emitowac --quantization: {out}"
+        );
+        assert!(
+            !out.contains("modelopt_fp4"),
+            "nvfp4 nie powinno emitowac modelopt_fp4: {out}"
+        );
     }
 
     #[test]
