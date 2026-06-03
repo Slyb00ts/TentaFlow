@@ -5162,6 +5162,24 @@ pub fn get_addon(pool: &DbPool, addon_id: &str) -> Result<Option<Addon>> {
     Ok(result)
 }
 
+/// Zwraca (package_id, package_version) instancji addona, czyli z ktorej wersji
+/// pakietu zostala utworzona. None gdy instancja nie istnieje.
+pub fn get_addon_instance_package_ref(
+    pool: &DbPool,
+    addon_id: &str,
+) -> Result<Option<(String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT package_id, package_version FROM addons WHERE addon_id = ?1",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![addon_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()?;
+    Ok(row)
+}
+
 /// Upsert wersji pakietu do katalogu `addon_packages`. Idempotentne po
 /// (package_id, version) — reconciler wbudowanych addonow woła to przy kazdym
 /// starcie; ponowne wrzucenie tej samej wersji odswieza manifest/hash.
@@ -5197,6 +5215,33 @@ pub struct AddonPackageRow {
     pub bundle_hash: String,
     pub source: String,
     pub created_at: String,
+}
+
+/// Zwraca jedna wersje pakietu z katalogu (lub None gdy brak).
+pub fn get_addon_package(
+    pool: &DbPool,
+    package_id: &str,
+    version: &str,
+) -> Result<Option<AddonPackageRow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT package_id, version, name, manifest_json, bundle_hash, source, created_at \
+         FROM addon_packages WHERE package_id = ?1 AND version = ?2",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![package_id, version], |row| {
+            Ok(AddonPackageRow {
+                package_id: row.get(0)?,
+                version: row.get(1)?,
+                name: row.get(2)?,
+                manifest_json: row.get(3)?,
+                bundle_hash: row.get(4)?,
+                source: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
 }
 
 /// Lista wszystkich wersji wszystkich pakietow w katalogu, najnowsze najpierw.

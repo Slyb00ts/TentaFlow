@@ -16,8 +16,6 @@ use crate::db::DbPool;
 // Wlacz wygenerowany plik z osadzonymi addonami
 include!(concat!(env!("OUT_DIR"), "/bundled_addons.rs"));
 
-const BUNDLE_HASH_SETTING_PREFIX: &str = "addon_bundle_hash:";
-
 // =============================================================================
 // Instalacja wbudowanych addonow
 // =============================================================================
@@ -75,82 +73,27 @@ fn install_single_bundled_addon(addon: &BundledAddon, db: &DbPool) -> Result<()>
 
     let bundle_hash = compute_bundle_hash(addon);
 
-    // Sprawdz czy addon juz istnieje w DB
-    let existing = crate::db::repository::get_addon(db, &addon_id)?;
-    let stored_bundle_hash =
-        crate::db::repository::get_setting(db, &bundle_hash_setting_key(&addon_id))?;
-
-    // Pakiet (szablon) zyje na dysku wersjonowany: packages/{id}/{version}/.
-    // Dzieki temu instancje moga przypiac konkretna wersje i aktualizowac sie
-    // niezaleznie. Katalog `addon_packages` indeksuje dostepne wersje.
-    let addon_dir = package_dir(&addon_id, &bundled_version);
-    write_bundled_addon_files(&addon_dir, addon)?;
+    // Reconciler jest CATALOG-ONLY: materializuje pakiet (szablon) na dysku w
+    // wersjonowanym ukladzie packages/{id}/{version}/ i wpisuje wersje do
+    // katalogu `addon_packages`. NIE tworzy ani nie aktualizuje zadnej instancji
+    // — instancje instaluje/aktualizuje user (lifecycle::install_instance /
+    // update_instance). Dzieki temu kazda instancja przypina wlasna wersje i
+    // aktualizuje sie niezaleznie (test przed prod).
+    let dir = package_dir(&addon_id, &bundled_version);
+    write_bundled_addon_files(&dir, addon)?;
     crate::db::repository::upsert_addon_package(
         db,
         &addon_id,
         &bundled_version,
-        &addon.name,
+        addon.name,
         addon.manifest_toml,
         &bundle_hash,
         "bundled",
     )?;
-
-    match existing {
-        Some(ref existing_addon)
-            if existing_addon.version == bundled_version
-                && existing_addon.manifest_json == addon.manifest_toml
-                && stored_bundle_hash.as_deref() == Some(bundle_hash.as_str()) =>
-        {
-            super::lifecycle::ensure_sql_storage(&addon_dir, db)?;
-            info!(
-                "Wbudowany addon '{}' v{} jest aktualny — pomijam",
-                addon_id, bundled_version
-            );
-            return Ok(());
-        }
-        Some(ref existing_addon) => {
-            let mut reasons: Vec<&str> = Vec::new();
-            if existing_addon.version != bundled_version {
-                reasons.push("version");
-            }
-            if existing_addon.manifest_json != addon.manifest_toml {
-                reasons.push("manifest");
-            }
-            if stored_bundle_hash.as_deref() != Some(bundle_hash.as_str()) {
-                reasons.push("bundle_hash");
-            }
-            info!(
-                "Aktualizacja wbudowanego addonu '{}': v{} -> v{} (powod: {})",
-                addon_id,
-                existing_addon.version,
-                bundled_version,
-                reasons.join(", ")
-            );
-        }
-        None => {
-            info!(
-                "Instalacja wbudowanego addonu '{}' v{}",
-                addon_id, bundled_version
-            );
-        }
-    }
-
-    // Zainstaluj lub upgrade przez lifecycle
-    if existing.is_some() {
-        super::lifecycle::upgrade(&addon_id, &addon_dir, db)?;
-        crate::db::repository::set_setting(db, &bundle_hash_setting_key(&addon_id), &bundle_hash)?;
-        info!(
-            "Wbudowany addon '{}' zaktualizowany do v{}",
-            addon_id, bundled_version
-        );
-    } else {
-        super::lifecycle::install(&addon_dir, db)?;
-        crate::db::repository::set_setting(db, &bundle_hash_setting_key(&addon_id), &bundle_hash)?;
-        info!(
-            "Wbudowany addon '{}' v{} zainstalowany pomyslnie",
-            addon_id, bundled_version
-        );
-    }
+    info!(
+        "Pakiet wbudowany '{}' v{} dostepny w katalogu",
+        addon_id, bundled_version
+    );
 
     Ok(())
 }
@@ -216,10 +159,6 @@ fn parse_addon_id_and_version(manifest_toml: &str) -> Result<(String, String)> {
         .ok_or_else(|| anyhow::anyhow!("Brak pola version w manifest.toml"))?;
 
     Ok((id.to_string(), version.to_string()))
-}
-
-fn bundle_hash_setting_key(addon_id: &str) -> String {
-    format!("{BUNDLE_HASH_SETTING_PREFIX}{addon_id}")
 }
 
 fn compute_bundle_hash(addon: &BundledAddon) -> String {
