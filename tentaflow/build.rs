@@ -79,6 +79,13 @@ fn set_linux_rpath() {
             // by absolute path so the loader resolves libzvec_c_api.so.
             add_zvec_vendor_rpath();
         }
+        "macos" => {
+            // Na macOS dylib zvec ma install name `@rpath/libzvec_c_api.dylib`,
+            // wiec binarka potrzebuje absolutnego rpath do zwendorowanego katalogu
+            // (analogicznie jak Linux). Rpath @loader_path/target_dir ustawia
+            // build_mlx_bridge — tu chodzi tylko o vendor zvec.
+            add_zvec_vendor_rpath();
+        }
         "windows" => {
             // MSVC odpowiednik --allow-multiple-definition. whisper-rs-sys i
             // llama-cpp-sys-2 obie linkuja wlasna kopie ggml-quants.c, na
@@ -95,14 +102,17 @@ fn set_linux_rpath() {
 }
 
 /// Emit an absolute rpath to the vendored zvec shared lib so `cargo run` from the
-/// repo finds `libzvec_c_api.so` without `LD_LIBRARY_PATH`. Platform mapping
-/// mirrors `tentaflow-zvec-sys/build.rs`. No-op if the dir is absent (e.g. zvec
-/// not vendored for this arch) — the rpath entry is then simply unused.
+/// repo finds the zvec library (`libzvec_c_api.so` on Linux, `libzvec_c_api.dylib`
+/// on macOS) without `LD_LIBRARY_PATH`. Platform mapping mirrors
+/// `tentaflow-zvec-sys/build.rs`. No-op if the dir is absent (e.g. zvec not
+/// vendored for this target) — the rpath entry is then simply unused.
 fn add_zvec_vendor_rpath() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let platform = match arch.as_str() {
-        "x86_64" => "linux-x86_64",
-        "aarch64" => "linux-aarch64",
+    let platform = match (target_os.as_str(), arch.as_str()) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("macos", "aarch64") => "macos-arm64",
         _ => return,
     };
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
