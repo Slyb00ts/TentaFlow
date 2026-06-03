@@ -1,4 +1,3 @@
-#![cfg(feature = "vector")]
 // =============================================================================
 // File: tests/vector_host_functions.rs
 // Purpose: Integration tests for the F1c P3 vector storage stack — exercises

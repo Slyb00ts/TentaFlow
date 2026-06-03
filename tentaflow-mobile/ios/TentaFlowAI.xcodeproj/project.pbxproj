@@ -295,10 +295,13 @@
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/debug",
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/release",
 					"$(TOOLCHAIN_DIR)/usr/lib/clang/21/lib/darwin",
+					"$(PROJECT_DIR)/../../tentaflow-zvec-sys/vendor/lib/ios-arm64",
 				);
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
 					"-ltentaflow_mobile",
+					"-Wl,-force_load,$(PROJECT_DIR)/../../tentaflow-zvec-sys/vendor/lib/ios-arm64/libzvec_c_api.a",
+					"-lzvec_deps",
 					"-lc++",
 					"-ObjC",
 					"-lresolv",
@@ -353,10 +356,13 @@
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/debug",
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/release",
 					"$(TOOLCHAIN_DIR)/usr/lib/clang/21/lib/darwin",
+					"$(PROJECT_DIR)/../../tentaflow-zvec-sys/vendor/lib/ios-arm64",
 				);
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
 					"-ltentaflow_mobile",
+					"-Wl,-force_load,$(PROJECT_DIR)/../../tentaflow-zvec-sys/vendor/lib/ios-arm64/libzvec_c_api.a",
+					"-lzvec_deps",
 					"-lc++",
 					"-ObjC",
 					"-lresolv",

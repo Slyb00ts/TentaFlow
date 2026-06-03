@@ -50,7 +50,6 @@ pub mod stream_hub;
 pub mod streaming;
 pub mod supervisor;
 pub mod transport;
-#[cfg(feature = "vector")]
 pub mod vector;
 
 pub use tts::{TTSClient, TTSConfigCompat};
@@ -71,13 +70,11 @@ static PICKUP_TOKEN_ISSUER: OnceLock<Arc<pickup_tokens::PickupTokenIssuer>> = On
 static FRAME_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static RECORDING_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static LEGAL_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
-#[cfg(feature = "vector")]
 static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
 
 /// Returns the process-wide vector namespace manager, initializing it lazily
 /// on first call. The DB pool is bound on first init — subsequent calls
 /// ignore the argument (a single shared catalog across the process).
-#[cfg(feature = "vector")]
 pub fn vector_namespace_manager(
     pool: &crate::db::DbPool,
 ) -> &'static Arc<vector::NamespaceManager> {
