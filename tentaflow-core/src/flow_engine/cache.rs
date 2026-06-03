@@ -22,7 +22,7 @@ const MAX_FLOW_EDGES: usize = 1024;
 /// metadane (kolejność topo, adjacency, streaming detection).
 #[derive(Debug)]
 pub struct CompiledFlow {
-    pub flow_id: i64,
+    pub flow_id: String,
     pub definition: Arc<FlowDefinition>,
     /// Kolejność wykonywania jako indeksy do `definition.nodes`. Używana przez
     /// executor w pętli topo.
@@ -57,7 +57,7 @@ pub enum CompileError {
 
 impl CompiledFlow {
     pub fn from_json(
-        flow_id: i64,
+        flow_id: &str,
         flow_json: &str,
         registry: &AdapterRegistry,
     ) -> Result<Self, CompileError> {
@@ -67,7 +67,7 @@ impl CompiledFlow {
     }
 
     pub fn compile(
-        flow_id: i64,
+        flow_id: &str,
         definition: FlowDefinition,
         registry: &AdapterRegistry,
     ) -> Result<Self, CompileError> {
@@ -113,7 +113,7 @@ impl CompiledFlow {
         }
         let is_streaming = definition.edges.iter().any(|e| e.from_port == "stream");
         Ok(Self {
-            flow_id,
+            flow_id: flow_id.to_string(),
             definition: Arc::new(definition),
             execution_order,
             incoming_edges_per_pos,
@@ -440,12 +440,7 @@ mod tests {
             ],
             "edges": [{"from":"t","to":"o","from_port":"text","to_port":"text"}]
         }"#;
-        let cf = CompiledFlow::from_json(
-            1,
-            json,
-            &registry(),
-        )
-        .unwrap();
+        let cf = CompiledFlow::from_json("1", json, &registry()).unwrap();
         assert_eq!(cf.execution_order.len(), 2);
         assert!(!cf.is_streaming);
         assert_eq!(cf.trigger_run_idx(), Some(0));
@@ -465,12 +460,7 @@ mod tests {
             ]
         }"#;
         // R7 streaming end-shape: llm.stream → output(stream).
-        let cf = CompiledFlow::from_json(
-            1,
-            json,
-            &registry(),
-        )
-        .unwrap();
+        let cf = CompiledFlow::from_json("1", json, &registry()).unwrap();
         assert!(cf.is_streaming);
         assert_eq!(cf.streaming_llm_run_idx(), Some(1));
         // Stage 3d Krok 2c: chain pusty dla direct LLM → output (output
@@ -504,12 +494,7 @@ mod tests {
                 {"from":"p","to":"o","from_port":"stream","to_port":"text"}
             ]
         }"#;
-        let cf = CompiledFlow::from_json(
-            1,
-            json,
-            &r,
-        )
-        .unwrap();
+        let cf = CompiledFlow::from_json("1", json, &r).unwrap();
         let chain = cf.streaming_chain_run_idxs();
         assert_eq!(chain.len(), 1);
         // Chain pos to run_idx pii_filter — czyli execution_order[chain[0]]
@@ -534,24 +519,14 @@ mod tests {
                 {"from":"b","to":"a","from_port":"true"}
             ]
         }"#;
-        let err = CompiledFlow::from_json(
-            1,
-            json,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = CompiledFlow::from_json("1", json, &registry()).unwrap_err();
         assert!(matches!(err, CompileError::Cycle { .. }));
     }
 
     #[test]
     fn compile_rejects_empty_flow() {
         let json = r#"{"nodes":[],"edges":[]}"#;
-        let err = CompiledFlow::from_json(
-            1,
-            json,
-            &registry(),
-        )
-        .unwrap_err();
+        let err = CompiledFlow::from_json("1", json, &registry()).unwrap_err();
         assert!(matches!(err, CompileError::Empty));
     }
 
@@ -578,14 +553,7 @@ mod tests {
                 {"from":"l","to":"o","to_port":"text"}
             ]
         }"#;
-        Arc::new(
-            CompiledFlow::from_json(
-                42,
-                json,
-                &registry(),
-            )
-            .expect("compile"),
-        )
+        Arc::new(CompiledFlow::from_json("42", json, &registry()).expect("compile"))
     }
 
     #[test]

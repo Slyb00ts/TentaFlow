@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub use tentaflow_protocol::mesh::BaselineEpoch;
+
 pub type LedgerResult<T> = std::result::Result<T, SyncLedgerError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +33,9 @@ pub enum SyncLedgerError {
     },
     #[error("hash operacji nie zgadza sie z trescia: {op_id}")]
     InvalidOperationHash { op_id: OperationId },
-    #[error("identyfikator operacji nie zgadza sie z hashem: expected={expected}, actual={actual}")]
+    #[error(
+        "identyfikator operacji nie zgadza sie z hashem: expected={expected}, actual={actual}"
+    )]
     InvalidOperationId {
         expected: OperationId,
         actual: OperationId,
@@ -50,6 +54,11 @@ pub enum SyncLedgerError {
     InvalidPublicKey { actor_node_id: String },
     #[error("hash-chain partycji nie zgadza sie: partition={partition}, sequence={sequence}")]
     HashChainMismatch { partition: String, sequence: u64 },
+    #[error("operacja z innego epoch baseline: expected={expected:?}, actual={actual:?}")]
+    EpochMismatch {
+        expected: BaselineEpoch,
+        actual: BaselineEpoch,
+    },
     #[error("merkle summary wymaga przynajmniej jednej operacji")]
     EmptyMerkleSummary,
     #[error("operacja z innej partycji w merkle summary: expected={expected}, actual={actual}")]
@@ -195,6 +204,25 @@ pub struct HybridLogicalTimestamp {
     pub node_id: String,
 }
 
+// Total order over the lexicographic tuple (wall_time_ms, logical, node_id).
+// The node_id tie-break makes the order total even when two nodes mint the
+// same (wall, logical) pair, which is what conflict resolution needs to pick a
+// single deterministic winner across the whole mesh.
+impl Ord for HybridLogicalTimestamp {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.wall_time_ms
+            .cmp(&other.wall_time_ms)
+            .then_with(|| self.logical.cmp(&other.logical))
+            .then_with(|| self.node_id.cmp(&other.node_id))
+    }
+}
+
+impl PartialOrd for HybridLogicalTimestamp {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewSyncOperation {
     pub org_id: String,
@@ -212,6 +240,7 @@ pub struct NewSyncOperation {
     pub actor_device_id: String,
     pub actor_node_id: String,
     pub hlc_timestamp: HybridLogicalTimestamp,
+    pub epoch: BaselineEpoch,
     pub payload_hash: [u8; 32],
     pub acl_snapshot_hash: [u8; 32],
     pub policy_epoch: u64,
@@ -236,6 +265,12 @@ pub struct SyncOperationBody {
     pub actor_device_id: String,
     pub actor_node_id: String,
     pub hlc_timestamp: HybridLogicalTimestamp,
+    // Pre-epoch operations (read from disk, or received from un-upgraded peers)
+    // carry no `epoch` field. Defaulting to genesis lets them deserialize cleanly
+    // and then get rejected by epoch-fencing in put_verified_in_inbox
+    // (EpochMismatch), instead of a hard CBOR `missing field` failure.
+    #[serde(default)]
+    pub epoch: BaselineEpoch,
     pub prev_partition_hash: Option<[u8; 32]>,
     pub payload_hash: [u8; 32],
     pub acl_snapshot_hash: [u8; 32],
@@ -281,6 +316,7 @@ impl SyncOperation {
             actor_device_id: new_operation.actor_device_id,
             actor_node_id: new_operation.actor_node_id,
             hlc_timestamp: new_operation.hlc_timestamp,
+            epoch: new_operation.epoch,
             prev_partition_hash,
             payload_hash: new_operation.payload_hash,
             acl_snapshot_hash: new_operation.acl_snapshot_hash,
@@ -443,7 +479,7 @@ pub trait SyncLedgerStore: Send + Sync {
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation>;
     fn put_in_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn get_outbox_entry(&self, target: SyncTarget, op_id: OperationId)
-    -> LedgerResult<OutboxEntry>;
+        -> LedgerResult<OutboxEntry>;
     fn list_pending_outbox(
         &self,
         target: SyncTarget,
@@ -467,6 +503,10 @@ pub trait SyncLedgerStore: Send + Sync {
     ) -> LedgerResult<()>;
     fn mark_delivered(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn mark_acknowledged(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
+    /// Removes a single outbox entry keyed by `(target, op_id)`. Used to lazily
+    /// reap orphaned entries whose backing operation has been compacted away;
+    /// removing an absent key is a no-op.
+    fn remove_outbox_entry(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn get_peer_cursor(
         &self,
         peer: PeerId,
@@ -507,7 +547,42 @@ pub trait SyncLedgerStore: Send + Sync {
         up_to_sequence: u64,
     ) -> LedgerResult<Vec<OutboxEntry>>;
     fn compact(&self, policy: CompactionPolicy) -> LedgerResult<()>;
+    /// Returns the locally-active baseline epoch. Every operation minted or
+    /// accepted into the inbox must carry exactly this epoch; mismatches are
+    /// rejected so a node never mixes pre/post-baseline-reset operations.
+    fn current_epoch(&self) -> LedgerResult<BaselineEpoch>;
+    /// Persists `epoch` as the locally-active baseline epoch. Called during a
+    /// baseline reset (phase B/C cutover) to advance past every prior operation.
+    fn set_epoch(&self, epoch: BaselineEpoch) -> LedgerResult<()>;
+    /// Returns the last persisted HLC state, used to resume the local clock
+    /// after a restart so monotonicity survives across process boundaries.
+    fn current_hlc(&self) -> LedgerResult<Option<HybridLogicalTimestamp>>;
+    /// Persists the latest HLC state emitted/observed by the local clock.
+    fn save_hlc(&self, timestamp: &HybridLogicalTimestamp) -> LedgerResult<()>;
+    /// Advances the local epoch counter, stamping `origin_node` as the minter,
+    /// and returns the new epoch. Used by the local node when it performs a
+    /// core baseline reset and re-seeds operations under a fresh epoch.
+    fn bump_epoch(&self, origin_node: &str) -> LedgerResult<BaselineEpoch> {
+        let current = self.current_epoch()?;
+        let next = BaselineEpoch {
+            counter: current.counter.saturating_add(1),
+            origin_node: origin_node.to_string(),
+        };
+        self.set_epoch(next.clone())?;
+        Ok(next)
+    }
+    /// Wipes all ledger state for partitions whose `partition_id` starts with
+    /// `partition_prefix`. Phase B uses this to rebuild core data from a fresh
+    /// baseline without touching addon/kv data.
+    fn reset_partitions_with_prefix(&self, partition_prefix: &str) -> LedgerResult<()>;
+    /// Convenience wrapper that resets every core partition (`core/...`).
+    fn reset_core_partitions(&self) -> LedgerResult<()> {
+        self.reset_partitions_with_prefix(CORE_PARTITION_PREFIX)
+    }
 }
+
+/// Prefix shared by every core-owned partition_id (`core/org/<org>/<suffix>`).
+pub const CORE_PARTITION_PREFIX: &str = "core/";
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> LedgerResult<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -529,4 +604,151 @@ pub(crate) fn signing_bytes_for_hash(operation_hash: [u8; 32]) -> Vec<u8> {
     let mut bytes = b"tentaflow-sync-operation-v1".to_vec();
     bytes.extend_from_slice(&operation_hash);
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn hlc(wall: i64, logical: u32, node: &str) -> HybridLogicalTimestamp {
+        HybridLogicalTimestamp {
+            wall_time_ms: wall,
+            logical,
+            node_id: node.to_string(),
+        }
+    }
+
+    #[test]
+    fn newer_wall_time_is_greater() {
+        let older = hlc(100, 9, "node_z");
+        let newer = hlc(200, 0, "node_a");
+        assert!(newer > older);
+        assert!(older < newer);
+    }
+
+    #[test]
+    fn equal_wall_breaks_on_logical() {
+        let lower = hlc(100, 1, "node_z");
+        let higher = hlc(100, 2, "node_a");
+        assert!(higher > lower);
+    }
+
+    #[test]
+    fn equal_wall_and_logical_breaks_on_node_id() {
+        let a = hlc(100, 5, "node_a");
+        let b = hlc(100, 5, "node_b");
+        assert!(b > a);
+        assert_eq!(a.cmp(&b), Ordering::Less);
+    }
+
+    #[test]
+    fn operation_body_with_epoch_round_trips_cbor() {
+        let body = SyncOperationBody {
+            org_id: "org_1".to_string(),
+            partition_id: PartitionId::new("core/org/org_1/flows").unwrap(),
+            partition_sequence: 7,
+            addon_id: "core".to_string(),
+            resource_type: "core.flow".to_string(),
+            resource_id: "flow-uuid".to_string(),
+            table_name: "flows".to_string(),
+            primary_key: "id".to_string(),
+            action: ActionType::Insert,
+            changed_fields: BTreeMap::new(),
+            before_hash: None,
+            after_hash: Some([3; 32]),
+            actor_user_id: "user-uuid".to_string(),
+            actor_device_id: "node_a".to_string(),
+            actor_node_id: "node_a".to_string(),
+            hlc_timestamp: hlc(100, 1, "node_a"),
+            epoch: BaselineEpoch {
+                counter: 5,
+                origin_node: "node_a".to_string(),
+            },
+            prev_partition_hash: Some([9; 32]),
+            payload_hash: [1; 32],
+            acl_snapshot_hash: [2; 32],
+            policy_epoch: 2,
+            encryption_info: None,
+        };
+
+        let bytes = encode(&body).expect("encode");
+        let decoded: SyncOperationBody = decode(&bytes).expect("decode");
+
+        assert_eq!(decoded.epoch.counter, 5);
+        assert_eq!(decoded.epoch.origin_node, "node_a");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn pre_epoch_operation_body_decodes_to_genesis_epoch() {
+        // Mirrors SyncOperationBody as it was serialized before the epoch field
+        // existed (faza B). Encoding it produces a CBOR map with no `epoch` key,
+        // exactly like an operation read from an old on-disk ledger or received
+        // from an un-upgraded peer. Decoding MUST yield genesis epoch (so epoch
+        // fencing can reject it cleanly) instead of a hard "missing field" error.
+        #[derive(Serialize)]
+        struct LegacyOperationBody {
+            org_id: String,
+            partition_id: PartitionId,
+            partition_sequence: u64,
+            addon_id: String,
+            resource_type: String,
+            resource_id: String,
+            table_name: String,
+            primary_key: String,
+            action: ActionType,
+            changed_fields: BTreeMap<String, FieldValue>,
+            before_hash: Option<[u8; 32]>,
+            after_hash: Option<[u8; 32]>,
+            actor_user_id: String,
+            actor_device_id: String,
+            actor_node_id: String,
+            hlc_timestamp: HybridLogicalTimestamp,
+            prev_partition_hash: Option<[u8; 32]>,
+            payload_hash: [u8; 32],
+            acl_snapshot_hash: [u8; 32],
+            policy_epoch: u64,
+            encryption_info: Option<String>,
+        }
+
+        let legacy = LegacyOperationBody {
+            org_id: "org_1".to_string(),
+            partition_id: PartitionId::new("core/org/org_1/flows").unwrap(),
+            partition_sequence: 7,
+            addon_id: "core".to_string(),
+            resource_type: "core.flow".to_string(),
+            resource_id: "flow-uuid".to_string(),
+            table_name: "flows".to_string(),
+            primary_key: "id".to_string(),
+            action: ActionType::Insert,
+            changed_fields: BTreeMap::new(),
+            before_hash: None,
+            after_hash: Some([3; 32]),
+            actor_user_id: "user-uuid".to_string(),
+            actor_device_id: "node_a".to_string(),
+            actor_node_id: "node_a".to_string(),
+            hlc_timestamp: hlc(100, 1, "node_a"),
+            prev_partition_hash: Some([9; 32]),
+            payload_hash: [1; 32],
+            acl_snapshot_hash: [2; 32],
+            policy_epoch: 2,
+            encryption_info: None,
+        };
+
+        let bytes = encode(&legacy).expect("encode legacy");
+        let decoded: SyncOperationBody = decode(&bytes).expect("decode legacy into current");
+
+        assert_eq!(decoded.epoch, BaselineEpoch::default());
+        assert_eq!(decoded.epoch.counter, 0);
+        assert!(decoded.epoch.origin_node.is_empty());
+    }
+
+    #[test]
+    fn ordering_is_antisymmetric_and_reflexive() {
+        let a = hlc(100, 5, "node_a");
+        let b = hlc(100, 5, "node_b");
+        assert_eq!(a.cmp(&b), b.cmp(&a).reverse());
+        assert_eq!(a.cmp(&a), Ordering::Equal);
+    }
 }

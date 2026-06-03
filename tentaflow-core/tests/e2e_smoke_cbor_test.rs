@@ -83,7 +83,7 @@ fn create_instance(
 ) -> (
     wasmtime::Store<AddonState>,
     wasmtime::Instance,
-    Arc<parking_lot::RwLock<std::collections::HashMap<(i64, String, String), Vec<u8>>>>,
+    Arc<parking_lot::RwLock<std::collections::HashMap<(String, String, String), Vec<u8>>>>,
 ) {
     let wasm_bytes = load_e2e_smoke_wasm();
     let engine = create_engine().expect("create engine");
@@ -123,7 +123,7 @@ fn on_start_emits_canonical_panel_shell() {
 
     // Verify PanelShell was stored in ui_panels cache.
     let cache = ui_panels.read();
-    let key = (0_i64, "e2e-smoke".to_string(), "cbor_msg".to_string());
+    let key = (String::new(), "e2e-smoke".to_string(), "cbor_msg".to_string());
     let cbor_bytes = cache.get(&key).expect("PanelShell not in ui_panels cache");
 
     // Verify canonical CBOR encoding.
@@ -204,7 +204,7 @@ fn increment_action_emits_canonical_state_patch() {
 
     // The StatePatch should now be in the ui_panels cache (overwrites the PanelShell).
     let cache = ui_panels.read();
-    let key = (0_i64, "e2e-smoke".to_string(), "cbor_msg".to_string());
+    let key = (String::new(), "e2e-smoke".to_string(), "cbor_msg".to_string());
     let cbor_bytes = cache.get(&key).expect("StatePatch not in ui_panels cache");
 
     // Verify canonical encoding.
@@ -283,7 +283,7 @@ fn multiple_increments_advance_revision() {
 
     // Verify the last StatePatch has counter=3 and revision 2->3.
     let cache = ui_panels.read();
-    let key = (0_i64, "e2e-smoke".to_string(), "cbor_msg".to_string());
+    let key = (String::new(), "e2e-smoke".to_string(), "cbor_msg".to_string());
     let cbor_bytes = cache.get(&key).unwrap();
 
     validate_canonical(cbor_bytes).expect("canonical");
@@ -315,7 +315,7 @@ fn cbor_roundtrip_bit_identical() {
     on_start.call(&mut store, ()).expect("on_start");
 
     let cache = ui_panels.read();
-    let key = (0_i64, "e2e-smoke".to_string(), "cbor_msg".to_string());
+    let key = (String::new(), "e2e-smoke".to_string(), "cbor_msg".to_string());
     let original = cache.get(&key).unwrap().clone();
 
     // Decode then re-encode — must produce identical bytes (canonical determinism).

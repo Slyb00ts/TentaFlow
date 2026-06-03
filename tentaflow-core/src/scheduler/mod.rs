@@ -37,7 +37,7 @@ pub struct ScheduledJob {
     pub max_runtime_seconds: i64,
     pub retry_policy_json: String,
     pub concurrency_policy: String,
-    pub created_by_user_id: Option<i64>,
+    pub created_by_user_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -161,7 +161,7 @@ pub fn list_addon_actions(db: &DbPool) -> Result<Vec<SchedulerAction>> {
     Ok(out)
 }
 
-pub fn upsert_job(db: &DbPool, req: UpsertJobRequest, user_id: i64) -> Result<ScheduledJob> {
+pub fn upsert_job(db: &DbPool, req: UpsertJobRequest, user_id: &str) -> Result<ScheduledJob> {
     validate_job_request(&req)?;
     ensure_target_action_exists(db, &req.target_addon_id, &req.target_action_id)?;
     let id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -229,7 +229,7 @@ pub async fn run_now(
     db: &DbPool,
     addon_manager: Arc<AddonManager>,
     job_id: &str,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<ScheduledRun> {
     let job = get_job(db, job_id)?.ok_or_else(|| anyhow::anyhow!("scheduled job not found"))?;
     execute_job(db, addon_manager, job, Utc::now(), user_id).await
@@ -241,7 +241,7 @@ async fn run_due_once(db: &DbPool, addon_manager: &Arc<AddonManager>) -> Result<
         let db = db.clone();
         let addon_manager = addon_manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = execute_job(&db, addon_manager, job, Utc::now(), 0).await {
+            if let Err(e) = execute_job(&db, addon_manager, job, Utc::now(), "").await {
                 warn!("scheduler job execution failed: {}", e);
             }
         });
@@ -254,7 +254,7 @@ async fn execute_job(
     addon_manager: Arc<AddonManager>,
     job: ScheduledJob,
     scheduled_for: DateTime<Utc>,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<ScheduledRun> {
     if job.concurrency_policy == "skip" && has_running_run(db, &job.id)? {
         let run_id = insert_run(db, &job.id, "skipped", scheduled_for)?;
@@ -276,25 +276,28 @@ async fn execute_job(
     let addon_id = job.target_addon_id.clone();
     let action_id = job.target_action_id.clone();
     let timeout_seconds = job.max_runtime_seconds.max(1) as u64;
-    let actor_user_id = if user_id > 0 {
-        user_id
+    let actor_user_id = if !user_id.is_empty() {
+        user_id.to_string()
     } else {
-        job.created_by_user_id.unwrap_or(0)
+        job.created_by_user_id.clone().unwrap_or_default()
     };
 
-    let task = tokio::task::spawn_blocking(move || {
-        if actor_user_id <= 0 {
-            bail!("scheduler run requires an actor user id");
-        }
-        if !addon_manager.has_running_instance(&addon_id) {
-            addon_manager
-                .start_addon(&addon_id, Some(actor_user_id), None)
-                .map_err(|e| {
-                    anyhow::anyhow!("nie udalo sie uruchomic addonu '{}': {e}", addon_id)
-                })?;
-        }
-        addon_manager.call_tool(&addon_id, &action_id, params, actor_user_id)
-    });
+    let task = {
+        let actor_user_id = actor_user_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if actor_user_id.is_empty() {
+                bail!("scheduler run requires an actor user id");
+            }
+            if !addon_manager.has_running_instance(&addon_id) {
+                addon_manager
+                    .start_addon(&addon_id, Some(actor_user_id.clone()), None)
+                    .map_err(|e| {
+                        anyhow::anyhow!("nie udalo sie uruchomic addonu '{}': {e}", addon_id)
+                    })?;
+            }
+            addon_manager.call_tool(&addon_id, &action_id, params, &actor_user_id)
+        })
+    };
     let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), task).await;
     match result {
         Ok(Ok(Ok(value))) => {
@@ -320,10 +323,10 @@ async fn execute_job(
 
     let _ = repository::log_audit(
         db,
-        if actor_user_id > 0 {
-            Some(actor_user_id)
-        } else {
+        if actor_user_id.is_empty() {
             None
+        } else {
+            Some(actor_user_id.as_str())
         },
         Some(&job.target_addon_id),
         "scheduler.run",
@@ -638,8 +641,8 @@ mod tests {
         let db = fresh_db();
         install_eureka_metadata(&db);
 
-        assert!(upsert_job(&db, eureka_job("sync_new"), 1).is_ok());
-        assert!(upsert_job(&db, eureka_job("missing_tool"), 1).is_err());
+        assert!(upsert_job(&db, eureka_job("sync_new"), "1").is_ok());
+        assert!(upsert_job(&db, eureka_job("missing_tool"), "1").is_err());
     }
 
     #[test]

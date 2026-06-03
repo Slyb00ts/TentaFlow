@@ -96,7 +96,12 @@ pub fn service_list_v1(
             );
             let empty = ServiceListOutput::default();
             return write_services_output(
-                &memory, &mut caller, &empty, out_ptr, out_cap, out_len_ptr,
+                &memory,
+                &mut caller,
+                &empty,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
             );
         }
     };

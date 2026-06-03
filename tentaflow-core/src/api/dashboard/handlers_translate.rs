@@ -88,15 +88,10 @@ fn pick_llm_model(ctx: &HandlerContext) -> String {
     "default".to_string()
 }
 
-fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
+fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
-            if user_id[0] != 0xFF {
-                return None;
-            }
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&user_id[8..]);
-            Some(i64::from_le_bytes(le))
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
         }
         _ => None,
     }
@@ -120,7 +115,7 @@ fn audit_translate(
     let node_id = ctx.state.local_node_id.as_ref();
     if let Err(e) = repository::log_audit_full(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "translate",
         Some("translate"),

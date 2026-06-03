@@ -111,7 +111,7 @@ pub struct AuditEntry {
     /// Czas zdarzenia
     pub timestamp: DateTime<Utc>,
     /// ID uzytkownika (opcjonalne — operacje systemowe nie maja user_id)
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     /// ID addonu (opcjonalne — operacje na uzytkow. nie dotycza addonu)
     pub addon_id: Option<String>,
     /// Akcja — np. "addon.install", "user.create", "tool.call"
@@ -142,8 +142,8 @@ impl AuditEntry {
     }
 
     /// Ustawia user_id
-    pub fn with_user(mut self, user_id: i64) -> Self {
-        self.user_id = Some(user_id);
+    pub fn with_user(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = Some(user_id.into());
         self
     }
 
@@ -186,7 +186,7 @@ impl AuditEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuditFilters {
     /// Filtruj po ID uzytkownika
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     /// Filtruj po ID addonu
     pub addon_id: Option<String>,
     /// Filtruj po akcji (dokladne dopasowanie)
@@ -305,7 +305,7 @@ impl AuditLogger {
         for entry in &entries {
             let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
             let hash_input = chain::AuditRowHashInput {
-                user_id: entry.user_id,
+                user_id: entry.user_id.as_deref(),
                 addon_id: entry.addon_id.as_deref(),
                 instance_id: None,
                 action: &entry.action,
@@ -423,7 +423,7 @@ impl AuditLogger {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
-        if let Some(uid) = filters.user_id {
+        if let Some(uid) = filters.user_id.clone() {
             sql.push_str(&format!(" AND user_id = ?{}", idx));
             params.push(Box::new(uid));
             idx += 1;
@@ -494,7 +494,7 @@ impl AuditLogger {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
-        if let Some(uid) = filters.user_id {
+        if let Some(uid) = filters.user_id.clone() {
             sql.push_str(&format!(" AND user_id = ?{}", idx));
             params.push(Box::new(uid));
             idx += 1;
@@ -543,7 +543,7 @@ impl AuditLogger {
                 csv.push_str(&format!(
                     "{},{},{},{},{},{},{},{}\n",
                     entry.timestamp.to_rfc3339(),
-                    entry.user_id.map(|id| id.to_string()).unwrap_or_default(),
+                    entry.user_id.as_deref().unwrap_or(""),
                     entry.addon_id.as_deref().unwrap_or(""),
                     escape_csv_field(&entry.action),
                     entry

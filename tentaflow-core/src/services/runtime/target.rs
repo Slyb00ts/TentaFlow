@@ -43,7 +43,7 @@ pub enum ResolvedExecutionTarget {
     /// validated by the resolver so the flow is guaranteed compatible
     /// with the request shape.
     Flow {
-        flow_id: i64,
+        flow_id: String,
         published_name: String,
     },
 }
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(mesh.telemetry_tag(), "mesh_forward");
 
         let flow = ResolvedExecutionTarget::Flow {
-            flow_id: 7,
+            flow_id: "7".to_string(),
             published_name: "chat-pl".into(),
         };
         assert_eq!(flow.telemetry_tag(), "flow_engine");
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn requested_model_returns_user_facing_name() {
         let flow = ResolvedExecutionTarget::Flow {
-            flow_id: 7,
+            flow_id: "7".to_string(),
             published_name: "chat-pl".into(),
         };
         assert_eq!(flow.requested_model(), "chat-pl");

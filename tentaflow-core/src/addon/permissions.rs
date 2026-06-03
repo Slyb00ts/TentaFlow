@@ -47,7 +47,7 @@ impl PermissionResult {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
     addon_id: String,
-    user_id: i64,
+    user_id: String,
     permission_type: String,
     resource: String,
 }
@@ -81,7 +81,7 @@ pub struct PermissionChecker {
     /// Cache default uprawnien per (addon_id, permission_id) → grant_mode
     defaults_cache: ArcSwap<HashMap<DefaultKey, PermissionResult>>,
     /// Cache listy adminow (user_id)
-    admin_cache: ArcSwap<Vec<i64>>,
+    admin_cache: ArcSwap<Vec<String>>,
     /// Licznik trafien cache — monitoring
     cache_hits: AtomicU64,
     /// Licznik odpytan — monitoring
@@ -113,7 +113,7 @@ impl PermissionChecker {
     pub fn check(
         &self,
         addon_id: &str,
-        user_id: i64,
+        user_id: &str,
         permission_type: &str,
         resource: Option<&str>,
     ) -> PermissionResult {
@@ -122,7 +122,7 @@ impl PermissionChecker {
         // 1. Admin bypass — sprawdz z cache listy adminow
         {
             let admins = self.admin_cache.load();
-            if admins.contains(&user_id) {
+            if admins.iter().any(|a| a == user_id) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return PermissionResult::Granted;
             }
@@ -132,7 +132,7 @@ impl PermissionChecker {
         let resource_str = resource.unwrap_or("*").to_string();
         let cache_key = CacheKey {
             addon_id: addon_id.to_string(),
-            user_id,
+            user_id: user_id.to_string(),
             permission_type: permission_type.to_string(),
             resource: resource_str,
         };
@@ -268,7 +268,7 @@ impl PermissionChecker {
     // =========================================================================
 
     /// Laduje liste user_id adminow (uzytkownikow w grupie "admins")
-    fn load_admins(conn: &rusqlite::Connection) -> Vec<i64> {
+    fn load_admins(conn: &rusqlite::Connection) -> Vec<String> {
         let result = conn.prepare(
             "SELECT gm.user_id FROM group_members gm \
              JOIN user_groups g ON g.id = gm.group_id \
@@ -282,7 +282,7 @@ impl PermissionChecker {
             }
         };
 
-        let admins: Vec<i64> = match stmt.query_map([], |row| row.get(0)) {
+        let admins: Vec<String> = match stmt.query_map([], |row| row.get(0)) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
             Err(e) => {
                 warn!("load_admins: blad zapytania: {}", e);
@@ -477,7 +477,7 @@ impl PermissionChecker {
         for entry in &raw {
             let key = CacheKey {
                 addon_id: entry.addon_id.clone(),
-                user_id: entry.user_id,
+                user_id: entry.user_id.clone(),
                 permission_type: entry.permission_id.clone(),
                 resource: "*".to_string(),
             };
@@ -533,7 +533,7 @@ enum EntrySource {
 /// Surowy wpis z DB przed rozwiazaniem hierarchii
 struct RawEntry {
     addon_id: String,
-    user_id: i64,
+    user_id: String,
     permission_id: String,
     source: EntrySource,
     grant_mode: String,
@@ -579,22 +579,24 @@ mod tests {
         crate::db::init(Path::new(":memory:")).expect("Nie udalo sie utworzyc test DB")
     }
 
-    /// Wstawia uzytkownika do bazy testowej, zwraca user_id
-    fn insert_test_user(db: &DbPool, username: &str) -> i64 {
+    /// Wstawia uzytkownika do bazy testowej, zwraca user_id (UUID)
+    fn insert_test_user(db: &DbPool, username: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
         let conn = db.lock().unwrap();
         conn.execute(
-            "INSERT INTO user_accounts (username, password_hash, display_name) VALUES (?1, 'hash', ?1)",
-            rusqlite::params![username],
+            "INSERT INTO user_accounts (id, username, password_hash, display_name) VALUES (?1, ?2, 'hash', ?2)",
+            rusqlite::params![id, username],
         ).expect("Nie udalo sie wstawic uzytkownika");
-        conn.last_insert_rowid()
+        id
     }
 
-    /// Tworzy grupe i zwraca group_id
-    fn insert_test_group(db: &DbPool, name: &str) -> i64 {
+    /// Tworzy grupe i zwraca group_id (UUID)
+    fn insert_test_group(db: &DbPool, name: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
         let conn = db.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO user_groups (name, description) VALUES (?1, ?1)",
-            rusqlite::params![name],
+            "INSERT OR IGNORE INTO user_groups (id, name, description) VALUES (?1, ?2, ?2)",
+            rusqlite::params![id, name],
         )
         .expect("Nie udalo sie wstawic grupy");
         conn.query_row(
@@ -606,7 +608,7 @@ mod tests {
     }
 
     /// Dodaje uzytkownika do grupy
-    fn add_user_to_group(db: &DbPool, group_id: i64, user_id: i64) {
+    fn add_user_to_group(db: &DbPool, group_id: &str, user_id: &str) {
         let conn = db.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?1, ?2)",
@@ -621,7 +623,7 @@ mod tests {
         db: &DbPool,
         addon_id: &str,
         subject_type: &str,
-        subject_id: i64,
+        subject_id: &str,
         permission_id: &str,
         grant_mode: &str,
     ) {
@@ -641,7 +643,7 @@ mod tests {
         db: &DbPool,
         addon_id: &str,
         subject_type: &str,
-        subject_id: i64,
+        subject_id: &str,
         permission_id: &str,
         granted: bool,
     ) {
@@ -668,7 +670,7 @@ mod tests {
         db: &DbPool,
         addon_id: &str,
         subject_type: &str,
-        subject_id: i64,
+        subject_id: &str,
         permission_id: &str,
         granted: i32,
         grant_mode: &str,
@@ -695,14 +697,14 @@ mod tests {
         let addon_id = "test-addon";
 
         // Ustaw uprawnienie granted=true per user
-        set_permission(&db, addon_id, "user", user_id, "chat_read", true);
+        set_permission(&db, addon_id, "user", &user_id, "chat_read", true);
 
         let checker = PermissionChecker::new(db.clone());
         // Warm-up cache
         checker.refresh_all();
 
         // Act 1 — sprawdzenie (z cache)
-        let result1 = checker.check(addon_id, user_id, "chat_read", None);
+        let result1 = checker.check(addon_id, &user_id, "chat_read", None);
 
         // Assert 1 — powinno zwrocic Granted
         assert_eq!(
@@ -712,10 +714,10 @@ mod tests {
         );
 
         // Arrange — zmien uprawnienie na granted=false
-        set_permission(&db, addon_id, "user", user_id, "chat_read", false);
+        set_permission(&db, addon_id, "user", &user_id, "chat_read", false);
 
         // Act 2 — sprawdz BEZ invalidacji cache (powinno zwrocic stary wynik z cache)
-        let result2 = checker.check(addon_id, user_id, "chat_read", None);
+        let result2 = checker.check(addon_id, &user_id, "chat_read", None);
 
         // Assert 2 — cache nadal zwraca Granted (stary wynik)
         assert_eq!(
@@ -726,7 +728,7 @@ mod tests {
 
         // Act 3 — invaliduj cache i sprawdz ponownie
         checker.invalidate_cache();
-        let result3 = checker.check(addon_id, user_id, "chat_read", None);
+        let result3 = checker.check(addon_id, &user_id, "chat_read", None);
 
         // Assert 3 — teraz powinno zwrocic Denied (granted=false → explicit deny)
         assert_eq!(
@@ -762,18 +764,18 @@ mod tests {
         let group_a_id = insert_test_group(&db, "group_a");
         let group_b_id = insert_test_group(&db, "group_b");
 
-        add_user_to_group(&db, group_a_id, user_id);
-        add_user_to_group(&db, group_b_id, user_id);
+        add_user_to_group(&db, &group_a_id, &user_id);
+        add_user_to_group(&db, &group_b_id, &user_id);
 
         // Grupa A: granted=true dla "chat_read"
-        set_permission(&db, "teams", "group", group_a_id, "chat_read", true);
+        set_permission(&db, "teams", "group", &group_a_id, "chat_read", true);
         // Grupa B: brak uprawnien dla "chat_read" (nie ustawiamy nic)
 
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
 
         // Act
-        let result = checker.check("teams", user_id, "chat_read", None);
+        let result = checker.check("teams", &user_id, "chat_read", None);
 
         // Assert — user powinien miec Granted (suma grup, OR — jedna grupa przyznaje)
         assert_eq!(
@@ -799,19 +801,19 @@ mod tests {
             conn.query_row(
                 "SELECT id FROM user_groups WHERE name = 'admins'",
                 [],
-                |row| row.get::<_, i64>(0),
+                |row| row.get::<_, String>(0),
             )
             .expect("Grupa 'admins' powinna istniec po seedzie")
         };
 
-        add_user_to_group(&db, admins_group_id, user_id);
+        add_user_to_group(&db, &admins_group_id, &user_id);
 
         // NIE ustawiaj zadnych uprawnien addonu
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
 
         // Act — sprawdz dowolne uprawnienie
-        let result = checker.check("nieistniejacy-addon", user_id, "cokolwiek", None);
+        let result = checker.check("nieistniejacy-addon", &user_id, "cokolwiek", None);
 
         // Assert — admin bypass powinien przyznac dostep
         assert_eq!(
@@ -836,7 +838,7 @@ mod tests {
         checker.refresh_all();
 
         // Act
-        let result = checker.check("test-addon", user_id, "chat_read", None);
+        let result = checker.check("test-addon", &user_id, "chat_read", None);
 
         // Assert — powinno zwrocic NotConfigured (default deny)
         assert_eq!(
@@ -855,7 +857,7 @@ mod tests {
         // Arrange
         let db = create_test_db();
         let user_id = insert_test_user(&db, "perf_user");
-        set_permission(&db, "perf-addon", "user", user_id, "llm", true);
+        set_permission(&db, "perf-addon", "user", &user_id, "llm", true);
 
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
@@ -863,7 +865,7 @@ mod tests {
         // Act — sprawdz 10000 razy
         let start = std::time::Instant::now();
         for _ in 0..10_000 {
-            let result = checker.check("perf-addon", user_id, "llm", None);
+            let result = checker.check("perf-addon", &user_id, "llm", None);
             assert_eq!(result, PermissionResult::Granted);
         }
         let elapsed = start.elapsed();
@@ -933,7 +935,7 @@ platforms = []
         assert_eq!(addon.version, "1.0.0");
 
         // Arrange — dodaj dane powiazane (uprawnienia, config) zeby sprawdzic czyszczenie
-        set_permission(&db, "test-lifecycle", "user", 1, "chat_read", true);
+        set_permission(&db, "test-lifecycle", "user", "1", "chat_read", true);
         {
             let conn = db.lock().unwrap();
             conn.execute(
@@ -1001,7 +1003,7 @@ platforms = []
         checker.refresh_all();
 
         // Act 1 — sprawdz uprawnienie (brak konfiguracji → NotConfigured)
-        let result1 = checker.check(addon_id, user_id, "chat_read", None);
+        let result1 = checker.check(addon_id, &user_id, "chat_read", None);
         assert_eq!(
             result1,
             PermissionResult::NotConfigured,
@@ -1009,10 +1011,10 @@ platforms = []
         );
 
         // Arrange — ustaw uprawnienie granted=true
-        set_permission(&db, addon_id, "user", user_id, "chat_read", true);
+        set_permission(&db, addon_id, "user", &user_id, "chat_read", true);
 
         // Act 2 — sprawdz bez invalidacji (cache nie ma wpisu → nadal NotConfigured)
-        let result2 = checker.check(addon_id, user_id, "chat_read", None);
+        let result2 = checker.check(addon_id, &user_id, "chat_read", None);
         assert_eq!(
             result2,
             PermissionResult::NotConfigured,
@@ -1021,7 +1023,7 @@ platforms = []
 
         // Act 3 — invaliduj cache dla tego addonu i sprawdz ponownie
         checker.invalidate_addon(addon_id);
-        let result3 = checker.check(addon_id, user_id, "chat_read", None);
+        let result3 = checker.check(addon_id, &user_id, "chat_read", None);
         assert_eq!(
             result3,
             PermissionResult::Granted,
@@ -1047,12 +1049,12 @@ platforms = []
     // =========================================================================
 
     /// Pomocnik: pobiera ID grupy 'admins' utworzonej przez seed.
-    fn admins_group_id(db: &DbPool) -> i64 {
+    fn admins_group_id(db: &DbPool) -> String {
         let conn = db.lock().unwrap();
         conn.query_row(
             "SELECT id FROM user_groups WHERE name = 'admins'",
             [],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, String>(0),
         )
         .expect("Grupa 'admins' powinna istniec po seedzie")
     }
@@ -1062,13 +1064,13 @@ platforms = []
         // Arrange — admin user bez zadnych jawnych uprawnien
         let db = create_test_db();
         let user_id = insert_test_user(&db, "admin_bypass_user");
-        add_user_to_group(&db, admins_group_id(&db), user_id);
+        add_user_to_group(&db, &admins_group_id(&db), &user_id);
 
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
 
         // Act + Assert — admin dostaje Granted na wszystko
-        let result = checker.check("dowolny-addon", user_id, "dowolne.uprawnienie", None);
+        let result = checker.check("dowolny-addon", &user_id, "dowolne.uprawnienie", None);
         assert_eq!(
             result,
             PermissionResult::Granted,
@@ -1081,13 +1083,13 @@ platforms = []
         // Arrange — user-level allow na konkretne uprawnienie
         let db = create_test_db();
         let user_id = insert_test_user(&db, "user_allow_user");
-        set_permission_mode(&db, "addon-x", "user", user_id, "x.y", "allow");
+        set_permission_mode(&db, "addon-x", "user", &user_id, "x.y", "allow");
 
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
 
         // Act
-        let result = checker.check("addon-x", user_id, "x.y", None);
+        let result = checker.check("addon-x", &user_id, "x.y", None);
 
         // Assert
         assert_eq!(
@@ -1103,16 +1105,16 @@ platforms = []
         let db = create_test_db();
         let user_id = insert_test_user(&db, "user_deny_over_group");
         let group_id = insert_test_group(&db, "grupa_pozwalajaca");
-        add_user_to_group(&db, group_id, user_id);
+        add_user_to_group(&db, &group_id, &user_id);
 
-        set_permission_mode(&db, "addon-x", "group", group_id, "x.y", "allow");
-        set_permission_mode(&db, "addon-x", "user", user_id, "x.y", "deny");
+        set_permission_mode(&db, "addon-x", "group", &group_id, "x.y", "allow");
+        set_permission_mode(&db, "addon-x", "user", &user_id, "x.y", "deny");
 
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
 
         // Act
-        let result = checker.check("addon-x", user_id, "x.y", None);
+        let result = checker.check("addon-x", &user_id, "x.y", None);
 
         // Assert
         assert_eq!(
@@ -1129,17 +1131,17 @@ platforms = []
         let user_id = insert_test_user(&db, "two_groups_user");
         let g_allow = insert_test_group(&db, "grupa_allow");
         let g_deny = insert_test_group(&db, "grupa_deny");
-        add_user_to_group(&db, g_allow, user_id);
-        add_user_to_group(&db, g_deny, user_id);
+        add_user_to_group(&db, &g_allow, &user_id);
+        add_user_to_group(&db, &g_deny, &user_id);
 
-        set_permission_mode(&db, "addon-x", "group", g_allow, "x.y", "allow");
-        set_permission_mode(&db, "addon-x", "group", g_deny, "x.y", "deny");
+        set_permission_mode(&db, "addon-x", "group", &g_allow, "x.y", "allow");
+        set_permission_mode(&db, "addon-x", "group", &g_deny, "x.y", "deny");
 
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
 
         // Act
-        let result = checker.check("addon-x", user_id, "x.y", None);
+        let result = checker.check("addon-x", &user_id, "x.y", None);
 
         // Assert
         assert_eq!(
@@ -1154,14 +1156,14 @@ platforms = []
         // Arrange — user ma grant_mode='inherit', default='allow'
         let db = create_test_db();
         let user_id = insert_test_user(&db, "inherit_user");
-        set_permission_mode(&db, "addon-x", "user", user_id, "x.y", "inherit");
+        set_permission_mode(&db, "addon-x", "user", &user_id, "x.y", "inherit");
         set_permission_default(&db, "addon-x", "x.y", "allow");
 
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
 
         // Act
-        let result = checker.check("addon-x", user_id, "x.y", None);
+        let result = checker.check("addon-x", &user_id, "x.y", None);
 
         // Assert
         assert_eq!(
@@ -1181,7 +1183,7 @@ platforms = []
         checker.refresh_all();
 
         // Act
-        let result = checker.check("addon-nieskonfigurowany", user_id, "x.y", None);
+        let result = checker.check("addon-nieskonfigurowany", &user_id, "x.y", None);
 
         // Assert — deny-by-default (NotConfigured)
         assert_eq!(
@@ -1198,13 +1200,13 @@ platforms = []
         // Nowy checker MUSI czytac z grant_mode.
         let db = create_test_db();
         let user_id = insert_test_user(&db, "mismatch_user");
-        insert_raw_permission(&db, "addon-mismatch", "user", user_id, "x.y", 1, "deny");
+        insert_raw_permission(&db, "addon-mismatch", "user", &user_id, "x.y", 1, "deny");
 
         let checker = PermissionChecker::new(db.clone());
         checker.refresh_all();
 
         // Act
-        let result = checker.check("addon-mismatch", user_id, "x.y", None);
+        let result = checker.check("addon-mismatch", &user_id, "x.y", None);
 
         // Assert — czyta grant_mode='deny', ignoruje stare granted=1
         assert_eq!(

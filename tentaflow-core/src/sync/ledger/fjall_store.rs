@@ -4,13 +4,15 @@
 // =============================================================================
 
 use super::types::{
-    AppendResult, CompactionPolicy, InboxEntry, LedgerResult, NewSyncOperation, OperationId,
-    OperationQuery, OutboxEntry, PartitionHead, PartitionId, PeerCursor, PeerId, RepairQueueEntry,
-    SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner,
-    SyncOperationVerifier, SyncSnapshot, SyncTarget, decode, encode,
+    decode, encode, AppendResult, BaselineEpoch, CompactionPolicy, HybridLogicalTimestamp,
+    InboxEntry, LedgerResult, NewSyncOperation, OperationId, OperationQuery, OutboxEntry,
+    PartitionHead, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
+    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier, SyncSnapshot,
+    SyncTarget,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::path::Path;
 
 const OPERATIONS: &str = "operations";
@@ -21,6 +23,9 @@ const INBOX: &str = "inbox";
 const PEER_CURSORS: &str = "peer_cursors";
 const REPAIR_QUEUE: &str = "repair_queue";
 const SNAPSHOTS: &str = "snapshots";
+const META: &str = "meta";
+const META_EPOCH_KEY: &[u8] = b"baseline_epoch";
+const META_HLC_KEY: &[u8] = b"hlc_state";
 const SEP: u8 = 0;
 
 pub struct FjallSyncLedgerStore {
@@ -33,6 +38,7 @@ pub struct FjallSyncLedgerStore {
     peer_cursors: Keyspace,
     repair_queue: Keyspace,
     snapshots: Keyspace,
+    meta: Keyspace,
     append_lock: Mutex<()>,
 }
 
@@ -48,6 +54,7 @@ impl FjallSyncLedgerStore {
             peer_cursors: db.keyspace(PEER_CURSORS, KeyspaceCreateOptions::default)?,
             repair_queue: db.keyspace(REPAIR_QUEUE, KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace(SNAPSHOTS, KeyspaceCreateOptions::default)?,
+            meta: db.keyspace(META, KeyspaceCreateOptions::default)?,
             db,
             append_lock: Mutex::new(()),
         })
@@ -200,6 +207,13 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         verifier: &dyn SyncOperationVerifier,
     ) -> LedgerResult<()> {
         verifier.verify_operation_signature(&operation)?;
+        let local_epoch = self.current_epoch()?;
+        if operation.body.epoch != local_epoch {
+            return Err(SyncLedgerError::EpochMismatch {
+                expected: local_epoch,
+                actual: operation.body.epoch.clone(),
+            });
+        }
         if self
             .inbox
             .get(inbox_key(&source, operation.op_id))?
@@ -277,6 +291,11 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         entry.acknowledged = true;
         self.outbox
             .insert(outbox_key(&target, op_id), encode(&entry)?)?;
+        self.persist()
+    }
+
+    fn remove_outbox_entry(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()> {
+        self.outbox.remove(outbox_key(&target, op_id))?;
         self.persist()
     }
 
@@ -463,6 +482,118 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         batch.commit()?;
         Ok(())
     }
+
+    fn current_epoch(&self) -> LedgerResult<BaselineEpoch> {
+        match self.meta.get(META_EPOCH_KEY)? {
+            Some(value) => decode(value.as_ref()),
+            // Genesis epoch: a node that has never performed a baseline reset
+            // mints and accepts operations under counter 0. `origin_node` is
+            // empty so any explicitly-minted epoch (counter >= 1) sorts above it.
+            None => Ok(BaselineEpoch {
+                counter: 0,
+                origin_node: String::new(),
+            }),
+        }
+    }
+
+    fn set_epoch(&self, epoch: BaselineEpoch) -> LedgerResult<()> {
+        self.meta.insert(META_EPOCH_KEY, encode(&epoch)?)?;
+        self.persist()
+    }
+
+    fn current_hlc(&self) -> LedgerResult<Option<HybridLogicalTimestamp>> {
+        match self.meta.get(META_HLC_KEY)? {
+            Some(value) => Ok(Some(decode(value.as_ref())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn save_hlc(&self, timestamp: &HybridLogicalTimestamp) -> LedgerResult<()> {
+        self.meta.insert(META_HLC_KEY, encode(timestamp)?)?;
+        self.persist()
+    }
+
+    fn reset_partitions_with_prefix(&self, partition_prefix: &str) -> LedgerResult<()> {
+        let _guard = self.append_lock.lock();
+        let prefix_bytes = partition_prefix.as_bytes();
+
+        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+
+        // Operations + their op_id index. The operation key starts with the
+        // partition_id, so a byte-prefix match selects exactly the partitions
+        // under `partition_prefix`. Collect the matching op_ids while we are
+        // here so outbox/inbox cleanup below can match without re-reading.
+        let mut matched_op_ids: HashSet<OperationId> = HashSet::new();
+        for item in self.operations.prefix(prefix_bytes) {
+            let (key, value) = item.into_inner()?;
+            let operation: SyncOperation = decode(value.as_ref())?;
+            batch.remove(&self.operation_index, operation.op_id.as_bytes().to_vec());
+            batch.remove(&self.operations, key.to_vec());
+            matched_op_ids.insert(operation.op_id);
+        }
+
+        // Snapshots are keyed by partition_prefix too.
+        for item in self.snapshots.prefix(prefix_bytes) {
+            let (key, _) = item.into_inner()?;
+            batch.remove(&self.snapshots, key.to_vec());
+        }
+
+        // Partition heads are keyed directly by partition_id.
+        for item in self.partition_heads.prefix(prefix_bytes) {
+            let (key, _) = item.into_inner()?;
+            batch.remove(&self.partition_heads, key.to_vec());
+        }
+
+        // Outbox is keyed by (target, op_id) and stores no partition, so the only
+        // entries we can attribute to this reset are those pointing at a core
+        // operation we just removed (`matched_op_ids`). Orphaned entries (op_id
+        // outside live operations) must be left untouched: their source
+        // partition is unknown, so deleting them here could wipe a non-core
+        // (addon/kv) orphan. The push path cleans up orphans lazily instead.
+        for item in self.outbox.iter() {
+            let (key, value) = item.into_inner()?;
+            let entry: OutboxEntry = decode(value.as_ref())?;
+            if matched_op_ids.contains(&entry.op_id) {
+                batch.remove(&self.outbox, key.to_vec());
+            }
+        }
+
+        // Inbox carries the full operation, so decode its partition_id.
+        for item in self.inbox.iter() {
+            let (key, value) = item.into_inner()?;
+            let entry: InboxEntry = decode(value.as_ref())?;
+            if entry
+                .operation
+                .body
+                .partition_id
+                .as_str()
+                .starts_with(partition_prefix)
+            {
+                batch.remove(&self.inbox, key.to_vec());
+            }
+        }
+
+        // Peer cursors and repair queue are keyed by (peer, partition) but the
+        // partition is concatenated raw, so decode the value to be safe.
+        for item in self.peer_cursors.iter() {
+            let (key, value) = item.into_inner()?;
+            let cursor: PeerCursor = decode(value.as_ref())?;
+            if cursor.partition_id.as_str().starts_with(partition_prefix) {
+                batch.remove(&self.peer_cursors, key.to_vec());
+            }
+        }
+
+        for item in self.repair_queue.iter() {
+            let (key, value) = item.into_inner()?;
+            let entry: RepairQueueEntry = decode(value.as_ref())?;
+            if entry.partition_id.as_str().starts_with(partition_prefix) {
+                batch.remove(&self.repair_queue, key.to_vec());
+            }
+        }
+
+        batch.commit()?;
+        Ok(())
+    }
 }
 
 fn load_outbox_entry(
@@ -555,7 +686,7 @@ fn snapshot_key(partition: &PartitionId, sequence: u64, snapshot_id: &str) -> Ve
 mod tests {
     use super::*;
     use crate::sync::ledger::{
-        ActionType, Ed25519OperationSigner, FieldValue, HexNodeIdOperationVerifier,
+        ActionType, BaselineEpoch, Ed25519OperationSigner, FieldValue, HexNodeIdOperationVerifier,
         HybridLogicalTimestamp, SnapshotId, SyncOperationSigner,
     };
     use ed25519_dalek::SigningKey;
@@ -566,6 +697,16 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let node_id = hex::encode(signing_key.verifying_key().to_bytes());
         Ed25519OperationSigner::new(node_id, signing_key).unwrap()
+    }
+
+    fn operation_in_partition(
+        signer: &Ed25519OperationSigner,
+        partition: &str,
+        resource_id: &str,
+    ) -> NewSyncOperation {
+        let mut op = sample_operation(signer, resource_id);
+        op.partition_id = PartitionId::new(partition).unwrap();
+        op
     }
 
     fn sample_operation(signer: &Ed25519OperationSigner, resource_id: &str) -> NewSyncOperation {
@@ -593,6 +734,10 @@ mod tests {
                 wall_time_ms: 1_765_000_000_000,
                 logical: 0,
                 node_id: signer.node_id().to_string(),
+            },
+            epoch: BaselineEpoch {
+                counter: 0,
+                origin_node: String::new(),
             },
             payload_hash: [1; 32],
             acl_snapshot_hash: [2; 32],
@@ -834,12 +979,10 @@ mod tests {
         drop(store);
 
         let reopened = FjallSyncLedgerStore::open(dir.path()).unwrap();
-        assert!(
-            reopened
-                .list_due_repair_requests(peer.clone(), 200, 10)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reopened
+            .list_due_repair_requests(peer.clone(), 200, 10)
+            .unwrap()
+            .is_empty());
         let due = reopened
             .list_due_repair_requests(peer.clone(), 500, 10)
             .unwrap();
@@ -850,12 +993,10 @@ mod tests {
         reopened
             .remove_repair_request(peer.clone(), partition.clone())
             .unwrap();
-        assert!(
-            reopened
-                .list_due_repair_requests(peer, 1_000, 10)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reopened
+            .list_due_repair_requests(peer, 1_000, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -927,5 +1068,338 @@ mod tests {
 
         let latest = store.latest_snapshot(partition, None).unwrap().unwrap();
         assert_eq!(latest.up_to_sequence, 30);
+    }
+
+    #[test]
+    fn reset_core_partitions_clears_only_core_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+
+        let core_partition = "core/org/org-default/flows";
+        let addon_partition = "addon/contacts/persons";
+        let kv_partition = "kv/org-default/memory";
+
+        let core_append = store
+            .append_operation(
+                operation_in_partition(&signer, core_partition, "flow_1"),
+                &signer,
+            )
+            .unwrap();
+        store
+            .append_operation(
+                operation_in_partition(&signer, core_partition, "flow_2"),
+                &signer,
+            )
+            .unwrap();
+        let addon_append = store
+            .append_operation(
+                operation_in_partition(&signer, addon_partition, "person_1"),
+                &signer,
+            )
+            .unwrap();
+        let kv_append = store
+            .append_operation(
+                operation_in_partition(&signer, kv_partition, "key_1"),
+                &signer,
+            )
+            .unwrap();
+
+        // Populate outbox / inbox / cursors / repair for both core and non-core.
+        let target = SyncTarget::new("node_b").unwrap();
+        store
+            .put_in_outbox(target.clone(), core_append.op_id)
+            .unwrap();
+        store.put_in_outbox(target, addon_append.op_id).unwrap();
+
+        let source = PeerId::new("node_c").unwrap();
+        let core_op = store.get_operation(core_append.op_id).unwrap();
+        let addon_op = store.get_operation(addon_append.op_id).unwrap();
+        store
+            .put_verified_in_inbox(source.clone(), core_op, &HexNodeIdOperationVerifier)
+            .unwrap();
+        store
+            .put_verified_in_inbox(source.clone(), addon_op, &HexNodeIdOperationVerifier)
+            .unwrap();
+
+        for partition in [core_partition, addon_partition] {
+            store
+                .save_peer_cursor(PeerCursor {
+                    peer: source.clone(),
+                    partition_id: PartitionId::new(partition).unwrap(),
+                    last_sequence: 1,
+                    last_hash: [3; 32],
+                })
+                .unwrap();
+            store
+                .upsert_repair_request(RepairQueueEntry {
+                    peer: source.clone(),
+                    partition_id: PartitionId::new(partition).unwrap(),
+                    from_sequence: 1,
+                    next_attempt_ms: 0,
+                    retry_count: 0,
+                })
+                .unwrap();
+        }
+
+        store.reset_core_partitions().unwrap();
+
+        // Core operations gone, addon + kv intact.
+        assert!(store
+            .get_operations(OperationQuery {
+                partition_id: PartitionId::new(core_partition).unwrap(),
+                from_sequence: None,
+                to_sequence: None,
+                limit: None,
+            })
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .get_operations(OperationQuery {
+                    partition_id: PartitionId::new(addon_partition).unwrap(),
+                    from_sequence: None,
+                    to_sequence: None,
+                    limit: None,
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_operations(OperationQuery {
+                    partition_id: PartitionId::new(kv_partition).unwrap(),
+                    from_sequence: None,
+                    to_sequence: None,
+                    limit: None,
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // op_id index for core is gone; addon/kv still resolvable.
+        assert!(store.get_operation(core_append.op_id).is_err());
+        assert!(store.get_operation(addon_append.op_id).is_ok());
+        assert!(store.get_operation(kv_append.op_id).is_ok());
+
+        // Partition head only removed for core.
+        assert!(store
+            .get_partition_head(PartitionId::new(core_partition).unwrap())
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_partition_head(PartitionId::new(addon_partition).unwrap())
+            .unwrap()
+            .is_some());
+
+        // Outbox: core entry removed, addon entry kept.
+        assert!(store
+            .get_outbox_entry(SyncTarget::new("node_b").unwrap(), core_append.op_id)
+            .is_err());
+        assert!(store
+            .get_outbox_entry(SyncTarget::new("node_b").unwrap(), addon_append.op_id)
+            .is_ok());
+
+        // Inbox: only the addon-partition entry survives.
+        let inbox = store.list_unapplied_inbox(10).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(
+            inbox[0].operation.body.partition_id.as_str(),
+            addon_partition
+        );
+
+        // Peer cursor: core gone, addon kept.
+        assert!(store
+            .get_peer_cursor(source.clone(), PartitionId::new(core_partition).unwrap())
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_peer_cursor(source.clone(), PartitionId::new(addon_partition).unwrap())
+            .unwrap()
+            .is_some());
+
+        // Repair queue: only the addon-partition request remains due.
+        let due = store
+            .list_due_repair_requests(source, i64::MAX, 10)
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].partition_id.as_str(), addon_partition);
+    }
+
+    #[test]
+    fn reset_core_partitions_preserves_orphaned_outbox() {
+        // An orphaned outbox row (operation compacted away) carries no partition,
+        // so a core reset cannot know whether it belonged to core or to addon/kv.
+        // It must therefore leave every orphan untouched and only remove entries
+        // pointing at the live core operations it is actually resetting.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+
+        let core_partition = "core/org/org-default/flows";
+        let addon_partition = "addon/contacts/persons";
+        let kv_partition = "kv/org-default/memory";
+
+        // core/flows gets two ops (sequences 1 and 2). Compaction below keeps
+        // only sequence 2, so the sequence-1 op becomes the core orphan and the
+        // sequence-2 op stays live.
+        let core_orphan = store
+            .append_operation(
+                operation_in_partition(&signer, core_partition, "flow_orphan"),
+                &signer,
+            )
+            .unwrap();
+        let core_live = store
+            .append_operation(
+                operation_in_partition(&signer, core_partition, "flow_keep"),
+                &signer,
+            )
+            .unwrap();
+        let addon_orphan = store
+            .append_operation(
+                operation_in_partition(&signer, addon_partition, "person_orphan"),
+                &signer,
+            )
+            .unwrap();
+        let kv_append = store
+            .append_operation(
+                operation_in_partition(&signer, kv_partition, "key_1"),
+                &signer,
+            )
+            .unwrap();
+
+        let target = SyncTarget::new("node_b").unwrap();
+        store
+            .put_in_outbox(target.clone(), core_live.op_id)
+            .unwrap();
+        store
+            .put_in_outbox(target.clone(), core_orphan.op_id)
+            .unwrap();
+        store
+            .put_in_outbox(target.clone(), addon_orphan.op_id)
+            .unwrap();
+        store
+            .put_in_outbox(target.clone(), kv_append.op_id)
+            .unwrap();
+
+        // Compact away the sequence-1 core op and the lone addon op (keeping
+        // their outbox rows), turning both into orphans whose source partition is
+        // unknowable from the outbox alone.
+        store
+            .compact(CompactionPolicy {
+                partition_id: PartitionId::new(core_partition).unwrap(),
+                keep_operations_after_sequence: Some(2),
+            })
+            .unwrap();
+        store
+            .compact(CompactionPolicy {
+                partition_id: PartitionId::new(addon_partition).unwrap(),
+                keep_operations_after_sequence: Some(2),
+            })
+            .unwrap();
+        assert!(store.get_operation(core_orphan.op_id).is_err());
+        assert!(store.get_operation(addon_orphan.op_id).is_err());
+        assert!(store.get_operation(core_live.op_id).is_ok());
+
+        store.reset_core_partitions().unwrap();
+
+        // (i) Outbox entry for the live core operation being reset is removed.
+        assert!(store
+            .get_outbox_entry(SyncTarget::new("node_b").unwrap(), core_live.op_id)
+            .is_err());
+        // (ii) Orphaned outbox entries survive the reset, whether their now-gone
+        // operation was core OR addon — reset never deletes orphans.
+        assert!(store
+            .get_outbox_entry(SyncTarget::new("node_b").unwrap(), core_orphan.op_id)
+            .is_ok());
+        assert!(store
+            .get_outbox_entry(SyncTarget::new("node_b").unwrap(), addon_orphan.op_id)
+            .is_ok());
+        // The live kv entry is untouched as well.
+        assert!(store
+            .get_outbox_entry(SyncTarget::new("node_b").unwrap(), kv_append.op_id)
+            .is_ok());
+    }
+
+    #[test]
+    fn epoch_defaults_to_genesis_and_persists_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+
+        let genesis = store.current_epoch().unwrap();
+        assert_eq!(genesis.counter, 0);
+        assert!(genesis.origin_node.is_empty());
+
+        let bumped = store.bump_epoch("node_a").unwrap();
+        assert_eq!(bumped.counter, 1);
+        assert_eq!(bumped.origin_node, "node_a");
+        drop(store);
+
+        let reopened = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.current_epoch().unwrap(), bumped);
+    }
+
+    #[test]
+    fn inbox_rejects_operation_from_other_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        // Local node advances past genesis, so a genesis-epoch operation from a
+        // peer must be rejected as belonging to a stale baseline.
+        store.bump_epoch("node_local").unwrap();
+        let append = store
+            .append_operation(sample_operation(&signer, "person_1"), &signer)
+            .unwrap();
+        let operation = store.get_operation(append.op_id).unwrap();
+
+        let result = store.put_verified_in_inbox(
+            PeerId::new("node_b").unwrap(),
+            operation,
+            &HexNodeIdOperationVerifier,
+        );
+
+        assert!(matches!(result, Err(SyncLedgerError::EpochMismatch { .. })));
+    }
+
+    #[test]
+    fn hlc_state_round_trips_through_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        assert!(store.current_hlc().unwrap().is_none());
+
+        let ts = HybridLogicalTimestamp {
+            wall_time_ms: 1_765_000_000_123,
+            logical: 9,
+            node_id: "node_a".to_string(),
+        };
+        store.save_hlc(&ts).unwrap();
+        drop(store);
+
+        let reopened = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.current_hlc().unwrap(), Some(ts));
+    }
+
+    #[test]
+    fn remove_outbox_entry_drops_single_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let append = store
+            .append_operation(sample_operation(&signer, "person_1"), &signer)
+            .unwrap();
+        let target = SyncTarget::new("node_b").unwrap();
+        store.put_in_outbox(target.clone(), append.op_id).unwrap();
+
+        store
+            .remove_outbox_entry(target.clone(), append.op_id)
+            .unwrap();
+
+        assert!(store
+            .get_outbox_entry(target.clone(), append.op_id)
+            .is_err());
+        // Removing an absent key is a no-op, not an error.
+        store.remove_outbox_entry(target, append.op_id).unwrap();
     }
 }

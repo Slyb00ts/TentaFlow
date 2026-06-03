@@ -20,7 +20,7 @@ use tentaflow_protocol::{
 use tokio::sync::broadcast::error::RecvError;
 
 use super::subscription::{
-    StreamHandlerMeta, Subscription, push_chunk_async, push_end, push_end_async,
+    push_chunk_async, push_end, push_end_async, StreamHandlerMeta, Subscription,
 };
 use super::{HandlerContext, SessionAuthKind};
 use crate::services::stream_hub::{StreamHub, StreamHubError};
@@ -339,10 +339,10 @@ fn enforce_subscribe_permission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::HandlerContext;
     use crate::dispatch::subscription::{
-        SubscriptionEvent, SubscriptionRegistry, find_stream_handler,
+        find_stream_handler, SubscriptionEvent, SubscriptionRegistry,
     };
+    use crate::dispatch::HandlerContext;
     use crate::services::stream_hub::{BinaryStreamSource, StreamHub};
     use async_trait::async_trait;
     use bytes::Bytes;

@@ -31,7 +31,7 @@ pub const GENESIS_PREV_HASH: ChainHash = [0u8; 32];
 /// version bump should arrive with an explicit migration.
 #[derive(Debug, Clone)]
 pub struct AuditRowHashInput<'a> {
-    pub user_id: Option<i64>,
+    pub user_id: Option<&'a str>,
     pub addon_id: Option<&'a str>,
     pub instance_id: Option<&'a str>,
     pub action: &'a str,
@@ -54,9 +54,8 @@ pub struct AuditRowHashInput<'a> {
 /// Canonical byte representation of an audit row for hashing. Stable across
 /// rustc versions and platforms — just `\0`-joined UTF-8.
 pub fn canonical_row_bytes(input: &AuditRowHashInput<'_>) -> Vec<u8> {
-    let user = input.user_id.map(|v| v.to_string()).unwrap_or_default();
     let parts: [&str; 17] = [
-        &user,
+        input.user_id.unwrap_or(""),
         input.addon_id.unwrap_or(""),
         input.instance_id.unwrap_or(""),
         input.action,
@@ -150,7 +149,7 @@ mod tests {
 
     fn sample<'a>(action: &'a str, ts: &'a str) -> AuditRowHashInput<'a> {
         AuditRowHashInput {
-            user_id: Some(7),
+            user_id: Some("00000000-0000-0000-0000-000000000007"),
             addon_id: Some("com.test"),
             instance_id: Some("inst-1"),
             action,

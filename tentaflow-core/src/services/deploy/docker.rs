@@ -650,6 +650,11 @@ impl DeployStrategy for DockerDeploy {
         if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
             env.insert("MODEL".into(), model);
         }
+        // vLLM featured presets (Bielik NVFP4 + draft, Qwen MTP): NVFP4
+        // self-quant + speculative-config env the bare MODEL repo can't carry.
+        for (k, v) in super::vllm_deploy_env(&self.manifest, &self.user_config) {
+            env.insert(k, v);
+        }
         // See python_bundle.rs: the served name must equal the advertised slug
         // (`models_from_manifest` model_name) or dispatch 404s when preset id
         // differs from the repo. entrypoint.sh reads `$SERVED_MODEL_NAME`.
@@ -699,10 +704,7 @@ impl DeployStrategy for DockerDeploy {
             }
             if self.manifest.engine.id == "vllm-spark" {
                 if let Some(raw) = env.get("VLLM_ARGS").cloned() {
-                    env.insert(
-                        "VLLM_ARGS".into(),
-                        super::normalize_vllm_spark_args(&raw),
-                    );
+                    env.insert("VLLM_ARGS".into(), super::normalize_vllm_spark_args(&raw));
                 }
             }
         }

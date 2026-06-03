@@ -31,7 +31,7 @@ use crate::services::service_call_rate_limit::{
 #[derive(Debug, Clone)]
 pub struct CallerContext {
     pub addon_id: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub instance_id: Option<String>,
     /// `true` skips the per-user permission resolve. Flow operators run
     /// system-side and inherit the addon's manifest permission set.
@@ -399,7 +399,7 @@ fn permission_granted(
     if !permissions.iter().any(|p| p == permission_type) {
         return false;
     }
-    let user_id = match caller.user_id {
+    let user_id = match caller.user_id.as_deref() {
         Some(id) => id,
         None => return caller.is_system_call,
     };
@@ -611,7 +611,7 @@ fn emit_audit_inner(
     let action_hash = crate::addon::utils::fnv1a_hash(action);
     let instance = caller.instance_id.as_deref();
     let hash_input = crate::audit::chain::AuditRowHashInput {
-        user_id: caller.user_id,
+        user_id: caller.user_id.as_deref(),
         addon_id: Some(caller.addon_id.as_str()),
         instance_id: instance,
         action,

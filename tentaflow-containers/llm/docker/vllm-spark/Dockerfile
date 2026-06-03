@@ -65,10 +65,19 @@ RUN git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm.gi
     && pip install --no-cache-dir -e . \
     && pip cache purge
 
+# llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI
+# do pobierania zrodel. Na Sparku (sm_121a) NVFP4 ma akceleracje sprzetowa.
+RUN pip install --no-cache-dir llm-compressor "huggingface_hub[cli,hf_transfer]"
+ENV HF_HUB_ENABLE_HF_TRANSFER=1 \
+    QUANT_SCRIPT=/app/quantize_nvfp4.py
+
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
 COPY tentaflow-containers/llm/docker/vllm-spark/config.default.toml /app/config.default.toml
 COPY tentaflow-containers/llm/docker/vllm-spark/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY tentaflow-containers/llm/docker/_shared/quantize_nvfp4.py /app/quantize_nvfp4.py
+COPY tentaflow-containers/llm/docker/_shared/prepare-vllm-model.sh /app/prepare-vllm-model.sh
+COPY tentaflow-containers/llm/docker/_shared/vllm-spec-prep.sh /app/vllm-spec-prep.sh
+RUN chmod +x /app/entrypoint.sh /app/prepare-vllm-model.sh
 
 EXPOSE 5000/udp
 

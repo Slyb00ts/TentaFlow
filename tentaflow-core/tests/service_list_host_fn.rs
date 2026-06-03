@@ -31,6 +31,9 @@ fn svc(id: i64, node: &str, name: &str, kind: &str, status: &str) -> ServiceInfo
         endpoint_url: Some(format!("http://127.0.0.1:800{id}")),
         restart_count: 0,
         health_last_err: None,
+        active_deploy_id: String::new(),
+        last_deploy_id: String::new(),
+        deployment_progress_pct: 0,
         progress_message: None,
         models: Vec::new(),
         created_at: "2026-01-01 00:00:00".into(),
@@ -218,7 +221,7 @@ fn permission_checker_denies_without_service_read() {
     // in `is_system_call=true` mode — host fn deny path matches.
     assert!(
         !checker
-            .check("addon-no-perm", 0, "service.read", None)
+            .check("addon-no-perm", "", "service.read", None)
             .is_granted()
             || true,
         "checker behavior probed; matrix logic owned by user/permission tests"

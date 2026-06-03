@@ -20,7 +20,7 @@ use tentaflow_core::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMesh
 use tentaflow_core::mesh::security::MeshSecurity;
 use tentaflow_core::sync::core_capture::CoreWriteCapture;
 use tentaflow_core::sync::core_registry::{
-    CORE_SYNC_ADDON_ID, CoreSyncResourceKind, descriptor_for_kind,
+    descriptor_for_kind, CoreSyncResourceKind, CORE_SYNC_ADDON_ID,
 };
 use tentaflow_core::sync::ledger::{FieldValue, OperationId};
 use tentaflow_core::sync::runtime::{MeshSyncPullResult, SqlWriteAction, SqlWriteCapture};
@@ -34,7 +34,6 @@ const SUITE_USER_ID: &str = "20101";
 const SUITE_GROUP_ID: &str = "20102";
 const SUITE_FLOW_ID: &str = "20103";
 const SUITE_BINDING_ID: &str = "20104";
-const SUITE_FLOW_VERSION_ID: &str = "20105";
 const SUITE_ROLE_ID: &str = "process-sync-role";
 const SUITE_MODEL_PATTERN: &str = "process-sync-model";
 const SNAPSHOT_ADDON_ID: &str = "process-snapshot-addon";
@@ -643,7 +642,8 @@ async fn child_main() {
 
     let db = tentaflow_core::db::init(&home.join("data").join("tentaflow.db")).expect("db");
     let cipher = std::sync::Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[0x44; 32]));
-    let security = std::sync::Arc::new(MeshSecurity::new(db.clone(), cipher.clone()).expect("security"));
+    let security =
+        std::sync::Arc::new(MeshSecurity::new(db.clone(), cipher.clone()).expect("security"));
     let _runtime =
         tentaflow_core::sync::runtime::init(db.clone(), security.clone(), cipher).expect("runtime");
     let local_node_id = security.ed25519_public_key_hex();
@@ -670,13 +670,15 @@ async fn child_main() {
         loop {
             match events.recv().await {
                 Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data }) => {
-                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPushPayload>(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<
+                        tentaflow_protocol::mesh::MeshSyncPushPayload,
+                    >(&data)
                     .expect("decode sync push");
                     match tentaflow_core::sync::runtime::handle_push_payload(&from_node_id, payload)
                     {
                         Ok(Some(ack)) => {
-                            let ack_bytes = tentaflow_protocol::cbor::encode(&ack)
-                                .expect("encode ack");
+                            let ack_bytes =
+                                tentaflow_protocol::cbor::encode(&ack).expect("encode ack");
                             mesh_for_events
                                 .send_sync_ack(&from_node_id, &ack_bytes)
                                 .await
@@ -687,13 +689,17 @@ async fn child_main() {
                     }
                 }
                 Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data }) => {
-                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncAckPayload>(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<
+                        tentaflow_protocol::mesh::MeshSyncAckPayload,
+                    >(&data)
                     .expect("decode sync ack");
                     tentaflow_core::sync::runtime::handle_ack_payload(&from_node_id, payload)
                         .expect("handle ack");
                 }
                 Ok(IrohMeshEvent::SyncPullReceived { from_node_id, data }) => {
-                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullPayload>(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<
+                        tentaflow_protocol::mesh::MeshSyncPullPayload,
+                    >(&data)
                     .expect("decode sync pull");
                     let Some(result) =
                         tentaflow_core::sync::runtime::handle_pull_payload(&from_node_id, payload)
@@ -724,7 +730,9 @@ async fn child_main() {
                     .expect("send pull result");
                 }
                 Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data }) => {
-                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncPullResponsePayload>(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<
+                        tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+                    >(&data)
                     .expect("decode sync pull response");
                     let Some(ack) = tentaflow_core::sync::runtime::handle_pull_response_payload(
                         &from_node_id,
@@ -733,15 +741,16 @@ async fn child_main() {
                     .expect("handle pull response") else {
                         continue;
                     };
-                    let bytes = tentaflow_protocol::cbor::encode(&ack)
-                        .expect("encode ack");
+                    let bytes = tentaflow_protocol::cbor::encode(&ack).expect("encode ack");
                     mesh_for_events
                         .send_sync_ack(&from_node_id, &bytes)
                         .await
                         .expect("send pull ack");
                 }
                 Ok(IrohMeshEvent::SyncSnapshotPullReceived { from_node_id, data }) => {
-                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncSnapshotPullPayload>(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<
+                        tentaflow_protocol::mesh::MeshSyncSnapshotPullPayload,
+                    >(&data)
                     .expect("decode sync snapshot pull");
                     let Some(response) =
                         tentaflow_core::sync::runtime::handle_snapshot_pull_payload(
@@ -760,7 +769,9 @@ async fn child_main() {
                         .expect("send snapshot response");
                 }
                 Ok(IrohMeshEvent::SyncSnapshotResponseReceived { from_node_id, data }) => {
-                    let payload = tentaflow_protocol::cbor::decode::<tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload>(&data)
+                    let payload = tentaflow_protocol::cbor::decode::<
+                        tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload,
+                    >(&data)
                     .expect("decode sync snapshot response");
                     let Some(ack) =
                         tentaflow_core::sync::runtime::handle_snapshot_response_payload(
@@ -771,8 +782,8 @@ async fn child_main() {
                     else {
                         continue;
                     };
-                    let bytes = tentaflow_protocol::cbor::encode(&ack)
-                        .expect("encode snapshot ack");
+                    let bytes =
+                        tentaflow_protocol::cbor::encode(&ack).expect("encode snapshot ack");
                     mesh_for_events
                         .send_sync_ack(&from_node_id, &bytes)
                         .await
@@ -863,11 +874,7 @@ async fn handle_child_command(
             seed_sql_receiver(db, local_node_id, &security.public_key_hex())?;
             Ok("SEED_SQL_RECEIVER".to_string())
         }
-        [
-            "SEED_SQL_CENTRAL_CLIENT",
-            authority_node_id,
-            authority_public_key,
-        ] => {
+        ["SEED_SQL_CENTRAL_CLIENT", authority_node_id, authority_public_key] => {
             seed_sql_central_client(
                 db,
                 local_node_id,
@@ -987,8 +994,7 @@ async fn handle_child_command(
         ["PUSH", target] => {
             let payload = tentaflow_core::sync::runtime::build_push_payload_for_target(target, 32)?
                 .expect("push payload");
-            let bytes = tentaflow_protocol::cbor::encode(&payload)
-                .expect("encode push");
+            let bytes = tentaflow_protocol::cbor::encode(&payload).expect("encode push");
             mesh.send_sync_push(target, &bytes).await?;
             Ok("PUSH".to_string())
         }
@@ -1069,8 +1075,7 @@ async fn send_repair_pull(mesh: &IrohMeshManager, peer: &str) -> anyhow::Result<
             continue;
         }
         for payload in payloads {
-            let bytes = tentaflow_protocol::cbor::encode(&payload)
-                .expect("encode repair pull");
+            let bytes = tentaflow_protocol::cbor::encode(&payload).expect("encode repair pull");
             mesh.send_sync_pull(peer, &bytes).await?;
         }
         return Ok(());
@@ -1092,8 +1097,7 @@ async fn send_snapshot_pull(
         64,
     )?
     .expect("runtime initialized");
-    let bytes = tentaflow_protocol::cbor::encode(&payload)
-        .expect("encode snapshot pull");
+    let bytes = tentaflow_protocol::cbor::encode(&payload).expect("encode snapshot pull");
     mesh.send_sync_snapshot_pull(peer, &bytes).await?;
     Ok(())
 }
@@ -1377,7 +1381,7 @@ fn seed_sql_source(
                 "node",
                 node_id,
                 "sync_receive",
-                Some(1),
+                Some("1"),
             )?;
         } else {
             grant_storage_proxy_target(db, node_id)?;
@@ -1402,7 +1406,7 @@ fn grant_storage_proxy_target(
             "node",
             node_id,
             action,
-            Some(1),
+            Some("1"),
         )?;
     }
     Ok(())
@@ -1456,7 +1460,7 @@ fn grant_source_target(db: &tentaflow_core::db::DbPool, node_id: &str) -> anyhow
         "node",
         node_id,
         "sync_receive",
-        Some(1),
+        Some("1"),
     )?;
     Ok(())
 }
@@ -1473,13 +1477,13 @@ fn grant_core_suite_target(db: &tentaflow_core::db::DbPool, node_id: &str) -> an
             "node",
             node_id,
             "sync_receive",
-            Some(1),
+            Some("1"),
         )?;
     }
     Ok(())
 }
 
-fn core_suite_kinds() -> [CoreSyncResourceKind; 9] {
+fn core_suite_kinds() -> [CoreSyncResourceKind; 8] {
     [
         CoreSyncResourceKind::Organization,
         CoreSyncResourceKind::UserAccount,
@@ -1488,12 +1492,11 @@ fn core_suite_kinds() -> [CoreSyncResourceKind; 9] {
         CoreSyncResourceKind::Role,
         CoreSyncResourceKind::OrgMembership,
         CoreSyncResourceKind::Flow,
-        CoreSyncResourceKind::FlowVersion,
         CoreSyncResourceKind::FlowModelBinding,
     ]
 }
 
-fn core_suite_resources() -> [(CoreSyncResourceKind, &'static str); 9] {
+fn core_suite_resources() -> [(CoreSyncResourceKind, &'static str); 8] {
     [
         (CoreSyncResourceKind::Organization, SUITE_ORG_ID),
         (CoreSyncResourceKind::UserAccount, SUITE_USER_ID),
@@ -1502,7 +1505,6 @@ fn core_suite_resources() -> [(CoreSyncResourceKind, &'static str); 9] {
         (CoreSyncResourceKind::Role, SUITE_ROLE_ID),
         (CoreSyncResourceKind::OrgMembership, "org-default:20101"),
         (CoreSyncResourceKind::Flow, SUITE_FLOW_ID),
-        (CoreSyncResourceKind::FlowVersion, SUITE_FLOW_VERSION_ID),
         (CoreSyncResourceKind::FlowModelBinding, SUITE_BINDING_ID),
     ]
 }
@@ -1529,7 +1531,9 @@ fn core_flow_capture_id(resource_id: &str, name: &str) -> CoreWriteCapture {
         resource_id,
         SqlWriteAction::Insert,
         fields,
-        Some(1),
+        Some("1".to_string()),
+        tentaflow_core::sync::runtime::core_hlc_now(),
+        tentaflow_core::sync::runtime::core_epoch(),
     )
 }
 
@@ -1619,8 +1623,14 @@ fn core_suite_captures() -> Vec<CoreWriteCapture> {
     ));
 
     let mut group_member = BTreeMap::new();
-    group_member.insert("group_id".to_string(), FieldValue::I64(20102));
-    group_member.insert("user_id".to_string(), FieldValue::I64(20101));
+    group_member.insert(
+        "group_id".to_string(),
+        FieldValue::String(SUITE_GROUP_ID.to_string()),
+    );
+    group_member.insert(
+        "user_id".to_string(),
+        FieldValue::String(SUITE_USER_ID.to_string()),
+    );
     captures.push(core_capture_for(
         CoreSyncResourceKind::GroupMember,
         "20102:20101",
@@ -1652,37 +1662,11 @@ fn core_suite_captures() -> Vec<CoreWriteCapture> {
 
     captures.push(core_suite_flow_capture());
 
-    let mut version = BTreeMap::new();
-    version.insert("flow_id".to_string(), FieldValue::I64(20103));
-    version.insert("version_num".to_string(), FieldValue::I64(1));
-    version.insert(
-        "flow_json".to_string(),
-        FieldValue::String(r#"{"nodes":[{"id":"trigger"}]}"#.to_string()),
-    );
-    version.insert(
-        "name".to_string(),
-        FieldValue::String("Process Suite Flow v1".to_string()),
-    );
-    version.insert(
-        "description".to_string(),
-        FieldValue::String("Version synchronized by process test".to_string()),
-    );
-    version.insert(
-        "status".to_string(),
-        FieldValue::String("published".to_string()),
-    );
-    version.insert(
-        "created_by".to_string(),
-        FieldValue::String("process-e2e".to_string()),
-    );
-    captures.push(core_capture_for(
-        CoreSyncResourceKind::FlowVersion,
-        SUITE_FLOW_VERSION_ID,
-        version,
-    ));
-
     let mut binding = BTreeMap::new();
-    binding.insert("flow_id".to_string(), FieldValue::I64(20103));
+    binding.insert(
+        "flow_id".to_string(),
+        FieldValue::String(SUITE_FLOW_ID.to_string()),
+    );
     binding.insert(
         "model_pattern".to_string(),
         FieldValue::String(SUITE_MODEL_PATTERN.to_string()),
@@ -1708,7 +1692,9 @@ fn core_capture_for(
         resource_id,
         SqlWriteAction::Insert,
         fields,
-        Some(1),
+        Some("1".to_string()),
+        tentaflow_core::sync::runtime::core_hlc_now(),
+        tentaflow_core::sync::runtime::core_epoch(),
     )
 }
 
@@ -1745,7 +1731,9 @@ fn core_suite_flow_capture() -> CoreWriteCapture {
         SUITE_FLOW_ID,
         SqlWriteAction::Insert,
         fields,
-        Some(1),
+        Some("1".to_string()),
+        tentaflow_core::sync::runtime::core_hlc_now(),
+        tentaflow_core::sync::runtime::core_epoch(),
     )
 }
 
@@ -1801,7 +1789,7 @@ fn sql_capture(action: SqlWriteAction, name: &str) -> SqlWriteCapture {
         params,
         rows_affected: 1,
         last_insert_id: 1,
-        actor_user_id: Some(7),
+        actor_user_id: Some("7".to_string()),
         created_at_ms: tentaflow_core::sync::runtime::now_ms(),
     }
 }
@@ -1831,7 +1819,7 @@ async fn remote_sql_query(
         addon_id: SNAPSHOT_ADDON_ID.to_string(),
         resource_type: "person".to_string(),
         resource_id: "person-1".to_string(),
-        actor_user_id: Some(7),
+        actor_user_id: Some("7".to_string()),
         kind: StorageProxyRequestKind::SqlQuery {
             query: "SELECT name FROM contacts WHERE id = ?1".to_string(),
             params: vec![StorageValueWire::I64(1)],
@@ -1871,7 +1859,7 @@ async fn remote_sql_exec(
         addon_id: SNAPSHOT_ADDON_ID.to_string(),
         resource_type: "person".to_string(),
         resource_id: "person-1".to_string(),
-        actor_user_id: Some(7),
+        actor_user_id: Some("7".to_string()),
         kind: StorageProxyRequestKind::SqlExec {
             query: "UPDATE contacts SET name = ?1 WHERE id = ?2".to_string(),
             params: vec![
@@ -1904,7 +1892,7 @@ async fn wait_for_flow_name(
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if let Some(flow) = repository::get_flow(db, FLOW_ID.parse()?)? {
+        if let Some(flow) = repository::get_flow(db, FLOW_ID)? {
             if flow.name == expected_name {
                 return Ok(());
             }
@@ -2002,20 +1990,20 @@ fn core_suite_status(db: &tentaflow_core::db::DbPool) -> anyhow::Result<String> 
     let username = conn
         .query_row(
             "SELECT username FROM user_accounts WHERE id = ?1",
-            rusqlite::params![SUITE_USER_ID.parse::<i64>()?],
+            rusqlite::params![SUITE_USER_ID],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
     let group_name = conn
         .query_row(
             "SELECT name FROM user_groups WHERE id = ?1",
-            rusqlite::params![SUITE_GROUP_ID.parse::<i64>()?],
+            rusqlite::params![SUITE_GROUP_ID],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
     let group_count = conn.query_row(
         "SELECT COUNT(*) FROM group_members WHERE group_id = ?1 AND user_id = ?2",
-        rusqlite::params![20102_i64, 20101_i64],
+        rusqlite::params![SUITE_GROUP_ID, SUITE_USER_ID],
         |row| row.get::<_, i64>(0),
     )?;
     let role_name = conn
@@ -2033,21 +2021,14 @@ fn core_suite_status(db: &tentaflow_core::db::DbPool) -> anyhow::Result<String> 
     let flow_name = conn
         .query_row(
             "SELECT name FROM flows WHERE id = ?1",
-            rusqlite::params![SUITE_FLOW_ID.parse::<i64>()?],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let version_name = conn
-        .query_row(
-            "SELECT name FROM flow_versions WHERE id = ?1",
-            rusqlite::params![SUITE_FLOW_VERSION_ID.parse::<i64>()?],
+            rusqlite::params![SUITE_FLOW_ID],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
     let binding_pattern = conn
         .query_row(
             "SELECT model_pattern FROM flow_model_bindings WHERE id = ?1",
-            rusqlite::params![SUITE_BINDING_ID.parse::<i64>()?],
+            rusqlite::params![SUITE_BINDING_ID],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -2058,7 +2039,6 @@ fn core_suite_status(db: &tentaflow_core::db::DbPool) -> anyhow::Result<String> 
         && role_name.as_deref() == Some("Process Sync Role")
         && membership_count == 1
         && flow_name.as_deref() == Some("Process Suite Flow")
-        && version_name.as_deref() == Some("Process Suite Flow v1")
         && binding_pattern.as_deref() == Some(SUITE_MODEL_PATTERN)
     {
         return Ok("complete".to_string());
@@ -2066,14 +2046,14 @@ fn core_suite_status(db: &tentaflow_core::db::DbPool) -> anyhow::Result<String> 
     Ok(format!(
         "org={org_name:?} user={username:?} group={group_name:?} group_count={group_count} \
          role={role_name:?} membership_count={membership_count} flow={flow_name:?} \
-         version={version_name:?} binding={binding_pattern:?}"
+         binding={binding_pattern:?}"
     ))
 }
 
 async fn assert_no_flow(db: &tentaflow_core::db::DbPool) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
-        if let Some(flow) = repository::get_flow(db, FLOW_ID.parse()?)? {
+        if let Some(flow) = repository::get_flow(db, FLOW_ID)? {
             anyhow::bail!("flow unexpectedly materialized: {}", flow.name);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -49,14 +49,17 @@ fn require_user_id(ctx: &HandlerContext) -> Result<[u8; 16], ProtocolError> {
     }
 }
 
-/// Konwertuje 16-bajtowe user_id (z markerem 0xFF) do i64 dla DB query.
-pub(super) fn user_id_to_i64(bytes: &[u8; 16]) -> Option<i64> {
-    if bytes[0] != 0xFF || bytes[1..8].iter().any(|&b| b != 0) {
-        return None;
-    }
-    let mut le = [0u8; 8];
-    le.copy_from_slice(&bytes[8..]);
-    Some(i64::from_le_bytes(le))
+/// Session user_id travels the wire as 16 raw UUID bytes; decode them back into
+/// the canonical UUID string used by every `user_accounts`-keyed DB query.
+pub(crate) fn user_id_to_uuid(bytes: &[u8; 16]) -> String {
+    uuid::Uuid::from_bytes(*bytes).to_string()
+}
+
+/// Packs a `user_accounts` UUID string into the 16-byte session/wire form.
+fn uuid_to_user_id_bytes(id: &str) -> Result<[u8; 16], ProtocolError> {
+    uuid::Uuid::parse_str(id)
+        .map(|u| *u.as_bytes())
+        .map_err(|_| ProtocolError::internal("user id is not a valid UUID"))
 }
 
 fn db_err(e: impl std::fmt::Display) -> ProtocolError {
@@ -83,7 +86,7 @@ fn flow_write_err(e: anyhow::Error) -> ProtocolError {
 /// aktywnych WS klientow (Audit screen otrzymuje live update).
 fn audit(
     ctx: &HandlerContext,
-    user_id: Option<i64>,
+    user_id: Option<&str>,
     event_kind: &str,
     resource: Option<&str>,
     message: Option<&str>,
@@ -224,17 +227,17 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             .map_err(db_err)?
             .ok_or_else(|| ProtocolError::internal("jwt_secret not configured"))?;
 
-    let jwt = auth::generate_jwt(user.id, &user.username, &jwt_secret, 24)
+    let jwt = auth::generate_jwt(&user.id, &user.username, &jwt_secret, 24)
         .map_err(|e| ProtocolError::internal(format!("jwt generation failed: {}", e)))?;
 
     // Zaktualizuj last_login_at (best effort — log w razie bledu, nie failuj logowania).
-    if let Err(e) = repository::update_user_last_login(&ctx.state.db, user.id) {
-        tracing::warn!("update_user_last_login failed: {}", e);
+    if let Err(e) = repository::update_user_account_last_login(&ctx.state.db, &user.id) {
+        tracing::warn!("update_user_account_last_login failed: {}", e);
     }
 
     let _ = repository::log_audit(
         &ctx.state.db,
-        Some(user.id),
+        Some(&user.id),
         None,
         "user.login",
         Some("auth"),
@@ -245,10 +248,7 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
 
     let role = if user.is_admin { "admin" } else { "user" };
 
-    // Pakuj user_id do 16-bajtowego formatu z markerem 0xFF (patrz ws_binary).
-    let mut user_id_bytes = [0u8; 16];
-    user_id_bytes[0] = 0xFF;
-    user_id_bytes[8..].copy_from_slice(&(user.id as u64).to_le_bytes());
+    let user_id_bytes = uuid_to_user_id_bytes(&user.id)?;
 
     Ok(MessageBody::AuthLoginResponseBody(AuthLoginResponse {
         jwt,
@@ -262,10 +262,9 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
 #[observed]
 pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let user_id_bytes = require_user_id(ctx)?;
-    let user_id = user_id_to_i64(&user_id_bytes)
-        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    let user_id = user_id_to_uuid(&user_id_bytes);
 
-    let user = repository::get_user_account_by_id(&ctx.state.db, user_id)
+    let user = repository::get_user_account_by_id(&ctx.state.db, &user_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("user account not found"))?;
 
@@ -292,10 +291,9 @@ pub fn me_preferences_get(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let user_id_bytes = require_user_id(ctx)?;
-    let user_id = user_id_to_i64(&user_id_bytes)
-        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    let user_id = user_id_to_uuid(&user_id_bytes);
     let language =
-        repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
+        repository::get_user_preferred_language(&ctx.state.db, &user_id).map_err(db_err)?;
     Ok(MessageBody::MePreferencesGetResponseBody(
         tentaflow_protocol::MePreferencesGetResponse { language },
     ))
@@ -317,15 +315,14 @@ pub fn me_preferences_update(
         }
     };
     let user_id_bytes = require_user_id(ctx)?;
-    let user_id = user_id_to_i64(&user_id_bytes)
-        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
-    if repository::set_user_preferred_language(&ctx.state.db, user_id, payload.language.as_deref())
+    let user_id = user_id_to_uuid(&user_id_bytes);
+    if repository::set_user_preferred_language(&ctx.state.db, &user_id, payload.language.as_deref())
         .is_err()
     {
         return Err(ProtocolError::bad_request("unsupported language code"));
     }
     let language =
-        repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
+        repository::get_user_preferred_language(&ctx.state.db, &user_id).map_err(db_err)?;
     Ok(MessageBody::MePreferencesUpdateResponseBody(
         tentaflow_protocol::MePreferencesUpdateResponse { language },
     ))
@@ -384,10 +381,10 @@ pub fn api_key_create(
     let id = repository::create_api_key(&ctx.state.db, &key_hash, &key_prefix, &payload.name, 60)
         .map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "apikey.create",
         Some(&format!("apikey:{}", id)),
@@ -429,10 +426,10 @@ pub fn api_key_revoke(
 
     let affected = repository::delete_api_key(&ctx.state.db, target.id).map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "apikey.delete",
         Some(&format!("apikey:{}", target.id)),
@@ -462,10 +459,8 @@ pub fn model_list_request(
             let role_str = role.clone().unwrap_or_else(|| "user".to_string());
             if role_str == "admin" {
                 None
-            } else if let Some(i64_id) = user_id_to_i64(user_id) {
-                Some((i64_id, role_str))
             } else {
-                None
+                Some((user_id_to_uuid(user_id), role_str))
             }
         }
         _ => None,
@@ -481,7 +476,7 @@ pub fn model_list_request(
                 &ctx.state.db,
                 "model",
                 &m.model_name,
-                *uid,
+                uid,
                 role,
             ),
             None => true,
@@ -637,10 +632,10 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         crate::services_repo::services::delete(&conn, service_id).map_err(db_err)?;
     }
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "model.delete",
         Some(&format!("model:{}", service_id)),
@@ -738,13 +733,10 @@ pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
 #[policy(UserSession)]
 #[observed]
 pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let flow_id_str = match req {
+    let flow_id = match req {
         MessageBody::FlowDetailRequest { flow_id } => flow_id,
         _ => return Err(ProtocolError::bad_request("expected FlowDetailRequest")),
     };
-    let flow_id: i64 = flow_id_str
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
 
     let flow = repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
@@ -783,7 +775,7 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
             .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
     }
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let params = db::models::FlowParams {
         name: &payload.name,
         description: payload.description.as_deref(),
@@ -792,14 +784,14 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         flow_json: &payload.graph_json,
         status: "active",
         published_model_name: payload.published_model_name.as_deref(),
-        actor_user_id: user_id,
+        actor_user_id: user_id.as_deref(),
     };
     let id = repository::create_flow(&ctx.state.db, &params).map_err(flow_write_err)?;
     ctx.state.router.rebuild_catalog();
 
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "flow.create",
         Some(&format!("flow:{}", id)),
@@ -817,13 +809,10 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 #[policy(PowerUser)]
 #[observed]
 pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let flow_id_str = match req {
+    let flow_id = match req {
         MessageBody::FlowDeleteRequest { flow_id } => flow_id,
         _ => return Err(ProtocolError::bad_request("expected FlowDeleteRequest")),
     };
-    let flow_id: i64 = flow_id_str
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
 
     // Existence check przed delete (delete_flow nie raisuje na missing).
     let exists = repository::get_flow(&ctx.state.db, flow_id)
@@ -838,10 +827,10 @@ pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     // next alias mutation or supervisor tick.
     ctx.state.router.rebuild_catalog();
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "flow.delete",
         Some(&format!("flow:{}", flow_id)),
@@ -860,7 +849,7 @@ pub fn flow_executions_list(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let flow_id_str = match req {
+    let flow_id = match req {
         MessageBody::FlowExecutionsListRequest { flow_id } => flow_id,
         _ => {
             return Err(ProtocolError::bad_request(
@@ -868,9 +857,6 @@ pub fn flow_executions_list(
             ));
         }
     };
-    let flow_id: i64 = flow_id_str
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
 
     let execs =
         repository::list_flow_executions_for_flow(&ctx.state.db, flow_id, 100).map_err(db_err)?;
@@ -903,10 +889,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         _ => return Err(ProtocolError::bad_request("expected FlowUpdateRequestBody")),
     };
 
-    let flow_id: i64 = payload
-        .flow_id
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
+    let flow_id = &payload.flow_id;
 
     let existing = repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
@@ -950,8 +933,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     }
 
     // Audyt + podpis snapshotu w flow_versions.
-    let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let created_by = user_id_opt.map(|u| u.to_string());
+    let user_id_opt = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
 
     let params = db::models::FlowParams {
         name: &new_name,
@@ -961,7 +943,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         flow_json: &new_flow_json,
         status: &new_status,
         published_model_name: new_published.as_deref(),
-        actor_user_id: user_id_opt,
+        actor_user_id: user_id_opt.as_deref(),
     };
 
     match repository::update_flow_with_snapshot(
@@ -969,7 +951,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         flow_id,
         existing.version,
         &params,
-        created_by.as_deref(),
+        user_id_opt.as_deref(),
     ) {
         Ok(()) => {}
         Err(e) if e.to_string().contains("CONFLICT") => {
@@ -984,7 +966,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 
     audit(
         ctx,
-        user_id_opt,
+        user_id_opt.as_deref(),
         "flow.update",
         Some(&format!("flow:{}", flow_id)),
         Some(&new_name),
@@ -1106,10 +1088,7 @@ pub fn flow_version_list(
             ));
         }
     };
-    let flow_id: i64 = payload
-        .flow_id
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
+    let flow_id = &payload.flow_id;
 
     if repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
@@ -1152,14 +1131,8 @@ pub fn flow_version_get(
             ));
         }
     };
-    let flow_id: i64 = payload
-        .flow_id
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
-    let version_id: i64 = payload
-        .version_id
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("version_id must be integer"))?;
+    let flow_id = &payload.flow_id;
+    let version_id = &payload.version_id;
 
     if repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
@@ -1203,14 +1176,8 @@ pub fn flow_version_restore(
             ));
         }
     };
-    let flow_id: i64 = payload
-        .flow_id
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
-    let version_id: i64 = payload
-        .version_id
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("version_id must be integer"))?;
+    let flow_id = &payload.flow_id;
+    let version_id = &payload.version_id;
 
     let existing = repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
@@ -1221,8 +1188,7 @@ pub fn flow_version_restore(
 
     let flow_json = version.flow_json.as_deref().unwrap_or("");
     validate_flow_json_str(ctx, flow_json)?;
-    let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let created_by = user_id_opt.map(|u| u.to_string());
+    let user_id_opt = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     // Restoring an old version keeps whatever publish name the live flow
     // currently advertises — old versions never tracked the catalog field.
     let params = db::models::FlowParams {
@@ -1233,7 +1199,7 @@ pub fn flow_version_restore(
         flow_json,
         status: version.status.as_deref().unwrap_or("draft"),
         published_model_name: existing.published_model_name.as_deref(),
-        actor_user_id: user_id_opt,
+        actor_user_id: user_id_opt.as_deref(),
     };
 
     match repository::update_flow_with_snapshot(
@@ -1241,7 +1207,7 @@ pub fn flow_version_restore(
         flow_id,
         existing.version,
         &params,
-        created_by.as_deref(),
+        user_id_opt.as_deref(),
     ) {
         Ok(()) => {}
         Err(e) if e.to_string().contains("CONFLICT") => {
@@ -1255,7 +1221,7 @@ pub fn flow_version_restore(
 
     audit(
         ctx,
-        user_id_opt,
+        user_id_opt.as_deref(),
         "flow.version.restore",
         Some(&format!("flow:{}", flow_id)),
         Some(&format!("version:{}", version_id)),
@@ -1463,10 +1429,10 @@ pub fn cluster_create(
     )
     .map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "cluster.create",
         Some(&format!("cluster:{}", cluster_id)),
         Some(&payload.name),
@@ -1527,10 +1493,10 @@ pub fn cluster_update(
     )
     .map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "cluster.update",
         Some(&format!("cluster:{}", payload.cluster_id)),
@@ -1571,10 +1537,10 @@ pub fn cluster_delete(
 
     repository::delete_cluster(&ctx.state.db, &payload.cluster_id).map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "cluster.delete",
         Some(&format!("cluster:{}", payload.cluster_id)),
@@ -1623,10 +1589,10 @@ pub fn cluster_add_member(
     )
     .map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "cluster.add_member",
         Some(&format!(
@@ -1669,10 +1635,10 @@ pub fn cluster_remove_member(
     repository::remove_cluster_member(&ctx.state.db, &payload.cluster_id, &payload.node_id)
         .map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "cluster.remove_member",
         Some(&format!(
@@ -1757,10 +1723,10 @@ pub fn mesh_pair_init(
         chrono::Utc::now().timestamp()
     );
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "mesh.pair_init",
         Some(&format!("node:{}", hex::encode(&payload.node_id[..8]))),
@@ -1829,7 +1795,7 @@ pub fn settings_update(
     };
 
     let mut applied = 0u32;
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     for entry in &payload.entries {
         let result = if entry.is_secret && repository::is_shared_secret_setting_key(&entry.key) {
             repository::set_shared_secret_setting_secure(
@@ -1837,7 +1803,7 @@ pub fn settings_update(
                 &entry.key,
                 &entry.value,
                 &ctx.state.settings_cipher,
-                user_id,
+                user_id.as_deref(),
             )
         } else if entry.is_secret {
             repository::set_setting_secure(
@@ -1857,7 +1823,7 @@ pub fn settings_update(
 
     let _ = repository::log_audit(
         &ctx.state.db,
-        user_id,
+        user_id.as_deref(),
         None,
         "settings.update",
         Some("settings"),
@@ -1957,14 +1923,14 @@ pub fn sso_provider_create(
         &encrypted_secret,
         &payload.discovery_url,
         payload.auto_create_users,
-        payload.default_group_id,
+        payload.default_group_id.as_deref(),
     )
     .map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "sso.provider.create",
         Some(&payload.name),
         Some(&format!("type={}", payload.provider_type)),
@@ -2002,8 +1968,14 @@ pub fn sso_provider_delete(
         .unwrap_or_default();
     repository::delete_sso_provider(&ctx.state.db, payload.id).map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    audit(ctx, user_id, "sso.provider.delete", Some(&name), None);
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        "sso.provider.delete",
+        Some(&name),
+        None,
+    );
 
     Ok(MessageBody::SsoProviderDeleteResponseBody(
         tentaflow_protocol::SsoProviderDeleteResponse {
@@ -3149,7 +3121,7 @@ fn catalog_snapshot_to_wire(
                 flow_id,
                 published_name,
             } => CatalogEntryKindWire::Flow {
-                flow_id: *flow_id,
+                flow_id: flow_id.clone(),
                 published_name: published_name.clone(),
             },
             CatalogEntryKind::Alias {
@@ -3256,10 +3228,10 @@ pub fn model_alias_create(
         &ctx.state.quic_mesh,
     );
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "model_alias_create",
         Some(&payload.alias),
         Some(&format!("target={}", payload.target_model)),
@@ -3310,10 +3282,10 @@ pub fn model_alias_update(
         &ctx.state.quic_mesh,
     );
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "model_alias_update",
         Some(&payload.alias),
         Some(&format!("target={}", payload.target_model)),
@@ -3355,10 +3327,10 @@ pub fn model_alias_delete(
         &ctx.state.quic_mesh,
     );
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "model_alias_delete",
         Some(&id.to_string()),
         None,
@@ -3496,7 +3468,7 @@ pub async fn service_manifest_deploy(
     );
 
     use crate::services::manifest::runtime_validate::{
-        DeployValidationError, validate_deploy_target,
+        validate_deploy_target, DeployValidationError,
     };
     validate_deploy_target(&payload.engine_id, &payload.deploy_method).map_err(
         |err| match err {
@@ -3514,10 +3486,10 @@ pub async fn service_manifest_deploy(
         },
     )?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "service.manifest.deploy",
         Some(&payload.engine_id),
         Some(&format!(
@@ -3558,7 +3530,7 @@ pub async fn service_manifest_deploy(
         &user_config,
         &ctx.state.db,
         ctx.state.local_node_id.as_ref(),
-        user_id,
+        user_id.as_deref(),
         None,
     )
     .map_err(|e| ProtocolError::internal(e.to_string()))?;
@@ -3596,11 +3568,10 @@ pub async fn service_manifest_deploy(
                                 tentaflow_protocol::ServiceChange::Updated(info.clone()),
                             );
                             if let Some(qm) = quic_mesh_status.as_ref() {
-                                let payload =
-                                    tentaflow_protocol::mesh::MeshServicesUpdatePayload {
-                                        from_node_id: local_node_id_status.clone(),
-                                        change: tentaflow_protocol::ServiceChange::Updated(info),
-                                    };
+                                let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                                    from_node_id: local_node_id_status.clone(),
+                                    change: tentaflow_protocol::ServiceChange::Updated(info),
+                                };
                                 if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
                                     let _ = qm
                                         .broadcast_ufp2_to_trusted(
@@ -3737,13 +3708,11 @@ pub async fn service_manifest_deploy(
                     error_message: err.to_string(),
                     duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
                 });
-                if let Ok(Some(info)) =
-                    crate::services::snapshot_builder::build_one(
-                        &db_clone,
-                        job_task.service_id,
-                        &local_node_id_task,
-                    )
-                {
+                if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+                    &db_clone,
+                    job_task.service_id,
+                    &local_node_id_task,
+                ) {
                     mesh_services_registry_task.apply_local_change(
                         &local_node_id_task,
                         tentaflow_protocol::ServiceChange::Updated(info.clone()),
@@ -3875,9 +3844,9 @@ pub async fn deploy_vllm_recommend(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     use crate::deploy::vram_calculator::{
-        AutoFitOutcome, AutoFitRequest, analyze_gpu_compatibility, auto_fit_config,
-        build_vllm_args_string, estimate_vllm_vram, fetch_hf_config,
-        max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config_with_override,
+        analyze_gpu_compatibility, auto_fit_config, build_vllm_args_string, estimate_vllm_vram,
+        fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
+        parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest,
     };
 
     let payload = match req {
@@ -3958,14 +3927,17 @@ pub async fn deploy_vllm_recommend(
         error: fit_error,
     } = fit;
 
+    // Over-budget NIE jest twardym bledem requestu — auto_fit zwraca uzywalny
+    // `applied` (minimalny ctx/seqs), wiec liczymy estymacje i oddajemy
+    // kalkulator z `fits=false` + ostrzezeniem. Inaczej kafelek nie mieszczacy
+    // sie w VRAM gubil caly kalkulator (user nie widzial rozkladu ani nie mogl
+    // zmienic quant/ctx/GPU zeby go dopasowac).
+    let mut estimate = estimate_vllm_vram(&spec, &applied_input);
     if let Some(err) = fit_error {
-        return Err(ProtocolError::new(
-            tentaflow_protocol::ProtocolErrorCode::BadRequest,
-            err,
-        ));
+        estimate.fits_per_gpu = false;
+        estimate.fits_total = false;
+        estimate.warnings.push(err);
     }
-
-    let estimate = estimate_vllm_vram(&spec, &applied_input);
     let max_supported_model_len = max_context_for_budget(&spec, &applied_input);
     let max_supported_num_seqs = max_concurrent_seqs_for_budget(&spec, &applied_input);
     let recommended_vllm_args = build_vllm_args_string(&spec, &applied_input);
@@ -4107,7 +4079,7 @@ pub async fn engine_recommend(
                 ));
             }
             use crate::deploy::vram_calculator::{
-                AutoFitRequest, auto_fit_config, fetch_hf_config, parse_hf_config_with_override,
+                auto_fit_config, fetch_hf_config, parse_hf_config_with_override, AutoFitRequest,
             };
 
             let client = reqwest::Client::builder()
@@ -4334,7 +4306,7 @@ fn deployment_row_to_summary(
         finished_at: r.finished_at.unwrap_or_default(),
         error_message: r.error_message.unwrap_or_default(),
         log_tail: r.log_tail,
-        user_id: r.user_id.unwrap_or(0),
+        user_id: r.user_id.unwrap_or_default(),
     }
 }
 
@@ -4383,7 +4355,7 @@ pub fn deployment_list(
         &ctx.session,
         SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
     );
-    let uid = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let uid = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let filter_user_id = if payload.only_mine || !is_admin {
         uid
     } else {
@@ -4408,7 +4380,7 @@ pub fn deployment_list(
         &ctx.state.db,
         engine_id_filter,
         status_filter,
-        filter_user_id,
+        filter_user_id.as_deref(),
         limit,
     )
     .map_err(db_err)?;
@@ -4429,8 +4401,7 @@ pub fn deployment_list(
 #[observed]
 pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let user_id_bytes = require_user_id(ctx)?;
-    let user_id = user_id_to_i64(&user_id_bytes)
-        .ok_or_else(|| ProtocolError::internal("nie udalo sie zdekodowac user_id z sesji"))?;
+    let user_id = user_id_to_uuid(&user_id_bytes);
     let is_admin = matches!(
         &ctx.session,
         SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
@@ -4441,7 +4412,7 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     for a in rows.into_iter() {
         // Non-admin: filtruj po widocznosci (admin_only + group-based).
         if !is_admin
-            && !repository::is_addon_visible_to_user(&ctx.state.db, &a.addon_id, user_id)
+            && !repository::is_addon_visible_to_user(&ctx.state.db, &a.addon_id, &user_id)
                 .map_err(db_err)?
         {
             continue;
@@ -4491,7 +4462,7 @@ fn proto_filters_to_db(
     f: &tentaflow_protocol::AuditLogFilters,
 ) -> crate::db::models::AuditLogFilters {
     crate::db::models::AuditLogFilters {
-        user_id: f.user_id,
+        user_id: f.user_id.clone(),
         addon_id: f.addon_id.clone(),
         action: f.action.clone(),
         from_date: f.from_date.clone(),
@@ -4629,13 +4600,10 @@ pub fn scheduler_job_upsert(
             ));
         }
     };
-    let user_id = require_user_id(ctx)
-        .ok()
-        .and_then(|b| user_id_to_i64(&b))
-        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
     let input: crate::scheduler::UpsertJobRequest = serde_json::from_str(&payload.job_json)
         .map_err(|e| ProtocolError::bad_request(format!("invalid scheduler job json: {}", e)))?;
-    let job = crate::scheduler::upsert_job(&ctx.state.db, input, user_id).map_err(db_err)?;
+    let job = crate::scheduler::upsert_job(&ctx.state.db, input, &user_id).map_err(db_err)?;
     let job_json = serde_json::to_string(&job)
         .map_err(|e| ProtocolError::internal(format!("scheduler job encode failed: {}", e)))?;
     Ok(MessageBody::SchedulerBody(
@@ -4688,11 +4656,8 @@ pub async fn scheduler_job_run_now(
         .addon_manager
         .clone()
         .ok_or_else(|| ProtocolError::internal("AddonManager unavailable"))?;
-    let user_id = require_user_id(ctx)
-        .ok()
-        .and_then(|b| user_id_to_i64(&b))
-        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
-    let run = crate::scheduler::run_now(&ctx.state.db, addon_manager, &payload.job_id, user_id)
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let run = crate::scheduler::run_now(&ctx.state.db, addon_manager, &payload.job_id, &user_id)
         .await
         .map_err(db_err)?;
     let run_json = serde_json::to_string(&run)
@@ -4777,7 +4742,7 @@ pub fn audit_log_export(
             "{},{},{},{},{},{},{},{},{}\n",
             e.id,
             e.timestamp,
-            e.user_id.map(|id| id.to_string()).unwrap_or_default(),
+            e.user_id.as_deref().unwrap_or(""),
             e.addon_id.as_deref().unwrap_or(""),
             escape_csv(&e.action),
             e.resource.as_deref().map(escape_csv).unwrap_or_default(),
@@ -4787,10 +4752,10 @@ pub fn audit_log_export(
         ));
     }
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "audit.export",
         None,
         Some(&format!("rows={}", filtered.len())),
@@ -4826,10 +4791,10 @@ pub fn audit_log_cleanup(
     let deleted =
         repository::cleanup_audit_logs(&ctx.state.db, payload.keep_days as i64).map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "audit.cleanup",
         None,
         Some(&format!(
@@ -4853,7 +4818,7 @@ pub fn audit_log_cleanup(
 
 fn user_to_info(
     u: crate::db::models::UserAccount,
-    group_ids: Vec<i64>,
+    group_ids: Vec<String>,
 ) -> tentaflow_protocol::UserInfo {
     tentaflow_protocol::UserInfo {
         id: u.id,
@@ -4892,7 +4857,7 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             let users: Vec<_> = rows
                 .into_iter()
                 .map(|u| {
-                    let gs = repository::get_user_groups(db, u.id)
+                    let gs = repository::get_user_groups(db, &u.id)
                         .ok()
                         .unwrap_or_default()
                         .into_iter()
@@ -4904,10 +4869,10 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             P::ResListUsers { users }
         }
         P::ReqGetUser { user_id } => {
-            let u = repository::get_user_account_by_id(db, *user_id)
+            let u = repository::get_user_account_by_id(db, user_id)
                 .map_err(db_err)?
                 .ok_or_else(|| ProtocolError::not_found("user"))?;
-            let gs = repository::get_user_groups(db, *user_id)
+            let gs = repository::get_user_groups(db, user_id)
                 .map_err(db_err)?
                 .into_iter()
                 .map(|g| g.id)
@@ -4928,9 +4893,9 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 .map_err(|e| iam_err(anyhow::anyhow!("hash: {}", e)))?;
             let user_id = repository::create_user_account(db, username, &hash, display_name, email)
                 .map_err(db_err)?;
-            repository::set_user_role(db, user_id, role).map_err(iam_err)?;
+            repository::set_user_role(db, &user_id, role).map_err(iam_err)?;
             for gid in group_ids {
-                let _ = repository::add_user_to_group(db, *gid, user_id);
+                let _ = repository::add_user_to_group(db, gid, &user_id);
             }
             P::ResCreateUser { user_id }
         }
@@ -4941,28 +4906,29 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             is_active,
             role,
         } => {
-            repository::update_user_account(db, *user_id, display_name, email, *is_active)
+            repository::update_user_account(db, user_id, display_name, email, *is_active)
                 .map_err(db_err)?;
-            repository::set_user_role(db, *user_id, role).map_err(iam_err)?;
+            repository::set_user_role(db, user_id, role).map_err(iam_err)?;
             P::ResOk
         }
         P::ReqDeleteUser { user_id } => {
-            repository::delete_user_account(db, *user_id).map_err(db_err)?;
+            repository::delete_user_account(db, user_id).map_err(db_err)?;
             P::ResOk
         }
         P::ReqSetUserGroups { user_id, group_ids } => {
             // Prosty diff — remove z nieobecnych, add brakujace.
-            let current: std::collections::HashSet<i64> = repository::get_user_groups(db, *user_id)
-                .map_err(db_err)?
-                .into_iter()
-                .map(|g| g.id)
-                .collect();
-            let target: std::collections::HashSet<i64> = group_ids.iter().copied().collect();
+            let current: std::collections::HashSet<String> =
+                repository::get_user_groups(db, user_id)
+                    .map_err(db_err)?
+                    .into_iter()
+                    .map(|g| g.id)
+                    .collect();
+            let target: std::collections::HashSet<String> = group_ids.iter().cloned().collect();
             for gid in current.difference(&target) {
-                let _ = repository::remove_user_from_group(db, *gid, *user_id);
+                let _ = repository::remove_user_from_group(db, gid, user_id);
             }
             for gid in target.difference(&current) {
-                let _ = repository::add_user_to_group(db, *gid, *user_id);
+                let _ = repository::add_user_to_group(db, gid, user_id);
             }
             P::ResOk
         }
@@ -4972,7 +4938,7 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         } => {
             let hash = crate::crypto::hash_password(new_password)
                 .map_err(|e| iam_err(anyhow::anyhow!("hash: {}", e)))?;
-            repository::update_user_account_password(db, *user_id, &hash).map_err(db_err)?;
+            repository::update_user_account_password(db, user_id, &hash).map_err(db_err)?;
             P::ResOk
         }
 
@@ -4982,7 +4948,7 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             let infos: Vec<_> = groups
                 .into_iter()
                 .map(|g| {
-                    let count = repository::list_group_members(db, g.id)
+                    let count = repository::list_group_members(db, &g.id)
                         .ok()
                         .map(|m| m.len() as u32)
                         .unwrap_or(0);
@@ -5005,19 +4971,19 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             name,
             description,
         } => {
-            repository::update_group(db, *group_id, name, description).map_err(db_err)?;
+            repository::update_group(db, group_id, name, description).map_err(db_err)?;
             P::ResOk
         }
         P::ReqDeleteGroup { group_id } => {
-            repository::delete_group(db, *group_id).map_err(db_err)?;
+            repository::delete_group(db, group_id).map_err(db_err)?;
             P::ResOk
         }
         P::ReqGroupMembers { group_id } => {
-            let rows = repository::list_group_members(db, *group_id).map_err(db_err)?;
+            let rows = repository::list_group_members(db, group_id).map_err(db_err)?;
             let members: Vec<_> = rows
                 .into_iter()
                 .map(|u| {
-                    let gs = repository::get_user_groups(db, u.id)
+                    let gs = repository::get_user_groups(db, &u.id)
                         .ok()
                         .unwrap_or_default()
                         .into_iter()
@@ -5042,7 +5008,7 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 resource_type,
                 resource_id,
                 subject_type,
-                *subject_id,
+                subject_id,
                 access_level,
             )
             .map_err(iam_err)?;
@@ -5059,7 +5025,7 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 resource_type,
                 resource_id,
                 subject_type,
-                *subject_id,
+                subject_id,
             )
             .map_err(db_err)?;
             P::ResOk
@@ -5088,7 +5054,7 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             subject_id,
         } => {
             let rows =
-                repository::resource_permissions::list_for_subject(db, subject_type, *subject_id)
+                repository::resource_permissions::list_for_subject(db, subject_type, subject_id)
                     .map_err(db_err)?;
             let entries = rows
                 .into_iter()
@@ -5218,8 +5184,7 @@ pub fn addon_ui_dispatch(
     // Visibility: admin_only / group-restricted addons must not appear in
     // the launcher for unauthorized users.
     let user_id_bytes = require_user_id(ctx)?;
-    let user_id = user_id_to_i64(&user_id_bytes)
-        .ok_or_else(|| ProtocolError::internal("nie udalo sie zdekodowac user_id z sesji"))?;
+    let user_id = user_id_to_uuid(&user_id_bytes);
     let is_admin = matches!(
         &ctx.session,
         SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
@@ -5228,7 +5193,7 @@ pub fn addon_ui_dispatch(
         if is_admin {
             return Ok(true);
         }
-        repository::is_addon_visible_to_user(&ctx.state.db, addon_id, user_id).map_err(db_err)
+        repository::is_addon_visible_to_user(&ctx.state.db, addon_id, &user_id).map_err(db_err)
     };
 
     let res = match payload {
@@ -5426,10 +5391,10 @@ pub fn sync_conflict_dispatch(
             )
             .map_err(|e| ProtocolError::internal(format!("sync conflict resolve failed: {}", e)))?
             .ok_or_else(|| ProtocolError::internal("sync runtime unavailable"))?;
-            let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+            let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
             audit(
                 ctx,
-                user_id,
+                user_id.as_deref(),
                 "sync.conflict.resolve",
                 Some(&request.operation_id),
                 Some(&result.resolution),
@@ -5589,7 +5554,11 @@ fn parse_bool_setting(raw: &Option<String>, default: bool) -> bool {
 }
 
 fn bool_to_setting(v: bool) -> &'static str {
-    if v { "1" } else { "0" }
+    if v {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn load_network_config(
@@ -5771,10 +5740,10 @@ pub fn network_dispatch(
             )
             .map_err(db_err)?;
 
-            let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+            let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
             audit(
                 ctx,
-                user_id,
+                user_id.as_deref(),
                 "mesh.network_config.update",
                 Some("mesh.network_config"),
                 Some(&format!(
@@ -6133,10 +6102,10 @@ pub async fn service_delete(
     // a 1s lag here causes confusing GUI state.
     ctx.state.router.rebuild_catalog();
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "service.delete",
         Some(&svc.engine_id),
         Some(&format!(
@@ -6201,10 +6170,10 @@ pub async fn service_pin(
         .map_err(db_err)?;
     drop(conn);
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "service.pin",
         None,
         Some(&format!(
@@ -6306,10 +6275,10 @@ pub async fn service_pause(
             .map_err(db_err)?;
     }
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "service.pause",
         None,
         Some(&format!(
@@ -6462,10 +6431,10 @@ pub async fn service_start(
         }
     };
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "service.start",
         Some(&svc.engine_id),
         Some(&format!(
@@ -6707,10 +6676,10 @@ pub async fn service_update(
         }
     }
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
-        user_id,
+        user_id.as_deref(),
         "service.update",
         Some(&svc.engine_id),
         Some(&format!(
@@ -6749,9 +6718,9 @@ pub async fn service_vram_hint(
     // Mesh forward NIE jest zaimplementowany dla VramHint — wymagałby
     // proxy nvidia-smi przez QUIC. Local only na razie. `node_id` ignored.
     let exclude_pids: Vec<u32> = Vec::new(); // exclude_service_id mapping na PID
-    // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
-    // własny serwis zwykle nie liczy się jako zaskakujący duży
-    // konsument GPU bo jest dopiero startowany lub stopped.
+                                             // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
+                                             // własny serwis zwykle nie liczy się jako zaskakujący duży
+                                             // konsument GPU bo jest dopiero startowany lub stopped.
     let snapshot =
         crate::services::gpu_snapshot::collect_vram_snapshot(payload.gpu_index, &exclude_pids)
             .await;
@@ -6873,11 +6842,11 @@ mod catalog_list_tests {
         }
     }
 
-    fn flow_entry(id: &str, flow_id: i64) -> CatalogEntry {
+    fn flow_entry(id: &str, flow_id: &str) -> CatalogEntry {
         CatalogEntry {
             id: id.to_string(),
             kind: CatalogEntryKind::Flow {
-                flow_id,
+                flow_id: flow_id.to_string(),
                 published_name: id.to_string(),
             },
             service_surfaces: vec![ServiceSurface::Chat],
@@ -6891,7 +6860,7 @@ mod catalog_list_tests {
     fn maps_each_kind_into_its_wire_variant() {
         let snap = snapshot_with(vec![
             service_entry("llama-3", ServiceSurface::Chat),
-            flow_entry("chat-pl", 17),
+            flow_entry("chat-pl", "17"),
             alias_entry("rag-llm", "llama-3", vec!["bielik-11b"]),
         ]);
 
@@ -6924,8 +6893,8 @@ mod catalog_list_tests {
         let flow = by_id.get("chat-pl").unwrap();
         assert_eq!(flow.owned_by, "tentaflow-flow");
         assert!(matches!(
-            flow.kind,
-            CatalogEntryKindWire::Flow { flow_id: 17, .. }
+            &flow.kind,
+            CatalogEntryKindWire::Flow { flow_id, .. } if flow_id == "17"
         ));
 
         let alias = by_id.get("rag-llm").unwrap();

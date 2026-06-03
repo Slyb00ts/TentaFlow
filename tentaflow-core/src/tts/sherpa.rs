@@ -745,11 +745,9 @@ mod tests {
         // Piper config sibling — picker musi go pomijac (to nie model).
         touch(dir.path(), "pl_PL-jarvis_wg_glos-medium.onnx.json");
 
-        let picked = pick_onnx_for_voice(
-            dir.path(),
-            Some("vits-piper-pl_PL-jarvis_wg_glos-medium"),
-        )
-        .expect("powinien znalezc voice");
+        let picked =
+            pick_onnx_for_voice(dir.path(), Some("vits-piper-pl_PL-jarvis_wg_glos-medium"))
+                .expect("powinien znalezc voice");
         assert_eq!(
             picked.file_name().and_then(|s| s.to_str()),
             Some("pl_PL-jarvis_wg_glos-medium.onnx"),

@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use super::recorder;
 use super::resume_token::{self, ResumeError};
 use super::subscription::{
-    StreamHandlerMeta, Subscription, push_chunk, push_chunk_async, push_end, push_end_async,
+    push_chunk, push_chunk_async, push_end, push_end_async, StreamHandlerMeta, Subscription,
 };
 use super::{HandlerContext, SessionAuthKind};
 
@@ -250,10 +250,9 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         Some(lang) => Some(lang),
         None => match &ctx.session {
             SessionAuth::UserSession { user_id, .. } => {
-                super::handlers::user_id_to_i64(user_id)
-                    .and_then(|uid| {
-                        crate::db::repository::get_user_preferred_language(&ctx.state.db, uid).ok()
-                    })
+                let uid = super::handlers::user_id_to_uuid(user_id);
+                crate::db::repository::get_user_preferred_language(&ctx.state.db, &uid)
+                    .ok()
                     .flatten()
             }
             _ => None,
@@ -993,10 +992,10 @@ inventory::submit! {
 
 #[cfg(test)]
 mod tests {
-    use super::super::SessionAuthKind;
     use super::super::subscription::{
-        SubscriptionEvent, find_stream_handler, stream_handler_count,
+        find_stream_handler, stream_handler_count, SubscriptionEvent,
     };
+    use super::super::SessionAuthKind;
 
     #[test]
     fn chat_stream_handler_registered() {
@@ -1013,9 +1012,9 @@ mod tests {
 
     #[tokio::test]
     async fn p0_cross_user_resume_attack_rejected() {
-        use super::super::HandlerContext;
         use super::super::resume_token;
         use super::super::subscription::{SubscriptionEvent, SubscriptionRegistry};
+        use super::super::HandlerContext;
         use std::sync::Arc;
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
@@ -1064,8 +1063,8 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_resume_handler_rejects_invalid_token() {
-        use super::super::HandlerContext;
         use super::super::subscription::SubscriptionRegistry;
+        use super::super::HandlerContext;
         use std::sync::Arc;
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
@@ -1106,9 +1105,9 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_resume_handler_accepts_valid_token() {
-        use super::super::HandlerContext;
         use super::super::resume_token;
         use super::super::subscription::SubscriptionRegistry;
+        use super::super::HandlerContext;
         use std::sync::Arc;
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
@@ -1158,8 +1157,8 @@ mod tests {
         // jeden chunk [routing error] i End. Test weryfikuje ze (a) request
         // w ogole jest parsowany, (b) End jest emitowany, (c) nie wystepuje
         // panika. Pelny test produkcji z backendem jest w api/openai/server.rs.
-        use super::super::HandlerContext;
         use super::super::subscription::SubscriptionRegistry;
+        use super::super::HandlerContext;
         use tentaflow_protocol::{ChatMessage, ChatStreamRequest, MessageBody, SessionAuth};
 
         let reg = SubscriptionRegistry::new();

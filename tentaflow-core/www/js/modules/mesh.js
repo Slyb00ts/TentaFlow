@@ -23,6 +23,7 @@ import { runPairProgress } from '/js/lib/pair-progress.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
 import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
+import { openBaselineAdoptModal } from '/js/modules/mesh-baseline-adopt.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
@@ -36,6 +37,7 @@ let relayHealth = null;
 let refresher = null;
 let refreshTickCount = 0;
 let activeTab = 'list';
+let isAdmin = false;
 
 const MeshScreen = {
   title: 'Mesh',
@@ -60,6 +62,7 @@ const MeshScreen = {
             <div class="d-badges" id="mesh-badges"></div>
           </div>
           <div class="d-actions">
+            <tf-button variant="secondary" icon="download" id="btn-baseline-adopt" hidden>${escapeHtml(I18n.t('mesh.baseline_adopt_btn'))}</tf-button>
             <tf-button variant="primary" icon="plus" id="btn-pair-new">${escapeHtml(I18n.t('mesh.pair_new'))}</tf-button>
           </div>
         </div>
@@ -75,6 +78,27 @@ const MeshScreen = {
   },
   async mount() {
     byId('btn-pair-new')?.addEventListener('click', openPairModal);
+
+    // Baseline-adopt to operacja admina (handlery #[policy(Admin)] po stronie
+    // hosta). Pokazujemy przycisk tylko adminowi; host i tak odrzuci nie-admina.
+    try {
+      const me = await ApiBinary.one('authMeRequest');
+      isAdmin = !!me && (me.role === 'admin' || me.isAdmin === true);
+    } catch {
+      isAdmin = false;
+    }
+    const baselineBtn = byId('btn-baseline-adopt');
+    if (baselineBtn) {
+      if (isAdmin) baselineBtn.removeAttribute('hidden');
+      baselineBtn.addEventListener('click', () => {
+        openBaselineAdoptModal({
+          onDone: async () => {
+            await loadData();
+            renderActiveTab();
+          },
+        });
+      });
+    }
 
     const tabsEl = byId('mesh-tabs-nav');
     if (tabsEl) tabsEl.addEventListener('change', handleTabChange);
@@ -114,6 +138,7 @@ const MeshScreen = {
     relayHealth = null;
     refreshTickCount = 0;
     activeTab = 'list';
+    isAdmin = false;
   },
 };
 

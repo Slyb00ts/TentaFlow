@@ -5,6 +5,6 @@
 // host-side dispatch.
 // =============================================================================
 
+pub use tentaflow_sdk_spec::validate_canonical;
 pub use tentaflow_sdk_spec::UiPayload;
 pub use tentaflow_sdk_spec::UiTag;
-pub use tentaflow_sdk_spec::validate_canonical;

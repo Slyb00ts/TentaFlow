@@ -230,7 +230,7 @@ impl AliasResolver {
                     return Ok(());
                 }
                 out.push(ResolvedExecutionTarget::Flow {
-                    flow_id: *flow_id,
+                    flow_id: flow_id.clone(),
                     published_name: published_name.clone(),
                 });
                 Ok(())

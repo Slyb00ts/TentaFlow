@@ -312,9 +312,9 @@ pub async fn handle_addon_oauth_callback(
     let stored_addon_id = parts
         .first()
         .ok_or_else(|| anyhow::anyhow!("Niepoprawny addon_id w state"))?;
-    let user_id: i64 = parts
+    let user_id: &str = parts
         .get(1)
-        .and_then(|s| s.parse().ok())
+        .copied()
         .ok_or_else(|| anyhow::anyhow!("Niepoprawny user_id w state"))?;
 
     if *stored_addon_id != addon_id {

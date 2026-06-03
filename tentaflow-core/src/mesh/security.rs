@@ -651,41 +651,11 @@ mod tests {
     use std::sync::Mutex;
 
     fn setup_test_db() -> DbPool {
+        // Run the real migrations: `add_trusted_node` now materialises trusted
+        // nodes into `sync_nodes` and seeds `sync_policies`, so a hand-rolled
+        // partial schema would miss those tables.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS trusted_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL UNIQUE,
-                public_key TEXT NOT NULL,
-                hostname TEXT DEFAULT '',
-                approved_by TEXT DEFAULT '',
-                approved_at TEXT NOT NULL DEFAULT (datetime('now')),
-                is_active INTEGER NOT NULL DEFAULT 1,
-                last_addresses TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS pending_pairings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                remote_node_id TEXT NOT NULL,
-                pin_code TEXT NOT NULL,
-                direction TEXT NOT NULL CHECK(direction IN ('outgoing','incoming')),
-                expires_at TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS revoked_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL UNIQUE,
-                revoked_by TEXT,
-                revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            ",
-        )
-        .unwrap();
+        crate::db::migrations::run(&conn).unwrap();
         Arc::new(Mutex::new(conn))
     }
 

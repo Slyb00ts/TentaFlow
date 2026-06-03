@@ -15,14 +15,14 @@ use anyhow::Result;
 /// reverse_request), ACL jest wtedy skipowane (fail-open).
 #[derive(Debug, Clone)]
 pub struct UserContext {
-    pub user_id: i64,
+    pub user_id: String,
     pub role: String,
 }
 
 impl UserContext {
-    pub fn new(user_id: i64, role: impl Into<String>) -> Self {
+    pub fn new(user_id: impl Into<String>, role: impl Into<String>) -> Self {
         Self {
-            user_id,
+            user_id: user_id.into(),
             role: role.into(),
         }
     }
@@ -38,7 +38,7 @@ pub fn check_access(
     db: &DbPool,
     resource_type: &str,
     resource_id: &str,
-    user_id: i64,
+    user_id: &str,
     user_role: &str,
 ) -> Result<bool> {
     crate::db::repository::resource_permissions::check(
@@ -56,7 +56,7 @@ pub fn check_access_safe(
     db: &DbPool,
     resource_type: &str,
     resource_id: &str,
-    user_id: i64,
+    user_id: &str,
     user_role: &str,
 ) -> bool {
     match check_access(db, resource_type, resource_id, user_id, user_role) {

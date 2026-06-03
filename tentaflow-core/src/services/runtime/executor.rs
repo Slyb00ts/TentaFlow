@@ -564,14 +564,9 @@ impl ModelRuntimeExecutor {
                     metadata: None,
                     session_id: None,
                 };
-                let payload = tentaflow_protocol::cbor::encode(&model_request)
-                    .map_err(|e| {
-                        ExecutorError::Internal(format!(
-                            "mesh stream serialize ModelRequest: {}",
-                            e
-                        ))
-                    })?
-                    ;
+                let payload = tentaflow_protocol::cbor::encode(&model_request).map_err(|e| {
+                    ExecutorError::Internal(format!("mesh stream serialize ModelRequest: {}", e))
+                })?;
                 let frame_stream = mesh
                     .forward_stream_request(node_id, &request_id, payload)
                     .await
@@ -797,7 +792,7 @@ impl ModelRuntimeExecutor {
                     .flow_dispatcher
                     .as_ref()
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
-                ctx.enter_flow(*flow_id)
+                ctx.enter_flow(flow_id)
                     .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
 
                 // Pair `enter_flow` with `leave_flow` on every exit path
@@ -820,7 +815,7 @@ impl ModelRuntimeExecutor {
                             .await
                             .map_err(|e| ExecutorError::Internal(format!("envelope seed: {e}")))?;
                     dispatcher
-                        .dispatch_by_flow_id(*flow_id, initial, meta)
+                        .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                         .await
                 };
                 ctx.leave_flow();
@@ -1262,7 +1257,7 @@ impl ModelRuntimeExecutor {
                     .flow_dispatcher
                     .as_ref()
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
-                ctx.enter_flow(*flow_id)
+                ctx.enter_flow(flow_id)
                     .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
                 // Codex R3b.1 round 2 H1: propagate user → flow ACL gate.
                 // Without this `dispatch_by_flow_id` sees `user_id = None`
@@ -1270,7 +1265,7 @@ impl ModelRuntimeExecutor {
                 let (initial, meta) =
                     embeddings_request_to_initial_envelope(&request, ctx.user.clone());
                 let dispatch_result = dispatcher
-                    .dispatch_by_flow_id(*flow_id, initial, meta)
+                    .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;
                 ctx.leave_flow();
                 let outcome =
@@ -1440,8 +1435,7 @@ impl ModelRuntimeExecutor {
                         .await
                         .has(&engine_id_owned)
                     {
-                        let repo =
-                            resolve_embedded_tts_repo(&engine_id_owned, &model_name_owned);
+                        let repo = resolve_embedded_tts_repo(&engine_id_owned, &model_name_owned);
                         crate::tts::ensure_embedded_engine_loaded(
                             &engine_id_owned,
                             &repo,
@@ -1601,11 +1595,11 @@ impl ModelRuntimeExecutor {
                     .flow_dispatcher
                     .as_ref()
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
-                ctx.enter_flow(*flow_id)
+                ctx.enter_flow(flow_id)
                     .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {e}")))?;
                 let (initial, meta) = tts_request_to_initial_envelope(&request, ctx.user.clone());
                 let dispatch_result = dispatcher
-                    .dispatch_by_flow_id(*flow_id, initial, meta)
+                    .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;
                 ctx.leave_flow();
                 let outcome =
@@ -2329,7 +2323,7 @@ mod tests {
     async fn embeddings_flow_without_dispatcher_returns_typed_error() {
         let exec = dummy_executor();
         let target = ResolvedExecutionTarget::Flow {
-            flow_id: 1,
+            flow_id: "1".to_string(),
             published_name: "embed-flow".into(),
         };
         let mut ctx = ExecutionContext::default();
@@ -2440,7 +2434,7 @@ mod tests {
     async fn tts_flow_without_dispatcher_returns_typed_error() {
         let exec = dummy_executor();
         let target = ResolvedExecutionTarget::Flow {
-            flow_id: 1,
+            flow_id: "1".to_string(),
             published_name: "tts-flow".into(),
         };
         let mut ctx = ExecutionContext::default();

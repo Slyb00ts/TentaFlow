@@ -7,7 +7,7 @@
 // =============================================================================
 
 use tentaflow_protocol::mesh as legacy;
-use tentaflow_sdk_spec::protocol::frame::channel::{Channel, Kind, channels};
+use tentaflow_sdk_spec::protocol::frame::channel::{channels, Channel, Kind};
 
 /// Convert a legacy MESH_MSG_* u8 discriminator into the matching UFP/2
 /// `Kind` value. Mesh-channel kinds keep `low_byte == legacy discriminator`;
@@ -145,8 +145,8 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
 /// code that targets the UFP/2 path; legacy code can keep using the u8
 /// constants and pass them through `kind_from_legacy`.
 pub mod kinds {
-    use super::Kind;
     use super::legacy;
+    use super::Kind;
 
     pub const HEARTBEAT: Kind = Kind(legacy::MESH_MSG_HEARTBEAT as u16);
     pub const FORWARD_REQ: Kind = Kind(legacy::MESH_MSG_FORWARD_REQ as u16);

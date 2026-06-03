@@ -250,27 +250,52 @@ mod tests {
         (pub_, cmd_rx)
     }
 
+    /// Frames a top-level MP4 box as `push_chunk` expects: 4-byte big-endian
+    /// size (header + payload) followed by the 4-byte kind and the payload.
+    fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (8 + payload.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Pushes an init box (`ftyp`) then a `moof`+`mdat` pair so the publisher
+    /// seals the init segment AND flushes the sealing media segment, leaving the
+    /// media buffer empty for the test's own segments. Returns the exact init
+    /// bytes the publisher should now expose.
+    fn seed_init(pub_: &Mp4StreamPublisher) -> Vec<u8> {
+        let init = mp4_box(b"ftyp", &[0xDE, 0xAD, 0xBE, 0xEF]);
+        pub_.push_chunk(init.clone());
+        pub_.push_chunk(mp4_box(b"moof", &[0x00]));
+        pub_.push_chunk(mp4_box(b"mdat", &[0x00]));
+        init
+    }
+
     #[tokio::test]
     async fn init_segment_cached_on_first_chunk() {
         let (pub_, _cmd_rx) = make_publisher();
-        pub_.push_chunk(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let expected = seed_init(&pub_);
         let init = pub_.init_segment().await.expect("init present");
-        assert_eq!(&init[..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(&init[..], &expected[..]);
         // Re-calling returns the same cached buffer (no re-allocation).
         let init2 = pub_.init_segment().await.expect("init still present");
-        assert_eq!(&init2[..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(&init2[..], &expected[..]);
     }
 
     #[tokio::test]
     async fn init_segment_notify_unblocks_waiters() {
         let (pub_, _cmd_rx) = make_publisher();
         let pub_for_push = Arc::clone(&pub_);
+        let expected = mp4_box(b"ftyp", &[1, 2, 3]);
+        let expected_for_push = expected.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            pub_for_push.push_chunk(vec![1, 2, 3]);
+            pub_for_push.push_chunk(expected_for_push);
+            pub_for_push.push_chunk(mp4_box(b"moof", &[0x00]));
         });
         let init = pub_.init_segment().await.expect("init via notify");
-        assert_eq!(&init[..], &[1, 2, 3]);
+        assert_eq!(&init[..], &expected[..]);
     }
 
     #[tokio::test]
@@ -296,31 +321,47 @@ mod tests {
     #[tokio::test]
     async fn subsequent_chunks_broadcast_to_subscribers() {
         let (pub_, _cmd_rx) = make_publisher();
-        // Seed the init segment first — only chunks pushed AFTER the init
+        // Seed the init segment first — only media segments pushed AFTER the init
         // segment travel through the broadcast channel.
-        pub_.push_chunk(vec![0xFF]);
+        seed_init(&pub_);
         let _ = pub_.init_segment().await.expect("init seeded");
         let mut rx = pub_.chunk_broadcaster().subscribe();
-        pub_.push_chunk(vec![1, 2, 3]);
-        pub_.push_chunk(vec![4, 5, 6]);
+        // A media segment is the `moof`+`mdat` pair, broadcast concatenated.
+        let moof1 = mp4_box(b"moof", &[1]);
+        let mdat1 = mp4_box(b"mdat", &[2]);
+        pub_.push_chunk(moof1.clone());
+        pub_.push_chunk(mdat1.clone());
+        let moof2 = mp4_box(b"moof", &[3]);
+        let mdat2 = mp4_box(b"mdat", &[4]);
+        pub_.push_chunk(moof2.clone());
+        pub_.push_chunk(mdat2.clone());
         let first = rx.recv().await.expect("first chunk");
         let second = rx.recv().await.expect("second chunk");
-        assert_eq!(&first[..], &[1, 2, 3]);
-        assert_eq!(&second[..], &[4, 5, 6]);
+        let mut expected1 = moof1.clone();
+        expected1.extend_from_slice(&mdat1);
+        let mut expected2 = moof2.clone();
+        expected2.extend_from_slice(&mdat2);
+        assert_eq!(&first[..], &expected1[..]);
+        assert_eq!(&second[..], &expected2[..]);
     }
 
     #[tokio::test]
     async fn multiple_subscribers_receive_same_chunks() {
         let (pub_, _cmd_rx) = make_publisher();
-        pub_.push_chunk(vec![0xAA]);
+        seed_init(&pub_);
         let _ = pub_.init_segment().await.expect("init seeded");
         let mut rx1 = pub_.chunk_broadcaster().subscribe();
         let mut rx2 = pub_.chunk_broadcaster().subscribe();
-        pub_.push_chunk(vec![9, 9, 9]);
+        let moof = mp4_box(b"moof", &[9]);
+        let mdat = mp4_box(b"mdat", &[9]);
+        pub_.push_chunk(moof.clone());
+        pub_.push_chunk(mdat.clone());
+        let mut expected = moof.clone();
+        expected.extend_from_slice(&mdat);
         let a = rx1.recv().await.expect("rx1");
         let b = rx2.recv().await.expect("rx2");
-        assert_eq!(&a[..], &[9, 9, 9]);
-        assert_eq!(&b[..], &[9, 9, 9]);
+        assert_eq!(&a[..], &expected[..]);
+        assert_eq!(&b[..], &expected[..]);
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ pub struct ComplianceRetentionPolicySummary {
 #[derive(Debug, Clone, PartialEq, Eq, Default, SerdeSerialize, SerdeDeserialize)]
 pub struct ComplianceAiEventListFilter {
     pub status: Option<String>,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub addon_id: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -51,11 +51,11 @@ pub struct ComplianceAiEventListFilter {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ComplianceAiEventSummary {
     pub event_id: String,
-    pub user_id: Option<i64>,
+    pub user_id: Option<String>,
     pub node_id: String,
     pub addon_id: Option<String>,
     pub instance_id: Option<String>,
-    pub flow_id: Option<i64>,
+    pub flow_id: Option<String>,
     pub flow_node_id: Option<String>,
     pub request_id: String,
     pub model_id: String,
@@ -104,7 +104,7 @@ mod tests {
     fn compliance_payload_round_trip() {
         let payload = ComplianceAdminPayload::ListAiEventsRequest(ComplianceAiEventListFilter {
             status: Some("success".to_string()),
-            user_id: Some(7),
+            user_id: Some("00000000-0000-0000-0000-000000000007".to_string()),
             addon_id: Some("contacts".to_string()),
             limit: Some(50),
             offset: Some(10),

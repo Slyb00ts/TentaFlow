@@ -1,0 +1,23 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle uruchamiajacy SearXNG jako lokalny metasearch engine.
+# Przykład: TentaFlow instaluje repo SearXNG i startuje server.py na porcie uslugi.
+# =============================================================================
+
+[bundle]
+engine = "searxng"
+description = "SearXNG private metasearch engine (git source)"
+python_version = "3.12"
+source = "git"
+git_repo = "https://github.com/searxng/searxng.git"
+git_ref = "master"
+
+[launch]
+command = "python"
+args = ["${BUNDLE_DIR}/server.py"]
+internal_port = 8080
+
+[requires]
+gpu_memory_gb = 0
+disk_gb = 2
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]

@@ -29,7 +29,9 @@ use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
 use crate::services_repo::deployments::{self as deployments_repo, DeploymentStatus};
 use crate::services_repo::models::{self as models_repo, NewModel};
-use crate::services_repo::services::{self as services_repo, DeployMethod, NewService, ServiceStatus};
+use crate::services_repo::services::{
+    self as services_repo, DeployMethod, NewService, ServiceStatus,
+};
 
 // ----- Errors ---------------------------------------------------------------
 
@@ -236,7 +238,7 @@ pub fn create_deploy_job(
     user_config: &serde_json::Value,
     db: &DbPool,
     local_node_id: &str,
-    user_id: Option<i64>,
+    user_id: Option<&str>,
     existing_slug: Option<String>,
 ) -> DeployResult<DeployJob> {
     let slug = existing_slug.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -403,7 +405,12 @@ pub async fn deploy(
             if let Some(s) = &sink {
                 s.emit("error", &rb_msg);
             }
-            mark_finished(db, job.deployment_id, DeploymentStatus::Failed, Some(&rb_msg));
+            mark_finished(
+                db,
+                job.deployment_id,
+                DeploymentStatus::Failed,
+                Some(&rb_msg),
+            );
             mark_service_deploy_failed(db, job.service_id, &slug, &rb_msg, false);
             return Err(commit_err);
         }
@@ -726,7 +733,8 @@ fn mark_service_deploy_failed(
         } else {
             ServiceStatus::Failed
         };
-        let _ = services_repo::mark_deploy_failed(&conn, service_id, deploy_id, status, Some(message));
+        let _ =
+            services_repo::mark_deploy_failed(&conn, service_id, deploy_id, status, Some(message));
     }
 }
 
@@ -1054,6 +1062,35 @@ pub(crate) fn resolve_model_repo(
     Some(chosen.repo.clone())
 }
 
+/// Resolves the `[[model_preset]]` selected for this deploy, mirroring
+/// `resolve_model_repo` precedence: explicit `model_preset_id`, else the
+/// recommended preset, else the first. `None` when the manifest has no presets.
+pub(crate) fn resolve_selected_preset<'a>(
+    manifest: &'a ServiceManifest,
+    user_config: &serde_json::Value,
+) -> Option<&'a crate::services::manifest::ModelPreset> {
+    if let Some(id) = user_config
+        .get("model_preset_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(p) = manifest.model_presets.iter().find(|m| m.id == id) {
+            return Some(p);
+        }
+    }
+    if manifest.model_presets.is_empty() {
+        return None;
+    }
+    Some(
+        manifest
+            .model_presets
+            .iter()
+            .find(|p| p.recommended)
+            .unwrap_or(&manifest.model_presets[0]),
+    )
+}
+
 /// Resolves the name the service advertises for its default model — the same
 /// value `models_from_manifest` writes as `model_name` and the executor
 /// rewrites `request.model` to before dispatch. For OpenAI-compatible HTTP
@@ -1095,6 +1132,96 @@ pub(crate) fn resolve_served_model_name(
         .find(|p| p.recommended)
         .unwrap_or(&manifest.model_presets[0]);
     Some(chosen.id.clone())
+}
+
+/// Maps a preset's `speculator_method` to the vLLM container's `VLLM_SPEC_METHOD`
+/// vocabulary (`ngram` / `mtp` / `draft`). `None` for methods the entrypoint
+/// contract does not assemble (e.g. eagle/medusa flow straight through
+/// `vllm_args`).
+fn vllm_spec_method(method: &str) -> Option<&'static str> {
+    match method.trim().to_ascii_lowercase().as_str() {
+        "ngram" => Some("ngram"),
+        "mtp" => Some("mtp"),
+        "draft" | "draft_model" => Some("draft"),
+        _ => None,
+    }
+}
+
+/// Builds the `VLLM_*` container env for a vLLM featured preset: NVFP4
+/// self-quantization (`VLLM_MODEL_QUANTIZE` / `VLLM_SPEC_DRAFT_QUANTIZE`) and
+/// speculative decoding (`VLLM_SPEC_METHOD` / `VLLM_SPEC_REPO` /
+/// `VLLM_SPEC_NUM_TOKENS`). The entrypoint quantizes before serving and
+/// assembles `--speculative-config` with resolved local paths. `HF_TOKEN`
+/// (gated repos like Bielik) comes from `user_config.hf_token`. Empty when the
+/// preset carries no vLLM speculative/quantize config.
+pub(crate) fn vllm_deploy_env(
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    let Some(preset) = resolve_selected_preset(manifest, user_config) else {
+        return env;
+    };
+
+    if let Some(scheme) = preset.vllm.as_ref().and_then(|v| v.quantize.as_ref()) {
+        env.insert("VLLM_MODEL_QUANTIZE".into(), scheme.clone());
+    }
+
+    if let Some(method) = preset
+        .speculator_method
+        .as_deref()
+        .and_then(vllm_spec_method)
+    {
+        env.insert("VLLM_SPEC_METHOD".into(), method.to_string());
+        let ntok = preset.speculator_num_tokens.unwrap_or(4);
+        env.insert("VLLM_SPEC_NUM_TOKENS".into(), ntok.to_string());
+        if method == "draft" {
+            if let Some(repo) = &preset.speculator_repo {
+                env.insert("VLLM_SPEC_REPO".into(), repo.clone());
+            }
+            if let Some(scheme) = preset.vllm.as_ref().and_then(|v| v.quantize_draft.as_ref()) {
+                env.insert("VLLM_SPEC_DRAFT_QUANTIZE".into(), scheme.clone());
+            }
+        }
+    }
+
+    if !env.is_empty() {
+        if let Some(token) = user_config
+            .get("hf_token")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            env.insert("HF_TOKEN".into(), token.to_string());
+        }
+    }
+
+    env
+}
+
+/// Builds the `--speculative-config <json>` argument for the NATIVE python-bundle
+/// path (which has no entrypoint to assemble it from env). The draft method uses
+/// the `speculator_repo` HF repo directly. Returns `None` when the preset has no
+/// supported speculative method.
+pub(crate) fn vllm_native_speculative_arg(
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+) -> Option<String> {
+    let preset = resolve_selected_preset(manifest, user_config)?;
+    let method = vllm_spec_method(preset.speculator_method.as_deref()?)?;
+    let ntok = preset.speculator_num_tokens.unwrap_or(4);
+    let json = match method {
+        "ngram" => format!(
+            "{{\"method\":\"ngram\",\"num_speculative_tokens\":{ntok},\"prompt_lookup_max\":4,\"prompt_lookup_min\":2}}"
+        ),
+        "mtp" => format!("{{\"method\":\"mtp\",\"num_speculative_tokens\":{ntok}}}"),
+        "draft" => {
+            let repo = preset.speculator_repo.as_ref()?;
+            format!("{{\"model\":\"{repo}\",\"num_speculative_tokens\":{ntok}}}")
+        }
+        _ => return None,
+    };
+    Some(format!("--speculative-config {json}"))
 }
 
 /// Builds the canonical base URL we persist as `services.endpoint_url` for
@@ -1915,6 +2042,7 @@ mod tests {
                 speculator_repo: None,
                 speculator_method: None,
                 speculator_num_tokens: None,
+                vllm: None,
             }],
             parameters: vec![],
             docker_source_hash: String::new(),
@@ -1937,7 +2065,7 @@ mod tests {
         cfg: &serde_json::Value,
         slug: Option<String>,
     ) -> DeployJob {
-        create_deploy_job(method, manifest, cfg, db, "node-test", Some(1), slug).unwrap()
+        create_deploy_job(method, manifest, cfg, db, "node-test", Some("1"), slug).unwrap()
     }
 
     #[tokio::test]

@@ -658,7 +658,7 @@ export function encodeAddonPermissionCatalogRequest(addon_id) {
  * `user_id` = None (pass null z JS) => serwer uzyje id z sesji.
  * @param {string} addon_id
  * @param {string} permission_id
- * @param {number | null} [user_id]
+ * @param {string | null} [user_id]
  * @returns {Uint8Array}
  */
 export function encodeAddonPermissionCheckRequest(addon_id, permission_id, user_id) {
@@ -666,13 +666,15 @@ export function encodeAddonPermissionCheckRequest(addon_id, permission_id, user_
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(permission_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAddonPermissionCheckRequest(ptr0, len0, ptr1, len1, !isLikeNone(user_id), isLikeNone(user_id) ? 0 : user_id);
+    var ptr2 = isLikeNone(user_id) ? 0 : passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonPermissionCheckRequest(ptr0, len0, ptr1, len1, ptr2, len2);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v3;
+    return v4;
 }
 
 /**
@@ -719,7 +721,7 @@ export function encodeAddonPermissionMatrixRequest(addon_id) {
  * MessageBody::AddonPermissionSetRequest — ustawia grant per (user|group).
  * @param {string} addon_id
  * @param {string} subject_type
- * @param {number} subject_id
+ * @param {string} subject_id
  * @param {string} permission_id
  * @param {string} grant_mode
  * @returns {Uint8Array}
@@ -729,17 +731,19 @@ export function encodeAddonPermissionSetRequest(addon_id, subject_type, subject_
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passStringToWasm0(permission_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr2 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ptr3 = passStringToWasm0(grant_mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr3 = passStringToWasm0(permission_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len3 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAddonPermissionSetRequest(ptr0, len0, ptr1, len1, subject_id, ptr2, len2, ptr3, len3);
+    const ptr4 = passStringToWasm0(grant_mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonPermissionSetRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v5;
+    return v6;
 }
 
 /**
@@ -883,20 +887,22 @@ export function encodeAddonVisibilityListRequest(addon_id) {
 /**
  * MessageBody::AddonVisibilitySetRequest { addon_id, group_id, visible }.
  * @param {string} addon_id
- * @param {number} group_id
+ * @param {string} group_id
  * @param {boolean} visible
  * @returns {Uint8Array}
  */
 export function encodeAddonVisibilitySetRequest(addon_id, group_id, visible) {
     const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAddonVisibilitySetRequest(ptr0, len0, group_id, visible);
+    const ptr1 = passStringToWasm0(group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonVisibilitySetRequest(ptr0, len0, ptr1, len1, visible);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v2;
+    return v3;
 }
 
 /**
@@ -981,7 +987,7 @@ export function encodeAuditLogCleanupRequest(keep_days) {
 
 /**
  * MessageBody::AuditLogExportRequest — eksport CSV z filtrami.
- * @param {number | null} [user_id]
+ * @param {string | null} [user_id]
  * @param {string | null} [addon_id]
  * @param {string | null} [action]
  * @param {string | null} [from_date]
@@ -990,28 +996,30 @@ export function encodeAuditLogCleanupRequest(keep_days) {
  * @returns {Uint8Array}
  */
 export function encodeAuditLogExportRequest(user_id, addon_id, action, from_date, to_date, search) {
-    var ptr0 = isLikeNone(addon_id) ? 0 : passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr0 = isLikeNone(user_id) ? 0 : passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
-    var ptr1 = isLikeNone(action) ? 0 : passStringToWasm0(action, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr1 = isLikeNone(addon_id) ? 0 : passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len1 = WASM_VECTOR_LEN;
-    var ptr2 = isLikeNone(from_date) ? 0 : passStringToWasm0(from_date, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr2 = isLikeNone(action) ? 0 : passStringToWasm0(action, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len2 = WASM_VECTOR_LEN;
-    var ptr3 = isLikeNone(to_date) ? 0 : passStringToWasm0(to_date, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr3 = isLikeNone(from_date) ? 0 : passStringToWasm0(from_date, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len3 = WASM_VECTOR_LEN;
-    var ptr4 = isLikeNone(search) ? 0 : passStringToWasm0(search, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr4 = isLikeNone(to_date) ? 0 : passStringToWasm0(to_date, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len4 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAuditLogExportRequest(!isLikeNone(user_id), isLikeNone(user_id) ? 0 : user_id, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+    var ptr5 = isLikeNone(search) ? 0 : passStringToWasm0(search, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAuditLogExportRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v6;
+    return v7;
 }
 
 /**
  * MessageBody::AuditLogListRequest — lista logu z filtrami + paginacja.
- * @param {number | null | undefined} user_id
+ * @param {string | null | undefined} user_id
  * @param {string | null | undefined} addon_id
  * @param {string | null | undefined} action
  * @param {string | null | undefined} from_date
@@ -1022,23 +1030,25 @@ export function encodeAuditLogExportRequest(user_id, addon_id, action, from_date
  * @returns {Uint8Array}
  */
 export function encodeAuditLogListRequest(user_id, addon_id, action, from_date, to_date, search, offset, limit) {
-    var ptr0 = isLikeNone(addon_id) ? 0 : passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr0 = isLikeNone(user_id) ? 0 : passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
-    var ptr1 = isLikeNone(action) ? 0 : passStringToWasm0(action, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr1 = isLikeNone(addon_id) ? 0 : passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len1 = WASM_VECTOR_LEN;
-    var ptr2 = isLikeNone(from_date) ? 0 : passStringToWasm0(from_date, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr2 = isLikeNone(action) ? 0 : passStringToWasm0(action, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len2 = WASM_VECTOR_LEN;
-    var ptr3 = isLikeNone(to_date) ? 0 : passStringToWasm0(to_date, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr3 = isLikeNone(from_date) ? 0 : passStringToWasm0(from_date, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len3 = WASM_VECTOR_LEN;
-    var ptr4 = isLikeNone(search) ? 0 : passStringToWasm0(search, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr4 = isLikeNone(to_date) ? 0 : passStringToWasm0(to_date, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len4 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAuditLogListRequest(!isLikeNone(user_id), isLikeNone(user_id) ? 0 : user_id, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, offset, limit);
+    var ptr5 = isLikeNone(search) ? 0 : passStringToWasm0(search, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAuditLogListRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, offset, limit);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v6;
+    return v7;
 }
 
 /**
@@ -1067,6 +1077,61 @@ export function encodeAuthLoginRequest(username, password) {
  */
 export function encodeAuthMeRequest() {
     const ret = wasm.encodeAuthMeRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeBaselineAdoptClearRequest() {
+    const ret = wasm.encodeBaselineAdoptClearRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} donor_node_id
+ * @returns {Uint8Array}
+ */
+export function encodeBaselineAdoptStartRequest(donor_node_id) {
+    const ptr0 = passStringToWasm0(donor_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBaselineAdoptStartRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeBaselineAdoptStatusRequest() {
+    const ret = wasm.encodeBaselineAdoptStatusRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeBaselineDonorListRequest() {
+    const ret = wasm.encodeBaselineDonorListRequest();
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -1375,7 +1440,7 @@ export function encodeClusterUpdateRequest(cluster_id, name, description, strate
 
 /**
  * @param {string | null} [status]
- * @param {number | null} [user_id]
+ * @param {string | null} [user_id]
  * @param {string | null} [addon_id]
  * @param {number | null} [limit]
  * @param {number | null} [offset]
@@ -1384,15 +1449,17 @@ export function encodeClusterUpdateRequest(cluster_id, name, description, strate
 export function encodeComplianceAiEventsListRequest(status, user_id, addon_id, limit, offset) {
     var ptr0 = isLikeNone(status) ? 0 : passStringToWasm0(status, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
-    var ptr1 = isLikeNone(addon_id) ? 0 : passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr1 = isLikeNone(user_id) ? 0 : passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len1 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeComplianceAiEventsListRequest(ptr0, len0, !isLikeNone(user_id), isLikeNone(user_id) ? 0 : user_id, ptr1, len1, isLikeNone(limit) ? Number.MAX_SAFE_INTEGER : (limit) >>> 0, isLikeNone(offset) ? Number.MAX_SAFE_INTEGER : (offset) >>> 0);
+    var ptr2 = isLikeNone(addon_id) ? 0 : passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeComplianceAiEventsListRequest(ptr0, len0, ptr1, len1, ptr2, len2, isLikeNone(limit) ? Number.MAX_SAFE_INTEGER : (limit) >>> 0, isLikeNone(offset) ? Number.MAX_SAFE_INTEGER : (offset) >>> 0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v3;
+    return v4;
 }
 
 /**
@@ -1628,7 +1695,7 @@ export function encodeFlowExecutionsListRequest(flow_id) {
 /**
  * MessageBody::FlowInvokeRequest — uniwersalny most do flow engine. Wariant
  * audio-only dla chat audio (jedno wejście Audio). Multi-input dojdzie później.
- * @param {bigint | null | undefined} flow_id
+ * @param {string | null | undefined} flow_id
  * @param {string} model
  * @param {string} service_type
  * @param {string} mime
@@ -1639,25 +1706,27 @@ export function encodeFlowExecutionsListRequest(flow_id) {
  * @returns {Uint8Array}
  */
 export function encodeFlowInvokeAudio(flow_id, model, service_type, mime, sample_rate, audio, language, session_id) {
-    const ptr0 = passStringToWasm0(model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(service_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var ptr0 = isLikeNone(flow_id) ? 0 : passStringToWasm0(flow_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passStringToWasm0(mime, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr2 = passStringToWasm0(service_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ptr3 = passArray8ToWasm0(audio, wasm.__wbindgen_malloc);
+    const ptr3 = passStringToWasm0(mime, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len3 = WASM_VECTOR_LEN;
-    var ptr4 = isLikeNone(language) ? 0 : passStringToWasm0(language, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    var len4 = WASM_VECTOR_LEN;
-    var ptr5 = isLikeNone(session_id) ? 0 : passStringToWasm0(session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr4 = passArray8ToWasm0(audio, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    var ptr5 = isLikeNone(language) ? 0 : passStringToWasm0(language, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len5 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeFlowInvokeAudio(!isLikeNone(flow_id), isLikeNone(flow_id) ? BigInt(0) : flow_id, ptr0, len0, ptr1, len1, ptr2, len2, isLikeNone(sample_rate) ? Number.MAX_SAFE_INTEGER : (sample_rate) >>> 0, ptr3, len3, ptr4, len4, ptr5, len5);
+    var ptr6 = isLikeNone(session_id) ? 0 : passStringToWasm0(session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len6 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeFlowInvokeAudio(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, isLikeNone(sample_rate) ? Number.MAX_SAFE_INTEGER : (sample_rate) >>> 0, ptr4, len4, ptr5, len5, ptr6, len6);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v8 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v7;
+    return v8;
 }
 
 /**
@@ -1816,7 +1885,7 @@ export function encodeHubModelSearchRequest(query) {
  * @param {string} resource_type
  * @param {string} resource_id
  * @param {string} subject_type
- * @param {number} subject_id
+ * @param {string} subject_id
  * @returns {Uint8Array}
  */
 export function encodeIamClearPermissionRequest(resource_type, resource_id, subject_type, subject_id) {
@@ -1826,13 +1895,15 @@ export function encodeIamClearPermissionRequest(resource_type, resource_id, subj
     const len1 = WASM_VECTOR_LEN;
     const ptr2 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeIamClearPermissionRequest(ptr0, len0, ptr1, len1, ptr2, len2, subject_id);
+    const ptr3 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamClearPermissionRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v4;
+    return v5;
 }
 
 /**
@@ -1886,59 +1957,67 @@ export function encodeIamCreateUserRequest(username, password, display_name, ema
 }
 
 /**
- * @param {number} group_id
+ * @param {string} group_id
  * @returns {Uint8Array}
  */
 export function encodeIamDeleteGroupRequest(group_id) {
-    const ret = wasm.encodeIamDeleteGroupRequest(group_id);
+    const ptr0 = passStringToWasm0(group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamDeleteGroupRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
+    return v2;
 }
 
 /**
- * @param {number} user_id
+ * @param {string} user_id
  * @returns {Uint8Array}
  */
 export function encodeIamDeleteUserRequest(user_id) {
-    const ret = wasm.encodeIamDeleteUserRequest(user_id);
+    const ptr0 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamDeleteUserRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
+    return v2;
 }
 
 /**
- * @param {number} user_id
+ * @param {string} user_id
  * @returns {Uint8Array}
  */
 export function encodeIamGetUserRequest(user_id) {
-    const ret = wasm.encodeIamGetUserRequest(user_id);
+    const ptr0 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamGetUserRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
+    return v2;
 }
 
 /**
- * @param {number} group_id
+ * @param {string} group_id
  * @returns {Uint8Array}
  */
 export function encodeIamGroupMembersRequest(group_id) {
-    const ret = wasm.encodeIamGroupMembersRequest(group_id);
+    const ptr0 = passStringToWasm0(group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamGroupMembersRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
+    return v2;
 }
 
 /**
@@ -1975,19 +2054,21 @@ export function encodeIamListPermsForResourceRequest(resource_type, resource_id)
 
 /**
  * @param {string} subject_type
- * @param {number} subject_id
+ * @param {string} subject_id
  * @returns {Uint8Array}
  */
 export function encodeIamListPermsForSubjectRequest(subject_type, subject_id) {
     const ptr0 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeIamListPermsForSubjectRequest(ptr0, len0, subject_id);
+    const ptr1 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamListPermsForSubjectRequest(ptr0, len0, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v2;
+    return v3;
 }
 
 /**
@@ -2004,27 +2085,29 @@ export function encodeIamListUsersRequest() {
 }
 
 /**
- * @param {number} user_id
+ * @param {string} user_id
  * @param {string} new_password
  * @returns {Uint8Array}
  */
 export function encodeIamResetUserPasswordRequest(user_id, new_password) {
-    const ptr0 = passStringToWasm0(new_password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr0 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeIamResetUserPasswordRequest(user_id, ptr0, len0);
+    const ptr1 = passStringToWasm0(new_password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamResetUserPasswordRequest(ptr0, len0, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v2;
+    return v3;
 }
 
 /**
  * @param {string} resource_type
  * @param {string} resource_id
  * @param {string} subject_type
- * @param {number} subject_id
+ * @param {string} subject_id
  * @param {string} access_level
  * @returns {Uint8Array}
  */
@@ -2035,46 +2118,30 @@ export function encodeIamSetPermissionRequest(resource_type, resource_id, subjec
     const len1 = WASM_VECTOR_LEN;
     const ptr2 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ptr3 = passStringToWasm0(access_level, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr3 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len3 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeIamSetPermissionRequest(ptr0, len0, ptr1, len1, ptr2, len2, subject_id, ptr3, len3);
+    const ptr4 = passStringToWasm0(access_level, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamSetPermissionRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v5;
+    return v6;
 }
 
 /**
- * @param {number} user_id
+ * @param {string} user_id
  * @param {string} group_ids_csv
  * @returns {Uint8Array}
  */
 export function encodeIamSetUserGroupsRequest(user_id, group_ids_csv) {
-    const ptr0 = passStringToWasm0(group_ids_csv, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr0 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeIamSetUserGroupsRequest(user_id, ptr0, len0);
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v2;
-}
-
-/**
- * @param {number} group_id
- * @param {string} name
- * @param {string} description
- * @returns {Uint8Array}
- */
-export function encodeIamUpdateGroupRequest(group_id, name, description) {
-    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(description, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr1 = passStringToWasm0(group_ids_csv, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeIamUpdateGroupRequest(group_id, ptr0, len0, ptr1, len1);
+    const ret = wasm.encodeIamSetUserGroupsRequest(ptr0, len0, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -2084,7 +2151,29 @@ export function encodeIamUpdateGroupRequest(group_id, name, description) {
 }
 
 /**
- * @param {number} user_id
+ * @param {string} group_id
+ * @param {string} name
+ * @param {string} description
+ * @returns {Uint8Array}
+ */
+export function encodeIamUpdateGroupRequest(group_id, name, description) {
+    const ptr0 = passStringToWasm0(group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(description, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamUpdateGroupRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @param {string} user_id
  * @param {string} display_name
  * @param {string} email
  * @param {boolean} is_active
@@ -2092,19 +2181,21 @@ export function encodeIamUpdateGroupRequest(group_id, name, description) {
  * @returns {Uint8Array}
  */
 export function encodeIamUpdateUserRequest(user_id, display_name, email, is_active, role) {
-    const ptr0 = passStringToWasm0(display_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr0 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(email, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr1 = passStringToWasm0(display_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passStringToWasm0(role, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const ptr2 = passStringToWasm0(email, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeIamUpdateUserRequest(user_id, ptr0, len0, ptr1, len1, is_active, ptr2, len2);
+    const ptr3 = passStringToWasm0(role, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeIamUpdateUserRequest(ptr0, len0, ptr1, len1, ptr2, len2, is_active, ptr3, len3);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v4;
+    return v5;
 }
 
 /**
@@ -3783,7 +3874,7 @@ export function encodeSettingsUpdateSingle(key, value, is_secret) {
  * @param {string} client_secret
  * @param {string} discovery_url
  * @param {boolean} auto_create_users
- * @param {number | null} [default_group_id]
+ * @param {string | null} [default_group_id]
  * @returns {Uint8Array}
  */
 export function encodeSsoProviderCreateRequest(name, provider_type, client_id, client_secret, discovery_url, auto_create_users, default_group_id) {
@@ -3797,13 +3888,15 @@ export function encodeSsoProviderCreateRequest(name, provider_type, client_id, c
     const len3 = WASM_VECTOR_LEN;
     const ptr4 = passStringToWasm0(discovery_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len4 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeSsoProviderCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, auto_create_users, !isLikeNone(default_group_id), isLikeNone(default_group_id) ? 0 : default_group_id);
+    var ptr5 = isLikeNone(default_group_id) ? 0 : passStringToWasm0(default_group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSsoProviderCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, auto_create_users, ptr5, len5);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v6;
+    return v7;
 }
 
 /**
@@ -4496,17 +4589,22 @@ function __wbg_get_imports() {
             const ret = arg0;
             return ret;
         },
-        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000002: function(arg0) {
+            // Cast intrinsic for `I64 -> Externref`.
+            const ret = arg0;
+            return ret;
+        },
+        __wbindgen_cast_0000000000000003: function(arg0, arg1) {
             // Cast intrinsic for `Ref(Slice(U8)) -> NamedExternref("Uint8Array")`.
             const ret = getArrayU8FromWasm0(arg0, arg1);
             return ret;
         },
-        __wbindgen_cast_0000000000000003: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000004: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return ret;
         },
-        __wbindgen_cast_0000000000000004: function(arg0) {
+        __wbindgen_cast_0000000000000005: function(arg0) {
             // Cast intrinsic for `U64 -> Externref`.
             const ret = BigInt.asUintN(64, arg0);
             return ret;

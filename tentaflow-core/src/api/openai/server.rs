@@ -463,7 +463,7 @@ async fn handle_audio_tts(
     if tts_request.language.is_none() {
         if let (Some(ref ctx), Some(ref db)) = (user_ctx.as_ref(), router.db.as_ref()) {
             if let Ok(Some(lang)) =
-                crate::db::repository::get_user_preferred_language(db, ctx.user_id)
+                crate::db::repository::get_user_preferred_language(db, &ctx.user_id)
             {
                 tts_request.language = Some(lang);
             }
@@ -614,11 +614,11 @@ async fn handle_audio_tts_stream(
                 db,
                 "model",
                 &api_request.model,
-                u.user_id,
+                &u.user_id,
                 &u.role,
             ) {
                 tracing::warn!(
-                    user_id = u.user_id,
+                    user_id = %u.user_id,
                     model = %api_request.model,
                     "ACL denied TTS stream model"
                 );
@@ -647,7 +647,7 @@ async fn handle_audio_tts_stream(
         format: api_request.response_format.clone(),
         language: api_request.language.clone(),
         speed: api_request.speed,
-        user_id: user_ctx.as_ref().map(|u| u.user_id),
+        user_id: user_ctx.as_ref().map(|u| u.user_id.clone()),
         user_role: user_ctx.as_ref().map(|u| u.role.clone()),
         cancel_token: cancel.clone(),
     };
@@ -800,11 +800,11 @@ async fn handle_audio_speech_flow_stream(
                 db,
                 "model",
                 &api_request.model,
-                u.user_id,
+                &u.user_id,
                 &u.role,
             ) {
                 tracing::warn!(
-                    user_id = u.user_id,
+                    user_id = %u.user_id,
                     model = %api_request.model,
                     "ACL denied flow audio stream model"
                 );
@@ -1037,7 +1037,7 @@ async fn handle_audio_transcriptions(
     if language.is_none() {
         if let (Some(ref ctx), Some(ref db)) = (user_ctx.as_ref(), router.db.as_ref()) {
             if let Ok(Some(lang)) =
-                crate::db::repository::get_user_preferred_language(db, ctx.user_id)
+                crate::db::repository::get_user_preferred_language(db, &ctx.user_id)
             {
                 language = Some(lang);
             }
@@ -1265,9 +1265,8 @@ async fn handle_models_list(
     };
 
     let body = serde_json::to_vec(&response).unwrap();
-Ok(json_response(StatusCode::OK, body))
+    Ok(json_response(StatusCode::OK, body))
 }
-
 
 /// Sprawdza czy request ma wlaczony debug routing (header lub query param)
 fn is_debug_route_openai(headers: &hyper::header::HeaderMap, uri: &hyper::Uri) -> bool {

@@ -305,7 +305,7 @@ fn audit_log_for_addon_in_org_a_carries_org_id_a() {
     let state = AddonState {
         addon_id: "audit-test".to_string(),
         instance_id: "i-9".to_string(),
-        user_id: Some(7),
+        user_id: Some("00000000-0000-0000-0000-000000000007".to_string()),
         org_id: Some("org-a".to_string()),
         db: pool.clone(),
         permissions: vec![],

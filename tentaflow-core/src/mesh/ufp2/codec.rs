@@ -191,9 +191,9 @@ fn priority_for_kind(kind: Kind) -> Priority {
     // Heartbeat / topology gossip are low-impact background traffic.
     // Pairing / trust / sync interactive. Logs / deploy progress are bulk.
     match kind.0 {
-        0x0010 | 0x001A | 0x001B => Priority::Bulk,            // heartbeat, topology, known peers
-        0x0020..=0x0027 => Priority::Interactive,              // pairing/trust
-        0x0030..=0x0033 => Priority::Bulk,                     // command / deploy
+        0x0010 | 0x001A | 0x001B => Priority::Bulk, // heartbeat, topology, known peers
+        0x0020..=0x0027 => Priority::Interactive,   // pairing/trust
+        0x0030..=0x0033 => Priority::Bulk,          // command / deploy
         _ => Priority::Normal,
     }
 }
@@ -212,7 +212,10 @@ mod tests {
             7,
         );
         assert_eq!(env.channel, channels::MESH);
-        assert_eq!(env.kind.0 as u8, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT);
+        assert_eq!(
+            env.kind.0 as u8,
+            tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT
+        );
         assert_eq!(env.body, b"heartbeat-payload");
         assert_eq!(env.auth.epoch, Some(7));
     }
