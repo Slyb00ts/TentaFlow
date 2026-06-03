@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
         engine: engine.clone(),
         instance_name: Some(format!("smoke-{}", engine)),
         env,
+        extra_args: Vec::new(),
     };
 
     let log_sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line: &str| {

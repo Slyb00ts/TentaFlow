@@ -1206,7 +1206,7 @@ pub(crate) fn vllm_deploy_env(
 pub(crate) fn vllm_native_speculative_arg(
     manifest: &ServiceManifest,
     user_config: &serde_json::Value,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     let preset = resolve_selected_preset(manifest, user_config)?;
     let method = vllm_spec_method(preset.speculator_method.as_deref()?)?;
     let ntok = preset.speculator_num_tokens.unwrap_or(4);
@@ -1221,7 +1221,10 @@ pub(crate) fn vllm_native_speculative_arg(
         }
         _ => return None,
     };
-    Some(format!("--speculative-config {json}"))
+    // Flaga i JSON jako DWA osobne elementy argv. JSON nigdy nie przechodzi
+    // przez shlex/xargs, wiec wewnetrzne cudzyslowy zostaja nietkniete i
+    // vLLM dostaje poprawny `--speculative-config {"model":...}`.
+    Some(vec!["--speculative-config".to_string(), json])
 }
 
 /// Builds the canonical base URL we persist as `services.endpoint_url` for
@@ -1920,18 +1923,6 @@ pub(crate) fn parse_gpu_memory_utilization_arg(raw: &str) -> Option<f64> {
         }
     }
     None
-}
-
-pub(crate) fn normalize_vllm_spark_args(raw: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for tok in raw.split_whitespace() {
-        if tok == "--enable-flashinfer-autotune" || tok == "--no-enable-flashinfer-autotune" {
-            continue;
-        }
-        out.push(tok.to_string());
-    }
-    out.push("--no-enable-flashinfer-autotune".to_string());
-    out.join(" ")
 }
 
 // ----- Tiny extension on Category to get string capability tag --------------

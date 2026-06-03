@@ -16,7 +16,7 @@ use rusqlite::Transaction;
 
 use super::{
     auto_gpu_memory_utilization, build_endpoint_url, build_new_service, category_tag,
-    host_os_supported, is_cuda_vllm_engine, models_from_manifest, normalize_vllm_spark_args,
+    host_os_supported, is_cuda_vllm_engine, models_from_manifest,
     parse_gpu_memory_utilization_arg, query_cuda0_vram_mib, resolve_display_name,
     smart_health_probe, strip_gpu_memory_utilization, DeployError, DeployResult, DeployStrategy,
     LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
@@ -220,39 +220,35 @@ impl DeployStrategy for PythonBundleDeploy {
         }
         let is_cuda_vllm = is_cuda_vllm_engine(&engine_id);
         apply_vllm_user_args(&engine_id, &self.user_config, &mut env);
-        // vLLM featured presets (Bielik draft, Qwen MTP): append the preset's
-        // `--speculative-config` to VLLM_ARGS so the native server enables
-        // speculative decoding. (NVFP4 self-quant for native still serves the
-        // unquantized HF repo — the quantize prelaunch is docker-only for now.)
-        if let Some(spec_arg) =
+
+        // Strukturalne argi CLI budowane przez Rust (speculative, gpu-memory).
+        // Plyna do silnika jako osobne elementy argv przez
+        // `NativeDeployRequest.extra_args` — NIE przez stringowy VLLM_ARGS.
+        // Stary round-trip przez VLLM_ARGS + shlex zjadal cudzyslowy w JSON
+        // `--speculative-config`, a doklejanie tych samych flag co bundle.toml
+        // dawalo duplikaty. Dedup last-wins w build_engine_args zalatwia kolizje.
+        let mut extra_args: Vec<String> = Vec::new();
+
+        // vLLM featured presets (Bielik draft, Qwen MTP): `--speculative-config`
+        // <json> jako dwa osobne elementy argv. (NVFP4 self-quant dla native
+        // nadal serwuje niequantyzowane HF repo — quantize prelaunch jest na
+        // razie tylko docker.)
+        if let Some(spec_args) =
             super::vllm_native_speculative_arg(&self.manifest, &self.user_config)
         {
-            let merged = match env.get("VLLM_ARGS") {
-                Some(existing) if !existing.trim().is_empty() => {
-                    format!("{} {}", existing, spec_arg)
-                }
-                _ => spec_arg,
-            };
-            env.insert("VLLM_ARGS".into(), merged);
+            extra_args.extend(spec_args);
         }
-        // VLLM_ARGS / gpu_memory_utilization sa pojeciami specyficznymi dla
-        // vllm. Inne python-bundle silniki (qwen-asr, parakeet, xtts itd.)
-        // odpalaja przez uvicorn lub wlasny entrypoint, ktore nie znaja
-        // `--gpu-memory-utilization` — bez tego guarda flaga byla appendowana
-        // do uvicorn argv przez `build_engine_args` (rozwija VLLM_ARGS env
-        // dla kazdego engine'a) i serwis padal na `No such option`.
-        // Single source of truth dla --gpu-memory-utilization.
+
+        // gpu_memory_utilization jest pojeciem specyficznym dla vllm. Inne
+        // python-bundle silniki (qwen-asr, parakeet, xtts itd.) odpalaja przez
+        // uvicorn / wlasny entrypoint ktore nie znaja `--gpu-memory-utilization`,
+        // wiec liczymy ja tylko dla CUDA vllm.
+        // Single source of truth dla --gpu-memory-utilization:
         //   - Manual mode: wizard wysyla user's value (top-level
-        //     `gpu_memory_utilization` lub w `vllm_args`). Backend ją honoruje
-        //     1:1, BEZ klamrowania. Jezeli user wybral za duzo i vllm padnie
-        //     przy starcie — to swiadoma decyzja (slider widzi free VRAM,
-        //     wizard ostrzega).
-        //   - Auto mode: wizard nie wysyla osobnego pola, vllm_args
-        //     pochodzi z `recommended_vllm_args` (backend recommendation).
-        //     Tu my dorzucamy auto-clamp na podstawie aktualnego free VRAM,
-        //     zeby vllm wstal niezaleznie od stanu hosta.
-        // Niezaleznie od trybu, finalnie w VLLM_ARGS jest **dokladnie jedna**
-        // flaga --gpu-memory-utilization — wszystkie poprzednie sa wyciete.
+        //     `gpu_memory_utilization` lub w `vllm_args`). Honorujemy ją 1:1.
+        //   - Auto mode: brak osobnego pola → auto-clamp z aktualnego free VRAM.
+        // Finalna flaga ląduje w extra_args; ewentualny duplikat z user
+        // VLLM_ARGS wycina dedup last-wins (extra_args jest ostatnie → wygrywa).
         let user_explicit_ratio = if !is_cuda_vllm {
             None
         } else {
@@ -283,16 +279,20 @@ impl DeployStrategy for PythonBundleDeploy {
                 .or_else(auto_gpu_memory_utilization)
         };
         if let Some(ratio) = final_ratio {
-            // Wytnij ewentualne stare wystapienia flagi z VLLM_ARGS.
+            // Stare wystapienia flagi w user VLLM_ARGS wytnij — dedup last-wins
+            // i tak by je usunal, ale czyszczenie tu trzyma VLLM_ARGS w czystym
+            // stanie i upraszcza detekcje `--enforce-eager` ponizej.
             let cleaned = match env.get("VLLM_ARGS") {
                 Some(raw) => strip_gpu_memory_utilization(raw),
                 None => String::new(),
             };
-            let mut merged_parts: Vec<String> = Vec::new();
-            if !cleaned.is_empty() {
-                merged_parts.push(cleaned.clone());
+            if cleaned.trim().is_empty() {
+                env.remove("VLLM_ARGS");
+            } else {
+                env.insert("VLLM_ARGS".into(), cleaned.clone());
             }
-            merged_parts.push(format!("--gpu-memory-utilization {:.2}", ratio));
+            extra_args.push("--gpu-memory-utilization".to_string());
+            extra_args.push(format!("{:.2}", ratio));
 
             // CUDA graph capture (default mode w vllm) potrafi zaalokowac
             // 1.5-3 GiB ponad `gpu_memory_utilization` budget przy
@@ -311,15 +311,13 @@ impl DeployStrategy for PythonBundleDeploy {
                 .split_whitespace()
                 .any(|t| t == "--enforce-eager" || t == "--no-enforce-eager");
             if user_capped && !already_has_eager {
-                merged_parts.push("--enforce-eager".to_string());
+                extra_args.push("--enforce-eager".to_string());
                 if let Some(s) = &self.log_sink {
                     s.info(
                         "[python-bundle] dolepiono --enforce-eager (user_ratio<auto_safe) — wylacza CUDA graph capture, peak alloc w budgecie",
                     );
                 }
             }
-            let merged = merged_parts.join(" ");
-            env.insert("VLLM_ARGS".into(), merged);
             env.insert("GPU_MEMORY_UTILIZATION".into(), format!("{:.2}", ratio));
             if let Some(s) = &self.log_sink {
                 let (free_mib, total_mib) = query_cuda0_vram_mib().unwrap_or((0, 0));
@@ -345,14 +343,17 @@ impl DeployStrategy for PythonBundleDeploy {
             }
         }
         if engine_id == "vllm-spark" {
-            let raw = env.get("VLLM_ARGS").map(String::as_str).unwrap_or("");
-            env.insert("VLLM_ARGS".into(), normalize_vllm_spark_args(raw));
+            // Spark wymaga `--no-enable-flashinfer-autotune`. Dolepiamy do
+            // extra_args; dedup last-wins skasuje ewentualny `--enable-...`
+            // z bundle.toml / user args.
+            extra_args.push("--no-enable-flashinfer-autotune".to_string());
         }
 
         let req = NativeDeployRequest {
             engine: engine_id.clone(),
             instance_name: Some(instance_name.clone()),
             env,
+            extra_args,
         };
         let log = self.build_venv_log();
 
@@ -537,24 +538,6 @@ mod tests {
     fn strip_no_op_when_flag_absent() {
         let raw = "--dtype auto --max-model-len 8192";
         assert_eq!(strip_gpu_memory_utilization(raw), raw);
-    }
-
-    #[test]
-    fn normalize_vllm_spark_args_forces_no_autotune() {
-        let raw = "--dtype auto --enable-flashinfer-autotune --max-model-len 8192";
-        assert_eq!(
-            normalize_vllm_spark_args(raw),
-            "--dtype auto --max-model-len 8192 --no-enable-flashinfer-autotune"
-        );
-    }
-
-    #[test]
-    fn normalize_vllm_spark_args_dedupes_no_autotune() {
-        let raw = "--no-enable-flashinfer-autotune --gpu-memory-utilization 0.70";
-        assert_eq!(
-            normalize_vllm_spark_args(raw),
-            "--gpu-memory-utilization 0.70 --no-enable-flashinfer-autotune"
-        );
     }
 
     #[test]

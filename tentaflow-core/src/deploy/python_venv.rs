@@ -141,6 +141,16 @@ pub struct NativeDeployRequest {
     pub engine: String,
     pub instance_name: Option<String>,
     pub env: HashMap<String, String>,
+    /// Strukturalne argumenty CLI budowane przez Rust (np.
+    /// `["--speculative-config", "{...json...}"]` albo
+    /// `["--gpu-memory-utilization", "0.85"]`). Dolaczane do argv silnika
+    /// 1:1, BEZ shlex-a — inaczej parser shellowy zjada wewnetrzne cudzyslowy
+    /// kompaktowego JSON-a w `--speculative-config` i vLLM dostaje zepsuty
+    /// payload. To jest sciezka dla argumentow ktore MY skladamy z typed
+    /// configu; user-typed `VLLM_ARGS` (env) nadal idzie przez shlex bo user
+    /// sam cytuje. Last-wins z dedup nadpisuje pokrywajace sie flagi z
+    /// bundle.toml i `VLLM_ARGS`.
+    pub extra_args: Vec<String>,
 }
 
 /// Wynik: uruchomiony subprocess + sciezki.
@@ -1502,10 +1512,11 @@ fn copy_bundle_files(bundle_src: &Path, venv: &Path) -> Result<()> {
 pub(crate) fn build_engine_args(
     spec: &BundleSpec,
     env: &HashMap<String, String>,
+    extra_args: &[String],
     bundle_dir: &Path,
     venv: &Path,
 ) -> Vec<String> {
-    let mut args: Vec<String> = Vec::with_capacity(spec.launch.args.len() + 8);
+    let mut args: Vec<String> = Vec::with_capacity(spec.launch.args.len() + extra_args.len() + 8);
     for arg in &spec.launch.args {
         let substituted = substitute_vars_full(arg, env, bundle_dir, venv);
         // `${VAR?--flag:}` z falsy env produkuje pusty token. Pomijamy go,
@@ -1518,13 +1529,10 @@ pub(crate) fn build_engine_args(
         }
         args.push(substituted);
     }
-    // VLLM_ARGS / SGLANG_ARGS / itd. z deploy wizard (Advanced section) -
-    // appendowane PO arguments z bundle.toml. shlex split honoruje cudzyslowy
-    // (np. --extra-config '{"key": "val"}'). Pozwala uzytkownikowi nadpisac
-    // tensor-parallel-size, max-model-len, kv-cache-dtype itp. dla bundle
-    // python tak samo jak dla docker (gdzie entrypoint.sh tokenizuje VLLM_ARGS
-    // przez `xargs`, ktory rowniez honoruje cudzyslowy — surowy `$VLLM_ARGS`
-    // w bashu zostawialby literalne apostrofy wokol JSON).
+    // VLLM_ARGS / SGLANG_ARGS / itd. z deploy wizard (Advanced section) —
+    // user-typed string, wiec shlex split honoruje cudzyslowy ktore USER sam
+    // postawil (np. --override-generation-config '{"max_tokens":100}'). To
+    // jest jedyna sciezka ktora powinna tokenizowac przez shlex.
     let extra_args_env_keys = ["VLLM_ARGS", "SGLANG_ARGS", "TRTLLM_ARGS", "EXTRA_ARGS"];
     for key in extra_args_env_keys {
         if let Some(extra) = env.get(key) {
@@ -1547,7 +1555,132 @@ pub(crate) fn build_engine_args(
             }
         }
     }
-    args
+    // Strukturalne argi budowane przez Rust (speculative-config JSON,
+    // gpu-memory-utilization). Dolaczane 1:1 BEZ shlex-a — kompaktowy JSON
+    // `{"model":"...","num_speculative_tokens":3}` jest pojedynczym elementem
+    // Vec i MUSI przezyc nietkniety; shlex zjadlby wewnetrzne cudzyslowy.
+    // `${VAR}` wewnatrz nadal podstawiamy (np. sciezki), ale bez re-tokenizacji.
+    for arg in extra_args {
+        args.push(substitute_vars_full(arg, env, bundle_dir, venv));
+    }
+    // Dedup last-wins: bundle.toml dostarcza baseline (--dtype, --max-model-len,
+    // boolean --enable-x), a user VLLM_ARGS i strukturalne extra_args moga te
+    // same flagi nadpisac. Bez dedupu vLLM dostaje duplikaty (warning
+    // "duplicate keys") albo wręcz konflikt --enable-x / --no-enable-x.
+    dedup_cli_args_last_wins(args)
+}
+
+/// Czy token wyglada jak flaga CLI (`--flag` / `--flag=value` / `-f`).
+fn is_cli_flag(tok: &str) -> bool {
+    tok.starts_with('-') && tok.len() > 1 && !tok.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Czy flaga jest boolean toggle (nie konsumuje nastepnego tokenu jako wartosci).
+/// Rodzina vLLM/sglang `--enable-*` / `--no-enable-*` to czyste przelaczniki —
+/// gdyby konsumowaly nastepny token, sekwencja `--enable-x file --no-enable-x`
+/// skasowalaby pozycjonalne `file` razem z para enable/no-enable przy last-wins.
+fn is_boolean_cli_flag(tok: &str) -> bool {
+    if !is_cli_flag(tok) || tok.contains('=') {
+        return false;
+    }
+    let name = tok.trim_start_matches('-');
+    name.starts_with("enable-") || name.starts_with("no-enable-")
+}
+
+/// Wyciaga kanoniczna nazwe flagi dla potrzeb dedupu. `--max-model-len=8192`
+/// → `--max-model-len`. Boolean pary `--enable-foo` / `--no-enable-foo`
+/// kolapsuja do wspolnego klucza `--enable-foo`, zeby ostatni wariant w argv
+/// (enable albo no-enable) wygral zamiast obu naraz lecieć do silnika.
+fn flag_canonical_name(tok: &str) -> Option<String> {
+    if !is_cli_flag(tok) {
+        return None;
+    }
+    let name = tok.split('=').next().unwrap_or(tok);
+    let stripped = name.trim_start_matches('-');
+    let canonical = stripped.strip_prefix("no-").unwrap_or(stripped);
+    Some(format!("--{canonical}"))
+}
+
+/// Dedup argumentow CLI z semantyka last-wins. Obsluguje formy:
+///   * `--flag value`  (wartosc to nastepny token nie bedacy flaga)
+///   * `--flag=value`
+///   * `--flag`         (boolean bez wartosci)
+///   * pary `--enable-x` / `--no-enable-x` (wspolny klucz, ostatnie wygrywa)
+/// Pozycjonalne argumenty (nie-flagi na poczatku, np. `-m module`, sciezki)
+/// nie maja kanonicznej nazwy i sa zachowywane bez dedupu.
+///
+/// Algorytm: parsujemy argv na (klucz, segment) grupy, idziemy od TYLU
+/// i zachowujemy pierwsze (czyli ostatnie w oryginalnej kolejnosci)
+/// wystapienie kazdego klucza, potem odwracamy by przywrocic kolejnosc.
+pub(crate) fn dedup_cli_args_last_wins(args: Vec<String>) -> Vec<String> {
+    // Segment = jedna flaga z opcjonalna wartoscia, albo pojedynczy
+    // pozycjonalny token. `key=None` → pozycjonalny (nigdy nie deduplikowany).
+    struct Segment {
+        key: Option<String>,
+        tokens: Vec<String>,
+    }
+    let mut segments: Vec<Segment> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let tok = &args[i];
+        match flag_canonical_name(tok) {
+            Some(key) => {
+                // `--flag=value` niesie wartosc w sobie; `--flag value`
+                // konsumuje nastepny token jako wartosc TYLKO gdy flaga nie jest
+                // boolean toggle (--enable-x / --no-enable-x nie maja wartosci)
+                // ORAZ nastepny token nie jest sam flaga. Inaczej pozycjonalny
+                // token za boolean (np. `--enable-x file`) zostalby blednie
+                // wciagniety i skasowany razem z flaga przy last-wins.
+                if tok.contains('=') {
+                    segments.push(Segment {
+                        key: Some(key),
+                        tokens: vec![tok.clone()],
+                    });
+                    i += 1;
+                } else if !is_boolean_cli_flag(tok)
+                    && i + 1 < args.len()
+                    && !is_cli_flag(&args[i + 1])
+                {
+                    segments.push(Segment {
+                        key: Some(key),
+                        tokens: vec![tok.clone(), args[i + 1].clone()],
+                    });
+                    i += 2;
+                } else {
+                    segments.push(Segment {
+                        key: Some(key),
+                        tokens: vec![tok.clone()],
+                    });
+                    i += 1;
+                }
+            }
+            None => {
+                segments.push(Segment {
+                    key: None,
+                    tokens: vec![tok.clone()],
+                });
+                i += 1;
+            }
+        }
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut kept_rev: Vec<Segment> = Vec::with_capacity(segments.len());
+    for seg in segments.into_iter().rev() {
+        match &seg.key {
+            Some(k) => {
+                if seen.insert(k.clone()) {
+                    kept_rev.push(seg);
+                }
+            }
+            None => kept_rev.push(seg),
+        }
+    }
+    kept_rev
+        .into_iter()
+        .rev()
+        .flat_map(|s| s.tokens)
+        .collect()
 }
 
 /// Buduje `Command` ktora opakowuje docelowa binarke w `nice` + `ionice`
@@ -1676,7 +1809,7 @@ fn spawn_engine(
     let bundle_dir = venv.join("app");
 
     let mut cmd = build_engine_command(&exe);
-    for arg in build_engine_args(spec, &req.env, &bundle_dir, venv) {
+    for arg in build_engine_args(spec, &req.env, &req.extra_args, &bundle_dir, venv) {
         cmd.arg(arg);
     }
     for (k, v) in &req.env {
@@ -2272,7 +2405,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("PORT".to_string(), "5001".to_string());
         env.insert("ENABLE_CHUNKED".to_string(), "false".to_string());
-        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        let args = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
         // Empty token z falsy ternary jest filtrowany.
         assert_eq!(
             args,
@@ -2281,7 +2414,7 @@ mod tests {
 
         // Truthy ternary daje --enable-chunked-prefill jako oddzielny token.
         env.insert("ENABLE_CHUNKED".to_string(), "true".to_string());
-        let args2 = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        let args2 = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
         assert_eq!(
             args2,
             vec![
@@ -2340,7 +2473,7 @@ mod tests {
             "--tensor-parallel-size 4 --max-model-len 16384 --kv-cache-dtype fp8".into(),
         );
 
-        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        let args = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
 
         // Bundle defaults
         assert!(args
@@ -2368,7 +2501,7 @@ mod tests {
             "VLLM_ARGS".to_string(),
             r#"--tensor-parallel-size 2 --override-generation-config '{"max_tokens": 100}'"#.into(),
         );
-        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        let args = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
         assert!(args.contains(&"--tensor-parallel-size".to_string()));
         assert!(args.contains(&"2".to_string()));
         assert!(args.contains(&"--override-generation-config".to_string()));
@@ -2386,7 +2519,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("MODEL".to_string(), "test".into());
         env.insert("VLLM_ARGS".to_string(), "   ".into()); // whitespace only
-        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        let args = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
         // Powinno byc tylko bundle defaults, BEZ trailing junk
         let last = args.last().unwrap();
         assert_ne!(last, " ");
@@ -2403,10 +2536,180 @@ mod tests {
             "SGLANG_ARGS".to_string(),
             "--mem-fraction-static 0.85 --tp 2".into(),
         );
-        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        let args = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
         assert!(args.contains(&"--mem-fraction-static".to_string()));
         assert!(args.contains(&"0.85".to_string()));
         assert!(args.contains(&"--tp".to_string()));
+    }
+
+    #[test]
+    fn build_engine_args_keeps_speculative_json_as_single_element() {
+        // KLUCZOWE: JSON `--speculative-config {...}` jako element extra_args
+        // MUSI przezyc jako jeden token z nietknietymi wewnetrznymi
+        // cudzyslowami. To jest bug z produkcji — shlex/round-trip przez
+        // VLLM_ARGS zjadal cudzyslowy i vLLM padal na "cannot be converted".
+        let spec = vllm_bundle_spec();
+        let mut env = HashMap::new();
+        env.insert("MODEL".to_string(), "TentaFlow/Bielik-1.5B-NVFP4".into());
+        let json = r#"{"model":"TentaFlow/Bielik-1.5B-NVFP4","num_speculative_tokens":3}"#;
+        let extra = vec!["--speculative-config".to_string(), json.to_string()];
+        let args = build_engine_args(
+            &spec,
+            &env,
+            &extra,
+            Path::new("/tmp/b"),
+            Path::new("/tmp/v"),
+        );
+        // Flaga obecna i bezposrednio po niej caly nietkniety JSON.
+        let pos = args
+            .iter()
+            .position(|a| a == "--speculative-config")
+            .expect("flaga --speculative-config musi byc w argv");
+        assert_eq!(
+            args[pos + 1], json,
+            "JSON musi byc jednym nietknietym elementem, dostalem: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn build_engine_args_extra_args_not_shlex_split() {
+        // extra_args nie przechodza przez shlex — element z apostrofami w
+        // srodku zostaje jednym tokenem (gdyby szedl przez shlex, '{' zostalby
+        // zjedzony / rozbity).
+        let spec = vllm_bundle_spec();
+        let mut env = HashMap::new();
+        env.insert("MODEL".to_string(), "test".into());
+        let extra = vec![
+            "--speculative-config".to_string(),
+            r#"{"method":"ngram","num_speculative_tokens":3}"#.to_string(),
+        ];
+        let args = build_engine_args(
+            &spec,
+            &env,
+            &extra,
+            Path::new("/tmp/b"),
+            Path::new("/tmp/v"),
+        );
+        assert!(args
+            .iter()
+            .any(|a| a == r#"{"method":"ngram","num_speculative_tokens":3}"#));
+    }
+
+    #[test]
+    fn dedup_last_wins_space_separated() {
+        let args = vec![
+            "--dtype".into(),
+            "auto".into(),
+            "--max-model-len".into(),
+            "8192".into(),
+            "--max-model-len".into(),
+            "16384".into(),
+        ];
+        let out = dedup_cli_args_last_wins(args);
+        assert_eq!(out, vec!["--dtype", "auto", "--max-model-len", "16384"]);
+    }
+
+    #[test]
+    fn dedup_last_wins_equals_form() {
+        let args = vec![
+            "--gpu-memory-utilization=0.90".into(),
+            "--dtype".into(),
+            "auto".into(),
+            "--gpu-memory-utilization".into(),
+            "0.70".into(),
+        ];
+        let out = dedup_cli_args_last_wins(args);
+        assert_eq!(out, vec!["--dtype", "auto", "--gpu-memory-utilization", "0.70"]);
+    }
+
+    #[test]
+    fn dedup_last_wins_boolean_enable_no_enable_pair() {
+        // --enable-x i --no-enable-x kolapsuja do wspolnego klucza, ostatni
+        // wygrywa — eliminuje konflikt ktory vLLM odrzucal.
+        let args = vec![
+            "--enable-flashinfer-autotune".into(),
+            "--dtype".into(),
+            "auto".into(),
+            "--no-enable-flashinfer-autotune".into(),
+        ];
+        let out = dedup_cli_args_last_wins(args);
+        assert_eq!(
+            out,
+            vec!["--dtype", "auto", "--no-enable-flashinfer-autotune"]
+        );
+    }
+
+    #[test]
+    fn dedup_boolean_flag_does_not_eat_positional() {
+        // `--enable-x file --no-enable-x`: boolean flaga NIE zjada `file`.
+        // Pozycjonalny `file` zostaje, a z pary enable/no-enable wygrywa
+        // ostatni (--no-enable-x) przez last-wins.
+        let args = vec![
+            "--enable-prefix-caching".into(),
+            "file".into(),
+            "--no-enable-prefix-caching".into(),
+        ];
+        let out = dedup_cli_args_last_wins(args);
+        assert!(out.iter().any(|a| a == "file"), "pozycjonalny zniknal: {out:?}");
+        assert!(out.iter().any(|a| a == "--no-enable-prefix-caching"), "{out:?}");
+        assert!(!out.iter().any(|a| a == "--enable-prefix-caching"), "{out:?}");
+        assert_eq!(out, vec!["file", "--no-enable-prefix-caching"]);
+    }
+
+    #[test]
+    fn dedup_pure_boolean_pair_last_wins() {
+        // Czysta para boolean bez pozycjonalnego — last-wins, jeden token.
+        let args = vec![
+            "--enable-prefix-caching".into(),
+            "--no-enable-prefix-caching".into(),
+        ];
+        let out = dedup_cli_args_last_wins(args);
+        assert_eq!(out, vec!["--no-enable-prefix-caching"]);
+    }
+
+    #[test]
+    fn dedup_preserves_positional_and_negative_values() {
+        // Pozycjonalne (-m module) i wartosci ujemne nie sa traktowane jak
+        // flagi do dedupu.
+        let args = vec![
+            "-m".into(),
+            "vllm.entrypoints.openai.api_server".into(),
+            "--seed".into(),
+            "-1".into(),
+        ];
+        let out = dedup_cli_args_last_wins(args.clone());
+        assert_eq!(out, args);
+    }
+
+    #[test]
+    fn dedup_does_not_touch_json_value() {
+        // JSON jako wartosc flagi nie jest re-tokenizowany ani gubiony.
+        let json = r#"{"model":"x","num_speculative_tokens":3}"#;
+        let args = vec!["--speculative-config".into(), json.to_string()];
+        let out = dedup_cli_args_last_wins(args);
+        assert_eq!(out, vec!["--speculative-config", json]);
+    }
+
+    #[test]
+    fn build_engine_args_dedup_user_overrides_bundle() {
+        // bundle.toml ma --max-model-len 8192, user VLLM_ARGS nadpisuje 32768.
+        // Last-wins → tylko jedna flaga z wartoscia usera.
+        let mut spec = vllm_bundle_spec();
+        spec.launch.args = vec![
+            "-m".into(),
+            "vllm.entrypoints.openai.api_server".into(),
+            "--max-model-len".into(),
+            "8192".into(),
+        ];
+        let mut env = HashMap::new();
+        env.insert("MODEL".to_string(), "test".into());
+        env.insert("VLLM_ARGS".to_string(), "--max-model-len 32768".into());
+        let args = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
+        let count = args.iter().filter(|a| *a == "--max-model-len").count();
+        assert_eq!(count, 1, "tylko jedna --max-model-len, dostalem: {:?}", args);
+        let pos = args.iter().position(|a| a == "--max-model-len").unwrap();
+        assert_eq!(args[pos + 1], "32768");
     }
 
     #[test]

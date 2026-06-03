@@ -44,8 +44,8 @@ docker run -d --name "$CONTAINER" \
   -v "$DATA_DIR:/data" \
   -v "$HF_CACHE:/root/.cache/huggingface" \
   -e MODEL="$MODEL" \
-  -e SGLANG_ARGS="--tp 1 --mem-fraction-static 0.5" \
-  tentaflow/sglang:latest >/dev/null
+  tentaflow/sglang:latest \
+  --tp 1 --mem-fraction-static 0.5 >/dev/null
 echo "[test] kontener up"
 
 ENDPOINT_ID=""

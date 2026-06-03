@@ -84,6 +84,7 @@ impl LoadableEngine for PythonBundleEngine {
             engine: self.engine_id.clone(),
             instance_name: Some(self.instance_name.clone()),
             env: self.env.clone(),
+            extra_args: Vec::new(),
         };
         let running =
             tokio::task::spawn_blocking(move || crate::deploy::python_venv::relaunch(&req))

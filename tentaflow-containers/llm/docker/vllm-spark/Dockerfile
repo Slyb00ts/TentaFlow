@@ -76,7 +76,6 @@ COPY tentaflow-containers/llm/docker/vllm-spark/config.default.toml /app/config.
 COPY tentaflow-containers/llm/docker/vllm-spark/entrypoint.sh /app/entrypoint.sh
 COPY tentaflow-containers/llm/docker/_shared/quantize_nvfp4.py /app/quantize_nvfp4.py
 COPY tentaflow-containers/llm/docker/_shared/prepare-vllm-model.sh /app/prepare-vllm-model.sh
-COPY tentaflow-containers/llm/docker/_shared/vllm-spec-prep.sh /app/vllm-spec-prep.sh
 RUN chmod +x /app/entrypoint.sh /app/prepare-vllm-model.sh
 
 EXPOSE 5000/udp
