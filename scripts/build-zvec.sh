@@ -32,6 +32,21 @@ PLATFORM="${1:-linux-x86_64}"
 
 SRC_DIR="${ZVEC_SRC_DIR:-/tmp/zvec-build}"
 
+# zvec submoduly wymagaja cmake<4 (CMake 4 wywalil kompatybilnosc z
+# cmake_minimum_required<3.5); zwraca major cmake albo nic.
+cmake_major_version() { cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9][0-9]*\).*/\1/p'; }
+
+# True (0) gdy zvec mozna zbudowac na Linuksie NATYWNIE (bez Dockera): potrzeba
+# gcc-11/g++-11 (RocksDB 8.1 nie kompiluje sie pod gcc>=13), ninja oraz cmake<4.
+linux_native_zvec_ok() {
+  command -v gcc-11 >/dev/null 2>&1 || return 1
+  command -v g++-11 >/dev/null 2>&1 || return 1
+  command -v ninja  >/dev/null 2>&1 || return 1
+  local maj; maj="$(cmake_major_version)"
+  [ -n "$maj" ] && [ "$maj" -lt 4 ] || return 1
+  return 0
+}
+
 echo "=========================================="
 echo "  Build zvec static archive (model B)"
 echo "  Platform: $PLATFORM | ref: $ZVEC_REF"
@@ -42,8 +57,18 @@ echo "=========================================="
 if [ ! -d "$SRC_DIR/.git" ]; then
     git clone "$ZVEC_REPO" "$SRC_DIR"
 fi
-( cd "$SRC_DIR" && git fetch origin -q && git checkout "$ZVEC_REF" \
-  && git submodule update --init --recursive --depth 1 )
+( cd "$SRC_DIR" && git fetch origin -q
+  # Inny ZVEC_REF niz obecny checkout moze ciagnac inne wersje thirdparty/
+  # submodulow; zostawione untracked pliki (rozpakowane zaleznosci, np. CRoaring)
+  # blokuja checkout. Sprobuj normalnie; gdy sie nie uda — wyczysc drzewo +
+  # submoduly (untracked tez) i ponow.
+  if ! git checkout "$ZVEC_REF" 2>/dev/null; then
+    git submodule foreach --recursive 'git reset --hard -q; git clean -ffdxq' 2>/dev/null || true
+    git reset --hard -q 2>/dev/null || true
+    git clean -ffdxq 2>/dev/null || true
+    git checkout "$ZVEC_REF"
+  fi
+  git submodule update --init --recursive --depth 1 --force )
 
 OUT_LIB_DIR="$SYS_CRATE/vendor/lib/$PLATFORM"
 mkdir -p "$OUT_LIB_DIR" "$VENDOR_INCLUDE"
@@ -54,18 +79,30 @@ mkdir -p "$OUT_LIB_DIR" "$VENDOR_INCLUDE"
 
 case "$PLATFORM" in
   linux-x86_64|linux-aarch64)
-    # RocksDB 8.1 does not build with gcc >= 13; build in a pinned container.
-    docker run --rm -v "$SRC_DIR:/src" -w /src ubuntu:22.04 bash -c '
-      set -e
-      export DEBIAN_FRONTEND=noninteractive CC=gcc-11 CXX=g++-11
-      apt-get update -qq && apt-get install -y -qq build-essential gcc-11 g++-11 git python3 python3-pip libssl-dev pkg-config curl ca-certificates >/dev/null 2>&1
-      pip3 install -q "cmake<4" ninja >/dev/null 2>&1
-      rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
-      cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
-        -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_C_BINDINGS=ON ..
-      ninja zvec_c_api -j"$(nproc)"
-      chown -R '"$(id -u):$(id -g)"' /src/build_zvec
-    '
+    # RocksDB 8.1 nie kompiluje sie pod gcc>=13. Preferujemy NATYWNY gcc-11
+    # (bez Dockera, bez root-owned artefaktow); gdy go brak — fallback na
+    # kontener Ubuntu 22.04/gcc-11 (dostarcza gcc-11 + cmake<4 w srodku).
+    if linux_native_zvec_ok; then
+      echo "  Build natywny: gcc-$(gcc-11 -dumpversion) / cmake $(cmake_major_version).x / ninja (bez Dockera)"
+      ( cd "$SRC_DIR" && rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
+          -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_C_BINDINGS=ON ..
+        ninja zvec_c_api -j"$(nproc)" )
+    else
+      echo "  Brak natywnego gcc-11/ninja/cmake<4 — buduje w Dockerze (Ubuntu 22.04/gcc-11)."
+      docker run --rm -v "$SRC_DIR:/src" -w /src ubuntu:22.04 bash -c '
+        set -e
+        export DEBIAN_FRONTEND=noninteractive CC=gcc-11 CXX=g++-11
+        apt-get update -qq && apt-get install -y -qq build-essential gcc-11 g++-11 git python3 python3-pip libssl-dev pkg-config curl ca-certificates >/dev/null 2>&1
+        pip3 install -q "cmake<4" ninja >/dev/null 2>&1
+        rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
+          -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_C_BINDINGS=ON ..
+        ninja zvec_c_api -j"$(nproc)"
+        chown -R '"$(id -u):$(id -g)"' /src/build_zvec
+      '
+    fi
     cp "$SRC_DIR/build_zvec/lib/libzvec_c_api.so" "$OUT_LIB_DIR/libzvec_c_api.so"
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.so"
     ;;
