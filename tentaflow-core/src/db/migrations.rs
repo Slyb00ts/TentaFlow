@@ -340,8 +340,22 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "repair_admin_non_uuid_id",
             MigrationStep::RustSelfManaged(repair_admin_non_uuid_id),
         ),
+        (
+            59,
+            "drop_legacy_users_table",
+            MigrationStep::Sql(DROP_LEGACY_USERS_TABLE),
+        ),
     ]
 }
+
+// The legacy `users` table (F1a auth) is dead weight: dashboard login,
+// session identity and every FK go through `user_accounts` (F2). v38/v56
+// still read `users` to backfill memberships / flip identity on upgrading
+// installs, so it must survive those migrations — this final step drops it
+// once they have run. Fresh installs create it in INITIAL_SCHEMA, exercise
+// the historical migrations, then drop it here. No runtime code references
+// it after this point.
+const DROP_LEGACY_USERS_TABLE: &str = "DROP TABLE IF EXISTS users;";
 
 // =============================================================================
 // v56 — core identity INTEGER -> TEXT UUID migration

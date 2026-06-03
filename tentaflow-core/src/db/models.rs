@@ -29,20 +29,6 @@ pub struct DbSetting {
     pub updated_at: String,
 }
 
-/// Uzytkownik dashboardu
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbUser {
-    pub id: i64,
-    pub username: String,
-    #[serde(skip_serializing)]
-    pub password_hash: String,
-    pub role: String,
-    #[serde(default)]
-    pub must_change_password: bool,
-    pub created_at: String,
-    pub last_login_at: Option<String>,
-}
-
 /// Prompt systemowy lub szablon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbPrompt {

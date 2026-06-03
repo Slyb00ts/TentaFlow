@@ -15,42 +15,11 @@ use crate::crypto;
 /// ma staly '00000000-0000-4000-8000-000000000001'.
 const DEFAULT_ADMIN_ID: &str = "00000000-0000-4000-8000-000000000002";
 
-/// Seeduje domyslne dane jesli baza jest pusta.
-/// Caly seed w jednej transakcji (jedno fsync zamiast wielu).
+/// Seeduje domyslne dane. Leci przy kazdym starcie i jest idempotentne
+/// (INSERT OR IGNORE), wiec dopelnia braki na istniejacych bazach — m.in.
+/// org_membership admina. Caly seed w jednej transakcji (jedno fsync).
 pub fn seed_defaults(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-
-    // Sprawdz czy jest juz uzytkownik
-    let user_count: i64 = tx.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
-
-    if user_count == 0 {
-        let password_hash = crypto::hash_password("admin")?;
-        tx.execute(
-            "INSERT INTO users (username, password_hash, role, must_change_password) VALUES ('admin', ?1, 'admin', 1)",
-            rusqlite::params![password_hash],
-        )?;
-        info!("Utworzono domyslnego uzytkownika: admin/admin");
-    } else {
-        migrate_sha256_passwords(&tx)?;
-    }
-
-    // F2 P1.a — every admin in `users` must have an `org_memberships` row in
-    // `org-default` with `role-org-admin`, otherwise binary-WS resolves the
-    // session to `org_context=None` and every dispatch path that filters by
-    // org (cameras, recordings, frame_url, ...) rejects the call.
-    // Migration v38 backfills this for pre-existing deployments, but on a
-    // fresh DB v38 runs BEFORE this seed inserts the admin user — so the
-    // membership table stays empty. Seed therefore re-applies the same
-    // invariant after creating users. Idempotent via INSERT OR IGNORE on
-    // the (org_id, user_id) primary key.
-    tx.execute(
-        "INSERT OR IGNORE INTO org_memberships \
-            (org_id, user_id, role_id, granted_at, granted_by) \
-         SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
-                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
-         FROM users u WHERE u.role = 'admin'",
-        [],
-    )?;
 
     // Domyslne ustawienia
     let jwt_secret = generate_jwt_secret();
@@ -88,6 +57,23 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
 
     // Seed user_accounts — domyslny admin z hashem argon2
     seed_user_accounts(&tx)?;
+
+    // Kazdy admin w `user_accounts` musi miec wiersz `org_memberships` w
+    // `org-default` z rola `role-org-admin` — inaczej binary-WS rozwiazuje
+    // sesje do `org_context=None` i kazda sciezka filtrowana po org (kamery,
+    // nagrania, frame_url, compliance) odrzuca request. Login dashboardu idzie
+    // wylacznie przez `user_accounts`, wiec to jedyna tabela istotna dla
+    // membership. Musi byc PO `seed_user_accounts`, bo dopiero ono tworzy
+    // wiersz admina. Idempotentne przez PK (org_id, user_id) — naprawia tez
+    // bazy zaseedowane zanim ten krok istnial (seed leci przy kazdym starcie).
+    tx.execute(
+        "INSERT OR IGNORE INTO org_memberships \
+            (org_id, user_id, role_id, granted_at, granted_by) \
+         SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
+         FROM user_accounts u WHERE u.is_admin = 1 OR u.role = 'admin'",
+        [],
+    )?;
 
     tx.commit()?;
     Ok(())
@@ -747,32 +733,6 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Migruje hasla z formatu SHA256 (hex) na argon2 (PHC string).
-/// Wykrywa stary format po braku prefiksu "$argon2".
-fn migrate_sha256_passwords(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT id, username, password_hash FROM users")?;
-    let users: Vec<(i64, String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for (id, username, hash) in &users {
-        if !hash.starts_with("$argon2") {
-            let new_hash = crypto::hash_password("admin")?;
-            conn.execute(
-                "UPDATE users SET password_hash = ?1, must_change_password = 1 WHERE id = ?2",
-                rusqlite::params![new_hash, id],
-            )?;
-            info!(
-                "Zmigrowano haslo uzytkownika '{}' z SHA256 na argon2 (wymagana zmiana hasla)",
-                username
-            );
-        }
-    }
-
-    Ok(())
-}
-
 /// Generuje kryptograficznie losowy JWT secret (32 bajty -> 64 znaki hex)
 fn generate_jwt_secret() -> String {
     let mut bytes = [0u8; 32];
@@ -979,6 +939,50 @@ mod tests {
         );
         uuid::Uuid::parse_str(&member_user_id)
             .unwrap_or_else(|e| panic!("group_members.user_id '{member_user_id}' nie jest UUID: {e}"));
+    }
+
+    /// Regresja: po pelnym migrations::run + seed_defaults na swiezej bazie
+    /// admin z user_accounts MUSI miec wiersz org_memberships w 'org-default'
+    /// z rola 'role-org-admin'. Bez niego binary-WS rozwiazuje sesje do
+    /// org_context=None i kazda sciezka filtrowana po org (kamery, nagrania,
+    /// frame_url, compliance) odrzuca request. Wczesniej seed backfillowal
+    /// membership z martwej tabeli `users`, wiec admin loguje sie przez
+    /// user_accounts.id ktore nigdy nie dostawalo wpisu.
+    #[test]
+    fn seeded_admin_has_org_membership() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.lock().unwrap();
+
+        let (org_id, role_id): (String, String) = conn
+            .query_row(
+                "SELECT m.org_id, m.role_id FROM org_memberships m \
+                 JOIN user_accounts u ON CAST(u.id AS TEXT) = m.user_id \
+                 WHERE u.username = 'admin'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("admin z user_accounts ma wiersz org_memberships");
+
+        assert_eq!(org_id, "org-default");
+        assert_eq!(role_id, "role-org-admin");
+    }
+
+    /// Regresja: tabela `users` (F1a) jest wyrzucona migracja v59 — po pelnej
+    /// inicjalizacji nie istnieje w bazie. Cala tozsamosc idzie przez
+    /// user_accounts.
+    #[test]
+    fn legacy_users_table_is_dropped() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.lock().unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "legacy `users` table should be dropped");
     }
 
     /// find_prompt z fallback na 'pl' gdy dany jezyk nie istnieje.
