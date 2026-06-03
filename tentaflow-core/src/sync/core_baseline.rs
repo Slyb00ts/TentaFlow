@@ -83,6 +83,26 @@ pub fn store_adopt_state(db: &DbPool, state: &BaselineAdoptState) -> LedgerResul
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
 }
 
+/// Zapisuje stan adopcji single-flight W OBREBIE przekazanej transakcji. Uzywane
+/// przez import baseline'u, by faza `Imported` byla utrwalona ATOMOWO z merge'em
+/// tabel (ten sam `tx.commit()`). Bez tego istnialo okno: commit merge'a, potem
+/// osobny zapis fazy — crash pomiedzy zostawial DB scalony z faza `Importing`,
+/// wiec re-pair importowal drugi raz.
+fn store_adopt_state_tx(
+    tx: &Transaction<'_>,
+    state: &BaselineAdoptState,
+) -> LedgerResult<()> {
+    let json = serde_json::to_string(state)
+        .map_err(|e| SyncLedgerError::Codec(format!("baseline adopt state encode: {e}")))?;
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+        params![BASELINE_ADOPT_STATE_KEY, json],
+    )
+    .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    Ok(())
+}
+
 pub fn load_adopt_state(db: &DbPool) -> LedgerResult<Option<BaselineAdoptState>> {
     let Some(json) = db::repository::get_setting(db, BASELINE_ADOPT_STATE_KEY)
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
@@ -99,13 +119,26 @@ pub fn clear_adopt_state(db: &DbPool) -> LedgerResult<()> {
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
 }
 
-/// Czy istniejacy stan adopcji blokuje wejscie w `desired` role. Trwajaca
-/// adopcja w przeciwnej roli (faza != Completed) jest konfliktem single-flight
-/// anty-split-brain; `Completed` w przeciwnej roli to zakonczona poprzednia
-/// adopcja i nie blokuje. Czysta funkcja decyzyjna — bez I/O — uzywana przez
-/// atomowy `begin_adopt_atomic` i przez idempotentny wznawiacz importu.
-fn role_conflicts(existing: &BaselineAdoptState, desired: BaselineRole) -> bool {
-    existing.role != desired && existing.phase != BaselinePhase::Completed
+/// Czy istniejacy stan adopcji blokuje nowy start celujacy w
+/// `(desired, peer, epoch)`. Dowolna trwajaca adopcja (faza != Completed) blokuje
+/// KAZDY nowy start o innym celu — niezaleznie od roli/peera/epocha. To
+/// szczelniejsza bramka single-flight niz "tylko przeciwna rola": dwa starty tej
+/// samej roli z roznymi peerami (albo ten sam peer/inny epoch) nie moga juz oba
+/// wygrac, bo pierwszy zajmuje slot, a drugi widzi konflikt. Identyczny cel
+/// (`role+peer+epoch`) NIE jest konfliktem — to wznowienie. `Completed` zwalnia
+/// slot (poprzednia adopcja skonczona). Czysta funkcja decyzyjna — bez I/O.
+fn conflicts_with(
+    existing: &BaselineAdoptState,
+    desired: BaselineRole,
+    peer: &str,
+    epoch: &BaselineEpoch,
+) -> bool {
+    if existing.phase == BaselinePhase::Completed {
+        return false;
+    }
+    let same_target =
+        existing.role == desired && existing.peer == peer && &existing.epoch == epoch;
+    !same_target
 }
 
 /// Atomowy start adopcji single-flight. Sprawdzenie istniejacego stanu I zapis
@@ -152,7 +185,8 @@ pub fn begin_adopt_atomic(
 
     if let Some(existing) = existing {
         // Wznowienie tej samej adopcji (same peer+epoch+rola) w fazie
-        // przetrwalej awarie post-commit lub juz zakonczonej.
+        // przetrwalej awarie post-commit lub juz zakonczonej: DB jest scalony,
+        // wiec wywolujacy ma tylko dokonczyc post-commit, nie importowac od nowa.
         let same_target = existing.role == desired
             && existing.peer == peer
             && &existing.epoch == epoch;
@@ -161,11 +195,20 @@ pub fn begin_adopt_atomic(
         {
             return Ok(BeginOutcome::Resume(existing));
         }
-        if role_conflicts(&existing, desired) {
+        // Single-flight: KAZDA trwajaca adopcja o innym celu (inna rola/peer/epoch,
+        // faza != Completed) blokuje nowy start. Tylko identyczny cel (wznowienie
+        // wczesnej fazy) lub poprzedni `Completed` przepuszczaja dalej.
+        if conflicts_with(&existing, desired, peer, epoch) {
             return Err(SyncLedgerError::Runtime(format!(
-                "baseline adopt already in progress as {:?} with peer {} (phase {:?}); \
-                 refusing to start as {:?} with peer {}",
-                existing.role, existing.peer, existing.phase, desired, peer
+                "baseline adopt already in progress as {:?} with peer {} epoch {} (phase {:?}); \
+                 refusing to start as {:?} with peer {} epoch {}",
+                existing.role,
+                existing.peer,
+                existing.epoch.counter,
+                existing.phase,
+                desired,
+                peer,
+                epoch.counter
             )));
         }
     }
@@ -1043,23 +1086,25 @@ pub fn import_baseline(
             }
         };
 
+        // Faza `Imported` zapisana W TEJ SAMEJ TRANSAKCJI co merge tabel: commit
+        // ATOMOWO scala DB i oznacza go jako zaimportowany. Brak okna miedzy
+        // commitem merge'a a zapisem fazy — crash po commicie widzi `Imported`
+        // (re-pair wznawia tylko post-commit), crash przed commitem cofa wszystko
+        // (faza < Imported -> pelny re-import).
+        store_adopt_state_tx(
+            &tx,
+            &BaselineAdoptState {
+                role: BaselineRole::Joiner,
+                peer: donor_node_id.to_string(),
+                epoch: snapshot.epoch.clone(),
+                phase: BaselinePhase::Imported,
+            },
+        )?;
+
         tx.commit()
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         report
     };
-
-    // DB scalony TRWALE. Utrwalamy faze `Imported` ZANIM ruszy post-commit
-    // epoch-adopt/reseed: gdyby ten krok padl, re-pair zobaczy `Imported` i NIE
-    // zaimportuje drugi raz — wznowi tylko epoch-adopt+reseed.
-    store_adopt_state(
-        db,
-        &BaselineAdoptState {
-            role: BaselineRole::Joiner,
-            peer: donor_node_id.to_string(),
-            epoch: snapshot.epoch.clone(),
-            phase: BaselinePhase::Imported,
-        },
-    )?;
 
     finish_post_commit(db, &snapshot.epoch, donor_node_id)?;
 
@@ -1324,36 +1369,54 @@ fn read_local_users(tx: &Transaction<'_>) -> LedgerResult<Vec<LocalUser>> {
 /// dlugosci, ale UI/inne warstwy zakladaja rozsadny limit).
 const COLLISION_VALUE_MAX_LEN: usize = 200;
 
+/// Gorna granica prob sondowania wolnej wartosci. Przy realnym imporcie kolizji
+/// jest garstka; setny kolejny suffix oznacza patologie (np. ktos celowo zalal
+/// przestrzen nazw) — wtedy lepiej zwrocic blad niz petlic.
+const COLLISION_PROBE_LIMIT: u32 = 10_000;
+
 /// Sonduje wolna wartosc dla kolumny UNIQUE: probuje `<base>-<short_id>`, a gdy
-/// ta tez koliduje, dokleja licznik `<base>-<short_id>-<n>` az do wolnej. Nigdy
-/// nie abortuje — pierwszy wariant jest deterministyczny (stabilny per id),
-/// kolejne tylko gdy realnie wystepuja dalsze kolizje. `exists` zwraca czy dana
-/// kandydat-wartosc jest juz zajeta (przez kogokolwiek poza wlasnym wierszem).
+/// ta tez koliduje, dokleja licznik `<base>-<short_id>-<n>`. Pierwszy wariant
+/// jest deterministyczny (stabilny per id), kolejne tylko gdy realnie wystepuja
+/// dalsze kolizje. `exists` zwraca czy dana kandydat-wartosc jest juz zajeta
+/// (przez kogokolwiek poza wlasnym wierszem).
+///
+/// KLUCZOWE: kandydat budowany jest tak, by ZAWSZE zmiescil sie w limicie
+/// dlugosci ORAZ by licznik realnie zmienial wynik. Gdyby ucinac dopiero gotowy
+/// `<base>-<short>-<n>` przy max-dlugiej bazie, ucinany bylby zmienny licznik —
+/// wszystkie kandydatury bylyby identyczne i petla bieglaby do limitu. Dlatego
+/// REZERWUJEMY miejsce na suffix: baze przycinamy do `max_len - suffix_len`,
+/// a dopiero potem doklejamy `-{short}` / `-{short}-{counter}`.
 fn probe_free_value(
     base: &str,
     local_id: &str,
     mut exists: impl FnMut(&str) -> LedgerResult<bool>,
 ) -> LedgerResult<String> {
     let short = short_id(local_id);
-    let mut candidate = truncate_value(&format!("{base}-{short}"));
-    let mut counter: u32 = 1;
-    while exists(&candidate)? {
-        candidate = truncate_value(&format!("{base}-{short}-{counter}"));
+
+    let mut counter: u32 = 0;
+    loop {
+        let suffix = if counter == 0 {
+            format!("-{short}")
+        } else {
+            format!("-{short}-{counter}")
+        };
+        // Zarezerwuj miejsce na suffix: baze tniemy do reszty limitu, by calosc
+        // miescila sie w `COLLISION_VALUE_MAX_LEN` a licznik nie byl obciety.
+        let reserved = COLLISION_VALUE_MAX_LEN.saturating_sub(suffix.chars().count());
+        let base_part: String = base.chars().take(reserved).collect();
+        let candidate = format!("{base_part}{suffix}");
+
+        if !exists(&candidate)? {
+            return Ok(candidate);
+        }
+
         counter += 1;
-        if counter == u32::MAX {
+        if counter >= COLLISION_PROBE_LIMIT {
             return Err(SyncLedgerError::Runtime(format!(
-                "could not find a free unique value for base '{base}' (exhausted probes)"
+                "could not find a free unique value for base '{base}' after {COLLISION_PROBE_LIMIT} probes"
             )));
         }
     }
-    Ok(candidate)
-}
-
-fn truncate_value(value: &str) -> String {
-    if value.chars().count() <= COLLISION_VALUE_MAX_LEN {
-        return value.to_string();
-    }
-    value.chars().take(COLLISION_VALUE_MAX_LEN).collect()
 }
 
 /// (b) Rozsuwa kolidujace UNIQUE wartosci joinera, gdy dawca niesie rekord o
@@ -1932,6 +1995,47 @@ fn remap_user_owned_rows(
     tx.execute(
         "UPDATE OR IGNORE group_members SET user_id = ?1 WHERE user_id = ?2",
         params![donor_id, local_id],
+    )
+    .map_err(map_err)?;
+
+    // sync_nodes.owner_user_id -> id dawcy. Bez tego po usunieciu lokalnego usera
+    // FK `ON DELETE SET NULL` zerowalby wlasciciela noda joinera.
+    tx.execute(
+        "UPDATE sync_nodes SET owner_user_id = ?1 WHERE owner_user_id = ?2",
+        params![donor_id, local_id],
+    )
+    .map_err(map_err)?;
+
+    // sync_explicit_shares: subject (gdy subject_type='user') oraz wystawca grantu
+    // przepinane na dawce. Bez subject_id: FK `ON DELETE CASCADE` przy usunieciu
+    // usera skasowalby udzialy; bez granted_by: `ON DELETE SET NULL` zgubilby
+    // autora grantu. `OR IGNORE` na subject_id chroni przed kolizja PK, gdy dawca
+    // ma juz identyczny grant (donor-wins, dublet znika ponizej).
+    tx.execute(
+        "UPDATE OR IGNORE sync_explicit_shares SET subject_id = ?1 \
+         WHERE subject_type = 'user' AND subject_id = ?2",
+        params![donor_id, local_id],
+    )
+    .map_err(map_err)?;
+    tx.execute(
+        "DELETE FROM sync_explicit_shares WHERE subject_type = 'user' AND subject_id = ?1",
+        params![local_id],
+    )
+    .map_err(map_err)?;
+    tx.execute(
+        "UPDATE sync_explicit_shares SET granted_by = ?1 WHERE granted_by = ?2",
+        params![donor_id, local_id],
+    )
+    .map_err(map_err)?;
+
+    // user_identity_keys: donor-wins. Klucze tozsamosci dawcy sa juz
+    // zaimportowane i autorytatywne dla scalonej tozsamosci, wiec lokalne klucze
+    // joinera usuwamy (a nie remapujemy) — remap naruszylby UNIQUE(user_id,
+    // key_type, public_key) gdy dawca ma juz klucz tego samego typu/wartosci, a
+    // poza tym joinerowy klucz prywatny nie nalezy do tozsamosci dawcy.
+    tx.execute(
+        "DELETE FROM user_identity_keys WHERE user_id = ?1",
+        params![local_id],
     )
     .map_err(map_err)?;
 

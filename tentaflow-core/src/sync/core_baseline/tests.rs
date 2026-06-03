@@ -181,6 +181,68 @@ fn seed_explicit_share(
     .unwrap();
 }
 
+fn seed_identity_key(pool: &DbPool, key_id: &str, user_id: &str, public_key: &str) {
+    let conn = pool.lock().unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO user_identity_keys \
+            (key_id, user_id, key_type, public_key, purpose, status) \
+         VALUES (?1, ?2, 'ed25519', ?3, 'sync', 'active')",
+        params![key_id, user_id, public_key],
+    )
+    .unwrap();
+}
+
+fn seed_node_owner(pool: &DbPool, node_id: &str, owner_user_id: &str) {
+    let conn = pool.lock().unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_nodes (node_id, public_key, display_name, trust_status, owner_user_id) \
+         VALUES (?1, ?1, ?1, 'trusted', ?2)",
+        params![node_id, owner_user_id],
+    )
+    .unwrap();
+}
+
+fn identity_key_count(pool: &DbPool, user_id: &str) -> i64 {
+    let conn = pool.lock().unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM user_identity_keys WHERE user_id = ?1",
+        params![user_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn node_owner_of(pool: &DbPool, node_id: &str) -> Option<String> {
+    let conn = pool.lock().unwrap();
+    conn.query_row(
+        "SELECT owner_user_id FROM sync_nodes WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .unwrap()
+    .flatten()
+}
+
+fn share_granted_by(pool: &DbPool, subject_id: &str) -> Option<String> {
+    let conn = pool.lock().unwrap();
+    conn.query_row(
+        "SELECT granted_by FROM sync_explicit_shares WHERE subject_id = ?1 LIMIT 1",
+        params![subject_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .unwrap()
+    .flatten()
+}
+
+fn foreign_key_violations(pool: &DbPool) -> i64 {
+    let conn = pool.lock().unwrap();
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check").unwrap();
+    let rows = stmt.query_map([], |_| Ok(())).unwrap();
+    rows.count() as i64
+}
+
 fn set_secret(pool: &DbPool, cipher: &SettingsCipher, key: &str, value: &str) {
     let conn = pool.lock().unwrap();
     let enc = cipher.encrypt(value).unwrap();
@@ -1066,4 +1128,234 @@ fn import_resumes_after_epoch_adopt_failure_without_double_import() {
     // Stan koncowy: Completed.
     let st = load_adopt_state(&joiner).unwrap().unwrap();
     assert_eq!(st.phase, BaselinePhase::Completed);
+}
+
+// =============================================================================
+// CRITICAL 1: single-flight blokuje KAZDY rozny cel (nie tylko przeciwna role)
+// =============================================================================
+
+#[test]
+fn begin_adopt_atomic_same_role_different_peer_in_progress_rejected() {
+    let pool = new_pool();
+    // Pierwszy start: joiner wobec peer-a, w toku (faza != Completed).
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "peer-a",
+            &epoch(1, "a"),
+            BaselinePhase::Importing,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+
+    // Drugi start TEJ SAMEJ roli (joiner) ale wobec INNEGO peera — single-flight
+    // musi odmowic (dawniej przechodzil i nadpisywal stan).
+    assert!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "peer-b",
+            &epoch(1, "b"),
+            BaselinePhase::Importing,
+        )
+        .is_err(),
+        "ten sam role lecz inny peer w toku musi byc odrzucony"
+    );
+
+    // Ta sama rola, ten sam peer, INNY epoch — tez konflikt (rozny cel).
+    assert!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "peer-a",
+            &epoch(2, "a"),
+            BaselinePhase::Importing,
+        )
+        .is_err(),
+        "ten sam role+peer lecz inny epoch w toku musi byc odrzucony"
+    );
+
+    // Stan single-flight nietkniety: dalej peer-a/epoch 1.
+    let st = load_adopt_state(&pool).unwrap().unwrap();
+    assert_eq!(st.peer, "peer-a");
+    assert_eq!(st.epoch.counter, 1);
+}
+
+#[test]
+fn begin_adopt_atomic_identical_start_is_allowed_resumption() {
+    let pool = new_pool();
+    // Start: joiner/peer-a/epoch 1 w fazie Elected.
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "peer-a",
+            &epoch(1, "a"),
+            BaselinePhase::Elected,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+
+    // Identyczny cel (role+peer+epoch) we wczesnej fazie — wznowienie, nie konflikt.
+    // Posuwamy faze (Elected -> Importing): brak bledu, stan zaktualizowany.
+    assert!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "peer-a",
+            &epoch(1, "a"),
+            BaselinePhase::Importing,
+        )
+        .is_ok(),
+        "identyczny cel musi byc dozwolony (wznowienie)"
+    );
+    let st = load_adopt_state(&pool).unwrap().unwrap();
+    assert_eq!(st.phase, BaselinePhase::Importing);
+}
+
+// =============================================================================
+// CRITICAL 2: faza Imported zapisana ATOMOWO z merge'em (jeden commit)
+// =============================================================================
+
+#[test]
+fn import_commits_imported_phase_atomically_never_leaves_importing() {
+    // Po udanym imporcie DB jest scalony i faza NIGDY nie jest `Importing`:
+    // `Imported` jest zapisana w tej samej transakcji co merge, a in-process
+    // post-commit (no-op) dociaga do `Completed`. Gdyby zapis fazy byl po
+    // commicie i padl, faza utknelaby na `Importing` przy scalonym DB.
+    let donor = new_pool();
+    let joiner = new_pool();
+    seed_org(&donor, "org-donor", "donor");
+    seed_role(&donor, "role-user", "user");
+    seed_user(&donor, "u-donor", "alice", Some("a@x.io"));
+    seed_org(&joiner, "org-joiner", "joiner");
+
+    let snap = donor_snapshot(&donor, 11);
+    import(&joiner, &snap, "donor-node").unwrap();
+
+    // DB scalony.
+    assert!(user_exists(&joiner, "u-donor"));
+    // Faza nigdy nie zostaje na `Importing` po scaleniu.
+    let st = load_adopt_state(&joiner).unwrap().unwrap();
+    assert_ne!(st.phase, BaselinePhase::Importing);
+    assert!(matches!(
+        st.phase,
+        BaselinePhase::Imported | BaselinePhase::Completed
+    ));
+}
+
+#[test]
+fn import_rollback_does_not_persist_imported_phase() {
+    // Gdy merge cofa sie przed commitem (FK violation w trakcie upsertu dawcy),
+    // ANI DB ANI faza `Imported` nie sa utrwalone — faza zostaje na `Importing`
+    // (z `begin_adopt_atomic`), a re-pair zrobi pelny import. To dowodzi, ze
+    // zapis `Imported` dzieli transakcje z merge'em (rollback cofa oba).
+    let donor = new_pool();
+    let joiner = new_pool();
+    seed_org(&donor, "org-donor", "donor");
+    seed_role(&donor, "role-user", "user");
+    seed_user(&donor, "u-donor", "alice", Some("a@x.io"));
+    seed_membership(&donor, "org-donor", "u-donor", "role-user");
+    seed_org(&joiner, "org-joiner", "joiner");
+
+    let mut snap = donor_snapshot(&donor, 12);
+    // Psujemy snapshot: membership wskazuje role, ktorej snapshot NIE niesie ->
+    // INSERT membership lamie FK roles(role_id) wewnatrz transakcji importu.
+    for m in &mut snap.org_memberships {
+        m.role_id = "role-does-not-exist".to_string();
+    }
+
+    let res = import(&joiner, &snap, "donor-node");
+    assert!(res.is_err(), "import z naruszeniem FK musi zwrocic blad");
+
+    // DB joinera nietkniety: user dawcy NIE zostal scalony (rollback).
+    assert!(!user_exists(&joiner, "u-donor"));
+    // Faza utknela na `Importing` (zapis `Imported` byl w cofnietej transakcji).
+    let st = load_adopt_state(&joiner).unwrap().unwrap();
+    assert_eq!(st.phase, BaselinePhase::Importing);
+}
+
+// =============================================================================
+// HIGH 3: remap tabel security przy merge tozsamosci (brak dangling refs)
+// =============================================================================
+
+#[test]
+fn merge_identity_remaps_security_tables_no_dangling_refs() {
+    let donor = new_pool();
+    let joiner = new_pool();
+    seed_org(&donor, "org-donor", "donor");
+    seed_role(&donor, "role-user", "user");
+    seed_user(&donor, "u-donor", "alice", Some("same@x.io"));
+    seed_identity_key(&donor, "k-donor", "u-donor", "DONOR_PUBKEY");
+
+    seed_org(&joiner, "org-joiner", "joiner");
+    // Joiner user z TYM SAMYM emailem (zostanie scalony z u-donor, lokalny znika).
+    seed_user(&joiner, "u-joiner", "alice_local", Some("same@x.io"));
+    seed_membership(&joiner, "org-joiner", "u-joiner", "role-user");
+    // Lokalne wiersze security wskazujace na usera joinera (FK na user_accounts).
+    seed_node_owner(&joiner, "joiner-owned-node", "u-joiner");
+    seed_identity_key(&joiner, "k-joiner", "u-joiner", "JOINER_PUBKEY");
+    seed_explicit_share(&joiner, "org-joiner", "u-joiner", "u-joiner");
+
+    let snap = donor_snapshot(&donor, 1);
+    let report = import(&joiner, &snap, "donor-node").unwrap();
+    assert_eq!(report.users_merged_by_email, 1);
+
+    // Lokalny user joinera usuniety; user dawcy obecny.
+    assert!(!user_exists(&joiner, "u-joiner"));
+    assert!(user_exists(&joiner, "u-donor"));
+
+    // sync_nodes.owner_user_id przepiete na dawce (nie wyzerowane przez FK).
+    assert_eq!(node_owner_of(&joiner, "joiner-owned-node").as_deref(), Some("u-donor"));
+
+    // sync_explicit_shares: subject_id i granted_by przepiete na dawce (org_id
+    // share'a nie jest remapowany — to zasob w org joinera, ktora wciaz istnieje).
+    assert_eq!(explicit_share_count(&joiner, "org-joiner", "u-donor"), 1);
+    assert_eq!(explicit_share_count(&joiner, "org-joiner", "u-joiner"), 0);
+    assert_eq!(share_granted_by(&joiner, "u-donor").as_deref(), Some("u-donor"));
+
+    // user_identity_keys: donor-wins. Klucz joinera usuniety, klucz dawcy zostaje.
+    assert_eq!(identity_key_count(&joiner, "u-joiner"), 0, "klucz joinera usuniety");
+    assert_eq!(identity_key_count(&joiner, "u-donor"), 1, "klucz dawcy zachowany");
+
+    // Brak zadnych dangling refs (FK check czysty).
+    assert_eq!(foreign_key_violations(&joiner), 0, "brak naruszen FK po merge tozsamosci");
+}
+
+// =============================================================================
+// HIGH 5: suffix-probe terminuje przy max-dlugiej bazie (nie petli do u32::MAX)
+// =============================================================================
+
+#[test]
+fn import_max_length_base_collision_terminates_with_unique_value() {
+    let donor = new_pool();
+    let joiner = new_pool();
+    seed_org(&donor, "org-donor", "donor");
+    seed_role(&donor, "role-user", "user");
+
+    // Username dawcy o MAKSYMALNEJ dlugosci (>= limit kolizji). Joiner ma user o
+    // tej samej (max) nazwie -> kolizja UNIQUE wymaga suffixu mieszczacego sie w
+    // limicie. Stary kod ucinalby zmienny licznik i petlil do u32::MAX.
+    let long_name: String = std::iter::repeat('a').take(300).collect();
+    seed_user(&donor, "u-donor", &long_name, Some("donor@x.io"));
+    seed_org(&joiner, "org-joiner", "joiner");
+    seed_user(&joiner, "u-joiner", &long_name, Some("joiner@x.io"));
+
+    let snap = donor_snapshot(&donor, 1);
+    // Nie petli, nie panikuje: import konczy sie sukcesem.
+    import(&joiner, &snap, "donor-node").unwrap();
+
+    // Dawca zachowuje (obcieta do limitu) nazwe, joiner dostaje INNA, unikalna,
+    // mieszczaca sie w limicie dlugosci wartosc.
+    let donor_name = username_of(&joiner, "u-donor").unwrap();
+    let joiner_name = username_of(&joiner, "u-joiner").unwrap();
+    assert_ne!(donor_name, joiner_name, "wartosci musza byc rozne");
+    assert!(
+        joiner_name.chars().count() <= 200,
+        "suffixowana wartosc joinera musi miescic sie w limicie: {} znakow",
+        joiner_name.chars().count()
+    );
 }
