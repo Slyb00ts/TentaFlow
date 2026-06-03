@@ -41,12 +41,18 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (sm_121a)"
-# shellcheck disable=SC2086
+# Tokenizacja VLLM_ARGS respektujaca cudzyslowy — jak native (shlex::split).
+# `xargs` zdejmuje single-quotes wokol --speculative-config '{...}' i NIE
+# wykonuje podstawien -> bezpieczne, bez `eval`. Surowe `$VLLM_ARGS` zostawialo
+# literalne apostrofy -> zepsuty JSON. Dziala z/bez speculative, 1/wiele GPU, TP.
+VLLM_ARG_ARR=()
+while IFS= read -r _a; do VLLM_ARG_ARR+=("$_a"); done < <(xargs -n1 printf '%s\n' <<< "$VLLM_ARGS")
+
+echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (sm_121a, ${#VLLM_ARG_ARR[@]} args)"
 vllm serve "$MODEL" \
   --host 127.0.0.1 \
   --port "$VLLM_PORT" \
-  $VLLM_ARGS 2>&1 \
+  "${VLLM_ARG_ARR[@]}" 2>&1 \
   | sed -u 's/^/[vllm] /' &
 VLLM_PID=$!
 echo "[entrypoint] vllm PID=$VLLM_PID"
