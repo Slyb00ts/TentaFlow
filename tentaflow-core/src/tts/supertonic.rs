@@ -40,9 +40,9 @@ const DEFAULT_LANG: &str = "en";
 /// glosu i `load_model` nie znajdzie konkretnego pliku.
 const DEFAULT_VOICE: &str = "M1";
 
-/// Liczba krokow solvera flow-matching (vector_estimator). 8 to wartosc z
-/// referencyjnego pipeline'u — kompromis jakosc/szybkosc.
-const TOTAL_STEP: usize = 8;
+/// Liczba krokow solvera flow-matching (vector_estimator). Wyzej = lepsza
+/// jakosc, wolniej; 10 daje wyrazniejsza mowe niz referencyjne 8.
+const TOTAL_STEP: usize = 10;
 
 /// Domyslny mnoznik tempa (duration /= speed). Wyzszy = szybsza mowa.
 const DEFAULT_SPEED: f32 = 1.2;
