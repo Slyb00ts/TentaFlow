@@ -10,10 +10,17 @@ use std::path::{Path, PathBuf};
 
 fn require(path: &Path, platform: &str) {
     if !path.exists() {
+        // build-zvec.sh is a bash script and cannot run on native Windows; point
+        // Windows users at the PowerShell installer that builds zvec with MSVC.
+        let hint = if platform == "windows-x86_64" {
+            "scripts\\setup.ps1".to_string()
+        } else {
+            format!("./scripts/build-zvec.sh {platform}")
+        };
         panic!(
-            "tentaflow-zvec-sys: missing {}. Build it with `./scripts/build-zvec.sh {}`",
+            "tentaflow-zvec-sys: missing {}. Build it with `{}`",
             path.display(),
-            platform
+            hint
         );
     }
 }
@@ -31,6 +38,7 @@ fn main() {
         "aarch64-apple-ios" => "ios-arm64",
         "aarch64-apple-ios-sim" => "ios-sim-arm64",
         "aarch64-linux-android" => "android-arm64",
+        "x86_64-pc-windows-msvc" => "windows-x86_64",
         other => panic!("tentaflow-zvec-sys: no vendored zvec archive for target `{other}`"),
     };
 
@@ -46,7 +54,14 @@ fn main() {
     //     .so). `libzvec_c_api` (C entry points + the 4 internal zvec libs that carry
     //     the index/metric static-initializer registrations) MUST be whole-archived;
     //     `libzvec_deps` (protobuf/Arrow/RocksDB) is linked normally.
-    if target.contains("linux") || target.contains("apple-darwin") {
+    if target.contains("windows") {
+        // MSVC links against the import library (`zvec_c_api.lib`) at build time;
+        // the actual `zvec_c_api.dll` is resolved at runtime from PATH or the
+        // executable's directory. Windows has no rpath, so the .dll must be copied
+        // next to the binary (tentaflow/build.rs handles that for the main exe).
+        require(&lib_dir.join("zvec_c_api.lib"), platform);
+        println!("cargo:rustc-link-lib=dylib=zvec_c_api");
+    } else if target.contains("linux") || target.contains("apple-darwin") {
         let shared = if target.contains("apple") {
             "libzvec_c_api.dylib"
         } else {

@@ -25,6 +25,9 @@ DISTRO=""
 # Lista zainstalowanych komponentow (do podsumowania)
 INSTALLED=()
 
+# Stan buildu zvec (feature 'vector' jest obowiazkowy) — twarda weryfikacja na koncu
+ZVEC_OK=true
+
 # --- Funkcje pomocnicze ---
 
 log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -410,6 +413,7 @@ install_base() {
 
             local pkgs=(
                 cmake
+                ninja
                 llvm
                 pkg-config
                 glib
@@ -423,7 +427,7 @@ install_base() {
             brew install "${pkgs[@]}"
             configure_macos_gstreamer_pkg_config
             ensure_macos_metal_toolchain
-            INSTALLED+=("cmake" "llvm (clang+lld)" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
+            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
             ;;
     esac
 
@@ -455,18 +459,33 @@ install_zvec() {
     fi
 
     # Linux: RocksDB 8.1 (zaleznosc zvec) nie kompiluje sie pod gcc>=13, wiec build
-    # leci w kontenerze Ubuntu 22.04/gcc-11 — wymaga Dockera.
+    # leci w kontenerze Ubuntu 22.04/gcc-11 — wymaga Dockera. Setup ma "zrobic
+    # wszystko", wiec gdy Dockera brak — probujemy go doinstalowac przez menedzer
+    # pakietow dystrybucji (best-effort), a nie po cichu odpuszczamy.
     if [[ "$DISTRO" != "macos" ]] && ! command -v docker &>/dev/null; then
-        log_warn "Docker wymagany do zbudowania zvec na Linux. Zainstaluj go i uruchom:"
-        log_warn "  ./scripts/build-zvec.sh $plat"
-        return
+        log_info "Docker wymagany do zbudowania zvec na Linux — probuje zainstalowac..."
+        case "$DISTRO" in
+            arch)   run_privileged pacman -S --needed --noconfirm docker ;;
+            debian) run_privileged apt-get install -y docker.io ;;
+            fedora) run_privileged dnf install -y docker || run_privileged dnf install -y moby-engine ;;
+        esac
+        run_privileged systemctl enable --now docker 2>/dev/null || true
+
+        if ! run_privileged docker info &>/dev/null; then
+            log_error "Docker zainstalowany, ale daemon/uprawnienia nie dzialaja."
+            log_error "  Moze wymagac wylogowania albo: sudo usermod -aG docker \$USER"
+            log_error "  Potem zbuduj zvec recznie: ./scripts/build-zvec.sh $plat"
+            ZVEC_OK=false
+            return
+        fi
     fi
 
     log_info "Buduje zvec ($plat) — dlugi build (RocksDB+Arrow), jednorazowo na maszyne..."
     if bash "$(dirname "$0")/build-zvec.sh" "$plat"; then
         INSTALLED+=("zvec ($plat static lib)")
     else
-        log_warn "Build zvec nieudany — sprobuj recznie: ./scripts/build-zvec.sh $plat"
+        log_error "Build zvec nieudany — sprobuj recznie: ./scripts/build-zvec.sh $plat"
+        ZVEC_OK=false
     fi
 }
 
@@ -1245,6 +1264,31 @@ verify_installation() {
         else
             log_warn "hipcc (ROCm): NIE ZNALEZIONO"
         fi
+    fi
+
+    # zvec — feature 'vector' jest OBOWIAZKOWY dla binarki tentaflow, wiec
+    # natywna biblioteka musi byc obecna w vendorze, inaczej projekt sie nie zbuduje.
+    local zvec_plat
+    if [[ "$DISTRO" == "macos" ]]; then
+        zvec_plat="macos-arm64"
+    elif [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
+        zvec_plat="linux-aarch64"
+    else
+        zvec_plat="linux-x86_64"
+    fi
+    local zvec_artifact="libzvec_c_api.so"
+    [[ "$DISTRO" == "macos" ]] && zvec_artifact="libzvec_c_api.dylib"
+    local zvec_lib="$(dirname "$0")/../tentaflow-zvec-sys/vendor/lib/$zvec_plat/$zvec_artifact"
+    if [[ -f "$zvec_lib" ]]; then
+        log_ok "zvec: $zvec_lib"
+    else
+        log_error "zvec: BRAK natywnej biblioteki — feature 'vector' jest obowiazkowy, projekt sie nie zbuduje"
+        log_error "  Zbuduj: ./scripts/build-zvec.sh $zvec_plat"
+        [[ "$DISTRO" != "macos" ]] && log_error "  (na Linux wymagany dzialajacy Docker — RocksDB buduje sie w kontenerze gcc-11)"
+        ok=false
+    fi
+    if [[ "$ZVEC_OK" != true ]]; then
+        ok=false
     fi
 
     echo ""

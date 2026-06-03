@@ -14,9 +14,40 @@ use std::process::Command;
 fn main() {
     set_linux_rpath();
     copy_versioned_shared_libs_linux();
+    copy_zvec_dll_windows();
     build_mlx_bridge();
     build_kokoro_bridge();
     build_meeting_bot();
+}
+
+// Windows nie ma rpath — `tentaflow.exe` znajduje `zvec_c_api.dll` tylko w PATH
+// albo obok siebie. Kopiujemy zwendorowany dll z tentaflow-zvec-sys do
+// target/<profile>/ (tam laduje binarka), zeby `cargo run` i spakowany build
+// dzialaly bez recznego ustawiania PATH. No-op poza Windowsem i gdy dll jeszcze
+// nie zwendorowany (build.rs zvec-sys i tak failuje glosno na brak importu .lib).
+fn copy_zvec_dll_windows() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "windows" {
+        return;
+    }
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let platform = match arch.as_str() {
+        "x86_64" => "windows-x86_64",
+        _ => return,
+    };
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dll_src = manifest
+        .join("../tentaflow-zvec-sys/vendor/lib")
+        .join(platform)
+        .join("zvec_c_api.dll");
+    println!("cargo:rerun-if-changed={}", dll_src.display());
+    if !dll_src.exists() {
+        return;
+    }
+    let dll_dest = cargo_target_dir().join("zvec_c_api.dll");
+    if let Err(e) = std::fs::copy(&dll_src, &dll_dest) {
+        println!("cargo:warning=tentaflow: copy zvec_c_api.dll nieudane: {}", e);
+    }
 }
 
 // ----- Linux linker flags ----------------------------------------------------
