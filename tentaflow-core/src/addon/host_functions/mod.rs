@@ -32,7 +32,6 @@ pub mod streaming;
 pub mod sync_acl;
 pub mod ui;
 pub mod user;
-#[cfg(feature = "vector")]
 pub mod vector;
 pub mod web_research;
 
@@ -278,7 +277,6 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         .map_err(|e| anyhow::anyhow!("Rejestracja flow_cancel_v1: {e}"))?;
 
     // --- Vector API (F1c P3 — embedded usearch HNSW + mmap) ---
-    #[cfg(feature = "vector")]
     {
         linker
             .func_wrap("tentaflow", "vector_upsert_v1", vector::vector_upsert_v1)

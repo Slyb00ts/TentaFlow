@@ -7,7 +7,6 @@
 //          end-to-end (validity window, signers, scope).
 // =============================================================================
 
-#![cfg(feature = "vector")]
 
 use std::sync::Arc;
 

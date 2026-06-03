@@ -21,9 +21,7 @@
 use tentaflow_core::db::repository as repo;
 use tentaflow_core::db::DbPool;
 use tentaflow_core::services::org::DEFAULT_ORG_ID;
-#[cfg(feature = "vector")]
 use tentaflow_core::services::vector::backend::Metric;
-#[cfg(feature = "vector")]
 use tentaflow_core::services::vector::namespace::NamespaceManager;
 
 fn open_pool() -> (tempfile::TempDir, DbPool) {
@@ -127,7 +125,6 @@ fn camera_insert_with_none_org_falls_back_to_default() {
     assert_eq!(row.camera_id, "cam-boot");
 }
 
-#[cfg(feature = "vector")]
 #[test]
 fn vector_namespace_get_returns_not_found_for_cross_org_lookup() {
     let (_d, pool) = open_pool();

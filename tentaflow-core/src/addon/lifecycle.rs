@@ -803,7 +803,6 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     // Reconcile vector-namespace metadata schemas against the new manifest:
     // add/drop typed columns on collections that already exist so a declared
     // schema change in `[[vector_namespace]].fields` is applied on upgrade.
-    #[cfg(feature = "vector")]
     reconcile_vector_namespaces(db, &new_manifest);
 
     // F1c P5 — atomically swap compiled flows: drop every previous-version
@@ -1776,7 +1775,6 @@ fn parse_claim_requirement(val: &toml::Value) -> Result<crate::addon::manifest::
 /// failure for one (org, namespace) is logged and the upgrade still completes —
 /// the schema mismatch surfaces later as a clear filter/insert error rather
 /// than aborting an otherwise-valid upgrade.
-#[cfg(feature = "vector")]
 fn reconcile_vector_namespaces(db: &DbPool, manifest: &AddonManifest) {
     use tentaflow_sdk_spec::{FieldSpec, FieldType};
 
