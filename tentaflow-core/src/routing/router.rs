@@ -79,6 +79,10 @@ pub struct Router {
     /// `Arc::new(router)` zeby trzymal `Weak<Router>` (anty-cykl).
     /// `None` w testach DB-less.
     pub(crate) stt_runtime: Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>,
+    /// Lazy-load + memory guard dla embedded modeli. Planted przez
+    /// `plant_model_residency` w runtime startup. Wspoldzielony slot z executorem.
+    pub(crate) model_residency:
+        Arc<parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>>,
 }
 
 /// Wynik identyfikacji mowcy z poziomem pewnosci.
@@ -224,6 +228,12 @@ impl Router {
         let stt_runtime_slot: Arc<
             parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>,
         > = Arc::new(parking_lot::RwLock::new(None));
+        // Lazy-load + memory guard slot — planted przez `plant_model_residency`
+        // w runtime startup (potrzebuje db + port_allocator). None = brak
+        // residency (testy / nody bez supervisora) → ensure_resident to no-op.
+        let model_residency_slot: Arc<
+            parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>,
+        > = Arc::new(parking_lot::RwLock::new(None));
         let db_clone = db.clone();
         // Etap 2: BlobStore default = FileBlobStore w `<TENTAFLOW_HOME>/blobs`.
         // Override `TENTAFLOW_BLOB_STORE=memory` dla testów / lokalnych dev
@@ -283,6 +293,7 @@ impl Router {
             catalog_provider: Arc::new(crate::services::catalog::CatalogProvider::new()),
             executor: executor_slot.clone(),
             stt_runtime: stt_runtime_slot,
+            model_residency: model_residency_slot,
         };
 
         // R1.5e: zbuduj ModelRuntimeExecutor i wpiec do routera. Wymaga
@@ -313,6 +324,7 @@ impl Router {
                 local_inference.clone(),
                 router.stt_runtime.clone(),
                 router.mesh_manager.clone(),
+                router.model_residency.clone(),
             ));
             *executor_slot.write() = Some(executor);
         }
@@ -517,6 +529,22 @@ impl Router {
     /// without forcing every mutation point to remember to refresh.
     pub fn catalog_provider(&self) -> &Arc<crate::services::catalog::CatalogProvider> {
         &self.catalog_provider
+    }
+
+    /// Wpina `ModelResidency` (lazy-load + memory guard). Wolane w runtime
+    /// startup gdy dostepny port_allocator + db. Executor czyta ten sam slot.
+    pub fn plant_model_residency(
+        &self,
+        residency: Arc<crate::services::model_residency::ModelResidency>,
+    ) {
+        *self.model_residency.write() = Some(residency);
+    }
+
+    /// Slot residency — dla memory guard (lifecycle) zeby wyladowac wszystko.
+    pub fn model_residency(
+        &self,
+    ) -> Option<Arc<crate::services::model_residency::ModelResidency>> {
+        self.model_residency.read().clone()
     }
 
     /// Rebuild the catalog from the current mesh registry plus the local DB

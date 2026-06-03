@@ -17,6 +17,15 @@ use crate::services::manifest::{Category, ModelPreset, NativeRuntime, ServiceMan
 use crate::services::transport::Transport;
 use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
 
+/// Serializuje CIEZKIE ladowanie modeli embedded (LLM/STT/TTS) do pamieci.
+/// Boot reloaduje kilka silnikow [detached] RoWNOLEGLE — bez tej bramki ich
+/// peaki pamieci podczas ladowania (MLX alokuje bufory grafu, ~2x wag) sumuja
+/// sie i przekraczaja limit aplikacji iOS -> OOM/jetsam kill, mimo ze
+/// steady-state wszystkich modeli by sie zmiescil. Bramka (1 permit) wpuszcza
+/// jeden load na raz: peak = jeden ladowany model + reszta w steady-state.
+/// Pobranie modelu (siec/dysk) jest POZA bramka — serializujemy tylko load.
+static EMBEDDED_LOAD_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 struct EmbeddedLlmSelection {
     model_name: String,
     repo: String,
@@ -119,6 +128,12 @@ impl EmbeddedDeploy {
                 &format!("[stt] loading embedded {engine_id} ({model_repo})"),
             );
         }
+        // Serializuj load wzgledem innych embedded (peak pamieci) — patrz
+        // EMBEDDED_LOAD_GATE. Permit trzymany do konca funkcji (przez load).
+        let _load_gate = EMBEDDED_LOAD_GATE
+            .acquire()
+            .await
+            .expect("EMBEDDED_LOAD_GATE never closed");
         let shared = crate::stt::shared_stt_manager();
         let info = {
             let mut mgr = shared.write().await;
@@ -164,6 +179,12 @@ impl EmbeddedDeploy {
                 &format!("[tts] loading embedded {engine_id} ({model_repo})"),
             );
         }
+        // Serializuj load wzgledem innych embedded (peak pamieci) — patrz
+        // EMBEDDED_LOAD_GATE.
+        let _load_gate = EMBEDDED_LOAD_GATE
+            .acquire()
+            .await
+            .expect("EMBEDDED_LOAD_GATE never closed");
         crate::tts::ensure_embedded_engine_loaded(&engine_id, &model_repo, voice_hint)
             .await
             // {e:#} — pelny lancuch przyczyn anyhow (np. "dlopen ... nieudane:
@@ -371,6 +392,12 @@ impl EmbeddedDeploy {
                 mlx: app.mlx.clone(),
             };
 
+            // Serializuj load wzgledem innych embedded (peak pamieci) — patrz
+            // EMBEDDED_LOAD_GATE. Pobranie modelu juz za nami (poza bramka).
+            let _load_gate = EMBEDDED_LOAD_GATE
+                .acquire()
+                .await
+                .expect("EMBEDDED_LOAD_GATE never closed");
             let shared = crate::inference::shared_inference_manager();
             let mut manager = shared.write().await;
             let info = manager

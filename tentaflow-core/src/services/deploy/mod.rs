@@ -731,12 +731,12 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         deploy_method: prepared.deploy_method,
         transport: prepared.transport,
         status,
-        // Domyslnie pinned: po Ctrl+C tentaflow stop_all_supervised terminuje
-        // procesy (zwalnia VRAM/porty), a przy starcie supervisor.first_tick
-        // → auto_start_pinned respawnuje serwis. Bez pin user musialby recznie
-        // klikac Start po kazdym restarcie. Odpinanie zostaje pod kontrola
-        // usera (przycisk pin w GUI).
-        pinned: true,
+        // Domyslnie pinned na desktop/serwerze: po Ctrl+C stop_all_supervised
+        // terminuje procesy (zwalnia VRAM/porty), a przy starcie
+        // supervisor.first_tick → auto_start_pinned respawnuje serwis. Na mobile
+        // domyslnie UNPINNED (lazy load + memory guard) — patrz default_pinned().
+        // Odpinanie/przypinanie zostaje pod kontrola usera (przycisk pin w GUI).
+        pinned: default_pinned(),
         paused: false,
         runtime_pid: prepared.runtime.pid,
         runtime_port: prepared.runtime.port,
@@ -748,6 +748,20 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         deployment_progress_pct: if status == ServiceStatus::Running { 100 } else { 0 },
         deployed_source_hash,
     }
+}
+
+/// Domyslny `pinned` przy deployu zalezny od platformy.
+///
+/// Mobile (iOS/Android) → `false`: pamiec aplikacji jest ograniczona, wiec
+/// modele domyslnie sa UNPINNED — przygotowane (pobrane, routowalne) ale NIE
+/// ladowane przy boocie. Laduja sie leniwie na pierwsze zadanie, a memory guard
+/// zwalnia je gdy idle / przy wymianie (supervisor boot = pinned-only +
+/// eviction single-resident). User moze recznie przypiac.
+///
+/// Pozostale nody → `true`: zachowanie jak dotad (boot-load + rezydentnie).
+/// Lazy loading dziala tam tez, ale wlaczany recznie przez odpiecie serwisu.
+pub(crate) fn default_pinned() -> bool {
+    !cfg!(any(target_os = "ios", target_os = "android"))
 }
 
 fn build_placeholder_service(
@@ -763,7 +777,7 @@ fn build_placeholder_service(
         deploy_method: method,
         transport: placeholder_transport(method),
         status: ServiceStatus::Deploying,
-        pinned: true,
+        pinned: default_pinned(),
         paused: false,
         runtime_pid: None,
         runtime_port: None,
