@@ -1064,7 +1064,7 @@ pub struct MeshSyncSnapshotResponsePayload {
 /// Monotoniczny epoch baseline'u. Porzadek leksykograficzny (counter,
 /// origin_node) daje deterministyczny tie-break gdy dwa nody wybija ten sam
 /// licznik.
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BaselineEpoch {
     pub counter: u64,
     pub origin_node: String,
