@@ -160,8 +160,7 @@ pub fn load_core_write_capture(
 
 pub fn drain_pending_core_captures(pool: &crate::db::DbPool, limit: usize) -> Result<usize> {
     drain_pending_core_captures_with(pool, limit, |capture| {
-        super::runtime::record_core_capture(capture)
-            .map(|opt| opt.map(|record| record.op_id))
+        super::runtime::record_core_capture(capture).map(|opt| opt.map(|record| record.op_id))
     })
 }
 
@@ -217,19 +216,17 @@ where
     Ok(drained)
 }
 
-/// Re-arms every core capture row back to `pending` so a baseline reset re-emits
-/// the full core write journal under the freshly-bumped epoch. The stored HLC is
-/// kept so the originating order survives the re-seed.
-pub fn requeue_all_core_captures(pool: &crate::db::DbPool) -> Result<usize> {
+/// Empties the core capture journal so a baseline reset starts from a clean
+/// slate before re-seeding the present SQLite snapshot. The historical journal
+/// is intentionally discarded: after the v54 ALTER its rows carry zeroed HLCs,
+/// which LWW cannot order, and the reset replicates current state rather than
+/// the write history. Returns the number of rows removed.
+pub fn clear_core_capture_journal(pool: &crate::db::DbPool) -> Result<usize> {
     let conn = pool
         .lock()
         .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
-    let updated = conn.execute(
-        "UPDATE __tentaflow_core_sync_captures \
-         SET status = 'pending', operation_id = NULL, error_message = NULL, ledgered_at_ms = NULL",
-        [],
-    )?;
-    Ok(updated)
+    let removed = conn.execute("DELETE FROM __tentaflow_core_sync_captures", [])?;
+    Ok(removed)
 }
 
 fn load_pending_core_captures(

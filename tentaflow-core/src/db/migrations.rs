@@ -579,7 +579,9 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
         t(
             "flow_invocations",
             "actor_user_id",
-            "added directly as TEXT user_accounts(id) UUID; no INTEGER→UUID remap needed",
+            "TEXT user_accounts(id) ref; legacy rows held stringified-INTEGER \
+             session ids, value-remapped in place by v53 (remap_text_int_column), \
+             not a rebuilt table",
         ),
         t(
             "org_memberships",
@@ -713,6 +715,42 @@ fn core_identity_int_to_uuid(conn: &Connection, version: i64, name: &str) -> Res
             remap_text_int_column(&tx, "org_memberships", "user_id", &users_map)?;
         }
 
+        // flow_invocations.actor_user_id is declared TEXT REFERENCES
+        // user_accounts(id), but legacy rows stored the session user id as a
+        // stringified INTEGER (the pre-UUID account id). It is a runtime table,
+        // so a row whose actor was since deleted must not abort the migration:
+        // best-effort `remap_text_int_column` rewrites the ids it can resolve
+        // and leaves UUIDs / unresolved ids untouched (the column carries no
+        // enforced FK, so a stale actor id is an audit artifact, not corruption).
+        if table_exists(&tx, "flow_invocations")? {
+            remap_text_int_column(&tx, "flow_invocations", "actor_user_id", &users_map)?;
+        }
+
+        // Phase 3b: align declared types on upgraded DBs. A child column that
+        // references one of the flipped parents was value-remapped in place, but
+        // on a legacy DB its declared affinity is still INTEGER while it now
+        // stores UUID text. Rebuild each such column to TEXT so an upgraded
+        // schema is byte-for-byte identical to a fresh install (the allowlist
+        // guard then holds for both paths). Fresh installs already declare TEXT,
+        // so this is a no-op there. Grouped per table so a multi-column table
+        // (e.g. group_members) is rebuilt once.
+        let mut text_targets: std::collections::BTreeMap<&'static str, Vec<&'static str>> =
+            std::collections::BTreeMap::new();
+        for remap in child_remaps() {
+            if !table_exists(&tx, remap.table)? {
+                continue;
+            }
+            if !column_is_text(&tx, remap.table, remap.column)? {
+                text_targets
+                    .entry(remap.table)
+                    .or_default()
+                    .push(remap.column);
+            }
+        }
+        for (table, columns) in text_targets {
+            convert_columns_to_text(&tx, table, &columns)?;
+        }
+
         // Drop AUTOINCREMENT bookkeeping for the rebuilt tables.
         if table_exists(&tx, "sqlite_sequence")? {
             tx.execute(
@@ -760,6 +798,246 @@ fn core_identity_int_to_uuid(conn: &Connection, version: i64, name: &str) -> Res
             Err(e)
         }
     }
+}
+
+/// True when `table` has a column named `column` (per PRAGMA table_info).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Rebuilds `table` so each column in `columns` is declared TEXT, preserving
+/// every other column, constraint and index. Used by the v53 upgrade path to
+/// align a value-remapped FK column's declared affinity with a fresh install
+/// (SQLite cannot change a column's type in place). Must run with
+/// `foreign_keys = OFF` (the caller owns that pragma).
+fn convert_columns_to_text(conn: &Connection, table: &str, columns: &[&str]) -> Result<()> {
+    // PRAGMA table_info gives column order, declared types, NOT NULL, default
+    // and the PK position — enough to rebuild a column list with the target
+    // columns forced to TEXT. Table-level constraints (composite PK, UNIQUE,
+    // CHECK, FK) are reconstructed from the original CREATE statement's body.
+    struct Col {
+        name: String,
+        decl_type: String,
+        not_null: bool,
+        default: Option<String>,
+        pk: i64,
+    }
+    let mut cols: Vec<Col> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            cols.push(Col {
+                name: row.get(1)?,
+                decl_type: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                not_null: row.get::<_, i64>(3)? != 0,
+                default: row.get::<_, Option<String>>(4)?,
+                pk: row.get(5)?,
+            });
+        }
+    }
+    if cols.is_empty() {
+        anyhow::bail!("convert_columns_to_text: table {table} has no columns");
+    }
+
+    // Original CREATE statement, used to recover table-level constraints
+    // (composite PRIMARY KEY, UNIQUE, CHECK) that PRAGMA table_info omits.
+    let create_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![table],
+        |r| r.get(0),
+    )?;
+    let mut table_constraints = extract_table_constraints(&create_sql);
+    // Foreign keys (column-level or table-level) are recovered from
+    // PRAGMA foreign_key_list and re-emitted as table-level clauses, so an
+    // inline `REFERENCES` on a rebuilt column is preserved rather than lost.
+    table_constraints.extend(foreign_key_clauses(conn, table)?);
+
+    let pk_cols: Vec<&Col> = {
+        let mut v: Vec<&Col> = cols.iter().filter(|c| c.pk > 0).collect();
+        v.sort_by_key(|c| c.pk);
+        v
+    };
+    // A single-column INTEGER PRIMARY KEY is a rowid alias; keep it inline.
+    let inline_single_pk = pk_cols.len() == 1;
+
+    let mut col_defs: Vec<String> = Vec::new();
+    for c in &cols {
+        let decl_type = if columns.contains(&c.name.as_str()) {
+            "TEXT".to_string()
+        } else if c.decl_type.is_empty() {
+            "TEXT".to_string()
+        } else {
+            c.decl_type.clone()
+        };
+        let mut def = format!("\"{}\" {}", c.name, decl_type);
+        if inline_single_pk && c.pk == 1 {
+            def.push_str(" PRIMARY KEY");
+        }
+        if c.not_null {
+            def.push_str(" NOT NULL");
+        }
+        if let Some(d) = &c.default {
+            def.push_str(&format!(" DEFAULT {d}"));
+        }
+        col_defs.push(def);
+    }
+    if !inline_single_pk && !pk_cols.is_empty() {
+        let names: Vec<String> = pk_cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+        col_defs.push(format!("PRIMARY KEY ({})", names.join(", ")));
+    }
+    for constraint in &table_constraints {
+        col_defs.push(constraint.clone());
+    }
+
+    let new_table = format!("{table}__text_rebuild");
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{new_table}\";"))?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE \"{new_table}\" (\n{}\n);",
+        col_defs.join(",\n")
+    ))?;
+
+    let col_list: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+    let col_csv = col_list.join(", ");
+    conn.execute(
+        &format!("INSERT INTO \"{new_table}\" ({col_csv}) SELECT {col_csv} FROM \"{table}\""),
+        [],
+    )?;
+    conn.execute_batch(&format!("DROP TABLE \"{table}\";"))?;
+    conn.execute_batch(&format!(
+        "ALTER TABLE \"{new_table}\" RENAME TO \"{table}\";"
+    ))?;
+
+    // Recreate the indexes the dropped table owned (sqlite drops them with it).
+    let index_sqls: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![table], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for sql in index_sqls {
+        conn.execute_batch(&format!("{sql};"))?;
+    }
+    Ok(())
+}
+
+/// Reconstructs every foreign key on `table` as a table-level `FOREIGN KEY`
+/// clause from PRAGMA foreign_key_list, so a column-rebuild keeps inline
+/// `REFERENCES` constraints that PRAGMA table_info does not expose. Composite
+/// FKs (multi-row same `id`) are grouped by their `id`.
+fn foreign_key_clauses(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    struct FkPart {
+        seq: i64,
+        parent_table: String,
+        from: String,
+        to: Option<String>,
+        on_update: String,
+        on_delete: String,
+    }
+    let mut by_id: std::collections::BTreeMap<i64, Vec<FkPart>> = std::collections::BTreeMap::new();
+    {
+        let mut stmt = conn.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            by_id.entry(id).or_default().push(FkPart {
+                seq: row.get(1)?,
+                parent_table: row.get(2)?,
+                from: row.get(3)?,
+                to: row.get::<_, Option<String>>(4)?,
+                on_update: row.get(5)?,
+                on_delete: row.get(6)?,
+            });
+        }
+    }
+    let mut clauses = Vec::new();
+    for (_id, mut parts) in by_id {
+        parts.sort_by_key(|p| p.seq);
+        let parent = parts[0].parent_table.clone();
+        let from_cols: Vec<String> = parts.iter().map(|p| format!("\"{}\"", p.from)).collect();
+        let to_cols: Vec<String> = parts
+            .iter()
+            .filter_map(|p| p.to.as_ref().map(|t| format!("\"{t}\"")))
+            .collect();
+        let mut clause = format!(
+            "FOREIGN KEY ({}) REFERENCES \"{}\"",
+            from_cols.join(", "),
+            parent
+        );
+        if !to_cols.is_empty() {
+            clause.push_str(&format!(" ({})", to_cols.join(", ")));
+        }
+        if parts[0].on_update != "NO ACTION" {
+            clause.push_str(&format!(" ON UPDATE {}", parts[0].on_update));
+        }
+        if parts[0].on_delete != "NO ACTION" {
+            clause.push_str(&format!(" ON DELETE {}", parts[0].on_delete));
+        }
+        clauses.push(clause);
+    }
+    Ok(clauses)
+}
+
+/// Extracts table-level non-FK constraint clauses (composite PRIMARY KEY,
+/// UNIQUE, CHECK) from a CREATE TABLE statement. Foreign keys are handled
+/// separately via `foreign_key_clauses`. These live as top-level items in the
+/// parenthesised body that do NOT start with a column name; the column
+/// definitions are rebuilt separately from PRAGMA table_info.
+fn extract_table_constraints(create_sql: &str) -> Vec<String> {
+    let open = match create_sql.find('(') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let close = match create_sql.rfind(')') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    if close <= open {
+        return Vec::new();
+    }
+    let body = &create_sql[open + 1..close];
+
+    // Split on top-level commas (depth 0 outside parens).
+    let mut items: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(body[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(body[start..].trim().to_string());
+
+    items
+        .into_iter()
+        .filter(|item| {
+            let upper = item.to_ascii_uppercase();
+            // Foreign keys are re-emitted from PRAGMA foreign_key_list and the
+            // PRIMARY KEY is rebuilt from PRAGMA table_info's pk columns, so skip
+            // both here to avoid declaring them twice.
+            if upper.contains("FOREIGN KEY") || upper.contains("PRIMARY KEY") {
+                return false;
+            }
+            upper.starts_with("UNIQUE")
+                || upper.starts_with("CHECK")
+                || upper.starts_with("CONSTRAINT")
+        })
+        .collect()
 }
 
 /// True when `table.column` has declared type affinity TEXT (per PRAGMA).
@@ -922,26 +1200,84 @@ fn foreign_key_check(conn: &Connection) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Scans untyped (no REFERENCES) attribution columns for values that no longer
-/// match any parent UUID. `foreign_key_check` cannot see these because they
-/// carry no FK constraint, yet a dangling value is still a data-integrity bug.
+/// True when `table.column` is the child side of a declared foreign key, i.e.
+/// `foreign_key_check` already validates it. Such columns are skipped by the
+/// untyped-orphan scan to avoid duplicating the engine's own check.
+fn column_has_declared_fk(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        // column index 3 of foreign_key_list is the child ("from") column.
+        let from: String = row.get(3)?;
+        if from.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Scans every remapped column that carries NO declared foreign key for values
+/// that no longer resolve to a parent UUID after the flip. `foreign_key_check`
+/// already validates the FK-constrained children, so this covers exactly the
+/// gap it leaves: untyped attribution columns (e.g. `audit_log.user_id`). A
+/// dangling value here is still a data-integrity bug, so it aborts the
+/// migration. Polymorphic `subject_id` rows are validated against the parent
+/// selected by their `subject_type` discriminator.
 fn scan_untyped_orphans(
     conn: &Connection,
     users_map: &std::collections::HashMap<i64, String>,
-    _groups_map: &std::collections::HashMap<i64, String>,
-    _flows_map: &std::collections::HashMap<i64, String>,
+    groups_map: &std::collections::HashMap<i64, String>,
+    flows_map: &std::collections::HashMap<i64, String>,
 ) -> Result<()> {
     let user_uuids: std::collections::HashSet<&String> = users_map.values().collect();
-    // audit_log.user_id has no FK clause (kept nullable for system actors), but
-    // a non-NULL value must resolve to a real user UUID after the remap.
-    if table_exists(conn, "audit_log")? {
-        let mut stmt = conn.prepare("SELECT user_id FROM audit_log WHERE user_id IS NOT NULL")?;
+    let group_uuids: std::collections::HashSet<&String> = groups_map.values().collect();
+    let flow_uuids: std::collections::HashSet<&String> = flows_map.values().collect();
+
+    for remap in child_remaps() {
+        if !table_exists(conn, remap.table)? {
+            continue;
+        }
+        // Skip children the engine already checks via their REFERENCES clause.
+        if column_has_declared_fk(conn, remap.table, remap.column)? {
+            continue;
+        }
+
+        let valid: &std::collections::HashSet<&String> = match remap.parent {
+            IdentityTable::UserAccounts => &user_uuids,
+            IdentityTable::UserGroups => &group_uuids,
+            IdentityTable::Flows => &flow_uuids,
+        };
+
+        let polymorphic = remap.column == "subject_id"
+            && matches!(remap.table, "addon_permissions" | "resource_permissions");
+        let select_sql = if polymorphic {
+            let want = match remap.parent {
+                IdentityTable::UserGroups => "group",
+                _ => "user",
+            };
+            format!(
+                "SELECT {col} FROM {tbl} WHERE {col} IS NOT NULL AND subject_type = '{want}'",
+                col = remap.column,
+                tbl = remap.table,
+            )
+        } else {
+            format!(
+                "SELECT {col} FROM {tbl} WHERE {col} IS NOT NULL",
+                col = remap.column,
+                tbl = remap.table,
+            )
+        };
+
+        let mut stmt = conn.prepare(&select_sql)?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            let uid: String = row.get(0)?;
-            if !user_uuids.contains(&uid) {
+            let value: String = row.get(0)?;
+            if !valid.contains(&value) {
                 anyhow::bail!(
-                    "core_identity_int_to_uuid: audit_log.user_id={uid} is orphaned after remap"
+                    "core_identity_int_to_uuid: {}.{}={} is orphaned after remap",
+                    remap.table,
+                    remap.column,
+                    value
                 );
             }
         }
@@ -1177,12 +1513,54 @@ fn rebuild_user_accounts(
             )?;
         }
     }
+    // Carry over an existing `user_accounts.preferred_language` when the legacy
+    // table already had the column (some upgraded DBs added it ad hoc). The
+    // SELECT above omits it because the canonical legacy shape has no such
+    // column, so copy it here keyed by the freshly-minted UUID's source row.
+    if column_exists(conn, "user_accounts", "preferred_language")? {
+        let mut sel = conn.prepare("SELECT id, preferred_language FROM user_accounts")?;
+        let mut rows = sel.query([])?;
+        while let Some(row) = rows.next()? {
+            let old_id: i64 = row.get(0)?;
+            let lang: Option<String> = row.get(1)?;
+            if let (Some(new_id), Some(lang)) = (map.get(&old_id), lang) {
+                conn.execute(
+                    "UPDATE user_accounts_uuid_new SET preferred_language = ?1 WHERE id = ?2",
+                    rusqlite::params![lang, new_id],
+                )?;
+            }
+        }
+    }
     conn.execute_batch(
         r#"
         DROP TABLE user_accounts;
         ALTER TABLE user_accounts_uuid_new RENAME TO user_accounts;
         "#,
     )?;
+
+    // Backfill the per-user language preference from the legacy `users` table.
+    // `users` (F1a auth) and `user_accounts` (F2 user mgmt) are distinct
+    // populations joined by their unique `username`; `users.preferred_language`
+    // is the only place the setting lived before user mgmt existed, so without
+    // this copy every legacy operator silently loses their UI language on the
+    // UUID flip. Only fills rows still missing a preference.
+    if table_exists(conn, "users")? && column_exists(conn, "users", "preferred_language")? {
+        conn.execute(
+            "UPDATE user_accounts \
+             SET preferred_language = ( \
+                 SELECT u.preferred_language FROM users u \
+                 WHERE u.username = user_accounts.username \
+                   AND u.preferred_language IS NOT NULL \
+             ) \
+             WHERE preferred_language IS NULL \
+               AND EXISTS ( \
+                 SELECT 1 FROM users u \
+                 WHERE u.username = user_accounts.username \
+                   AND u.preferred_language IS NOT NULL \
+               )",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -4581,6 +4959,20 @@ mod tests {
             INSERT INTO sso_providers
                 (name, provider_type, client_id, client_secret_encrypted, discovery_url, default_group_id)
                 VALUES ('idp', 'oidc', 'cid', 'sec', 'http://x', 101);
+            INSERT INTO flow_invocations
+                (id, addon_id, flow_id, started_at, status, operators_total, actor_user_id)
+                VALUES ('inv-1', 'a', '5', 'now', 'running', 1, '10'),
+                       ('inv-2', 'a', '5', 'now', 'running', 1, NULL);
+            "#,
+        )
+        .unwrap();
+
+        // Legacy `users` carries the only pre-mgmt language preference. Match by
+        // username so the v53 backfill can copy it into user_accounts.
+        conn.execute_batch(
+            r#"
+            INSERT INTO users (username, password_hash, role, preferred_language)
+            VALUES ('alice', 'h', 'admin', 'pl');
             "#,
         )
         .unwrap();
@@ -4715,6 +5107,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_user, alice_id);
+
+        // flow_invocations.actor_user_id remapped from legacy '10' to alice uuid;
+        // the NULL-actor row stays NULL.
+        let inv_actor: String = conn
+            .query_row(
+                "SELECT actor_user_id FROM flow_invocations WHERE id='inv-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inv_actor, alice_id);
+        let inv_null: Option<String> = conn
+            .query_row(
+                "SELECT actor_user_id FROM flow_invocations WHERE id='inv-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(inv_null.is_none(), "NULL-actor invocation stays NULL");
+
+        // preferred_language backfilled from legacy users (matched by username).
+        let alice_lang: Option<String> = conn
+            .query_row(
+                "SELECT preferred_language FROM user_accounts WHERE username='alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            alice_lang.as_deref(),
+            Some("pl"),
+            "alice's language preference must survive the UUID flip"
+        );
+
+        // MEDIUM 7: every value-remapped column without a declared FK must end up
+        // declared TEXT, so the upgraded schema matches a fresh install and the
+        // allowlist guard holds for both paths.
+        for remap in child_remaps() {
+            if !table_exists(&conn, remap.table).unwrap() {
+                continue;
+            }
+            assert!(
+                column_is_text(&conn, remap.table, remap.column).unwrap(),
+                "{}.{} must be TEXT after the upgrade-path migration",
+                remap.table,
+                remap.column
+            );
+        }
     }
 
     /// Builds a DB at exactly the v52 schema state (INTEGER identity ids) by
