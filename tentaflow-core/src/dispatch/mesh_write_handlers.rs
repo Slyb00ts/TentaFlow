@@ -11,12 +11,14 @@ use std::sync::Arc;
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
-    MeshConnectRequest, MeshConnectResponse, MeshNodeCommandRequest, MeshNodeCommandResponse,
-    MeshNodeNetworkConfigRequest, MeshNodeNetworkConfigResponse, MeshPairingConfirmRequest,
-    MeshPairingConfirmResponse, MeshPairingRejectRequest, MeshPairingRejectResponse,
-    MeshPairingStartRequest, MeshPairingStartResponse, MeshTrustRetrustRequest,
-    MeshTrustRetrustResponse, MeshTrustRevokeRequest, MeshTrustRevokeResponse, MessageBody,
-    ProtocolError, ProtocolErrorCode,
+    BaselineAdoptClearResponse, BaselineAdoptPhaseTag, BaselineAdoptReport, BaselineAdoptStartRequest,
+    BaselineAdoptStartResponse, BaselineAdoptStatusResponse, BaselineDonorCandidate,
+    BaselineDonorListResponse, MeshConnectRequest, MeshConnectResponse, MeshNodeCommandRequest,
+    MeshNodeCommandResponse, MeshNodeNetworkConfigRequest, MeshNodeNetworkConfigResponse,
+    MeshPairingConfirmRequest, MeshPairingConfirmResponse, MeshPairingRejectRequest,
+    MeshPairingRejectResponse, MeshPairingStartRequest, MeshPairingStartResponse,
+    MeshTrustRetrustRequest, MeshTrustRetrustResponse, MeshTrustRevokeRequest,
+    MeshTrustRevokeResponse, MessageBody, ProtocolError, ProtocolErrorCode,
 };
 use tracing::warn;
 
@@ -512,6 +514,227 @@ pub async fn mesh_node_network_config(
 }
 
 // =============================================================================
+// Sync baseline-adopt admin (donor list + start/status/clear). Admin wskazuje
+// dawce baseline'u i steruje pojedyncza adopcja single-flight. Cala maszyneria
+// zyje w mesh::admin_ops / sync::core_baseline — tu robimy walidacje i mapowanie.
+// =============================================================================
+
+fn map_baseline_phase(
+    phase: crate::sync::core_baseline::BaselinePhase,
+) -> BaselineAdoptPhaseTag {
+    use crate::sync::core_baseline::BaselinePhase;
+    match phase {
+        BaselinePhase::Elected => BaselineAdoptPhaseTag::Elected,
+        BaselinePhase::Receiving => BaselineAdoptPhaseTag::Receiving,
+        BaselinePhase::Importing => BaselineAdoptPhaseTag::Importing,
+        BaselinePhase::Imported => BaselineAdoptPhaseTag::Imported,
+        BaselinePhase::Completed => BaselineAdoptPhaseTag::Completed,
+    }
+}
+
+fn baseline_ledger_err(e: crate::sync::ledger::SyncLedgerError) -> ProtocolError {
+    // Internal ledger/codec text never reaches the wire — log and return a
+    // generic message so SQLite paths/schema details do not leak to clients.
+    tracing::error!("baseline adopt admin: ledger error: {}", e);
+    ProtocolError::new(ProtocolErrorCode::Internal, "internal baseline error")
+}
+
+// -----------------------------------------------------------------------------
+// BaselineDonorListRequest — kandydaci na dawce (zaufane sparowane peery).
+// -----------------------------------------------------------------------------
+
+#[handler(variant = "BaselineDonorListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn baseline_donor_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use crate::mesh::peer_registry::TrustStateTag;
+
+    let local_node_id = ctx.state.local_node_id.as_ref();
+    // Source of truth: in-memory PeerRegistry (hydrated from peer_persisted at
+    // startup). Only Trusted peers (other than self) are eligible donors — adopt
+    // pulls a full baseline over the already-trusted pairing channel, so an
+    // untrusted node must never be offered as a candidate.
+    let candidates: Vec<BaselineDonorCandidate> = ctx
+        .state
+        .mesh_peer_store
+        .registry()
+        .map(|reg| {
+            reg.snapshot_summary()
+                .into_iter()
+                .filter(|s| matches!(s.trust, TrustStateTag::Trusted))
+                .filter_map(|s| {
+                    let node_id = hex::encode(s.node_id);
+                    if node_id == local_node_id {
+                        return None;
+                    }
+                    let display_name = if s.hostname.is_empty() {
+                        node_id.clone()
+                    } else {
+                        (*s.hostname).to_string()
+                    };
+                    Some(BaselineDonorCandidate {
+                        node_id,
+                        display_name,
+                        trusted: true,
+                        // Donor row counts are only known from the transfer
+                        // header (`BaselineHeader`); nothing reliable is known
+                        // locally, so summary stays None for the list.
+                        summary: None,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(MessageBody::BaselineDonorListResponseBody(
+        BaselineDonorListResponse { candidates },
+    ))
+}
+
+// -----------------------------------------------------------------------------
+// BaselineAdoptStartRequest — rozpocznij adopcje od wskazanego dawcy (joiner).
+// -----------------------------------------------------------------------------
+
+#[handler(variant = "BaselineAdoptStartRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn baseline_adopt_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::BaselineAdoptStartRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected BaselineAdoptStartRequestBody",
+            ));
+        }
+    };
+    let BaselineAdoptStartRequest { donor_node_id } = payload;
+
+    let security = require_mesh_security(ctx)?;
+
+    let outcome = admin_ops::admin_start_baseline_adopt(
+        &ctx.state.db,
+        &security,
+        ctx.state.local_node_id.as_ref(),
+        donor_node_id,
+        &ctx.state.quic_mesh,
+    )?;
+
+    Ok(MessageBody::BaselineAdoptStartResponseBody(
+        BaselineAdoptStartResponse {
+            ok: true,
+            started: outcome.started,
+            message: outcome.message,
+        },
+    ))
+}
+
+// -----------------------------------------------------------------------------
+// BaselineAdoptStatusRequest — biezaca faza + raport gdy Completed.
+// -----------------------------------------------------------------------------
+
+#[handler(variant = "BaselineAdoptStatusRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn baseline_adopt_status(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use crate::sync::core_baseline::{
+        load_adopt_report, load_adopt_state, BaselinePhase, BaselineRole,
+    };
+
+    let state =
+        load_adopt_state(&ctx.state.db).map_err(baseline_ledger_err)?;
+
+    let response = match state {
+        None => BaselineAdoptStatusResponse {
+            phase: BaselineAdoptPhaseTag::None,
+            peer: None,
+            is_joiner: None,
+            report: None,
+        },
+        Some(state) => {
+            let report = if state.phase == BaselinePhase::Completed {
+                load_adopt_report(&ctx.state.db)
+                    .map_err(baseline_ledger_err)?
+                    .map(|r| BaselineAdoptReport {
+                        donor_org_id: r.donor_org_id,
+                        users_merged_by_email: r.users_merged_by_email as u64,
+                        users_joined_donor_org: r.users_joined_donor_org as u64,
+                        collisions_suffixed: r.collisions_suffixed as u64,
+                    })
+            } else {
+                None
+            };
+            BaselineAdoptStatusResponse {
+                phase: map_baseline_phase(state.phase),
+                peer: Some(state.peer),
+                is_joiner: Some(state.role == BaselineRole::Joiner),
+                report,
+            }
+        }
+    };
+
+    Ok(MessageBody::BaselineAdoptStatusResponseBody(response))
+}
+
+// -----------------------------------------------------------------------------
+// BaselineAdoptClearRequest — odblokuj zawieszony stan adopcji (escape hatch).
+// -----------------------------------------------------------------------------
+
+#[handler(variant = "BaselineAdoptClearRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn baseline_adopt_clear(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use crate::sync::core_baseline::{clear_adopt_state, load_adopt_state, BaselinePhase};
+
+    let state =
+        load_adopt_state(&ctx.state.db).map_err(baseline_ledger_err)?;
+
+    let response = match state {
+        None => BaselineAdoptClearResponse {
+            ok: true,
+            cleared: false,
+            message: "brak stanu adopcji do wyczyszczenia".to_string(),
+        },
+        // An in-flight transfer/import must NOT be torn out from under the
+        // transaction: clearing it would orphan a half-merged database. Only
+        // Elected (transfer not started) and Completed (already done) are safe
+        // to clear; Receiving/Importing/Imported are refused.
+        Some(state)
+            if matches!(
+                state.phase,
+                BaselinePhase::Receiving | BaselinePhase::Importing | BaselinePhase::Imported
+            ) =>
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Conflict,
+                "adopcja w trakcie aktywnego transferu/importu — nie mozna wyczyscic",
+            ));
+        }
+        Some(_) => {
+            clear_adopt_state(&ctx.state.db).map_err(baseline_ledger_err)?;
+            BaselineAdoptClearResponse {
+                ok: true,
+                cleared: true,
+                message: "stan adopcji wyczyszczony".to_string(),
+            }
+        }
+    };
+
+    Ok(MessageBody::BaselineAdoptClearResponseBody(response))
+}
+
+// =============================================================================
 // 9. ProfilingBody — multi-source profiling (start/stop/sessions/report/...).
 // =============================================================================
 
@@ -998,6 +1221,126 @@ register_profiling_variant!(
     "ProfilingCollectorsStatusRequest",
     "tentaflow_ws_handler_profiling_collectors_status"
 );
+
+#[cfg(test)]
+mod baseline_adopt_handler_tests {
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use crate::sync::core_baseline::{
+        store_adopt_state, BaselineAdoptState, BaselinePhase, BaselineRole,
+    };
+    use tentaflow_protocol::mesh::BaselineEpoch;
+    use tentaflow_protocol::SessionAuth;
+
+    fn admin_ctx() -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: AppState::for_test(),
+            org_context: None,
+        }
+    }
+
+    fn seed_state(ctx: &HandlerContext, phase: BaselinePhase) {
+        let state = BaselineAdoptState {
+            role: BaselineRole::Joiner,
+            peer: "donor-node".to_string(),
+            epoch: BaselineEpoch {
+                counter: 3,
+                origin_node: "donor-node".to_string(),
+            },
+            phase,
+        };
+        store_adopt_state(&ctx.state.db, &state).expect("seed adopt state");
+    }
+
+    #[test]
+    fn donor_list_without_registry_is_empty_and_typed() {
+        let ctx = admin_ctx();
+        let res = baseline_donor_list(&MessageBody::BaselineDonorListRequest, &ctx)
+            .expect("donor list ok");
+        match res {
+            MessageBody::BaselineDonorListResponseBody(r) => assert!(r.candidates.is_empty()),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_none_when_no_state() {
+        let ctx = admin_ctx();
+        let res = baseline_adopt_status(&MessageBody::BaselineAdoptStatusRequest, &ctx)
+            .expect("status ok");
+        match res {
+            MessageBody::BaselineAdoptStatusResponseBody(r) => {
+                assert_eq!(r.phase, tentaflow_protocol::BaselineAdoptPhaseTag::None);
+                assert!(r.peer.is_none() && r.report.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_reports_phase_and_peer() {
+        let ctx = admin_ctx();
+        seed_state(&ctx, BaselinePhase::Receiving);
+        let res = baseline_adopt_status(&MessageBody::BaselineAdoptStatusRequest, &ctx)
+            .expect("status ok");
+        match res {
+            MessageBody::BaselineAdoptStatusResponseBody(r) => {
+                assert_eq!(r.phase, tentaflow_protocol::BaselineAdoptPhaseTag::Receiving);
+                assert_eq!(r.peer.as_deref(), Some("donor-node"));
+                assert_eq!(r.is_joiner, Some(true));
+                // Report only attached at Completed.
+                assert!(r.report.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_refused_during_active_import() {
+        let ctx = admin_ctx();
+        seed_state(&ctx, BaselinePhase::Importing);
+        let err = baseline_adopt_clear(&MessageBody::BaselineAdoptClearRequest, &ctx)
+            .expect_err("clear during import must be refused");
+        assert_eq!(err.code, ProtocolErrorCode::Conflict);
+        // State must still be present (not torn out).
+        assert!(crate::sync::core_baseline::load_adopt_state(&ctx.state.db)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn clear_allowed_when_elected() {
+        let ctx = admin_ctx();
+        seed_state(&ctx, BaselinePhase::Elected);
+        let res = baseline_adopt_clear(&MessageBody::BaselineAdoptClearRequest, &ctx)
+            .expect("clear of elected state ok");
+        match res {
+            MessageBody::BaselineAdoptClearResponseBody(r) => assert!(r.ok && r.cleared),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        assert!(crate::sync::core_baseline::load_adopt_state(&ctx.state.db)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn clear_noop_when_no_state() {
+        let ctx = admin_ctx();
+        let res = baseline_adopt_clear(&MessageBody::BaselineAdoptClearRequest, &ctx)
+            .expect("clear with no state ok");
+        match res {
+            MessageBody::BaselineAdoptClearResponseBody(r) => assert!(r.ok && !r.cleared),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod profiling_tests {

@@ -945,3 +945,227 @@ pub fn retrust(security: &Arc<MeshSecurity>, node_id: &str) -> Result<(), AdminE
     })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod baseline_adopt_admin_tests {
+    use super::*;
+    use crate::sync::core_baseline::{load_adopt_state, BaselinePhase, BaselineRole};
+    use std::sync::Mutex;
+
+    fn setup_test_db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn test_cipher() -> Arc<crate::crypto::SettingsCipher> {
+        Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]))
+    }
+
+    /// Buduje MeshSecurity z jednym zaufanym peerem `donor` (valid Ed25519 key
+    /// pozyczony z drugiej, niezależnej tożsamości).
+    fn security_with_trusted_donor(db: &DbPool, donor: &str) -> Arc<MeshSecurity> {
+        let security = Arc::new(MeshSecurity::new(db.clone(), test_cipher()).unwrap());
+        let other_db = setup_test_db();
+        let other = MeshSecurity::new(other_db, test_cipher()).unwrap();
+        security
+            .add_trusted_key(donor, &other.public_key_hex(), "donor-host")
+            .unwrap();
+        security
+    }
+
+    #[test]
+    fn rejects_untrusted_donor() {
+        let db = setup_test_db();
+        let security = Arc::new(MeshSecurity::new(db.clone(), test_cipher()).unwrap());
+        let err = admin_start_baseline_adopt(
+            &db,
+            &security,
+            "local-node",
+            "donor-node",
+            &None,
+        )
+        .expect_err("untrusted donor must be rejected");
+        assert!(matches!(err.kind, AdminErrorKind::BadRequest));
+        // No state must be written when the donor is rejected.
+        assert!(load_adopt_state(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_self_as_donor() {
+        let db = setup_test_db();
+        let security = security_with_trusted_donor(&db, "local-node");
+        let err = admin_start_baseline_adopt(
+            &db,
+            &security,
+            "local-node",
+            "local-node",
+            &None,
+        )
+        .expect_err("self donor must be rejected");
+        assert!(matches!(err.kind, AdminErrorKind::BadRequest));
+    }
+
+    #[test]
+    fn starts_adopt_as_joiner_for_trusted_donor() {
+        let db = setup_test_db();
+        let security = security_with_trusted_donor(&db, "donor-node");
+        let outcome = admin_start_baseline_adopt(
+            &db,
+            &security,
+            "local-node",
+            "donor-node",
+            &None,
+        )
+        .expect("trusted donor must start adopt");
+        assert!(outcome.started);
+
+        let state = load_adopt_state(&db).unwrap().expect("state persisted");
+        assert_eq!(state.role, BaselineRole::Joiner);
+        assert_eq!(state.peer, "donor-node");
+        assert_eq!(state.phase, BaselinePhase::Elected);
+    }
+
+    #[test]
+    fn second_start_with_different_donor_conflicts_single_flight() {
+        let db = setup_test_db();
+        let security = Arc::new(MeshSecurity::new(db.clone(), test_cipher()).unwrap());
+        let other_db = setup_test_db();
+        let other = MeshSecurity::new(other_db, test_cipher()).unwrap();
+        security
+            .add_trusted_key("donor-a", &other.public_key_hex(), "a")
+            .unwrap();
+        let other_db2 = setup_test_db();
+        let other2 = MeshSecurity::new(other_db2, test_cipher()).unwrap();
+        security
+            .add_trusted_key("donor-b", &other2.public_key_hex(), "b")
+            .unwrap();
+
+        admin_start_baseline_adopt(&db, &security, "local-node", "donor-a", &None)
+            .expect("first start ok");
+        let err = admin_start_baseline_adopt(&db, &security, "local-node", "donor-b", &None)
+            .expect_err("second start with different donor must conflict");
+        assert!(matches!(err.kind, AdminErrorKind::AlreadyPending));
+    }
+}
+
+/// Wynik admina-inicjowanej adopcji baseline'u.
+#[derive(Debug)]
+pub struct AdoptStartOutcome {
+    /// `true` gdy nowa adopcja faktycznie ruszyla (lokalny nod jako joiner,
+    /// pull snapshotu wystartowal w tle). `false` gdy to wznowienie istniejacej.
+    pub started: bool,
+    pub message: String,
+}
+
+/// Admin-inicjowana adopcja baseline'u od JAWNIE wskazanego dawcy. W odroznieniu
+/// od `begin_baseline_adopt_after_confirm` (auto po pairingu, role z nizszego
+/// node_id) admin podaje dawce explicit: `decide_roles(.., proposed_donor=donor)`
+/// wymusza, ze wskazany peer jest dawca, a lokalny nod joinerem.
+///
+/// Bezpieczenstwo: dawca MUSI byc zaufanym sparowanym peerem (`is_trusted`);
+/// inaczej odrzucamy. Stan single-flight jest utrwalany atomowo (`begin_adopt_atomic`),
+/// wiec rownolegly start o innym celu dostaje twardy konflikt. Sam pull snapshotu
+/// idzie w tle (sieciowy, wznawialny przy starcie ze stanu `Elected`).
+pub fn admin_start_baseline_adopt(
+    db: &DbPool,
+    security: &Arc<MeshSecurity>,
+    local_node_id: &str,
+    donor_node_id: &str,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
+) -> Result<AdoptStartOutcome, AdminError> {
+    use crate::sync::core_baseline::{
+        begin_adopt_atomic, decide_roles, local_role, BaselinePhase, BaselineRole, BeginOutcome,
+    };
+
+    if !is_valid_id(donor_node_id) {
+        return Err(AdminError::new(
+            AdminErrorKind::BadRequest,
+            "Niepoprawny donor_node_id",
+        ));
+    }
+    if donor_node_id == local_node_id {
+        return Err(AdminError::new(
+            AdminErrorKind::BadRequest,
+            "donor == local node — nie ma od kogo adoptowac",
+        ));
+    }
+    if !security.is_trusted(donor_node_id) {
+        return Err(AdminError::new(
+            AdminErrorKind::BadRequest,
+            "wskazany dawca nie jest zaufanym sparowanym peerem",
+        ));
+    }
+
+    let donor_epoch = crate::sync::runtime::core_epoch();
+    // Admin wskazuje dawce jawnie — proposed_donor wymusza role.
+    let (donor, _joiner) = decide_roles(local_node_id, donor_node_id, Some(donor_node_id));
+    let role = local_role(local_node_id, &donor);
+    if role != BaselineRole::Joiner {
+        // decide_roles z proposed_donor=donor_node_id zawsze daje joinera lokalnie;
+        // ta galaz to obrona przed regresja, nie realny przeplyw.
+        return Err(AdminError::new(
+            AdminErrorKind::Internal,
+            "internal mesh error",
+        ));
+    }
+
+    match begin_adopt_atomic(
+        db,
+        BaselineRole::Joiner,
+        donor_node_id,
+        &donor_epoch,
+        BaselinePhase::Elected,
+    ) {
+        Ok(BeginOutcome::Started) => {}
+        Ok(BeginOutcome::Resume(_)) => {
+            return Ok(AdoptStartOutcome {
+                started: false,
+                message: "adopcja juz w toku z tym dawca — wznawiam".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(AdminError::new(
+                AdminErrorKind::AlreadyPending,
+                format!("adopcja zablokowana (single-flight): {e}"),
+            ));
+        }
+    }
+
+    let _ = crate::db::repository::log_audit(
+        &security.db,
+        None,
+        None,
+        "baseline_adopt_started",
+        None,
+        Some(&format!(
+            "Admin rozpoczal adopcje baseline'u od dawcy {donor_node_id}"
+        )),
+        None,
+        Some(donor_node_id),
+    );
+
+    if let Some(qm) = quic_mesh.clone() {
+        let donor = donor_node_id.to_string();
+        let epoch_seen = donor_epoch.counter;
+        tokio::spawn(async move {
+            if let Err(e) = qm.pull_baseline_from_donor(&donor, epoch_seen).await {
+                warn!(
+                    donor = %donor,
+                    "baseline adopt (admin): pull nieudany (wznowi przy starcie): {}",
+                    e
+                );
+            }
+        });
+    } else {
+        warn!(
+            donor = %donor_node_id,
+            "baseline adopt (admin): brak mesh managera — joiner wznowi pull przy starcie"
+        );
+    }
+
+    Ok(AdoptStartOutcome {
+        started: true,
+        message: "adopcja rozpoczeta".to_string(),
+    })
+}
