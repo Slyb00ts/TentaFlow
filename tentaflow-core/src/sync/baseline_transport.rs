@@ -45,6 +45,7 @@ use crate::sync::core_baseline::{
     decide_roles, deserialize_snapshot, import_baseline, load_adopt_state, local_role,
     reassemble_chunks, serialize_snapshot, store_adopt_state, validate_ack_agreement,
     BaselineAdoptState, BaselineImportReport, BaselinePhase, BaselineRole, BeginOutcome,
+    BASELINE_MAX_TOTAL_BYTES,
 };
 use crate::sync::ledger::{LedgerResult, SyncLedgerError};
 
@@ -148,6 +149,19 @@ pub async fn run_joiner_session<S: FrameStream>(
     validate_ack_agreement(&ack, &donor, &joiner, ack.epoch)?;
 
     let header: BaselineHeader = read_frame(stream, "header").await?;
+    // Both `total_bytes` and `max_bytes` are donor-declared, so neither bounds the
+    // joiner's memory. The only trustworthy limit is the LOCAL hard cap: reject the
+    // header up front so a malicious-but-trusted donor cannot make us buffer chunks
+    // toward an attacker-chosen total. We still keep the donor self-consistency check.
+    if header.total_bytes > BASELINE_MAX_TOTAL_BYTES {
+        return Err(transport_err(
+            "header",
+            format!(
+                "declared snapshot {} bytes exceeds local hard cap {}",
+                header.total_bytes, BASELINE_MAX_TOTAL_BYTES
+            ),
+        ));
+    }
     if header.total_bytes > header.max_bytes {
         return Err(transport_err(
             "header",
@@ -166,8 +180,24 @@ pub async fn run_joiner_session<S: FrameStream>(
     while received_bytes < header.total_bytes {
         let chunk: BaselineChunk = read_frame(stream, "chunk").await?;
         // Egzekwuj limit ZANIM odeslemy ACK — uszkodzony/zlosliwy donor nie moze
-        // przekroczyc zadeklarowanego rozmiaru.
+        // przekroczyc zadeklarowanego rozmiaru ANI lokalnego twardego capa. Cap
+        // jest sprawdzany per-chunk, by pamiec nie urosla powyzej limitu nawet gdy
+        // header sklamal o total_bytes wzgledem faktycznego strumienia.
         received_bytes = received_bytes.saturating_add(chunk.bytes.len() as u64);
+        if received_bytes > BASELINE_MAX_TOTAL_BYTES {
+            let ack = BaselineChunkAck {
+                seq: chunk.seq,
+                ok: false,
+            };
+            let _ = write_frame(stream, &ack, "chunk_ack").await;
+            return Err(transport_err(
+                "chunk",
+                format!(
+                    "received {} bytes exceeds local hard cap {}",
+                    received_bytes, BASELINE_MAX_TOTAL_BYTES
+                ),
+            ));
+        }
         if received_bytes > header.total_bytes {
             let ack = BaselineChunkAck {
                 seq: chunk.seq,
