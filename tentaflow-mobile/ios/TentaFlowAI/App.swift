@@ -64,6 +64,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         KokoroEngineBridge.registerWithRust()
         NSLog("[TentaFlow] Kokoro callbacks zarejestrowane")
 
+        // MLX Whisper (WhisperEngine.swift) — STT na iOS idzie wylacznie przez
+        // MLX (nie whisper.cpp). Rejestracja przed startem Rust core.
+        NSLog("[TentaFlow] Rejestracja MLX Whisper callbacks...")
+        WhisperEngineBridge.registerWithRust()
+        NSLog("[TentaFlow] MLX Whisper callbacks zarejestrowane")
+
         // Uruchom Rust core — serwisy startuja w osobnym watku, nie blokuje main thread.
         // MeshSecurity (z ktorej bierze sie nasz node_id iroh) inicjalizuje sie w tle,
         // wiec NativeDiscovery startujemy dopiero po 4s zeby mesh byl gotowy i FFI

@@ -25,6 +25,7 @@ plans/*
 build-xcode/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
+**/.swiftpm/xcode/xcuserdata/
 DerivedData/
 
 # Wygenerowany manifest serwisow dla GUI (build.rs produkuje przy kompilacji)

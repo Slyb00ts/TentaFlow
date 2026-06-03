@@ -19,7 +19,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use libloading::{Library, Symbol};
+use libloading::Library;
+#[cfg(not(target_os = "ios"))]
+use libloading::Symbol;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -31,6 +33,7 @@ use super::{
 // FFI kontrakt — odpowiada @_cdecl symbolom w WhisperEngine.swift
 // =============================================================================
 
+#[cfg(not(target_os = "ios"))]
 type GetContextFn = unsafe extern "C" fn() -> *mut c_void;
 type LoadModelFn = unsafe extern "C" fn(*const c_char, *mut c_void) -> i32;
 type UnloadModelFn = unsafe extern "C" fn(*mut c_void);
@@ -52,7 +55,10 @@ extern "C" {
 /// (Copy) zamiast `Symbol<'static, _>`, zeby mozna bylo skopiowac do
 /// `spawn_blocking` bez `move out of shared reference`.
 struct Bridge {
-    _lib: &'static Library,
+    // macOS trzyma `Library` zywa (dlopen libMLXBridge.dylib). iOS nie ma
+    // dylib — Swift (WhisperEngine.swift) rejestruje wskazniki + context przy
+    // starcie (tentaflow_register_whisper), wiec tam _lib = None.
+    _lib: Option<&'static Library>,
     load_fn: LoadModelFn,
     unload_fn: UnloadModelFn,
     transcribe_fn: TranscribeFn,
@@ -198,13 +204,16 @@ fn progress_for_sink(
 // Helpery `locate_dylib` + `ensure_metallib_next_to` zostaly przeniesione do
 // `crate::macos_ffi` zeby mogly z nich korzystac inne moduly Apple-specific
 // (apple_tts, mlx_kokoro). Lokalne fn ponizej deleguja do wspoldzielonego.
+#[cfg(not(target_os = "ios"))]
 fn locate_dylib() -> Option<PathBuf> {
     crate::macos_ffi::locate_mlx_bridge_dylib()
 }
+#[cfg(not(target_os = "ios"))]
 fn ensure_metallib_next_to(dylib: &std::path::Path) {
     crate::macos_ffi::ensure_mlx_metallib_next_to(dylib)
 }
 
+#[cfg(not(target_os = "ios"))]
 fn open_bridge() -> Result<Bridge> {
     let path = locate_dylib().context(
         "Nie znaleziono libMLXBridge.dylib — zbuduj projekt cargo build (build.rs odpala swift build)",
@@ -242,12 +251,66 @@ fn open_bridge() -> Result<Bridge> {
     // Symbol -> raw fn pointer. Symbol referencuje `_lib` (`'static`), wiec
     // pointer pozostaje wazny do konca procesu.
     Ok(Bridge {
-        _lib: lib,
+        _lib: Some(lib),
         load_fn: *load_fn,
         unload_fn: *unload_fn,
         transcribe_fn: *transcribe_fn,
         context,
     })
+}
+
+// iOS: brak libMLXBridge.dylib. WhisperEngine.swift (MLX) jest wkompilowany w
+// apke i przy starcie rejestruje wskazniki + context przez
+// tentaflow_register_whisper. Mirror tentaflow_register_kokoro / _apple_tts.
+#[cfg(target_os = "ios")]
+fn open_bridge() -> Result<Bridge> {
+    let reg = WHISPER_REG.get().context(
+        "MLX Whisper nie zarejestrowany ze Swift — tentaflow_register_whisper \
+         nie zostalo wywolane przy starcie aplikacji",
+    )?;
+    Ok(Bridge {
+        _lib: None,
+        load_fn: reg.load_fn,
+        unload_fn: reg.unload_fn,
+        transcribe_fn: reg.transcribe_fn,
+        context: reg.context,
+    })
+}
+
+#[cfg(target_os = "ios")]
+struct WhisperRegistration {
+    load_fn: LoadModelFn,
+    unload_fn: UnloadModelFn,
+    transcribe_fn: TranscribeFn,
+    context: *mut c_void,
+}
+
+#[cfg(target_os = "ios")]
+unsafe impl Send for WhisperRegistration {}
+#[cfg(target_os = "ios")]
+unsafe impl Sync for WhisperRegistration {}
+
+#[cfg(target_os = "ios")]
+static WHISPER_REG: std::sync::OnceLock<WhisperRegistration> = std::sync::OnceLock::new();
+
+/// Rejestruje wskazniki MLX Whisper ze strony Swift (iOS). Swift sam tworzy
+/// context (MLXWhisperEngine.shared) i podaje go tutaj — odpowiednik
+/// `MLXWhisper_getContext` z dylib na macOS.
+#[cfg(target_os = "ios")]
+#[no_mangle]
+pub extern "C" fn tentaflow_register_whisper(
+    load_fn: LoadModelFn,
+    unload_fn: UnloadModelFn,
+    transcribe_fn: TranscribeFn,
+    context: *mut c_void,
+) {
+    let _ = WHISPER_REG.set(WhisperRegistration {
+        load_fn,
+        unload_fn,
+        transcribe_fn,
+        context,
+    });
+    tracing::info!("[mlx-whisper] Swift callbacks zarejestrowane");
 }
 
 // =============================================================================

@@ -544,12 +544,15 @@ function getAdvancedModelName() {
 }
 
 function getAdvancedGpus() {
-  // MLX nie ma dyskretnego GPU — budzet unified memory wysylamy jako jedno
-  // syntetyczne "urzadzenie", zeby istniejacy recommend zwrocil model_spec +
-  // wagi. Max-context liczymy potem client-side (bez workspace'u vLLM).
+  // MLX nie ma dyskretnego GPU — recommend wolamy WYLACZNIE po model_spec +
+  // wagi. Syntetycznemu "urzadzeniu" dajemy DUZY budzet (nie realny limit MLX),
+  // bo backendowy auto_fit liczy vLLM workspace (~5 GB) i dla malego
+  // unified-memory budzetu zwrocilby twardy BadRequest ("zwieksz liczbe GPU"),
+  // przerywajac handler zanim odda model_spec. Realny limit (mlx_max_memory_mb)
+  // i tak liczymy client-side w computeMlxMaxContext — bez workspace'u vLLM.
   if (String(engineEntry?.engine?.id || '').toLowerCase() === 'mlx') {
     const mb = Number(selection.advanced?.mlx_max_memory_mb) || 0;
-    return mb > 0 ? [{ index: 0, name: 'Apple unified memory', memory_gb: mb / 1024 }] : [];
+    return mb > 0 ? [{ index: 0, name: 'Apple unified memory', memory_gb: 4096 }] : [];
   }
   const node = nodes.find((n) => (n.node_id || n.id) === selection.nodeId);
   if (!node) return [];
