@@ -91,22 +91,23 @@ pub fn mirror_trusted_peer_to_registry(
     }
 }
 
-/// Po potwierdzonym parowaniu inicjator (joiner) decyduje role baseline-adopt i
-/// utrwala single-flight stan adopcji. Gdy lokalny nod wychodzi jako JOINER,
-/// zapisuje stan w fazie `Elected` — KROK 2 (transport iroh) odczyta ten stan,
-/// otworzy strumien baseline do dawcy (`BaselineElect` -> `BaselineAck` ->
-/// `BaselineHeader` + `BaselineChunk`*), zlozy chunki przez
-/// `core_baseline::reassemble_chunks` i zawola `core_baseline::run_baseline_adopt`
-/// (pelna, juz zaimplementowana, atomowa logika importu). Gdy lokalny nod jest
-/// DAWCA, nie robi nic poza zapisem roli — to dawca odpowiada na `BaselineElect`
-/// snapshotem (`core_baseline::capture_baseline_snapshot` + `chunk_snapshot`).
+/// Po potwierdzonym parowaniu obie strony decyduja role baseline-adopt i utrwala
+/// single-flight stan adopcji. Gdy lokalny nod jest JOINEREM, zapisuje stan w
+/// fazie `Elected` i (gdy mesh manager dostepny) odpala w tle transport iroh:
+/// dial dawcy na ALPN_BASELINE, sekwencja `BaselineElect` -> `BaselineAck` ->
+/// `BaselineHeader` + `BaselineChunk`*, zlozenie i atomowy import przez
+/// `core_baseline::run_baseline_adopt`. Gdy lokalny nod jest DAWCA, zapisuje
+/// tylko role — to dawca odpowiada na przychodzacy `BaselineElect` snapshotem
+/// (handler ALPN_BASELINE w `iroh_manager`).
 ///
-/// Tu NIE ma transferu sieciowego (krok 2); elekcja i stan single-flight sa
-/// realne i potrzebne natychmiast, by zablokowac rownolegly split-brain.
+/// Elekcja i stan single-flight sa utrwalane SYNCHRONICZNIE (blokuja split-brain
+/// natychmiast); samo pobranie snapshotu przez joinera idzie w tle (sieciowe,
+/// moze trwac) i jest wznawialne przy starcie z trwalego stanu `Elected`.
 fn begin_baseline_adopt_after_confirm(
     db: &DbPool,
     local_node_id: &str,
     remote_node_id: &str,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
 ) {
     use crate::sync::core_baseline::{
         begin_adopt_atomic, local_role, BaselinePhase, BaselineRole, BeginOutcome,
@@ -142,10 +143,30 @@ fn begin_baseline_adopt_after_confirm(
         }
     }
     match role {
-        BaselineRole::Joiner => info!(
-            peer = %remote_node_id,
-            "baseline adopt: lokalny nod jest JOINEREM — krok 2 pobierze snapshot dawcy"
-        ),
+        BaselineRole::Joiner => {
+            info!(
+                peer = %remote_node_id,
+                "baseline adopt: lokalny nod jest JOINEREM — pobieram snapshot dawcy w tle"
+            );
+            if let Some(qm) = quic_mesh.clone() {
+                let donor_node_id = remote_node_id.to_string();
+                let epoch_seen = donor_epoch.counter;
+                tokio::spawn(async move {
+                    if let Err(e) = qm.pull_baseline_from_donor(&donor_node_id, epoch_seen).await {
+                        warn!(
+                            donor = %donor_node_id,
+                            "baseline adopt: pobranie snapshotu nieudane (wznowi przy starcie): {}",
+                            e
+                        );
+                    }
+                });
+            } else {
+                warn!(
+                    peer = %remote_node_id,
+                    "baseline adopt: brak mesh managera — joiner wznowi pull przy starcie"
+                );
+            }
+        }
         BaselineRole::Donor => info!(
             peer = %remote_node_id,
             "baseline adopt: lokalny nod jest DAWCA — odpowie na BaselineElect snapshotem"
@@ -592,6 +613,7 @@ pub async fn initiate_pairing(
                     &security.db,
                     local_node_id,
                     &remote_hints.node_id,
+                    quic_mesh,
                 );
                 completed = true;
             }
@@ -721,7 +743,7 @@ pub async fn confirm_pairing(
     // durable `Elected` row that krok 2 can resume from — instead of a trusted peer
     // with no adopt state and no retry. `decide_roles` is pure, so both ends compute
     // the identical donor/joiner split.
-    begin_baseline_adopt_after_confirm(&security.db, local_node_id, remote_node_id);
+    begin_baseline_adopt_after_confirm(&security.db, local_node_id, remote_node_id, quic_mesh);
 
     if let Some(ref qm) = quic_mesh {
         if let Some(ref hints) = pending_hints {

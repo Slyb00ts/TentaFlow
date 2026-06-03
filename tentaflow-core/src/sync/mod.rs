@@ -3,6 +3,7 @@
 // Opis: Moduły synchronizacji danych TentaFlow oparte o podpisany ledger operacji.
 // =============================================================================
 
+pub mod baseline_transport;
 pub mod blob_capture;
 pub mod compaction;
 pub mod core_baseline;
