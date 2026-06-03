@@ -265,6 +265,11 @@ pub struct SyncOperationBody {
     pub actor_device_id: String,
     pub actor_node_id: String,
     pub hlc_timestamp: HybridLogicalTimestamp,
+    // Pre-epoch operations (read from disk, or received from un-upgraded peers)
+    // carry no `epoch` field. Defaulting to genesis lets them deserialize cleanly
+    // and then get rejected by epoch-fencing in put_verified_in_inbox
+    // (EpochMismatch), instead of a hard CBOR `missing field` failure.
+    #[serde(default)]
     pub epoch: BaselineEpoch,
     pub prev_partition_hash: Option<[u8; 32]>,
     pub payload_hash: [u8; 32],
@@ -673,6 +678,70 @@ mod tests {
         assert_eq!(decoded.epoch.counter, 5);
         assert_eq!(decoded.epoch.origin_node, "node_a");
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn pre_epoch_operation_body_decodes_to_genesis_epoch() {
+        // Mirrors SyncOperationBody as it was serialized before the epoch field
+        // existed (faza B). Encoding it produces a CBOR map with no `epoch` key,
+        // exactly like an operation read from an old on-disk ledger or received
+        // from an un-upgraded peer. Decoding MUST yield genesis epoch (so epoch
+        // fencing can reject it cleanly) instead of a hard "missing field" error.
+        #[derive(Serialize)]
+        struct LegacyOperationBody {
+            org_id: String,
+            partition_id: PartitionId,
+            partition_sequence: u64,
+            addon_id: String,
+            resource_type: String,
+            resource_id: String,
+            table_name: String,
+            primary_key: String,
+            action: ActionType,
+            changed_fields: BTreeMap<String, FieldValue>,
+            before_hash: Option<[u8; 32]>,
+            after_hash: Option<[u8; 32]>,
+            actor_user_id: String,
+            actor_device_id: String,
+            actor_node_id: String,
+            hlc_timestamp: HybridLogicalTimestamp,
+            prev_partition_hash: Option<[u8; 32]>,
+            payload_hash: [u8; 32],
+            acl_snapshot_hash: [u8; 32],
+            policy_epoch: u64,
+            encryption_info: Option<String>,
+        }
+
+        let legacy = LegacyOperationBody {
+            org_id: "org_1".to_string(),
+            partition_id: PartitionId::new("core/org/org_1/flows").unwrap(),
+            partition_sequence: 7,
+            addon_id: "core".to_string(),
+            resource_type: "core.flow".to_string(),
+            resource_id: "flow-uuid".to_string(),
+            table_name: "flows".to_string(),
+            primary_key: "id".to_string(),
+            action: ActionType::Insert,
+            changed_fields: BTreeMap::new(),
+            before_hash: None,
+            after_hash: Some([3; 32]),
+            actor_user_id: "user-uuid".to_string(),
+            actor_device_id: "node_a".to_string(),
+            actor_node_id: "node_a".to_string(),
+            hlc_timestamp: hlc(100, 1, "node_a"),
+            prev_partition_hash: Some([9; 32]),
+            payload_hash: [1; 32],
+            acl_snapshot_hash: [2; 32],
+            policy_epoch: 2,
+            encryption_info: None,
+        };
+
+        let bytes = encode(&legacy).expect("encode legacy");
+        let decoded: SyncOperationBody = decode(&bytes).expect("decode legacy into current");
+
+        assert_eq!(decoded.epoch, BaselineEpoch::default());
+        assert_eq!(decoded.epoch.counter, 0);
+        assert!(decoded.epoch.origin_node.is_empty());
     }
 
     #[test]
