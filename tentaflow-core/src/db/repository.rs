@@ -5244,6 +5244,22 @@ pub fn get_addon_package(
     Ok(row)
 }
 
+/// Lista wersji jednego pakietu, najnowsze (po created_at) najpierw. Pusty
+/// wektor gdy pakietu nie ma w katalogu. Sluzy do detekcji "dostepna
+/// aktualizacja" (instancja.package_version != versions[0]) i wyboru wersji
+/// docelowej update_instance.
+pub fn list_package_versions(pool: &DbPool, package_id: &str) -> Result<Vec<String>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT version FROM addon_packages WHERE package_id = ?1 \
+         ORDER BY created_at DESC, version DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![package_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Lista wszystkich wersji wszystkich pakietow w katalogu, najnowsze najpierw.
 pub fn list_addon_packages(pool: &DbPool) -> Result<Vec<AddonPackageRow>> {
     let conn = acquire(pool)?;
