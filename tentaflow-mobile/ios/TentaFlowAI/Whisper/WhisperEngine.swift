@@ -136,25 +136,43 @@ public final class MLXWhisperEngine {
             unloadModel()
             MLX.GPU.clearCache()
         }
+
+        print("[MLXWhisper] Ladowanie modelu z \(path)")
+        // KRYTYCZNE: `WhisperLoader.load` jest SYNCHRONICZNY i ciezki (safetensors
+        // + budowa grafu MLX). NIE wolno go odpalac w `Task` — przy boocie 3
+        // silniki embedded laduja sie rownolegle i ciezka praca sync w Tasku
+        // glodzi pule kooperacyjnych watkow Swift concurrency (gdy nie ma awaitu
+        // downloadu zwalniajacego watek, np. model z cache) -> forward-progress
+        // deadlock, deploy wisi na 0% "WDRAZANIE" na zawsze, a write-lock STT
+        // managera zostaje wziety na stale (blokuje kolejne deploye STT).
+        // loadModel jest wolany z Rust `spawn_blocking` (dedykowany watek
+        // blokujacy), wiec sync load lecimy WPROST tutaj.
+        let m: Whisper
+        do {
+            m = try WhisperLoader.load(directory: url)
+        } catch {
+            print("[MLXWhisper] Blad ladowania modelu: \(error)")
+            return false
+        }
+        // Tokenizer jest async (AutoTokenizer.from). Tylko ten lekki fragment
+        // (czyta lokalne pliki tokenizera) idzie przez semafor+Task — nie glodzi
+        // puli, bo `await` zwalnia watek.
         let semaphore = DispatchSemaphore(value: 0)
-        var success = false
+        var loadedTokenizer: WhisperTokenizer?
         Task {
-            do {
-                print("[MLXWhisper] Ladowanie modelu z \(path)")
-                let m = try WhisperLoader.load(directory: url)
-                let tk = try await WhisperTokenizer(folder: url)
-                self.model = m
-                self.tokenizer = tk
-                self.modelPath = path
-                success = true
-                print("[MLXWhisper] Model zaladowany — \(m.config.nVocab) tokenow, \(m.config.nAudioLayer)/\(m.config.nTextLayer) warstw enc/dec")
-            } catch {
-                print("[MLXWhisper] Blad ladowania: \(error)")
-            }
+            loadedTokenizer = try? await WhisperTokenizer(folder: url)
             semaphore.signal()
         }
         semaphore.wait()
-        return success
+        guard let tk = loadedTokenizer else {
+            print("[MLXWhisper] Blad ladowania tokenizera z \(path)")
+            return false
+        }
+        self.model = m
+        self.tokenizer = tk
+        self.modelPath = path
+        print("[MLXWhisper] Model zaladowany — \(m.config.nVocab) tokenow, \(m.config.nAudioLayer)/\(m.config.nTextLayer) warstw enc/dec")
+        return true
     }
 
     public func unloadModel() {
