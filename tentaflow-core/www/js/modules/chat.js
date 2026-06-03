@@ -891,8 +891,15 @@ function sendVoiceUtterance(wav, sampleRate) {
         if (endBody && endBody.error) {
           assistantMsg.text = `[error] ${endBody.error}`;
           toast(`${I18n.t('common.error')}: ${endBody.error}`, 'error');
-        } else if (assistantMsg.text === '') {
-          assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
+        } else {
+          // Pelny tekst z serwera (FlowInvokeEnd.text) jest autorytatywny — sklejane
+          // delty streamu bywaja uciete na koncu (audio leci dluzej niz dolecial tekst).
+          if (endBody && typeof endBody.text === 'string' && endBody.text.length > 0) {
+            assistantMsg.text = endBody.text;
+          }
+          if (assistantMsg.text === '') {
+            assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
+          }
         }
         conv.updatedAt = Date.now();
         saveConversations();

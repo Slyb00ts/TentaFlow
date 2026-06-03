@@ -836,7 +836,7 @@ impl BackendClient {
     }
 
     /// Wysyla TTS request do backendu HTTP (OpenAI-compatible /audio/speech).
-    /// Uzywany przez python-bundle TTS (chatterbox-mlx, kyutai-tts, voxcpm,
+    /// Uzywany przez python-bundle TTS (kyutai-tts, voxcpm,
     /// xtts) ktore wystawiaja `/v1/audio/speech` zgodnie z OpenAI API.
     /// Zwraca surowe bajty audio (WAV/PCM/MP3/Opus zaleznie od response_format).
     pub async fn audio_speech(
@@ -868,7 +868,7 @@ impl BackendClient {
             body["model"] = serde_json::Value::String(override_name.to_string());
         }
         // Typed request-time overrides — TTS wrappery (kyutai-tts,
-        // chatterbox, xtts itd.) konsumuja extra fields w body POST do
+        // xtts itd.) konsumuja extra fields w body POST do
         // `/v1/audio/speech`.
         self.apply_chat_overrides(&mut body);
 

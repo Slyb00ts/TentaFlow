@@ -1849,11 +1849,27 @@ fn spawn_engine(
     let file_out = Arc::clone(&file_arc);
     std::thread::spawn(move || {
         if let Some(o) = stdout {
-            for line in BufReader::new(o).lines().map_while(Result::ok) {
-                sink_out(&line);
-                if let Ok(mut f) = file_out.lock() {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{}", line);
+            let mut reader = BufReader::new(o);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break, // EOF — proces zakonczyl, pipe zamkniety naturalnie
+                    Ok(_) => {
+                        // Lossy: nie-UTF-8 (paski tqdm z mlx-audio) NIE moga zatrzymac
+                        // drenowania. `Lines::next` walidowalby UTF-8 i `map_while`
+                        // konczyl petle na pierwszym blednym bajcie — read-end pipe'a
+                        // zamykal sie, a dlugozyjacy engine dostawal SIGPIPE/BrokenPipe
+                        // przy nastepnym zapisie progresu na stdout (HTTP 500 przy TTS).
+                        let line = String::from_utf8_lossy(&buf);
+                        let line = line.trim_end_matches(['\n', '\r']);
+                        sink_out(line);
+                        if let Ok(mut f) = file_out.lock() {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{}", line);
+                        }
+                    }
+                    Err(_) => break, // realny blad IO (pipe zamkniety) — koniec
                 }
             }
         }
@@ -1862,11 +1878,24 @@ fn spawn_engine(
     let file_err = Arc::clone(&file_arc);
     std::thread::spawn(move || {
         if let Some(e) = stderr {
-            for line in BufReader::new(e).lines().map_while(Result::ok) {
-                sink_err(&line);
-                if let Ok(mut f) = file_err.lock() {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{}", line);
+            let mut reader = BufReader::new(e);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break, // EOF — proces zakonczyl, pipe zamkniety naturalnie
+                    Ok(_) => {
+                        // Lossy: nie-UTF-8 NIE moze zatrzymac drenowania, inaczej
+                        // zamkniecie read-endu zabija dlugozyjacy engine SIGPIPE.
+                        let line = String::from_utf8_lossy(&buf);
+                        let line = line.trim_end_matches(['\n', '\r']);
+                        sink_err(line);
+                        if let Ok(mut f) = file_err.lock() {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{}", line);
+                        }
+                    }
+                    Err(_) => break, // realny blad IO (pipe zamkniety) — koniec
                 }
             }
         }
