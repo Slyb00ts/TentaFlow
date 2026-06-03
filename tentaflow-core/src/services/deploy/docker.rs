@@ -96,6 +96,239 @@ impl DockerDeploy {
             Some(DockerTransport::SidecarQuic) | None => Transport::SidecarQuic,
         }
     }
+
+    /// Host port explicitly requested by the admin in the deploy form
+    /// (`config_json.port`). Used as the preferred port for a fresh compose
+    /// deploy — honored when free, otherwise the allocator falls back to the
+    /// next free one (a busy suggested port never fails the deploy).
+    #[cfg_attr(not(feature = "docker"), allow(dead_code))]
+    fn requested_port(&self) -> Option<u16> {
+        self.user_config
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .filter(|p| (1..=u64::from(u16::MAX)).contains(p))
+            .map(|p| p as u16)
+    }
+
+    /// Launch a `compose_path` stack (multi-container infra like Milvus /
+    /// iroh-relay) via `docker compose up -d --wait`. Each deploy runs as its own
+    /// compose PROJECT named `tentaflow-<engine>-<port>`, so N independent
+    /// instances coexist on one host — every container/volume/network is
+    /// project-prefixed by compose (no sharing). We allocate a free host port for
+    /// the engine's API and inject it via `MILVUS_GRPC_PORT` (the stack maps it to
+    /// the container's gRPC port). `--wait` blocks until the stack's own
+    /// healthchecks pass, so a successful return means it is up.
+    #[cfg(feature = "docker")]
+    async fn prepare_compose(&mut self, compose_path: &str) -> DeployResult<PreparedDeploy> {
+        let compose_file = crate::paths::containers_root().join(compose_path);
+        if !compose_file.exists() {
+            return Err(DeployError::Manifest(format!(
+                "docker compose_path does not exist: {}",
+                compose_file.display()
+            )));
+        }
+
+        // Ports already published by ANY docker container — including ones
+        // created outside TentaFlow. `docker ps` reflects the daemon's own port
+        // reservations, so this catches conflicts the kernel bind-probe misses
+        // when dockerd runs with userland-proxy disabled (iptables DNAT leaves
+        // no host listener for our `TcpListener::bind` to trip on).
+        let docker_busy = docker_published_host_ports().await;
+
+        // Pick a host port that is free per the allocator (own ledger + kernel
+        // probe) AND not published by docker; bring the stack up; retry on a
+        // port-allocation conflict (race with a concurrent deploy/container).
+        // Ports we skip stay leased during the loop so each turn gets a fresh
+        // one; the unused ones are released once we succeed or give up.
+        let mut held: Vec<u16> = Vec::new();
+        let mut chosen: Option<(u16, String)> = None;
+        let mut last_err = String::new();
+        // First attempt honors the port the admin chose in the form (or the
+        // service's preserved port on respawn); later attempts take the next
+        // free one if that was already taken.
+        let first_choice = self.preserved_port.or_else(|| self.requested_port());
+        for attempt in 0..30usize {
+            let preferred = if attempt == 0 { first_choice } else { None };
+            let port = match self.ports.acquire_or_specific(preferred) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = e.to_string();
+                    break;
+                }
+            };
+            // Proactively skip ports docker already owns (unless it is this
+            // service's own preserved port, which it legitimately still holds).
+            if docker_busy.contains(&port) && Some(port) != self.preserved_port {
+                held.push(port);
+                continue;
+            }
+            let project = compose_project_name(&self.manifest.engine.id, port);
+            if let Some(s) = &self.log_sink {
+                s.info(&format!(
+                    "[compose] starting stack {} (project {}, host port {})",
+                    compose_file.display(),
+                    project,
+                    port
+                ));
+            }
+            let output = tokio::process::Command::new("docker")
+                .arg("compose")
+                .arg("-f")
+                .arg(&compose_file)
+                .arg("-p")
+                .arg(&project)
+                .arg("up")
+                .arg("-d")
+                .arg("--wait")
+                .env("MILVUS_GRPC_PORT", port.to_string())
+                .output()
+                .await
+                .map_err(|e| {
+                    let _ = self.ports.release(port);
+                    for h in &held {
+                        let _ = self.ports.release(*h);
+                    }
+                    DeployError::Spawn(format!(
+                        "docker compose up: {e} (is the `docker compose` CLI plugin installed?)"
+                    ))
+                })?;
+            if output.status.success() {
+                chosen = Some((port, project));
+                break;
+            }
+            // Always tear down the partial project before retrying / failing.
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let _ = tokio::process::Command::new("docker")
+                .args(["compose", "-p", &project, "down"])
+                .output()
+                .await;
+            if is_port_conflict(&stderr) {
+                // Hold this port leased so the next acquire skips it; retry.
+                held.push(port);
+                last_err = stderr.trim().to_string();
+                continue;
+            }
+            // Non-port failure (image pull, bad config, …) — do not retry.
+            let _ = self.ports.release(port);
+            for h in &held {
+                let _ = self.ports.release(*h);
+            }
+            return Err(DeployError::Spawn(format!(
+                "docker compose up failed for '{}': {}",
+                self.manifest.engine.id,
+                stderr.trim()
+            )));
+        }
+
+        let (port, project) = match chosen {
+            Some(v) => v,
+            None => {
+                for h in &held {
+                    let _ = self.ports.release(*h);
+                }
+                return Err(DeployError::PortAlloc(format!(
+                    "no free host port for '{}' (every candidate was taken by docker or the OS; last: {})",
+                    self.manifest.engine.id, last_err
+                )));
+            }
+        };
+        // Release the ports we skipped/failed; keep only the chosen one leased.
+        for h in &held {
+            if *h != port {
+                let _ = self.ports.release(*h);
+            }
+        }
+
+        let transport = self.pick_transport();
+        let endpoint_url = Some(build_endpoint_url("127.0.0.1", port, self.manifest.engine.api));
+
+        let runtime = RuntimeHandle {
+            pid: None,
+            port: Some(port),
+            sidecar_port: None,
+            endpoint_url,
+            // Sentinel so `stop()` tears the whole stack down with
+            // `docker compose -p <project> down` instead of removing one container.
+            container_id: Some(format!("compose:{project}")),
+            instance_dir: None,
+        };
+        let models = models_from_manifest(&self.manifest, &self.user_config);
+        let config_json = serde_json::to_string(&self.user_config)
+            .map_err(|e| DeployError::Other(format!("serialize config: {e}")))?;
+
+        Ok(PreparedDeploy {
+            engine_id: self.manifest.engine.id.clone(),
+            category: category_tag(&self.manifest).to_string(),
+            display_name: resolve_display_name(&self.manifest),
+            deploy_method: DeployMethod::Docker,
+            transport,
+            runtime,
+            models,
+            config_json,
+            allocated_ports: vec![port],
+        })
+    }
+}
+
+/// Deterministic docker-compose project name for one deployed stack instance.
+/// Includes the host port so multiple instances of the same engine get distinct
+/// projects, and `stop()` can reconstruct it from `engine_id` + `runtime_port`
+/// to run `docker compose -p <name> down`.
+#[cfg(feature = "docker")]
+pub(super) fn compose_project_name(engine_id: &str, port: u16) -> String {
+    let safe: String = engine_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("tentaflow-{safe}-{port}")
+}
+
+/// Host ports currently published by any running docker container (incl. ones
+/// not managed by TentaFlow). Parsed from `docker ps --format '{{.Ports}}'`,
+/// whose entries look like `0.0.0.0:5001->19530/tcp, [::]:5001->19530/tcp`.
+/// Reflects the daemon's port reservations regardless of userland-proxy mode.
+#[cfg(feature = "docker")]
+async fn docker_published_host_ports() -> std::collections::HashSet<u16> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(o) = tokio::process::Command::new("docker")
+        .args(["ps", "--format", "{{.Ports}}"])
+        .output()
+        .await
+    else {
+        return out;
+    };
+    let text = String::from_utf8_lossy(&o.stdout);
+    for line in text.lines() {
+        for seg in line.split(',') {
+            // Only mappings with an explicit host binding ("host:PORT->container").
+            if let Some(arrow) = seg.find("->") {
+                let left = &seg[..arrow];
+                if let Some(colon) = left.rfind(':') {
+                    if let Ok(p) = left[colon + 1..].trim().parse::<u16>() {
+                        out.insert(p);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True when a `docker compose up` failure is a host-port collision (so the
+/// caller should retry on a different port rather than abort the deploy).
+#[cfg(feature = "docker")]
+fn is_port_conflict(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("port is already allocated")
+        || s.contains("address already in use")
+        || s.contains("bind for") // "Bind for 0.0.0.0:5001 failed: port is already allocated"
+        || s.contains("already in use by container")
 }
 
 #[cfg(feature = "docker")]
@@ -321,11 +554,21 @@ impl DeployStrategy for DockerDeploy {
                 self.manifest.engine.id
             ))
         })?;
-        let context_path = docker_section.context_path.as_deref().ok_or_else(|| {
-            DeployError::Manifest(
-                "docker deploy needs context_path (compose not yet handled in v2)".into(),
-            )
-        })?;
+        // Multi-container engines (infra stacks like Milvus / iroh-relay) declare
+        // `compose_path` instead of `context_path`: launch the whole stack via
+        // `docker compose up` rather than building a single image.
+        let context_path = match docker_section.context_path.clone() {
+            Some(p) => p,
+            None => {
+                let compose_path = docker_section.compose_path.clone().ok_or_else(|| {
+                    DeployError::Manifest(
+                        "docker deploy needs context_path or compose_path".into(),
+                    )
+                })?;
+                return self.prepare_compose(&compose_path).await;
+            }
+        };
+        let context_path = context_path.as_str();
 
         let docker = backend::connect().await?;
         backend::ping(&docker).await?;

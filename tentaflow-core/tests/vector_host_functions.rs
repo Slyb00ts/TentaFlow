@@ -2,10 +2,10 @@
 // =============================================================================
 // File: tests/vector_host_functions.rs
 // Purpose: Integration tests for the F1c P3 vector storage stack — exercises
-//          the public services API (`NamespaceManager` + `UsearchBackend`)
+//          the public services API (`NamespaceManager` + `ZvecBackend`)
 //          plus the host-function helpers (`decode_vector`, `check_gate`,
 //          `map_vector_error`) end-to-end against a real on-disk SQLite + a
-//          tempdir for the `.usearch` files. The wasmtime ABI wiring is
+//          tempdir for the per-namespace zvec collections. The wasmtime ABI wiring is
 //          covered indirectly: every host function in `vector.rs` reduces to
 //          these helpers + the manager so a regression at this layer is the
 //          same defect a guest addon would observe.
@@ -22,6 +22,8 @@ use tentaflow_core::addon::manifest::VectorNamespaceSpec;
 use tentaflow_core::services::vector::{
     Metric, NamespaceManager, VectorError, MAX_NAMESPACES_PER_ADDON,
 };
+
+const ORG: &str = "org-test";
 
 fn open_pool() -> (TempDir, tentaflow_core::db::DbPool) {
     let dir = TempDir::new().expect("tempdir");
@@ -42,6 +44,8 @@ fn spec(name: &str, dim: u32, distance: &str, gate: Option<&str>) -> VectorNames
         distance: distance.to_string(),
         data_class: "B".to_string(),
         gate: gate.map(|s| s.to_string()),
+        fields: Vec::new(),
+        sparse: false,
     }
 }
 
@@ -141,24 +145,24 @@ fn e2e_vector_upsert_search_delete_roundtrip() {
     let mgr = mgr_with_temproot(pool, root.path().to_path_buf());
 
     let be = mgr
-        .get_or_create("addon_a", "faces", 4, Metric::Cosine)
+        .get_or_create(ORG, "addon_a", "faces", 4, Metric::Cosine, &[], false)
         .expect("open ns");
 
-    be.upsert(1, &[1.0, 0.0, 0.0, 0.0]).expect("upsert 1");
-    be.upsert(2, &[0.0, 1.0, 0.0, 0.0]).expect("upsert 2");
-    be.upsert(3, &[0.0, 0.0, 1.0, 0.0]).expect("upsert 3");
+    be.upsert(1, &[1.0, 0.0, 0.0, 0.0], &[], None).expect("upsert 1");
+    be.upsert(2, &[0.0, 1.0, 0.0, 0.0], &[], None).expect("upsert 2");
+    be.upsert(3, &[0.0, 0.0, 1.0, 0.0], &[], None).expect("upsert 3");
     be.save().expect("persist");
-    mgr.update_count("addon_a", "faces", be.count()).unwrap();
+    mgr.update_count(ORG, "addon_a", "faces", be.count()).unwrap();
 
     // Search: query close to vector 1 returns it first.
-    let hits = be.search(&[0.99, 0.01, 0.0, 0.0], 2).expect("search");
+    let hits = be.search(&[0.99, 0.01, 0.0, 0.0], 2, None, &[]).expect("search");
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].ref_id, 1);
 
     // Delete vector 1, search again: vector 2 wins.
     assert!(be.delete(1).expect("delete"));
     be.save().expect("persist after delete");
-    let hits2 = be.search(&[0.99, 0.01, 0.0, 0.0], 1).expect("search 2");
+    let hits2 = be.search(&[0.99, 0.01, 0.0, 0.0], 1, None, &[]).expect("search 2");
     assert_eq!(hits2.len(), 1);
     assert_ne!(hits2[0].ref_id, 1);
 }
@@ -170,18 +174,18 @@ fn e2e_cross_addon_namespace_isolation() {
     let mgr = mgr_with_temproot(pool, root.path().to_path_buf());
 
     let a = mgr
-        .get_or_create("addon_a", "faces", 3, Metric::Cosine)
+        .get_or_create(ORG, "addon_a", "faces", 3, Metric::Cosine, &[], false)
         .unwrap();
     let b = mgr
-        .get_or_create("addon_b", "faces", 3, Metric::Cosine)
+        .get_or_create(ORG, "addon_b", "faces", 3, Metric::Cosine, &[], false)
         .unwrap();
-    a.upsert(100, &[1.0, 0.0, 0.0]).unwrap();
-    a.upsert(200, &[0.0, 1.0, 0.0]).unwrap();
+    a.upsert(100, &[1.0, 0.0, 0.0], &[], None).unwrap();
+    a.upsert(200, &[0.0, 1.0, 0.0], &[], None).unwrap();
 
     // addon_b's "faces" namespace is a different on-disk file: it sees
     // nothing of addon_a's data.
     assert_eq!(b.count(), 0);
-    let hits = b.search(&[1.0, 0.0, 0.0], 5).unwrap();
+    let hits = b.search(&[1.0, 0.0, 0.0], 5, None, &[]).unwrap();
     assert!(hits.is_empty());
 }
 
@@ -192,11 +196,11 @@ fn e2e_quota_enforcement_at_namespace_limit() {
     let mgr = mgr_with_temproot(pool, root.path().to_path_buf());
 
     for i in 0..MAX_NAMESPACES_PER_ADDON {
-        mgr.get_or_create("addon_a", &format!("ns_{i}"), 4, Metric::Cosine)
+        mgr.get_or_create(ORG, "addon_a", &format!("ns_{i}"), 4, Metric::Cosine, &[], false)
             .unwrap();
     }
     // 11th namespace must be rejected by the quota check.
-    let res = mgr.get_or_create("addon_a", "overflow", 4, Metric::Cosine);
+    let res = mgr.get_or_create(ORG, "addon_a", "overflow", 4, Metric::Cosine, &[], false);
     assert!(matches!(
         res,
         Err(VectorError::NamespaceQuotaExceeded { .. })
@@ -212,17 +216,17 @@ fn e2e_persist_survives_manager_restart() {
     {
         let mgr = mgr_with_temproot(pool.clone(), root_path.clone());
         let be = mgr
-            .get_or_create("addon_a", "attrs", 3, Metric::Cosine)
+            .get_or_create(ORG, "addon_a", "attrs", 3, Metric::Cosine, &[], false)
             .unwrap();
-        be.upsert(42, &[1.0, 0.0, 0.0]).unwrap();
+        be.upsert(42, &[1.0, 0.0, 0.0], &[], None).unwrap();
         be.save().unwrap();
     }
 
     // Build a fresh manager against the same DB + on-disk root.
     let mgr2 = mgr_with_temproot(pool, root_path);
-    let be2 = mgr2.get("addon_a", "attrs").expect("reopen ns");
+    let be2 = mgr2.get(ORG, "addon_a", "attrs").expect("reopen ns");
     assert_eq!(be2.count(), 1);
-    let hits = be2.search(&[1.0, 0.0, 0.0], 1).unwrap();
+    let hits = be2.search(&[1.0, 0.0, 0.0], 1, None, &[]).unwrap();
     assert_eq!(hits[0].ref_id, 42);
 }
 
@@ -233,12 +237,12 @@ fn e2e_delete_namespace_clears_db_and_file() {
     let mgr = mgr_with_temproot(pool.clone(), root.path().to_path_buf());
 
     let be = mgr
-        .get_or_create("addon_a", "scratch", 3, Metric::Cosine)
+        .get_or_create(ORG, "addon_a", "scratch", 3, Metric::Cosine, &[], false)
         .unwrap();
-    be.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
+    be.upsert(1, &[1.0, 0.0, 0.0], &[], None).unwrap();
     be.save().unwrap();
 
-    mgr.delete_namespace("addon_a", "scratch").expect("delete");
+    mgr.delete_namespace(ORG, "addon_a", "scratch").expect("delete");
 
     // DB row gone.
     let conn = pool.lock().unwrap();
@@ -253,7 +257,7 @@ fn e2e_delete_namespace_clears_db_and_file() {
 
     // Subsequent get() returns NamespaceNotFound.
     drop(conn);
-    let res = mgr.get("addon_a", "scratch");
+    let res = mgr.get(ORG, "addon_a", "scratch");
     assert!(matches!(res, Err(VectorError::NamespaceNotFound { .. })));
 }
 
@@ -263,15 +267,15 @@ fn e2e_namespace_geometry_mismatch_rejected_on_reopen() {
     let root = TempDir::new().unwrap();
     let mgr = mgr_with_temproot(pool, root.path().to_path_buf());
 
-    mgr.get_or_create("addon_a", "faces", 512, Metric::Cosine)
+    mgr.get_or_create(ORG, "addon_a", "faces", 512, Metric::Cosine, &[], false)
         .unwrap();
 
     // Caller passes a different dim — must be rejected, not silently coerced.
-    let res = mgr.get_or_create("addon_a", "faces", 768, Metric::Cosine);
+    let res = mgr.get_or_create(ORG, "addon_a", "faces", 768, Metric::Cosine, &[], false);
     assert!(matches!(res, Err(VectorError::DimMismatch { .. })));
 
     // Different metric is also rejected.
-    let res2 = mgr.get_or_create("addon_a", "faces", 512, Metric::Euclidean);
+    let res2 = mgr.get_or_create(ORG, "addon_a", "faces", 512, Metric::Euclidean, &[], false);
     assert!(matches!(res2, Err(VectorError::MetricMismatch { .. })));
 }
 
@@ -309,7 +313,7 @@ fn search_on_nonexistent_namespace_via_manager_returns_not_found_no_mutation() {
     let root = TempDir::new().unwrap();
     let mgr = mgr_with_temproot(pool.clone(), root.path().to_path_buf());
 
-    let res = mgr.get("addon_a", "never_written");
+    let res = mgr.get(ORG, "addon_a", "never_written");
     assert!(matches!(res, Err(VectorError::NamespaceNotFound { .. })));
 
     // The DB row must not have been created as a side effect.
@@ -343,7 +347,7 @@ fn upsert_with_quota_concurrent_at_cap_blocks_all_new_inserts() {
     // the cap. The quota check sums the `count` column, so this is a valid
     // shortcut to the "addon is saturated" state without inserting 1M
     // real vectors.
-    mgr.upsert_with_quota("addon_a", "ns", 1, &[1.0, 0.0, 0.0], 3, Metric::Cosine)
+    mgr.upsert_with_quota(ORG, "addon_a", "ns", 1, &[1.0, 0.0, 0.0], 3, Metric::Cosine, &[], &[], false, None)
         .unwrap();
     {
         let conn = pool.lock().unwrap();
@@ -359,12 +363,17 @@ fn upsert_with_quota_concurrent_at_cap_blocks_all_new_inserts() {
         let mgr_c = mgr.clone();
         handles.push(thread::spawn(move || {
             mgr_c.upsert_with_quota(
+                ORG,
                 "addon_a",
                 "ns",
                 100 + tid,
                 &[1.0, 0.0, 0.0],
                 3,
                 Metric::Cosine,
+                &[],
+                &[],
+                false,
+                None,
             )
         }));
     }
@@ -407,15 +416,19 @@ fn delete_persistence_survives_backend_reopen() {
     {
         let mgr = mgr_with_temproot(pool.clone(), root_path.clone());
         let be = mgr
-            .get_or_create("addon_a", "ns", 3, Metric::Cosine)
+            .get_or_create(ORG, "addon_a", "ns", 3, Metric::Cosine, &[], false)
             .unwrap();
-        be.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
-        be.upsert(2, &[0.0, 1.0, 0.0]).unwrap();
+        be.upsert(1, &[1.0, 0.0, 0.0], &[], None).unwrap();
+        be.upsert(2, &[0.0, 1.0, 0.0], &[], None).unwrap();
         assert!(be.delete(1).unwrap());
-        backend_path = root_path.join("addon_a").join("vectors").join("ns.usearch");
+        backend_path = root_path
+            .join(ORG)
+            .join("addon_a")
+            .join("vectors")
+            .join("ns.usearch");
     }
     let mgr2 = mgr_with_temproot(pool, root_path);
-    let be2 = mgr2.get("addon_a", "ns").expect("reopen");
+    let be2 = mgr2.get(ORG, "addon_a", "ns").expect("reopen");
     assert_eq!(be2.count(), 1, "delete must be durable across reopen");
     assert!(backend_path.exists());
 }

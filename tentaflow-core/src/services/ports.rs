@@ -152,6 +152,19 @@ impl PortAllocator {
         Ok(())
     }
 
+    /// Returns the first port the next `acquire()` would hand out, WITHOUT
+    /// leasing it — for showing a suggested free port in the deploy UI. Skips
+    /// leased / excluded / OS-bound ports. Advisory only: the value may be taken
+    /// by the time a deploy commits, so the deploy still re-allocates (and the
+    /// shown-after-deploy port is authoritative).
+    pub fn peek_free(&self) -> Option<u16> {
+        let (lo, hi) = self.range;
+        let inner = self.inner.lock().ok()?;
+        (lo..=hi).find(|c| {
+            !inner.leased.contains(c) && !inner.excluded.contains(c) && is_port_free(*c)
+        })
+    }
+
     /// Releases a previously acquired port so future calls may hand it out
     /// again. Releasing an unleased port is a no-op (logged via Result Ok).
     pub fn release(&self, port: u16) -> Result<()> {

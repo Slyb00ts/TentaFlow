@@ -131,6 +131,10 @@ model.save_pretrained('$merged_dir')
 tokenizer.save_pretrained('$merged_dir')
 print('Merge OK: $merged_dir')
 "
+        # Merge zapisuje zagniezdzony multimodalny checkpoint — splaszcz do
+        # plaskiego tekstowego CausalLM (full FT splaszczyl juz train.py).
+        echo "  Splaszczanie do tekstowego CausalLM..."
+        python3 "$SCRIPT_DIR/flatten_guard.py" "$merged_dir" "$merged_dir"
     fi
 
     # Konwersja do GGUF F16
