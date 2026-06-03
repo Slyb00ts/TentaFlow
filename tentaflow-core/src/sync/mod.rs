@@ -5,6 +5,7 @@
 
 pub mod blob_capture;
 pub mod compaction;
+pub mod core_baseline;
 pub mod core_capture;
 pub mod core_materializer;
 pub mod core_registry;

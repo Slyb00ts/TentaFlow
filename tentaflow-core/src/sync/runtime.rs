@@ -225,6 +225,22 @@ pub fn run_pending_baseline_cutover() -> LedgerResult<Option<usize>> {
     runtime.run_pending_baseline_cutover()
 }
 
+/// Adopts the donor's baseline epoch after a baseline-adopt import committed the
+/// donor snapshot into SQLite (see `sync::core_baseline::import_baseline`). The
+/// local epoch is set to the donor's, then core ledger partitions are wiped and
+/// re-seeded from the freshly-imported SQLite state so the joiner's outbox emits
+/// every adopted row under the donor's epoch.
+///
+/// When the runtime is not initialized (in-process unit tests that exercise the
+/// pure SQLite import with two bare `DbPool`s), this is a no-op: the SQLite
+/// transaction is already committed and fully testable on its own.
+pub fn adopt_donor_baseline_epoch(donor_epoch: &BaselineEpoch) -> LedgerResult<()> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(());
+    };
+    runtime.adopt_donor_baseline_epoch(donor_epoch)
+}
+
 /// Parses the baseline-cutover marker. Returns the recorded pre-cutover epoch
 /// counter when the marker has been upgraded to `pre_cutover_epoch=<n>`, or
 /// `None` for the migration's initial `"1"` sentinel (no counter recorded yet).
@@ -535,6 +551,32 @@ impl SyncRuntime {
         )
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         Ok(emitted)
+    }
+
+    /// Sets the local epoch to the donor's and re-seeds core partitions from the
+    /// just-imported SQLite snapshot. Called by `adopt_donor_baseline_epoch`
+    /// after the baseline-adopt import transaction has committed.
+    fn adopt_donor_baseline_epoch(&self, donor_epoch: &BaselineEpoch) -> LedgerResult<()> {
+        self.ledger.set_epoch(donor_epoch.clone())?;
+        self.ledger.reset_core_partitions()?;
+        crate::sync::core_capture::clear_core_capture_journal(&self.db)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        repository::reseed_core_state_from_current_rows(&self.db, &self.settings_cipher)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        crate::sync::core_capture::drain_pending_core_captures_with(
+            &self.db,
+            usize::MAX,
+            |capture| {
+                self.record_core_capture(capture)
+                    .map(|record| Some(record.op_id))
+            },
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        warn!(
+            "sync runtime: adopted donor baseline epoch counter={} origin={}",
+            donor_epoch.counter, donor_epoch.origin_node
+        );
+        Ok(())
     }
 
     fn record_blob_capture(
