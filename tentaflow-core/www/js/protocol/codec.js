@@ -1608,6 +1608,8 @@ export const encode = {
     const hideCgnat = !!(payload.hideCgnat ?? payload.hide_cgnat);
     const preferSameSubnet = !!(payload.preferSameSubnet ?? payload.prefer_same_subnet);
     const irohRelayUrl = String(payload.irohRelayUrl ?? payload.iroh_relay_url ?? '');
+    const excludedRaw = payload.excludedInterfaces ?? payload.excluded_interfaces ?? [];
+    const excludedInterfaces = Array.isArray(excludedRaw) ? excludedRaw.map(String) : [];
     const body = _wasm.encodeNetworkConfigUpdateRequest(
       bindMode,
       bindIpv4,
@@ -1617,6 +1619,7 @@ export const encode = {
       hideCgnat,
       preferSameSubnet,
       irohRelayUrl,
+      excludedInterfaces,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

@@ -16,11 +16,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use libloading::{Library, Symbol};
+use libloading::Library;
+#[cfg(not(target_os = "ios"))]
+use libloading::Symbol;
 use tracing::info;
 
 use super::{SynthesizeParams, SynthesizeResult, TtsEngine, TtsModelInfo};
 
+#[cfg(not(target_os = "ios"))]
 type GetContextFn = unsafe extern "C" fn() -> *mut c_void;
 type LoadModelFn = unsafe extern "C" fn(*const c_char, *mut c_void) -> i32;
 type UnloadModelFn = unsafe extern "C" fn(*mut c_void);
@@ -36,7 +39,10 @@ type SynthesizeFn = unsafe extern "C" fn(
 type FreeBufferFn = unsafe extern "C" fn(ptr: *mut f32);
 
 struct Bridge {
-    _lib: &'static Library,
+    // macOS trzyma `Library` zywa (dlopen libKokoroBridge.dylib). iOS nie ma
+    // dylib — Swift rejestruje wskazniki + context przy starcie
+    // (tentaflow_register_kokoro), wiec tam _lib = None.
+    _lib: Option<&'static Library>,
     load_fn: LoadModelFn,
     /// Held for future Drop impl — Kokoro bridge owns model resources
     /// across the FFI boundary; releasing them on engine drop avoids
@@ -53,6 +59,7 @@ struct Bridge {
 unsafe impl Send for Bridge {}
 unsafe impl Sync for Bridge {}
 
+#[cfg(not(target_os = "ios"))]
 fn locate_kokoro_dylib() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?.to_path_buf();
@@ -78,6 +85,7 @@ fn locate_kokoro_dylib() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+#[cfg(not(target_os = "ios"))]
 fn open_bridge() -> Result<Bridge> {
     let path = locate_kokoro_dylib()
         .context("Nie znaleziono libKokoroBridge.dylib — zbuduj projekt cargo build")?;
@@ -112,13 +120,70 @@ fn open_bridge() -> Result<Bridge> {
         anyhow::bail!("Kokoro_getContext zwrocil NULL");
     }
     Ok(Bridge {
-        _lib: lib,
+        _lib: Some(lib),
         load_fn: *load_fn,
         unload_fn: *unload_fn,
         synthesize_fn: *synthesize_fn,
         free_buffer_fn: *free_buffer_fn,
         context,
     })
+}
+
+// iOS: brak libKokoroBridge.dylib. KokoroSwiftLocal (MLX) jest wkompilowany w
+// apke, a Swift przekazuje wskazniki + context przez tentaflow_register_kokoro
+// przy starcie. Mirror tentaflow_register_apple_tts / tentaflow_register_mlx_swift.
+#[cfg(target_os = "ios")]
+fn open_bridge() -> Result<Bridge> {
+    let reg = KOKORO_REG.get().context(
+        "Kokoro MLX nie zarejestrowany ze Swift — tentaflow_register_kokoro \
+         nie zostalo wywolane przy starcie aplikacji",
+    )?;
+    Ok(Bridge {
+        _lib: None,
+        load_fn: reg.load_fn,
+        unload_fn: reg.unload_fn,
+        synthesize_fn: reg.synthesize_fn,
+        free_buffer_fn: reg.free_buffer_fn,
+        context: reg.context,
+    })
+}
+
+#[cfg(target_os = "ios")]
+struct KokoroRegistration {
+    load_fn: LoadModelFn,
+    unload_fn: UnloadModelFn,
+    synthesize_fn: SynthesizeFn,
+    free_buffer_fn: FreeBufferFn,
+    context: *mut c_void,
+}
+
+#[cfg(target_os = "ios")]
+unsafe impl Send for KokoroRegistration {}
+#[cfg(target_os = "ios")]
+unsafe impl Sync for KokoroRegistration {}
+
+#[cfg(target_os = "ios")]
+static KOKORO_REG: std::sync::OnceLock<KokoroRegistration> = std::sync::OnceLock::new();
+
+/// Rejestruje wskazniki MLX Kokoro ze strony Swift (iOS). Swift sam tworzy
+/// context (engine) i podaje go tutaj — odpowiednik `Kokoro_getContext` z dylib.
+#[cfg(target_os = "ios")]
+#[no_mangle]
+pub extern "C" fn tentaflow_register_kokoro(
+    load_fn: LoadModelFn,
+    unload_fn: UnloadModelFn,
+    synthesize_fn: SynthesizeFn,
+    free_buffer_fn: FreeBufferFn,
+    context: *mut c_void,
+) {
+    let _ = KOKORO_REG.set(KokoroRegistration {
+        load_fn,
+        unload_fn,
+        synthesize_fn,
+        free_buffer_fn,
+        context,
+    });
+    tracing::info!("[mlx-kokoro] Swift callbacks zarejestrowane");
 }
 
 // =============================================================================

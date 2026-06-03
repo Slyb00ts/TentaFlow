@@ -2704,6 +2704,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             if let Some(err) = end.error {
                 set(&obj, "error", err.into());
             }
+            if let Some(t) = end.text {
+                set(&obj, "text", t.into());
+            }
         }
         MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Req(req)) => {
             set(&obj, "variant", "TranslateRequest".into());
@@ -7925,6 +7928,16 @@ fn network_config_to_js(cfg: &NetworkConfig) -> js_sys::Object {
     set(&obj, "prefer_same_subnet", cfg.prefer_same_subnet.into());
     set(&obj, "irohRelayUrl", cfg.iroh_relay_url.clone().into());
     set(&obj, "iroh_relay_url", cfg.iroh_relay_url.clone().into());
+    set(
+        &obj,
+        "excludedInterfaces",
+        string_vec_to_js(cfg.excluded_interfaces.clone()).into(),
+    );
+    set(
+        &obj,
+        "excluded_interfaces",
+        string_vec_to_js(cfg.excluded_interfaces.clone()).into(),
+    );
     obj
 }
 
@@ -7959,6 +7972,7 @@ pub fn encode_network_config_update_request(
     hide_cgnat: bool,
     prefer_same_subnet: bool,
     iroh_relay_url: String,
+    excluded_interfaces: Vec<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_network(NetworkPayload::ReqConfigUpdate(NetworkConfig {
         bind_mode,
@@ -7969,6 +7983,7 @@ pub fn encode_network_config_update_request(
         hide_cgnat,
         prefer_same_subnet,
         iroh_relay_url,
+        excluded_interfaces,
     }))
 }
 

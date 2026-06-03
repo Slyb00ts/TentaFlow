@@ -98,12 +98,18 @@ impl SttRuntime {
         if mgr.active_engine().map(|e| e.is_loaded()).unwrap_or(false) {
             return Ok(());
         }
-        mgr.ensure_and_load(None)
-            .await
-            .map_err(|e| CoreError::InternalError {
-                message: format!("nie udalo sie zaladowac embedded whisper: {e}"),
-                source: None,
-            })?;
+        mgr.ensure_and_load(
+            None,
+            None,
+            None,
+            None,
+            crate::stt::WhisperDeployParams::default(),
+        )
+        .await
+        .map_err(|e| CoreError::InternalError {
+            message: format!("nie udalo sie zaladowac embedded whisper: {e}"),
+            source: None,
+        })?;
         Ok(())
     }
 

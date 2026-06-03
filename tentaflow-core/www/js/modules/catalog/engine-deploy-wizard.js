@@ -190,8 +190,11 @@ function applySpeculatorPreset(preset) {
     sp.model = preset.speculator_repo;
     sp.method = preset.speculator_method || 'dflash';
     sp.num_tokens = preset.speculator_num_tokens || 8;
-    // Nie wlaczamy automatycznie — to user-opt-in. Pre-fill ma tylko
-    // ulatwic wybor jak user kliknie toggle.
+    // Featured presety to gotowe, turnkey bloczki (np. Bielik NVFP4 + draft) —
+    // speculative wlacza sie automatycznie, zeby deploy nie wymagal recznego
+    // toggle. Zwykle (nie-featured) presety ze sparowanym draftem zostaja
+    // user-opt-in jak dotad.
+    sp.enabled = !!preset.featured;
   } else {
     sp.enabled = false;
     sp.model = '';
@@ -556,12 +559,15 @@ function getAdvancedModelName() {
 }
 
 function getAdvancedGpus() {
-  // MLX nie ma dyskretnego GPU — budzet unified memory wysylamy jako jedno
-  // syntetyczne "urzadzenie", zeby istniejacy recommend zwrocil model_spec +
-  // wagi. Max-context liczymy potem client-side (bez workspace'u vLLM).
+  // MLX nie ma dyskretnego GPU — recommend wolamy WYLACZNIE po model_spec +
+  // wagi. Syntetycznemu "urzadzeniu" dajemy DUZY budzet (nie realny limit MLX),
+  // bo backendowy auto_fit liczy vLLM workspace (~5 GB) i dla malego
+  // unified-memory budzetu zwrocilby twardy BadRequest ("zwieksz liczbe GPU"),
+  // przerywajac handler zanim odda model_spec. Realny limit (mlx_max_memory_mb)
+  // i tak liczymy client-side w computeMlxMaxContext — bez workspace'u vLLM.
   if (String(engineEntry?.engine?.id || '').toLowerCase() === 'mlx') {
     const mb = Number(selection.advanced?.mlx_max_memory_mb) || 0;
-    return mb > 0 ? [{ index: 0, name: 'Apple unified memory', memory_gb: mb / 1024 }] : [];
+    return mb > 0 ? [{ index: 0, name: 'Apple unified memory', memory_gb: 4096 }] : [];
   }
   const node = nodes.find((n) => (n.node_id || n.id) === selection.nodeId);
   if (!node) return [];
@@ -1868,10 +1874,11 @@ async function startDeploy() {
   }
 
   // Speculative Decoding — append `--speculative-config '{...}'` do VLLM_ARGS.
-  // shlex::split po stronie backendu (python_venv::build_engine_args) honoruje
-  // single-quotes wokol JSON, a docker entrypoint robi to przez shell. Trzeba
-  // tylko zachowac '...' jako quoting (single-quotes nie potrzebuja escapingu
-  // wewnetrznych ", a JSON nie zawiera ' wiec single-quote bezpieczny).
+  // Tokenizacja po stronie backendu honoruje single-quotes wokol JSON w OBU
+  // torach: native przez `shlex::split` (python_venv::build_engine_args), docker
+  // przez `xargs` w entrypoint.sh (surowy `$VLLM_ARGS` w bashu zostawialby
+  // literalne apostrofy). Single-quotes nie potrzebuja escapingu wewnetrznych
+  // ", a JSON nie zawiera ' wiec single-quote jest bezpieczny.
   const sp = selection.advanced?.speculative;
   if (!shouldSkipAdvancedStep() && sp && sp.enabled && sp.model) {
     const cfg = {

@@ -19,9 +19,10 @@ platforms = ["linux", "windows"]
 transport = "sidecar-quic"
 
 [deploy.native]
-# iOS pominiete — apka mobilna ma natywny silnik Whisper po stronie Swift
-# (TentaFlowAI/Whisper/*), Rust whisper-rs nie jest tam kompilowany.
-platforms = ["linux", "macos", "windows", "android"]
+# Apple (macOS/iOS) pominiete — tam STT idzie WYLACZNIE przez mlx-whisper
+# (GPU). whisper-rs (whisper.cpp na CPU) jest kompilowany tylko na
+# Linux/Windows/Android. Na macOS uzyj serwisu `mlx-whisper`.
+platforms = ["linux", "windows", "android"]
 runtime = "embedded"
 feature_flag = "inference-whisper"
 

@@ -1,0 +1,76 @@
+# Manifest serwisu Supertonic — wielojezyczny TTS przez ONNX Runtime, on-device.
+# Embedded przez crate `ort` (load-dynamic) za feature `inference-supertonic`.
+# Glos wybierany presetem (M1..M5 / F1..F5); jezyk jest per-request (nie preset).
+
+[engine]
+id = "supertonic"
+category = "tts"
+resource_kind = "ai"
+name = "Supertonic"
+description_pl = "Wielojezyczny TTS (31 jezykow) przez ONNX Runtime, on-device. Pipeline flow-matching, sample rate 44.1 kHz."
+description_en = "Multilingual TTS (31 languages) via ONNX Runtime, on-device. Flow-matching pipeline, 44.1 kHz sample rate."
+homepage = "https://huggingface.co/Supertone/supertonic-3"
+license = "Apache-2.0"
+icon = "supertonic"
+default_port = 5021
+api = "openai-compatible"
+version = "3.0.0"
+
+[deploy.native]
+# Embedded: ONNX Runtime przez crate `ort` (feature load-dynamic — onnxruntime
+# dlopenowany runtime'em, bez kolizji z sherpa-onnx). Faza 1: desktop. iOS to
+# osobna faza (nieobslugiwany tutaj).
+platforms = ["linux", "macos", "windows"]
+runtime = "embedded"
+feature_flag = "inference-supertonic"
+
+[[model_preset]]
+id = "supertonic-3-m1"
+display_name = "Supertonic v3 (M1, meski)"
+repo = "Supertone/supertonic-3"
+recommended = true
+
+[[model_preset]]
+id = "supertonic-3-m2"
+display_name = "Supertonic v3 (M2, meski)"
+repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-m3"
+display_name = "Supertonic v3 (M3, meski)"
+repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-m4"
+display_name = "Supertonic v3 (M4, meski)"
+repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-m5"
+display_name = "Supertonic v3 (M5, meski)"
+repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-f1"
+display_name = "Supertonic v3 (F1, zenski)"
+repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-f2"
+display_name = "Supertonic v3 (F2, zenski)"
+repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-f3"
+display_name = "Supertonic v3 (F3, zenski)"
+repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-f4"
+display_name = "Supertonic v3 (F4, zenski)"
+repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-f5"
+display_name = "Supertonic v3 (F5, zenski)"
+repo = "Supertone/supertonic-3"

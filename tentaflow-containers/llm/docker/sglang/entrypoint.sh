@@ -22,13 +22,19 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-echo "[entrypoint] start sglang"
-# shellcheck disable=SC2086
+# Tokenizacja SGLANG_ARGS respektujaca cudzyslowy — jak native (shlex::split).
+# `xargs` zdejmuje single-quotes (np. wokol JSON speculative) i NIE wykonuje
+# podstawien -> bezpieczne, bez `eval`. Surowe `$SGLANG_ARGS` zostawialo
+# literalne apostrofy. Dziala z/bez speculative, 1/wiele GPU, --tp itd.
+SGLANG_ARG_ARR=()
+while IFS= read -r _a; do SGLANG_ARG_ARR+=("$_a"); done < <(xargs -n1 printf '%s\n' <<< "$SGLANG_ARGS")
+
+echo "[entrypoint] start sglang (${#SGLANG_ARG_ARR[@]} args)"
 python3 -m sglang.launch_server \
   --model-path "$MODEL" \
   --host 127.0.0.1 \
   --port "$SGLANG_PORT" \
-  $SGLANG_ARGS 2>&1 \
+  "${SGLANG_ARG_ARR[@]}" 2>&1 \
   | sed -u 's/^/[sglang] /' &
 ENGINE_PID=$!
 echo "[entrypoint] sglang PID=$ENGINE_PID"

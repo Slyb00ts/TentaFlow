@@ -22,12 +22,18 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-echo "[entrypoint] start trtllm"
-# shellcheck disable=SC2086
+# Tokenizacja TRTLLM_ARGS respektujaca cudzyslowy — jak native (shlex::split).
+# `xargs` zdejmuje single-quotes i NIE wykonuje podstawien -> bezpieczne, bez
+# `eval`. Surowe `$TRTLLM_ARGS` zostawialo literalne apostrofy. Dziala z/bez
+# speculative, 1/wiele GPU, tensor parallel itd.
+TRTLLM_ARG_ARR=()
+while IFS= read -r _a; do TRTLLM_ARG_ARR+=("$_a"); done < <(xargs -n1 printf '%s\n' <<< "$TRTLLM_ARGS")
+
+echo "[entrypoint] start trtllm (${#TRTLLM_ARG_ARR[@]} args)"
 trtllm-serve "$MODEL" \
   --host 127.0.0.1 \
   --port "$TRTLLM_PORT" \
-  $TRTLLM_ARGS 2>&1 \
+  "${TRTLLM_ARG_ARR[@]}" 2>&1 \
   | sed -u 's/^/[trtllm] /' &
 ENGINE_PID=$!
 echo "[entrypoint] trtllm PID=$ENGINE_PID"
