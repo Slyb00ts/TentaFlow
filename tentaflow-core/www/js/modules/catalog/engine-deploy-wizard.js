@@ -1820,10 +1820,11 @@ async function startDeploy() {
   }
 
   // Speculative Decoding — append `--speculative-config '{...}'` do VLLM_ARGS.
-  // shlex::split po stronie backendu (python_venv::build_engine_args) honoruje
-  // single-quotes wokol JSON, a docker entrypoint robi to przez shell. Trzeba
-  // tylko zachowac '...' jako quoting (single-quotes nie potrzebuja escapingu
-  // wewnetrznych ", a JSON nie zawiera ' wiec single-quote bezpieczny).
+  // Tokenizacja po stronie backendu honoruje single-quotes wokol JSON w OBU
+  // torach: native przez `shlex::split` (python_venv::build_engine_args), docker
+  // przez `xargs` w entrypoint.sh (surowy `$VLLM_ARGS` w bashu zostawialby
+  // literalne apostrofy). Single-quotes nie potrzebuja escapingu wewnetrznych
+  // ", a JSON nie zawiera ' wiec single-quote jest bezpieczny.
   const sp = selection.advanced?.speculative;
   if (!shouldSkipAdvancedStep() && sp && sp.enabled && sp.model) {
     const cfg = {

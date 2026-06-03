@@ -1522,8 +1522,9 @@ pub(crate) fn build_engine_args(
     // appendowane PO arguments z bundle.toml. shlex split honoruje cudzyslowy
     // (np. --extra-config '{"key": "val"}'). Pozwala uzytkownikowi nadpisac
     // tensor-parallel-size, max-model-len, kv-cache-dtype itp. dla bundle
-    // python tak samo jak dla docker (gdzie VLLM_ARGS jest expanded w
-    // entrypoint.sh przez shell).
+    // python tak samo jak dla docker (gdzie entrypoint.sh tokenizuje VLLM_ARGS
+    // przez `xargs`, ktory rowniez honoruje cudzyslowy — surowy `$VLLM_ARGS`
+    // w bashu zostawialby literalne apostrofy wokol JSON).
     let extra_args_env_keys = ["VLLM_ARGS", "SGLANG_ARGS", "TRTLLM_ARGS", "EXTRA_ARGS"];
     for key in extra_args_env_keys {
         if let Some(extra) = env.get(key) {
