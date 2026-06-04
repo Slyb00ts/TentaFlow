@@ -28,6 +28,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::SyncResourceAcl
             | CoreSyncResourceKind::SyncUserOrgProfile
             | CoreSyncResourceKind::AddonInstance
+            | CoreSyncResourceKind::AddonConfig
     )
 }
 
@@ -101,6 +102,7 @@ pub fn apply_core_operation(
             apply_shared_setting_secret(&tx, settings_cipher, operation)?
         }
         CoreSyncResourceKind::AddonInstance => apply_addon_instance(&tx, operation)?,
+        CoreSyncResourceKind::AddonConfig => apply_addon_config(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -265,10 +267,60 @@ fn apply_addon_instance(
             )
             .map_err(sql_error)
             .and_then(require_existing(operation)),
-        ActionType::Delete => tx
-            .execute(
+        ActionType::Delete => {
+            // Purge scoped rows too (no FKs) so a later reinstall of the same
+            // addon_id never inherits stale synced config/limits/rules. Mirrors
+            // the local uninstall cleanup. Per-instance SQLite file + data dir
+            // are removed by the reconcile hook (it has fs access).
+            for table in [
+                "addon_storage",
+                "addon_permissions",
+                "addon_secrets",
+                "addon_resource_limits",
+                "addon_config",
+                "addon_network_rules",
+                "addon_migrations_applied",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE addon_id = ?1"),
+                    rusqlite::params![addon_id],
+                )
+                .ok();
+            }
+            tx.execute(
                 "DELETE FROM addons WHERE addon_id = ?1",
                 rusqlite::params![addon_id],
+            )
+            .map_err(sql_error)
+        }
+    }
+}
+
+/// Apply a replicated NON-secret addon-config row. Components travel in the
+/// fields (`addon_id`, `key`, `value`); the resource id is `addon_id:key` for
+/// per-key LWW. Always stored with is_secret=0 (secret rows never sync). No FK on
+/// `addon_config`, so a row arriving before its instance is a harmless orphan
+/// until the instance lands.
+fn apply_addon_config(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let addon_id = field_string(operation, "addon_id")?;
+    let key = field_string(operation, "key")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO addon_config (addon_id, key, value, is_secret, updated_at) \
+                 VALUES (?1, ?2, ?3, 0, datetime('now')) \
+                 ON CONFLICT(addon_id, key) DO UPDATE SET \
+                    value = excluded.value, is_secret = 0, updated_at = datetime('now')",
+                rusqlite::params![addon_id, key, field_string(operation, "value")?],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM addon_config WHERE addon_id = ?1 AND key = ?2",
+                rusqlite::params![addon_id, key],
             )
             .map_err(sql_error),
     }

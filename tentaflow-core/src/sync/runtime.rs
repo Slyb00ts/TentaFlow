@@ -1335,6 +1335,10 @@ impl SyncRuntime {
         // compile) never interleaves with — and stalls — applying other ops.
         let mut pending_addon_reconciles: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        // Addons whose synced config changed — drop their cached vector backend
+        // so a replicated `__vector_config` takes effect without a restart.
+        let mut pending_config_invalidations: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         for entry in entries {
             if entry.operation.body.resource_type == "core.blob" {
                 match apply_blob_operation(&entry.operation) {
@@ -1374,6 +1378,13 @@ impl SyncRuntime {
                         if entry.operation.body.resource_type == "core.addon_instance" {
                             pending_addon_reconciles
                                 .insert(entry.operation.body.resource_id.clone());
+                        } else if entry.operation.body.resource_type == "core.addon_config" {
+                            // resource_id == "addon_id:key" — take the addon_id.
+                            if let Some((addon_id, _)) =
+                                entry.operation.body.resource_id.split_once(':')
+                            {
+                                pending_config_invalidations.insert(addon_id.to_string());
+                            }
                         }
                     }
                     Err(e) => {
@@ -1454,6 +1465,11 @@ impl SyncRuntime {
                     reconciler.reconcile_addon(addon_id);
                 }
             }
+        }
+        // Drop cached vector backends for addons whose config was replicated, so
+        // the next access rebuilds against the new `__vector_config`.
+        for addon_id in &pending_config_invalidations {
+            crate::services::vector_namespace_manager(&self.db).invalidate_addon(addon_id);
         }
         Ok(applied)
     }
