@@ -2,7 +2,9 @@
 // File: modules/addons/bindings.js
 // Description: Bindings tab for addon detail. Shows the AI aliases owned by
 //              this addon (readonly — full management lives in M16
-//              Services -> Aliases) plus four storage usage cards (KV, SQL,
+//              Services -> Aliases), a vector-backend picker (zvec default /
+//              Milvus with local service discovery + manual URL) backed by
+//              AddonVectorBody, plus four storage usage cards (KV, SQL,
 //              Vector, Recording) populated from AddonStorageStatsRequest.
 //              Vector/Recording cards report "unavailable" when the build lacks
 //              the vector/camera feature. Alias list still uses the addon-prefix
@@ -18,13 +20,17 @@ let currentAddonId = null;
 let currentContainer = null;
 let aliases = [];
 let storageStats = null;  // AddonStorageStatsResponse (kv/sql/vector/recording)
+let vectorConfig = null;  // AddonVectorConfigResponse (backend + milvus discovery)
+
+// i18n helper scoped to this tab's namespace.
+const t = (k) => I18n.t('addon_bindings.' + k);
 
 export const BindingsTab = {
   async mount(container, addonId) {
     currentAddonId = addonId;
     currentContainer = container;
     container.innerHTML = `<div class="addons-empty">${escapeHtml(I18n.t('common.loading'))}</div>`;
-    await Promise.all([loadAliases(), loadStorageStats()]);
+    await Promise.all([loadAliases(), loadStorageStats(), loadVectorConfig()]);
     render();
   },
 
@@ -33,8 +39,20 @@ export const BindingsTab = {
     currentContainer = null;
     aliases = [];
     storageStats = null;
+    vectorConfig = null;
   },
 };
+
+// Konfiguracja vector backendu addona (zvec / Milvus) + lista lokalnych serwisow
+// Milvus do pickera. Admin endpoint AddonVectorGetConfigRequest.
+async function loadVectorConfig() {
+  try {
+    vectorConfig = await ApiBinary.one('addonVectorGetConfigRequest', { addonId: currentAddonId });
+  } catch (err) {
+    vectorConfig = null;
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+  }
+}
 
 // Statystyki storage addona (KV/SQL/Vector/Recording) — admin endpoint
 // AddonStorageStatsRequest. SQL liczone z osobnego read-only polaczenia (nie
@@ -79,6 +97,7 @@ function render() {
   currentContainer.innerHTML = `
     <div class="addon-bindings">
       ${renderAliasesSection()}
+      ${renderVectorBackendSection()}
       ${renderStorageSection()}
     </div>
   `;
@@ -86,9 +105,10 @@ function render() {
     Router.navigate('services', { tab: 'aliases' });
   });
   currentContainer.querySelector('#bindings-refresh')?.addEventListener('click', async () => {
-    await Promise.all([loadAliases(), loadStorageStats()]);
+    await Promise.all([loadAliases(), loadStorageStats(), loadVectorConfig()]);
     render();
   });
+  wireVectorBackendSection();
 }
 
 function renderAliasesSection() {
@@ -177,6 +197,181 @@ function renderAliasesSection() {
       </table>
     </section>
   `;
+}
+
+// Sekcja wyboru vector backendu: zvec (domyslny, wbudowany) vs Milvus. Dla
+// Milvus — wybor lokalnego serwisu (discovery) albo reczny URL + sekrety.
+// Milvus jest wylaczony gdy build nie ma feature vector-milvus.
+function renderVectorBackendSection() {
+  const v = vectorConfig;
+  if (!v) {
+    return `
+      <section class="section-card">
+        <div class="section-card-head">
+          <div class="title"><svg class="icon"><use href="#i-cpu"/></svg>${escapeHtml(t('vcfg_title'))}</div>
+        </div>
+        <div class="addons-empty">${escapeHtml(t('stats_unavailable'))}</div>
+      </section>
+    `;
+  }
+
+  const cfg = v.config || { backend: 'zvec' };
+  const milvusOk = !!v.milvusCompiled;
+  // Build bez vector-milvus nie moze pokazac/zapisac milvus — wymuszamy zvec.
+  const backend = cfg.backend === 'milvus' && milvusOk ? 'milvus' : 'zvec';
+  // Tylko osiagalne serwisy sa wybieralne — niedostepny serwis nie jest stanem
+  // konfiguracyjnym. Composite value `nodeId|serviceId` jest forward-compatible
+  // z C-2 (zdalne serwisy); dla lokalnego slice'a nodeId jest puste.
+  const allServices = Array.isArray(v.milvusServices) ? v.milvusServices : [];
+  const services = allServices.filter((s) => s.reachable);
+  const source = cfg.milvusSource === 'manual'
+    ? 'manual'
+    : (cfg.milvusSource === 'service_ref' || services.length ? 'service_ref' : 'manual');
+  const selRef = cfg.serviceRef || {};
+  const selectedKey = `${selRef.nodeId || ''}|${selRef.serviceId || ''}`;
+  const manualUri = cfg.manualUri || '';
+  const collection = cfg.collectionOverride || '';
+  const hasSecret = !!v.hasMilvusUser || !!v.hasMilvusPassword;
+
+  const milvusWarn = milvusOk ? '' : `
+    <div class="bindings-info bindings-info-warn">
+      <svg class="icon"><use href="#i-info"/></svg>
+      <span>${escapeHtml(t('vcfg_milvus_unavailable'))}</span>
+    </div>
+  `;
+
+  const serviceOptions = services.map((s) => {
+    const key = `${s.nodeId || ''}|${s.serviceId}`;
+    const local = s.local ? ` · ${t('vcfg_local_chip')}` : '';
+    const label = `${s.displayName || s.serviceId}${local}`;
+    return `<option value="${escapeAttr(key)}" ${key === selectedKey ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+  }).join('');
+
+  const serviceBlock = services.length
+    ? `<tf-select id="vcfg-service" value="${escapeAttr(selectedKey)}">${serviceOptions}</tf-select>`
+    : `<div class="bindings-info"><svg class="icon"><use href="#i-info"/></svg><span>${escapeHtml(t('vcfg_no_services'))}</span></div>`;
+
+  const clearSecretsRow = hasSecret
+    ? `<tf-checkbox id="vcfg-clear-secrets" label="${escapeAttr(t('vcfg_clear_secrets'))}"></tf-checkbox>`
+    : '';
+
+  const milvusBlock = `
+    <div class="vcfg-milvus" id="vcfg-milvus" style="${backend === 'milvus' ? '' : 'display:none'}">
+      <tf-radio-group name="vcfg-source" id="vcfg-source" value="${escapeAttr(source)}">
+        <tf-radio value="service_ref" label="${escapeAttr(t('vcfg_source_service'))}"></tf-radio>
+        <tf-radio value="manual" label="${escapeAttr(t('vcfg_source_manual'))}"></tf-radio>
+      </tf-radio-group>
+      <div class="vcfg-source-block" id="vcfg-block-service" style="${source === 'service_ref' ? '' : 'display:none'}">
+        <span class="tf-label">${escapeHtml(t('vcfg_service_label'))}</span>
+        ${serviceBlock}
+      </div>
+      <div class="vcfg-source-block" id="vcfg-block-manual" style="${source === 'manual' ? '' : 'display:none'}">
+        <tf-input id="vcfg-uri" label="${escapeAttr(t('vcfg_manual_uri_label'))}" placeholder="http://host:19530" value="${escapeAttr(manualUri)}"></tf-input>
+      </div>
+      <tf-input id="vcfg-collection" label="${escapeAttr(t('vcfg_collection_label'))}" value="${escapeAttr(collection)}" maxlength="128"></tf-input>
+      <tf-input id="vcfg-user" label="${escapeAttr(t('vcfg_user_label'))}" placeholder="${v.hasMilvusUser ? escapeAttr(t('vcfg_secret_set')) : ''}" maxlength="512" autocomplete="off"></tf-input>
+      <tf-input id="vcfg-pass" type="password" label="${escapeAttr(t('vcfg_pass_label'))}" placeholder="${v.hasMilvusPassword ? escapeAttr(t('vcfg_secret_set')) : ''}" maxlength="512" autocomplete="new-password"></tf-input>
+      ${clearSecretsRow}
+    </div>
+  `;
+
+  return `
+    <section class="section-card">
+      <div class="section-card-head">
+        <div class="title"><svg class="icon"><use href="#i-cpu"/></svg>${escapeHtml(t('vcfg_title'))}</div>
+        <div class="actions">
+          <tf-button variant="primary" icon="check" id="vcfg-save">${escapeHtml(t('vcfg_save'))}</tf-button>
+        </div>
+      </div>
+      <div class="bindings-info"><svg class="icon"><use href="#i-info"/></svg><span>${escapeHtml(t('vcfg_desc'))}</span></div>
+      <tf-radio-group name="vcfg-backend" id="vcfg-backend" value="${escapeAttr(backend)}">
+        <tf-radio value="zvec" label="${escapeAttr(t('vcfg_backend_zvec'))}"></tf-radio>
+        <tf-radio value="milvus" label="${escapeAttr(t('vcfg_backend_milvus'))}" ${milvusOk ? '' : 'disabled'}></tf-radio>
+      </tf-radio-group>
+      <div class="vcfg-hints">
+        <div class="muted">${escapeHtml(t('vcfg_backend_zvec_sub'))}</div>
+        <div class="muted">${escapeHtml(t('vcfg_backend_milvus_sub'))}</div>
+      </div>
+      ${milvusWarn}
+      ${milvusBlock}
+    </section>
+  `;
+}
+
+// Interaktywnosc pickera bez re-renderu (zachowuje wpisane wartosci): radio
+// backendu pokazuje/ukrywa blok Milvus, radio zrodla przelacza serwis/URL.
+function wireVectorBackendSection() {
+  const root = currentContainer;
+  if (!root) return;
+  const milvusBlock = root.querySelector('#vcfg-milvus');
+  root.querySelector('#vcfg-backend')?.addEventListener('change', (e) => {
+    if (milvusBlock) milvusBlock.style.display = e.detail?.value === 'milvus' ? '' : 'none';
+  });
+  root.querySelector('#vcfg-source')?.addEventListener('change', (e) => {
+    const svc = root.querySelector('#vcfg-block-service');
+    const man = root.querySelector('#vcfg-block-manual');
+    const isService = e.detail?.value === 'service_ref';
+    if (svc) svc.style.display = isService ? '' : 'none';
+    if (man) man.style.display = isService ? 'none' : '';
+  });
+  root.querySelector('#vcfg-save')?.addEventListener('click', saveVectorConfig);
+}
+
+// Zbiera wartosci z DOM i zapisuje przez AddonVectorSetConfigRequest. Puste
+// pola sekretow oznaczaja "nie zmieniaj" (None na wire), wiec ich nie wysylamy.
+async function saveVectorConfig() {
+  const root = currentContainer;
+  if (!root) return;
+  const backend = root.querySelector('#vcfg-backend')?.value || 'zvec';
+  const payload = { addonId: currentAddonId, backend };
+
+  if (backend === 'milvus') {
+    const srcSel = root.querySelector('#vcfg-source')?.value || 'service_ref';
+    payload.milvusSource = srcSel;
+    if (srcSel === 'service_ref') {
+      // Composite `nodeId|serviceId` — rozbij na osobne pola wire.
+      const key = root.querySelector('#vcfg-service')?.value || '';
+      const sep = key.indexOf('|');
+      const serviceId = sep >= 0 ? key.slice(sep + 1) : key;
+      if (!serviceId) {
+        toast(t('vcfg_no_services'), 'error');
+        return;
+      }
+      payload.serviceNodeId = sep >= 0 ? key.slice(0, sep) : '';
+      payload.serviceId = serviceId;
+    } else {
+      const uri = (root.querySelector('#vcfg-uri')?.value || '').trim();
+      if (!uri) {
+        toast(t('vcfg_manual_uri_label'), 'error');
+        return;
+      }
+      payload.manualUri = uri;
+    }
+    // Pole edytowalne — wyslij zawsze (pusty string czysci nadpisanie).
+    payload.collectionOverride = (root.querySelector('#vcfg-collection')?.value || '').trim();
+    // Sekrety: domyslnie puste = "nie zmieniaj" (pomijamy). Checkbox "wyczyść"
+    // jawnie wysyla pusty string = usuniecie zapisanego sekretu.
+    const clearSecrets = !!root.querySelector('#vcfg-clear-secrets')?.checked;
+    const user = (root.querySelector('#vcfg-user')?.value || '').trim();
+    const pass = (root.querySelector('#vcfg-pass')?.value || '').trim();
+    if (clearSecrets) {
+      payload.milvusUser = '';
+      payload.milvusPassword = '';
+    } else {
+      if (user) payload.milvusUser = user;
+      if (pass) payload.milvusPassword = pass;
+    }
+  }
+
+  try {
+    const res = await ApiBinary.one('addonVectorSetConfigRequest', payload);
+    if (res && res.ok === false) throw new Error(res.error || I18n.t('common.error'));
+    toast(t('vcfg_saved'), 'success');
+    await Promise.all([loadVectorConfig(), loadStorageStats()]);
+    render();
+  } catch (err) {
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+  }
 }
 
 // Jeden kafelek storage: tytul, glowna wartosc, podtytul, opcjonalny pasek
