@@ -1,17 +1,42 @@
 // Quick e2e test: Apple TTS + Kokoro Apple MLX integration in same binary.
-#![cfg(all(
+
+// Apple MLX TTS dziala wylacznie na macOS/iOS z feature inference-mlx-kokoro;
+// na innych targetach przyklad kompiluje sie do stub main, zeby `cargo test
+// --no-run` (i CI na Linuksie) nie wywracal sie na braku `main`.
+#[cfg(not(all(
+    any(target_os = "macos", target_os = "ios"),
+    feature = "inference-mlx-kokoro"
+)))]
+fn main() {
+    eprintln!(
+        "tts_e2e wymaga macOS/iOS + feature inference-mlx-kokoro — pomijam"
+    );
+}
+
+#[cfg(all(
     any(target_os = "macos", target_os = "ios"),
     feature = "inference-mlx-kokoro"
 ))]
-
 use anyhow::Result;
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    feature = "inference-mlx-kokoro"
+))]
 use std::path::Path;
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    feature = "inference-mlx-kokoro"
+))]
 use tentaflow_core::tts::{
     apple_tts::AppleTtsEngine,
     mlx_kokoro::{prepare_model, MlxKokoroEngine},
     SynthesizeParams, TtsEngine,
 };
 
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    feature = "inference-mlx-kokoro"
+))]
 fn write_wav(samples: &[f32], sr: u32, path: &str) -> Result<()> {
     use std::io::Write;
     let n = samples.len();
@@ -38,6 +63,10 @@ fn write_wav(samples: &[f32], sr: u32, path: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    feature = "inference-mlx-kokoro"
+))]
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
