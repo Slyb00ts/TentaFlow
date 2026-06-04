@@ -21,15 +21,14 @@ include!(concat!(env!("OUT_DIR"), "/bundled_addons.rs"));
 // Instalacja wbudowanych addonow
 // =============================================================================
 
-/// Instaluje wszystkie wbudowane addony (z binarki) jesli nie sa jeszcze
-/// zainstalowane lub wymagaja aktualizacji.
+/// Reconcile wbudowanych addonow przy starcie. CATALOG-ONLY: materializuje
+/// kazdy bundled pakiet (szablon) na dysk i wpisuje wersje do katalogu
+/// `addon_packages`. NIE tworzy instancji — te user instaluje z katalogu
+/// (`lifecycle::install_instance`), kazda do wlasnego addon_id + danych.
 ///
-/// Kroki dla kazdego bundled addonu:
-/// 1. Parsuj manifest.toml — wyciagnij addon_id i wersje
-/// 2. Sprawdz czy addon juz istnieje w DB
-/// 3. Jesli nie — rozpakuj do katalogu tymczasowego i zainstaluj przez lifecycle
-/// 4. Jesli tak i wersja jest nowsza — rozpakuj i upgrade przez lifecycle
-/// 5. Jesli ta sama wersja — pomin
+/// Dodatkowo czysci pozostalosci sprzed splitu pakiet/instancja (gdy bundled
+/// addony byly auto-instalowane wprost do `addons`) — patrz
+/// [`prune_pre_split_bundled_installs`].
 pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
     if BUNDLED_ADDONS.is_empty() {
         info!("Brak wbudowanych addonow do zainstalowania");
@@ -37,7 +36,7 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
     }
 
     info!(
-        "Sprawdzanie {} wbudowanych addonow (WASM total: {} bytes)...",
+        "Reconcile {} wbudowanych pakietow do katalogu (WASM total: {} bytes)...",
         BUNDLED_ADDONS.len(),
         BUNDLED_ADDONS
             .iter()
@@ -49,18 +48,83 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
         anyhow::anyhow!("Nie udalo sie utworzyc katalogu pakietow addonow: {e}")
     })?;
 
+    let mut reconciled: std::collections::HashSet<String> = std::collections::HashSet::new();
     for addon in BUNDLED_ADDONS {
-        if let Err(e) = install_single_bundled_addon(addon, db) {
-            error!("Blad instalacji wbudowanego addonu '{}': {}", addon.name, e);
-            // Kontynuuj z nastepnym addonem — nie przerywaj calego procesu
+        match install_single_bundled_addon(addon, db) {
+            Ok(package_id) => {
+                reconciled.insert(package_id);
+            }
+            Err(e) => {
+                error!("Blad reconcile wbudowanego pakietu '{}': {}", addon.name, e);
+                // Kontynuuj z nastepnym addonem — nie przerywaj calego procesu
+            }
         }
     }
+
+    // Prune tylko pakietow, ktorych katalog faktycznie sie odswiezyl — inaczej
+    // mozna by usunac legacy instalacje zanim szablon trafi do katalogu, czyniac
+    // reinstall niemozliwym.
+    prune_pre_split_bundled_installs(db, &reconciled);
 
     Ok(())
 }
 
-/// Instaluje pojedynczy wbudowany addon
-fn install_single_bundled_addon(addon: &BundledAddon, db: &DbPool) -> Result<()> {
+/// Jednorazowa migracja przejsciowa: usuwa pozostalosci sprzed splitu
+/// pakiet/instancja. Przed splitem bundled addony byly instalowane wprost do
+/// tabeli `addons` z `addon_id == <id pakietu>` (bez sufiksu instancji). W nowym
+/// modelu bundled to TYLKO katalog — wiec taki wiersz usuwamy wraz z danymi
+/// scoped (per-instancyjny SQLite/katalog + config/flow). Instancje uzytkownika
+/// (`<id pakietu>-<hex>`) nie pasuja do warunku i pozostaja nietkniete.
+///
+/// Best-effort: blad jednej instancji nie przerywa reszty. `reconciled` to
+/// pakiety, ktorych katalog sie odswiezyl w tym starcie — tylko ich dotykamy.
+fn prune_pre_split_bundled_installs(db: &DbPool, reconciled: &std::collections::HashSet<String>) {
+    for package_id in reconciled {
+        // Defensywnie: bundled id NIE moze wygladac jak instancja (`<base>-<8hex>`),
+        // inaczej skasowalibysmy realna instancje uzytkownika o tym ksztalcie.
+        if looks_like_instance_id(package_id) {
+            continue;
+        }
+        // Pre-split sygnatura: zainstalowany addon o addon_id DOKLADNIE rownym id
+        // pakietu. Instancje maja sufiks `-<hex>`, wiec nigdy tu nie wpadaja.
+        match crate::db::repository::get_addon(db, package_id) {
+            Ok(Some(_)) => {
+                match crate::addon::lifecycle::uninstall_instance(package_id, db) {
+                    Ok(()) => info!(
+                        "Migracja pakiet/instancja: usunieto pre-split instalacje bundled '{}' \
+                         (teraz dostepna tylko w katalogu)",
+                        package_id
+                    ),
+                    Err(e) => error!(
+                        "Nie udalo sie usunac pre-split instalacji bundled '{}': {}",
+                        package_id, e
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => error!("Blad sprawdzania pre-split instalacji '{}': {}", package_id, e),
+        }
+    }
+}
+
+/// True gdy id ma ksztalt instancji `<base>-<8 hex>` (sufiks z
+/// `unique_instance_id`). Bundled package id (np. `company-lookup`) nie pasuje —
+/// jego ostatni segment nie jest dokladnie 8 znakami hex.
+fn looks_like_instance_id(id: &str) -> bool {
+    match id.rsplit_once('-') {
+        Some((base, suffix)) => {
+            !base.is_empty()
+                && suffix.len() == 8
+                && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        None => false,
+    }
+}
+
+/// Reconcile pojedynczego bundled pakietu do katalogu. Zwraca jego `package_id`
+/// (potrzebny, by prune dotykal tylko pakietow, ktorych katalog faktycznie sie
+/// odswiezyl).
+fn install_single_bundled_addon(addon: &BundledAddon, db: &DbPool) -> Result<String> {
     // Parsuj manifest — wyciagnij addon_id i wersje
     let (addon_id, bundled_version) = match parse_addon_id_and_version(addon.manifest_toml) {
         Ok(v) => v,
@@ -96,7 +160,7 @@ fn install_single_bundled_addon(addon: &BundledAddon, db: &DbPool) -> Result<()>
         addon_id, bundled_version
     );
 
-    Ok(())
+    Ok(addon_id)
 }
 
 fn write_bundled_addon_files(addon_dir: &std::path::Path, addon: &BundledAddon) -> Result<()> {
@@ -250,6 +314,23 @@ pub fn package_dir(package_id: &str, version: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_id_shape_guard() {
+        // Real instance ids (base-<8hex>) — must be recognized as instances.
+        assert!(looks_like_instance_id("eureka-a1b2c3d4"));
+        assert!(looks_like_instance_id("company-lookup-0f0f0f0f"));
+        // Bundled package ids — must NOT look like instances (never pruned-wrong).
+        assert!(!looks_like_instance_id("eureka"));
+        assert!(!looks_like_instance_id("company-lookup"));
+        assert!(!looks_like_instance_id("deep-research"));
+        assert!(!looks_like_instance_id("embeddings-chunker"));
+        // Edge: 7 or 9 hex, non-hex tail, empty base.
+        assert!(!looks_like_instance_id("x-a1b2c3d"));
+        assert!(!looks_like_instance_id("x-a1b2c3d4e"));
+        assert!(!looks_like_instance_id("x-zzzzzzzz"));
+        assert!(!looks_like_instance_id("-a1b2c3d4"));
+    }
 
     #[test]
     fn test_parse_new_format_manifest() {
