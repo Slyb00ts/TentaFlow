@@ -2595,6 +2595,89 @@ pub enum AddonInstancePayload {
 }
 
 // =============================================================================
+// Storage stats addona (zakladka Powiazania) — KV / SQL / Vector / Recording.
+// =============================================================================
+
+/// Statystyki KV store (tabela `addon_storage`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonKvStats {
+    pub keys: i64,
+    pub bytes: i64,
+    /// Limit z `addon_resource_limits.storage_limit_mb`; 0 = bez limitu.
+    pub limit_mb: i64,
+}
+
+/// Jedna tabela uzytkownika w per-addon SQLite.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonSqlTable {
+    pub name: String,
+    /// Liczba wierszy. Liczona z capem (LIMIT) zeby nie skanowac ogromnych tabel
+    /// — gdy `rows_capped=true`, `rows` to dolna granica (np. "100000+").
+    pub rows: i64,
+    pub rows_capped: bool,
+}
+
+/// Statystyki per-addon SQLite (`orgs/<org>/addons/<addon_id>/data.db`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonSqlStats {
+    /// Addon deklaruje `[storage] sql=true`.
+    pub enabled: bool,
+    /// Plik bazy istnieje i udalo sie go otworzyc (read-only).
+    pub available: bool,
+    /// Rozmiar bazy: `page_count * page_size` (tani pragma, bez skanu). -1 = nieznany.
+    pub db_size_bytes: i64,
+    /// Tabele uzytkownika (z pominieciem wewnetrznych `__tentaflow_%`).
+    pub tables: Vec<AddonSqlTable>,
+}
+
+/// Jeden namespace wektorowy addona (`addon_vector_namespaces`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonVectorNamespace {
+    pub namespace: String,
+    pub dim: i64,
+    pub metric: String,
+    /// Cachowana liczba wektorow z `addon_vector_namespaces.count`.
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonVectorStats {
+    /// Funkcja `vector` wkompilowana w ten build.
+    pub available: bool,
+    pub namespaces: Vec<AddonVectorNamespace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonRecordingStats {
+    /// Funkcja `camera` wkompilowana w ten build.
+    pub available: bool,
+    pub segments: i64,
+    pub snapshots: i64,
+    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonStorageStatsRequest {
+    pub addon_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonStorageStatsResponse {
+    pub kv: AddonKvStats,
+    pub sql: AddonSqlStats,
+    pub vector: AddonVectorStats,
+    pub recording: AddonRecordingStats,
+}
+
+/// Multiplex statystyk storage addona w 1 wariancie MessageBody (limit 256
+/// wariantow CBOR), wzorem AddonUiBody/AddonInstanceBody.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum AddonStoragePayload {
+    StatsRequest(AddonStorageStatsRequest),
+    StatsResponse(AddonStorageStatsResponse),
+}
+
+// =============================================================================
 // SCHEMA v14: Apps menu + UI v2 endpointy
 // =============================================================================
 
@@ -4383,9 +4466,6 @@ pub enum MessageBody {
     // v14: Apps menu + UI v2 — multiplex w 1 slocie zeby zmiescic sie w 256
     // wariantach CBOR (vide IamBody/ServicePayload).
     AddonUiBody(AddonUiPayload),
-    // Multi-instance: katalog pakietow + install/duplicate/versions/update
-    // instancji — multiplex w 1 slocie (jak AddonUiBody).
-    AddonInstanceBody(AddonInstancePayload),
     AddonDetailRequestBody(AddonDetailRequest),
     AddonDetailResponseBody(AddonDetailResponse),
     AddonToggleRequestBody(AddonToggleRequest),
@@ -4543,6 +4623,15 @@ pub enum MessageBody {
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
     Error(ProtocolError),
+
+    // ---- Addony: multi-instance + storage stats ----
+    // UWAGA: ciborium 0.8 koduje warianty enuma po INDEKSIE (twardy limit 256),
+    // wiec NOWE warianty dopisujemy ZAWSZE na koncu — wstawienie w srodku
+    // przesuwa indeksy kolejnych wariantow i lamie wire-compat z innymi nodami.
+    // Multi-instance: katalog pakietow + install/duplicate/versions/update.
+    AddonInstanceBody(AddonInstancePayload),
+    // Storage stats addona (KV/SQL/Vector/Recording).
+    AddonStorageBody(AddonStoragePayload),
 }
 
 // =============================================================================
@@ -4575,6 +4664,52 @@ mod tests {
     fn round_trip(body: MessageBody) -> MessageBody {
         let bytes = crate::cbor::encode(&body).expect("encode");
         crate::cbor::decode::<MessageBody>(&bytes).expect("decode")
+    }
+
+    #[test]
+    fn addon_storage_stats_response_roundtrip() {
+        let body = MessageBody::AddonStorageBody(AddonStoragePayload::StatsResponse(
+            AddonStorageStatsResponse {
+                kv: AddonKvStats {
+                    keys: 42,
+                    bytes: 4096,
+                    limit_mb: 100,
+                },
+                sql: AddonSqlStats {
+                    enabled: true,
+                    available: true,
+                    db_size_bytes: 1_048_576,
+                    tables: vec![
+                        AddonSqlTable {
+                            name: "eureka_entries".to_string(),
+                            rows: 1234,
+                            rows_capped: false,
+                        },
+                        AddonSqlTable {
+                            name: "huge".to_string(),
+                            rows: 100_000,
+                            rows_capped: true,
+                        },
+                    ],
+                },
+                vector: AddonVectorStats {
+                    available: true,
+                    namespaces: vec![AddonVectorNamespace {
+                        namespace: "faces".to_string(),
+                        dim: 512,
+                        metric: "cosine".to_string(),
+                        count: 7,
+                    }],
+                },
+                recording: AddonRecordingStats {
+                    available: false,
+                    segments: 0,
+                    snapshots: 0,
+                    bytes: 0,
+                },
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
     }
 
     #[test]
