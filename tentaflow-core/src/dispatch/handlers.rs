@@ -5302,9 +5302,18 @@ pub fn addon_ui_dispatch(
                         Err(_) => continue,
                     };
                 if let Some(app) = manifest.application {
+                    // Multi-instance: w menu pokazujemy nazwe INSTANCJI (display_name)
+                    // a nie tytul z manifestu pakietu — inaczej dwie instancje tego
+                    // samego GUI-addona mialyby identyczna etykiete. Fallback na
+                    // tytul manifestu gdy display_name pusty.
+                    let title = if a.display_name.is_empty() {
+                        app.title
+                    } else {
+                        a.display_name.clone()
+                    };
                     applications.push(tentaflow_protocol::AddonApplicationInfo {
                         addon_id: a.addon_id.clone(),
-                        title: app.title,
+                        title,
                         entry_panel: app.entry_panel,
                         icon: app.icon,
                         description: app.description,

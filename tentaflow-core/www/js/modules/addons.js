@@ -27,6 +27,8 @@ import { BindingsTab } from '/js/modules/addons/bindings.js';
 
 // --- Stan listy ------------------------------------------------------------
 let addonsList = [];
+let catalogList = [];           // AddonPackageInfo[] (zakladka "Katalog")
+let activeView = 'installed';   // installed | catalog
 let filterSearch = '';
 let filterMode = 'all';  // all | enabled | disabled | oauth_global | oauth_individual | runtime_*
 let isAdmin = false;
@@ -123,6 +125,11 @@ const AddonsScreen = {
           </div>
         </div>
 
+        <div class="tf-filter-group addons-view-switch" role="tablist" style="margin-bottom:10px;">
+          <tf-chip class="view-chip" clickable active data-view="installed" icon="puzzle">Zainstalowane</tf-chip>
+          <tf-chip class="view-chip" clickable data-view="catalog" icon="globe">Katalog</tf-chip>
+        </div>
+
         <div class="addons-toolbar">
           <tf-searchbox class="addons-search" id="addons-search" placeholder="${escapeAttr(I18n.t('addons.search_placeholder'))}" debounce="200"></tf-searchbox>
           <div class="tf-filter-group" role="tablist">
@@ -144,12 +151,15 @@ const AddonsScreen = {
   async mount() {
     await detectRole();
     await loadList();
+    await loadCatalog();
     attachListHandlers();
   },
 
   unmount() {
     unmountActiveTab();
     addonsList = [];
+    catalogList = [];
+    activeView = 'installed';
     currentAddonId = null;
     currentAddonDetail = null;
     activeTab = 'settings';
@@ -182,10 +192,33 @@ async function detectRole() {
 async function loadList() {
   try {
     addonsList = await ApiBinary.list('addonsListRequest', { arrayKey: 'addons' });
-    renderList();
-    updateSubtitle();
+    if (activeView === 'installed') {
+      renderList();
+      updateSubtitle();
+    }
   } catch (err) {
     toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+  }
+}
+
+// Katalog pakietow (szablonow). Kazdy pakiet ma akcje "Zainstaluj" tworzaca
+// nowa instancje pod nadana nazwa.
+async function loadCatalog() {
+  try {
+    catalogList = await ApiBinary.list('addonCatalogListRequest', { arrayKey: 'packages' });
+    if (activeView === 'catalog') renderCatalog();
+  } catch (err) {
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+  }
+}
+
+// Renderuje aktywny widok (zainstalowane albo katalog) do wspolnego gridu.
+function renderActive() {
+  if (activeView === 'catalog') {
+    renderCatalog();
+  } else {
+    renderList();
+    updateSubtitle();
   }
 }
 
@@ -212,21 +245,36 @@ function updateSubtitle() {
 }
 
 function attachListHandlers() {
+  // Przelacznik widoku Zainstalowane / Katalog.
+  document.querySelectorAll('.addons-view-switch tf-chip[data-view]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      document
+        .querySelectorAll('.addons-view-switch tf-chip[data-view]')
+        .forEach((c) => c.removeAttribute('active'));
+      chip.setAttribute('active', '');
+      activeView = chip.dataset.view;
+      renderActive();
+    });
+  });
   byId('addons-search')?.addEventListener('search', (e) => {
     filterSearch = (e.detail?.value || '').toLowerCase();
-    renderList();
+    renderActive();
   });
   document.querySelectorAll('.addons-screen tf-chip[clickable][data-f]').forEach((chip) => {
     chip.addEventListener('click', () => {
       document.querySelectorAll('.addons-screen tf-chip[clickable][data-f]').forEach((c) => c.removeAttribute('active'));
       chip.setAttribute('active', '');
       filterMode = chip.dataset.f;
-      renderList();
+      renderActive();
     });
   });
   byId('addons-install')?.addEventListener('click', onInstallZip);
   byId('addons-browse')?.addEventListener('click', () => {
-    toast(I18n.t('addons.browse_registry') + ' — TODO', 'info');
+    activeView = 'catalog';
+    document
+      .querySelectorAll('.addons-view-switch tf-chip[data-view]')
+      .forEach((c) => c.toggleAttribute('active', c.dataset.view === 'catalog'));
+    renderActive();
   });
 }
 
@@ -236,7 +284,8 @@ function renderList() {
 
   const filtered = addonsList.filter((a) => {
     if (filterSearch) {
-      const hay = `${a.name} ${a.addonId ?? a.addon_id} ${a.description || ''} ${a.category || ''} ${a.runtime || ''}`.toLowerCase();
+      const dn = a.displayName ?? a.display_name ?? '';
+      const hay = `${dn} ${a.name} ${a.addonId ?? a.addon_id} ${a.description || ''} ${a.category || ''} ${a.runtime || ''}`.toLowerCase();
       if (!hay.includes(filterSearch)) return false;
     }
     const runtime = String(a.runtime || '').toLowerCase();
@@ -284,6 +333,77 @@ function renderList() {
       }
     });
   });
+  // Akcje instancji (update/duplicate/uninstall) — stopPropagation, bo karta
+  // otwiera detal.
+  grid.querySelectorAll('.a-actions tf-button[data-act]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      switch (btn.dataset.act) {
+        case 'update': openUpdateModal(id); break;
+        case 'duplicate': openDuplicateModal(id); break;
+        case 'uninstall': onUninstallInstance(id, btn.dataset.name || id); break;
+      }
+    });
+  });
+}
+
+// --- Katalog ---------------------------------------------------------------
+function renderCatalog() {
+  const grid = byId('addons-grid');
+  if (!grid) return;
+  const filtered = catalogList.filter((p) => {
+    if (!filterSearch) return true;
+    const hay = `${p.packageId ?? p.package_id} ${p.name || ''}`.toLowerCase();
+    return hay.includes(filterSearch);
+  });
+  const sub = byId('addons-sub');
+  if (sub) sub.textContent = `${catalogList.length} pakiet(ow) w katalogu`;
+  if (filtered.length === 0) {
+    grid.innerHTML = `<div class="addons-empty">${escapeHtml(I18n.t('addons.empty'))}</div>`;
+    return;
+  }
+  grid.innerHTML = filtered.map((p) => renderCatalogCard(p)).join('');
+  grid.querySelectorAll('tf-button[data-act="install"]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const pkgId = btn.dataset.pkg;
+      const pkg = catalogList.find((p) => (p.packageId ?? p.package_id) === pkgId);
+      if (pkg) openInstallInstanceModal(pkg);
+    });
+  });
+}
+
+function renderCatalogCard(p) {
+  const pkgId = p.packageId ?? p.package_id;
+  const latest = p.latestVersion ?? p.latest_version ?? '0.0.0';
+  const versions = Array.isArray(p.versions) ? p.versions : [];
+  const installed = Number(p.installedInstances ?? p.installed_instances ?? 0);
+  const source = p.source || 'bundled';
+  const badges = [];
+  badges.push(renderAddonBadge(`v${latest}`, { status: 'info', icon: 'chip', className: 'runtime' }));
+  if (versions.length > 1) {
+    badges.push(renderAddonBadge(`${versions.length} wersji`, { status: 'accent', icon: 'history', className: 'perms' }));
+  }
+  if (installed > 0) {
+    badges.push(renderAddonBadge(`${installed} instancji`, { status: 'ok', icon: 'puzzle', className: 'visibility' }));
+  }
+  badges.push(renderAddonBadge(source, { status: 'info', icon: 'globe', className: 'oauth-generic' }));
+  const installBtn = isAdmin
+    ? `<tf-button size="sm" variant="primary" icon="download" data-act="install" data-pkg="${escapeAttr(pkgId)}">Zainstaluj</tf-button>`
+    : '';
+  return `
+    <div class="addon-card" data-catalog-card="${escapeAttr(pkgId)}">
+      <div class="addon-head">
+        <div class="addon-ico">${spriteRaw('puzzle')}</div>
+        <div class="addon-meta">
+          <div class="a-name">${escapeHtml(p.name || pkgId)}</div>
+          <div class="a-version">${escapeHtml(pkgId)}</div>
+        </div>
+      </div>
+      <div class="a-badges">${badges.join('')}</div>
+      <div class="a-actions" style="display:flex;gap:6px;margin-top:8px;">${installBtn}</div>
+    </div>
+  `;
 }
 
 function renderCard(a) {
@@ -301,7 +421,8 @@ function renderCard(a) {
   const sizeLabel = sizeBytes > 0 ? formatBytes(sizeBytes) : '';
 
   const metaParts = [];
-  metaParts.push(`v${escapeHtml(a.version || '0.0.0')}`);
+  const pkgVersion = a.packageVersion ?? a.package_version ?? a.version ?? '0.0.0';
+  metaParts.push(`v${escapeHtml(pkgVersion)}`);
   if (sizeLabel) metaParts.push(escapeHtml(sizeLabel));
   if (runtime) metaParts.push(escapeHtml(runtime));
   if (a.author) metaParts.push(escapeHtml(a.author));
@@ -316,6 +437,14 @@ function renderCard(a) {
     };
     const config = badgeConfig[oauthMode] || { status: 'info', icon: 'key', className: 'oauth-generic' };
     badges.push(renderAddonBadge(I18n.t('addons.badges.oauth_' + oauthMode), config));
+  }
+  const updateAvailable = !!(a.updateAvailable ?? a.update_available);
+  if (updateAvailable) {
+    badges.push(renderAddonBadge('aktualizacja', {
+      status: 'warn',
+      icon: 'download',
+      className: 'update-available',
+    }));
   }
   const visibilityBadge = formatVisibilityBadge(visibilityScope);
   if (visibilityBadge) badges.push(visibilityBadge);
@@ -334,13 +463,24 @@ function renderCard(a) {
     }));
   }
   const footerText = footerTextForAddon({ enabled, usersWithOauth, oauthMode, runtime });
+  const displayName = a.displayName ?? a.display_name ?? a.name ?? id;
+  // Wiersz akcji instancji (admin). stopPropagation w handlerze, zeby klik w
+  // przycisk nie otwieral detalu.
+  const actions = isAdmin
+    ? `
+      <div class="a-actions" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+        ${updateAvailable ? `<tf-button size="sm" variant="primary" icon="download" data-act="update" data-id="${escapeAttr(id)}">Aktualizuj</tf-button>` : ''}
+        <tf-button size="sm" variant="secondary" icon="copy" data-act="duplicate" data-id="${escapeAttr(id)}">Duplikuj</tf-button>
+        <tf-button size="sm" variant="ghost" icon="trash" data-act="uninstall" data-id="${escapeAttr(id)}" data-name="${escapeAttr(displayName)}">Odinstaluj</tf-button>
+      </div>`
+    : '';
 
   return `
     <div class="addon-card${enabled ? '' : ' disabled'}" data-addon-card="${escapeAttr(id)}">
       <div class="addon-head">
         <div class="addon-ico">${spriteRaw(iconId)}</div>
         <div class="addon-meta">
-          <div class="a-name">${escapeHtml(a.name || id)}</div>
+          <div class="a-name">${escapeHtml(displayName)}</div>
           <div class="a-version">${versionLine}</div>
         </div>
       </div>
@@ -354,8 +494,178 @@ function renderCard(a) {
         <span class="a-foot-note">${escapeHtml(footerText)}</span>
         <tf-toggle size="sm" data-role="enabled" ${enabled ? 'checked' : ''}></tf-toggle>
       </div>
+      ${actions}
     </div>
   `;
+}
+
+// Generyczny modal TfWindow z body + przyciskiem potwierdzenia. onConfirm(win)
+// moze byc async; gdy zwroci falsy/throw, okno zostaje otwarte (blad pokazany).
+function openModal({ title, icon = 'puzzle', bodyHtml, confirmLabel, confirmIcon = 'check', onConfirm }) {
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', title);
+  win.setAttribute('icon', icon);
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('min-width', '420');
+  win.setAttribute('width', '460');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.innerHTML = bodyHtml;
+  const foot = document.createElement('div');
+  foot.slot = 'footer';
+  foot.innerHTML = `
+    <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+    <tf-button variant="primary" icon="${escapeAttr(confirmIcon)}" data-action="confirm">${escapeHtml(confirmLabel)}</tf-button>
+  `;
+  win.appendChild(body);
+  win.appendChild(foot);
+  win.addEventListener('action', async (e) => {
+    if (e.detail?.action !== 'confirm') return;
+    e.preventDefault();
+    try {
+      const ok = await onConfirm(win);
+      if (ok !== false) win.remove();
+    } catch (err) {
+      toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+    }
+  });
+  document.body.appendChild(win);
+  return win;
+}
+
+// Katalog → "Zainstaluj": nazwa instancji + wybor wersji pakietu.
+function openInstallInstanceModal(pkg) {
+  const pkgId = pkg.packageId ?? pkg.package_id;
+  const versions = Array.isArray(pkg.versions) ? pkg.versions : [];
+  const opts = versions.map((v) => `<option value="${escapeAttr(v)}">${escapeHtml(v)}</option>`).join('');
+  openModal({
+    title: `Zainstaluj: ${pkg.name || pkgId}`,
+    icon: 'download',
+    confirmLabel: 'Zainstaluj',
+    confirmIcon: 'download',
+    bodyHtml: `
+      <div style="display:flex;flex-direction:column;gap:12px;font-size:13px;">
+        <label style="display:flex;flex-direction:column;gap:4px;">Nazwa instancji
+          <tf-input id="inst-name" placeholder="${escapeAttr(pkg.name || pkgId)}"></tf-input>
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;">Wersja
+          <tf-select id="inst-version">${opts}</tf-select>
+        </label>
+      </div>`,
+    onConfirm: async (win) => {
+      const name = (win.querySelector('#inst-name')?.value || '').trim();
+      const version = win.querySelector('#inst-version')?.value || versions[0];
+      if (!name) { toast('Podaj nazwe instancji', 'error'); return false; }
+      const res = await ApiBinary.action('addonInstanceInstallRequest', {
+        packageId: pkgId,
+        version,
+        displayName: name,
+      });
+      if (!res.ok) { toast(res.error || 'Instalacja nieudana', 'error'); return false; }
+      toast(`Zainstalowano instancje "${name}"`, 'success');
+      await refreshAll();
+      return true;
+    },
+  });
+}
+
+// Instancja → "Aktualizuj": pobierz wersje, wybierz docelowa, hot-update.
+async function openUpdateModal(addonId) {
+  let info;
+  try {
+    info = await ApiBinary.one('addonInstanceVersionsRequest', { addonId });
+  } catch (err) {
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+    return;
+  }
+  const current = info.current || '';
+  const available = Array.isArray(info.available) ? info.available : [];
+  const opts = available
+    .map((v) => `<option value="${escapeAttr(v)}"${v === current ? ' disabled' : ''}>${escapeHtml(v)}${v === current ? ' (aktualna)' : ''}</option>`)
+    .join('');
+  openModal({
+    title: `Aktualizuj instancje`,
+    icon: 'download',
+    confirmLabel: 'Aktualizuj',
+    confirmIcon: 'download',
+    bodyHtml: `
+      <div style="display:flex;flex-direction:column;gap:12px;font-size:13px;">
+        <div style="color:var(--text-2);">Aktualna wersja: <b>${escapeHtml(current)}</b></div>
+        <label style="display:flex;flex-direction:column;gap:4px;">Wersja docelowa
+          <tf-select id="upd-version">${opts}</tf-select>
+        </label>
+      </div>`,
+    onConfirm: async (win) => {
+      const target = win.querySelector('#upd-version')?.value || '';
+      if (!target || target === current) { toast('Wybierz inna wersje', 'error'); return false; }
+      const res = await ApiBinary.action('addonInstanceUpdateRequest', { addonId, targetVersion: target });
+      if (!res.ok) { toast(res.error || 'Aktualizacja nieudana', 'error'); return false; }
+      toast(`Zaktualizowano do v${target}`, 'success');
+      await refreshAll();
+      return true;
+    },
+  });
+}
+
+// Instancja → "Duplikuj": nowa nazwa, pusta kopia.
+function openDuplicateModal(sourceAddonId) {
+  openModal({
+    title: 'Duplikuj instancje',
+    icon: 'copy',
+    confirmLabel: 'Duplikuj',
+    confirmIcon: 'copy',
+    bodyHtml: `
+      <div style="display:flex;flex-direction:column;gap:12px;font-size:13px;">
+        <div style="color:var(--text-2);">Nowa instancja tego samego pakietu, z pustymi danymi.</div>
+        <label style="display:flex;flex-direction:column;gap:4px;">Nazwa nowej instancji
+          <tf-input id="dup-name"></tf-input>
+        </label>
+      </div>`,
+    onConfirm: async (win) => {
+      const name = (win.querySelector('#dup-name')?.value || '').trim();
+      if (!name) { toast('Podaj nazwe instancji', 'error'); return false; }
+      const res = await ApiBinary.action('addonInstanceDuplicateRequest', {
+        sourceAddonId,
+        newDisplayName: name,
+      });
+      if (!res.ok) { toast(res.error || 'Duplikacja nieudana', 'error'); return false; }
+      toast(`Utworzono instancje "${name}"`, 'success');
+      await refreshAll();
+      return true;
+    },
+  });
+}
+
+// Instancja → "Odinstaluj": potwierdzenie + usuniecie (purge danych po stronie
+// backendu).
+function onUninstallInstance(addonId, displayName) {
+  openModal({
+    title: 'Odinstaluj instancje',
+    icon: 'trash',
+    confirmLabel: 'Odinstaluj',
+    confirmIcon: 'trash',
+    bodyHtml: `
+      <div style="font-size:13px;color:var(--text-2);">
+        Na pewno odinstalowac instancje <b>${escapeHtml(displayName)}</b>?
+        Dane tej instancji zostana trwale usuniete.
+      </div>`,
+    onConfirm: async () => {
+      const res = await ApiBinary.action('addonUninstallRequest', { addonId });
+      if (res && res.ok === false) { toast('Deinstalacja nieudana', 'error'); return false; }
+      toast(`Odinstalowano "${displayName}"`, 'success');
+      await refreshAll();
+      return true;
+    },
+  });
+}
+
+// Po operacji na instancji/katalogu: przeladuj oba zrodla i przerenderuj widok.
+async function refreshAll() {
+  await Promise.all([loadList(), loadCatalog()]);
+  renderActive();
 }
 
 async function onInstallZip() {
