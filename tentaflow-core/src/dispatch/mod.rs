@@ -842,6 +842,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::AddonInstancePayload::ReqUpdate(_) => "AddonInstanceUpdateRequest",
             tentaflow_protocol::AddonInstancePayload::ResUpdate(_) => "AddonInstanceUpdateResponse",
         },
+        MessageBody::AddonStorageBody(p) => match p {
+            tentaflow_protocol::AddonStoragePayload::StatsRequest(_) => "AddonStorageStatsRequest",
+            tentaflow_protocol::AddonStoragePayload::StatsResponse(_) => "AddonStorageStatsResponse",
+        },
         MessageBody::IamBody(p) => match p {
             tentaflow_protocol::IamPayload::ReqListUsers => "IamListUsersRequest",
             tentaflow_protocol::IamPayload::ResListUsers { .. } => "IamListUsersResponse",

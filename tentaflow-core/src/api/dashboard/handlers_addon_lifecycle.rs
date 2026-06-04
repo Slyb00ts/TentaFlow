@@ -15,9 +15,11 @@ use tentaflow_protocol::{
     AddonInstanceInstallResponse, AddonInstancePayload, AddonInstanceUpdateResponse,
     AddonInstanceVersionsResponse, AddonLogEntry, AddonLogsResponse, AddonNetworkRuleDecl,
     AddonNetworkRulesGetResponse, AddonNetworkRulesSetResponse, AddonPackageInfo,
-    AddonReloadResponse, AddonResourcesGetResponse, AddonResourcesSetResponse, AddonToggleResponse,
-    AddonToolDecl, AddonToolParam, AddonToolsResponse, AddonUninstallResponse, MessageBody,
-    ProtocolError, ProtocolErrorCode, SessionAuth,
+    AddonKvStats, AddonRecordingStats, AddonReloadResponse, AddonResourcesGetResponse,
+    AddonResourcesSetResponse, AddonSqlStats, AddonSqlTable, AddonStoragePayload,
+    AddonStorageStatsResponse, AddonToggleResponse, AddonToolDecl, AddonToolParam,
+    AddonToolsResponse, AddonUninstallResponse, AddonVectorStats, MessageBody, ProtocolError,
+    ProtocolErrorCode, SessionAuth,
 };
 
 use crate::db::repository;
@@ -1348,6 +1350,233 @@ register_addon_instance_variant!(
 register_addon_instance_variant!(
     "AddonInstanceUpdateRequest",
     "tentaflow_ws_handler_addon_instance_update",
+    crate::dispatch::SessionAuthKind::Admin
+);
+
+// =============================================================================
+// Storage stats addona (zakladka Powiazania) — KV / SQL / Vector / Recording.
+// Multipleksowane w `AddonStorageBody` (limit 256 wariantow CBOR).
+// =============================================================================
+
+const SQL_ROW_CAP: i64 = 100_000;
+
+#[handler(variant = "AddonStorageBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_storage_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use AddonStoragePayload as P;
+    let payload = match req {
+        MessageBody::AddonStorageBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AddonStorageBody")),
+    };
+    let r = match payload {
+        P::StatsRequest(r) => r,
+        P::StatsResponse(_) => {
+            return Err(ProtocolError::bad_request("unexpected response variant"))
+        }
+    };
+    validate_addon_id(&r.addon_id)?;
+
+    // Scope: instancja musi istniec (kanoniczny addon_id, nie sciezka).
+    let addon = repository::get_addon(&ctx.state.db, &r.addon_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
+    let db = &ctx.state.db;
+    let org_id = crate::services::org::DEFAULT_ORG_ID;
+
+    // KV store.
+    let (keys, bytes, limit_mb) = repository::addon_kv_stats(db, &r.addon_id).map_err(db_err)?;
+    let kv = AddonKvStats {
+        keys,
+        bytes,
+        limit_mb,
+    };
+
+    // Per-addon SQLite — tylko gdy manifest deklaruje [storage] sql=true.
+    let sql_declared = crate::addon::lifecycle::parse_manifest_toml(&addon.manifest_json)
+        .ok()
+        .and_then(|m| m.storage)
+        .map(|s| s.sql)
+        .unwrap_or(false);
+    let sql = if sql_declared {
+        addon_sql_stats(org_id, &r.addon_id)
+    } else {
+        AddonSqlStats {
+            enabled: false,
+            available: false,
+            db_size_bytes: -1,
+            tables: Vec::new(),
+        }
+    };
+
+    // Vector namespaces (feature-gated).
+    #[cfg(feature = "vector")]
+    let vector = {
+        let namespaces = repository::addon_vector_namespace_stats(db, &r.addon_id)
+            .map_err(db_err)?
+            .into_iter()
+            .map(
+                |(namespace, dim, metric, count)| tentaflow_protocol::AddonVectorNamespace {
+                    namespace,
+                    dim,
+                    metric,
+                    count,
+                },
+            )
+            .collect();
+        AddonVectorStats {
+            available: true,
+            namespaces,
+        }
+    };
+    #[cfg(not(feature = "vector"))]
+    let vector = AddonVectorStats {
+        available: false,
+        namespaces: Vec::new(),
+    };
+
+    // Recording (feature-gated).
+    #[cfg(feature = "camera")]
+    let recording = match repository::recording_stats_for_addon(db, &r.addon_id, None, Some(org_id))
+    {
+        Ok(agg) => AddonRecordingStats {
+            available: true,
+            segments: agg.total_segments as i64,
+            snapshots: agg.total_snapshots as i64,
+            bytes: agg.total_size_bytes as i64,
+        },
+        // Blad zapytania (np. schemat kamer) -> nie raportuj falszywych zer.
+        Err(_) => AddonRecordingStats {
+            available: false,
+            segments: 0,
+            snapshots: 0,
+            bytes: 0,
+        },
+    };
+    #[cfg(not(feature = "camera"))]
+    let recording = AddonRecordingStats {
+        available: false,
+        segments: 0,
+        snapshots: 0,
+        bytes: 0,
+    };
+
+    Ok(MessageBody::AddonStorageBody(P::StatsResponse(
+        AddonStorageStatsResponse {
+            kv,
+            sql,
+            vector,
+            recording,
+        },
+    )))
+}
+
+/// Statystyki per-addon SQLite z OSOBNEGO, read-only polaczenia do pliku data.db
+/// (zero interferencji z poolem zapisu addona; WAL pozwala czytac rownolegle z
+/// zapisami, wiec nie blokujemy zywego addona). Rozmiar = page_count*page_size
+/// (tani pragma, bez skanu). Liczba wierszy liczona z capem (LIMIT SQL_ROW_CAP+1)
+/// zeby nie skanowac ogromnych tabel — przy przekroczeniu zwracamy dolna granice
+/// (`rows_capped=true`).
+fn addon_sql_stats(org_id: &str, addon_id: &str) -> AddonSqlStats {
+    use rusqlite::OpenFlags;
+    let unavailable = || AddonSqlStats {
+        enabled: true,
+        available: false,
+        db_size_bytes: -1,
+        tables: Vec::new(),
+    };
+    let path = match crate::addon::fs_sandbox::addon_db_path(org_id, addon_id) {
+        Ok(p) => p,
+        Err(_) => return unavailable(),
+    };
+    if !path.exists() {
+        return unavailable();
+    }
+    let conn = match rusqlite::Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(c) => c,
+        Err(_) => return unavailable(),
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
+
+    // Gwarancja "nie blokuje zapisow addona" trzyma sie tylko w WAL (czytelnik
+    // i pisarz rownolegle). Managed addon DB zawsze jest WAL (storage_sql go
+    // wymusza), ale dla podmienionego/uszkodzonego pliku nie-WAL skan moglby
+    // blokowac commit pisarza — wtedy raportujemy unavailable zamiast skanowac.
+    let journal: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+        .unwrap_or_default();
+    if !journal.eq_ignore_ascii_case("wal") {
+        return unavailable();
+    }
+
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(-1);
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(-1);
+    let db_size_bytes = if page_count >= 0 && page_size >= 0 {
+        page_count * page_size
+    } else {
+        -1
+    };
+
+    let mut tables: Vec<AddonSqlTable> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' \
+         AND name NOT LIKE '__tentaflow_%' AND name NOT LIKE 'sqlite_%' ORDER BY name ASC",
+    ) {
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map(|it| it.filter_map(|x| x.ok()).collect())
+            .unwrap_or_default();
+        for name in names {
+            // Identyfikator z sqlite_master (zaufany schemat); escapujemy cudzyslow.
+            let q = format!(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM \"{}\" LIMIT {})",
+                name.replace('"', "\"\""),
+                SQL_ROW_CAP + 1
+            );
+            let cnt: i64 = conn.query_row(&q, [], |r| r.get(0)).unwrap_or(-1);
+            let (rows, rows_capped) = if cnt > SQL_ROW_CAP {
+                (SQL_ROW_CAP, true)
+            } else {
+                (cnt, false)
+            };
+            tables.push(AddonSqlTable {
+                name,
+                rows,
+                rows_capped,
+            });
+        }
+    }
+
+    AddonSqlStats {
+        enabled: true,
+        available: true,
+        db_size_bytes,
+        tables,
+    }
+}
+
+/// Rejestruje handler storage stats pod inner-nazwa requestu (Admin).
+macro_rules! register_addon_storage_variant {
+    ($variant:literal, $metric:literal, $auth:expr) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: $auth,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_addon_storage_dispatch,
+            }
+        }
+    };
+}
+
+register_addon_storage_variant!(
+    "AddonStorageStatsRequest",
+    "tentaflow_ws_handler_addon_storage_stats",
     crate::dispatch::SessionAuthKind::Admin
 );
 

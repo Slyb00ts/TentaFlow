@@ -23,7 +23,8 @@ use tentaflow_protocol::{
         AddonAdminOnlySetRequest, AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest,
         AddonInstallRequest, AddonInstanceDuplicateRequest, AddonInstanceInstallRequest,
         AddonInstancePayload, AddonInstanceUpdateRequest, AddonInstanceVersionsRequest,
-        AddonLogsRequest, AddonNetworkRulesGetRequest,
+        AddonLogsRequest, AddonNetworkRulesGetRequest, AddonStoragePayload,
+        AddonStorageStatsRequest,
         AddonNetworkRulesSetRequest, AddonOAuthAuthorizeStartRequest,
         AddonOAuthConfigClearSecretRequest, AddonOAuthConfigListRequest,
         AddonOAuthConfigSetRequest, AddonOAuthLinkedAccountsRequest, AddonOAuthReauthorizeRequest,
@@ -1058,6 +1059,15 @@ pub fn encode_addon_instance_update_request(
         addon_id,
         target_version,
     }))
+}
+
+/// MessageBody::AddonStorageBody(StatsRequest) — statystyki storage addona.
+#[wasm_bindgen(js_name = encodeAddonStorageStatsRequest)]
+pub fn encode_addon_storage_stats_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonStorageBody(
+        AddonStoragePayload::StatsRequest(AddonStorageStatsRequest { addon_id }),
+    ))
+    .map_err(|e| JsError::new(&e))
 }
 
 // =============================================================================
@@ -3451,6 +3461,64 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     if let Some(e) = r.error {
                         set(&obj, "error", e.into());
                     }
+                }
+            }
+        }
+
+        // ---- Storage stats addona (KV/SQL/Vector/Recording) ----
+        MessageBody::AddonStorageBody(p) => {
+            use tentaflow_protocol::AddonStoragePayload as SP;
+            match p {
+                SP::StatsRequest(_) => {
+                    set(&obj, "variant", "AddonStorageStatsRequest".into());
+                }
+                SP::StatsResponse(r) => {
+                    set(&obj, "variant", "AddonStorageStatsResponse".into());
+                    // i64 -> f64 zeby JS dostal Number (nie BigInt); -1 = nieznane.
+                    let kv = js_sys::Object::new();
+                    set(&kv, "keys", (r.kv.keys as f64).into());
+                    set(&kv, "bytes", (r.kv.bytes as f64).into());
+                    set(&kv, "limitMb", (r.kv.limit_mb as f64).into());
+                    set(&kv, "limit_mb", (r.kv.limit_mb as f64).into());
+                    set(&obj, "kv", kv.into());
+
+                    let sql = js_sys::Object::new();
+                    set(&sql, "enabled", r.sql.enabled.into());
+                    set(&sql, "available", r.sql.available.into());
+                    set(&sql, "dbSizeBytes", (r.sql.db_size_bytes as f64).into());
+                    set(&sql, "db_size_bytes", (r.sql.db_size_bytes as f64).into());
+                    let tables = js_sys::Array::new();
+                    for t in r.sql.tables {
+                        let item = js_sys::Object::new();
+                        set(&item, "name", t.name.into());
+                        set(&item, "rows", (t.rows as f64).into());
+                        set(&item, "rowsCapped", t.rows_capped.into());
+                        set(&item, "rows_capped", t.rows_capped.into());
+                        tables.push(&item.into());
+                    }
+                    set(&sql, "tables", tables.into());
+                    set(&obj, "sql", sql.into());
+
+                    let vector = js_sys::Object::new();
+                    set(&vector, "available", r.vector.available.into());
+                    let ns = js_sys::Array::new();
+                    for n in r.vector.namespaces {
+                        let item = js_sys::Object::new();
+                        set(&item, "namespace", n.namespace.into());
+                        set(&item, "dim", (n.dim as f64).into());
+                        set(&item, "metric", n.metric.into());
+                        set(&item, "count", (n.count as f64).into());
+                        ns.push(&item.into());
+                    }
+                    set(&vector, "namespaces", ns.into());
+                    set(&obj, "vector", vector.into());
+
+                    let rec = js_sys::Object::new();
+                    set(&rec, "available", r.recording.available.into());
+                    set(&rec, "segments", (r.recording.segments as f64).into());
+                    set(&rec, "snapshots", (r.recording.snapshots as f64).into());
+                    set(&rec, "bytes", (r.recording.bytes as f64).into());
+                    set(&obj, "recording", rec.into());
                 }
             }
         }

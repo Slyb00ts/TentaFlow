@@ -5225,6 +5225,50 @@ pub struct AddonPackageRow {
     pub created_at: String,
 }
 
+/// Statystyki KV store addona: (liczba kluczy, suma bajtow, limit_mb).
+/// Limit 0 = bez limitu. KV jest scope'owane po addon_id (= instancja).
+pub fn addon_kv_stats(pool: &DbPool, addon_id: &str) -> Result<(i64, i64, i64)> {
+    let conn = acquire(pool)?;
+    let keys: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM addon_storage WHERE addon_id = ?1",
+        rusqlite::params![addon_id],
+        |r| r.get(0),
+    )?;
+    let bytes: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(value_size_bytes), 0) FROM addon_storage WHERE addon_id = ?1",
+        rusqlite::params![addon_id],
+        |r| r.get(0),
+    )?;
+    let limit_mb: i64 = conn
+        .query_row(
+            "SELECT COALESCE(storage_limit_mb, 0) FROM addon_resource_limits WHERE addon_id = ?1",
+            rusqlite::params![addon_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok((keys, bytes, limit_mb))
+}
+
+/// Lista namespace'ow wektorowych addona z cachowana liczba wektorow:
+/// (namespace, dim, metric, count). Czyta tabele `addon_vector_namespaces`.
+#[cfg(feature = "vector")]
+pub fn addon_vector_namespace_stats(
+    pool: &DbPool,
+    addon_id: &str,
+) -> Result<Vec<(String, i64, String, i64)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT namespace, dim, metric, count FROM addon_vector_namespaces \
+         WHERE addon_id = ?1 ORDER BY namespace ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Liczba zainstalowanych instancji danego pakietu (wierszy w `addons`).
 pub fn count_addon_instances(pool: &DbPool, package_id: &str) -> Result<i64> {
     let conn = acquire(pool)?;

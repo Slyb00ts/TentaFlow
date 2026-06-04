@@ -1970,6 +1970,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AddonStorageBody(StatsRequest) — statystyki storage addona. */
+  addonStorageStatsRequest(correlationId, { addonId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonStorageStatsRequest(addonId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
 
   /** MessageBody::UsersListRequest (unit, Admin) — lista uzytkownikow. */
   usersListRequest(correlationId, sequence = 1) {
