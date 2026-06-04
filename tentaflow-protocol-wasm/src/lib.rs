@@ -3384,6 +3384,77 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
         }
 
+        // ---- Multi-instance: katalog pakietow + operacje na instancjach ----
+        MessageBody::AddonInstanceBody(p) => {
+            use tentaflow_protocol::AddonInstancePayload as AP;
+            match p {
+                AP::ReqCatalogList => {
+                    set(&obj, "variant", "AddonCatalogListRequest".into());
+                }
+                AP::ResCatalogList { packages } => {
+                    set(&obj, "variant", "AddonCatalogListResponse".into());
+                    let arr = js_sys::Array::new();
+                    for pkg in packages {
+                        let item = js_sys::Object::new();
+                        set(&item, "packageId", pkg.package_id.clone().into());
+                        set(&item, "package_id", pkg.package_id.into());
+                        set(&item, "name", pkg.name.into());
+                        set(&item, "latestVersion", pkg.latest_version.clone().into());
+                        set(&item, "latest_version", pkg.latest_version.into());
+                        let vers = js_sys::Array::new();
+                        for v in pkg.versions {
+                            vers.push(&JsValue::from(v));
+                        }
+                        set(&item, "versions", vers.into());
+                        set(&item, "source", pkg.source.into());
+                        set(&item, "installedInstances", pkg.installed_instances.into());
+                        set(&item, "installed_instances", pkg.installed_instances.into());
+                        arr.push(&item.into());
+                    }
+                    set(&obj, "packages", arr.into());
+                }
+                AP::ReqInstall(_) => {
+                    set(&obj, "variant", "AddonInstanceInstallRequest".into());
+                }
+                AP::ResInstall(r) => {
+                    set(&obj, "variant", "AddonInstanceInstallResponse".into());
+                    set(&obj, "ok", r.ok.into());
+                    if let Some(id) = r.addon_id {
+                        set(&obj, "addonId", id.clone().into());
+                        set(&obj, "addon_id", id.into());
+                    }
+                    if let Some(e) = r.error {
+                        set(&obj, "error", e.into());
+                    }
+                }
+                AP::ReqDuplicate(_) => {
+                    set(&obj, "variant", "AddonInstanceDuplicateRequest".into());
+                }
+                AP::ReqVersions(_) => {
+                    set(&obj, "variant", "AddonInstanceVersionsRequest".into());
+                }
+                AP::ResVersions(r) => {
+                    set(&obj, "variant", "AddonInstanceVersionsResponse".into());
+                    set(&obj, "current", r.current.into());
+                    let arr = js_sys::Array::new();
+                    for v in r.available {
+                        arr.push(&JsValue::from(v));
+                    }
+                    set(&obj, "available", arr.into());
+                }
+                AP::ReqUpdate(_) => {
+                    set(&obj, "variant", "AddonInstanceUpdateRequest".into());
+                }
+                AP::ResUpdate(r) => {
+                    set(&obj, "variant", "AddonInstanceUpdateResponse".into());
+                    set(&obj, "ok", r.ok.into());
+                    if let Some(e) = r.error {
+                        set(&obj, "error", e.into());
+                    }
+                }
+            }
+        }
+
         // ---- Audit log screen ----
         MessageBody::AuditLogListRequestBody(_) => {
             set(&obj, "variant", "AuditLogListRequest".into());

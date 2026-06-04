@@ -328,6 +328,20 @@ export function encodeAddonApplicationsListRequest() {
 }
 
 /**
+ * MessageBody::AddonInstanceBody(ReqCatalogList) — lista pakietow w katalogu.
+ * @returns {Uint8Array}
+ */
+export function encodeAddonCatalogListRequest() {
+    const ret = wasm.encodeAddonCatalogListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * @param {string} addon_id
  * @returns {Uint8Array}
  */
@@ -401,6 +415,86 @@ export function encodeAddonInstallRequest(filename, content) {
     var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v3;
+}
+
+/**
+ * MessageBody::AddonInstanceBody(ReqDuplicate) — duplikacja instancji.
+ * @param {string} source_addon_id
+ * @param {string} new_display_name
+ * @returns {Uint8Array}
+ */
+export function encodeAddonInstanceDuplicateRequest(source_addon_id, new_display_name) {
+    const ptr0 = passStringToWasm0(source_addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(new_display_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonInstanceDuplicateRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::AddonInstanceBody(ReqInstall) — instalacja instancji z katalogu.
+ * @param {string} package_id
+ * @param {string} version
+ * @param {string} display_name
+ * @returns {Uint8Array}
+ */
+export function encodeAddonInstanceInstallRequest(package_id, version, display_name) {
+    const ptr0 = passStringToWasm0(package_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(version, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(display_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonInstanceInstallRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::AddonInstanceBody(ReqUpdate) — hot-update instancji do wersji.
+ * @param {string} addon_id
+ * @param {string} target_version
+ * @returns {Uint8Array}
+ */
+export function encodeAddonInstanceUpdateRequest(addon_id, target_version) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(target_version, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonInstanceUpdateRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::AddonInstanceBody(ReqVersions) — wersje dostepne dla instancji.
+ * @param {string} addon_id
+ * @returns {Uint8Array}
+ */
+export function encodeAddonInstanceVersionsRequest(addon_id) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonInstanceVersionsRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**
