@@ -352,6 +352,9 @@ pub fn addon_install(
             let addon_id = manifest.addon_id.clone();
             let version = manifest.version.clone();
             let _ = repository::create_default_addon_resource_limits(&ctx.state.db, &addon_id);
+            // Replicate the uploaded instance to the mesh (the package bytes
+            // already went out as a blob during install). Origin-only.
+            capture_addon_instance_sync(&ctx.state.db, &addon_id);
             // Audyt: podstawowe metadane instalacji (bez zawartosci plikow/konfiguracji).
             let declared_oauth_providers: Vec<String> = manifest
                 .oauth_provider
@@ -430,7 +433,7 @@ pub fn addon_uninstall(
     // must not emit a tombstone) while the row still exists for the check. If
     // the uninstall below then fails, baseline reseed re-emits a newer Insert
     // that supersedes this tombstone (LWW) — self-healing.
-    if repository::addon_is_bundled(&ctx.state.db, &payload.addon_id)
+    if repository::addon_is_syncable(&ctx.state.db, &payload.addon_id)
         .map_err(db_err)
         .unwrap_or(false)
     {

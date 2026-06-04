@@ -1499,9 +1499,29 @@ impl SyncRuntime {
             match crate::addon::lifecycle::materialize_synced_addon_package(
                 &self.db, blob_id, &blob_path,
             ) {
-                Ok((package_id, version)) => tracing::info!(
-                    "sync runtime: addon package '{package_id}' v{version} zsynchronizowany do katalogu"
-                ),
+                Ok((package_id, version)) => {
+                    tracing::info!(
+                        "sync runtime: addon package '{package_id}' v{version} zsynchronizowany do katalogu"
+                    );
+                    // The package just became loadable — (re)reconcile any of its
+                    // installed instances whose op arrived before the bytes.
+                    if let Some(reconciler) = self.addon_reconciler.read().clone() {
+                        match crate::db::repository::installed_addon_ids_for_package(
+                            &self.db,
+                            &package_id,
+                            &version,
+                        ) {
+                            Ok(ids) => {
+                                for addon_id in ids {
+                                    reconciler.reconcile_addon(&addon_id);
+                                }
+                            }
+                            Err(e) => warn!(
+                                "sync runtime: instancje pakietu '{package_id}' v{version}: {e}"
+                            ),
+                        }
+                    }
+                }
                 Err(e) => warn!("sync runtime: rozpakowanie pakietu '{blob_id}': {e}"),
             }
         }

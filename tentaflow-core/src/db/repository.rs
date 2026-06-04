@@ -3338,14 +3338,13 @@ pub fn reseed_core_state_from_current_rows(
                 }
             }
             K::AddonInstance => {
-                // Re-seed installed instances backed by a BUNDLED package (present
-                // in every node's store, so the receiver can load the wasm). Joined
-                // to addon_packages to apply the bundled-only gate; uploaded-package
-                // instances are skipped until package-byte transport exists.
+                // Re-seed every installed instance that has a package row. Bundled
+                // packages live in every binary; uploaded ones replicate as blobs
+                // (Phase 4), so both load on the receiver. The JOIN just guards
+                // against a malformed instance with no package.
                 let mut stmt = tx.prepare(&format!(
                     "SELECT {ADDON_INSTANCE_SYNC_COLS} FROM addons a \
-                     JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
-                     WHERE p.source = 'bundled'"
+                     JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version"
                 ))?;
                 let rows = stmt
                     .query_map([], |r| Ok(addon_instance_row_from_query(r)?))?
@@ -3369,7 +3368,7 @@ pub fn reseed_core_state_from_current_rows(
                      JOIN addons a ON a.addon_id = c.addon_id \
                      JOIN addon_packages p ON p.package_id = a.package_id \
                           AND p.version = a.package_version \
-                     WHERE c.is_secret = 0 AND p.source = 'bundled'",
+                     WHERE c.is_secret = 0",
                 )?;
                 let rows = stmt
                     .query_map([], |r| {
@@ -10220,7 +10219,7 @@ pub fn set_addon_enabled(pool: &DbPool, addon_id: &str, enabled: bool) -> Result
         rusqlite::params![addon_id, enabled as i64],
     )?;
     // Replicate the enable/disable to the mesh — bundled instances only.
-    if rows > 0 && addon_is_bundled_tx(&tx, addon_id)? {
+    if rows > 0 && addon_is_syncable_tx(&tx, addon_id)? {
         let mut fields = BTreeMap::new();
         fields.insert(
             "is_enabled".to_string(),
@@ -10247,34 +10246,36 @@ const ADDON_INSTANCE_SYNC_COLS: &str =
      a.skill_md, a.keywords_json, a.category, a.disambiguation_json, a.icon, a.runtime, \
      a.wasm_size_bytes, a.license, a.show_in_catalog";
 
-fn addon_is_bundled_tx(tx: &rusqlite::Transaction<'_>, addon_id: &str) -> Result<bool> {
+fn addon_is_syncable_tx(tx: &rusqlite::Transaction<'_>, addon_id: &str) -> Result<bool> {
     let n: i64 = tx.query_row(
         "SELECT COUNT(*) FROM addons a \
          JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
-         WHERE a.addon_id = ?1 AND p.source = 'bundled'",
+         WHERE a.addon_id = ?1",
         rusqlite::params![addon_id],
         |r| r.get(0),
     )?;
     Ok(n > 0)
 }
 
-/// True when the installed addon's package is a BUNDLED one (present in every
-/// node's store). Only such instances are eligible for mesh sync.
-pub fn addon_is_bundled(pool: &DbPool, addon_id: &str) -> Result<bool> {
+/// True when the installed addon has a package row (bundled or uploaded) — i.e.
+/// it is eligible for mesh sync. Bundled packages live in every binary; uploaded
+/// ones replicate as blobs (Phase 4), so both can load on a receiver.
+pub fn addon_is_syncable(pool: &DbPool, addon_id: &str) -> Result<bool> {
     let conn = acquire(pool)?;
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM addons a \
          JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
-         WHERE a.addon_id = ?1 AND p.source = 'bundled'",
+         WHERE a.addon_id = ?1",
         rusqlite::params![addon_id],
         |r| r.get(0),
     )?;
     Ok(n > 0)
 }
 
-/// Emit an addon-instance Insert capture for a freshly installed BUNDLED
-/// instance (no-op for uploaded packages). Called on the ORIGIN node after a
-/// user install; the receiver rebuilds the row + loads the wasm on reconcile.
+/// Emit an addon-instance Insert capture for a freshly installed instance with a
+/// package row (no-op otherwise). Called on the ORIGIN node after a user install;
+/// the receiver rebuilds the row + loads the wasm on reconcile (the package is in
+/// its store — bundled in the binary, or arrived as a synced blob).
 pub fn capture_addon_instance_insert(pool: &DbPool, addon_id: &str) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
@@ -10283,7 +10284,7 @@ pub fn capture_addon_instance_insert(pool: &DbPool, addon_id: &str) -> Result<()
             &format!(
                 "SELECT {ADDON_INSTANCE_SYNC_COLS} FROM addons a \
                  JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
-                 WHERE a.addon_id = ?1 AND p.source = 'bundled'"
+                 WHERE a.addon_id = ?1"
             ),
             rusqlite::params![addon_id],
             addon_instance_row_from_query,
@@ -10304,7 +10305,7 @@ pub fn capture_addon_instance_insert(pool: &DbPool, addon_id: &str) -> Result<()
 }
 
 /// Emit an addon-instance Delete capture. The caller gates on
-/// [`addon_is_bundled`] BEFORE removing the row (so uploaded/never-synced
+/// [`addon_is_syncable`] BEFORE removing the row (so uploaded/never-synced
 /// instances do not emit a tombstone, and the bundled check is possible while
 /// the row still exists).
 pub fn capture_addon_instance_delete(pool: &DbPool, addon_id: &str) -> Result<()> {
@@ -10371,7 +10372,7 @@ pub fn upsert_addon_config_value(
     // Replicate NON-secret config of bundled instances (secrets stay node-local
     // by design). If a previously-synced key flips to secret, emit a Delete so
     // peers drop the now-secret value instead of keeping a stale plaintext copy.
-    if addon_is_bundled_tx(&tx, addon_id)? {
+    if addon_is_syncable_tx(&tx, addon_id)? {
         use crate::sync::core_registry::CoreSyncResourceKind::AddonConfig;
         use crate::sync::runtime::SqlWriteAction::{Delete, Insert};
         // Both actions carry addon_id+key (apply_addon_config reads them from the
@@ -10395,6 +10396,25 @@ pub fn upsert_addon_config_value(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Installed instance addon_ids backed by a given package (id+version). Used by
+/// the sync runtime to (re)load instances once their package blob arrives.
+pub fn installed_addon_ids_for_package(
+    pool: &DbPool,
+    package_id: &str,
+    version: &str,
+) -> Result<Vec<String>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT addon_id FROM addons WHERE package_id = ?1 AND package_version = ?2",
+    )?;
+    let ids = stmt
+        .query_map(rusqlite::params![package_id, version], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ids)
 }
 
 /// Composite resource id for an `addon_config` row. `addon_id` charset excludes

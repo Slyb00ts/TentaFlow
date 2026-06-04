@@ -747,9 +747,9 @@ impl AddonManager {
     /// unload when it is disabled or removed. Idempotent. Called by the mesh-sync
     /// reconcile hook after a replicated `core.addon_instance` op commits.
     ///
-    /// Bundled packages only: if the package files are not in the local store
-    /// (uploaded-package byte transport is a later phase), this logs and skips —
-    /// the row stays in the DB but the runtime is not loaded.
+    /// If the package files are not yet in the local store (an uploaded package
+    /// whose blob has not arrived), this logs and skips — the row stays in the DB
+    /// and the sync runtime re-reconciles once the package blob lands.
     fn reconcile_synced_addon(&self, addon_id: &str) {
         let addon = match crate::db::repository::get_addon(&self.db, addon_id) {
             Ok(Some(a)) => a,
@@ -782,9 +782,12 @@ impl AddonManager {
         let pkg_dir =
             crate::addon::bundled::package_dir(&addon.package_id, &addon.package_version);
         if !pkg_dir.join("manifest.toml").exists() {
-            warn!(
-                "sync reconcile addon '{addon_id}': pakiet '{}' v{} brak w lokalnym store — \
-                 pomijam (transport pakietow uploaded jeszcze niezaimplementowany)",
+            // Package bytes not here yet (uploaded package whose blob is still in
+            // flight). The sync runtime re-reconciles this instance once the
+            // package blob lands — so this is a transient skip, not a failure.
+            tracing::debug!(
+                "sync reconcile addon '{addon_id}': pakiet '{}' v{} jeszcze niedostepny — \
+                 czekam na blob pakietu",
                 addon.package_id, addon.package_version
             );
             return;
