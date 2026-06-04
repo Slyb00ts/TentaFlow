@@ -30,3 +30,4 @@ pub mod reconnect;
 pub mod relay_health;
 pub mod security;
 pub mod ufp2;
+pub mod vector_transport;

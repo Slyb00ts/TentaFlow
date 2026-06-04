@@ -12,10 +12,12 @@ pub mod filter;
 #[cfg(feature = "vector-milvus")]
 pub mod milvus_backend;
 pub mod namespace;
+pub mod remote;
 pub mod zvec_backend;
 
 pub use backend::{Metric, SearchHit, VectorBackend};
 pub use error::{Result as VectorResult, VectorError};
+pub use remote::RemoteVectorTransport;
 pub use namespace::{
     NamespaceManager, ReconcileReport, MAX_NAMESPACES_PER_ADDON, MAX_VECTORS_PER_ADDON,
 };

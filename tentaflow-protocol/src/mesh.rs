@@ -422,6 +422,14 @@ pub enum MeshCommandType {
     WebResearch {
         request_json: String,
     },
+    /// Forwarded vector operation. The receiver owns a Milvus service; it opens
+    /// that local service by `service_id` (carried inside the CBOR) and runs the
+    /// op against its own loopback Milvus, returning a `VectorOpResult`. The
+    /// payload is an opaque minicbor `VectorOpRequest` (keeps this crate free of
+    /// vector-type deps). New variant appended at END (ciborium index rule).
+    VectorOp {
+        request_cbor: Vec<u8>,
+    },
 }
 
 // =============================================================================
@@ -483,6 +491,9 @@ pub enum MeshCommandResponsePayload {
     },
     /// Serialized WebResearchResponse JSON produced by the receiver.
     WebResearchResult { response_json: String },
+    /// Opaque minicbor `VectorOpResponse` produced by the receiver running a
+    /// forwarded `VectorOp` against its local Milvus. Appended at END.
+    VectorOpResult { result_cbor: Vec<u8> },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -617,6 +628,10 @@ impl std::fmt::Debug for MeshCommandType {
             Self::WebResearch { request_json } => f
                 .debug_struct("WebResearch")
                 .field("request_len", &request_json.len())
+                .finish(),
+            Self::VectorOp { request_cbor } => f
+                .debug_struct("VectorOp")
+                .field("request_len", &request_cbor.len())
                 .finish(),
         }
     }

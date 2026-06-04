@@ -396,6 +396,29 @@ impl MeshCommandExecutor {
             MeshCommandType::WebResearch { request_json } => {
                 self.handle_web_research(request_json).await
             }
+            MeshCommandType::VectorOp { request_cbor } => {
+                self.handle_vector_op(request_cbor).await
+            }
+        }
+    }
+
+    /// Owner side of a forwarded vector op: run it against THIS node's local
+    /// Milvus and return the encoded `VectorOpResponse`. The handler module
+    /// resolves the local service by id and encodes any failure as a
+    /// `VectorOpResponse::Err` payload (never a transport-level error).
+    async fn handle_vector_op(&self, request_cbor: Vec<u8>) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("vector op remote context is not initialized");
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            crate::services::vector::remote::handle_vector_op_cbor(&ctx.db, &request_cbor)
+        })
+        .await;
+        match result {
+            Ok(result_cbor) => {
+                CommandResponse::ok(MeshCommandResponsePayload::VectorOpResult { result_cbor })
+            }
+            Err(e) => CommandResponse::fail(format!("vector op task failed: {}", e)),
         }
     }
 
