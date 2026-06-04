@@ -3300,6 +3300,36 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            K::AddonConfig => {
+                // Non-secret config of bundled instances (secret rows never sync).
+                let mut stmt = tx.prepare(
+                    "SELECT c.addon_id, c.key, c.value FROM addon_config c \
+                     JOIN addons a ON a.addon_id = c.addon_id \
+                     JOIN addon_packages p ON p.package_id = a.package_id \
+                          AND p.version = a.package_version \
+                     WHERE c.is_secret = 0 AND p.source = 'bundled'",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (addon_id, key, value) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        addon_config_resource_id(&addon_id, &key),
+                        Insert,
+                        addon_config_changed_fields(&addon_id, &key, &value),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
         }
     }
 
@@ -10264,8 +10294,9 @@ pub fn upsert_addon_config_value(
     is_secret: bool,
     updated_by: Option<&str>,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO addon_config (addon_id, key, value, is_secret, updated_by, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) \
          ON CONFLICT(addon_id, key) DO UPDATE SET \
@@ -10275,7 +10306,51 @@ pub fn upsert_addon_config_value(
             updated_at = datetime('now')",
         rusqlite::params![addon_id, key, value, is_secret as i64, updated_by],
     )?;
+    // Replicate NON-secret config of bundled instances (secrets stay node-local
+    // by design). If a previously-synced key flips to secret, emit a Delete so
+    // peers drop the now-secret value instead of keeping a stale plaintext copy.
+    if addon_is_bundled_tx(&tx, addon_id)? {
+        use crate::sync::core_registry::CoreSyncResourceKind::AddonConfig;
+        use crate::sync::runtime::SqlWriteAction::{Delete, Insert};
+        // Both actions carry addon_id+key (apply_addon_config reads them from the
+        // fields); only Insert carries the value.
+        let (action, fields) = if is_secret {
+            let mut f = BTreeMap::new();
+            f.insert("addon_id".to_string(), field_string(addon_id));
+            f.insert("key".to_string(), field_string(key));
+            (Delete, f)
+        } else {
+            (Insert, addon_config_changed_fields(addon_id, key, value))
+        };
+        record_core_capture_tx(
+            &tx,
+            AddonConfig,
+            addon_config_resource_id(addon_id, key),
+            action,
+            fields,
+            updated_by.map(String::from),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
+}
+
+/// Composite resource id for an `addon_config` row. `addon_id` charset excludes
+/// `:`, so splitting on the first `:` is unambiguous.
+fn addon_config_resource_id(addon_id: &str, key: &str) -> String {
+    format!("{addon_id}:{key}")
+}
+
+fn addon_config_changed_fields(
+    addon_id: &str,
+    key: &str,
+    value: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut f = BTreeMap::new();
+    f.insert("addon_id".to_string(), field_string(addon_id));
+    f.insert("key".to_string(), field_string(key));
+    f.insert("value".to_string(), field_string(value));
+    f
 }
 
 /// Pojedynczy wpis audytu dla widoku logs addona (po stronie repo — kolumny DB 1:1).

@@ -27,6 +27,7 @@ pub enum CoreSyncResourceKind {
     SyncExplicitShare,
     SharedSettingSecret,
     AddonInstance,
+    AddonConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +230,18 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         table_name: "addons",
         resource_type: "core.addon_instance",
         primary_key_column: "addon_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "addons",
+    },
+    // Per-addon NON-secret config (`addon_config` rows with is_secret=0). Secret
+    // rows (passwords, tokens) stay node-local by design. Same "addons" partition
+    // as the instance so a row's config applies after its install. Per-key LWW.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AddonConfig,
+        table_name: "addon_config",
+        resource_type: "core.addon_config",
+        primary_key_column: "addon_id,key",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "addons",

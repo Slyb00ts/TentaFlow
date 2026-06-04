@@ -754,9 +754,20 @@ impl AddonManager {
         let addon = match crate::db::repository::get_addon(&self.db, addon_id) {
             Ok(Some(a)) => a,
             Ok(None) => {
-                // Uninstalled on origin → unload here.
+                // Uninstalled on origin (materializer already purged the scoped
+                // DB rows) → unload runtime + drop the per-instance SQLite pool
+                // and data dir here (fs cleanup the materializer can't do).
                 self.unregister_addon_runtime(addon_id);
-                info!("sync reconcile: addon '{addon_id}' usuniety — odladowano runtime");
+                let org_id = crate::services::org::DEFAULT_ORG_ID;
+                crate::addon::storage_sql::close_addon_db(org_id, addon_id);
+                if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
+                    if dir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&dir) {
+                            warn!("sync reconcile: usuwanie danych '{addon_id}' nieudane: {e}");
+                        }
+                    }
+                }
+                info!("sync reconcile: addon '{addon_id}' usuniety — odladowano i wyczyszczono");
                 return;
             }
             Err(e) => {
