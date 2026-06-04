@@ -2837,6 +2837,15 @@ pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>
         Vec<tentaflow_protocol::mesh::MeshSyncPullPayload>,
     >,
 {
+    // Convert pending core write-captures into outbox operations before the
+    // per-peer push below reads the outbox, so core writes made while the process
+    // is running (e.g. a Flow saved in the Flow Builder) propagate within one tick
+    // instead of waiting for the next restart's startup drain. SQL/KV/blob
+    // captures publish immediately after commit, so they are intentionally not
+    // drained here to avoid double-emitting the same operation.
+    if let Err(e) = crate::sync::runtime::drain_pending_core_captures_online(256) {
+        warn!("sync repair: core capture drain failed: {}", e);
+    }
     let peers = qm.connected_peers().await;
     for peer_id in peers {
         if !mesh_security.is_trusted(&peer_id) {
