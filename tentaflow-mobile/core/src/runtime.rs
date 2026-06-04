@@ -142,6 +142,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
             &services_runtime_cfg,
             db.clone(),
             port_allocator,
+            settings_cipher.clone(),
             node_id.clone(),
             mesh_services_registry.clone(),
             live_handles,
@@ -186,6 +187,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
             tentaflow_core::services::model_residency::ModelResidency::new(
                 db.clone(),
                 ports,
+                settings_cipher.clone(),
                 std::time::Duration::from_secs(60),
             ),
         );

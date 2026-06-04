@@ -14,8 +14,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde_json::Value;
 use tentaflow_core::db::DbPool;
-use tentaflow_core::services::deploy::{deploy, DeployOutcome};
+use tentaflow_core::services::deploy::{create_deploy_job, deploy, DeployOutcome};
 use tentaflow_core::services::manifest::{registry, ServiceManifest};
 use tentaflow_core::services::ports::PortAllocator;
 use tentaflow_core::services_repo::services::DeployMethod;
@@ -26,6 +27,12 @@ fn open_db() -> DbPool {
     conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     tentaflow_core::db::migrations::run(&conn).unwrap();
     Arc::new(Mutex::new(conn))
+}
+
+/// Deterministyczny cipher dla `deploy()` — testy nie zapisuja sekretu HF, wiec
+/// klucz jest dowolny; wzorzec lustruje `tests/services_e2e.rs`.
+fn test_cipher() -> tentaflow_core::crypto::SettingsCipher {
+    tentaflow_core::crypto::SettingsCipher::new(&[0u8; 32])
 }
 
 /// Buduje PortAllocator z duzym zakresem testowym, niezaleznym dla kazdego testu.
@@ -39,6 +46,23 @@ fn load_manifest(engine_id: &str) -> ServiceManifest {
         .by_id(engine_id)
         .cloned()
         .unwrap_or_else(|| panic!("manifest '{}' not found in registry", engine_id))
+}
+
+/// Wykonuje pelny two-phase deploy: `create_deploy_job` -> `deploy`. Lustruje
+/// wzorzec z `tests/services_e2e.rs` (job + settings_cipher), bo `deploy()`
+/// rozwiazuje HF_TOKEN przez `settings_cipher` z bazy tego noda.
+async fn run_deploy(
+    method: DeployMethod,
+    manifest: &ServiceManifest,
+    cfg: &Value,
+    ports: &Arc<PortAllocator>,
+    db: &DbPool,
+) -> DeployOutcome {
+    let job = create_deploy_job(method, manifest, cfg, db, "node-test", None, None)
+        .expect("create deploy job");
+    deploy(job, method, manifest, cfg, ports, db, &test_cipher(), None)
+        .await
+        .expect("deploy succeeds")
 }
 
 /// Sprawdza po deploy:
@@ -93,17 +117,7 @@ async fn deploy_apple_tts_zosia_pl() {
     let ports = make_ports(45_900, 45_999);
     let manifest = load_manifest("apple-tts");
     let cfg = serde_json::json!({ "model_preset_id": "zosia-pl" });
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("apple-tts deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "apple-tts");
 }
 
@@ -119,17 +133,7 @@ async fn deploy_mlx_qwen3_5_0_8b() {
     let ports = make_ports(46_000, 46_099);
     let manifest = load_manifest("mlx");
     let cfg = serde_json::json!({ "model_preset_id": "qwen3-5-0-8b-mlx-4bit" });
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("mlx deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "mlx");
 }
 
@@ -139,17 +143,7 @@ async fn deploy_llama_cpp_qwen3_5_0_8b_q4() {
     let ports = make_ports(46_100, 46_199);
     let manifest = load_manifest("llama-cpp");
     let cfg = serde_json::json!({ "model_preset_id": "qwen3-5-0-8b-q4" });
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("llama-cpp deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "llama-cpp");
 }
 
@@ -161,17 +155,7 @@ async fn deploy_whisper_large_v3_turbo() {
     let ports = make_ports(46_200, 46_299);
     let manifest = load_manifest("whisper");
     let cfg = serde_json::json!({ "model_preset_id": "whisper-large-v3-turbo" });
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("whisper deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "whisper");
 }
 
@@ -181,17 +165,7 @@ async fn deploy_mlx_whisper_large_v3_turbo() {
     let ports = make_ports(46_300, 46_399);
     let manifest = load_manifest("mlx-whisper");
     let cfg = serde_json::json!({ "model_preset_id": "whisper-large-v3-turbo-4bit" });
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("mlx-whisper deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "mlx-whisper");
 }
 
@@ -203,17 +177,7 @@ async fn deploy_kokoro_v1_mlx_bf16() {
     let ports = make_ports(46_400, 46_499);
     let manifest = load_manifest("kokoro");
     let cfg = serde_json::json!({ "model_preset_id": "kokoro-v1-mlx-bf16" });
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("kokoro deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "kokoro");
 }
 
@@ -223,17 +187,7 @@ async fn deploy_sherpa_onnx_jarvis_pl() {
     let ports = make_ports(46_500, 46_599);
     let manifest = load_manifest("sherpa-onnx");
     let cfg = serde_json::json!({ "model_preset_id": "vits-piper-pl_PL-jarvis_wg_glos-medium" });
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("sherpa-onnx deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "sherpa-onnx");
 }
 
@@ -250,17 +204,7 @@ async fn deploy_vision_yolov8n_pose() {
     let ports = make_ports(46_600, 46_699);
     let manifest = load_manifest("yolov8n-pose");
     let cfg = serde_json::json!({});
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("yolov8n-pose deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "yolov8n-pose");
 }
 
@@ -270,17 +214,7 @@ async fn deploy_vision_scrfd() {
     let ports = make_ports(46_700, 46_799);
     let manifest = load_manifest("scrfd");
     let cfg = serde_json::json!({});
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("scrfd deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "scrfd");
 }
 
@@ -291,17 +225,7 @@ async fn deploy_vision_emonet() {
     let ports = make_ports(46_800, 46_899);
     let manifest = load_manifest("emonet");
     let cfg = serde_json::json!({});
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("emonet deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "emonet");
 }
 
@@ -311,17 +235,7 @@ async fn deploy_vision_mivolo() {
     let ports = make_ports(46_900, 46_999);
     let manifest = load_manifest("mivolo");
     let cfg = serde_json::json!({});
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("mivolo deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "mivolo");
 }
 
@@ -331,17 +245,7 @@ async fn deploy_vision_movenet_lightning() {
     let ports = make_ports(47_000, 47_099);
     let manifest = load_manifest("movenet-lightning");
     let cfg = serde_json::json!({});
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("movenet-lightning deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "movenet-lightning");
 }
 
@@ -351,17 +255,7 @@ async fn deploy_vision_yolov8_face() {
     let ports = make_ports(47_100, 47_199);
     let manifest = load_manifest("yolov8-face");
     let cfg = serde_json::json!({});
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("yolov8-face deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "yolov8-face");
 }
 
@@ -371,17 +265,7 @@ async fn deploy_vision_hsemotion() {
     let ports = make_ports(47_200, 47_299);
     let manifest = load_manifest("hsemotion");
     let cfg = serde_json::json!({});
-    let outcome = deploy(
-        DeployMethod::NativeEmbedded,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("hsemotion deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeEmbedded, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "hsemotion");
 }
 
@@ -394,17 +278,7 @@ async fn deploy_stable_diffusion_cpp() {
     let ports = make_ports(47_300, 47_399);
     let manifest = load_manifest("stable-diffusion-cpp");
     let cfg = serde_json::json!({ "model_preset_id": "sd-1-5-gguf" });
-    let outcome = deploy(
-        DeployMethod::NativeBinary,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("stable-diffusion-cpp deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativeBinary, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "stable-diffusion-cpp");
 }
 
@@ -417,17 +291,7 @@ async fn deploy_ollama_external() {
     let ports = make_ports(47_400, 47_499);
     let manifest = load_manifest("ollama");
     let cfg = serde_json::json!({ "model_preset_id": "qwen3-5-0-8b" });
-    let outcome = deploy(
-        DeployMethod::External,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("ollama deploy succeeds");
+    let outcome = run_deploy(DeployMethod::External, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "ollama");
 }
 
@@ -448,17 +312,7 @@ async fn deploy_vllm_metal() {
     let ports = make_ports(47_500, 47_599);
     let manifest = load_manifest("vllm-metal");
     let cfg = serde_json::json!({ "model_preset_id": "qwen3-5-0-8b-mlx-4bit" });
-    let outcome = deploy(
-        DeployMethod::NativePythonBundle,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("vllm-metal deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "vllm-metal");
 }
 
@@ -469,17 +323,7 @@ async fn deploy_chatterbox_mlx() {
     let ports = make_ports(47_600, 47_699);
     let manifest = load_manifest("chatterbox-mlx");
     let cfg = serde_json::json!({ "model_preset_id": "chatterbox-turbo-4bit" });
-    let outcome = deploy(
-        DeployMethod::NativePythonBundle,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("chatterbox-mlx deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "chatterbox-mlx");
 }
 
@@ -490,17 +334,7 @@ async fn deploy_kyutai_tts() {
     let ports = make_ports(47_700, 47_799);
     let manifest = load_manifest("kyutai-tts");
     let cfg = serde_json::json!({ "model_preset_id": "pocket-tts-en" });
-    let outcome = deploy(
-        DeployMethod::NativePythonBundle,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("kyutai-tts deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "kyutai-tts");
 }
 
@@ -511,17 +345,7 @@ async fn deploy_chatterbox() {
     let ports = make_ports(47_800, 47_899);
     let manifest = load_manifest("chatterbox");
     let cfg = serde_json::json!({ "model_preset_id": "chatterbox-multilingual" });
-    let outcome = deploy(
-        DeployMethod::NativePythonBundle,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("chatterbox deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "chatterbox");
 }
 
@@ -532,17 +356,7 @@ async fn deploy_xtts() {
     let ports = make_ports(47_900, 47_999);
     let manifest = load_manifest("xtts");
     let cfg = serde_json::json!({ "model_preset_id": "xtts-v2" });
-    let outcome = deploy(
-        DeployMethod::NativePythonBundle,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("xtts deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "xtts");
 }
 
@@ -553,16 +367,6 @@ async fn deploy_voxcpm() {
     let ports = make_ports(48_000, 48_099);
     let manifest = load_manifest("voxcpm");
     let cfg = serde_json::json!({ "model_preset_id": "voxcpm-base" });
-    let outcome = deploy(
-        DeployMethod::NativePythonBundle,
-        &manifest,
-        &cfg,
-        &ports,
-        &db,
-        None,
-        None,
-    )
-    .await
-    .expect("voxcpm deploy succeeds");
+    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
     assert_deployed(&db, &outcome, "voxcpm");
 }

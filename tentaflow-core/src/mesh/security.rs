@@ -156,6 +156,13 @@ impl MeshSecurity {
         Ok((signing_key, x25519_secret))
     }
 
+    /// Szyfr `settings` tego noda. Cross-node deploy (`handle_service_deploy_remote`)
+    /// musi rozwiazac WLASNY `hf_token` z secure setting — token nigdy nie jest
+    /// forwardowany przez mesh, kazdy node uzywa swojego.
+    pub fn settings_cipher(&self) -> &Arc<crate::crypto::SettingsCipher> {
+        &self.settings_cipher
+    }
+
     fn load_trusted_from_db(&self) -> Result<()> {
         let trusted = db::repository::list_trusted_nodes(&self.db)?;
 

@@ -237,13 +237,7 @@ impl DeployStrategy for BinaryDeploy {
             instance_dir: None,
         };
 
-        let models = if matches!(
-            self.manifest.engine.resource_kind,
-            Some(crate::services::manifest::ResourceKind::Infra)
-        ) || matches!(
-            self.manifest.engine.category,
-            crate::services::manifest::Category::Agents
-        ) {
+        let models = if self.manifest.engine.is_model_less() {
             // Infra & agents have no model registry rows.
             Vec::new()
         } else {

@@ -232,6 +232,25 @@ pub trait DeployStrategy: Send + Sync {
 /// `BusMessage::Line` keyed by `slug`. `existing_slug` lets the caller pin a
 /// pre-generated slug (e.g. so the WebSocket subscription URL is known
 /// before the audit row is written); when `None` a fresh UUID is used.
+/// Klucz w `user_config` przez ktory wizard/frontend moze (omylkowo) przeslac
+/// surowy token HF. Sekret rozwiazujemy lokalnie z secure setting i wstrzykujemy
+/// tylko do ENV procesu silnika — w `config_json` (services + deployments) nie
+/// moze sie nigdy znalezc, bo te wiersze ida do bazy plaintextem i replikuja sie
+/// przez sync. Stad usuwamy ten klucz z configu przy KAZDEJ serializacji.
+const HF_TOKEN_CONFIG_KEY: &str = "hf_token";
+
+/// Zwraca kopie `user_config` bez klucza `hf_token`. Uzywane wszedzie tam gdzie
+/// config trafia do `config_json` (placeholder service + deployments row + commit
+/// kazdej strategii), zeby sekret z secure setting albo z payloadu frontendu nie
+/// wyciekl do bazy/sync. Token do silnika idzie osobnym kanalem (ENV).
+pub(crate) fn strip_hf_token(user_config: &serde_json::Value) -> serde_json::Value {
+    let mut sanitized = user_config.clone();
+    if let Some(map) = sanitized.as_object_mut() {
+        map.remove(HF_TOKEN_CONFIG_KEY);
+    }
+    sanitized
+}
+
 pub fn create_deploy_job(
     method: DeployMethod,
     manifest: &ServiceManifest,
@@ -242,7 +261,10 @@ pub fn create_deploy_job(
     existing_slug: Option<String>,
 ) -> DeployResult<DeployJob> {
     let slug = existing_slug.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let config_json = serde_json::to_string(user_config)
+    // Sekret nigdy do config_json — strip przed serializacja placeholdera i
+    // deployments row.
+    let sanitized_config = strip_hf_token(user_config);
+    let config_json = serde_json::to_string(&sanitized_config)
         .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
     let placeholder = build_placeholder_service(method, manifest, &config_json, &slug);
     let (service_id, deployment_id) = with_tx(db, |tx| {
@@ -279,9 +301,23 @@ pub async fn deploy(
     user_config: &serde_json::Value,
     ports: &Arc<PortAllocator>,
     db: &DbPool,
+    settings_cipher: &crate::crypto::SettingsCipher,
     log_sink: Option<broadcast::Sender<BusMessage>>,
 ) -> DeployResult<DeployOutcome> {
     let slug = job.deploy_id.clone();
+
+    // Punkt wspolny dla deployu lokalnego (dispatch handler) i zdalnego
+    // (handle_service_deploy_remote). Token HF rozwiazujemy TU, z secure setting
+    // TEGO noda — nigdy nie jest forwardowany przez mesh, wiec odbiorca uzywa
+    // wlasnego. Wartosci nie logujemy. Jednoczesnie usuwamy `hf_token` z configu
+    // przekazywanego strategiom, bo ich `prepare/commit` serializuje go do
+    // config_json (services + deployments). Sekret leci dalej tylko jako ENV.
+    let hf_token = crate::db::repository::get_setting_secure(db, HF_TOKEN_CONFIG_KEY, settings_cipher)
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let user_config = &strip_hf_token(user_config);
     let sink = log_sink.map(|sender| LogSink {
         slug: slug.clone(),
         sender,
@@ -341,12 +377,14 @@ pub async fn deploy(
             manifest.clone(),
             user_config.clone(),
             ports.clone(),
+            hf_token.clone(),
             sink.clone(),
         )),
         DeployMethod::Docker => Box::new(docker::DockerDeploy::new(
             manifest.clone(),
             user_config.clone(),
             ports.clone(),
+            hf_token.clone(),
             sink.clone(),
         )),
         DeployMethod::External => Box::new(external::ExternalDeploy::new(
@@ -449,6 +487,8 @@ pub async fn respawn(
     deploy_method: DeployMethod,
     config_json: &str,
     ports: Arc<PortAllocator>,
+    db: &DbPool,
+    settings_cipher: &crate::crypto::SettingsCipher,
     preserved_port: Option<u16>,
 ) -> DeployResult<RuntimeHandle> {
     let manifest = crate::services::manifest::registry()
@@ -471,12 +511,23 @@ pub async fn respawn(
         kill_listener_on_port(port).await;
     }
 
-    let user_config: serde_json::Value = if config_json.is_empty() {
+    let parsed: serde_json::Value = if config_json.is_empty() {
         serde_json::Value::Object(serde_json::Map::new())
     } else {
         serde_json::from_str(config_json)
             .map_err(|e| DeployError::Other(format!("respawn: parse config_json: {}", e)))?
     };
+    // Defensywnie: stare wiersze sprzed fixu moga miec `hf_token` w config_json.
+    // Strip i tak, zeby respawn nie reintrodukowal sekretu do strategii/configu.
+    let user_config = strip_hf_token(&parsed);
+    // Respawn gated-repo (vLLM/Bielik) tez musi miec HF_TOKEN — config_json juz
+    // go nie niesie, wiec rozwiazujemy z secure setting TEGO noda.
+    let hf_token =
+        crate::db::repository::get_setting_secure(db, HF_TOKEN_CONFIG_KEY, settings_cipher)
+            .ok()
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
     let mut strategy: Box<dyn DeployStrategy> = match deploy_method {
         DeployMethod::NativeEmbedded => {
@@ -494,6 +545,7 @@ pub async fn respawn(
                 manifest,
                 user_config,
                 ports.clone(),
+                hf_token.clone(),
                 None,
                 preserved_port,
             ))
@@ -502,6 +554,7 @@ pub async fn respawn(
             manifest,
             user_config,
             ports.clone(),
+            hf_token.clone(),
             None,
             preserved_port,
         )),
@@ -1029,6 +1082,49 @@ pub(crate) fn models_from_manifest(
 ///   2. `user_config.model_preset_id` — preset.repo lookup.
 ///   3. Recommended preset's repo (or first preset's repo as fallback).
 ///   4. None — manifest has no presets and wizard sent no repo.
+/// Czy ten deploy faktycznie pobiera model z Hugging Face. Single source dla
+/// bramkowania `HF_TOKEN` (docker + native): silniki infra bez modelu (searxng,
+/// browser-renderer, tools) NIE rozwiazuja repo modelu, wiec nie moga dostac
+/// sekretu w env. Token leci wylacznie do silnikow, ktore realnie sciagaja wagi
+/// z HF — inaczej sekret byl czytelny w env niezwiazanych kontenerow/procesow.
+pub(crate) fn engine_uses_hf_model(
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+) -> bool {
+    // Allow-list, nie deny-list: token leci wylacznie do silnikow, ktore
+    // POZYTYWNIE deklaruja model HF. Inaczej silnik kategorii Agents
+    // (np. teams-bot — brak `requires_model`, brak `model_presets`) ze
+    // spreparowanym `model_repo` w config_json przeszedlby bramke i dostal
+    // HF_TOKEN do env. Sam `model_repo` w configu NIE wystarcza.
+
+    // Silniki bez rejestru modeli (Infra, Agents) NIGDY nie dostaja tokenu —
+    // ten sam predykat co przy budowie wierszy modeli (single source).
+    if manifest.engine.is_model_less() {
+        return false;
+    }
+    // Silniki ciagnace wagi z WLASNEGO rejestru (Ollama -> rejestr Ollama,
+    // ComfyUI -> civitai/wlasny mechanizm) NIGDY nie odpytuja HF, wiec token
+    // do nich nie leci — nawet jesli ich `model_presets`/`model_repo` wygladaja
+    // jak repo HF. Niepusta lista presetow nie dowodzi pobierania z HF.
+    if manifest.engine.uses_own_model_registry() {
+        return false;
+    }
+    // Silnik jawnie deklarujacy brak modelu — to samo: brak tokenu.
+    if matches!(manifest.engine.requires_model, Some(false)) {
+        return false;
+    }
+    // Wymagana POZYTYWNA deklaracja modelu HF z manifestu: albo jawne
+    // `requires_model = true`, albo niepusta lista `model_presets`. Bez tego
+    // manifest nie deklaruje realnie modelu i token nie wycieka.
+    let declares_hf_model = matches!(manifest.engine.requires_model, Some(true))
+        || !manifest.model_presets.is_empty();
+    if !declares_hf_model {
+        return false;
+    }
+    // I dopiero gdy faktycznie da sie rozwiazac repo modelu do sciagniecia.
+    resolve_model_repo(manifest, user_config).is_some()
+}
+
 pub(crate) fn resolve_model_repo(
     manifest: &ServiceManifest,
     user_config: &serde_json::Value,
@@ -1152,13 +1248,24 @@ fn vllm_spec_method(method: &str) -> Option<&'static str> {
 /// speculative decoding (`VLLM_SPEC_METHOD` / `VLLM_SPEC_REPO` /
 /// `VLLM_SPEC_NUM_TOKENS`). The entrypoint quantizes before serving and
 /// assembles `--speculative-config` with resolved local paths. `HF_TOKEN`
-/// (gated repos like Bielik) comes from `user_config.hf_token`. Empty when the
-/// preset carries no vLLM speculative/quantize config.
+/// (gated repos like Bielik) jest przekazywany jawnie z `deploy()` (rozwiazany
+/// per-node z secure setting), NIGDY z `user_config` — sekret nie moze trafic do
+/// config_json. Empty when the preset carries no vLLM speculative/quantize config
+/// AND no token.
 pub(crate) fn vllm_deploy_env(
     manifest: &ServiceManifest,
     user_config: &serde_json::Value,
+    hf_token: Option<&str>,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
+
+    // Token gated repo (Bielik) musi byc widoczny niezaleznie od tego czy preset
+    // niesie speculative/quantize — inaczej pobieranie wag dla zwyklego gated
+    // modelu leci nieuwierzytelnione i CDN throttluje do zawieszenia.
+    if let Some(token) = hf_token.map(str::trim).filter(|s| !s.is_empty()) {
+        env.insert("HF_TOKEN".into(), token.to_string());
+    }
+
     let Some(preset) = resolve_selected_preset(manifest, user_config) else {
         return env;
     };
@@ -1182,17 +1289,6 @@ pub(crate) fn vllm_deploy_env(
             if let Some(scheme) = preset.vllm.as_ref().and_then(|v| v.quantize_draft.as_ref()) {
                 env.insert("VLLM_SPEC_DRAFT_QUANTIZE".into(), scheme.clone());
             }
-        }
-    }
-
-    if !env.is_empty() {
-        if let Some(token) = user_config
-            .get("hf_token")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            env.insert("HF_TOKEN".into(), token.to_string());
         }
     }
 
@@ -1552,6 +1648,214 @@ mod apply_parameters_deploy_tests {
     }
 }
 
+#[cfg(test)]
+mod hf_token_gate_tests {
+    use super::*;
+    use crate::services::manifest::{
+        ApiKind, Category, DeploySection, DockerDeploy, DockerTransport, Engine, ModelPreset,
+        ResourceKind, TargetOs,
+    };
+    use serde_json::json;
+
+    fn engine(
+        category: Category,
+        resource_kind: Option<ResourceKind>,
+        requires_model: Option<bool>,
+        api: ApiKind,
+    ) -> Engine {
+        Engine {
+            id: "test".into(),
+            category,
+            name: "test".into(),
+            description_pl: String::new(),
+            description_en: String::new(),
+            homepage: String::new(),
+            license: String::new(),
+            icon: None,
+            resource_kind,
+            requires_model,
+            gpu_supported: None,
+            default_port: 8000,
+            dgx_spark: None,
+            api,
+            version: "0.1.0".into(),
+            service_surfaces: None,
+            input_modalities: None,
+            output_modalities: None,
+        }
+    }
+
+    fn docker() -> DeploySection {
+        DeploySection {
+            docker: Some(DockerDeploy {
+                context_path: Some("docker/test".into()),
+                compose_path: None,
+                platforms: vec![TargetOs::Linux],
+                download_image: None,
+                download_size_mb: None,
+                transport: Some(DockerTransport::SidecarQuic),
+            }),
+            native: None,
+            external: None,
+        }
+    }
+
+    fn preset(repo: &str) -> ModelPreset {
+        serde_json::from_value(json!({
+            "id": "p",
+            "display_name": "p",
+            "repo": repo,
+            "recommended": true,
+        }))
+        .expect("ModelPreset")
+    }
+
+    fn manifest(
+        resource_kind: Option<ResourceKind>,
+        requires_model: Option<bool>,
+        presets: Vec<ModelPreset>,
+    ) -> ServiceManifest {
+        manifest_api(
+            Category::Llm,
+            resource_kind,
+            requires_model,
+            presets,
+            ApiKind::OpenaiCompatible,
+        )
+    }
+
+    fn manifest_cat(
+        category: Category,
+        resource_kind: Option<ResourceKind>,
+        requires_model: Option<bool>,
+        presets: Vec<ModelPreset>,
+    ) -> ServiceManifest {
+        manifest_api(
+            category,
+            resource_kind,
+            requires_model,
+            presets,
+            ApiKind::OpenaiCompatible,
+        )
+    }
+
+    fn manifest_api(
+        category: Category,
+        resource_kind: Option<ResourceKind>,
+        requires_model: Option<bool>,
+        presets: Vec<ModelPreset>,
+        api: ApiKind,
+    ) -> ServiceManifest {
+        ServiceManifest {
+            engine: engine(category, resource_kind, requires_model, api),
+            deploy: docker(),
+            model_presets: presets,
+            parameters: vec![],
+            docker_source_hash: String::new(),
+            native_source_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn model_capable_engine_with_repo_gets_token() {
+        // Pozytywna deklaracja modelu: niepusta lista presetow.
+        let m = manifest(Some(ResourceKind::Ai), Some(true), vec![preset("Qwen/Qwen3-0.6B")]);
+        assert!(engine_uses_hf_model(&m, &json!({})));
+        // Pozytywna deklaracja przez `requires_model = true` + custom repo z wizarda.
+        let m2 = manifest(None, Some(true), vec![]);
+        assert!(engine_uses_hf_model(
+            &m2,
+            &json!({ "model_repo": "Qwen/Qwen3-0.6B" })
+        ));
+    }
+
+    #[test]
+    fn engine_without_positive_model_declaration_gets_no_token() {
+        // Brak `requires_model`, brak presetow — sam `model_repo` w configu
+        // (np. spreparowany payload) NIE wystarcza do bramki allow-list.
+        let m = manifest(None, None, vec![]);
+        assert!(!engine_uses_hf_model(
+            &m,
+            &json!({ "model_repo": "Qwen/Qwen3-0.6B" })
+        ));
+    }
+
+    #[test]
+    fn agents_engine_never_gets_token_even_with_model_repo() {
+        // Silnik kategorii Agents (np. teams-bot: brak model_presets, brak
+        // requires_model=false) ze spreparowanym `model_repo` NIE moze dostac
+        // HF_TOKEN — kategoria Agents jest model-less.
+        let m = manifest_cat(Category::Agents, None, None, vec![]);
+        assert!(!engine_uses_hf_model(
+            &m,
+            &json!({ "model_repo": "Qwen/Qwen3-0.6B" })
+        ));
+        // Nawet jesli ktos doda presety do manifestu Agents — wciaz brak tokenu.
+        let m2 = manifest_cat(Category::Agents, None, None, vec![preset("Qwen/Qwen3-0.6B")]);
+        assert!(!engine_uses_hf_model(&m2, &json!({})));
+    }
+
+    #[test]
+    fn infra_engine_never_gets_token_even_with_model_repo() {
+        // Spreparowany/stary config z niepustym model_repo nie moze przeciec
+        // HF_TOKEN do silnika infra.
+        let m = manifest(Some(ResourceKind::Infra), None, vec![]);
+        assert!(!engine_uses_hf_model(
+            &m,
+            &json!({ "model_repo": "Qwen/Qwen3-0.6B" })
+        ));
+    }
+
+    #[test]
+    fn requires_model_false_never_gets_token_even_with_model_repo() {
+        let m = manifest(None, Some(false), vec![]);
+        assert!(!engine_uses_hf_model(
+            &m,
+            &json!({ "model_repo": "Qwen/Qwen3-0.6B" })
+        ));
+    }
+
+    #[test]
+    fn model_capable_engine_without_repo_gets_no_token() {
+        let m = manifest(Some(ResourceKind::Ai), Some(true), vec![]);
+        assert!(!engine_uses_hf_model(&m, &json!({})));
+    }
+
+    #[test]
+    fn ollama_engine_never_gets_token_despite_presets_and_repo() {
+        // Ollama deklaruje model (presety + requires_model) ale ciagnie wagi z
+        // rejestru Ollama (`ollama pull`), nie z HF. Bramka musi wykluczyc
+        // silnik po `ApiKind::OllamaNative`, nawet gdy preset/`model_repo`
+        // wygladaja jak repo HF.
+        let m = manifest_api(
+            Category::Llm,
+            Some(ResourceKind::Ai),
+            Some(true),
+            vec![preset("qwen3.5:0.8b")],
+            ApiKind::OllamaNative,
+        );
+        assert!(!engine_uses_hf_model(&m, &json!({})));
+        assert!(!engine_uses_hf_model(
+            &m,
+            &json!({ "model_repo": "Qwen/Qwen3-0.6B" })
+        ));
+    }
+
+    #[test]
+    fn comfyui_engine_never_gets_token_despite_hf_looking_preset() {
+        // ComfyUI preset repo wyglada jak HF (`runwayml/...`) ale model
+        // pochodzi z wlasnego mechanizmu / civitai — token nie leci.
+        let m = manifest_api(
+            Category::ImageGen,
+            Some(ResourceKind::Ai),
+            Some(true),
+            vec![preset("runwayml/stable-diffusion-v1-5")],
+            ApiKind::Comfyui,
+        );
+        assert!(!engine_uses_hf_model(&m, &json!({})));
+    }
+}
+
 /// Merguje `user_config` z typed `request_time_parameters` i serializuje
 /// do JSON do zapisu w `services.config_json`. Snapshot builder czyta to
 /// pole obratem i propaguje do `BackendClient` przez `LiveHandlesCache`.
@@ -1885,6 +2189,12 @@ pub(crate) fn standard_engine_env() -> HashMap<String, String> {
         "VLLM_CACHE_ROOT".into(),
         crate::paths::CONTAINER_VLLM_CACHE_PATH.to_string(),
     );
+    // Read-timeout (sekundy) dla huggingface_hub. Bez niego martwe/throttled
+    // polaczenie z HF CDN wisi w nieskonczonosc przy pobieraniu wag — po
+    // timeoucie hub retryuje + resume. Dotyczy wszystkich silnikow pobierajacych
+    // z HF (docker + binary). NIE wlaczamy HF_HUB_ENABLE_HF_TRANSFER — wymaga
+    // pakietu hf_transfer w obrazie (ImportError gdy go brak).
+    env.insert("HF_HUB_DOWNLOAD_TIMEOUT".into(), "30".into());
     env
 }
 
@@ -2059,6 +2369,10 @@ mod tests {
         create_deploy_job(method, manifest, cfg, db, "node-test", Some("1"), slug).unwrap()
     }
 
+    fn test_cipher() -> crate::crypto::SettingsCipher {
+        crate::crypto::SettingsCipher::new(&[0u8; 32])
+    }
+
     #[tokio::test]
     async fn smart_probe_returns_ready_when_readiness_url_succeeds() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2161,6 +2475,7 @@ mod tests {
             &cfg,
             &ports,
             &db,
+            &test_cipher(),
             None,
         )
         .await;
@@ -2206,6 +2521,7 @@ mod tests {
             &cfg,
             &ports,
             &db,
+            &test_cipher(),
             None,
         )
         .await
@@ -2241,6 +2557,7 @@ mod tests {
             &cfg,
             &ports,
             &db,
+            &test_cipher(),
             None,
         )
         .await
@@ -2263,6 +2580,8 @@ mod tests {
             DeployMethod::NativeEmbedded,
             "{}",
             ports.clone(),
+            &db,
+            &test_cipher(),
             None,
         )
         .await
@@ -2278,6 +2597,171 @@ mod tests {
         // Sanity: the seed deploy did create exactly one row.
         assert_eq!(count_after, 1);
         let _ = outcome;
+    }
+
+    // P2.2 / kanal ENV: vllm_deploy_env wstawia HF_TOKEN z jawnie podanego
+    // tokenu (rozwiazanego per-node w deploy()), nie z user_config — nawet gdy
+    // manifest nie ma presetu speculative/quantize (zwykly gated repo).
+    #[test]
+    fn vllm_deploy_env_injects_hf_token_from_explicit_arg() {
+        let manifest = dummy_manifest("vllm", NativeRuntime::PythonBundle);
+        let user_config = serde_json::json!({});
+        let env = vllm_deploy_env(&manifest, &user_config, Some("hf_resolved_secret"));
+        assert_eq!(
+            env.get("HF_TOKEN").map(String::as_str),
+            Some("hf_resolved_secret")
+        );
+    }
+
+    #[test]
+    fn vllm_deploy_env_skips_hf_token_when_none() {
+        let manifest = dummy_manifest("vllm", NativeRuntime::PythonBundle);
+        let user_config = serde_json::json!({});
+        let env = vllm_deploy_env(&manifest, &user_config, None);
+        assert!(!env.contains_key("HF_TOKEN"));
+    }
+
+    fn manifest_without_model(id: &str, runtime: NativeRuntime) -> ServiceManifest {
+        let mut m = dummy_manifest(id, runtime);
+        m.model_presets.clear();
+        m
+    }
+
+    // P2.1/P2.2 bramka: deploy z modelem HF rozwiazuje repo, wiec dostaje token.
+    #[test]
+    fn engine_uses_hf_model_true_when_model_resolves() {
+        let manifest = dummy_manifest("vllm", NativeRuntime::PythonBundle);
+        let user_config = serde_json::json!({});
+        assert!(engine_uses_hf_model(&manifest, &user_config));
+    }
+
+    // P2.1/P2.2 bramka: silnik infra (searxng/browser-renderer) bez presetow i
+    // bez model_repo NIE rozwiazuje modelu — nie moze dostac HF_TOKEN w env.
+    #[test]
+    fn engine_uses_hf_model_false_without_model() {
+        let manifest = manifest_without_model("searxng", NativeRuntime::PythonBundle);
+        let user_config = serde_json::json!({});
+        assert!(!engine_uses_hf_model(&manifest, &user_config));
+    }
+
+    // Custom model_repo z wizarda liczy sie jako model HF tylko gdy manifest
+    // POZYTYWNIE deklaruje model (`requires_model = true`) — bramka allow-list.
+    #[test]
+    fn engine_uses_hf_model_true_with_custom_repo() {
+        let mut manifest = manifest_without_model("vllm", NativeRuntime::PythonBundle);
+        manifest.engine.requires_model = Some(true);
+        let user_config = serde_json::json!({ "model_repo": "speakleash/Bielik" });
+        assert!(engine_uses_hf_model(&manifest, &user_config));
+    }
+
+    // Sam custom model_repo bez pozytywnej deklaracji modelu w manifescie NIE
+    // otwiera bramki — spreparowany payload nie wycieka HF_TOKEN.
+    #[test]
+    fn engine_uses_hf_model_false_with_custom_repo_but_no_declaration() {
+        let manifest = manifest_without_model("vllm", NativeRuntime::PythonBundle);
+        let user_config = serde_json::json!({ "model_repo": "speakleash/Bielik" });
+        assert!(!engine_uses_hf_model(&manifest, &user_config));
+    }
+
+    // P1.1: forward cross-node zdejmuje hf_token z config_json zanim trafi do
+    // mesh command. Mirror logiki w dispatch::handlers — sekret nie opuszcza noda.
+    #[test]
+    fn cross_node_forward_strips_hf_token_from_config_json() {
+        let raw = serde_json::json!({
+            "hf_token": "hf_node_secret_value",
+            "model_repo": "speakleash/Bielik",
+        });
+        let raw_str = serde_json::to_string(&raw).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw_str).unwrap();
+        let sanitized = strip_hf_token(&parsed);
+        let forwarded = serde_json::to_string(&sanitized).unwrap();
+        assert!(
+            !forwarded.contains("hf_token"),
+            "mesh command config_json leaked token key: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("hf_node_secret_value"),
+            "mesh command config_json leaked token value: {forwarded}"
+        );
+        assert!(forwarded.contains("speakleash/Bielik"));
+    }
+
+    #[test]
+    fn strip_hf_token_removes_secret_but_keeps_rest() {
+        let cfg = serde_json::json!({
+            "hf_token": "hf_super_secret",
+            "model_repo": "speakleash/Bielik",
+            "gpu_memory_utilization": 0.9,
+        });
+        let stripped = strip_hf_token(&cfg);
+        assert!(stripped.get("hf_token").is_none(), "token must be removed");
+        assert_eq!(
+            stripped.get("model_repo").and_then(|v| v.as_str()),
+            Some("speakleash/Bielik")
+        );
+        assert_eq!(
+            stripped.get("gpu_memory_utilization").and_then(|v| v.as_f64()),
+            Some(0.9)
+        );
+    }
+
+    // Klucz test bezpieczenstwa P2.1: nawet gdy frontend wysle `hf_token` w
+    // payloadzie deployu, `create_deploy_job` NIE moze go zapisac do
+    // services.config_json ani deployments.config_json (oba ida do bazy
+    // plaintextem i replikuja sie przez sync).
+    #[test]
+    fn create_deploy_job_never_persists_hf_token_in_config_json() {
+        let db = open_db();
+        let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
+        let cfg = serde_json::json!({
+            "hf_token": "hf_leaky_secret_value",
+            "model_repo": "speakleash/Bielik",
+        });
+        let job = create_deploy_job(
+            DeployMethod::NativeEmbedded,
+            &manifest,
+            &cfg,
+            &db,
+            "node-test",
+            Some("1"),
+            None,
+        )
+        .unwrap();
+
+        let conn = db.lock().unwrap();
+        let svc_config: String = conn
+            .query_row(
+                "SELECT config_json FROM services WHERE id = ?1",
+                rusqlite::params![job.service_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let dep_config: String = conn
+            .query_row(
+                "SELECT config_json FROM deployments WHERE id = ?1",
+                rusqlite::params![job.deployment_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            !svc_config.contains("hf_token"),
+            "services.config_json leaked token: {svc_config}"
+        );
+        assert!(
+            !svc_config.contains("hf_leaky_secret_value"),
+            "services.config_json leaked token value: {svc_config}"
+        );
+        assert!(
+            !dep_config.contains("hf_token"),
+            "deployments.config_json leaked token: {dep_config}"
+        );
+        assert!(
+            !dep_config.contains("hf_leaky_secret_value"),
+            "deployments.config_json leaked token value: {dep_config}"
+        );
+        // Reszta configu musi przetrwac.
+        assert!(svc_config.contains("speakleash/Bielik"));
     }
 
     #[tokio::test]
@@ -2298,6 +2782,7 @@ mod tests {
             &cfg,
             &ports,
             &db,
+            &test_cipher(),
             None,
         )
         .await;
@@ -2342,6 +2827,7 @@ mod tests {
             &cfg,
             &ports,
             &db,
+            &test_cipher(),
             None,
         )
         .await
@@ -2386,6 +2872,7 @@ mod tests {
             &cfg,
             &ports,
             &db,
+            &test_cipher(),
             Some(tx.clone()),
         )
         .await

@@ -243,6 +243,28 @@ impl Category {
 }
 
 impl Engine {
+    /// Czy ten silnik nie ma rejestru modeli — infrastruktura (searxng,
+    /// browser-renderer, narzedzia) oraz agenci (np. teams-bot) nie wpisuja
+    /// wierszy modeli i nie sciagaja wag z HF. Single source: uzywane zarowno
+    /// przy budowie `models_from_manifest` (binary deploy), jak i przy bramce
+    /// `HF_TOKEN`, zeby kategorie bez modelu nie przeciekly sekretu.
+    pub fn is_model_less(&self) -> bool {
+        matches!(self.resource_kind, Some(ResourceKind::Infra))
+            || matches!(self.category, Category::Agents)
+    }
+
+    /// Czy ten silnik pobiera wagi z WLASNEGO rejestru, nie z Hugging Face.
+    /// `model_presets` moga zawierac stringi wygladajace jak repo HF (np.
+    /// `runwayml/stable-diffusion-v1-5` dla ComfyUI), ale te silniki ciagna
+    /// modele z innego zrodla: Ollama z rejestru Ollama (`ollama pull`),
+    /// ComfyUI z wlasnego mechanizmu / civitai. Niepusta lista presetow NIE
+    /// dowodzi pobierania z HF, wiec sam predykat modelu nie wystarcza do
+    /// bramki `HF_TOKEN` — token nie moze wyciec do kontenera/procesu, ktory
+    /// nigdy nie odpyta huggingface.co. Single source dla bramki sekretu.
+    pub fn uses_own_model_registry(&self) -> bool {
+        matches!(self.api, ApiKind::OllamaNative | ApiKind::Comfyui)
+    }
+
     /// Resolve the surfaces this engine advertises after applying the
     /// preset > engine > category fallback chain. The argument is the
     /// optional preset that the deploy is targeting; pass `None` for

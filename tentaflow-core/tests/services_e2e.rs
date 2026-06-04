@@ -42,6 +42,12 @@ fn test_db() -> db::DbPool {
     Arc::new(Mutex::new(conn))
 }
 
+// Deterministyczny cipher dla `deploy()` — testy nie zapisuja sekretu HF, wiec
+// klucz zerowy wystarcza do rozwiazania (pustego) `hf_token`.
+fn test_cipher() -> tentaflow_core::crypto::SettingsCipher {
+    tentaflow_core::crypto::SettingsCipher::new(&[0u8; 32])
+}
+
 fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
     ServiceManifest {
         engine: Engine {
@@ -121,6 +127,7 @@ fn fake_service_info(id: i64, node_id: &str, model_name: &str) -> ServiceInfo {
         deployment_progress_pct: 0,
         // progress_message: brak raportu fazy startu w tescie
         progress_message: None,
+        update_available: false,
         models: vec![ServiceModelEntry {
             model_name: model_name.into(),
             display_name: None,
@@ -163,6 +170,7 @@ async fn deploy_embedded_persists_to_services_and_model_registry() {
         &json!({}),
         &ports,
         &db,
+        &test_cipher(),
         None,
     )
     .await
@@ -218,6 +226,7 @@ async fn delete_service_cascades_to_model_registry() {
         &json!({}),
         &ports,
         &db,
+        &test_cipher(),
         None,
     )
     .await
@@ -310,6 +319,7 @@ async fn external_deploy_rejects_manifest_without_external_section() {
         &json!({}),
         &ports,
         &db,
+        &test_cipher(),
         None,
     )
     .await

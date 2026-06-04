@@ -39,6 +39,10 @@ struct Resident {
 pub struct ModelResidency {
     db: DbPool,
     ports: Arc<PortAllocator>,
+    /// Szyfr `settings` — `respawn()` wymaga go do rozwiazania HF_TOKEN. Residency
+    /// laduje tylko embedded (lokalne, bez pobierania z HF), wiec w praktyce token
+    /// jest tu None, ale `respawn()` ma jeden kontrakt dla wszystkich sciezek.
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
     idle_timeout: Duration,
     /// Rezydentne unpinned modele: model_name -> Resident.
     resident: Mutex<HashMap<String, Resident>>,
@@ -48,10 +52,16 @@ pub struct ModelResidency {
 }
 
 impl ModelResidency {
-    pub fn new(db: DbPool, ports: Arc<PortAllocator>, idle_timeout: Duration) -> Self {
+    pub fn new(
+        db: DbPool,
+        ports: Arc<PortAllocator>,
+        settings_cipher: Arc<crate::crypto::SettingsCipher>,
+        idle_timeout: Duration,
+    ) -> Self {
         Self {
             db,
             ports,
+            settings_cipher,
             idle_timeout,
             resident: Mutex::new(HashMap::new()),
             ensure_lock: Mutex::new(()),
@@ -118,6 +128,8 @@ impl ModelResidency {
             svc.deploy_method,
             &svc.config_json,
             self.ports.clone(),
+            &self.db,
+            &self.settings_cipher,
             svc.runtime_port,
         )
         .await

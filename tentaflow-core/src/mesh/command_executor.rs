@@ -623,6 +623,7 @@ impl MeshCommandExecutor {
                 );
             }
             let db = actions.db.clone();
+            let settings_cipher = self.security.settings_cipher().clone();
             let engine_id = svc.engine_id.clone();
             let deploy_method = svc.deploy_method;
             let cfg_json_for_task = new_config_json.clone();
@@ -633,6 +634,8 @@ impl MeshCommandExecutor {
                     deploy_method,
                     &cfg_json_for_task,
                     ports,
+                    &db,
+                    &settings_cipher,
                     preserved_port,
                 )
                 .await
@@ -801,6 +804,8 @@ impl MeshCommandExecutor {
             svc.deploy_method,
             &svc.config_json,
             actions.port_allocator.clone(),
+            &actions.db,
+            self.security.settings_cipher(),
             svc.runtime_port,
         )
         .await;
@@ -926,6 +931,9 @@ impl MeshCommandExecutor {
         let slug = job.deploy_id.clone();
         let log_sender = crate::deploy::log_bus::sender_for(&slug);
         let db_clone = actions.db.clone();
+        // Token HF rozwiazujemy z secure setting TEGO noda (odbiorcy) wewnatrz
+        // deploy() — nigdy nie jest forwardowany przez mesh.
+        let settings_cipher_task = self.security.settings_cipher().clone();
         let port_alloc = actions.port_allocator.clone();
         let job_task = job.clone();
         let manifest_task = manifest.clone();
@@ -1038,6 +1046,7 @@ impl MeshCommandExecutor {
                 &user_config_task,
                 &port_alloc,
                 &db_clone,
+                &settings_cipher_task,
                 Some(log_sender_task.clone()),
             )
             .await;

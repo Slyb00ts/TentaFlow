@@ -36,6 +36,11 @@ pub struct DockerDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
     ports: Arc<PortAllocator>,
+    /// Token HF rozwiazany per-node w `deploy()` z secure setting. Idzie tylko do
+    /// ENV kontenera (`HF_TOKEN`), NIGDY do `user_config`/config_json. `None` =
+    /// brak tokenu (publiczne repo).
+    #[cfg_attr(not(feature = "docker"), allow(dead_code))]
+    hf_token: Option<String>,
     #[cfg_attr(not(feature = "docker"), allow(dead_code))]
     log_sink: Option<LogSink>,
     #[cfg_attr(not(feature = "docker"), allow(dead_code))]
@@ -49,15 +54,17 @@ impl DockerDeploy {
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        hf_token: Option<String>,
         log_sink: Option<LogSink>,
     ) -> Self {
-        Self::new_with_port(manifest, user_config, ports, log_sink, None)
+        Self::new_with_port(manifest, user_config, ports, hf_token, log_sink, None)
     }
 
     pub fn new_with_port(
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        hf_token: Option<String>,
         log_sink: Option<LogSink>,
         preserved_port: Option<u16>,
     ) -> Self {
@@ -65,6 +72,7 @@ impl DockerDeploy {
             manifest,
             user_config,
             ports,
+            hf_token,
             log_sink,
             container_id: std::sync::Mutex::new(None),
             preserved_port,
@@ -253,7 +261,8 @@ impl DockerDeploy {
             instance_dir: None,
         };
         let models = models_from_manifest(&self.manifest, &self.user_config);
-        let config_json = serde_json::to_string(&self.user_config)
+        // Sekret nigdy do config_json (services.config_json przez commit).
+        let config_json = serde_json::to_string(&super::strip_hf_token(&self.user_config))
             .map_err(|e| DeployError::Other(format!("serialize config: {e}")))?;
 
         Ok(PreparedDeploy {
@@ -658,7 +667,15 @@ impl DeployStrategy for DockerDeploy {
         }
         // vLLM featured presets (Bielik NVFP4 + draft, Qwen MTP): NVFP4
         // self-quant + speculative-config env the bare MODEL repo can't carry.
-        for (k, v) in super::vllm_deploy_env(&self.manifest, &self.user_config) {
+        // HF_TOKEN wstrzykujemy TYLKO gdy deploy realnie rozwiazuje model HF —
+        // silniki infra (searxng, browser-renderer) nie maja modelu i nie moga
+        // widziec sekretu w env. Speculative/quantize env leci niezaleznie.
+        let hf_token_for_env = if super::engine_uses_hf_model(&self.manifest, &self.user_config) {
+            self.hf_token.as_deref()
+        } else {
+            None
+        };
+        for (k, v) in super::vllm_deploy_env(&self.manifest, &self.user_config, hf_token_for_env) {
             env.insert(k, v);
         }
         // See python_bundle.rs: the served name must equal the advertised slug
@@ -1062,7 +1079,7 @@ mod tests {
     async fn prepare_errors_without_docker_feature() {
         let m = skeleton_manifest("no-docker");
         let ports = Arc::new(PortAllocator::new((48_500, 48_510), HashSet::new()).unwrap());
-        let mut s = DockerDeploy::new(m, serde_json::json!({}), ports, None);
+        let mut s = DockerDeploy::new(m, serde_json::json!({}), ports, None, None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Docker(_)));
     }
@@ -1071,7 +1088,7 @@ mod tests {
     fn pick_transport_default_is_sidecar_quic() {
         let m = skeleton_manifest("def");
         let ports = Arc::new(PortAllocator::new((48_600, 48_610), HashSet::new()).unwrap());
-        let s = DockerDeploy::new(m, serde_json::json!({}), ports, None);
+        let s = DockerDeploy::new(m, serde_json::json!({}), ports, None, None);
         assert_eq!(s.pick_transport(), Transport::SidecarQuic);
     }
 
@@ -1083,6 +1100,7 @@ mod tests {
             m,
             serde_json::json!({"transport_explicit": "direct_http"}),
             ports,
+            None,
             None,
         );
         assert_eq!(s.pick_transport(), Transport::HttpDirect);
