@@ -21,7 +21,9 @@ use tentaflow_protocol::{
     envelope::{Envelope, EnvelopeFlags, Routing, message_kind},
     message_body::{
         AddonAdminOnlySetRequest, AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest,
-        AddonInstallRequest, AddonLogsRequest, AddonNetworkRulesGetRequest,
+        AddonInstallRequest, AddonInstanceDuplicateRequest, AddonInstanceInstallRequest,
+        AddonInstancePayload, AddonInstanceUpdateRequest, AddonInstanceVersionsRequest,
+        AddonLogsRequest, AddonNetworkRulesGetRequest,
         AddonNetworkRulesSetRequest, AddonOAuthAuthorizeStartRequest,
         AddonOAuthConfigClearSecretRequest, AddonOAuthConfigListRequest,
         AddonOAuthConfigSetRequest, AddonOAuthLinkedAccountsRequest, AddonOAuthReauthorizeRequest,
@@ -996,6 +998,66 @@ pub fn encode_addons_list_request() -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen(js_name = encodeUsersListRequest)]
 pub fn encode_users_list_request() -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqListUsers)
+}
+
+// ---- Multi-instance: katalog pakietow + operacje na instancjach ----
+
+fn encode_addon_instance(payload: AddonInstancePayload) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonInstanceBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AddonInstanceBody(ReqCatalogList) — lista pakietow w katalogu.
+#[wasm_bindgen(js_name = encodeAddonCatalogListRequest)]
+pub fn encode_addon_catalog_list_request() -> Result<Vec<u8>, JsError> {
+    encode_addon_instance(AddonInstancePayload::ReqCatalogList)
+}
+
+/// MessageBody::AddonInstanceBody(ReqInstall) — instalacja instancji z katalogu.
+#[wasm_bindgen(js_name = encodeAddonInstanceInstallRequest)]
+pub fn encode_addon_instance_install_request(
+    package_id: String,
+    version: String,
+    display_name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_addon_instance(AddonInstancePayload::ReqInstall(AddonInstanceInstallRequest {
+        package_id,
+        version,
+        display_name,
+    }))
+}
+
+/// MessageBody::AddonInstanceBody(ReqDuplicate) — duplikacja instancji.
+#[wasm_bindgen(js_name = encodeAddonInstanceDuplicateRequest)]
+pub fn encode_addon_instance_duplicate_request(
+    source_addon_id: String,
+    new_display_name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_addon_instance(AddonInstancePayload::ReqDuplicate(
+        AddonInstanceDuplicateRequest {
+            source_addon_id,
+            new_display_name,
+        },
+    ))
+}
+
+/// MessageBody::AddonInstanceBody(ReqVersions) — wersje dostepne dla instancji.
+#[wasm_bindgen(js_name = encodeAddonInstanceVersionsRequest)]
+pub fn encode_addon_instance_versions_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_addon_instance(AddonInstancePayload::ReqVersions(
+        AddonInstanceVersionsRequest { addon_id },
+    ))
+}
+
+/// MessageBody::AddonInstanceBody(ReqUpdate) — hot-update instancji do wersji.
+#[wasm_bindgen(js_name = encodeAddonInstanceUpdateRequest)]
+pub fn encode_addon_instance_update_request(
+    addon_id: String,
+    target_version: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_addon_instance(AddonInstancePayload::ReqUpdate(AddonInstanceUpdateRequest {
+        addon_id,
+        target_version,
+    }))
 }
 
 // =============================================================================
