@@ -408,8 +408,8 @@ impl NamespaceManager {
     }
 
     /// Build the backend an addon's namespace should use. zvec (embedded, files
-    /// at `file_path`) is the default; an admin can switch a specific addon to an
-    /// external Milvus by setting the reserved `__vector_backend` config key.
+    /// at `file_path`) is the default; an admin can switch a specific addon to a
+    /// local or cross-node Milvus via the reserved `__vector_config` config key.
     fn build_backend(
         &self,
         org_id: &str,

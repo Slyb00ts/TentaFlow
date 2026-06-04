@@ -970,7 +970,7 @@ impl Supervisor {
     /// True when the engine is declared `resource_kind = "infra"` in its
     /// manifest (Milvus, iroh-relay, …). Such services are supporting
     /// infrastructure, not inference backends: TentaFlow talks to them
-    /// out-of-band (e.g. the vector backend uses Milvus via `__milvus_uri`), so
+    /// out-of-band (e.g. the vector backend uses Milvus via `__vector_config`), so
     /// the inference-style HTTP health probe does not apply and would spuriously
     /// mark them `Degraded` (a DB on a gRPC port answers an HTTP GET with 404).
     fn engine_is_infra(engine_id: &str) -> bool {
