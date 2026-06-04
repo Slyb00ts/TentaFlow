@@ -1982,6 +1982,54 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AddonVectorBody(GetConfigRequest) — config vector backendu. */
+  addonVectorGetConfigRequest(correlationId, { addonId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonVectorGetConfigRequest(addonId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonVectorBody(SetConfigRequest) — zapis config vector backendu. */
+  addonVectorSetConfigRequest(
+    correlationId,
+    {
+      addonId,
+      backend,
+      milvusSource,
+      serviceNodeId,
+      serviceId,
+      manualUri,
+      collectionOverride,
+      milvusUser,
+      milvusPassword,
+    },
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeAddonVectorSetConfigRequest(
+      addonId,
+      backend,
+      milvusSource ?? undefined,
+      serviceNodeId ?? undefined,
+      serviceId ?? undefined,
+      manualUri ?? undefined,
+      collectionOverride ?? undefined,
+      milvusUser ?? undefined,
+      milvusPassword ?? undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
 
   /** MessageBody::UsersListRequest (unit, Admin) — lista uzytkownikow. */
   usersListRequest(correlationId, sequence = 1) {

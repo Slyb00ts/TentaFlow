@@ -979,6 +979,65 @@ export function encodeAddonUninstallRequest(addon_id) {
 }
 
 /**
+ * MessageBody::AddonVectorBody(GetConfigRequest) — config vector backendu addona.
+ * @param {string} addon_id
+ * @returns {Uint8Array}
+ */
+export function encodeAddonVectorGetConfigRequest(addon_id) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonVectorGetConfigRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::AddonVectorBody(SetConfigRequest) — zapis config vector backendu.
+ * Pola configu jako osobne argumenty (bez serde_json w crate wasm).
+ * @param {string} addon_id
+ * @param {string} backend
+ * @param {string | null} [milvus_source]
+ * @param {string | null} [service_node_id]
+ * @param {string | null} [service_id]
+ * @param {string | null} [manual_uri]
+ * @param {string | null} [collection_override]
+ * @param {string | null} [milvus_user]
+ * @param {string | null} [milvus_password]
+ * @returns {Uint8Array}
+ */
+export function encodeAddonVectorSetConfigRequest(addon_id, backend, milvus_source, service_node_id, service_id, manual_uri, collection_override, milvus_user, milvus_password) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(backend, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    var ptr2 = isLikeNone(milvus_source) ? 0 : passStringToWasm0(milvus_source, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(service_node_id) ? 0 : passStringToWasm0(service_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(service_id) ? 0 : passStringToWasm0(service_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    var ptr5 = isLikeNone(manual_uri) ? 0 : passStringToWasm0(manual_uri, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    var ptr6 = isLikeNone(collection_override) ? 0 : passStringToWasm0(collection_override, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len6 = WASM_VECTOR_LEN;
+    var ptr7 = isLikeNone(milvus_user) ? 0 : passStringToWasm0(milvus_user, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len7 = WASM_VECTOR_LEN;
+    var ptr8 = isLikeNone(milvus_password) ? 0 : passStringToWasm0(milvus_password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len8 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonVectorSetConfigRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v10 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v10;
+}
+
+/**
  * MessageBody::AddonVisibilityListRequest { addon_id } — widocznosc per grupa.
  * @param {string} addon_id
  * @returns {Uint8Array}

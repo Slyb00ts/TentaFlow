@@ -2678,6 +2678,84 @@ pub enum AddonStoragePayload {
 }
 
 // =============================================================================
+// Vector backend picker addona (zakladka Ustawienia): zvec vs Milvus
+// (lokalny serwis / reczny URL). Config = __vector_config; sekrety osobno.
+// =============================================================================
+
+/// Odwolanie do serwisu Milvus (node + service id). Puste node_id == lokalny node.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonVectorServiceRef {
+    pub node_id: String,
+    pub service_id: String,
+}
+
+/// Strukturalny config backendu wektorowego (wire). Pola zgodne z zapisem
+/// `__vector_config`, ktory czyta NamespaceManager.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonVectorConfig {
+    /// "zvec" (domyslny) | "milvus".
+    pub backend: String,
+    /// Dla milvus: "service_ref" | "manual".
+    pub milvus_source: Option<String>,
+    pub service_ref: Option<AddonVectorServiceRef>,
+    pub manual_uri: Option<String>,
+    pub collection_override: Option<String>,
+}
+
+/// Jeden wykryty serwis Milvus do pickera.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonMilvusService {
+    pub node_id: String,
+    pub local: bool,
+    pub service_id: String,
+    pub display_name: String,
+    pub endpoint: String,
+    /// Czy ten node moze realnie polaczyc sie z tym serwisem (lokalny => tak;
+    /// zdalny => tylko gdy ma osiagalny advertised_endpoint — patrz C-2).
+    pub reachable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonVectorGetConfigRequest {
+    pub addon_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonVectorConfigResponse {
+    /// Czy build ma wkompilowany backend Milvus (vector-milvus).
+    pub milvus_compiled: bool,
+    pub config: AddonVectorConfig,
+    /// Czy sekret jest ustawiony (wartosci nie zwracamy).
+    pub has_milvus_user: bool,
+    pub has_milvus_password: bool,
+    pub milvus_services: Vec<AddonMilvusService>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonVectorSetConfigRequest {
+    pub addon_id: String,
+    pub config: AddonVectorConfig,
+    /// None = nie zmieniaj sekretu; Some("") = wyczysc; Some(x) = ustaw.
+    pub milvus_user: Option<String>,
+    pub milvus_password: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonVectorSetConfigResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Multiplex pickera vector backendu (limit 256 wariantow CBOR).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum AddonVectorPayload {
+    GetConfigRequest(AddonVectorGetConfigRequest),
+    GetConfigResponse(AddonVectorConfigResponse),
+    SetConfigRequest(AddonVectorSetConfigRequest),
+    SetConfigResponse(AddonVectorSetConfigResponse),
+}
+
+// =============================================================================
 // SCHEMA v14: Apps menu + UI v2 endpointy
 // =============================================================================
 
@@ -4632,6 +4710,8 @@ pub enum MessageBody {
     AddonInstanceBody(AddonInstancePayload),
     // Storage stats addona (KV/SQL/Vector/Recording).
     AddonStorageBody(AddonStoragePayload),
+    // Vector backend picker addona (zvec / Milvus config + discovery).
+    AddonVectorBody(AddonVectorPayload),
 }
 
 // =============================================================================
