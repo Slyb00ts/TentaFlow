@@ -410,6 +410,37 @@ pub fn apply_unapplied_inbox(limit: usize) -> LedgerResult<Option<usize>> {
     runtime.apply_unapplied_inbox(limit).map(Some)
 }
 
+/// Drains only the pending core write-capture journal into the Sync Ledger
+/// outbox using the active runtime's DB pool. The periodic sync-repair scheduler
+/// only reads the outbox, so core writes made while the process is running (e.g.
+/// a Flow saved in the Flow Builder) would otherwise sit in the journal until the
+/// next restart. Running this at the head of each scheduler tick converts those
+/// journal entries into outbox operations before the same tick's push reads the
+/// outbox.
+///
+/// Only the core journal is drained here: SQL, KV and blob captures publish
+/// immediately after their commit (`record_sql_capture` / `ledger_kv_capture_now`
+/// / `ledger_blob_capture_now`), so a periodic drain of those journals would
+/// re-emit the same local operation — a row still `pending` when the tick reads
+/// it gets published a second time by the immediate path, duplicating it in the
+/// ledger/outbox. Core capture (`record_core_capture_tx`) is journal-only with no
+/// online publish, so without this it would not sync until the next restart.
+///
+/// A drain failure is logged and the call returns `Ok(Some(0))`. Returns
+/// `Ok(None)` when no runtime is initialized (bootstrap/tests).
+pub fn drain_pending_core_captures_online(limit: usize) -> LedgerResult<Option<usize>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    match crate::sync::core_capture::drain_pending_core_captures(&runtime.db, limit) {
+        Ok(drained) => Ok(Some(drained)),
+        Err(e) => {
+            warn!("sync runtime: core capture drain failed: {}", e);
+            Ok(Some(0))
+        }
+    }
+}
+
 pub fn resolve_addon_sync_conflict(
     org_id: &str,
     addon_id: &str,
@@ -6891,6 +6922,137 @@ mod tests {
                 (later.wall_time_ms, later.logical)
                     > (reseed_a_hlc.wall_time_ms, reseed_a_hlc.logical),
                 "post-cutover update HLC {later:?} must exceed reseed HLC {reseed_a_hlc:?}"
+            );
+        });
+    }
+
+    /// Regression for the mesh Flow-sync gap: a core write goes through the
+    /// PRODUCTION path, i.e. it lands ONLY in the SQLite capture journal
+    /// (`__tentaflow_core_sync_captures`) inside the same transaction as the
+    /// `flows` row. It must NOT reach the peer's outbox until the journal is
+    /// drained. The bug was that the drain ran only at process startup, so a
+    /// Flow saved while the process was running stayed invisible to peers until
+    /// a restart. The other mesh-sync tests inject via
+    /// `record_core_capture(...)`, the DIRECT path that builds op + outbox
+    /// immediately and bypasses the journal — so they never exercised the drain
+    /// and could not catch this.
+    ///
+    /// We drive the drain with `drain_pending_core_captures_with(&db, limit,
+    /// |c| self.record_core_capture(c)...)`. That is exactly what the production
+    /// `drain_pending_core_captures_online(limit)` wrapper resolves to at
+    /// runtime: the wrapper looks up the global `SYNC_RUNTIME` (the live
+    /// instance) and records through it. In a per-instance test the global is
+    /// not set, so we record through this very runtime instance — the same
+    /// load/mark journal machinery, just with the recorder bound explicitly.
+    #[test]
+    fn core_flow_journal_write_reaches_outbox_only_after_drain() {
+        with_tmp_home(|| {
+            let node = make_runtime(180);
+            seed_core_authority_target(&node.runtime.db, "core.flow", "peer-authority");
+            // The journal row's actor_user_id is FK-bound to user_accounts(id).
+            seed_actor_user(&node.runtime.db, "test-actor");
+
+            // PRODUCTION path: persist the capture into the journal only — same
+            // transaction a real `repository::create_flow` would use when it
+            // calls `record_core_capture_tx`. No op, no outbox yet.
+            {
+                let conn = node.runtime.db.lock().expect("db");
+                let tx = conn.unchecked_transaction().expect("tx");
+                crate::sync::core_capture::record_core_write_capture(
+                    &tx,
+                    &complete_core_flow_capture("flow-online", "Online Flow"),
+                )
+                .expect("persist capture to journal");
+                tx.commit().expect("commit journal capture");
+            }
+
+            // Our flow's journal row exists and is still pending (undrained).
+            // The migrations seed other default core captures (org, roles); we
+            // assert only on flow-online, the resource this regression covers.
+            let flow_status_before: String = {
+                let conn = node.runtime.db.lock().expect("db");
+                conn.query_row(
+                    "SELECT status FROM __tentaflow_core_sync_captures \
+                     WHERE resource_type = 'core.flow' AND resource_id = 'flow-online'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("flow capture row must exist in the journal")
+            };
+            assert_eq!(
+                flow_status_before, "pending",
+                "production write must land in the journal as a pending capture"
+            );
+
+            // BEFORE drain: nothing in the peer's outbox — the bug's symptom.
+            // Only core.flow has a seeded target here, so the default org/role
+            // captures cannot queue to peer-authority and the push stays empty.
+            assert!(
+                node.runtime
+                    .build_push_payload_for_target("peer-authority", 256)
+                    .expect("build push before drain")
+                    .is_none(),
+                "undrained journal capture must NOT appear in the outbox"
+            );
+
+            // The drain converts pending journal rows into ledger ops + outbox
+            // entries. It also drains the default org/role captures, so the
+            // count is >= 1; the flow-specific assertions below are what matter.
+            let drained = crate::sync::core_capture::drain_pending_core_captures_with(
+                &node.runtime.db,
+                1000,
+                |capture| {
+                    node.runtime
+                        .record_core_capture(capture)
+                        .map(|record| Some(record.op_id))
+                },
+            )
+            .expect("drain pending captures");
+            assert!(drained >= 1, "the drain must process the pending capture(s)");
+
+            // AFTER drain: the core.flow op is now in the peer's outbox.
+            let push = node
+                .runtime
+                .build_push_payload_for_target("peer-authority", 256)
+                .expect("build push after drain")
+                .expect("drained capture must produce an outbox payload");
+            let flow_ops: Vec<_> = push
+                .operations
+                .iter()
+                .filter_map(|wire| {
+                    node.runtime
+                        .ledger
+                        .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
+                        .ok()
+                })
+                .filter(|op| {
+                    op.body.resource_type == "core.flow" && op.body.resource_id == "flow-online"
+                })
+                .collect();
+            assert_eq!(
+                flow_ops.len(),
+                1,
+                "the drained Flow op must reach the peer outbox"
+            );
+            assert_eq!(
+                flow_ops[0].body.changed_fields.get("name"),
+                Some(&FieldValue::String("Online Flow".to_string()))
+            );
+
+            // The flow's journal row is no longer pending — it is now ledgered.
+            let flow_status_after: String = {
+                let conn = node.runtime.db.lock().expect("db");
+                conn.query_row(
+                    "SELECT status FROM __tentaflow_core_sync_captures \
+                     WHERE resource_type = 'core.flow' AND resource_id = 'flow-online'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("flow capture row must still exist after drain")
+            };
+            assert_eq!(
+                flow_status_after, "ledgered",
+                "the drain must mark the flow's journal row as ledgered"
             );
         });
     }
