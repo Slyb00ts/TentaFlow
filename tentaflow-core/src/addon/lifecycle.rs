@@ -333,6 +333,16 @@ fn install_core(
             "",
             "uploaded",
         )?;
+        // Replicate the package BYTES so other mesh nodes can install this
+        // uploaded addon (bundled packages already live in every node's binary,
+        // so they skip this). Best-effort: failure never fails the local install.
+        if let Err(e) =
+            capture_addon_package_blob(db, package_id, package_version, &package_dir)
+        {
+            tracing::warn!(
+                "addon package '{package_id}' v{package_version}: blob sync capture nieudany: {e}"
+            );
+        }
     }
 
     // 5-9. Zarejestruj w DB (w jednej transakcji)
@@ -513,6 +523,177 @@ pub(crate) fn materialize_addon_derived_state(
         registry.register(&manifest.addon_id, flow);
     }
     Ok(())
+}
+
+/// Cap on a synced addon-package archive (compressed). Bounds disk/bandwidth a
+/// trusted-but-buggy peer can push; real addon packages are well under this.
+const MAX_SYNCED_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Blob id of a synced addon package: `addon-package:<package_id>:<version>`.
+/// `package_id` and semver `version` never contain `:`, so the receiver splits
+/// on the first `:` after the prefix unambiguously.
+fn addon_package_blob_id(package_id: &str, version: &str) -> String {
+    format!("addon-package:{package_id}:{version}")
+}
+
+/// Tar.gz the materialized package dir and hand it to the blob sync mechanism so
+/// other mesh nodes receive the bytes (content-addressed by sha256). Only the
+/// upload path calls this (bundled packages are in every binary). The blob is
+/// deduped fleet-wide by content hash.
+fn capture_addon_package_blob(
+    db: &DbPool,
+    package_id: &str,
+    version: &str,
+    package_dir: &Path,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    // Stage the archive in temp; the blob capture reads it to chunk into the
+    // ledger, after which we can drop it (the origin keeps the package_dir).
+    let tmp = std::env::temp_dir().join(format!(
+        "tf-addon-pkg-{}.tar.gz",
+        uuid::Uuid::new_v4().simple()
+    ));
+    {
+        let file = std::fs::File::create(&tmp)
+            .map_err(|e| anyhow::anyhow!("create package archive: {e}"))?;
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        builder
+            .append_dir_all(".", package_dir)
+            .map_err(|e| anyhow::anyhow!("tar package dir: {e}"))?;
+        builder
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("finish tar: {e}"))?
+            .finish()
+            .map_err(|e| anyhow::anyhow!("finish gzip: {e}"))?;
+    }
+    // All fallible work in one closure so the temp archive is removed on EVERY
+    // exit path (early errors included).
+    let result = (|| -> Result<()> {
+        let bytes =
+            std::fs::read(&tmp).map_err(|e| anyhow::anyhow!("read package archive: {e}"))?;
+        if bytes.len() as u64 > MAX_SYNCED_PACKAGE_BYTES {
+            bail!(
+                "pakiet '{package_id}' v{version} za duzy do synca ({} B > {} B)",
+                bytes.len(),
+                MAX_SYNCED_PACKAGE_BYTES
+            );
+        }
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let capture = crate::sync::blob_capture::BlobWriteCapture::new(
+            crate::services::org::DEFAULT_ORG_ID,
+            addon_package_blob_id(package_id, version),
+            &sha,
+            "application/gzip",
+            bytes.len() as u64,
+            tmp.to_string_lossy().to_string(),
+            None,
+        );
+        {
+            let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            crate::sync::blob_capture::record_blob_write_capture(&conn, &capture)?;
+        }
+        crate::sync::blob_capture::ledger_blob_capture_now(db, &capture)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Receiver side: a synced `addon-package:` blob fully arrived. Extract the
+/// tar.gz into this node's package store and upsert the catalog row so the
+/// package becomes installable here. `blob_path` is the reassembled blob.
+/// Returns (package_id, version). Trusted-peer input (mesh executor gate); tar
+/// unpack rejects path traversal.
+pub(crate) fn materialize_synced_addon_package(
+    db: &DbPool,
+    blob_id: &str,
+    blob_path: &Path,
+) -> Result<(String, String)> {
+    let rest = blob_id
+        .strip_prefix("addon-package:")
+        .ok_or_else(|| anyhow::anyhow!("not an addon-package blob: {blob_id}"))?;
+    let (package_id, version) = rest
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("malformed addon-package blob id: {blob_id}"))?;
+    // Path-safety: package_id/version become path segments under the store, so
+    // reject anything that could traverse out of it (trusted peer, but defense
+    // in depth).
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 128
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+    };
+    if !safe(package_id) || !safe(version) {
+        bail!("unsafe addon-package ref: {package_id}:{version}");
+    }
+
+    // Receiver-side cap (defense in depth; the origin also caps before sync).
+    if let Ok(meta) = std::fs::metadata(blob_path) {
+        if meta.len() > MAX_SYNCED_PACKAGE_BYTES {
+            bail!("synced package '{package_id}' v{version} przekracza limit rozmiaru");
+        }
+    }
+    let pkg_dir = crate::addon::bundled::package_dir(package_id, version);
+    // Extract into a sibling STAGING dir first and validate; only on success do
+    // we atomically replace the live package dir. A bad/truncated archive or a
+    // mismatched manifest never destroys the existing package.
+    let staging = pkg_dir.with_file_name(format!(
+        ".incoming-{version}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let extract = || -> Result<(String, String)> {
+        let file = std::fs::File::open(blob_path)
+            .map_err(|e| anyhow::anyhow!("open package blob: {e}"))?;
+        let dec = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(dec);
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| anyhow::anyhow!("create staging dir: {e}"))?;
+        archive
+            .unpack(&staging)
+            .map_err(|e| anyhow::anyhow!("unpack package: {e}"))?;
+        let manifest_toml = std::fs::read_to_string(staging.join("manifest.toml"))
+            .map_err(|e| anyhow::anyhow!("read synced manifest.toml: {e}"))?;
+        let manifest = parse_manifest_toml(&manifest_toml)?;
+        // The blob id is untrusted metadata — the extracted manifest is the
+        // truth. Refuse a mismatch (e.g. blob 'a:1' carrying manifest for 'b:2').
+        if manifest.addon_id != package_id || manifest.version != version {
+            bail!(
+                "synced package mismatch: blob '{package_id}:{version}' but manifest is \
+                 '{}:{}'",
+                manifest.addon_id,
+                manifest.version
+            );
+        }
+        Ok((manifest.display_name.clone(), manifest_toml))
+    };
+    let (display_name, manifest_toml) = match extract() {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+    // Swap: replace the live dir with the validated staging dir (same parent →
+    // rename is atomic on-disk).
+    let _ = std::fs::remove_dir_all(&pkg_dir);
+    std::fs::rename(&staging, &pkg_dir).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        anyhow::anyhow!("swap package dir: {e}")
+    })?;
+    crate::db::repository::upsert_addon_package(
+        db,
+        package_id,
+        version,
+        &display_name,
+        &manifest_toml,
+        "",
+        "uploaded",
+    )?;
+    Ok((package_id.to_string(), version.to_string()))
 }
 
 /// Kopiuje cala zawartosc katalogu zrodlowego addonu (wasm, manifest.toml,

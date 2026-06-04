@@ -1339,6 +1339,9 @@ impl SyncRuntime {
         // so a replicated `__vector_config` takes effect without a restart.
         let mut pending_config_invalidations: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        // Synced addon-package blobs that finished reassembling — (blob_id, sha).
+        // Extracted to the package store after the drain loop (untar is heavy).
+        let mut pending_package_extractions: Vec<(String, String)> = Vec::new();
         for entry in entries {
             if entry.operation.body.resource_type == "core.blob" {
                 match apply_blob_operation(&entry.operation) {
@@ -1346,6 +1349,18 @@ impl SyncRuntime {
                         self.ledger
                             .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
                         applied += 1;
+                        // A blob MANIFEST (table blob_store) applied → the blob is
+                        // fully reassembled. If it's a synced addon package, defer
+                        // extraction (untar + catalog) to after the drain loop.
+                        if entry.operation.body.table_name == "blob_store" {
+                            if let Ok(blob_id) = field_string(&entry.operation, "blob_id") {
+                                if blob_id.starts_with("addon-package:") {
+                                    if let Ok(sha) = field_string(&entry.operation, "sha256") {
+                                        pending_package_extractions.push((blob_id, sha));
+                                    }
+                                }
+                            }
+                        }
                     }
                     Ok(BlobApplyOutcome::Pending) => {}
                     Err(e) => {
@@ -1470,6 +1485,25 @@ impl SyncRuntime {
         // the next access rebuilds against the new `__vector_config`.
         for addon_id in &pending_config_invalidations {
             crate::services::vector_namespace_manager(&self.db).invalidate_addon(addon_id);
+        }
+        // Extract synced addon-package blobs into the local package store +
+        // catalog, so the uploaded addon becomes installable on this node.
+        for (blob_id, sha) in &pending_package_extractions {
+            let blob_path = match blob_path_for_sha(sha) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("sync runtime: addon package blob path '{sha}': {e}");
+                    continue;
+                }
+            };
+            match crate::addon::lifecycle::materialize_synced_addon_package(
+                &self.db, blob_id, &blob_path,
+            ) {
+                Ok((package_id, version)) => tracing::info!(
+                    "sync runtime: addon package '{package_id}' v{version} zsynchronizowany do katalogu"
+                ),
+                Err(e) => warn!("sync runtime: rozpakowanie pakietu '{blob_id}': {e}"),
+            }
         }
         Ok(applied)
     }
