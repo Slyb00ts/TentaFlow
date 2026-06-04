@@ -54,7 +54,52 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
         &package_id,
         &package_version,
         true,
+        true,
     )
+}
+
+/// Catalog-only upload: materialize an uploaded package into the store + catalog
+/// (+ replicate its bytes as a blob) WITHOUT creating an instance. Re-uploading
+/// the same version overwrites the package files; a new version is added to the
+/// catalog so existing instances see it as an available update — there is no
+/// "already installed" error because no instance is created. Instances are
+/// created/updated from the catalog (install_instance / update_instance),
+/// exactly like bundled packages. Returns (package_id, version).
+pub fn install_package_to_catalog(addon_dir: &Path, db: &DbPool) -> Result<(String, String)> {
+    let manifest_path = addon_dir.join("manifest.toml");
+    if !manifest_path.exists() {
+        bail!("Brak pliku manifest.toml w {:?}", addon_dir);
+    }
+    let manifest_content = std::fs::read_to_string(&manifest_path)?;
+    let manifest = parse_manifest_toml(&manifest_content)?;
+    let package_id = manifest.addon_id.clone();
+    let package_version = manifest.version.clone();
+    // A BUNDLED package version is owned by the binary — refuse to overwrite its
+    // files/source with an upload (which would run uploaded bytes under the
+    // bundled version until the next startup reconcile, and could replicate that
+    // swap to peers). An update is always a NEW version, so this never blocks a
+    // legitimate update — only a same-version clobber of a bundled package.
+    if let Some(existing) =
+        crate::db::repository::get_addon_package(db, &package_id, &package_version)?
+    {
+        if existing.source == "bundled" {
+            bail!(
+                "wersja '{package_version}' pakietu '{package_id}' jest wbudowana — \
+                 nie mozna jej nadpisac uploadem; podbij wersje w manifescie"
+            );
+        }
+    }
+    install_core(
+        addon_dir,
+        db,
+        manifest,
+        &manifest_content,
+        &package_id,
+        &package_version,
+        true,
+        false,
+    )?;
+    Ok((package_id, package_version))
 }
 
 /// Instaluje NOWA instancje pakietu z katalogu pod wlasnym, syntetycznym
@@ -101,6 +146,7 @@ pub fn install_instance(
         package_id,
         package_version,
         false,
+        true,
     )?;
     Ok(instance_id)
 }
@@ -179,6 +225,7 @@ fn install_core(
     package_id: &str,
     package_version: &str,
     materialize: bool,
+    create_instance: bool,
 ) -> Result<AddonManifest> {
     // 2. Walidacja
     validate_manifest(&manifest)?;
@@ -343,6 +390,14 @@ fn install_core(
                 "addon package '{package_id}' v{package_version}: blob sync capture nieudany: {e}"
             );
         }
+    }
+
+    // Catalog-only mode (uploaded package): the package template + its bytes are
+    // now in the store/catalog/blob outbox — stop here without creating a 1:1
+    // instance. Instances are created explicitly from the catalog
+    // (install_instance), exactly like bundled packages.
+    if !create_instance {
+        return Ok(manifest);
     }
 
     // 5-9. Zarejestruj w DB (w jednej transakcji)

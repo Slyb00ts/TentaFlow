@@ -720,9 +720,16 @@ async function onInstallZip() {
       if (Array.isArray(result.warnings) && result.warnings.length > 0) {
         console.warn('[addons] install warnings:', result.warnings);
       }
-      toast(I18n.t('common.saved'), 'success');
       win.close(true);
-      await loadList();
+      // Catalog-only upload: the package lands in the Catalog (a template to
+      // install from), not the Installed list. Switch there and refresh.
+      activeView = 'catalog';
+      document
+        .querySelectorAll('.addons-view-switch tf-chip[data-view]')
+        .forEach((c) => c.toggleAttribute('active', c.dataset.view === 'catalog'));
+      await loadCatalog();
+      renderActive();
+      toast(I18n.t('addons.uploaded_to_catalog'), 'success');
     } catch (err) {
       toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
     }

@@ -344,32 +344,25 @@ pub fn addon_install(
         }
     };
 
-    let install_result = crate::addon::lifecycle::install(&addon_dir, &ctx.state.db);
+    // Catalog-only: an upload adds/updates a PACKAGE version in the catalog (and
+    // replicates its bytes to the mesh), it does NOT create an instance. Uploading
+    // a new version of an existing package = an update (existing instances see it
+    // as available); re-uploading the same version overwrites the bytes. No
+    // "already installed" error because no instance is created. Instances are
+    // created from the catalog (install) and updated via the version picker.
+    let install_result =
+        crate::addon::lifecycle::install_package_to_catalog(&addon_dir, &ctx.state.db);
     let _ = std::fs::remove_dir_all(&tmp_root);
 
     match install_result {
-        Ok(manifest) => {
-            let addon_id = manifest.addon_id.clone();
-            let version = manifest.version.clone();
-            let _ = repository::create_default_addon_resource_limits(&ctx.state.db, &addon_id);
-            // Replicate the uploaded instance to the mesh (the package bytes
-            // already went out as a blob during install). Origin-only.
-            capture_addon_instance_sync(&ctx.state.db, &addon_id);
-            // Audyt: podstawowe metadane instalacji (bez zawartosci plikow/konfiguracji).
-            let declared_oauth_providers: Vec<String> = manifest
-                .oauth_provider
-                .iter()
-                .map(|p| p.id.clone())
-                .collect();
+        Ok((package_id, version)) => {
             audit(
                 ctx,
-                "addon_install",
-                &addon_id,
+                "addon_package_upload",
+                &package_id,
                 serde_json::json!({
-                    "addon_id": addon_id,
+                    "package_id": package_id,
                     "version": version,
-                    "declared_permissions_count": manifest.declared_permissions.len(),
-                    "declared_oauth_providers": declared_oauth_providers,
                     "file_size_bytes": payload.content.len(),
                     "filename": payload.filename,
                 }),
@@ -378,7 +371,7 @@ pub fn addon_install(
             Ok(MessageBody::AddonInstallResponseBody(
                 AddonInstallResponse {
                     ok: true,
-                    addon_id: Some(addon_id),
+                    addon_id: Some(package_id),
                     version: Some(version),
                     warnings: Vec::new(),
                     error: None,
