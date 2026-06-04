@@ -482,6 +482,9 @@ async fn run_server(args: Args) -> Result<()> {
         .set_mesh_services_registry(mesh_services_registry.clone());
     router.start();
 
+    // Store pakietow addonow obok bazy (jeden korzen danych dla tej binarki).
+    tentaflow_core::addon::bundled::set_packages_base(paths::data_dir());
+
     // Zainstaluj wbudowane addony
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
         tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);

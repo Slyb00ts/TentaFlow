@@ -126,6 +126,9 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
         &file_master_key,
     ));
 
+    // Store pakietow addonow obok bazy desktopowej (jeden korzen danych).
+    tentaflow_core::addon::bundled::set_packages_base(data_dir.clone());
+
     // Zainstaluj wbudowane addony
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
         tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);
