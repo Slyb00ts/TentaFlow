@@ -3275,11 +3275,140 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            K::AddonInstance => {
+                // Re-seed installed instances backed by a BUNDLED package (present
+                // in every node's store, so the receiver can load the wasm). Joined
+                // to addon_packages to apply the bundled-only gate; uploaded-package
+                // instances are skipped until package-byte transport exists.
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {ADDON_INSTANCE_SYNC_COLS} FROM addons a \
+                     JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
+                     WHERE p.source = 'bundled'"
+                ))?;
+                let rows = stmt
+                    .query_map([], |r| Ok(addon_instance_row_from_query(r)?))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for row in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        row.addon_id.clone(),
+                        Insert,
+                        addon_instance_changed_fields(&row),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
         }
     }
 
     tx.commit()?;
     Ok(emitted)
+}
+
+/// Snapshot of an `addons` row for mesh sync. Built from a SELECT (reseed) or
+/// from the manifest at install time, then turned into capture `changed_fields`
+/// by [`addon_instance_changed_fields`].
+pub(crate) struct AddonInstanceSyncRow {
+    pub addon_id: String,
+    pub name: String,
+    pub display_name: String,
+    pub version: String,
+    pub package_id: String,
+    pub package_version: String,
+    pub description: String,
+    pub author: String,
+    pub platforms: String,
+    pub manifest_json: String,
+    pub is_enabled: bool,
+    pub is_system: bool,
+    pub skill_md: Option<String>,
+    pub keywords_json: String,
+    pub category: String,
+    pub disambiguation_json: String,
+    pub icon: Option<String>,
+    pub runtime: String,
+    pub wasm_size_bytes: i64,
+    pub license: String,
+    pub show_in_catalog: bool,
+}
+
+/// Map a 21-column `addons` SELECT (column order as in the reseed query) to the
+/// sync row.
+fn addon_instance_row_from_query(r: &rusqlite::Row<'_>) -> rusqlite::Result<AddonInstanceSyncRow> {
+    Ok(AddonInstanceSyncRow {
+        addon_id: r.get(0)?,
+        name: r.get(1)?,
+        display_name: r.get(2)?,
+        version: r.get(3)?,
+        package_id: r.get(4)?,
+        package_version: r.get(5)?,
+        description: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        author: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+        platforms: r.get(8)?,
+        manifest_json: r.get(9)?,
+        is_enabled: r.get::<_, i64>(10)? != 0,
+        is_system: r.get::<_, i64>(11)? != 0,
+        skill_md: r.get(12)?,
+        keywords_json: r.get(13)?,
+        category: r.get(14)?,
+        disambiguation_json: r.get(15)?,
+        icon: r.get(16)?,
+        runtime: r.get(17)?,
+        wasm_size_bytes: r.get(18)?,
+        license: r.get(19)?,
+        show_in_catalog: r.get::<_, i64>(20)? != 0,
+    })
+}
+
+/// Build the capture `changed_fields` for an addon-instance Insert (all columns
+/// except the `addon_id` primary key, which travels as the resource id). The
+/// receiver upserts these in `apply_addon_instance`.
+pub(crate) fn addon_instance_changed_fields(
+    row: &AddonInstanceSyncRow,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut f = BTreeMap::new();
+    f.insert("name".to_string(), field_string(&row.name));
+    f.insert("display_name".to_string(), field_string(&row.display_name));
+    f.insert("version".to_string(), field_string(&row.version));
+    f.insert("package_id".to_string(), field_string(&row.package_id));
+    f.insert(
+        "package_version".to_string(),
+        field_string(&row.package_version),
+    );
+    f.insert("description".to_string(), field_string(&row.description));
+    f.insert("author".to_string(), field_string(&row.author));
+    f.insert("platforms".to_string(), field_string(&row.platforms));
+    f.insert("manifest_json".to_string(), field_string(&row.manifest_json));
+    f.insert("is_enabled".to_string(), FieldValue::Bool(row.is_enabled));
+    f.insert("is_system".to_string(), FieldValue::Bool(row.is_system));
+    f.insert(
+        "skill_md".to_string(),
+        field_optional_string(row.skill_md.as_deref()),
+    );
+    f.insert("keywords_json".to_string(), field_string(&row.keywords_json));
+    f.insert("category".to_string(), field_string(&row.category));
+    f.insert(
+        "disambiguation_json".to_string(),
+        field_string(&row.disambiguation_json),
+    );
+    f.insert(
+        "icon".to_string(),
+        field_optional_string(row.icon.as_deref()),
+    );
+    f.insert("runtime".to_string(), field_string(&row.runtime));
+    f.insert(
+        "wasm_size_bytes".to_string(),
+        FieldValue::I64(row.wasm_size_bytes),
+    );
+    f.insert("license".to_string(), field_string(&row.license));
+    f.insert(
+        "show_in_catalog".to_string(),
+        FieldValue::Bool(row.show_in_catalog),
+    );
+    f
 }
 
 fn organization_reseed_fields(
@@ -9992,12 +10121,113 @@ pub fn get_addon_enabled(pool: &DbPool, addon_id: &str) -> Result<Option<bool>> 
 
 /// Ustawia flage is_enabled dla addona. Zwraca false jesli addon nie istnieje.
 pub fn set_addon_enabled(pool: &DbPool, addon_id: &str, enabled: bool) -> Result<bool> {
-    let conn = acquire(pool)?;
-    let rows = conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let rows = tx.execute(
         "UPDATE addons SET is_enabled = ?2, updated_at = datetime('now') WHERE addon_id = ?1",
         rusqlite::params![addon_id, enabled as i64],
     )?;
+    // Replicate the enable/disable to the mesh — bundled instances only.
+    if rows > 0 && addon_is_bundled_tx(&tx, addon_id)? {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "is_enabled".to_string(),
+            crate::sync::ledger::FieldValue::Bool(enabled),
+        );
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonInstance,
+            addon_id,
+            crate::sync::runtime::SqlWriteAction::Update,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(rows > 0)
+}
+
+/// Column list (aliased `a.`) for an addon-instance sync snapshot — single
+/// source of truth for the reseed + insert-capture SELECTs.
+const ADDON_INSTANCE_SYNC_COLS: &str =
+    "a.addon_id, a.name, a.display_name, a.version, a.package_id, a.package_version, \
+     a.description, a.author, a.platforms, a.manifest_json, a.is_enabled, a.is_system, \
+     a.skill_md, a.keywords_json, a.category, a.disambiguation_json, a.icon, a.runtime, \
+     a.wasm_size_bytes, a.license, a.show_in_catalog";
+
+fn addon_is_bundled_tx(tx: &rusqlite::Transaction<'_>, addon_id: &str) -> Result<bool> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM addons a \
+         JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
+         WHERE a.addon_id = ?1 AND p.source = 'bundled'",
+        rusqlite::params![addon_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// True when the installed addon's package is a BUNDLED one (present in every
+/// node's store). Only such instances are eligible for mesh sync.
+pub fn addon_is_bundled(pool: &DbPool, addon_id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM addons a \
+         JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
+         WHERE a.addon_id = ?1 AND p.source = 'bundled'",
+        rusqlite::params![addon_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Emit an addon-instance Insert capture for a freshly installed BUNDLED
+/// instance (no-op for uploaded packages). Called on the ORIGIN node after a
+/// user install; the receiver rebuilds the row + loads the wasm on reconcile.
+pub fn capture_addon_instance_insert(pool: &DbPool, addon_id: &str) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let row = tx
+        .query_row(
+            &format!(
+                "SELECT {ADDON_INSTANCE_SYNC_COLS} FROM addons a \
+                 JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
+                 WHERE a.addon_id = ?1 AND p.source = 'bundled'"
+            ),
+            rusqlite::params![addon_id],
+            addon_instance_row_from_query,
+        )
+        .optional()?;
+    if let Some(row) = row {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonInstance,
+            addon_id,
+            crate::sync::runtime::SqlWriteAction::Insert,
+            addon_instance_changed_fields(&row),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Emit an addon-instance Delete capture. The caller gates on
+/// [`addon_is_bundled`] BEFORE removing the row (so uploaded/never-synced
+/// instances do not emit a tombstone, and the bundled check is possible while
+/// the row still exists).
+pub fn capture_addon_instance_delete(pool: &DbPool, addon_id: &str) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::AddonInstance,
+        addon_id,
+        crate::sync::runtime::SqlWriteAction::Delete,
+        BTreeMap::new(),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Pojedynczy wiersz konfiguracji addona (key/value + flaga secret).

@@ -496,6 +496,9 @@ async fn run_server(args: Args) -> Result<()> {
             .expect("Blad inicjalizacji AddonManager"),
     );
     addon_manager.set_router(router.clone());
+    // Wpiecie reconcilera mesh-sync: gdy zreplikowana instancja addona wyladuje,
+    // sync runtime kaze AddonManagerowi zaladowac/odladowac runtime wg stanu DB.
+    tentaflow_core::sync::runtime::set_global_addon_reconciler(addon_manager.clone());
     router
         .service_manager()
         .set_event_bus(addon_manager.event_bus().clone());

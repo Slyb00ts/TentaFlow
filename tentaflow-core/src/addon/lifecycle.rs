@@ -292,7 +292,8 @@ fn install_core(
     // addon whose templates silently no-op at runtime. Registry insertion
     // happens after the DB COMMIT so a later failure does not leave a flow
     // visible to invokers for an addon that is not actually installed.
-    let compiled_flows = compile_flow_templates(&manifest, addon_dir)?;
+    // Fail-fast validation before any DB write — materialize recompiles+registers.
+    let _ = compile_flow_templates(&manifest, addon_dir)?;
 
     let platforms_json =
         serde_json::to_string(&manifest.platforms).unwrap_or_else(|_| "[\"all\"]".to_string());
@@ -407,7 +408,32 @@ fn install_core(
     // Uprawnienia, narzedzia i limity sa przechowywane w manifest_json
     // (tabela addons.manifest_json zawiera pelny manifest)
 
-    // Limity zasobow — jesli manifest deklaruje [resources], uzyj ich; inaczej domyslne (0 = bez limitu)
+    conn.execute("COMMIT", [])?;
+    drop(conn);
+
+    // Derived state (resource limits, network rules, manifest metadata, per-addon
+    // SQL migrations, compiled flows) — idempotent, shared with the mesh-sync
+    // reconcile path. Runs after COMMIT so a fallible step never leaves the
+    // `addons` row half-materialized in the same tx. The pre-tx flow compile
+    // above already fail-fast-validated the templates before any DB write.
+    materialize_addon_derived_state(db, &manifest, &package_dir)?;
+
+    info!(
+        "Addon '{}' v{} installed ({} WASM bytes, {} permissions, {} tools, {} network rules)",
+        manifest.addon_id,
+        manifest.version,
+        wasm_size,
+        manifest.declared_permissions.len(),
+        manifest.tools.len(),
+        manifest.network_rules.len()
+    );
+
+    Ok(manifest)
+}
+
+/// Upsert per-addon resource limits from the manifest's `[resources]` (or
+/// defaults = no limit). Idempotent. Shared by install + sync reconcile.
+fn upsert_addon_resource_limits(conn: &rusqlite::Connection, manifest: &AddonManifest) -> Result<()> {
     if let Some(ref res) = manifest.resources {
         conn.execute(
             "INSERT OR REPLACE INTO addon_resource_limits \
@@ -422,7 +448,8 @@ fn install_core(
                 res.llm_tokens_per_minute.unwrap_or(0) as i64,
                 res.fuel_limit.unwrap_or(0) as i64,
             ],
-        ).ok();
+        )
+        .ok();
     } else {
         conn.execute(
             "INSERT OR IGNORE INTO addon_resource_limits \
@@ -433,9 +460,12 @@ fn install_core(
         )
         .ok();
     }
+    Ok(())
+}
 
-    // Zapisz reguly sieciowe z manifestu (TCP/UDP + HTTP domains).
-    // Deklaracja nie jest zgoda admina; kazda nowa regula startuje jako blocked.
+/// Upsert declared network rules (each starts `approved=0` — a manifest
+/// declaration is not admin consent). Idempotent. Shared by install + reconcile.
+fn upsert_addon_network_rules(conn: &rusqlite::Connection, manifest: &AddonManifest) -> Result<()> {
     for rule in &manifest.network_rules {
         conn.execute(
             "INSERT OR IGNORE INTO addon_network_rules \
@@ -454,44 +484,35 @@ fn install_core(
         )
         .ok();
     }
+    Ok(())
+}
 
-    conn.execute("COMMIT", [])?;
-    drop(conn);
-
-    // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
-    sync_manifest_metadata(db, &manifest)?;
-
-    // F1a §6.5 M1.W4: jezeli addon deklaruje [storage] sql=true — utworz
-    // per-addon SQLite (przez fs_sandbox::addon_data_dir) i zaaplikuj migracje.
-    // Bez deklaracji storage.sql nic sie nie dzieje — backward compat z istniejacymi
-    // addonami (test-app, teams-bot).
-    if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
-        apply_addon_sql_migrations(&manifest, &package_dir, db)?;
-    }
-
-    // F1c P5 — publish compiled flows as the final install step. Done after
-    // every fallible side-effect (DB tx, metadata sync, per-addon SQL migrate)
-    // so an error path never leaves orphaned registry entries pointing at an
-    // addon row that did not finish landing. Compilation already happened
-    // pre-tx; registration itself is infallible.
+/// Materialize an installed addon's LOCAL derived state from its package files:
+/// resource limits, network rules, manifest metadata (permission catalog, oauth
+/// providers, visibility), per-instance SQL migrations, and compiled flows. The
+/// `addons` row must already exist. Idempotent — used by `install_core` AND by
+/// the mesh-sync reconcile path (a replicated instance row rebuilds its derived
+/// state locally from the package it already has in the store).
+pub(crate) fn materialize_addon_derived_state(
+    db: &DbPool,
+    manifest: &AddonManifest,
+    package_dir: &Path,
+) -> Result<()> {
     {
-        let registry = crate::flow_runtime::registry::global();
-        for flow in compiled_flows {
-            registry.register(&manifest.addon_id, flow);
-        }
+        let conn = db.lock().unwrap();
+        upsert_addon_resource_limits(&conn, manifest)?;
+        upsert_addon_network_rules(&conn, manifest)?;
     }
-
-    info!(
-        "Addon '{}' v{} installed ({} WASM bytes, {} permissions, {} tools, {} network rules)",
-        manifest.addon_id,
-        manifest.version,
-        wasm_size,
-        manifest.declared_permissions.len(),
-        manifest.tools.len(),
-        manifest.network_rules.len()
-    );
-
-    Ok(manifest)
+    sync_manifest_metadata(db, manifest)?;
+    if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
+        apply_addon_sql_migrations(manifest, package_dir, db)?;
+    }
+    let compiled_flows = compile_flow_templates(manifest, package_dir)?;
+    let registry = crate::flow_runtime::registry::global();
+    for flow in compiled_flows {
+        registry.register(&manifest.addon_id, flow);
+    }
+    Ok(())
 }
 
 /// Kopiuje cala zawartosc katalogu zrodlowego addonu (wasm, manifest.toml,

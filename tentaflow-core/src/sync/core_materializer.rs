@@ -27,6 +27,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::SyncPolicy
             | CoreSyncResourceKind::SyncResourceAcl
             | CoreSyncResourceKind::SyncUserOrgProfile
+            | CoreSyncResourceKind::AddonInstance
     )
 }
 
@@ -99,6 +100,7 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::SharedSettingSecret => {
             apply_shared_setting_secret(&tx, settings_cipher, operation)?
         }
+        CoreSyncResourceKind::AddonInstance => apply_addon_instance(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -198,6 +200,75 @@ fn apply_shared_setting_secret(
             .execute(
                 "UPDATE settings SET value = '', updated_at = datetime('now') WHERE key = ?1",
                 rusqlite::params![key],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated installed-addon-instance op to the local `addons` table.
+/// Insert carries the full row (the origin's package is identical here, but
+/// carrying the row keeps the receiver from re-deriving anything in this tx).
+/// Update covers the enable/disable toggle. The runtime is loaded/unloaded by a
+/// post-commit reconcile (see sync runtime), NOT here — no wasmtime in a tx.
+fn apply_addon_instance(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let addon_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO addons \
+                 (addon_id, name, display_name, version, package_id, package_version, description, \
+                  author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, \
+                  category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
+                 ON CONFLICT(addon_id) DO UPDATE SET \
+                 name=excluded.name, display_name=excluded.display_name, version=excluded.version, \
+                 package_id=excluded.package_id, package_version=excluded.package_version, \
+                 description=excluded.description, author=excluded.author, platforms=excluded.platforms, \
+                 manifest_json=excluded.manifest_json, is_enabled=excluded.is_enabled, \
+                 is_system=excluded.is_system, skill_md=excluded.skill_md, keywords_json=excluded.keywords_json, \
+                 category=excluded.category, disambiguation_json=excluded.disambiguation_json, \
+                 icon=excluded.icon, runtime=excluded.runtime, wasm_size_bytes=excluded.wasm_size_bytes, \
+                 license=excluded.license, show_in_catalog=excluded.show_in_catalog, \
+                 updated_at=datetime('now')",
+                rusqlite::params![
+                    addon_id,
+                    field_string(operation, "name")?,
+                    field_string_or(operation, "display_name", "")?,
+                    field_string(operation, "version")?,
+                    field_string_or(operation, "package_id", "")?,
+                    field_string_or(operation, "package_version", "")?,
+                    field_string_or(operation, "description", "")?,
+                    field_string_or(operation, "author", "")?,
+                    field_string_or(operation, "platforms", "all")?,
+                    field_string(operation, "manifest_json")?,
+                    field_bool_or(operation, "is_enabled", true)?,
+                    field_bool_or(operation, "is_system", false)?,
+                    field_optional_string(operation, "skill_md")?,
+                    field_string_or(operation, "keywords_json", "[]")?,
+                    field_string_or(operation, "category", "")?,
+                    field_string_or(operation, "disambiguation_json", "[]")?,
+                    field_optional_string(operation, "icon")?,
+                    field_string_or(operation, "runtime", "wasmtime")?,
+                    field_i64_or(operation, "wasm_size_bytes", 0)?,
+                    field_string_or(operation, "license", "")?,
+                    field_bool_or(operation, "show_in_catalog", true)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => tx
+            .execute(
+                "UPDATE addons SET is_enabled = ?2, updated_at = datetime('now') WHERE addon_id = ?1",
+                rusqlite::params![addon_id, field_bool_or(operation, "is_enabled", true)?],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation)),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM addons WHERE addon_id = ?1",
+                rusqlite::params![addon_id],
             )
             .map_err(sql_error),
     }
