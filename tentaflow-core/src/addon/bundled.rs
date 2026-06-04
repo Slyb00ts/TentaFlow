@@ -6,6 +6,7 @@
 // =============================================================================
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -207,13 +208,33 @@ fn hash_chunk(hasher: &mut Sha256, name: &[u8], bytes: &[u8]) {
 // Sciezka do katalogu wbudowanych addonow
 // =============================================================================
 
-/// Korzen katalogu pakietow addonow (szablonow) na dysku. Kazdy pakiet ma
-/// podkatalog `{package_id}/{version}/` z addon.wasm + manifest.toml +
-/// migrations/. Wersjonowanie pozwala instancjom przypiac konkretna wersje.
+/// Bazowy katalog danych dla store'u pakietow. Ustawiany raz przy boocie przez
+/// binarke (set_packages_base). `dirs::data_dir()` (default) NIE wskazuje
+/// sandboxa na iOS/Android, dlatego mobile/desktop/main wstrzykuja swoj wlasny
+/// katalog danych — pakiety leza wtedy obok bazy i zawsze w zapisywalnym miejscu.
+static PACKAGES_BASE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Ustawia bazowy katalog danych store'u pakietow. Wolac RAZ przy boocie, PRZED
+/// `install_bundled_addons` i startem runtime addonow. Idempotentne (kolejne
+/// wywolania ignorowane). Bez ustawienia uzywany jest fallback `dirs::data_dir()`
+/// (zachowanie dla testow / starych sciezek).
+pub fn set_packages_base(base: PathBuf) {
+    let _ = PACKAGES_BASE.set(base);
+}
+
+/// Korzen katalogu pakietow addonow (szablonow) na dysku: `<base>/packages/`.
+/// Kazdy pakiet ma podkatalog `{package_id}/{version}/` z addon.wasm +
+/// manifest.toml + migrations/. Wersjonowanie pozwala instancjom przypiac
+/// konkretna wersje.
 pub fn packages_root() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("tentaflow-ai")
+    PACKAGES_BASE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("tentaflow-ai")
+        })
         .join("packages")
 }
 

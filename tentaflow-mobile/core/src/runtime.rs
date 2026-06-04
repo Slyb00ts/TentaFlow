@@ -202,6 +202,10 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
         info!("Model residency (lazy-load + memory guard) aktywny (idle 60s)");
     }
 
+    // Store pakietow addonow w sandboxie aplikacji (platform::data_dir), NIE w
+    // dirs::data_dir() ktory na iOS/Android nie wskazuje zapisywalnego sandboxa.
+    tentaflow_core::addon::bundled::set_packages_base(data_dir.clone());
+
     // Zainstaluj wbudowane addony (WASM — wasmi interpreter na mobile)
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
         tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);
