@@ -442,9 +442,16 @@ impl Router {
     // MESH ROUTING
     // ========================================================================
 
-    /// Ustawia mesh manager (wywolane po inicjalizacji mesh pipeline)
+    /// Ustawia mesh manager (wywolane po inicjalizacji mesh pipeline). Przy
+    /// okazji wpina transport mesh do menedzera namespace'ow wektorowych, zeby
+    /// zdalne (cross-node) backendy Milvus mogly proxowac operacje do wlasciciela.
     pub fn set_mesh_manager(&self, manager: Arc<crate::mesh::iroh_manager::IrohMeshManager>) {
-        *self.mesh_manager.write() = Some(manager);
+        *self.mesh_manager.write() = Some(manager.clone());
+        if let Some(db) = self.db.as_ref() {
+            let transport =
+                Arc::new(crate::mesh::vector_transport::MeshVectorTransport::new(manager));
+            crate::services::vector_namespace_manager(db).set_remote_transport(transport);
+        }
     }
 
     pub fn mesh_manager(&self) -> Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>> {

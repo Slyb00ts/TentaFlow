@@ -262,6 +262,16 @@ fn milvus_collection_name(
     s
 }
 
+/// `Some(service_ref)` when the config selects a REMOTE Milvus (source
+/// `service_ref` with a non-empty `node_id`). Local refs and manual URLs → None,
+/// so they fall through to the local (feature-gated) Milvus path.
+fn remote_service_ref(cfg: &VectorBackendConfig) -> Option<&VectorServiceRef> {
+    if cfg.milvus_source.as_deref() != Some("service_ref") {
+        return None;
+    }
+    cfg.service_ref.as_ref().filter(|sr| !sr.node_id.is_empty())
+}
+
 /// Result of [`NamespaceManager::reconcile_namespace`] — the metadata columns
 /// added and dropped to bring the live collection in line with the manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -290,6 +300,12 @@ pub struct NamespaceManager {
     /// Override for the on-disk root — production uses `dirs::home_dir()`;
     /// tests inject a tempdir to avoid polluting `~`.
     root_override: Option<PathBuf>,
+    /// Mesh transport for remote (`service_ref` with a non-empty `node_id`)
+    /// Milvus backends. Injected at router init via [`set_remote_transport`];
+    /// building a remote backend before it is set fails loudly (local backends
+    /// are unaffected). Swappable (RwLock, not OnceLock) so a mesh re-init
+    /// rewires the transport instead of stranding backends on a stale manager.
+    remote_transport: parking_lot::RwLock<Option<Arc<dyn super::remote::RemoteVectorTransport>>>,
 }
 
 impl NamespaceManager {
@@ -298,6 +314,7 @@ impl NamespaceManager {
             pool,
             backends: DashMap::new(),
             root_override: None,
+            remote_transport: parking_lot::RwLock::new(None),
         }
     }
 
@@ -309,7 +326,15 @@ impl NamespaceManager {
             pool,
             backends: DashMap::new(),
             root_override: Some(root),
+            remote_transport: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Inject (or replace) the mesh transport used to reach remote nodes' Milvus
+    /// services. Called at router init; a later mesh re-init overwrites it so
+    /// remote backends never strand on a stale manager.
+    pub fn set_remote_transport(&self, transport: Arc<dyn super::remote::RemoteVectorTransport>) {
+        *self.remote_transport.write() = Some(transport);
     }
 
     fn file_path_for(&self, org_id: &str, addon_id: &str, namespace: &str) -> Result<PathBuf> {
@@ -386,7 +411,17 @@ impl NamespaceManager {
                 file_path, dim, metric, fields, sparse,
             )?)),
             "milvus" => {
-                self.build_milvus(org_id, addon_id, namespace, dim, metric, fields, sparse, &cfg)
+                // service_ref z niepustym node_id => Milvus na innym nodzie:
+                // proxujemy operacje przez mesh (ten node NIE potrzebuje
+                // feature vector-milvus, laczy sie tylko wlasciciel). W p.p.
+                // lokalny Milvus (gated feature).
+                match remote_service_ref(&cfg) {
+                    Some(sr) => self.build_remote_milvus(
+                        org_id, addon_id, namespace, dim, metric, fields, sparse, &cfg, sr,
+                    ),
+                    None => self
+                        .build_milvus(org_id, addon_id, namespace, dim, metric, fields, sparse, &cfg),
+                }
             }
             // Nieznany backend => blad, nie cichy fallback na zvec (ochrona przed
             // utworzeniem pustego namespace zvec gdy intencja byla inna).
@@ -394,6 +429,49 @@ impl NamespaceManager {
                 "addon {addon_id}: nieznany vector backend '{other}' (dozwolone: zvec|milvus)"
             ))),
         }
+    }
+
+    /// Build a `RemoteMeshVectorBackend` proxying ops to the Milvus owned by
+    /// `sr.node_id`. Ungated on purpose: the client only ships CBOR over the
+    /// mesh and never links the Milvus SDK — so a node without `vector-milvus`
+    /// can still use another node's Milvus. The owner connects to its loopback.
+    #[allow(clippy::too_many_arguments)]
+    fn build_remote_milvus(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        dim: u32,
+        metric: Metric,
+        fields: &[FieldSpec],
+        sparse: bool,
+        cfg: &VectorBackendConfig,
+        sr: &VectorServiceRef,
+    ) -> Result<Arc<dyn VectorBackend>> {
+        let transport = self.remote_transport.read().clone().ok_or_else(|| {
+            VectorError::Backend(format!(
+                "addon {addon_id}: zdalny Milvus (node {}) wymaga mesh, ale transport \
+                 nie jest zainicjalizowany",
+                sr.node_id
+            ))
+        })?;
+        let collection =
+            milvus_collection_name(org_id, addon_id, namespace, cfg.collection_override.as_deref());
+        let user = self.addon_cfg(addon_id, CFG_MILVUS_USER);
+        let password = self.addon_cfg(addon_id, CFG_MILVUS_PASSWORD);
+        let be = super::remote::RemoteMeshVectorBackend::new(
+            transport.clone(),
+            sr.node_id.clone(),
+            sr.service_id.clone(),
+            collection,
+            dim,
+            metric,
+            fields.to_vec(),
+            sparse,
+            user,
+            password,
+        );
+        Ok(Arc::new(be))
     }
 
     #[cfg(feature = "vector-milvus")]
