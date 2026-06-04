@@ -32,6 +32,19 @@ fn is_vllm_python_bundle_engine(engine_id: &str) -> bool {
     matches!(engine_id, "vllm" | "vllm-spark" | "vllm-metal")
 }
 
+/// Wstrzykuje `HF_TOKEN` do env procesu silnika z tokenu rozwiazanego per-node
+/// w `deploy()` (secure setting), NIGDY z `user_config` — sekret nie moze trafic
+/// do config_json. Symetria z docker (`vllm_deploy_env`): native bez tego leci do
+/// HF nieuwierzytelniony, a gated/throttled repo (Bielik NVFP4) wisi przy
+/// pobieraniu wag. Sekret idzie ENV procesu, NIGDY przez argv
+/// (`/proc/<pid>/cmdline` jest world-readable). Pusty/biały token pomijamy,
+/// zeby nie nadpisac HF_TOKEN ustawionego gdzie indziej pusta wartoscia.
+fn apply_hf_token_env(hf_token: Option<&str>, env: &mut HashMap<String, String>) {
+    if let Some(token) = hf_token.map(str::trim).filter(|s| !s.is_empty()) {
+        env.insert("HF_TOKEN".into(), token.to_string());
+    }
+}
+
 fn apply_vllm_user_args(
     engine_id: &str,
     user_config: &serde_json::Value,
@@ -61,6 +74,10 @@ pub struct PythonBundleDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
     ports: Arc<PortAllocator>,
+    /// Token HF rozwiazany per-node w `deploy()` z secure setting. Idzie tylko
+    /// do ENV procesu silnika, NIGDY do `user_config`/config_json. `None` = brak
+    /// tokenu (publiczne repo).
+    hf_token: Option<String>,
     log_sink: Option<LogSink>,
     running: Mutex<Option<RunningState>>,
     /// Port zapisany w `services.runtime_port` (gdy respawn istniejącego
@@ -75,15 +92,17 @@ impl PythonBundleDeploy {
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        hf_token: Option<String>,
         log_sink: Option<LogSink>,
     ) -> Self {
-        Self::new_with_port(manifest, user_config, ports, log_sink, None)
+        Self::new_with_port(manifest, user_config, ports, hf_token, log_sink, None)
     }
 
     pub fn new_with_port(
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        hf_token: Option<String>,
         log_sink: Option<LogSink>,
         preserved_port: Option<u16>,
     ) -> Self {
@@ -91,6 +110,7 @@ impl PythonBundleDeploy {
             manifest,
             user_config,
             ports,
+            hf_token,
             log_sink,
             running: Mutex::new(None),
             preserved_port,
@@ -219,6 +239,15 @@ impl DeployStrategy for PythonBundleDeploy {
             env.insert("SERVED_MODEL_NAME".into(), served);
         }
         let is_cuda_vllm = is_cuda_vllm_engine(&engine_id);
+        // HF_TOKEN tylko dla bundli, ktore realnie pobieraja model z HF —
+        // searxng/browser-renderer (python-bundle bez modelu) nie moga dziedziczyc
+        // sekretu. Single source: `engine_uses_hf_model` (jak docker w P2.1).
+        let hf_token_for_env = if super::engine_uses_hf_model(&self.manifest, &self.user_config) {
+            self.hf_token.as_deref()
+        } else {
+            None
+        };
+        apply_hf_token_env(hf_token_for_env, &mut env);
         apply_vllm_user_args(&engine_id, &self.user_config, &mut env);
 
         // Strukturalne argi CLI budowane przez Rust (speculative, gpu-memory).
@@ -556,6 +585,34 @@ mod tests {
     }
 
     #[test]
+    fn apply_hf_token_env_sets_token_when_present() {
+        let mut env = HashMap::new();
+        apply_hf_token_env(Some("hf_abc123"), &mut env);
+        assert_eq!(env.get("HF_TOKEN").map(String::as_str), Some("hf_abc123"));
+    }
+
+    #[test]
+    fn apply_hf_token_env_trims_token() {
+        let mut env = HashMap::new();
+        apply_hf_token_env(Some("  hf_abc123  "), &mut env);
+        assert_eq!(env.get("HF_TOKEN").map(String::as_str), Some("hf_abc123"));
+    }
+
+    #[test]
+    fn apply_hf_token_env_skips_empty_token() {
+        let mut env = HashMap::new();
+        apply_hf_token_env(Some("   "), &mut env);
+        assert!(!env.contains_key("HF_TOKEN"));
+    }
+
+    #[test]
+    fn apply_hf_token_env_skips_missing_token() {
+        let mut env = HashMap::new();
+        apply_hf_token_env(None, &mut env);
+        assert!(!env.contains_key("HF_TOKEN"));
+    }
+
+    #[test]
     fn apply_vllm_user_args_sets_env_for_vllm_spark() {
         let mut env = HashMap::new();
         let config = serde_json::json!({
@@ -641,7 +698,7 @@ mod tests {
             native_source_hash: String::new(),
         };
         let ports = Arc::new(PortAllocator::new((48_000, 48_010), HashSet::new()).unwrap());
-        let mut s = PythonBundleDeploy::new(manifest, serde_json::json!({}), ports, None);
+        let mut s = PythonBundleDeploy::new(manifest, serde_json::json!({}), ports, None, None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Manifest(_)));
     }

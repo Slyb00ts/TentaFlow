@@ -207,6 +207,10 @@ pub struct Supervisor {
     initial_backoff: Duration,
     db: DbPool,
     ports: Arc<PortAllocator>,
+    /// Szyfr `settings` — `respawn()` rozwiazuje przez niego HF_TOKEN tego noda
+    /// dla auto-restartu gated-repo (vLLM/Bielik). Token nigdy nie jest w
+    /// config_json.
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
     snapshot_tx: watch::Sender<Arc<ServicesSnapshot>>,
     restart_state: Arc<Mutex<HashMap<i64, RestartState>>>,
     embedded_probe: Option<Arc<dyn EmbeddedHealthProbe>>,
@@ -248,6 +252,7 @@ impl Supervisor {
         config: &crate::config::ServicesRuntimeConfig,
         db: DbPool,
         ports: Arc<PortAllocator>,
+        settings_cipher: Arc<crate::crypto::SettingsCipher>,
         local_node_id: String,
         mesh_registry: Arc<MeshServicesRegistry>,
         live_handles: Arc<LiveHandlesCache>,
@@ -261,6 +266,7 @@ impl Supervisor {
             initial_backoff: initial,
             db,
             ports,
+            settings_cipher,
             snapshot_tx: tx,
             restart_state: Arc::new(Mutex::new(HashMap::new())),
             embedded_probe: None,
@@ -477,6 +483,7 @@ impl Supervisor {
         let preserved_port = svc.runtime_port;
         let db_for_task = self.db.clone();
         let ports_for_task = self.ports.clone();
+        let settings_cipher_for_task = self.settings_cipher.clone();
 
         tokio::spawn(async move {
             // Heartbeat progress: co 5s update progress_message
@@ -492,6 +499,8 @@ impl Supervisor {
                 deploy_method,
                 &config_json,
                 ports_for_task,
+                &db_for_task,
+                &settings_cipher_for_task,
                 preserved_port,
             );
             tokio::pin!(respawn_fut);
@@ -1063,6 +1072,8 @@ impl Supervisor {
                     svc.deploy_method,
                     &svc.config_json,
                     self.ports.clone(),
+                    &self.db,
+                    &self.settings_cipher,
                     svc.runtime_port,
                 )
                 .await
@@ -1362,6 +1373,10 @@ mod tests {
         Arc::new(PortAllocator::new((lo, hi), Default::default()).unwrap())
     }
 
+    fn cipher_for_test() -> Arc<crate::crypto::SettingsCipher> {
+        Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]))
+    }
+
     fn cfg(
         interval_ms: u64,
         max_restart: u32,
@@ -1437,6 +1452,7 @@ mod tests {
             &conf,
             db.clone(),
             ports,
+            cipher_for_test(),
             "test-node".to_string(),
             Arc::new(MeshServicesRegistry::new()),
             Arc::new(LiveHandlesCache::new()),
@@ -1507,6 +1523,7 @@ mod tests {
             &conf,
             db.clone(),
             ports,
+            cipher_for_test(),
             "test-node".to_string(),
             Arc::new(MeshServicesRegistry::new()),
             Arc::new(LiveHandlesCache::new()),
@@ -1561,6 +1578,7 @@ mod tests {
             &conf,
             db.clone(),
             ports,
+            cipher_for_test(),
             "test-node".to_string(),
             Arc::new(MeshServicesRegistry::new()),
             Arc::new(LiveHandlesCache::new()),
@@ -1680,6 +1698,7 @@ mod tests {
             &conf,
             db.clone(),
             ports,
+            cipher_for_test(),
             "test-node".to_string(),
             Arc::new(MeshServicesRegistry::new()),
             Arc::new(LiveHandlesCache::new()),
@@ -1748,6 +1767,7 @@ mod tests {
             &conf,
             db.clone(),
             ports,
+            cipher_for_test(),
             "test-node".to_string(),
             Arc::new(MeshServicesRegistry::new()),
             Arc::new(LiveHandlesCache::new()),
@@ -1824,6 +1844,7 @@ mod tests {
             &conf,
             db.clone(),
             ports,
+            cipher_for_test(),
             "test-node".to_string(),
             Arc::new(MeshServicesRegistry::new()),
             Arc::new(LiveHandlesCache::new()),
@@ -1876,6 +1897,7 @@ mod tests {
             &conf,
             db.clone(),
             ports,
+            cipher_for_test(),
             "test-node".to_string(),
             Arc::new(MeshServicesRegistry::new()),
             Arc::new(LiveHandlesCache::new()),
@@ -1931,6 +1953,7 @@ mod tests {
             &conf,
             db,
             ports,
+            cipher_for_test(),
             "local-node".to_string(),
             registry.clone(),
             cache.clone(),

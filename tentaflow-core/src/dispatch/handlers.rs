@@ -3451,10 +3451,26 @@ pub async fn service_manifest_deploy(
     let local_node_id = ctx.state.local_node_id.as_ref();
     if !payload.node_id.is_empty() && payload.node_id != local_node_id {
         let target = payload.node_id.clone();
+        // Sekret HF musi zostac zdjety ZANIM config_json poleci przez mesh.
+        // Legacy klient (lub wlasciciel) moze umiescic `hf_token` w payloadzie —
+        // bez tego stripu token TEGO noda wycieklby do odbiorcy. Odbiorca i tak
+        // rozwiazuje WLASNY token lokalnie z secure setting (`deploy()`), wiec
+        // sekret nigdy nie opuszcza noda.
+        let forwarded_config_json = if payload.config_json.is_empty() {
+            payload.config_json.clone()
+        } else {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&payload.config_json).map_err(|e| {
+                    ProtocolError::bad_request(format!("invalid config_json: {}", e))
+                })?;
+            let sanitized = crate::services::deploy::strip_hf_token(&parsed);
+            serde_json::to_string(&sanitized)
+                .map_err(|e| ProtocolError::internal(e.to_string()))?
+        };
         let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeployRemote {
             engine_id: payload.engine_id.clone(),
             deploy_method: payload.deploy_method.clone(),
-            config_json: payload.config_json.clone(),
+            config_json: forwarded_config_json,
         };
         let iroh =
             ctx.state.quic_mesh.clone().ok_or_else(|| {
@@ -3556,6 +3572,10 @@ pub async fn service_manifest_deploy(
     let deploy_method = resolve_deploy_method(&manifest, &payload.deploy_method)
         .map_err(ProtocolError::bad_request)?;
 
+    // Token HF NIE jest wstrzykiwany do user_config tutaj — sekret nie moze
+    // trafic do config_json (services + deployments ida do bazy plaintextem i
+    // replikuja sie przez sync). `deploy()` rozwiazuje go per-node z secure
+    // setting i wstrzykuje wylacznie do ENV procesu silnika.
     let user_config: serde_json::Value = if payload.config_json.is_empty() {
         serde_json::Value::Object(serde_json::Map::new())
     } else {
@@ -3636,6 +3656,7 @@ pub async fn service_manifest_deploy(
         });
     }
     let db_clone = ctx.state.db.clone();
+    let settings_cipher_task = ctx.state.settings_cipher.clone();
     let job_task = job.clone();
     let slug_task = slug.clone();
     let manifest_task = manifest.clone();
@@ -3657,6 +3678,7 @@ pub async fn service_manifest_deploy(
             &user_config_task,
             &port_allocator,
             &db_clone,
+            &settings_cipher_task,
             Some(log_sender_task.clone()),
         )
         .await;
@@ -6424,6 +6446,8 @@ pub async fn service_start(
         svc.deploy_method,
         &svc.config_json,
         port_allocator,
+        &ctx.state.db,
+        &ctx.state.settings_cipher,
         svc.runtime_port,
     )
     .await;
@@ -6653,6 +6677,7 @@ pub async fn service_update(
                 );
             }
             let db = ctx.state.db.clone();
+            let settings_cipher = ctx.state.settings_cipher.clone();
             let svc_id = payload.service_id;
             let engine_id = svc.engine_id.clone();
             let deploy_method = svc.deploy_method;
@@ -6664,6 +6689,8 @@ pub async fn service_update(
                     deploy_method,
                     &cfg_json,
                     ports,
+                    &db,
+                    &settings_cipher,
                     preserved_port,
                 )
                 .await

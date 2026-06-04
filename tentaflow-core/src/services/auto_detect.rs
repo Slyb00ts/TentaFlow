@@ -23,7 +23,11 @@ use crate::services_repo::services::{self as services_repo, DeployMethod};
 /// if reachable. Returns `Ok(Some(id))` when a new row was inserted,
 /// `Ok(None)` when nothing changed (binary missing, daemon down, or already
 /// registered), and `Err` only on unexpected DB errors.
-pub async fn auto_register_ollama(db: &DbPool, ports: Arc<PortAllocator>) -> Result<Option<i64>> {
+pub async fn auto_register_ollama(
+    db: &DbPool,
+    ports: Arc<PortAllocator>,
+    settings_cipher: &crate::crypto::SettingsCipher,
+) -> Result<Option<i64>> {
     // 1. Manifest must be in the registry — it carries the canonical
     //    detection_endpoint and detection_health_path.
     let reg = registry();
@@ -105,6 +109,7 @@ pub async fn auto_register_ollama(db: &DbPool, ports: Arc<PortAllocator>) -> Res
         &user_config,
         &ports,
         db,
+        settings_cipher,
         None,
     )
     .await

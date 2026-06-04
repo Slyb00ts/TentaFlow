@@ -424,6 +424,7 @@ async fn run_server(args: Args) -> Result<()> {
             &services_runtime_cfg,
             db.clone(),
             port_allocator,
+            settings_cipher.clone(),
             local_node_id_str.clone(),
             mesh_services_registry.clone(),
             live_handles,
@@ -460,10 +461,12 @@ async fn run_server(args: Args) -> Result<()> {
     // requirement.
     if let Some(port_allocator) = services_port_allocator.clone() {
         let db_for_detect = db.clone();
+        let settings_cipher_for_detect = settings_cipher.clone();
         tokio::spawn(async move {
             if let Err(e) = tentaflow_core::services::auto_detect::auto_register_ollama(
                 &db_for_detect,
                 port_allocator,
+                &settings_cipher_for_detect,
             )
             .await
             {
@@ -724,6 +727,7 @@ async fn run_server(args: Args) -> Result<()> {
             local_node_id_str.clone(),
             mesh_services_registry.clone(),
             quic_mesh_for_server.clone(),
+            settings_cipher.clone(),
         )
         .await;
     }
@@ -914,6 +918,7 @@ async fn resume_interrupted_deployments(
     local_node_id: String,
     mesh_services_registry: Arc<tentaflow_core::services::mesh_registry::MeshServicesRegistry>,
     quic_mesh: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>>,
+    settings_cipher: Arc<tentaflow_core::crypto::SettingsCipher>,
 ) {
     let rows = match db.lock() {
         Ok(conn) => match tentaflow_core::services_repo::deployments::list_resumable(&conn) {
@@ -1030,6 +1035,7 @@ async fn resume_interrupted_deployments(
         let quic_task = quic_mesh.clone();
         let manifest_task = manifest.clone();
         let config_task = user_config.clone();
+        let cipher_task = settings_cipher.clone();
         let deploy_id_task = deploy_id.clone();
         let job = tentaflow_core::services::deploy::DeployJob {
             deploy_id,
@@ -1076,6 +1082,7 @@ async fn resume_interrupted_deployments(
                 &config_task,
                 &ports_task,
                 &db_task,
+                &cipher_task,
                 Some(sender_task.clone()),
             )
             .await;

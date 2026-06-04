@@ -1861,14 +1861,20 @@ fn spawn_engine(
     let vllm_cache = crate::paths::vllm_cache_dir();
     let _ = std::fs::create_dir_all(&vllm_cache);
     for (k, v) in [
-        ("HF_HOME", hf.clone()),
-        ("HUGGINGFACE_HUB_CACHE", hf.clone()),
-        ("TRANSFORMERS_CACHE", hf.clone()),
-        ("TORCH_HOME", torch.clone()),
+        ("HF_HOME", hf.clone().into_os_string()),
+        ("HUGGINGFACE_HUB_CACHE", hf.clone().into_os_string()),
+        ("TRANSFORMERS_CACHE", hf.clone().into_os_string()),
+        ("TORCH_HOME", torch.clone().into_os_string()),
         // Shared vLLM kernel cache (host path for native; Docker uses
         // CONTAINER_VLLM_CACHE_PATH from standard_engine_env). Persists
         // Triton/torch.compile/FlashInfer JIT across restarts.
-        ("VLLM_CACHE_ROOT", vllm_cache.clone()),
+        ("VLLM_CACHE_ROOT", vllm_cache.clone().into_os_string()),
+        // Read-timeout (sekundy) dla huggingface_hub. Bez niego martwe/throttled
+        // polaczenie z HF CDN (sockety w CLOSE-WAIT) wisi w nieskonczonosc przy
+        // pobieraniu wielogigabajtowych wag. Po timeoucie hub retryuje + resume
+        // zamiast czekac wiecznie. NIE wlaczamy HF_HUB_ENABLE_HF_TRANSFER —
+        // wymaga pakietu hf_transfer w venv (ImportError gdy go brak).
+        ("HF_HUB_DOWNLOAD_TIMEOUT", std::ffi::OsString::from("30")),
     ] {
         if !req.env.contains_key(k) {
             cmd.env(k, &v);
