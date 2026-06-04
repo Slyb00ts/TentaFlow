@@ -34,6 +34,16 @@ use tentaflow_protocol::mesh::{
 static SYNC_RUNTIME: OnceLock<Arc<SyncRuntime>> = OnceLock::new();
 const BLOB_SYNC_CHUNK_SIZE: usize = 1024 * 1024;
 
+/// Post-apply hook: when a replicated addon-instance op lands (install / enable
+/// toggle / uninstall), the sync runtime asks the addon manager to make the
+/// local runtime match the new DB state (load/unload the wasm from the package
+/// store). Kept as a trait so the sync layer stays decoupled from AddonManager
+/// and so reconcile (wasmtime work) runs OUTSIDE the materializer transaction.
+pub trait AddonSyncReconciler: Send + Sync {
+    /// Idempotent: make the runtime match the DB row for `addon_id`.
+    fn reconcile_addon(&self, addon_id: &str);
+}
+
 pub struct SyncRuntime {
     db: DbPool,
     ledger: Arc<FjallSyncLedgerStore>,
@@ -41,6 +51,8 @@ pub struct SyncRuntime {
     local_node_id: String,
     settings_cipher: Arc<crate::crypto::SettingsCipher>,
     hlc: HlcClock,
+    /// Set once at startup; runs after a synced addon-instance op commits.
+    addon_reconciler: parking_lot::RwLock<Option<Arc<dyn AddonSyncReconciler>>>,
 }
 
 struct RuntimeSigner {
@@ -131,6 +143,7 @@ pub fn init(
         local_node_id,
         settings_cipher,
         hlc,
+        addon_reconciler: parking_lot::RwLock::new(None),
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
     Ok(SYNC_RUNTIME
@@ -181,6 +194,15 @@ pub fn core_hlc_now() -> HybridLogicalTimestamp {
     match SYNC_RUNTIME.get() {
         Some(runtime) => runtime.hlc_now(),
         None => fallback_hlc().now(),
+    }
+}
+
+/// Wire the addon reconciler onto the global sync runtime (startup). No-op if
+/// the runtime is not initialized (e.g. sync disabled) — replicated addon ops
+/// simply won't trigger a runtime reconcile in that case.
+pub fn set_global_addon_reconciler(reconciler: Arc<dyn AddonSyncReconciler>) {
+    if let Some(runtime) = SYNC_RUNTIME.get() {
+        runtime.set_addon_reconciler(reconciler);
     }
 }
 
@@ -425,6 +447,11 @@ pub fn resolve_addon_sync_conflict(
 }
 
 impl SyncRuntime {
+    /// Wire the addon reconciler (called at startup once the AddonManager exists).
+    pub fn set_addon_reconciler(&self, reconciler: Arc<dyn AddonSyncReconciler>) {
+        *self.addon_reconciler.write() = Some(reconciler);
+    }
+
     fn record_sql_capture(&self, capture: SqlWriteCapture) -> LedgerResult<SqlCaptureRecordResult> {
         let op = self.build_operation(&capture)?;
         let append = self.ledger.append_operation(op, &self.signer)?;
@@ -1303,6 +1330,11 @@ impl SyncRuntime {
         let mut entries = self.ledger.list_unapplied_inbox(limit)?;
         entries.sort_by(|left, right| inbox_apply_order(left).cmp(&inbox_apply_order(right)));
         let mut applied = 0usize;
+        // Addon-instance reconciles are deferred until AFTER the drain loop (and
+        // deduped) so heavy runtime work (wasmtime load, SQL migrations, flow
+        // compile) never interleaves with — and stalls — applying other ops.
+        let mut pending_addon_reconciles: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         for entry in entries {
             if entry.operation.body.resource_type == "core.blob" {
                 match apply_blob_operation(&entry.operation) {
@@ -1337,6 +1369,12 @@ impl SyncRuntime {
                         self.ledger
                             .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
                         applied += 1;
+                        // A replicated addon instance landed — defer the runtime
+                        // reconcile to after the drain loop (deduped).
+                        if entry.operation.body.resource_type == "core.addon_instance" {
+                            pending_addon_reconciles
+                                .insert(entry.operation.body.resource_id.clone());
+                        }
                     }
                     Err(e) => {
                         self.ledger.mark_inbox_conflicted(
@@ -1404,6 +1442,16 @@ impl SyncRuntime {
                         entry.operation.op_id.to_hex(),
                         e
                     );
+                }
+            }
+        }
+        // Run deferred addon reconciles once, after all ops in this batch are
+        // applied. Idempotent ("make runtime match DB"); a later op for the same
+        // addon will reconcile again on the next drain.
+        if !pending_addon_reconciles.is_empty() {
+            if let Some(reconciler) = self.addon_reconciler.read().clone() {
+                for addon_id in &pending_addon_reconciles {
+                    reconciler.reconcile_addon(addon_id);
                 }
             }
         }
@@ -2358,6 +2406,7 @@ mod tests {
                 local_node_id,
                 settings_cipher: make_settings_cipher(key_seed),
                 hlc,
+                addon_reconciler: parking_lot::RwLock::new(None),
             },
             _ledger_dir: ledger_dir,
         }
@@ -2379,6 +2428,7 @@ mod tests {
             local_node_id,
             settings_cipher: make_settings_cipher(key_seed),
             hlc,
+            addon_reconciler: parking_lot::RwLock::new(None),
         }
     }
 

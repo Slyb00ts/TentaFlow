@@ -525,6 +525,12 @@ pub struct AddonManager {
     addon_op_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
+impl crate::sync::runtime::AddonSyncReconciler for AddonManager {
+    fn reconcile_addon(&self, addon_id: &str) {
+        self.reconcile_synced_addon(addon_id);
+    }
+}
+
 /// Returns the subset of `owned` alias names that should be activated on
 /// addon start: every name owned by the addon **except** the ones the
 /// manifest marks with `[gate]`. Pure function — separated out so the
@@ -734,6 +740,69 @@ impl AddonManager {
             }
         }
         Ok(())
+    }
+
+    /// Make the local runtime match the (possibly just-replicated) `addons` row:
+    /// load + materialize derived state when the instance is installed & enabled,
+    /// unload when it is disabled or removed. Idempotent. Called by the mesh-sync
+    /// reconcile hook after a replicated `core.addon_instance` op commits.
+    ///
+    /// Bundled packages only: if the package files are not in the local store
+    /// (uploaded-package byte transport is a later phase), this logs and skips —
+    /// the row stays in the DB but the runtime is not loaded.
+    fn reconcile_synced_addon(&self, addon_id: &str) {
+        let addon = match crate::db::repository::get_addon(&self.db, addon_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                // Uninstalled on origin → unload here.
+                self.unregister_addon_runtime(addon_id);
+                info!("sync reconcile: addon '{addon_id}' usuniety — odladowano runtime");
+                return;
+            }
+            Err(e) => {
+                warn!("sync reconcile addon '{addon_id}': blad odczytu wiersza: {e}");
+                return;
+            }
+        };
+        if !addon.is_enabled {
+            self.unregister_addon_runtime(addon_id);
+            return;
+        }
+        let pkg_dir =
+            crate::addon::bundled::package_dir(&addon.package_id, &addon.package_version);
+        if !pkg_dir.join("manifest.toml").exists() {
+            warn!(
+                "sync reconcile addon '{addon_id}': pakiet '{}' v{} brak w lokalnym store — \
+                 pomijam (transport pakietow uploaded jeszcze niezaimplementowany)",
+                addon.package_id, addon.package_version
+            );
+            return;
+        }
+        let manifest = match self.load_addon_manifest(addon_id) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("sync reconcile addon '{addon_id}': blad manifestu: {e}");
+                return;
+            }
+        };
+        // Odladuj przed ponownym zaladowaniem — idempotentny, czysty stan runtime
+        // (np. po zmianie enable albo ponownym reconcile tej samej instancji).
+        self.unregister_addon_runtime(addon_id);
+        // Materializacja musi sie udac PRZED rejestracja runtime — inaczej
+        // zaladowalibysmy enabled addon bez migracji SQL / metadanych / flow.
+        if let Err(e) =
+            crate::addon::lifecycle::materialize_addon_derived_state(&self.db, &manifest, &pkg_dir)
+        {
+            warn!(
+                "sync reconcile addon '{addon_id}': blad materializacji stanu — NIE laduje runtime: {e}"
+            );
+            return;
+        }
+        if let Err(e) = self.register_addon_runtime(&manifest, &pkg_dir) {
+            warn!("sync reconcile addon '{addon_id}': blad rejestracji runtime: {e}");
+            return;
+        }
+        info!("sync reconcile: addon '{addon_id}' zsynchronizowany i zaladowany");
     }
 
     /// Iterates `manifest.aliases` and registers each in `model_aliases`

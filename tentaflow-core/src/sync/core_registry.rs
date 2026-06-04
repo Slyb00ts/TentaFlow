@@ -26,6 +26,7 @@ pub enum CoreSyncResourceKind {
     SyncResourceAcl,
     SyncExplicitShare,
     SharedSettingSecret,
+    AddonInstance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +218,20 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "external-credentials",
+    },
+    // Installed addon instances (the `addons` row). Bundled-package instances
+    // replicate fleet-wide; the receiver loads the wasm from its own (identical)
+    // bundled package store via a post-apply runtime reconcile. Uploaded-package
+    // instances are NOT captured until package-byte transport exists. Per-addon
+    // config + secrets are separate (secrets stay node-local).
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AddonInstance,
+        table_name: "addons",
+        resource_type: "core.addon_instance",
+        primary_key_column: "addon_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "addons",
     },
 ];
 

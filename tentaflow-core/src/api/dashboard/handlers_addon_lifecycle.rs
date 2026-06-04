@@ -424,6 +424,26 @@ pub fn addon_uninstall(
         ));
     }
 
+    // Emit the mesh delete tombstone BEFORE removing the row — a durable
+    // pre-delete capture so a crash mid-uninstall can never strand peers with
+    // the addon still installed. Gated bundled (uploaded/never-synced instances
+    // must not emit a tombstone) while the row still exists for the check. If
+    // the uninstall below then fails, baseline reseed re-emits a newer Insert
+    // that supersedes this tombstone (LWW) — self-healing.
+    if repository::addon_is_bundled(&ctx.state.db, &payload.addon_id)
+        .map_err(db_err)
+        .unwrap_or(false)
+    {
+        if let Err(e) =
+            repository::capture_addon_instance_delete(&ctx.state.db, &payload.addon_id)
+        {
+            tracing::warn!(
+                "addon uninstall: capture delete sync nieudany dla '{}': {e}",
+                payload.addon_id
+            );
+        }
+    }
+
     // Odinstalowanie instancji: przez managera (unregister runtime toole/flow
     // bloki + zatrzymanie wasm + purge katalogu danych instancji). Headless bez
     // managera (brak runtime addonow) — sama warstwa DB + purge danych.
@@ -1191,11 +1211,14 @@ pub fn addon_instance_dispatch(
             }
             let mgr = addon_manager(ctx)?;
             let res = match mgr.install_instance(&r.package_id, &r.version, name) {
-                Ok(addon_id) => AddonInstanceInstallResponse {
-                    ok: true,
-                    addon_id: Some(addon_id),
-                    error: None,
-                },
+                Ok(addon_id) => {
+                    capture_addon_instance_sync(db, &addon_id);
+                    AddonInstanceInstallResponse {
+                        ok: true,
+                        addon_id: Some(addon_id),
+                        error: None,
+                    }
+                }
                 Err(e) => AddonInstanceInstallResponse {
                     ok: false,
                     addon_id: None,
@@ -1212,11 +1235,14 @@ pub fn addon_instance_dispatch(
             }
             let mgr = addon_manager(ctx)?;
             let res = match mgr.duplicate_instance(&r.source_addon_id, name) {
-                Ok(addon_id) => AddonInstanceInstallResponse {
-                    ok: true,
-                    addon_id: Some(addon_id),
-                    error: None,
-                },
+                Ok(addon_id) => {
+                    capture_addon_instance_sync(db, &addon_id);
+                    AddonInstanceInstallResponse {
+                        ok: true,
+                        addon_id: Some(addon_id),
+                        error: None,
+                    }
+                }
                 Err(e) => AddonInstanceInstallResponse {
                     ok: false,
                     addon_id: None,
@@ -1237,10 +1263,13 @@ pub fn addon_instance_dispatch(
             validate_addon_id(&r.addon_id)?;
             let mgr = addon_manager(ctx)?;
             let res = match mgr.update_instance(&r.addon_id, &r.target_version) {
-                Ok(()) => AddonInstanceUpdateResponse {
-                    ok: true,
-                    error: None,
-                },
+                Ok(()) => {
+                    capture_addon_instance_sync(db, &r.addon_id);
+                    AddonInstanceUpdateResponse {
+                        ok: true,
+                        error: None,
+                    }
+                }
                 Err(e) => AddonInstanceUpdateResponse {
                     ok: false,
                     error: Some(e.to_string()),
@@ -1825,6 +1854,14 @@ fn discover_remote_milvus_services(ctx: &HandlerContext) -> Vec<AddonMilvusServi
             }
         })
         .collect()
+}
+
+/// Origin-side: replicate an installed/updated bundled addon instance to the
+/// mesh. Best-effort — a sync-capture failure never fails the user's action.
+fn capture_addon_instance_sync(db: &crate::db::DbPool, addon_id: &str) {
+    if let Err(e) = repository::capture_addon_instance_insert(db, addon_id) {
+        tracing::warn!("addon instance sync capture nieudany dla '{addon_id}': {e}");
+    }
 }
 
 /// Lista lokalnych serwisow Milvus (engine_id='milvus') dla pickera. Lokalny
