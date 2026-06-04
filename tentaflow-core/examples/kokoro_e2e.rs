@@ -8,15 +8,25 @@
 //     "Hello world" af_heart /tmp/whisper-test/kokoro.wav
 // =============================================================================
 
-#![cfg(feature = "inference-mlx-kokoro")]
+// Kokoro MLX dziala tylko z feature inference-mlx-kokoro; bez niej przyklad
+// kompiluje sie do stub main, zeby `cargo test --no-run` na innych konfiguracjach
+// nie wywracal sie na braku `main`.
+#[cfg(not(feature = "inference-mlx-kokoro"))]
+fn main() {
+    eprintln!("kokoro_e2e wymaga feature inference-mlx-kokoro — pomijam");
+}
 
+#[cfg(feature = "inference-mlx-kokoro")]
 use anyhow::Result;
+#[cfg(feature = "inference-mlx-kokoro")]
 use std::path::PathBuf;
+#[cfg(feature = "inference-mlx-kokoro")]
 use tentaflow_core::tts::{
     mlx_kokoro::{prepare_model, MlxKokoroEngine},
     SynthesizeParams, TtsEngine,
 };
 
+#[cfg(feature = "inference-mlx-kokoro")]
 fn write_wav(samples: &[f32], sample_rate: u32, path: &str) -> Result<()> {
     use std::io::Write;
     let n = samples.len();
@@ -46,6 +56,7 @@ fn write_wav(samples: &[f32], sample_rate: u32, path: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "inference-mlx-kokoro")]
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();

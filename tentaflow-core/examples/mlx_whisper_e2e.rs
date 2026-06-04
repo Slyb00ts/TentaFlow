@@ -7,16 +7,26 @@
 //           mlx-community/whisper-large-v3-turbo-4bit /tmp/whisper-test/long.wav en
 // =============================================================================
 
-#![cfg(feature = "inference-mlx-whisper")]
+// MLX Whisper dziala tylko z feature inference-mlx-whisper; bez niej przyklad
+// kompiluje sie do stub main, zeby `cargo test --no-run` na innych konfiguracjach
+// nie wywracal sie na braku `main`.
+#[cfg(not(feature = "inference-mlx-whisper"))]
+fn main() {
+    eprintln!("mlx_whisper_e2e wymaga feature inference-mlx-whisper — pomijam");
+}
 
+#[cfg(feature = "inference-mlx-whisper")]
 use std::path::PathBuf;
 
+#[cfg(feature = "inference-mlx-whisper")]
 use anyhow::Result;
+#[cfg(feature = "inference-mlx-whisper")]
 use tentaflow_core::stt::{
     mlx_whisper::{prepare_model, MlxWhisperEngine},
     SttEngine, TranscribeParams,
 };
 
+#[cfg(feature = "inference-mlx-whisper")]
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();

@@ -31,7 +31,9 @@ async fn run_whisper(
     audio_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use std::time::Instant;
-    use tentaflow_core::stt::{whisper::WhisperEngine, SttEngine, TranscribeParams};
+    use tentaflow_core::stt::{
+        whisper::WhisperEngine, SttEngine, TranscribeParams, WhisperDeployParams,
+    };
 
     if !model_path.exists() {
         anyhow::bail!("model file not found: {}", model_path.display());
@@ -41,7 +43,9 @@ async fn run_whisper(
 
     let started = Instant::now();
     let engine = WhisperEngine::new();
-    let info = engine.load_model(&model_path, None).await?;
+    let info = engine
+        .load_model(&model_path, None, &WhisperDeployParams::default())
+        .await?;
     eprintln!(
         "+++ loaded in {:.1}s — name={} backend={} device={}",
         started.elapsed().as_secs_f32(),
