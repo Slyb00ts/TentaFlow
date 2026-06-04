@@ -171,16 +171,16 @@ fn namespace_manager_routes_to_milvus_per_addon_config() {
     let pool = tentaflow_core::db::init(&dir.path().join("test.db")).expect("init db");
     {
         let conn = pool.lock().unwrap();
+        // Structured `__vector_config` (manual external Milvus) — the format the
+        // backend picker persists and NamespaceManager reads.
+        let cfg = format!(
+            r#"{{"backend":"milvus","milvus_source":"manual","manual_uri":"{}"}}"#,
+            url()
+        );
         conn.execute(
             "INSERT INTO addon_config (addon_id, key, value, is_secret, updated_at) \
              VALUES (?1, ?2, ?3, 0, datetime('now'))",
-            params!["addon_milvus", "__vector_backend", "milvus"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO addon_config (addon_id, key, value, is_secret, updated_at) \
-             VALUES (?1, ?2, ?3, 0, datetime('now'))",
-            params!["addon_milvus", "__milvus_uri", url()],
+            params!["addon_milvus", "__vector_config", cfg],
         )
         .unwrap();
     }
