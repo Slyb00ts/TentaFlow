@@ -742,7 +742,9 @@ fn prepare_instance_env(
 /// cuda_compile_cache) ktore zapisuja absolutne sciezki do plikow zrodlowych
 /// z konkretnej instancji venv. Po rebuild venv te cache zwracaja stale
 /// referencje i lamia kompilacje on-demand. Wywolujemy przy kazdej zmianie
-/// template_id (== zmiana bundle.toml / requirements.lock / Dockerfile).
+/// template_id (== zmiana build-relevant wejsc: requirements.lock, git_ref,
+/// install_variants.env itd. — patrz `template_identity`; `[launch]` z
+/// bundle.toml NIE liczy sie do template_id).
 fn purge_global_jit_caches(log: &LogSink) {
     let Some(home) = dirs::home_dir() else {
         return;
@@ -793,6 +795,12 @@ fn template_identity(
     if let Some(mode) = &spec.bundle.install_mode {
         hasher.update(mode.as_bytes());
     }
+    if let Some(ver) = &spec.bundle.vllm_version {
+        hasher.update(ver.as_bytes());
+    }
+    if let Some(repo) = &spec.bundle.vllm_metal_repo {
+        hasher.update(repo.as_bytes());
+    }
 
     if let Some(v) = variant {
         hasher.update(v.backend.as_bytes());
@@ -805,11 +813,34 @@ fn template_identity(
         for extra in &v.extras_no_build_isolation {
             hasher.update(extra.as_bytes());
         }
+        // `env` (np. TORCH_CUDA_ARCH_LIST) i `force_pins` realnie zmieniaja
+        // skompilowane kernele / rozwiazany graf pakietow → musza wejsc do
+        // hasha. HashMap nie ma deterministycznej kolejnosci, wiec sortujemy
+        // klucze przed mieszaniem.
+        let mut env_kv: Vec<(&String, &String)> = v.env.iter().collect();
+        env_kv.sort();
+        for (k, val) in env_kv {
+            hasher.update(k.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(val.as_bytes());
+            hasher.update([0u8]);
+        }
+        for pin in &v.force_pins {
+            hasher.update(pin.as_bytes());
+        }
     }
 
+    // Hashujemy pliki bundla (requirements.lock, patche, skrypty) — ale
+    // POMIJAMY `bundle.toml`. Jego pola build-relevant sa juz wmieszane jawnie
+    // powyzej; reszta to sekcja `[launch]` (command/args/env) ktora dotyczy
+    // WYLACZNIE runtime. Gdyby bundle.toml wchodzil tu w calosci, zmiana flagi
+    // startowej (np. dodanie `--served-model-name`) zmienialaby template_id i
+    // wymuszala pelny `pip install -e` (rekompilacja kerneli CUDA, 20-30 min)
+    // mimo ze venv jest identyczny.
     let mut files: Vec<PathBuf> = std::fs::read_dir(bundle_src)?
         .filter_map(|e| e.ok().map(|x| x.path()))
         .filter(|p| p.is_file())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some("bundle.toml"))
         .collect();
     files.sort();
     for file in files {
@@ -2841,5 +2872,65 @@ mod tests {
             std::env::remove_var("TENTAFLOW_CACHE_DIR");
         }
         assert_eq!(root, temp.path());
+    }
+
+    /// template_id musi byc niezmienniczy na zmiany sekcji `[launch]` (flagi
+    /// runtime jak `--served-model-name`) — inaczej kazda zmiana flagi kasuje
+    /// zbudowany venv i wymusza 20-30 min rekompilacji kerneli. Zmiana wejsc
+    /// build (requirements.lock, install_variants.env) MUSI zmieniac id.
+    #[test]
+    fn template_identity_ignores_launch_but_tracks_build_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("requirements.lock");
+        std::fs::write(&lock, "vllm==0.21.0\n").unwrap();
+        // bundle.toml jest pomijany w hashu — jego tresc nie powinna ruszac id.
+        std::fs::write(
+            dir.path().join("bundle.toml"),
+            "[launch]\nargs = [\"--model\", \"x\"]\n",
+        )
+        .unwrap();
+
+        let base = vllm_bundle_spec();
+        let id0 = template_identity(&base, None, dir.path()).unwrap();
+
+        // 1) Zmiana launch args (spec) — ten sam id.
+        let mut launch_changed = vllm_bundle_spec();
+        launch_changed
+            .launch
+            .args
+            .push("--served-model-name".to_string());
+        launch_changed.launch.args.push("bielik".to_string());
+        let id_launch = template_identity(&launch_changed, None, dir.path()).unwrap();
+        assert_eq!(id0, id_launch, "launch args nie moga zmieniac template_id");
+
+        // 2) Zmiana tresci bundle.toml (pominiety plik) — ten sam id.
+        std::fs::write(
+            dir.path().join("bundle.toml"),
+            "[launch]\nargs = [\"--served-model-name\", \"bielik\"]\n",
+        )
+        .unwrap();
+        let id_toml = template_identity(&base, None, dir.path()).unwrap();
+        assert_eq!(id0, id_toml, "tresc bundle.toml nie moze zmieniac template_id");
+
+        // 3) Zmiana requirements.lock — INNY id.
+        std::fs::write(&lock, "vllm==0.21.1\n").unwrap();
+        let id_lock = template_identity(&base, None, dir.path()).unwrap();
+        assert_ne!(id0, id_lock, "zmiana requirements.lock musi zmienic id");
+
+        // 4) Zmiana install_variants.env (np. TORCH_CUDA_ARCH_LIST) — INNY id.
+        std::fs::write(&lock, "vllm==0.21.0\n").unwrap();
+        let mut env = HashMap::new();
+        env.insert("TORCH_CUDA_ARCH_LIST".to_string(), "12.1a".to_string());
+        let variant = InstallVariant {
+            backend: "cuda-spark".to_string(),
+            extra_index: None,
+            extras: vec![],
+            extras_no_build_isolation: vec![],
+            install_hint: None,
+            env,
+            force_pins: vec![],
+        };
+        let id_env = template_identity(&base, Some(&variant), dir.path()).unwrap();
+        assert_ne!(id0, id_env, "zmiana install_variants.env musi zmienic id");
     }
 }
