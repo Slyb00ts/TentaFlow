@@ -454,6 +454,12 @@ pub struct Addon {
     pub runtime: String,
     /// Size of the compiled WASM module in bytes (captured at install/upgrade time).
     pub wasm_size_bytes: i64,
+    /// Multi-instance: pakiet (szablon), z ktorego ta instancja pochodzi.
+    pub package_id: String,
+    /// Przypieta wersja pakietu tej instancji.
+    pub package_version: String,
+    /// Nazwa instancji nadana przez usera.
+    pub display_name: String,
 }
 
 /// Sekret addonu (zaszyfrowany per addon per user)
