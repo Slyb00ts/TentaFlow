@@ -5250,8 +5250,8 @@ pub fn addon_kv_stats(pool: &DbPool, addon_id: &str) -> Result<(i64, i64, i64)> 
 }
 
 /// Lista namespace'ow wektorowych addona z cachowana liczba wektorow:
-/// (namespace, dim, metric, count). Czyta tabele `addon_vector_namespaces`.
-#[cfg(feature = "vector")]
+/// (namespace, dim, metric, count). Czyta tabele `addon_vector_namespaces`
+/// (zawsze obecna — warstwa wektorowa/zvec jest mandatory).
 pub fn addon_vector_namespace_stats(
     pool: &DbPool,
     addon_id: &str,

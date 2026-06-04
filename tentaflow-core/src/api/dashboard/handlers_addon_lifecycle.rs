@@ -1412,8 +1412,11 @@ pub fn addon_storage_dispatch(
         }
     };
 
-    // Vector namespaces (feature-gated).
-    #[cfg(feature = "vector")]
+    // Vector namespaces. Warstwa wektorowa (NamespaceManager + zvec + tabela
+    // addon_vector_namespaces) jest mandatory na kazdej platformie (zvec to
+    // niewarunkowy dependency), wiec statystyki sa zawsze dostepne. Osobny
+    // backend Milvus to feature `vector-milvus` (opcja, nie zmienia dostepnosci
+    // statystyk namespace'ow).
     let vector = {
         let namespaces = repository::addon_vector_namespace_stats(db, &r.addon_id)
             .map_err(db_err)?
@@ -1431,11 +1434,6 @@ pub fn addon_storage_dispatch(
             available: true,
             namespaces,
         }
-    };
-    #[cfg(not(feature = "vector"))]
-    let vector = AddonVectorStats {
-        available: false,
-        namespaces: Vec::new(),
     };
 
     // Recording (feature-gated).
