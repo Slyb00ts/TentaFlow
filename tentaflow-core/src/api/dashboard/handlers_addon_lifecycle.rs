@@ -736,71 +736,77 @@ pub fn addon_tools(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
 
-    let manifest = parse_manifest(&addon.manifest_json);
-    let tools = extract_tools_from_manifest(&manifest);
+    // Jedno zrodlo prawdy z LLM: kanoniczny parser manifestu (`[[tool]]`), ten
+    // sam, ktory zasila tool_dispatch. `registered_tools` nie nadaje sie tu, bo
+    // to stan runtime (pusty gdy addon wylaczony / nie wystartowal).
+    let mut tools: Vec<AddonToolDecl> = match crate::addon::lifecycle::parse_manifest_toml(
+        &addon.manifest_json,
+    ) {
+        Ok(manifest) => manifest.tools.iter().map(tool_decl_from_manifest).collect(),
+        Err(e) => {
+            tracing::warn!(
+                "addon '{}': nie udalo sie sparsowac manifestu dla listy tools: {}",
+                payload.addon_id,
+                e
+            );
+            Vec::new()
+        }
+    };
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(MessageBody::AddonToolsResponseBody(AddonToolsResponse {
         tools,
     }))
 }
 
-/// Wyciaga deklaracje tools z manifestu (sekcja [tools.<name>]). Zwraca puste Vec jesli brak.
-fn extract_tools_from_manifest(manifest: &toml::Value) -> Vec<AddonToolDecl> {
-    let Some(tools_tbl) = manifest.get("tools").and_then(|v| v.as_table()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<AddonToolDecl> = Vec::with_capacity(tools_tbl.len());
-    for (name, def) in tools_tbl.iter() {
-        let description = def
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let return_type = def
-            .get("returns")
-            .or_else(|| def.get("return_type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let parameters = def
-            .get("parameters")
-            .and_then(|v| v.as_table())
-            .map(|params| {
-                params
-                    .iter()
-                    .map(|(pname, pdef)| AddonToolParam {
-                        name: pname.clone(),
-                        param_type: pdef
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("string")
-                            .to_string(),
-                        description: pdef
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        required: pdef
-                            .get("required")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
-                        default_value: pdef.get("default").map(|v| match v {
-                            toml::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        }),
-                    })
-                    .collect()
-            })
+/// Mapuje kanoniczny `ManifestTool` (z `parse_manifest_toml`) na protokolowy
+/// `AddonToolDecl` dla dashboardu. Lista parametrow jest rekonstruowana z
+/// `parameters_schema` (JSON Schema: `properties` + `required`), bo to forma w
+/// jakiej parser przechowuje parametry (wymagana przez host functions/LLM).
+fn tool_decl_from_manifest(t: &crate::addon::ManifestTool) -> AddonToolDecl {
+    let mut parameters: Vec<AddonToolParam> = Vec::new();
+    if let Some(props) = t.parameters_schema.get("properties").and_then(|v| v.as_object()) {
+        let required: std::collections::HashSet<&str> = t
+            .parameters_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
             .unwrap_or_default();
-        out.push(AddonToolDecl {
-            name: name.clone(),
-            description,
-            parameters,
-            return_type,
-        });
+        for (pname, pdef) in props {
+            parameters.push(AddonToolParam {
+                name: pname.clone(),
+                param_type: pdef
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("string")
+                    .to_string(),
+                description: pdef
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                required: required.contains(pname.as_str()),
+                default_value: pdef.get("default").map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                }),
+            });
+        }
+        parameters.sort_by(|a, b| a.name.cmp(&b.name));
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    // return_type: prosty typ z JSON Schema wyniku (jesli zadeklarowany).
+    let return_type = t
+        .return_schema
+        .as_ref()
+        .and_then(|s| s.get("type").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    AddonToolDecl {
+        name: t.name.clone(),
+        description: t.description.clone(),
+        parameters,
+        return_type,
+    }
 }
 
 // =============================================================================
@@ -1349,6 +1355,38 @@ register_addon_instance_variant!(
 mod declared_status_tests {
     use super::*;
     use crate::db::repository::AddonDeclaredNetworkRule;
+
+    /// tool_decl_from_manifest rekonstruuje liste parametrow z JSON Schema
+    /// (`properties` + `required`) — w tej formie parser trzyma `[[tool]]`.
+    #[test]
+    fn tool_decl_maps_params_from_schema() {
+        let t = crate::addon::ManifestTool {
+            name: "search".to_string(),
+            description: "Szukaj".to_string(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Zapytanie" },
+                    "limit": { "type": "number", "description": "Limit", "default": 10 }
+                },
+                "required": ["query"]
+            }),
+            return_schema: Some(serde_json::json!({ "type": "object" })),
+            keywords: vec![],
+        };
+        let decl = tool_decl_from_manifest(&t);
+        assert_eq!(decl.name, "search");
+        assert_eq!(decl.return_type, "object");
+        assert_eq!(decl.parameters.len(), 2);
+        // posortowane po nazwie: limit, query
+        let q = decl.parameters.iter().find(|p| p.name == "query").unwrap();
+        assert_eq!(q.param_type, "string");
+        assert!(q.required);
+        let l = decl.parameters.iter().find(|p| p.name == "limit").unwrap();
+        assert_eq!(l.param_type, "number");
+        assert!(!l.required);
+        assert_eq!(l.default_value.as_deref(), Some("10"));
+    }
 
     fn rule(host: &str, approved: bool) -> AddonDeclaredNetworkRule {
         AddonDeclaredNetworkRule {
