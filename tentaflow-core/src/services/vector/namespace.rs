@@ -170,23 +170,94 @@ fn namespace_file_path(org_id: &str, addon_id: &str, namespace: &str) -> Result<
         .join(format!("{namespace}.usearch")))
 }
 
-/// Reserved per-addon config keys (set by an admin in the addon settings GUI,
-/// not declared in the manifest) that pick the vector backend for the addon.
-const CFG_BACKEND: &str = "__vector_backend";
-const CFG_MILVUS_URI: &str = "__milvus_uri";
-const CFG_MILVUS_USER: &str = "__milvus_user";
-const CFG_MILVUS_PASSWORD: &str = "__milvus_password";
+/// Reserved per-addon config keys (set by an admin via the vector backend picker,
+/// keyed by addon_id == instance). Config is one structured JSON value; secrets
+/// (Milvus auth) stay as separate `is_secret` rows so redaction/export keep working.
+const CFG_VECTOR_CONFIG: &str = "__vector_config";
+const CFG_MILVUS_USER: &str = "__vector_milvus_user";
+const CFG_MILVUS_PASSWORD: &str = "__vector_milvus_password";
 
-/// Stable, charset-safe Milvus collection name for a namespace. Milvus requires
-/// `^[A-Za-z_][A-Za-z0-9_]{0,254}$`; we compose `v_<org>_<addon>_<namespace>` and
-/// sanitize so the same addon in two tenants never shares a collection.
-fn milvus_collection_name(org_id: &str, addon_id: &str, namespace: &str) -> String {
-    let raw = format!("{org_id}_{addon_id}_{namespace}");
-    let mut s: String = raw
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-        .collect();
-    s.insert_str(0, "v_");
+/// Odwolanie do serwisu Milvus w mesh (node + service id). Endpoint rozwiazywany
+/// przy budowie polaczenia (nie zapisujemy runtime'owego URI w configu).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct VectorServiceRef {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    service_id: String,
+}
+
+/// Strukturalny config backendu wektorowego instancji (`__vector_config`).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct VectorBackendConfig {
+    /// "zvec" (embedded, domyslny) | "milvus".
+    #[serde(default = "default_vector_backend")]
+    backend: String,
+    /// Dla milvus: "service_ref" (z mesh) | "manual" (zewnetrzny URL).
+    #[serde(default)]
+    milvus_source: Option<String>,
+    #[serde(default)]
+    service_ref: Option<VectorServiceRef>,
+    #[serde(default)]
+    manual_uri: Option<String>,
+    /// Opcjonalny suffix nazwy kolekcji (walidowany; nie zastepuje izolacji).
+    #[serde(default)]
+    collection_override: Option<String>,
+}
+
+fn default_vector_backend() -> String {
+    "zvec".to_string()
+}
+
+impl Default for VectorBackendConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_vector_backend(),
+            milvus_source: None,
+            service_ref: None,
+            manual_uri: None,
+            collection_override: None,
+        }
+    }
+}
+
+/// 12 znakow hex z SHA-256 — deterministyczny, charset-safe segment nazwy.
+fn hash12(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(s.as_bytes());
+    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Stabilna, charset-safe nazwa kolekcji Milvus. Milvus wymaga
+/// `^[A-Za-z_][A-Za-z0-9_]{0,254}$`. Skladamy `v_o_<orghash>_a_<addonhash>_n_<nshash>`
+/// (hash org/addon/namespace) — ten addon w dwoch tenantach NIGDY nie dzieli
+/// kolekcji, a addon_id==instancja daje izolacje miedzy instancjami. (Crate
+/// milvus-sdk-rust nie wspiera wyboru bazy, wiec izolacja jest na poziomie nazwy
+/// kolekcji zamiast osobnej bazy per org.) `override` doklejany jako bezpieczny
+/// suffix, nigdy nie zastepuje czesci izolacyjnej.
+fn milvus_collection_name(
+    org_id: &str,
+    addon_id: &str,
+    namespace: &str,
+    override_suffix: Option<&str>,
+) -> String {
+    let mut s = format!(
+        "v_o_{}_a_{}_n_{}",
+        hash12(org_id),
+        hash12(addon_id),
+        hash12(namespace)
+    );
+    if let Some(o) = override_suffix.filter(|o| !o.is_empty()) {
+        let safe: String = o
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(32)
+            .collect();
+        if !safe.is_empty() {
+            s.push('_');
+            s.push_str(&safe);
+        }
+    }
     s.truncate(255);
     s
 }
@@ -266,6 +337,35 @@ impl NamespaceManager {
         .filter(|s| !s.is_empty())
     }
 
+    /// Strukturalny config backendu wektorowego instancji. BRAK configu =>
+    /// domyslny (zvec). Obecny ale NIEPOPRAWNY JSON => blad (nie cichy fallback
+    /// na zvec — inaczej literowka w configu Milvus tworzylaby pusty namespace
+    /// zvec i dane wygladalyby na utracone).
+    fn vector_config(&self, addon_id: &str) -> Result<VectorBackendConfig> {
+        // Czytamy raw (BEZ filtra pustych z addon_cfg), zeby odroznic brak wiersza
+        // (=> default zvec) od obecnej, niepoprawnej wartosci (=> blad). Puste/
+        // whitespace traktujemy jak brak (zvec).
+        let raw: Option<String> = {
+            let conn = match self.pool.lock() {
+                Ok(c) => c,
+                Err(_) => return Ok(VectorBackendConfig::default()),
+            };
+            conn.query_row(
+                "SELECT value FROM addon_config WHERE addon_id = ?1 AND key = ?2",
+                rusqlite::params![addon_id, CFG_VECTOR_CONFIG],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        };
+        match raw {
+            None => Ok(VectorBackendConfig::default()),
+            Some(s) if s.trim().is_empty() => Ok(VectorBackendConfig::default()),
+            Some(s) => serde_json::from_str(&s).map_err(|e| {
+                VectorError::Backend(format!("addon {addon_id}: niepoprawny __vector_config: {e}"))
+            }),
+        }
+    }
+
     /// Build the backend an addon's namespace should use. zvec (embedded, files
     /// at `file_path`) is the default; an admin can switch a specific addon to an
     /// external Milvus by setting the reserved `__vector_backend` config key.
@@ -280,14 +380,19 @@ impl NamespaceManager {
         fields: &[FieldSpec],
         sparse: bool,
     ) -> Result<Arc<dyn VectorBackend>> {
-        let backend = self
-            .addon_cfg(addon_id, CFG_BACKEND)
-            .unwrap_or_else(|| "zvec".to_string());
-        match backend.as_str() {
-            "milvus" => self.build_milvus(org_id, addon_id, namespace, dim, metric, fields, sparse),
-            _ => Ok(Arc::new(ZvecBackend::open_or_create(
+        let cfg = self.vector_config(addon_id)?;
+        match cfg.backend.as_str() {
+            "zvec" | "" => Ok(Arc::new(ZvecBackend::open_or_create(
                 file_path, dim, metric, fields, sparse,
             )?)),
+            "milvus" => {
+                self.build_milvus(org_id, addon_id, namespace, dim, metric, fields, sparse, &cfg)
+            }
+            // Nieznany backend => blad, nie cichy fallback na zvec (ochrona przed
+            // utworzeniem pustego namespace zvec gdy intencja byla inna).
+            other => Err(VectorError::Backend(format!(
+                "addon {addon_id}: nieznany vector backend '{other}' (dozwolone: zvec|milvus)"
+            ))),
         }
     }
 
@@ -301,15 +406,13 @@ impl NamespaceManager {
         metric: Metric,
         fields: &[FieldSpec],
         sparse: bool,
+        cfg: &VectorBackendConfig,
     ) -> Result<Arc<dyn VectorBackend>> {
-        let uri = self.addon_cfg(addon_id, CFG_MILVUS_URI).ok_or_else(|| {
-            VectorError::Backend(format!(
-                "addon {addon_id}: vector backend 'milvus' selected but {CFG_MILVUS_URI} is not set"
-            ))
-        })?;
+        let uri = self.resolve_milvus_uri(addon_id, cfg)?;
         let user = self.addon_cfg(addon_id, CFG_MILVUS_USER);
         let password = self.addon_cfg(addon_id, CFG_MILVUS_PASSWORD);
-        let collection = milvus_collection_name(org_id, addon_id, namespace);
+        let collection =
+            milvus_collection_name(org_id, addon_id, namespace, cfg.collection_override.as_deref());
         let be = super::milvus_backend::MilvusBackend::connect(
             &uri,
             user.as_deref(),
@@ -323,6 +426,66 @@ impl NamespaceManager {
         Ok(Arc::new(be))
     }
 
+    /// Rozwiazuje URI Milvus z configu: manual (zewnetrzny URL) albo service_ref.
+    /// Slice-1 rozwiazuje serwis LOKALNY (po service_id w `services`); zdalny
+    /// (mesh, advertised_endpoint) dochodzi w nastepnym slice.
+    #[cfg(feature = "vector-milvus")]
+    fn resolve_milvus_uri(&self, addon_id: &str, cfg: &VectorBackendConfig) -> Result<String> {
+        match cfg.milvus_source.as_deref() {
+            Some("manual") => cfg
+                .manual_uri
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    VectorError::Backend(format!(
+                        "addon {addon_id}: milvus_source=manual ale manual_uri jest puste"
+                    ))
+                }),
+            Some("service_ref") => {
+                let sr = cfg.service_ref.as_ref().ok_or_else(|| {
+                    VectorError::Backend(format!(
+                        "addon {addon_id}: milvus_source=service_ref ale service_ref brakuje"
+                    ))
+                })?;
+                self.resolve_local_milvus_endpoint(sr).ok_or_else(|| {
+                    VectorError::Backend(format!(
+                        "addon {addon_id}: serwis Milvus '{}' nie znaleziony / nieosiagalny na tym nodzie",
+                        sr.service_id
+                    ))
+                })
+            }
+            _ => Err(VectorError::Backend(format!(
+                "addon {addon_id}: backend=milvus ale milvus_source nie ustawiony (service_ref|manual)"
+            ))),
+        }
+    }
+
+    /// Lokalny serwis Milvus -> endpoint_url. Slice-1 obsluguje TYLKO lokalny
+    /// node: puste `node_id` == ten node. Niepuste `node_id` => ref zdalny, brak
+    /// resolucji tu (mesh discovery w nastepnym slice) — to chroni przed
+    /// trafieniem zdalnego `service_id` w lokalny wiersz o tym samym i64 id.
+    /// Filtr: engine 'milvus', niespauzowany, status running/degraded, endpoint set.
+    #[cfg(feature = "vector-milvus")]
+    fn resolve_local_milvus_endpoint(&self, sr: &VectorServiceRef) -> Option<String> {
+        use crate::services_repo::services::ServiceStatus;
+        if !sr.node_id.is_empty() {
+            return None;
+        }
+        let id: i64 = sr.service_id.parse().ok()?;
+        let conn = self.pool.lock().ok()?;
+        let services = crate::services_repo::services::list_all(&conn).ok()?;
+        services
+            .into_iter()
+            .find(|s| {
+                s.id == id
+                    && s.engine_id == "milvus"
+                    && !s.paused
+                    && matches!(s.status, ServiceStatus::Running | ServiceStatus::Degraded)
+            })
+            .and_then(|s| s.endpoint_url)
+            .filter(|u| !u.is_empty())
+    }
+
     #[cfg(not(feature = "vector-milvus"))]
     fn build_milvus(
         &self,
@@ -333,12 +496,18 @@ impl NamespaceManager {
         _metric: Metric,
         _fields: &[FieldSpec],
         _sparse: bool,
+        _cfg: &VectorBackendConfig,
     ) -> Result<Arc<dyn VectorBackend>> {
         Err(VectorError::Backend(
             "vector backend 'milvus' selected but this binary was built without the \
              'vector-milvus' feature"
                 .to_string(),
         ))
+    }
+
+    /// Czy ten build ma wkompilowany backend Milvus (`vector-milvus`).
+    pub fn milvus_compiled() -> bool {
+        cfg!(feature = "vector-milvus")
     }
 
     /// Returns the namespace handle, opening (or creating) the backing index
