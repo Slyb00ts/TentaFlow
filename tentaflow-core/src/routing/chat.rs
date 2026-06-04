@@ -144,9 +144,7 @@ impl Router {
                         outcome.finish_reason.as_openai_str().map(|s| s.to_string());
                     let response = flow_outcome_to_chat_response(outcome, &request.model);
                     let metadata = crate::routing::RouteMetadata {
-                        served_by_node: hostname::get()
-                            .map(|h| h.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| "unknown".to_string()),
+                        served_by_node: crate::mesh::node_info_collector::local_hostname(),
                         backend_type: "flow_engine".to_string(),
                         strategy_used: "direct".to_string(),
                         fallbacks_tried: 0,

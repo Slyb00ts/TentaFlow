@@ -122,10 +122,7 @@ impl Default for GossipConfig {
         Self {
             node_id: uuid::Uuid::new_v4().to_string(),
             listen_addr: "0.0.0.0:5002".parse().expect("poprawny adres"),
-            hostname: hostname::get()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
+            hostname: crate::mesh::node_info_collector::local_hostname(),
             role: "router".to_string(),
             cluster_name: "tentaflow".to_string(),
             ping_interval: Duration::from_secs(1),

@@ -650,7 +650,10 @@ impl IrohMeshManager {
                 // PairingHandler::accept uzywany przez iroh Router jest tutaj
                 // zastepowany manualnym obslugiwaniem — w pelnej integracji
                 // ProtocolHandler jest rejestrowany przy bind przez Router.
-                let handler = PairingHandler::new(Arc::clone(&self.security), hostname());
+                let handler = PairingHandler::new(
+                    Arc::clone(&self.security),
+                    crate::mesh::node_info_collector::local_hostname(),
+                );
                 match handler_accept_connection(&handler, connection).await {
                     Ok(Some(hints)) => {
                         let _ = self.event_tx.send(IrohMeshEvent::PairingTrusted { hints });
@@ -2499,13 +2502,6 @@ fn is_private_socket_addr(addr: &std::net::SocketAddr) -> bool {
             ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
         }
     }
-}
-
-fn hostname() -> String {
-    hostname::get()
-        .ok()
-        .and_then(|s| s.into_string().ok())
-        .unwrap_or_else(|| "unknown-host".to_string())
 }
 
 #[cfg(test)]
