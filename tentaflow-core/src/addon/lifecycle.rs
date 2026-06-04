@@ -494,22 +494,6 @@ fn install_core(
     Ok(manifest)
 }
 
-pub fn ensure_sql_storage(addon_dir: &Path, db: &DbPool) -> Result<()> {
-    let manifest_path = addon_dir.join("manifest.toml");
-    if !manifest_path.exists() {
-        bail!("Brak pliku manifest.toml w {:?}", addon_dir);
-    }
-    let manifest_content = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac manifest.toml: {e}"))?;
-    let manifest = parse_manifest_toml(&manifest_content)
-        .map_err(|e| anyhow::anyhow!("Nie udalo sie sparsowac manifest.toml: {e}"))?;
-    validate_manifest(&manifest)?;
-    if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
-        apply_addon_sql_migrations(&manifest, addon_dir, db)?;
-    }
-    Ok(())
-}
-
 /// Kopiuje cala zawartosc katalogu zrodlowego addonu (wasm, manifest.toml,
 /// migrations/, pliki pomocnicze) do wersjonowanego store'u pakietow. Nadpisuje
 /// istniejace pliki, zeby ponowny install tej samej wersji byl spójny.
