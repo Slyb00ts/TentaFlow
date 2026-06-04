@@ -24,7 +24,8 @@ use tentaflow_protocol::{
         AddonInstallRequest, AddonInstanceDuplicateRequest, AddonInstanceInstallRequest,
         AddonInstancePayload, AddonInstanceUpdateRequest, AddonInstanceVersionsRequest,
         AddonLogsRequest, AddonNetworkRulesGetRequest, AddonStoragePayload,
-        AddonStorageStatsRequest,
+        AddonStorageStatsRequest, AddonVectorConfig, AddonVectorGetConfigRequest,
+        AddonVectorPayload, AddonVectorServiceRef, AddonVectorSetConfigRequest,
         AddonNetworkRulesSetRequest, AddonOAuthAuthorizeStartRequest,
         AddonOAuthConfigClearSecretRequest, AddonOAuthConfigListRequest,
         AddonOAuthConfigSetRequest, AddonOAuthLinkedAccountsRequest, AddonOAuthReauthorizeRequest,
@@ -1066,6 +1067,55 @@ pub fn encode_addon_instance_update_request(
 pub fn encode_addon_storage_stats_request(addon_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonStorageBody(
         AddonStoragePayload::StatsRequest(AddonStorageStatsRequest { addon_id }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AddonVectorBody(GetConfigRequest) — config vector backendu addona.
+#[wasm_bindgen(js_name = encodeAddonVectorGetConfigRequest)]
+pub fn encode_addon_vector_get_config_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonVectorBody(
+        AddonVectorPayload::GetConfigRequest(AddonVectorGetConfigRequest { addon_id }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AddonVectorBody(SetConfigRequest) — zapis config vector backendu.
+/// Pola configu jako osobne argumenty (bez serde_json w crate wasm).
+#[wasm_bindgen(js_name = encodeAddonVectorSetConfigRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_addon_vector_set_config_request(
+    addon_id: String,
+    backend: String,
+    milvus_source: Option<String>,
+    service_node_id: Option<String>,
+    service_id: Option<String>,
+    manual_uri: Option<String>,
+    collection_override: Option<String>,
+    milvus_user: Option<String>,
+    milvus_password: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    let service_ref = match service_id {
+        Some(sid) if !sid.is_empty() => Some(AddonVectorServiceRef {
+            node_id: service_node_id.unwrap_or_default(),
+            service_id: sid,
+        }),
+        _ => None,
+    };
+    let config = AddonVectorConfig {
+        backend,
+        milvus_source,
+        service_ref,
+        manual_uri,
+        collection_override,
+    };
+    encode_body_inner(&MessageBody::AddonVectorBody(
+        AddonVectorPayload::SetConfigRequest(AddonVectorSetConfigRequest {
+            addon_id,
+            config,
+            milvus_user,
+            milvus_password,
+        }),
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -2267,6 +2317,28 @@ fn set_optional_u64(obj: &js_sys::Object, key: &str, value: Option<u64>) {
     if let Some(value) = value {
         set(obj, key, value.clone().into());
     }
+}
+
+/// Buduje JS obiekt z `AddonVectorConfig` (camelCase) dla pickera vector backendu.
+fn vector_config_to_js(c: &tentaflow_protocol::AddonVectorConfig) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "backend", c.backend.clone().into());
+    if let Some(s) = &c.milvus_source {
+        set(&o, "milvusSource", s.clone().into());
+    }
+    if let Some(sr) = &c.service_ref {
+        let r = js_sys::Object::new();
+        set(&r, "nodeId", sr.node_id.clone().into());
+        set(&r, "serviceId", sr.service_id.clone().into());
+        set(&o, "serviceRef", r.into());
+    }
+    if let Some(u) = &c.manual_uri {
+        set(&o, "manualUri", u.clone().into());
+    }
+    if let Some(co) = &c.collection_override {
+        set(&o, "collectionOverride", co.clone().into());
+    }
+    o.into()
 }
 
 fn set_optional_u32(obj: &js_sys::Object, key: &str, value: Option<u32>) {
@@ -3519,6 +3591,45 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&rec, "snapshots", (r.recording.snapshots as f64).into());
                     set(&rec, "bytes", (r.recording.bytes as f64).into());
                     set(&obj, "recording", rec.into());
+                }
+            }
+        }
+
+        // ---- Vector backend picker addona ----
+        MessageBody::AddonVectorBody(p) => {
+            use tentaflow_protocol::AddonVectorPayload as VP;
+            match p {
+                VP::GetConfigRequest(_) => {
+                    set(&obj, "variant", "AddonVectorGetConfigRequest".into());
+                }
+                VP::GetConfigResponse(r) => {
+                    set(&obj, "variant", "AddonVectorGetConfigResponse".into());
+                    set(&obj, "milvusCompiled", r.milvus_compiled.into());
+                    set(&obj, "hasMilvusUser", r.has_milvus_user.into());
+                    set(&obj, "hasMilvusPassword", r.has_milvus_password.into());
+                    set(&obj, "config", vector_config_to_js(&r.config));
+                    let arr = js_sys::Array::new();
+                    for s in r.milvus_services {
+                        let item = js_sys::Object::new();
+                        set(&item, "nodeId", s.node_id.into());
+                        set(&item, "local", s.local.into());
+                        set(&item, "serviceId", s.service_id.into());
+                        set(&item, "displayName", s.display_name.into());
+                        set(&item, "endpoint", s.endpoint.into());
+                        set(&item, "reachable", s.reachable.into());
+                        arr.push(&item.into());
+                    }
+                    set(&obj, "milvusServices", arr.into());
+                }
+                VP::SetConfigRequest(_) => {
+                    set(&obj, "variant", "AddonVectorSetConfigRequest".into());
+                }
+                VP::SetConfigResponse(r) => {
+                    set(&obj, "variant", "AddonVectorSetConfigResponse".into());
+                    set(&obj, "ok", r.ok.into());
+                    if let Some(e) = r.error {
+                        set(&obj, "error", e.into());
+                    }
                 }
             }
         }

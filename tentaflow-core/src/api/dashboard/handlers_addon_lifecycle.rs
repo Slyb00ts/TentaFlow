@@ -15,11 +15,13 @@ use tentaflow_protocol::{
     AddonInstanceInstallResponse, AddonInstancePayload, AddonInstanceUpdateResponse,
     AddonInstanceVersionsResponse, AddonLogEntry, AddonLogsResponse, AddonNetworkRuleDecl,
     AddonNetworkRulesGetResponse, AddonNetworkRulesSetResponse, AddonPackageInfo,
-    AddonKvStats, AddonRecordingStats, AddonReloadResponse, AddonResourcesGetResponse,
-    AddonResourcesSetResponse, AddonSqlStats, AddonSqlTable, AddonStoragePayload,
-    AddonStorageStatsResponse, AddonToggleResponse, AddonToolDecl, AddonToolParam,
-    AddonToolsResponse, AddonUninstallResponse, AddonVectorStats, MessageBody, ProtocolError,
-    ProtocolErrorCode, SessionAuth,
+    AddonKvStats, AddonMilvusService, AddonRecordingStats, AddonReloadResponse,
+    AddonResourcesGetResponse, AddonResourcesSetResponse, AddonSqlStats, AddonSqlTable,
+    AddonStoragePayload, AddonStorageStatsResponse, AddonToggleResponse, AddonToolDecl,
+    AddonToolParam, AddonToolsResponse, AddonUninstallResponse, AddonVectorConfig,
+    AddonVectorConfigResponse, AddonVectorPayload,
+    AddonVectorSetConfigResponse, AddonVectorStats, MessageBody, ProtocolError, ProtocolErrorCode,
+    SessionAuth,
 };
 
 use crate::db::repository;
@@ -1576,6 +1578,289 @@ register_addon_storage_variant!(
     "AddonStorageStatsRequest",
     "tentaflow_ws_handler_addon_storage_stats",
     crate::dispatch::SessionAuthKind::Admin
+);
+
+// =============================================================================
+// Vector backend picker addona (zakladka Ustawienia): zvec vs Milvus.
+// Multipleksowane w `AddonVectorBody`.
+// =============================================================================
+
+const CFG_VECTOR_CONFIG: &str = "__vector_config";
+const CFG_VECTOR_MILVUS_USER: &str = "__vector_milvus_user";
+const CFG_VECTOR_MILVUS_PASSWORD: &str = "__vector_milvus_password";
+
+// Bounds for persisted vector-config fields (CBOR/UI decode + DB size guard).
+const MAX_VECTOR_URI_LEN: usize = 512;
+const MAX_VECTOR_COLLECTION_LEN: usize = 128;
+const MAX_VECTOR_SECRET_LEN: usize = 512;
+
+fn default_vector_config() -> AddonVectorConfig {
+    AddonVectorConfig {
+        backend: "zvec".to_string(),
+        milvus_source: None,
+        service_ref: None,
+        manual_uri: None,
+        collection_override: None,
+    }
+}
+
+#[handler(variant = "AddonVectorBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_vector_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use AddonVectorPayload as P;
+    let payload = match req {
+        MessageBody::AddonVectorBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AddonVectorBody")),
+    };
+    let db = &ctx.state.db;
+
+    let res = match payload {
+        P::GetConfigRequest(r) => {
+            validate_addon_id(&r.addon_id)?;
+            repository::get_addon(db, &r.addon_id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
+
+            let rows = repository::list_addon_config_rows(db, &r.addon_id).map_err(db_err)?;
+            let raw = rows
+                .iter()
+                .find(|c| c.key == CFG_VECTOR_CONFIG)
+                .map(|c| c.value.clone())
+                .filter(|s| !s.trim().is_empty());
+            let config = raw
+                .and_then(|s| serde_json::from_str::<AddonVectorConfig>(&s).ok())
+                .unwrap_or_else(default_vector_config);
+            let has_milvus_user = rows
+                .iter()
+                .any(|c| c.key == CFG_VECTOR_MILVUS_USER && !c.value.trim().is_empty());
+            let has_milvus_password = rows
+                .iter()
+                .any(|c| c.key == CFG_VECTOR_MILVUS_PASSWORD && !c.value.trim().is_empty());
+
+            let milvus_compiled =
+                crate::services::vector::namespace::NamespaceManager::milvus_compiled();
+            let milvus_services = if milvus_compiled {
+                discover_local_milvus_services(db)
+            } else {
+                Vec::new()
+            };
+
+            P::GetConfigResponse(AddonVectorConfigResponse {
+                milvus_compiled,
+                config,
+                has_milvus_user,
+                has_milvus_password,
+                milvus_services,
+            })
+        }
+        P::SetConfigRequest(r) => {
+            validate_addon_id(&r.addon_id)?;
+            repository::get_addon(db, &r.addon_id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
+            validate_vector_config(&r.config)?;
+            // service_ref musi wskazywac istniejacy, osiagalny, lokalny serwis Milvus
+            // (zdalne dochodza w nastepnym slice). Sprawdzamy wzgledem dyskoveru.
+            if r.config.backend == "milvus" && r.config.milvus_source.as_deref() == Some("service_ref")
+            {
+                let sref = r
+                    .config
+                    .service_ref
+                    .as_ref()
+                    .ok_or_else(|| ProtocolError::bad_request("brak service_ref"))?;
+                if !sref.node_id.trim().is_empty() {
+                    return Err(ProtocolError::bad_request(
+                        "zdalne serwisy Milvus nie sa jeszcze wspierane (uzyj lokalnego lub manual)",
+                    ));
+                }
+                let ok = discover_local_milvus_services(db)
+                    .into_iter()
+                    .any(|s| s.service_id == sref.service_id && s.reachable);
+                if !ok {
+                    return Err(ProtocolError::bad_request(
+                        "service_ref nie wskazuje osiagalnego lokalnego serwisu Milvus",
+                    ));
+                }
+            }
+            if r.milvus_user.as_deref().map(|u| u.len() > MAX_VECTOR_SECRET_LEN).unwrap_or(false)
+                || r
+                    .milvus_password
+                    .as_deref()
+                    .map(|p| p.len() > MAX_VECTOR_SECRET_LEN)
+                    .unwrap_or(false)
+            {
+                return Err(ProtocolError::bad_request("milvus user/password za dlugie"));
+            }
+            let updated_by = current_user_id(ctx);
+            // Normalizuj: trzymaj tylko pola istotne dla wybranego backendu/zrodla,
+            // zeby nie persystowac nieograniczonych smieci w nieuzywanych polach.
+            let mut stored = r.config.clone();
+            if let Some(uri) = stored.manual_uri.as_mut() {
+                *uri = uri.trim().to_string();
+            }
+            if stored.backend != "milvus" {
+                stored.milvus_source = None;
+                stored.service_ref = None;
+                stored.manual_uri = None;
+            } else {
+                match stored.milvus_source.as_deref() {
+                    Some("manual") => stored.service_ref = None,
+                    Some("service_ref") => stored.manual_uri = None,
+                    _ => {}
+                }
+            }
+            let json = serde_json::to_string(&stored)
+                .map_err(|e| ProtocolError::internal(format!("serialize vector config: {e}")))?;
+            repository::upsert_addon_config_value(
+                db,
+                &r.addon_id,
+                CFG_VECTOR_CONFIG,
+                &json,
+                false,
+                updated_by.as_deref(),
+            )
+            .map_err(db_err)?;
+            if let Some(u) = &r.milvus_user {
+                repository::upsert_addon_config_value(
+                    db,
+                    &r.addon_id,
+                    CFG_VECTOR_MILVUS_USER,
+                    u,
+                    true,
+                    updated_by.as_deref(),
+                )
+                .map_err(db_err)?;
+            }
+            if let Some(p) = &r.milvus_password {
+                repository::upsert_addon_config_value(
+                    db,
+                    &r.addon_id,
+                    CFG_VECTOR_MILVUS_PASSWORD,
+                    p,
+                    true,
+                    updated_by.as_deref(),
+                )
+                .map_err(db_err)?;
+            }
+            P::SetConfigResponse(AddonVectorSetConfigResponse {
+                ok: true,
+                error: None,
+            })
+        }
+        P::GetConfigResponse(_) | P::SetConfigResponse(_) => {
+            return Err(ProtocolError::bad_request("unexpected response variant"))
+        }
+    };
+
+    Ok(MessageBody::AddonVectorBody(res))
+}
+
+/// Waliduje config: backend zvec|milvus; dla milvus wymaga zrodla i jego pola.
+/// Sprawdza ksztalt (schemat URI, dlugosci); istnienie serwisu weryfikuje handler.
+fn validate_vector_config(cfg: &AddonVectorConfig) -> Result<(), ProtocolError> {
+    if let Some(co) = cfg.collection_override.as_deref() {
+        if co.len() > MAX_VECTOR_COLLECTION_LEN {
+            return Err(ProtocolError::bad_request("collection_override za dlugie"));
+        }
+    }
+    match cfg.backend.as_str() {
+        "zvec" => Ok(()),
+        "milvus" => match cfg.milvus_source.as_deref() {
+            Some("manual") => {
+                let uri = cfg.manual_uri.as_deref().map(str::trim).unwrap_or("");
+                if uri.is_empty() {
+                    return Err(ProtocolError::bad_request("milvus_source=manual wymaga manual_uri"));
+                }
+                if uri.len() > MAX_VECTOR_URI_LEN {
+                    return Err(ProtocolError::bad_request("manual_uri za dlugie"));
+                }
+                if !(uri.starts_with("http://") || uri.starts_with("https://")) {
+                    return Err(ProtocolError::bad_request(
+                        "manual_uri musi byc http:// lub https://",
+                    ));
+                }
+                Ok(())
+            }
+            Some("service_ref") => {
+                if cfg.service_ref.as_ref().map(|s| !s.service_id.trim().is_empty()).unwrap_or(false)
+                {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::bad_request(
+                        "milvus_source=service_ref wymaga service_ref.service_id",
+                    ))
+                }
+            }
+            _ => Err(ProtocolError::bad_request(
+                "backend=milvus wymaga milvus_source (service_ref|manual)",
+            )),
+        },
+        other => Err(ProtocolError::bad_request(format!(
+            "nieznany vector backend '{other}' (zvec|milvus)"
+        ))),
+    }
+}
+
+/// Lista lokalnych serwisow Milvus (engine_id='milvus') dla pickera. Lokalny
+/// serwis jest osiagalny (ten sam node), wiec reachable = running+endpoint.
+/// Zdalne serwisy (mesh, advertised_endpoint) dochodza w nastepnym slice.
+fn discover_local_milvus_services(db: &crate::db::DbPool) -> Vec<AddonMilvusService> {
+    use crate::services_repo::services::ServiceStatus;
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let services = match crate::services_repo::services::list_all(&conn) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    services
+        .into_iter()
+        .filter(|s| s.engine_id == "milvus")
+        .map(|s| {
+            let endpoint = s.endpoint_url.clone().unwrap_or_default();
+            let reachable = !s.paused
+                && matches!(s.status, ServiceStatus::Running | ServiceStatus::Degraded)
+                && !endpoint.is_empty();
+            AddonMilvusService {
+                node_id: String::new(),
+                local: true,
+                service_id: s.id.to_string(),
+                display_name: s.display_name,
+                endpoint,
+                reachable,
+            }
+        })
+        .collect()
+}
+
+/// Rejestruje handler pickera pod inner-nazwami requestow (Admin).
+macro_rules! register_addon_vector_variant {
+    ($variant:literal, $metric:literal) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: crate::dispatch::SessionAuthKind::Admin,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_addon_vector_dispatch,
+            }
+        }
+    };
+}
+
+register_addon_vector_variant!(
+    "AddonVectorGetConfigRequest",
+    "tentaflow_ws_handler_addon_vector_get_config"
+);
+register_addon_vector_variant!(
+    "AddonVectorSetConfigRequest",
+    "tentaflow_ws_handler_addon_vector_set_config"
 );
 
 #[cfg(test)]

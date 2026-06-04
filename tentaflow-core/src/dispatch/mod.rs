@@ -846,6 +846,16 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::AddonStoragePayload::StatsRequest(_) => "AddonStorageStatsRequest",
             tentaflow_protocol::AddonStoragePayload::StatsResponse(_) => "AddonStorageStatsResponse",
         },
+        MessageBody::AddonVectorBody(p) => match p {
+            tentaflow_protocol::AddonVectorPayload::GetConfigRequest(_) => "AddonVectorGetConfigRequest",
+            tentaflow_protocol::AddonVectorPayload::GetConfigResponse(_) => {
+                "AddonVectorGetConfigResponse"
+            }
+            tentaflow_protocol::AddonVectorPayload::SetConfigRequest(_) => "AddonVectorSetConfigRequest",
+            tentaflow_protocol::AddonVectorPayload::SetConfigResponse(_) => {
+                "AddonVectorSetConfigResponse"
+            }
+        },
         MessageBody::IamBody(p) => match p {
             tentaflow_protocol::IamPayload::ReqListUsers => "IamListUsersRequest",
             tentaflow_protocol::IamPayload::ResListUsers { .. } => "IamListUsersResponse",
