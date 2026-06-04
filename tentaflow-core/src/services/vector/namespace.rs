@@ -337,6 +337,22 @@ impl NamespaceManager {
         *self.remote_transport.write() = Some(transport);
     }
 
+    /// True once the mesh transport is wired — i.e. remote (`node_id`) backends
+    /// can be built. The picker uses this to refuse a remote `service_ref` while
+    /// the mesh is not yet up, instead of saving a config that fails on use.
+    pub fn remote_transport_ready(&self) -> bool {
+        self.remote_transport.read().is_some()
+    }
+
+    /// Drop every cached open backend for `addon_id`. Called after the vector
+    /// backend config changes so the next access rebuilds against the new config
+    /// (zvec ⇄ local Milvus ⇄ remote Milvus) without a process restart. The
+    /// on-disk zvec data and remote collections are untouched — only the
+    /// in-memory handle cache is cleared.
+    pub fn invalidate_addon(&self, addon_id: &str) {
+        self.backends.retain(|k, _| k.addon_id != addon_id);
+    }
+
     fn file_path_for(&self, org_id: &str, addon_id: &str, namespace: &str) -> Result<PathBuf> {
         if let Some(root) = &self.root_override {
             Ok(root
