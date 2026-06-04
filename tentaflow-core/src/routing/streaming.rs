@@ -498,9 +498,7 @@ impl Router {
         >,
     > {
         let stream_start = std::time::Instant::now();
-        let stream_node_name = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+        let stream_node_name = crate::mesh::node_info_collector::local_hostname();
 
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
