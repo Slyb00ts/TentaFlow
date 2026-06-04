@@ -539,11 +539,27 @@ pub fn get_setting(pool: &DbPool, key: &str) -> Result<Option<String>> {
 }
 
 pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
         rusqlite::params![key, value],
     )?;
+    // Replicate fleet-wide non-secret settings (allowlist only). Same resource
+    // kind as shared secrets; the apply path branches secret vs plaintext by key.
+    // Gated to the 8 allowlisted keys, so node-local/internal settings written
+    // through this same chokepoint never leave the node.
+    if is_shared_setting_key(key) {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
+            key,
+            crate::sync::runtime::SqlWriteAction::Update,
+            shared_secret_setting_fields(key, value),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -627,6 +643,29 @@ pub const SHARED_SECRET_SETTING_KEYS: &[&str] = &["hf_token", "ngc_api_key"];
 
 pub fn is_shared_secret_setting_key(key: &str) -> bool {
     SHARED_SECRET_SETTING_KEYS.contains(&key)
+}
+
+/// Allowlist of NON-secret `settings` keys that replicate fleet-wide (stored
+/// plaintext, no re-encrypt). Deny-by-default: only genuinely shareable
+/// admin/fleet config is here. Node-local keys (node_*_key, jwt_secret,
+/// encryption_master_key, mesh.bind_* / advertise_excluded_interfaces — physical
+/// interface specific, mesh.bind_mode — coupled to bind_ipv4) and internal sync
+/// state (baseline_*, sync.permission_epoch:*) are deliberately EXCLUDED and
+/// must never be added here. Replicated through the same SharedSettingSecret
+/// resource kind (the apply path branches secret vs non-secret by key).
+pub const SHARED_SETTING_KEYS: &[&str] = &[
+    "mesh.iroh_relay_url",
+    "mesh.advertise_hide_docker",
+    "mesh.advertise_hide_link_local",
+    "mesh.advertise_hide_loopback",
+    "mesh.advertise_hide_cgnat",
+    "mesh.advertise_prefer_same_subnet",
+    "oauth_redirect_base_url",
+    "jwt_expiry_hours",
+];
+
+pub fn is_shared_setting_key(key: &str) -> bool {
+    SHARED_SETTING_KEYS.contains(&key)
 }
 
 fn shared_secret_setting_fields(
@@ -3264,6 +3303,29 @@ pub fn reseed_core_state_from_current_rows(
                     let value = cipher
                         .decrypt(&raw_value)
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        key,
+                        Update,
+                        shared_secret_setting_fields(key, &value),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+                // Non-secret fleet config (plaintext, no decrypt) under the same
+                // resource kind. Disjoint keyspace from the secret allowlist.
+                for &key in SHARED_SETTING_KEYS {
+                    let value: Option<String> = tx
+                        .query_row(
+                            "SELECT value FROM settings WHERE key = ?1",
+                            rusqlite::params![key],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let Some(value) = value else {
+                        continue;
+                    };
                     record_core_capture_tx(
                         &tx,
                         descriptor.kind,
@@ -14797,6 +14859,48 @@ pub fn is_publisher_trusted(pool: &DbPool, key_b64: &str) -> Result<bool> {
         |r| r.get(0),
     )?;
     Ok(count > 0)
+}
+
+#[cfg(test)]
+mod shared_setting_allowlist_tests {
+    use super::*;
+
+    #[test]
+    fn node_local_settings_never_sync() {
+        // Deny-by-default boundary: node identity / private keys / per-node bind
+        // config / internal sync state must NEVER be in the non-secret allowlist
+        // (and are not secrets either). A regression here would leak node-local
+        // state across the fleet.
+        for key in [
+            "node_private_key",
+            "node_x25519_private_key",
+            "encryption_master_key",
+            "jwt_secret",
+            "addon_oauth_master_key",
+            "tls_key_pem",
+            "mesh.bind_ipv4",
+            "mesh.bind_mode",
+            "mesh.advertise_excluded_interfaces",
+            "baseline_adopt_state",
+            "core_baseline_reset_pending",
+        ] {
+            assert!(
+                !is_shared_setting_key(key) && !is_shared_secret_setting_key(key),
+                "node-local setting '{key}' must not be syncable"
+            );
+        }
+    }
+
+    #[test]
+    fn allowlisted_settings_are_recognized() {
+        assert!(is_shared_setting_key("mesh.iroh_relay_url"));
+        assert!(is_shared_setting_key("oauth_redirect_base_url"));
+        assert!(!is_shared_setting_key("totally_unknown_key"));
+        // Disjoint keyspaces — no key is both a shared secret and a shared plain.
+        for &k in SHARED_SETTING_KEYS {
+            assert!(!is_shared_secret_setting_key(k), "key '{k}' in both lists");
+        }
+    }
 }
 
 #[cfg(test)]

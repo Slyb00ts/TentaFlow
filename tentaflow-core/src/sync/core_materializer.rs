@@ -180,21 +180,31 @@ fn apply_shared_setting_secret(
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
     let key = field_string(operation, "key")?;
-    if !crate::db::repository::is_shared_secret_setting_key(&key) {
+    // Same resource kind carries both allowlisted secrets (re-encrypted per node)
+    // and allowlisted non-secret fleet config (plaintext). Anything else is
+    // refused — a node never materializes a setting it has not opted into.
+    let is_secret = crate::db::repository::is_shared_secret_setting_key(&key);
+    let is_shared = crate::db::repository::is_shared_setting_key(&key);
+    if !is_secret && !is_shared {
         return Err(SyncLedgerError::Runtime(format!(
-            "setting secret is not syncable: {key}"
+            "setting is not syncable: {key}"
         )));
     }
     match operation.body.action {
         ActionType::Insert | ActionType::Update => {
             let value = field_string(operation, "value")?;
-            let encrypted = settings_cipher
-                .encrypt(&value)
-                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            // Secrets re-encrypt with THIS node's cipher; non-secrets stay plain.
+            let stored = if is_secret {
+                settings_cipher
+                    .encrypt(&value)
+                    .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
+            } else {
+                value
+            };
             tx.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
-                rusqlite::params![key, encrypted],
+                rusqlite::params![key, stored],
             )
             .map_err(sql_error)
         }
