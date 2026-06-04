@@ -2487,11 +2487,111 @@ pub struct AddonInfo {
     pub icon: Option<String>,
     pub category: Option<String>,
     pub file_size_bytes: i64,
+    /// Multi-instance: szablon (pakiet) z ktorego ta instancja pochodzi.
+    pub package_id: String,
+    /// Przypieta wersja pakietu tej instancji.
+    pub package_version: String,
+    /// Nazwa instancji nadana przez usera (rozna od `name`/pakietu gdy zmieniona).
+    pub display_name: String,
+    /// True gdy w katalogu jest nowsza wersja pakietu niz `package_version`.
+    pub update_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonsListResponse {
     pub addons: Vec<AddonInfo>,
+}
+
+// =============================================================================
+// Multi-instance addons: katalog pakietow + operacje na instancjach.
+// =============================================================================
+
+/// Jeden pakiet (szablon) w katalogu — zagregowany po package_id ze wszystkich
+/// wersji w `addon_packages`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonPackageInfo {
+    pub package_id: String,
+    pub name: String,
+    /// Najnowsza dostepna wersja (pierwsza z list_package_versions).
+    pub latest_version: String,
+    /// Wszystkie dostepne wersje, najnowsze najpierw.
+    pub versions: Vec<String>,
+    pub source: String,
+    /// Ile instancji tego pakietu jest aktualnie zainstalowanych.
+    pub installed_instances: i32,
+}
+
+/// Instalacja nowej instancji pakietu z katalogu pod nadana nazwa.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceInstallRequest {
+    pub package_id: String,
+    pub version: String,
+    pub display_name: String,
+}
+
+/// Wspolna odpowiedz dla install/duplicate — zwraca addon_id nowej instancji.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceInstallResponse {
+    pub ok: bool,
+    pub addon_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Duplikacja istniejacej instancji pod nowa nazwa (puste dane).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceDuplicateRequest {
+    pub source_addon_id: String,
+    pub new_display_name: String,
+}
+
+/// Zapytanie o wersje dostepne dla instancji (do pickera update).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceVersionsRequest {
+    pub addon_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceVersionsResponse {
+    pub current: String,
+    /// Wszystkie skatalogowane wersje pakietu, najnowsze najpierw.
+    pub available: Vec<String>,
+}
+
+/// Hot-update instancji do wybranej wersji.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceUpdateRequest {
+    pub addon_id: String,
+    pub target_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceUpdateResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Multiplex dla operacji katalog/instancje w 1 wariancie MessageBody (limit
+/// 256 wariantow CBOR), wzorem `AddonUiBody`/`IamBody`. Req* przychodza z UI,
+/// Res* wracaja. Routing po inner-nazwie (`variant_name_of`) do jednego handlera
+/// `addon_instance_dispatch`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum AddonInstancePayload {
+    /// Lista pakietow w katalogu (zakladka "Katalog").
+    ReqCatalogList,
+    ResCatalogList {
+        packages: Vec<AddonPackageInfo>,
+    },
+    /// Instalacja nowej instancji z katalogu.
+    ReqInstall(AddonInstanceInstallRequest),
+    ResInstall(AddonInstanceInstallResponse),
+    /// Duplikacja istniejacej instancji (reuzywa ResInstall).
+    ReqDuplicate(AddonInstanceDuplicateRequest),
+    /// Wersje dostepne dla instancji (picker update).
+    ReqVersions(AddonInstanceVersionsRequest),
+    ResVersions(AddonInstanceVersionsResponse),
+    /// Hot-update instancji do wybranej wersji.
+    ReqUpdate(AddonInstanceUpdateRequest),
+    ResUpdate(AddonInstanceUpdateResponse),
 }
 
 // =============================================================================
@@ -4283,6 +4383,9 @@ pub enum MessageBody {
     // v14: Apps menu + UI v2 — multiplex w 1 slocie zeby zmiescic sie w 256
     // wariantach CBOR (vide IamBody/ServicePayload).
     AddonUiBody(AddonUiPayload),
+    // Multi-instance: katalog pakietow + install/duplicate/versions/update
+    // instancji — multiplex w 1 slocie (jak AddonUiBody).
+    AddonInstanceBody(AddonInstancePayload),
     AddonDetailRequestBody(AddonDetailRequest),
     AddonDetailResponseBody(AddonDetailResponse),
     AddonToggleRequestBody(AddonToggleRequest),

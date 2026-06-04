@@ -12,15 +12,28 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     AddonConfigField, AddonConfigGetResponse, AddonConfigSetResponse, AddonInstallResponse,
-    AddonLogEntry, AddonLogsResponse, AddonNetworkRuleDecl, AddonNetworkRulesGetResponse,
-    AddonNetworkRulesSetResponse, AddonReloadResponse, AddonResourcesGetResponse,
-    AddonResourcesSetResponse, AddonToggleResponse, AddonToolDecl, AddonToolParam,
-    AddonToolsResponse, AddonUninstallResponse, MessageBody, ProtocolError, ProtocolErrorCode,
-    SessionAuth,
+    AddonInstanceInstallResponse, AddonInstancePayload, AddonInstanceUpdateResponse,
+    AddonInstanceVersionsResponse, AddonLogEntry, AddonLogsResponse, AddonNetworkRuleDecl,
+    AddonNetworkRulesGetResponse, AddonNetworkRulesSetResponse, AddonPackageInfo,
+    AddonReloadResponse, AddonResourcesGetResponse, AddonResourcesSetResponse, AddonToggleResponse,
+    AddonToolDecl, AddonToolParam, AddonToolsResponse, AddonUninstallResponse, MessageBody,
+    ProtocolError, ProtocolErrorCode, SessionAuth,
 };
 
 use crate::db::repository;
 use crate::dispatch::HandlerContext;
+
+/// Zwraca AddonManager z AppState lub blad gdy niedostepny (np. headless bez
+/// runtime addonow). Potrzebny dla operacji instancji (install/duplicate/update),
+/// bo musza zarejestrowac runtime (toole/flow bloki), nie tylko zapisac DB.
+fn addon_manager(
+    ctx: &HandlerContext,
+) -> Result<std::sync::Arc<crate::addon::AddonManager>, ProtocolError> {
+    ctx.state
+        .addon_manager
+        .clone()
+        .ok_or_else(|| ProtocolError::internal("AddonManager unavailable"))
+}
 
 // =============================================================================
 // Helpery
@@ -462,8 +475,16 @@ pub fn addon_uninstall(
         ));
     }
 
-    crate::addon::lifecycle::uninstall(&payload.addon_id, &ctx.state.db)
-        .map_err(|e| ProtocolError::internal(format!("uninstall: {}", e)))?;
+    // Odinstalowanie instancji: przez managera (unregister runtime toole/flow
+    // bloki + zatrzymanie wasm + purge katalogu danych instancji). Headless bez
+    // managera (brak runtime addonow) — sama warstwa DB + purge danych.
+    match ctx.state.addon_manager.clone() {
+        Some(mgr) => mgr
+            .uninstall_instance(&payload.addon_id)
+            .map_err(|e| ProtocolError::internal(format!("uninstall: {}", e)))?,
+        None => crate::addon::lifecycle::uninstall_instance(&payload.addon_id, &ctx.state.db)
+            .map_err(|e| ProtocolError::internal(format!("uninstall: {}", e)))?,
+    }
 
     audit(
         ctx,
@@ -1160,6 +1181,169 @@ pub fn addon_reload(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
 fn invalidate_instance_pool(_ctx: &HandlerContext, addon_id: &str) -> String {
     format!("reload queued for addon '{}'", addon_id)
 }
+
+// =============================================================================
+// Multi-instance: katalog pakietow + install/duplicate/versions/update instancji.
+// Multipleksowane w `AddonInstanceBody` (limit 256 wariantow CBOR), routing po
+// inner-nazwie do jednego handlera (wzorem AddonUiBody/IamBody).
+// =============================================================================
+
+#[handler(variant = "AddonInstanceBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_instance_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use AddonInstancePayload as P;
+    let payload = match req {
+        MessageBody::AddonInstanceBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AddonInstanceBody")),
+    };
+    let db = &ctx.state.db;
+
+    let res = match payload {
+        P::ReqCatalogList => {
+            // Wiersze sa posortowane (package_id ASC, created_at DESC), wiec
+            // agregujemy kolejne wersje tego samego pakietu w jeden wpis.
+            let rows = repository::list_addon_packages(db).map_err(db_err)?;
+            let mut packages: Vec<AddonPackageInfo> = Vec::new();
+            for row in rows {
+                if let Some(last) = packages.last_mut() {
+                    if last.package_id == row.package_id {
+                        last.versions.push(row.version);
+                        continue;
+                    }
+                }
+                let installed_instances =
+                    repository::count_addon_instances(db, &row.package_id).map_err(db_err)? as i32;
+                packages.push(AddonPackageInfo {
+                    package_id: row.package_id,
+                    name: row.name,
+                    latest_version: row.version.clone(),
+                    versions: vec![row.version],
+                    source: row.source,
+                    installed_instances,
+                });
+            }
+            P::ResCatalogList { packages }
+        }
+        P::ReqInstall(r) => {
+            validate_addon_id(&r.package_id)?;
+            let name = r.display_name.trim();
+            if name.is_empty() || name.len() > 120 {
+                return Err(ProtocolError::bad_request("nazwa instancji 1..=120 znakow"));
+            }
+            let mgr = addon_manager(ctx)?;
+            let res = match mgr.install_instance(&r.package_id, &r.version, name) {
+                Ok(addon_id) => AddonInstanceInstallResponse {
+                    ok: true,
+                    addon_id: Some(addon_id),
+                    error: None,
+                },
+                Err(e) => AddonInstanceInstallResponse {
+                    ok: false,
+                    addon_id: None,
+                    error: Some(e.to_string()),
+                },
+            };
+            P::ResInstall(res)
+        }
+        P::ReqDuplicate(r) => {
+            validate_addon_id(&r.source_addon_id)?;
+            let name = r.new_display_name.trim();
+            if name.is_empty() || name.len() > 120 {
+                return Err(ProtocolError::bad_request("nazwa instancji 1..=120 znakow"));
+            }
+            let mgr = addon_manager(ctx)?;
+            let res = match mgr.duplicate_instance(&r.source_addon_id, name) {
+                Ok(addon_id) => AddonInstanceInstallResponse {
+                    ok: true,
+                    addon_id: Some(addon_id),
+                    error: None,
+                },
+                Err(e) => AddonInstanceInstallResponse {
+                    ok: false,
+                    addon_id: None,
+                    error: Some(e.to_string()),
+                },
+            };
+            P::ResInstall(res)
+        }
+        P::ReqVersions(r) => {
+            validate_addon_id(&r.addon_id)?;
+            let (package_id, current) = repository::get_addon_instance_package_ref(db, &r.addon_id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::bad_request("instancja nie istnieje"))?;
+            let available = repository::list_package_versions(db, &package_id).map_err(db_err)?;
+            P::ResVersions(AddonInstanceVersionsResponse { current, available })
+        }
+        P::ReqUpdate(r) => {
+            validate_addon_id(&r.addon_id)?;
+            let mgr = addon_manager(ctx)?;
+            let res = match mgr.update_instance(&r.addon_id, &r.target_version) {
+                Ok(()) => AddonInstanceUpdateResponse {
+                    ok: true,
+                    error: None,
+                },
+                Err(e) => AddonInstanceUpdateResponse {
+                    ok: false,
+                    error: Some(e.to_string()),
+                },
+            };
+            P::ResUpdate(res)
+        }
+        // Res* nie sa prawidlowymi requestami.
+        P::ResCatalogList { .. } | P::ResInstall(_) | P::ResVersions(_) | P::ResUpdate(_) => {
+            return Err(ProtocolError::bad_request("unexpected response variant"));
+        }
+    };
+
+    Ok(MessageBody::AddonInstanceBody(res))
+}
+
+/// Rejestruje multipleksowany handler pod kazda inner-nazwa requestu z wlasnym
+/// auth (read = UserSession, write = Admin), wzorem `register_addon_ui_variant!`.
+macro_rules! register_addon_instance_variant {
+    ($variant:literal, $metric:literal, $auth:expr) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: $auth,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_addon_instance_dispatch,
+            }
+        }
+    };
+}
+
+register_addon_instance_variant!(
+    "AddonCatalogListRequest",
+    "tentaflow_ws_handler_addon_catalog_list",
+    crate::dispatch::SessionAuthKind::UserSession
+);
+register_addon_instance_variant!(
+    "AddonInstanceVersionsRequest",
+    "tentaflow_ws_handler_addon_instance_versions",
+    crate::dispatch::SessionAuthKind::UserSession
+);
+register_addon_instance_variant!(
+    "AddonInstanceInstallRequest",
+    "tentaflow_ws_handler_addon_instance_install",
+    crate::dispatch::SessionAuthKind::Admin
+);
+register_addon_instance_variant!(
+    "AddonInstanceDuplicateRequest",
+    "tentaflow_ws_handler_addon_instance_duplicate",
+    crate::dispatch::SessionAuthKind::Admin
+);
+register_addon_instance_variant!(
+    "AddonInstanceUpdateRequest",
+    "tentaflow_ws_handler_addon_instance_update",
+    crate::dispatch::SessionAuthKind::Admin
+);
 
 #[cfg(test)]
 mod declared_status_tests {

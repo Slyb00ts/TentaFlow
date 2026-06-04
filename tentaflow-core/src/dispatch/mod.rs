@@ -819,6 +819,29 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "AddonApplicationsListResponse"
             }
         },
+        MessageBody::AddonInstanceBody(p) => match p {
+            tentaflow_protocol::AddonInstancePayload::ReqCatalogList => "AddonCatalogListRequest",
+            tentaflow_protocol::AddonInstancePayload::ResCatalogList { .. } => {
+                "AddonCatalogListResponse"
+            }
+            tentaflow_protocol::AddonInstancePayload::ReqInstall(_) => {
+                "AddonInstanceInstallRequest"
+            }
+            tentaflow_protocol::AddonInstancePayload::ResInstall(_) => {
+                "AddonInstanceInstallResponse"
+            }
+            tentaflow_protocol::AddonInstancePayload::ReqDuplicate(_) => {
+                "AddonInstanceDuplicateRequest"
+            }
+            tentaflow_protocol::AddonInstancePayload::ReqVersions(_) => {
+                "AddonInstanceVersionsRequest"
+            }
+            tentaflow_protocol::AddonInstancePayload::ResVersions(_) => {
+                "AddonInstanceVersionsResponse"
+            }
+            tentaflow_protocol::AddonInstancePayload::ReqUpdate(_) => "AddonInstanceUpdateRequest",
+            tentaflow_protocol::AddonInstancePayload::ResUpdate(_) => "AddonInstanceUpdateResponse",
+        },
         MessageBody::IamBody(p) => match p {
             tentaflow_protocol::IamPayload::ReqListUsers => "IamListUsersRequest",
             tentaflow_protocol::IamPayload::ResListUsers { .. } => "IamListUsersResponse",

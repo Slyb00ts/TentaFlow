@@ -4493,6 +4493,22 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         } else {
             Some(a.category)
         };
+        // update_available: w katalogu jest nowsza wersja pakietu niz przypieta
+        // przez ta instancje (latest = pierwsza z list_package_versions).
+        let update_available = if a.package_id.is_empty() {
+            false
+        } else {
+            repository::list_package_versions(&ctx.state.db, &a.package_id)
+                .map_err(db_err)?
+                .first()
+                .map(|latest| latest != &a.package_version)
+                .unwrap_or(false)
+        };
+        let display_name = if a.display_name.is_empty() {
+            a.name.clone()
+        } else {
+            a.display_name
+        };
         addons.push(tentaflow_protocol::AddonInfo {
             addon_id: a.addon_id,
             name: a.name,
@@ -4509,6 +4525,10 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             icon,
             category,
             file_size_bytes: a.wasm_size_bytes,
+            package_id: a.package_id,
+            package_version: a.package_version,
+            display_name,
+            update_available,
         });
     }
     Ok(MessageBody::AddonsListResponseBody(

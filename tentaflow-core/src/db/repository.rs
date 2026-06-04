@@ -5099,7 +5099,8 @@ pub fn list_addons(pool: &DbPool) -> Result<Vec<Addon>> {
         "SELECT id, addon_id, name, version, description, author, platforms, \
          manifest_json, is_enabled, is_system, installed_at, updated_at, \
          COALESCE(category, ''), COALESCE(icon, ''), \
-         COALESCE(runtime, 'wasmtime'), COALESCE(wasm_size_bytes, 0) \
+         COALESCE(runtime, 'wasmtime'), COALESCE(wasm_size_bytes, 0), \
+         COALESCE(package_id, ''), COALESCE(package_version, ''), COALESCE(display_name, '') \
          FROM addons ORDER BY name",
     )?;
     let rows = stmt
@@ -5121,6 +5122,9 @@ pub fn list_addons(pool: &DbPool) -> Result<Vec<Addon>> {
                 icon: row.get(13)?,
                 runtime: row.get(14)?,
                 wasm_size_bytes: row.get(15)?,
+                package_id: row.get(16)?,
+                package_version: row.get(17)?,
+                display_name: row.get(18)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -5134,7 +5138,8 @@ pub fn get_addon(pool: &DbPool, addon_id: &str) -> Result<Option<Addon>> {
         "SELECT id, addon_id, name, version, description, author, platforms, \
          manifest_json, is_enabled, is_system, installed_at, updated_at, \
          COALESCE(category, ''), COALESCE(icon, ''), \
-         COALESCE(runtime, 'wasmtime'), COALESCE(wasm_size_bytes, 0) \
+         COALESCE(runtime, 'wasmtime'), COALESCE(wasm_size_bytes, 0), \
+         COALESCE(package_id, ''), COALESCE(package_version, ''), COALESCE(display_name, '') \
          FROM addons WHERE addon_id = ?1",
     )?;
     let result = stmt
@@ -5156,6 +5161,9 @@ pub fn get_addon(pool: &DbPool, addon_id: &str) -> Result<Option<Addon>> {
                 icon: row.get(13)?,
                 runtime: row.get(14)?,
                 wasm_size_bytes: row.get(15)?,
+                package_id: row.get(16)?,
+                package_version: row.get(17)?,
+                display_name: row.get(18)?,
             })
         })
         .optional()?;
@@ -5215,6 +5223,17 @@ pub struct AddonPackageRow {
     pub bundle_hash: String,
     pub source: String,
     pub created_at: String,
+}
+
+/// Liczba zainstalowanych instancji danego pakietu (wierszy w `addons`).
+pub fn count_addon_instances(pool: &DbPool, package_id: &str) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM addons WHERE package_id = ?1",
+        rusqlite::params![package_id],
+        |row| row.get(0),
+    )?;
+    Ok(n)
 }
 
 /// Zwraca jedna wersje pakietu z katalogu (lub None gdy brak).
