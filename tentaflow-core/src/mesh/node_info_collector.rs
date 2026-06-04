@@ -228,6 +228,75 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
     }
 }
 
+/// Zwraca przyjazna nazwe lokalnego hosta — jedno zrodlo prawdy dla calego core.
+///
+/// macOS: czytamy `ComputerName` (to co uzytkownik ustawia w Ustawieniach), bo
+/// uniksowy `kern.hostname` przy nieustawionym `scutil --get HostName` bywa
+/// wypelniany przez DHCP smieciami (znaki kontrolne, mojibake). Wynik jest
+/// cache'owany w `OnceLock`, bo hostname jest staly w trakcie zycia procesu, a
+/// nie chcemy spawnowac subprocesu przy kazdym wywolaniu.
+///
+/// iOS: `hostname` zwraca "localhost", wiec bierzemy nazwe urzadzenia przez FFI.
+///
+/// Pozostale platformy: standardowy `hostname::get()`.
+#[cfg(target_os = "macos")]
+pub fn local_hostname() -> String {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let computer_name = std::process::Command::new("scutil")
+                .args(["--get", "ComputerName"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            computer_name.unwrap_or_else(|| {
+                hostname::get()
+                    .ok()
+                    .and_then(|s| s.into_string().ok())
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
+        })
+        .clone()
+}
+
+#[cfg(target_os = "ios")]
+pub fn local_hostname() -> String {
+    // iOS nie ma uniksowego hostname uzytkownika — nazwa urzadzenia idzie przez FFI.
+    extern "C" {
+        fn tentaflow_get_device_name() -> *mut std::ffi::c_char;
+    }
+    let ptr = unsafe { tentaflow_get_device_name() };
+    if !ptr.is_null() {
+        let name = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .to_string();
+        extern "C" {
+            fn free(ptr: *mut std::ffi::c_void);
+        }
+        unsafe {
+            free(ptr as *mut std::ffi::c_void);
+        }
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    hostname::get()
+        .ok()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub fn local_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Wykrywa platforme na ktorej dziala nod
 pub fn detect_platform() -> String {
     if cfg!(target_os = "linux") {
@@ -256,34 +325,11 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
     // Startuj wgpu enumeration w tle (fire-and-forget, nie blokuje)
     start_wgpu_enumeration();
 
-    // Zbierz dane systemowe — KROTKO trzymaj lock na SYS, potem zwolnij
-    #[allow(unused_mut)] // mut potrzebny na iOS (FFI device name) i Android
-    let (hostname, os_info, cpu_count, ram_total_mb) = {
-        let sys = sys().lock();
-        let mut hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
+    let hostname = local_hostname();
 
-        // iOS: System::host_name() zwraca "localhost" — probuj pobrac nazwe urzadzenia przez FFI
-        #[cfg(target_os = "ios")]
-        {
-            extern "C" {
-                fn tentaflow_get_device_name() -> *mut std::ffi::c_char;
-            }
-            let ptr = unsafe { tentaflow_get_device_name() };
-            if !ptr.is_null() {
-                let name = unsafe { std::ffi::CStr::from_ptr(ptr) }
-                    .to_string_lossy()
-                    .to_string();
-                extern "C" {
-                    fn free(ptr: *mut std::ffi::c_void);
-                }
-                unsafe {
-                    free(ptr as *mut std::ffi::c_void);
-                }
-                if !name.is_empty() {
-                    hostname = name;
-                }
-            }
-        }
+    // Zbierz dane systemowe — KROTKO trzymaj lock na SYS, potem zwolnij
+    let (os_info, cpu_count, ram_total_mb) = {
+        let sys = sys().lock();
 
         #[allow(unused_mut)] // mut potrzebny na iOS/Android
         let mut os_name = System::name().unwrap_or_else(|| "unknown".to_string());
@@ -306,7 +352,7 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
         let os_info = format!("{} {} ({})", os_name, os_version, arch);
         let cpu_count = sys.cpus().len() as u32;
         let ram_total_mb = sys.total_memory() / (1024 * 1024);
-        (hostname, os_info, cpu_count, ram_total_mb)
+        (os_info, cpu_count, ram_total_mb)
         // SYS lock zwolniony tutaj — PRZED GPU detection
     };
 

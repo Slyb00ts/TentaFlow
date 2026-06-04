@@ -72,9 +72,8 @@ impl Router {
                             return Ok(crate::routing::RouteResult {
                                 response,
                                 metadata: crate::routing::RouteMetadata {
-                                    served_by_node: hostname::get()
-                                        .map(|h| h.to_string_lossy().to_string())
-                                        .unwrap_or_else(|_| "unknown".to_string()),
+                                    served_by_node:
+                                        crate::mesh::node_info_collector::local_hostname(),
                                     backend_type: "flow_engine".to_string(),
                                     strategy_used: "flow_dispatch".to_string(),
                                     fallbacks_tried: 0,
@@ -271,9 +270,8 @@ impl Router {
                             Ok(response) => Ok(crate::routing::RouteResult {
                                 response,
                                 metadata: crate::routing::RouteMetadata {
-                                    served_by_node: hostname::get()
-                                        .map(|h| h.to_string_lossy().to_string())
-                                        .unwrap_or_else(|_| "unknown".to_string()),
+                                    served_by_node:
+                                        crate::mesh::node_info_collector::local_hostname(),
                                     backend_type: "executor".to_string(),
                                     strategy_used: "executor".to_string(),
                                     fallbacks_tried: 0,
