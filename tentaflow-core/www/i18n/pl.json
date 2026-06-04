@@ -1258,6 +1258,7 @@
   },
   "addons": {
     "list_title": "Dodatki WASM",
+    "uploaded_to_catalog": "Pakiet dodany do katalogu — zainstaluj go, aby utworzyć instancję",
     "install_zip": "Zainstaluj z ZIP",
     "browse_registry": "Przeglądaj rejestr",
     "filter_all": "Wszystkie",
