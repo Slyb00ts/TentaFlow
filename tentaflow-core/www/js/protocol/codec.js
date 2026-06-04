@@ -1902,6 +1902,74 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AddonInstanceBody(ReqCatalogList) — lista pakietow w katalogu. */
+  addonCatalogListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonCatalogListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonInstanceBody(ReqInstall) — instalacja instancji z katalogu. */
+  addonInstanceInstallRequest(
+    correlationId,
+    { packageId, version, displayName },
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeAddonInstanceInstallRequest(packageId, version, displayName);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonInstanceBody(ReqDuplicate) — duplikacja instancji. */
+  addonInstanceDuplicateRequest(
+    correlationId,
+    { sourceAddonId, newDisplayName },
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeAddonInstanceDuplicateRequest(sourceAddonId, newDisplayName);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonInstanceBody(ReqVersions) — wersje dostepne dla instancji. */
+  addonInstanceVersionsRequest(correlationId, { addonId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonInstanceVersionsRequest(addonId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonInstanceBody(ReqUpdate) — hot-update instancji do wersji. */
+  addonInstanceUpdateRequest(correlationId, { addonId, targetVersion }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonInstanceUpdateRequest(addonId, targetVersion);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
 
   /** MessageBody::UsersListRequest (unit, Admin) — lista uzytkownikow. */
   usersListRequest(correlationId, sequence = 1) {
