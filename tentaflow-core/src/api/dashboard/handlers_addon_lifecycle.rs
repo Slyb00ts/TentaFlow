@@ -1643,11 +1643,9 @@ pub fn addon_vector_dispatch(
 
             let milvus_compiled =
                 crate::services::vector::namespace::NamespaceManager::milvus_compiled();
-            let milvus_services = if milvus_compiled {
-                discover_local_milvus_services(db)
-            } else {
-                Vec::new()
-            };
+            // Local services only when this build links Milvus; remote services
+            // (proxied over mesh) are usable even without the local feature.
+            let milvus_services = discover_milvus_services(ctx);
 
             P::GetConfigResponse(AddonVectorConfigResponse {
                 milvus_compiled,
@@ -1663,27 +1661,52 @@ pub fn addon_vector_dispatch(
                 .map_err(db_err)?
                 .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
             validate_vector_config(&r.config)?;
-            // service_ref musi wskazywac istniejacy, osiagalny, lokalny serwis Milvus
-            // (zdalne dochodza w nastepnym slice). Sprawdzamy wzgledem dyskoveru.
-            if r.config.backend == "milvus" && r.config.milvus_source.as_deref() == Some("service_ref")
-            {
-                let sref = r
-                    .config
-                    .service_ref
-                    .as_ref()
-                    .ok_or_else(|| ProtocolError::bad_request("brak service_ref"))?;
-                if !sref.node_id.trim().is_empty() {
-                    return Err(ProtocolError::bad_request(
-                        "zdalne serwisy Milvus nie sa jeszcze wspierane (uzyj lokalnego lub manual)",
-                    ));
-                }
-                let ok = discover_local_milvus_services(db)
-                    .into_iter()
-                    .any(|s| s.service_id == sref.service_id && s.reachable);
-                if !ok {
-                    return Err(ProtocolError::bad_request(
-                        "service_ref nie wskazuje osiagalnego lokalnego serwisu Milvus",
-                    ));
+            let milvus_compiled =
+                crate::services::vector::namespace::NamespaceManager::milvus_compiled();
+            if r.config.backend == "milvus" {
+                match r.config.milvus_source.as_deref() {
+                    Some("service_ref") => {
+                        // service_ref (lokalny LUB zdalny) musi wskazywac
+                        // istniejacy, osiagalny serwis Milvus — sprawdzamy
+                        // wzgledem polaczonego dyskoveru (po node_id + service_id).
+                        let sref = r
+                            .config
+                            .service_ref
+                            .as_ref()
+                            .ok_or_else(|| ProtocolError::bad_request("brak service_ref"))?;
+                        let ok = discover_milvus_services(ctx).into_iter().any(|s| {
+                            s.node_id == sref.node_id
+                                && s.service_id == sref.service_id
+                                && s.reachable
+                        });
+                        if !ok {
+                            return Err(ProtocolError::bad_request(
+                                "service_ref nie wskazuje osiagalnego serwisu Milvus",
+                            ));
+                        }
+                        // Zdalny ref wymaga zywego transportu mesh — odrzucamy
+                        // zanim zapiszemy config, ktory padlby przy pierwszym uzyciu.
+                        if !sref.node_id.trim().is_empty()
+                            && !crate::services::vector_namespace_manager(db)
+                                .remote_transport_ready()
+                        {
+                            return Err(ProtocolError::bad_request(
+                                "mesh nie jest jeszcze gotowy — zdalny serwis Milvus chwilowo \
+                                 niedostepny",
+                            ));
+                        }
+                    }
+                    Some("manual") => {
+                        // Reczny URL laczy sie bezposrednio (lokalny klient
+                        // Milvus) — wymaga feature vector-milvus na tym nodzie.
+                        if !milvus_compiled {
+                            return Err(ProtocolError::bad_request(
+                                "ten node nie ma wkompilowanego Milvus — reczny URL niedostepny \
+                                 (uzyj serwisu Milvus z innego noda)",
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
             }
             if r.milvus_user.as_deref().map(|u| u.len() > MAX_VECTOR_SECRET_LEN).unwrap_or(false)
@@ -1746,6 +1769,9 @@ pub fn addon_vector_dispatch(
                 )
                 .map_err(db_err)?;
             }
+            // Drop cached open backends for this addon so the new config takes
+            // effect on next access without a process restart.
+            crate::services::vector_namespace_manager(db).invalidate_addon(&r.addon_id);
             P::SetConfigResponse(AddonVectorSetConfigResponse {
                 ok: true,
                 error: None,
@@ -1805,9 +1831,59 @@ fn validate_vector_config(cfg: &AddonVectorConfig) -> Result<(), ProtocolError> 
     }
 }
 
+/// Polaczona lista serwisow Milvus dla pickera: lokalne (tylko gdy ten build
+/// linkuje Milvus — inaczej wybor lokalnego konczy sie bledem przy uzyciu) plus
+/// zdalne z rejestru mesh (proxowane przez VectorOp — dzialaja nawet bez
+/// lokalnego feature). Dedup po (node_id, service_id).
+fn discover_milvus_services(ctx: &HandlerContext) -> Vec<AddonMilvusService> {
+    let mut out = if crate::services::vector::namespace::NamespaceManager::milvus_compiled() {
+        discover_local_milvus_services(&ctx.state.db)
+    } else {
+        Vec::new()
+    };
+    out.extend(discover_remote_milvus_services(ctx));
+    out
+}
+
+/// Serwisy Milvus na INNYCH nodach z rejestru mesh. `reachable` = wlasciciel ma
+/// serwis running/degraded z endpointem (loopback po jego stronie — my laczymy
+/// sie przez mesh, nie bezposrednio, wiec endpointu nie pokazujemy klientowi).
+///
+/// `reachable` mowi tylko, ze serwis Milvus DZIALA u wlasciciela — nie, ze jego
+/// Core ma feature `vector-milvus` (potrzebny do wykonania VectorOp). Brak kanalu
+/// rozglaszania capability nodow, wiec taki rzadki przypadek (Milvus jako infra
+/// bez klienta w Core) konczy sie jasnym bledem przy pierwszej operacji, jak inne
+/// proxy mesh (web_research degraduje tak samo) — nie cicha utrata danych.
+fn discover_remote_milvus_services(ctx: &HandlerContext) -> Vec<AddonMilvusService> {
+    let registry = match ctx.state.service_manager.mesh_services_registry.read().clone() {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let local_node = registry.local().node_id.clone();
+    registry
+        .visible_services()
+        .into_iter()
+        .filter(|s| s.engine_id == "milvus" && !s.node_id.is_empty() && s.node_id != local_node)
+        .map(|s| {
+            let reachable = !s.paused
+                && matches!(s.status.as_str(), "running" | "degraded")
+                && s.endpoint_url.as_deref().map(|u| !u.is_empty()).unwrap_or(false);
+            AddonMilvusService {
+                node_id: s.node_id,
+                local: false,
+                service_id: s.id.to_string(),
+                display_name: s.display_name,
+                // Remote endpoint is the owner's loopback — not meaningful (and
+                // not reachable) for this node; the data path goes via mesh.
+                endpoint: String::new(),
+                reachable,
+            }
+        })
+        .collect()
+}
+
 /// Lista lokalnych serwisow Milvus (engine_id='milvus') dla pickera. Lokalny
 /// serwis jest osiagalny (ten sam node), wiec reachable = running+endpoint.
-/// Zdalne serwisy (mesh, advertised_endpoint) dochodza w nastepnym slice.
 fn discover_local_milvus_services(db: &crate::db::DbPool) -> Vec<AddonMilvusService> {
     use crate::services_repo::services::ServiceStatus;
     let conn = match db.lock() {

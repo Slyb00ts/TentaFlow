@@ -217,33 +217,41 @@ function renderVectorBackendSection() {
 
   const cfg = v.config || { backend: 'zvec' };
   const milvusOk = !!v.milvusCompiled;
-  // Build bez vector-milvus nie moze pokazac/zapisac milvus — wymuszamy zvec.
-  const backend = cfg.backend === 'milvus' && milvusOk ? 'milvus' : 'zvec';
-  // Tylko osiagalne serwisy sa wybieralne — niedostepny serwis nie jest stanem
-  // konfiguracyjnym. Composite value `nodeId|serviceId` jest forward-compatible
-  // z C-2 (zdalne serwisy); dla lokalnego slice'a nodeId jest puste.
+  // Tylko osiagalne serwisy sa wybieralne. Composite value `nodeId|serviceId`
+  // (puste nodeId = lokalny). Zdalne serwisy proxujemy przez mesh (VectorOp),
+  // wiec Milvus jest dostepny nawet bez lokalnego feature — o ile jest serwis.
   const allServices = Array.isArray(v.milvusServices) ? v.milvusServices : [];
   const services = allServices.filter((s) => s.reachable);
-  const source = cfg.milvusSource === 'manual'
+  // Milvus dostepny gdy: lokalny klient (feature) LUB widoczny osiagalny serwis.
+  const milvusAvailable = milvusOk || services.length > 0;
+  // Reczny URL laczy sie bezposrednio — wymaga lokalnego feature.
+  const manualAllowed = milvusOk;
+  const backend = cfg.backend === 'milvus' && milvusAvailable ? 'milvus' : 'zvec';
+  const source = cfg.milvusSource === 'manual' && manualAllowed
     ? 'manual'
-    : (cfg.milvusSource === 'service_ref' || services.length ? 'service_ref' : 'manual');
+    : (cfg.milvusSource === 'service_ref' || services.length ? 'service_ref' : (manualAllowed ? 'manual' : 'service_ref'));
   const selRef = cfg.serviceRef || {};
   const selectedKey = `${selRef.nodeId || ''}|${selRef.serviceId || ''}`;
   const manualUri = cfg.manualUri || '';
   const collection = cfg.collectionOverride || '';
   const hasSecret = !!v.hasMilvusUser || !!v.hasMilvusPassword;
 
-  const milvusWarn = milvusOk ? '' : `
+  // Ostrzezenie tylko gdy Milvus naprawde niedostepny (brak feature i brak
+  // widocznych serwisow). Gdy dostepny wylacznie zdalnie — dzialamy normalnie.
+  const milvusWarn = milvusAvailable ? '' : `
     <div class="bindings-info bindings-info-warn">
       <svg class="icon"><use href="#i-info"/></svg>
       <span>${escapeHtml(t('vcfg_milvus_unavailable'))}</span>
     </div>
   `;
 
+  const shortNode = (id) => String(id || '').slice(0, 8);
   const serviceOptions = services.map((s) => {
     const key = `${s.nodeId || ''}|${s.serviceId}`;
-    const local = s.local ? ` · ${t('vcfg_local_chip')}` : '';
-    const label = `${s.displayName || s.serviceId}${local}`;
+    const where = s.local
+      ? ` · ${t('vcfg_local_chip')}`
+      : ` · ${t('vcfg_remote_chip')} ${shortNode(s.nodeId)}`;
+    const label = `${s.displayName || s.serviceId}${where}`;
     return `<option value="${escapeAttr(key)}" ${key === selectedKey ? 'selected' : ''}>${escapeHtml(label)}</option>`;
   }).join('');
 
@@ -259,7 +267,7 @@ function renderVectorBackendSection() {
     <div class="vcfg-milvus" id="vcfg-milvus" style="${backend === 'milvus' ? '' : 'display:none'}">
       <tf-radio-group name="vcfg-source" id="vcfg-source" value="${escapeAttr(source)}">
         <tf-radio value="service_ref" label="${escapeAttr(t('vcfg_source_service'))}"></tf-radio>
-        <tf-radio value="manual" label="${escapeAttr(t('vcfg_source_manual'))}"></tf-radio>
+        <tf-radio value="manual" label="${escapeAttr(t('vcfg_source_manual'))}" ${manualAllowed ? '' : 'disabled'}></tf-radio>
       </tf-radio-group>
       <div class="vcfg-source-block" id="vcfg-block-service" style="${source === 'service_ref' ? '' : 'display:none'}">
         <span class="tf-label">${escapeHtml(t('vcfg_service_label'))}</span>
@@ -286,7 +294,7 @@ function renderVectorBackendSection() {
       <div class="bindings-info"><svg class="icon"><use href="#i-info"/></svg><span>${escapeHtml(t('vcfg_desc'))}</span></div>
       <tf-radio-group name="vcfg-backend" id="vcfg-backend" value="${escapeAttr(backend)}">
         <tf-radio value="zvec" label="${escapeAttr(t('vcfg_backend_zvec'))}"></tf-radio>
-        <tf-radio value="milvus" label="${escapeAttr(t('vcfg_backend_milvus'))}" ${milvusOk ? '' : 'disabled'}></tf-radio>
+        <tf-radio value="milvus" label="${escapeAttr(t('vcfg_backend_milvus'))}" ${milvusAvailable ? '' : 'disabled'}></tf-radio>
       </tf-radio-group>
       <div class="vcfg-hints">
         <div class="muted">${escapeHtml(t('vcfg_backend_zvec_sub'))}</div>
