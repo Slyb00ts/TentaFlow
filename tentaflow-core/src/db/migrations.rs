@@ -350,6 +350,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_packages_and_instance_versioning",
             MigrationStep::Sql(ADDON_PACKAGES_AND_INSTANCE_VERSIONING),
         ),
+        (
+            61,
+            "repair_default_flow_random_id",
+            MigrationStep::RustSelfManaged(repair_default_flow_random_id),
+        ),
     ]
 }
 
@@ -884,6 +889,11 @@ fn core_identity_int_to_uuid(conn: &Connection, version: i64, name: &str) -> Res
 // referencje admina (grupy/node'y uzywaja UUID).
 const REPAIRED_ADMIN_ID: &str = "00000000-0000-4000-8000-000000000002";
 
+/// Canonical id of the seeded "Default Chat" flow. Must match
+/// `crate::db::seed::DEFAULT_CHAT_FLOW_ID` (kept as a sibling literal, like
+/// `REPAIRED_ADMIN_ID` mirrors `DEFAULT_ADMIN_ID`).
+const REPAIRED_DEFAULT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
+
 fn repair_admin_non_uuid_id(conn: &Connection, version: i64, name: &str) -> Result<()> {
     let needs_repair: bool = conn.query_row(
         "SELECT COUNT(*) > 0 FROM user_accounts WHERE id = '1'",
@@ -951,6 +961,111 @@ fn repair_admin_non_uuid_id(conn: &Connection, version: i64, name: &str) -> Resu
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES ('migration_phase', ?1)",
                 rusqlite::params![format!("repair_admin_non_uuid_id:failed:{e}")],
+            );
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            Err(e)
+        }
+    }
+}
+
+/// Fresh DBs historically seeded "Default Chat" with a random `Uuid::new_v4()`,
+/// so the same logical flow held a different id on every node. Core sync targets
+/// rows by id (`UPDATE flows ... WHERE id = ?`), so editing the flow on one node
+/// produced ops the others could not apply ("target row not found") and the flow
+/// never converged. Re-key the existing default flow to the shared canonical id
+/// (the value fresh seeds now use), remapping every child FK through the same
+/// `child_remaps()` closure the v56 identity flip uses. Once every node has run
+/// this, the default flow shares one id across the mesh and edits sync; LWW then
+/// converges content. Mirrors `repair_admin_non_uuid_id` (FK pragma toggled
+/// outside the transaction, so it must be `RustSelfManaged`).
+fn repair_default_flow_random_id(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    let needs_repair: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM flows WHERE name = 'Default Chat' AND id != ?1",
+        rusqlite::params![REPAIRED_DEFAULT_FLOW_ID],
+        |row| row.get(0),
+    )?;
+    if !needs_repair {
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        return Ok(());
+    }
+
+    let old_id: String = conn.query_row(
+        "SELECT id FROM flows WHERE name = 'Default Chat' AND id != ?1 LIMIT 1",
+        rusqlite::params![REPAIRED_DEFAULT_FLOW_ID],
+        |row| row.get(0),
+    )?;
+
+    // A row already on the canonical id alongside a legacy one would mean two
+    // distinct "Default Chat" flows. Re-keying would collide on the PK; merging
+    // them is out of scope. Fail loudly rather than silently fuse two flows.
+    let canonical_exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM flows WHERE id = ?1",
+        rusqlite::params![REPAIRED_DEFAULT_FLOW_ID],
+        |row| row.get(0),
+    )?;
+    if canonical_exists {
+        anyhow::bail!(
+            "repair_default_flow_random_id: legacy '{old_id}' and the canonical default \
+             flow both exist; manual reconciliation needed"
+        );
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        // Children first (while the parent still holds the old id), then the PK.
+        for remap in child_remaps() {
+            if remap.parent != IdentityTable::Flows {
+                continue;
+            }
+            if !table_exists(&tx, remap.table)? {
+                continue;
+            }
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET {} = ?1 WHERE {} = ?2",
+                    remap.table, remap.column, remap.column
+                ),
+                rusqlite::params![REPAIRED_DEFAULT_FLOW_ID, old_id],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE flows SET id = ?1 WHERE id = ?2",
+            rusqlite::params![REPAIRED_DEFAULT_FLOW_ID, old_id],
+        )?;
+
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "repair_default_flow_random_id: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('migration_phase', ?1)",
+                rusqlite::params![format!("repair_default_flow_random_id:failed:{e}")],
             );
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             Err(e)
@@ -5340,6 +5455,109 @@ mod tests {
             violations_again.is_empty(),
             "powtorne wywolanie nie moze wprowadzic naruszen FK: {violations_again:?}"
         );
+    }
+
+    /// Regresja v61: migracja repair_default_flow_random_id przepina "Default
+    /// Chat", ktory na starych instalacjach mial losowy `Uuid::new_v4()` (rozny
+    /// per node), na wspolny staly id. Budujemy schemat przez run(), cofamy
+    /// wersje ponizej 61, odtwarzamy stan z losowym id + dzieckiem
+    /// (flow_model_bindings) na to id, po czym uruchamiamy repair i weryfikujemy
+    /// remap rodzica + dziecka, brak naruszen FK i idempotencje.
+    #[test]
+    fn migration_v61_repairs_random_default_flow_id() {
+        const CANONICAL: &str = "00000000-0000-4000-8000-000000000010";
+
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        conn.execute("DELETE FROM _migrations WHERE version >= 61", [])
+            .unwrap();
+
+        // Odtworz stary stan: Default Chat z losowym id + binding na to id.
+        let random_id = uuid::Uuid::new_v4().to_string();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, is_default, status) \
+             VALUES (?1, 'Default Chat', '{}', 1, 'active')",
+            rusqlite::params![random_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flow_model_bindings (id, flow_id, model_pattern, priority) \
+             VALUES (?1, ?2, 'gpt-*', 0)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), random_id],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        repair_default_flow_random_id(&conn, 61, "repair_default_flow_random_id").unwrap();
+
+        // (a) flow ma kanoniczny id, losowy zniknal.
+        let flow_id: String = conn
+            .query_row(
+                "SELECT id FROM flows WHERE name = 'Default Chat'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flow_id, CANONICAL, "Default Chat musi miec kanoniczny id");
+        assert_eq!(
+            random_id_count(&conn, &random_id),
+            0,
+            "losowy id nie moze juz istniec"
+        );
+
+        // (b) dziecko (binding) zremapowane na ten sam id.
+        let binding_flow_id: String = conn
+            .query_row(
+                "SELECT flow_id FROM flow_model_bindings LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            binding_flow_id, CANONICAL,
+            "flow_model_bindings.flow_id musi zostac zremapowane"
+        );
+
+        // (c) brak naruszen FK.
+        let violations = foreign_key_check(&conn).unwrap();
+        assert!(violations.is_empty(), "naruszenia FK po naprawie: {violations:?}");
+
+        // (d) v61 zapisane w _migrations.
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 61",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1, "v61 powinno byc zapisane w _migrations");
+
+        // (e) idempotencja: drugie wywolanie nic nie psuje.
+        repair_default_flow_random_id(&conn, 61, "repair_default_flow_random_id").unwrap();
+        let flow_id_again: String = conn
+            .query_row(
+                "SELECT id FROM flows WHERE name = 'Default Chat'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flow_id_again, CANONICAL);
+        let violations_again = foreign_key_check(&conn).unwrap();
+        assert!(
+            violations_again.is_empty(),
+            "powtorne wywolanie nie moze wprowadzic naruszen FK: {violations_again:?}"
+        );
+    }
+
+    fn random_id_count(conn: &Connection, id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM flows WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by
