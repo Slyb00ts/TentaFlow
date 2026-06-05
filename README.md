@@ -6,7 +6,7 @@
 
 **An operating system for your AI.**
 
-Turn every device you own — a GPU server, your laptop, your phone — into one private AI mesh.
+Turn every device you own - a GPU server, your laptop, your phone - into one private AI mesh.
 Deploy models anywhere, wire them into flows, and let TentaFlow pick the right model automatically:
 the big one on the server when you're connected, the local one on your phone when you're not.
 
@@ -26,15 +26,15 @@ as **one private AI system that you fully own**.
 
 TentaFlow is the layer that makes that happen. It is a single Rust application that runs on Linux,
 macOS, Windows, Android and iOS, and turns each device into a **node** in a peer-to-peer mesh.
-A node can be a rack server with four GPUs, a MacBook, or a phone in your pocket — they all speak the
+A node can be a rack server with four GPUs, a MacBook, or a phone in your pocket - they all speak the
 same protocol, share the same data, and expose the same capabilities.
 
 On top of that mesh you:
 
-- **Deploy models to any device** — run a 70B model on the GPU box and a small one on the phone, all from the same dashboard.
+- **Deploy models to any device** - run a 70B model on the GPU box and a small one on the phone, all from the same dashboard.
 - **Build flows visually** — chain LLMs, speech, vision, memory and tools into multi-step pipelines with the **Flow Builder**, no code required.
-- **Define aliases with automatic fallback** — point your app at `assistant`, and TentaFlow uses the powerful server model when it's reachable and silently falls back to a local laptop/phone model when it isn't.
-- **Extend everything with addons** — sandboxed plug-ins (with their own UI) that add tools, integrations and data sources, written against an SDK.
+- **Define aliases with automatic fallback** - point your app at `assistant`, and TentaFlow uses the powerful server model when it's reachable and silently falls back to a local laptop/phone model when it isn't.
+- **Extend everything with addons** - sandboxed plug-ins (with their own UI) that add tools, integrations and data sources, written against an SDK.
 
 And because the whole thing also runs **fully offline on a phone**, you get the exact same product whether
 you're online with a server farm or on a plane with nothing but your handset.
@@ -57,7 +57,7 @@ transparently, including multi-hop relays for peers that aren't directly connect
 LLM on your server as if it were local.
 
 State (your flows, settings, identities, RBAC, addon data) is kept consistent across the mesh by an
-embedded **Sync Ledger** — an append-only, hash-chained operation log with per-node cursors, outbox/inbox
+embedded **Sync Ledger** - an append-only, hash-chained operation log with per-node cursors, outbox/inbox
 and snapshots. Sync is permission-gated: a node only receives the resources it's allowed to.
 
 <p align="center"><img src="docs/screenshots/mesh.png" alt="Mesh view — paired nodes, live resource usage and pending pairings" width="900" /></p>
@@ -85,8 +85,8 @@ long-term memory.
 ### 🔀 Flows: compose AI like building blocks
 
 The **Flow Builder** is a visual, node-based editor (a typed DAG) for turning models and tools into
-real pipelines — transcribe → summarize → translate → speak, or trigger → retrieve from memory →
-LLM → filter PII → output. Node types include:
+real pipelines - transcribe -> summarize -> translate -> speak, or trigger -> retrieve from memory ->
+LLM -> filter PII -> output. Node types include:
 
 `trigger` · `llm` · `vision_llm` · `stt` · `tts` · `embeddings` · `memory` ·
 `conversation_history` · `condition` · `pii_filter` · `combine` · `sentence_buffer` ·
@@ -95,7 +95,7 @@ LLM → filter PII → output. Node types include:
 Flows run in two modes: **blocking** (full DAG, nodes run concurrently as their inputs become ready)
 and **streaming** (token-by-token for LLM chat). Every flow is validated on save.
 
-<p align="center"><img src="docs/screenshots/flow-builder.png" alt="Flow Builder — a typed DAG chaining trigger, memory, LLM and TTS nodes" width="900" /></p>
+<p align="center"><img src="docs/screenshots/flow-builder.png" alt="Flow Builder - a typed DAG chaining trigger, memory, LLM and TTS nodes" width="900" /></p>
 
 ### 🎯 Aliases with automatic fallback
 
@@ -113,13 +113,13 @@ alias "assistant"
 At request time TentaFlow resolves the alias against what's actually reachable right now. It prefers a
 **locally deployed** model over a remote one, walks the fallback chain on transport failures, and only
 surfaces an error if *every* candidate is unreachable. So when you're at your desk you get the big server
-model; when you walk away and lose the connection, the same `assistant` keeps working on-device — no code
+model; when you walk away and lose the connection, the same `assistant` keeps working on-device - no code
 change, no reconfiguration. Every resolution is audited (which target was used, whether a fallback kicked in).
 
 ### 🧩 Addons: extend everything, in your language
 
 Addons are **sandboxed WebAssembly plug-ins** (WASM/WASI, run via Wasmtime on desktop, wasmi on mobile).
-They add tools, data sources, Flow blocks and even **their own dashboard panels** — the UI is described
+They add tools, data sources, Flow blocks and even **their own dashboard panels** - the UI is described
 declaratively (a CBOR component tree of ~150 building blocks) and rendered natively by the host on web,
 iOS and desktop.
 
@@ -130,15 +130,13 @@ There is a real **SDK** with host capabilities exposed through clean wrappers:
 - events, timers, encrypted secrets, camera access, model aliases, and a typed UI builder
 
 All SDK types come from a single source-of-truth spec (`tentaflow-sdk-spec`) and the SDKs are **generated
-for Rust, C# and Python** (`tentaflow-sdk-gen`) — so addons aren't locked to one language. Bundled addons
-include `contacts` (a small CRM), `eureka`, `company-lookup`, `memory`, `embeddings-chunker` and
-`deep-research`.
+for Rust, C# and Python** (`tentaflow-sdk-gen`) - so addons aren't locked to one language. 
 
 <p align="center"><img src="docs/screenshots/addons.png" alt="Add-ons — sandboxed WASM plug-ins with per-addon permissions" width="900" /></p>
 
 ### 📱 The same product, fully offline
 
-The mobile build (Android via JNI, iOS via a Swift bridge) is **not a thin client** — it's the whole node:
+The mobile build (Android via JNI, iOS via a Swift bridge) is **not a thin client** - it's the whole node:
 local inference, the flow engine, addons, the sync ledger and the dashboard, all on-device. Pair it with
 your other nodes to share their models, or run it standalone on a plane. Same capabilities either way.
 
@@ -146,19 +144,19 @@ your other nodes to share their models, or run it standalone on a plane. Same ca
 
 ## More that's built in
 
-- **Web dashboard** — a fast vanilla-JS SPA on port `8090` with 20+ views (chat, playground, services,
+- **Web dashboard** - a fast vanilla-JS SPA on port `8090` with 20+ views (chat, playground, services,
   mesh, models, flows, addons, scheduler, audit, users, compliance, profiling…). It never uses REST — it
   talks to the core over a binary CBOR protocol.
 - **OpenAI-compatible API** — `POST /v1/chat/completions`, `/v1/audio/*`, `/v1/embeddings` for external
   apps that want to use your TentaFlow models, authenticated with an API key.
-- **Compliance core (GDPR/RODO)** — built-in AI audit, retention policies, ROPA, DSAR, consents, DPIA and
+- **Compliance core (GDPR/RODO)** - built-in AI audit, retention policies, ROPA, DSAR, consents, DPIA and
   a breach register, with every AI call linked into a tamper-evident audit chain.
-- **Scheduler** — run addon tools on a cron / interval / one-shot schedule.
-- **Camera & vision pipeline** — ingest RTSP/ONVIF/local cameras (GStreamer) and run on-frame face, pose
+- **Scheduler** - run addon tools on a cron / interval / one-shot schedule.
+- **Camera & vision pipeline** - ingest RTSP/ONVIF/local cameras (GStreamer) and run on-frame face, pose
   and emotion models.
-- **Web research for addons** — pluggable search providers (SearXNG, Brave, Tavily, DuckDuckGo) and a
+- **Web research for addons** - pluggable search providers (SearXNG, Brave, Tavily, DuckDuckGo) and a
   SSRF-guarded readable-page reader, optionally backed by a headless-Chromium renderer service.
-- **Service containers** — ship engines like SearXNG or the browser renderer as Docker images *or* native
+- **Service containers** - ship engines like SearXNG or the browser renderer as Docker images *or* native
   Python bundles, deployable to a node from the dashboard.
 
 ## Security
