@@ -90,6 +90,14 @@ pub enum StorageSqlError {
     SqlSyntax,
     #[error("sql constraint violation")]
     SqlConstraint,
+    /// A causal-ordering gap, not a data conflict: the replicated write could not
+    /// be applied yet because the row it depends on does not exist. Two shapes:
+    /// a FOREIGN KEY violation (missing parent row) or an UPDATE that matched no
+    /// row (the INSERT that creates the target has not been replicated yet). The
+    /// inbox must keep the entry retryable so a later drain applies it once the
+    /// prerequisite arrives — never recorded as a sync conflict.
+    #[error("replicated write deferred (missing prerequisite row): {0}")]
+    OrderingGap(String),
     #[error("operation timeout")]
     Timeout,
     #[error("internal sql error: {0}")]
@@ -108,6 +116,7 @@ impl StorageSqlError {
             StorageSqlError::InvalidParams(_) => AbiError::Operation,
             StorageSqlError::SqlSyntax => AbiError::SqlSyntax,
             StorageSqlError::SqlConstraint => AbiError::SqlConstraint,
+            StorageSqlError::OrderingGap(_) => AbiError::Operation,
             StorageSqlError::Timeout => AbiError::Timeout,
             StorageSqlError::Internal(_) => AbiError::Operation,
         }
@@ -122,6 +131,7 @@ impl StorageSqlError {
             StorageSqlError::InvalidParams(_) => "invalid_params",
             StorageSqlError::SqlSyntax => "sql_syntax",
             StorageSqlError::SqlConstraint => "sql_constraint",
+            StorageSqlError::OrderingGap(_) => "ordering_gap",
             StorageSqlError::Timeout => "timeout",
             StorageSqlError::Internal(_) => "internal",
         }
@@ -340,6 +350,21 @@ fn map_sqlite_error(e: &rusqlite::Error) -> StorageSqlError {
     } else {
         StorageSqlError::Internal(e.to_string())
     }
+}
+
+/// Classifies a SQLite error raised while applying a REPLICATED write. Unlike
+/// `map_sqlite_error` (addon-driven local writes, where every constraint is a
+/// real error to surface), a FOREIGN KEY violation here means the parent row has
+/// not been replicated yet — a causal-ordering gap that must stay retryable, not
+/// a data conflict. Every other constraint (UNIQUE / PRIMARY KEY / CHECK /
+/// NOT NULL) is a genuine conflict in the replicated payload and stays terminal.
+fn map_replicated_sqlite_error(e: &rusqlite::Error) -> StorageSqlError {
+    if let rusqlite::Error::SqliteFailure(code, _) = e {
+        if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY {
+            return StorageSqlError::OrderingGap(format!("foreign key not yet present: {e}"));
+        }
+    }
+    map_sqlite_error(e)
 }
 
 fn acquire_pool(org_id: &str, addon_id: &str) -> Result<AddonDbPool, StorageSqlError> {
@@ -625,7 +650,20 @@ fn apply_replicated_write_with_resolution(
             &capture.query,
             rusqlite::params_from_iter(bound.iter().copied()),
         )
-        .map_err(|e| map_sqlite_error(&e))?;
+        .map_err(|e| map_replicated_sqlite_error(&e))?;
+    // An UPDATE that matched no row means the INSERT creating the target has not
+    // been replicated yet — a causal-ordering gap, deferred (not a conflict).
+    // A DELETE matching no row is an idempotent no-op success: the row is already
+    // absent, so the delete's intent ("ensure this row is gone") is satisfied and
+    // there is nothing to wait for. Manual `accept_remote` resolution is exempt:
+    // the operator explicitly chose to apply this payload, so a no-op UPDATE there
+    // must surface as such rather than re-defer.
+    if !accept_remote && rows == 0 && matches!(capture.action, SqlWriteAction::Update) {
+        return Err(StorageSqlError::OrderingGap(format!(
+            "update target row not present yet: {}/{}",
+            capture.table_name, capture.resource_id
+        )));
+    }
     tx.commit().map_err(|e| map_sqlite_error(&e))?;
     Ok(rows as u64)
 }

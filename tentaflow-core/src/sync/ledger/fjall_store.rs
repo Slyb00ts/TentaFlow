@@ -214,12 +214,21 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
                 actual: operation.body.epoch.clone(),
             });
         }
-        if self
-            .inbox
-            .get(inbox_key(&source, operation.op_id))?
-            .is_some()
-        {
-            return Ok(());
+        // A re-delivery of an op already present: if it previously failed (data
+        // conflict) or was deferred for ordering, reset it to a fresh retryable
+        // state. A repair pull that finally brings the prerequisite INSERT relies
+        // on this — otherwise the stuck UPDATE would never be retried again.
+        if let Some(existing) = self.inbox.get(inbox_key(&source, operation.op_id))? {
+            let mut entry: InboxEntry = decode(existing.as_ref())?;
+            if entry.applied || (!entry.conflicted && entry.deferred_count == 0) {
+                return Ok(());
+            }
+            entry.conflicted = false;
+            entry.conflict_message = None;
+            entry.deferred_count = 0;
+            self.inbox
+                .insert(inbox_key(&source, entry.operation.op_id), encode(&entry)?)?;
+            return self.persist();
         }
         let entry = InboxEntry {
             source: source.clone(),
@@ -227,6 +236,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             applied: false,
             conflicted: false,
             conflict_message: None,
+            deferred_count: 0,
         };
         self.inbox
             .insert(inbox_key(&source, entry.operation.op_id), encode(&entry)?)?;
@@ -258,6 +268,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         entry.applied = true;
         entry.conflicted = false;
         entry.conflict_message = None;
+        entry.deferred_count = 0;
         self.inbox
             .insert(inbox_key(&source, op_id), encode(&entry)?)?;
         self.persist()
@@ -271,10 +282,28 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
     ) -> LedgerResult<()> {
         let mut entry = load_inbox_entry(&self.inbox, &source, op_id)?;
         entry.conflicted = true;
+        entry.deferred_count = 0;
         entry.conflict_message = Some(message);
         self.inbox
             .insert(inbox_key(&source, op_id), encode(&entry)?)?;
         self.persist()
+    }
+
+    fn mark_inbox_deferred(
+        &self,
+        source: PeerId,
+        op_id: OperationId,
+        message: String,
+    ) -> LedgerResult<u32> {
+        let mut entry = load_inbox_entry(&self.inbox, &source, op_id)?;
+        entry.conflicted = false;
+        entry.deferred_count = entry.deferred_count.saturating_add(1);
+        entry.conflict_message = Some(message);
+        let deferred_count = entry.deferred_count;
+        self.inbox
+            .insert(inbox_key(&source, op_id), encode(&entry)?)?;
+        self.persist()?;
+        Ok(deferred_count)
     }
 
     fn mark_delivered(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()> {

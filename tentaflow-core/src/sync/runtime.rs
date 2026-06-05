@@ -33,6 +33,11 @@ use tentaflow_protocol::mesh::{
 
 static SYNC_RUNTIME: OnceLock<Arc<SyncRuntime>> = OnceLock::new();
 const BLOB_SYNC_CHUNK_SIZE: usize = 1024 * 1024;
+/// How many times an inbox entry may be deferred for ordering reasons (its
+/// target row not yet created) before it is treated as a terminal conflict. High
+/// enough that a slow repair pull always wins, low enough that a genuinely
+/// orphaned UPDATE is eventually surfaced instead of being retried forever.
+const MAX_INBOX_DEFER_ATTEMPTS: u32 = 64;
 
 /// Post-apply hook: when a replicated addon-instance op lands (install / enable
 /// toggle / uninstall), the sync runtime asks the addon manager to make the
@@ -53,11 +58,24 @@ pub struct SyncRuntime {
     hlc: HlcClock,
     /// Set once at startup; runs after a synced addon-instance op commits.
     addon_reconciler: parking_lot::RwLock<Option<Arc<dyn AddonSyncReconciler>>>,
+    /// Deferral budget before an ordering-gap inbox entry is escalated to a
+    /// terminal conflict. Defaults to `MAX_INBOX_DEFER_ATTEMPTS`; only lowered in
+    /// tests so escalation can be exercised without thousands of drains.
+    max_inbox_defer_attempts: u32,
 }
 
 struct RuntimeSigner {
     node_id: String,
     security: Arc<MeshSecurity>,
+}
+
+/// What an inbox entry that was deferred for ordering reasons needs in order to
+/// be escalated to a terminal conflict once its deferral budget is exhausted.
+/// `capture` is `Some` only for the addon-SQL branch, where escalation must also
+/// write the conflict to the addon's `__tentaflow_sync_conflicts` table.
+struct DeferredInboxContext {
+    message: String,
+    capture: Option<SqlWriteCapture>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +162,7 @@ pub fn init(
         settings_cipher,
         hlc,
         addon_reconciler: parking_lot::RwLock::new(None),
+        max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
     Ok(SYNC_RUNTIME
@@ -1358,8 +1377,6 @@ impl SyncRuntime {
     }
 
     fn apply_unapplied_inbox(&self, limit: usize) -> LedgerResult<usize> {
-        let mut entries = self.ledger.list_unapplied_inbox(limit)?;
-        entries.sort_by(|left, right| inbox_apply_order(left).cmp(&inbox_apply_order(right)));
         let mut applied = 0usize;
         // Addon-instance reconciles are deferred until AFTER the drain loop (and
         // deduped) so heavy runtime work (wasmtime load, SQL migrations, flow
@@ -1373,134 +1390,165 @@ impl SyncRuntime {
         // Synced addon-package blobs that finished reassembling — (blob_id, sha).
         // Extracted to the package store after the drain loop (untar is heavy).
         let mut pending_package_extractions: Vec<(String, String)> = Vec::new();
-        for entry in entries {
-            if entry.operation.body.resource_type == "core.blob" {
-                match apply_blob_operation(&entry.operation) {
-                    Ok(BlobApplyOutcome::Applied) => {
-                        self.ledger
-                            .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
-                        applied += 1;
-                        // A blob MANIFEST (table blob_store) applied → the blob is
-                        // fully reassembled. If it's a synced addon package, defer
-                        // extraction (untar + catalog) to after the drain loop.
-                        if entry.operation.body.table_name == "blob_store" {
-                            if let Ok(blob_id) = field_string(&entry.operation, "blob_id") {
-                                if blob_id.starts_with("addon-package:") {
-                                    if let Ok(sha) = field_string(&entry.operation, "sha256") {
-                                        pending_package_extractions.push((blob_id, sha));
+        // Entries deferred for ordering reasons during THIS drain, keyed by
+        // (source, op_id). The deferral counter is bumped at most once per drain,
+        // and only for entries that are still unapplied when the drain ends — an
+        // entry whose prerequisite arrives in a later pass of the same drain
+        // applies and is removed here, so it never accrues a spurious increment.
+        // A long chain of dependent ops (longer than MAX_INBOX_DEFER_ATTEMPTS)
+        // therefore converges in a single drain without any false escalation.
+        let mut deferred_this_drain: std::collections::HashMap<
+            (PeerId, OperationId),
+            DeferredInboxContext,
+        > = std::collections::HashMap::new();
+        // Retry-until-no-progress: applying an INSERT may unblock an UPDATE that
+        // was deferred earlier in this drain (or in a prior delivery) because its
+        // target row did not exist yet. Each pass re-lists the inbox, so freshly
+        // applied prerequisites become visible to the entries that depend on them.
+        // The loop stops as soon as a pass applies nothing new, so there is no
+        // spin once every applicable entry has either landed or been deferred.
+        loop {
+            let mut entries = self.ledger.list_unapplied_inbox(limit)?;
+            entries.sort_by(|left, right| inbox_apply_order(left).cmp(&inbox_apply_order(right)));
+            let mut progressed = false;
+            for entry in entries {
+                if entry.operation.body.resource_type == "core.blob" {
+                    match apply_blob_operation(&entry.operation) {
+                        Ok(BlobApplyOutcome::Applied) => {
+                            self.ledger
+                                .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
+                            applied += 1;
+                            progressed = true;
+                            deferred_this_drain
+                                .remove(&(entry.source.clone(), entry.operation.op_id));
+                            // A blob MANIFEST (table blob_store) applied → the blob
+                            // is fully reassembled. If it's a synced addon package,
+                            // defer extraction (untar + catalog) to after the drain.
+                            if entry.operation.body.table_name == "blob_store" {
+                                if let Ok(blob_id) = field_string(&entry.operation, "blob_id") {
+                                    if blob_id.starts_with("addon-package:") {
+                                        if let Ok(sha) = field_string(&entry.operation, "sha256") {
+                                            pending_package_extractions.push((blob_id, sha));
+                                        }
                                     }
                                 }
                             }
                         }
+                        Ok(BlobApplyOutcome::Pending) => {}
+                        Err(e) => {
+                            self.classify_inbox_failure(
+                                &entry,
+                                e,
+                                None,
+                                &mut deferred_this_drain,
+                            )?;
+                        }
                     }
-                    Ok(BlobApplyOutcome::Pending) => {}
-                    Err(e) => {
-                        self.ledger.mark_inbox_conflicted(
-                            entry.source.clone(),
-                            entry.operation.op_id,
-                            e.to_string(),
-                        )?;
-                        warn!(
-                            "sync runtime: incoming blob operation {} recorded as conflict: {}",
-                            entry.operation.op_id.to_hex(),
-                            e
-                        );
-                    }
+                    continue;
                 }
-                continue;
-            }
-            if entry.operation.body.addon_id == crate::sync::core_registry::CORE_SYNC_ADDON_ID {
-                match crate::sync::core_materializer::apply_core_operation(
-                    &self.db,
-                    &self.settings_cipher,
-                    &entry.operation,
+                if entry.operation.body.addon_id == crate::sync::core_registry::CORE_SYNC_ADDON_ID {
+                    match crate::sync::core_materializer::apply_core_operation(
+                        &self.db,
+                        &self.settings_cipher,
+                        &entry.operation,
+                    ) {
+                        Ok(_) => {
+                            self.ledger
+                                .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
+                            applied += 1;
+                            progressed = true;
+                            deferred_this_drain
+                                .remove(&(entry.source.clone(), entry.operation.op_id));
+                            // A replicated addon instance landed — defer the runtime
+                            // reconcile to after the drain loop (deduped).
+                            if entry.operation.body.resource_type == "core.addon_instance" {
+                                pending_addon_reconciles
+                                    .insert(entry.operation.body.resource_id.clone());
+                            } else if entry.operation.body.resource_type == "core.addon_config" {
+                                // resource_id == "addon_id:key" — take the addon_id.
+                                if let Some((addon_id, _)) =
+                                    entry.operation.body.resource_id.split_once(':')
+                                {
+                                    pending_config_invalidations.insert(addon_id.to_string());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.classify_inbox_failure(
+                                &entry,
+                                e,
+                                None,
+                                &mut deferred_this_drain,
+                            )?;
+                        }
+                    }
+                    continue;
+                }
+                if entry.operation.body.resource_type == "addon.kv" {
+                    match apply_kv_operation(&self.db, &entry.operation) {
+                        Ok(_) => {
+                            self.ledger
+                                .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
+                            applied += 1;
+                            progressed = true;
+                            deferred_this_drain
+                                .remove(&(entry.source.clone(), entry.operation.op_id));
+                        }
+                        Err(e) => {
+                            self.classify_inbox_failure(
+                                &entry,
+                                e,
+                                None,
+                                &mut deferred_this_drain,
+                            )?;
+                        }
+                    }
+                    continue;
+                }
+                let capture = capture_from_operation(&entry.operation)?;
+                match crate::addon::storage_sql_exec::apply_replicated_write(
+                    &capture,
+                    entry.operation.op_id,
                 ) {
                     Ok(_) => {
                         self.ledger
                             .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
                         applied += 1;
-                        // A replicated addon instance landed — defer the runtime
-                        // reconcile to after the drain loop (deduped).
-                        if entry.operation.body.resource_type == "core.addon_instance" {
-                            pending_addon_reconciles
-                                .insert(entry.operation.body.resource_id.clone());
-                        } else if entry.operation.body.resource_type == "core.addon_config" {
-                            // resource_id == "addon_id:key" — take the addon_id.
-                            if let Some((addon_id, _)) =
-                                entry.operation.body.resource_id.split_once(':')
-                            {
-                                pending_config_invalidations.insert(addon_id.to_string());
+                        progressed = true;
+                        deferred_this_drain.remove(&(entry.source.clone(), entry.operation.op_id));
+                    }
+                    Err(e) => {
+                        // An ordering gap (missing FK parent, or UPDATE matching no
+                        // target row) is deferred and retried; only a genuine data
+                        // error (UNIQUE / CHECK / NOTNULL / type / syntax) becomes a
+                        // terminal conflict — and only then is it written to the
+                        // addon conflict table, so deferrals never pollute it.
+                        let ledger_error = match &e {
+                            crate::addon::storage_sql_exec::StorageSqlError::OrderingGap(msg) => {
+                                SyncLedgerError::DeferredOrdering(msg.clone())
                             }
-                        }
-                    }
-                    Err(e) => {
-                        self.ledger.mark_inbox_conflicted(
-                            entry.source.clone(),
-                            entry.operation.op_id,
-                            e.to_string(),
+                            other => SyncLedgerError::Runtime(other.to_string()),
+                        };
+                        self.classify_inbox_failure(
+                            &entry,
+                            ledger_error,
+                            Some(capture),
+                            &mut deferred_this_drain,
                         )?;
-                        warn!(
-                            "sync runtime: incoming core operation {} recorded as conflict: {}",
-                            entry.operation.op_id.to_hex(),
-                            e
-                        );
                     }
-                }
-                continue;
-            }
-            if entry.operation.body.resource_type == "addon.kv" {
-                match apply_kv_operation(&self.db, &entry.operation) {
-                    Ok(_) => {
-                        self.ledger
-                            .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
-                        applied += 1;
-                    }
-                    Err(e) => {
-                        self.ledger.mark_inbox_conflicted(
-                            entry.source.clone(),
-                            entry.operation.op_id,
-                            e.to_string(),
-                        )?;
-                        warn!(
-                            "sync runtime: incoming kv operation {} recorded as conflict: {}",
-                            entry.operation.op_id.to_hex(),
-                            e
-                        );
-                    }
-                }
-                continue;
-            }
-            let capture = capture_from_operation(&entry.operation)?;
-            match crate::addon::storage_sql_exec::apply_replicated_write(
-                &capture,
-                entry.operation.op_id,
-            ) {
-                Ok(_) => {
-                    self.ledger
-                        .mark_inbox_applied(entry.source.clone(), entry.operation.op_id)?;
-                    applied += 1;
-                }
-                Err(e) => {
-                    if let Err(record_error) = crate::addon::storage_sql_exec::record_sync_conflict(
-                        &capture,
-                        entry.operation.op_id,
-                        entry.source.as_str(),
-                        &e,
-                    ) {
-                        return Err(SyncLedgerError::Runtime(record_error.to_string()));
-                    }
-                    self.ledger.mark_inbox_conflicted(
-                        entry.source.clone(),
-                        entry.operation.op_id,
-                        e.to_string(),
-                    )?;
-                    warn!(
-                        "sync runtime: incoming operation {} recorded as conflict: {}",
-                        entry.operation.op_id.to_hex(),
-                        e
-                    );
                 }
             }
+            if !progressed {
+                break;
+            }
+        }
+        // After the drain has reached a fixpoint, every entry still left in
+        // `deferred_this_drain` truly failed to apply for the whole drain (any
+        // entry that applied in a later pass was removed above). Bump its deferral
+        // counter exactly once and, only if it has now exhausted its budget,
+        // escalate it to a terminal conflict so it stops blocking future drains.
+        for ((source, op_id), context) in deferred_this_drain {
+            self.escalate_or_defer_inbox_entry(source, op_id, context)?;
         }
         // Run deferred addon reconciles once, after all ops in this batch are
         // applied. Idempotent ("make runtime match DB"); a later op for the same
@@ -1557,6 +1605,105 @@ impl SyncRuntime {
             }
         }
         Ok(applied)
+    }
+
+    /// Classifies a failed inbox apply within a single drain pass, shared by every
+    /// branch (blob / core / kv / addon-SQL). A purely ordering-related failure
+    /// (`DeferredOrdering` — the prerequisite INSERT has not landed yet) is NOT
+    /// persisted here: the entry stays unapplied (so later passes retry it) and is
+    /// merely recorded in `deferred_this_drain`, to be counted once when the drain
+    /// settles (see `escalate_or_defer_inbox_entry`). Any other (data) error
+    /// — UNIQUE / CHECK / NOTNULL / type / syntax — is a genuine, non-orderable
+    /// conflict and is made terminal immediately.
+    ///
+    /// `capture` is `Some` only for the addon-SQL branch, where a terminal conflict
+    /// must also be written to the addon's `__tentaflow_sync_conflicts` table for
+    /// the operator. Ordering deferrals never write there, so the conflict table is
+    /// not polluted with entries that are merely waiting for their prerequisite.
+    fn classify_inbox_failure(
+        &self,
+        entry: &InboxEntry,
+        error: SyncLedgerError,
+        capture: Option<SqlWriteCapture>,
+        deferred_this_drain: &mut std::collections::HashMap<
+            (PeerId, OperationId),
+            DeferredInboxContext,
+        >,
+    ) -> LedgerResult<()> {
+        if let SyncLedgerError::DeferredOrdering(message) = error {
+            // Defer in memory only; the entry remains unapplied and retryable. The
+            // counter is bumped at most once per drain, after the loop settles.
+            deferred_this_drain.insert(
+                (entry.source.clone(), entry.operation.op_id),
+                DeferredInboxContext { message, capture },
+            );
+            return Ok(());
+        }
+        if let Some(capture) = &capture {
+            let storage_error =
+                crate::addon::storage_sql_exec::StorageSqlError::Internal(error.to_string());
+            crate::addon::storage_sql_exec::record_sync_conflict(
+                capture,
+                entry.operation.op_id,
+                entry.source.as_str(),
+                &storage_error,
+            )
+            .map_err(|record_error| SyncLedgerError::Runtime(record_error.to_string()))?;
+        }
+        self.ledger.mark_inbox_conflicted(
+            entry.source.clone(),
+            entry.operation.op_id,
+            error.to_string(),
+        )?;
+        warn!(
+            "sync runtime: incoming operation {} recorded as conflict: {}",
+            entry.operation.op_id.to_hex(),
+            error
+        );
+        Ok(())
+    }
+
+    /// Counts a single drain-long deferral for an entry that stayed unapplied for
+    /// the whole drain, and escalates it to a terminal conflict once it has been
+    /// deferred more than `MAX_INBOX_DEFER_ATTEMPTS` drains in a row (a genuinely
+    /// orphaned op whose prerequisite never arrives). Until then the entry remains
+    /// retryable. Only at escalation — and only for the addon-SQL branch — is the
+    /// conflict written to the addon conflict table.
+    fn escalate_or_defer_inbox_entry(
+        &self,
+        source: PeerId,
+        op_id: OperationId,
+        context: DeferredInboxContext,
+    ) -> LedgerResult<()> {
+        let deferred_count =
+            self.ledger
+                .mark_inbox_deferred(source.clone(), op_id, context.message.clone())?;
+        if deferred_count <= self.max_inbox_defer_attempts {
+            return Ok(());
+        }
+        // Prerequisite never arrived after the bounded number of drains: surface it
+        // as a terminal conflict so it stops being retried forever.
+        if let Some(capture) = &context.capture {
+            let storage_error = crate::addon::storage_sql_exec::StorageSqlError::OrderingGap(
+                context.message.clone(),
+            );
+            crate::addon::storage_sql_exec::record_sync_conflict(
+                capture,
+                op_id,
+                source.as_str(),
+                &storage_error,
+            )
+            .map_err(|record_error| SyncLedgerError::Runtime(record_error.to_string()))?;
+        }
+        self.ledger
+            .mark_inbox_conflicted(source.clone(), op_id, context.message.clone())?;
+        warn!(
+            "sync runtime: incoming operation {} recorded as conflict after {} deferrals: {}",
+            op_id.to_hex(),
+            deferred_count,
+            context.message
+        );
+        Ok(())
     }
 
     fn resolve_addon_sync_conflict(
@@ -2508,6 +2655,7 @@ mod tests {
                 settings_cipher: make_settings_cipher(key_seed),
                 hlc,
                 addon_reconciler: parking_lot::RwLock::new(None),
+                max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
             },
             _ledger_dir: ledger_dir,
         }
@@ -2530,6 +2678,7 @@ mod tests {
             settings_cipher: make_settings_cipher(key_seed),
             hlc,
             addon_reconciler: parking_lot::RwLock::new(None),
+            max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
         }
     }
 
@@ -4235,6 +4384,722 @@ mod tests {
                 .expect("repair pulls");
             assert_eq!(pulls.len(), 1);
             assert_eq!(pulls[0].from_sequence, 1);
+        });
+    }
+
+    #[test]
+    fn out_of_order_core_flow_update_defers_then_converges_after_insert() {
+        with_tmp_home(|| {
+            let source = make_runtime(81);
+            let receiver = make_runtime(82);
+            seed_core_authority_target(
+                &source.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+
+            // Node A: one INSERT followed by three UPDATEs of the SAME flow, each
+            // with a distinct flow_json and a strictly later HLC (mirrors a user
+            // editing a flow several times in the Flow Builder).
+            let resource_id = "77";
+            let flow_update = |json: &str, hlc: HybridLogicalTimestamp| {
+                let mut fields = BTreeMap::new();
+                fields.insert(
+                    "flow_json".to_string(),
+                    FieldValue::String(json.to_string()),
+                );
+                crate::sync::core_capture::CoreWriteCapture::new(
+                    crate::sync::core_registry::CoreSyncResourceKind::Flow,
+                    "org-default",
+                    resource_id,
+                    SqlWriteAction::Update,
+                    fields,
+                    Some("test-actor".to_string()),
+                    hlc,
+                    test_epoch(),
+                )
+            };
+            let base = now_ms();
+            let hlc_at = |offset: i64| HybridLogicalTimestamp {
+                wall_time_ms: base + offset,
+                logical: 0,
+                node_id: "test-node".to_string(),
+            };
+
+            let insert = source
+                .runtime
+                .record_core_capture(complete_core_flow_capture(resource_id, "Flow 77"))
+                .expect("record insert");
+            let update_one = source
+                .runtime
+                .record_core_capture(flow_update(r#"{"nodes":[{"id":"u1"}]}"#, hlc_at(1)))
+                .expect("record update 1");
+            let update_two = source
+                .runtime
+                .record_core_capture(flow_update(r#"{"nodes":[{"id":"u2"}]}"#, hlc_at(2)))
+                .expect("record update 2");
+            let update_three = source
+                .runtime
+                .record_core_capture(flow_update(r#"{"nodes":[{"id":"u3"}]}"#, hlc_at(3)))
+                .expect("record update 3");
+
+            let op = |op_id: OperationId| {
+                source
+                    .runtime
+                    .ledger
+                    .get_operation(op_id)
+                    .expect("operation")
+            };
+            let insert_op = op(insert.op_id);
+            let update_one_op = op(update_one.op_id);
+            let update_two_op = op(update_two.op_id);
+            let update_three_op = op(update_three.op_id);
+            let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
+
+            // Node B receives the LAST update first (the INSERT has not arrived).
+            // It must be DEFERRED (target row missing is an ordering gap, not a
+            // data conflict) so a later drain can still apply it.
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(
+                    peer.clone(),
+                    update_three_op.clone(),
+                    &HexNodeIdOperationVerifier,
+                )
+                .expect("inbox update three");
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply deferred update");
+
+            assert!(
+                repository::get_flow(&receiver.runtime.db, resource_id)
+                    .expect("get flow")
+                    .is_none(),
+                "flow must not exist before its INSERT arrives"
+            );
+            let deferred_entry = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer.clone(), update_three_op.op_id)
+                .expect("deferred inbox entry");
+            assert!(
+                !deferred_entry.conflicted,
+                "ordering gap must not be a terminal conflict"
+            );
+            assert!(!deferred_entry.applied);
+            assert_eq!(deferred_entry.deferred_count, 1);
+
+            // The INSERT and intermediate UPDATEs now arrive. After the drain the
+            // flow must exist and carry the LAST update's json — the deferred
+            // entry must have been retried and applied, not left stuck.
+            for operation in [&insert_op, &update_one_op, &update_two_op] {
+                receiver
+                    .runtime
+                    .ledger
+                    .put_verified_in_inbox(
+                        peer.clone(),
+                        operation.clone(),
+                        &HexNodeIdOperationVerifier,
+                    )
+                    .expect("inbox operation");
+            }
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply convergence");
+
+            let flow = repository::get_flow(&receiver.runtime.db, resource_id)
+                .expect("get flow")
+                .expect("flow exists after convergence");
+            assert_eq!(flow.flow_json, r#"{"nodes":[{"id":"u3"}]}"#);
+
+            let applied_entry = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer, update_three_op.op_id)
+                .expect("inbox entry after convergence");
+            assert!(applied_entry.applied);
+            assert!(!applied_entry.conflicted);
+        });
+    }
+
+    /// Opens an addon SQLite with a parent/child schema whose child rows carry a
+    /// FOREIGN KEY to the parent (FK enforcement is ON for addon DBs), plus a
+    /// UNIQUE column on the parent — enough to exercise both an ordering gap
+    /// (FK / no-target UPDATE) and a genuine data conflict (UNIQUE).
+    fn open_orders_schema(addon_id: &str) {
+        let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+            .expect("open addon db");
+        let conn = pool.get().expect("addon conn");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS customers (\
+                 id INTEGER PRIMARY KEY, \
+                 email TEXT NOT NULL UNIQUE);\
+             CREATE TABLE IF NOT EXISTS orders (\
+                 id INTEGER PRIMARY KEY, \
+                 customer_id INTEGER NOT NULL REFERENCES customers(id), \
+                 total TEXT NOT NULL);",
+        )
+        .expect("create orders schema");
+    }
+
+    fn customer_insert_capture(addon_id: &str, id: i64, email: &str) -> SqlWriteCapture {
+        SqlWriteCapture {
+            capture_id: format!("{addon_id}-customer-{id}-{email}"),
+            org_id: "org-default".to_string(),
+            addon_id: addon_id.to_string(),
+            table_name: "customers".to_string(),
+            action: SqlWriteAction::Insert,
+            resource_type: "customer".to_string(),
+            resource_id: id.to_string(),
+            query: "INSERT INTO customers (id, email) VALUES (?1, ?2)".to_string(),
+            params: vec![JsonValue::from(id), JsonValue::String(email.to_string())],
+            rows_affected: 1,
+            last_insert_id: id,
+            actor_user_id: Some("00000000-0000-0000-0000-000000000007".to_string()),
+            created_at_ms: now_ms(),
+        }
+    }
+
+    fn order_insert_capture(addon_id: &str, id: i64, customer_id: i64) -> SqlWriteCapture {
+        SqlWriteCapture {
+            capture_id: format!("{addon_id}-order-{id}-{customer_id}"),
+            org_id: "org-default".to_string(),
+            addon_id: addon_id.to_string(),
+            table_name: "orders".to_string(),
+            action: SqlWriteAction::Insert,
+            resource_type: "order".to_string(),
+            resource_id: id.to_string(),
+            query: "INSERT INTO orders (id, customer_id, total) VALUES (?1, ?2, ?3)".to_string(),
+            params: vec![
+                JsonValue::from(id),
+                JsonValue::from(customer_id),
+                JsonValue::String("100".to_string()),
+            ],
+            rows_affected: 1,
+            last_insert_id: id,
+            actor_user_id: Some("00000000-0000-0000-0000-000000000007".to_string()),
+            created_at_ms: now_ms(),
+        }
+    }
+
+    /// Builds a `SyncOperation` from an addon-SQL capture by recording it on
+    /// `source` and reading it back out of the ledger — the same shape a peer
+    /// would push, so it routes through the addon-SQL inbox-apply branch.
+    fn addon_sql_operation(source: &RuntimeHarness, capture: SqlWriteCapture) -> SyncOperation {
+        let recorded = source
+            .runtime
+            .record_sql_capture(capture)
+            .expect("record sql capture");
+        source
+            .runtime
+            .ledger
+            .get_operation(recorded.op_id)
+            .expect("operation")
+    }
+
+    #[test]
+    fn out_of_order_addon_sql_update_defers_then_applies_after_insert() {
+        with_tmp_home(|| {
+            let source = make_runtime(83);
+            let receiver = make_runtime(84);
+            let addon_id = "sync-addon-sql-defer-update";
+            for db in [&source.runtime.db, &receiver.runtime.db] {
+                seed_authority_target(db, addon_id, &receiver.runtime.local_node_id);
+            }
+            open_contacts_table(addon_id);
+
+            let insert_op =
+                addon_sql_operation(&source, capture(addon_id, "person-1", "Anna"));
+            let update_op =
+                addon_sql_operation(&source, update_capture(addon_id, "person-1", "Anna Nowak"));
+            let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
+
+            // The UPDATE arrives before the INSERT that creates its target row.
+            // It must be DEFERRED (no target row = ordering gap), never written to
+            // the addon conflict table.
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), update_op.clone(), &HexNodeIdOperationVerifier)
+                .expect("inbox update");
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply deferred update");
+
+            let deferred = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer.clone(), update_op.op_id)
+                .expect("deferred entry");
+            assert!(!deferred.conflicted, "ordering gap must not be a conflict");
+            assert!(!deferred.applied);
+            assert_eq!(deferred.deferred_count, 1);
+            assert!(
+                crate::addon::storage_sql_exec::list_sync_conflicts(
+                    "org-default",
+                    addon_id,
+                    Some("open"),
+                    10,
+                )
+                .expect("conflicts")
+                .is_empty(),
+                "an ordering deferral must not pollute the addon conflict table"
+            );
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+                .expect("open addon db");
+            assert!(
+                pool.get()
+                    .expect("conn")
+                    .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row.get::<_, String>(0))
+                    .is_err(),
+                "row must not exist before its INSERT arrives"
+            );
+
+            // The INSERT now arrives; the drain must retry the deferred UPDATE and
+            // converge to the UPDATE's value.
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), insert_op, &HexNodeIdOperationVerifier)
+                .expect("inbox insert");
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply convergence");
+
+            let name: String = pool
+                .get()
+                .expect("conn")
+                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row.get(0))
+                .expect("row exists");
+            assert_eq!(name, "Anna Nowak");
+            let applied = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer, update_op.op_id)
+                .expect("entry after convergence");
+            assert!(applied.applied);
+            assert!(!applied.conflicted);
+        });
+    }
+
+    #[test]
+    fn out_of_order_addon_sql_fk_insert_defers_then_applies_after_parent() {
+        with_tmp_home(|| {
+            let source = make_runtime(85);
+            let receiver = make_runtime(86);
+            let addon_id = "sync-addon-sql-defer-fk";
+            for db in [&source.runtime.db, &receiver.runtime.db] {
+                seed_authority_target(db, addon_id, &receiver.runtime.local_node_id);
+            }
+            open_orders_schema(addon_id);
+
+            let customer_op =
+                addon_sql_operation(&source, customer_insert_capture(addon_id, 1, "a@x.test"));
+            let order_op = addon_sql_operation(&source, order_insert_capture(addon_id, 10, 1));
+            let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
+
+            // The child INSERT (orders → customers FK) arrives before its parent.
+            // The FOREIGN KEY violation is an ordering gap, not a data conflict.
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), order_op.clone(), &HexNodeIdOperationVerifier)
+                .expect("inbox order");
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply deferred order");
+
+            let deferred = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer.clone(), order_op.op_id)
+                .expect("deferred entry");
+            assert!(
+                !deferred.conflicted,
+                "FK gap must defer, not become a conflict"
+            );
+            assert!(!deferred.applied);
+            assert_eq!(deferred.deferred_count, 1);
+            assert!(
+                crate::addon::storage_sql_exec::list_sync_conflicts(
+                    "org-default",
+                    addon_id,
+                    Some("open"),
+                    10,
+                )
+                .expect("conflicts")
+                .is_empty(),
+                "FK ordering gap must not pollute the conflict table"
+            );
+
+            // The parent INSERT arrives; the child must now apply.
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), customer_op, &HexNodeIdOperationVerifier)
+                .expect("inbox customer");
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply convergence");
+
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+                .expect("open addon db");
+            let customer_id: i64 = pool
+                .get()
+                .expect("conn")
+                .query_row("SELECT customer_id FROM orders WHERE id = 10", [], |row| {
+                    row.get(0)
+                })
+                .expect("order row exists");
+            assert_eq!(customer_id, 1);
+            let applied = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer, order_op.op_id)
+                .expect("entry after convergence");
+            assert!(applied.applied);
+            assert!(!applied.conflicted);
+        });
+    }
+
+    #[test]
+    fn addon_sql_unique_violation_is_terminal_conflict_not_deferred() {
+        with_tmp_home(|| {
+            let source = make_runtime(87);
+            let receiver = make_runtime(88);
+            let addon_id = "sync-addon-sql-unique-conflict";
+            for db in [&source.runtime.db, &receiver.runtime.db] {
+                seed_authority_target(db, addon_id, &receiver.runtime.local_node_id);
+            }
+            open_orders_schema(addon_id);
+            // A local row already owns the UNIQUE email; the replicated INSERT for a
+            // DIFFERENT primary key collides on it — a genuine data conflict.
+            crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+                .expect("open addon db")
+                .get()
+                .expect("conn")
+                .execute(
+                    "INSERT INTO customers (id, email) VALUES (1, 'dup@x.test')",
+                    [],
+                )
+                .expect("seed local customer");
+
+            let conflicting =
+                addon_sql_operation(&source, customer_insert_capture(addon_id, 2, "dup@x.test"));
+            let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(
+                    peer.clone(),
+                    conflicting.clone(),
+                    &HexNodeIdOperationVerifier,
+                )
+                .expect("inbox conflicting");
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply conflict");
+
+            let entry = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer, conflicting.op_id)
+                .expect("conflict entry");
+            assert!(
+                entry.conflicted,
+                "a UNIQUE violation is a data conflict, must be terminal"
+            );
+            assert!(!entry.applied);
+            assert_eq!(
+                entry.deferred_count, 0,
+                "a data conflict must not be deferred"
+            );
+            let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+                "org-default",
+                addon_id,
+                Some("open"),
+                10,
+            )
+            .expect("conflicts");
+            assert_eq!(conflicts.len(), 1, "conflict must be recorded for the operator");
+            assert_eq!(conflicts[0].resource_id, "2");
+        });
+    }
+
+    #[test]
+    fn deferred_addon_sql_update_leaves_no_applied_marker_until_it_lands() {
+        with_tmp_home(|| {
+            let source = make_runtime(95);
+            let receiver = make_runtime(96);
+            let addon_id = "sync-addon-sql-defer-marker";
+            for db in [&source.runtime.db, &receiver.runtime.db] {
+                seed_authority_target(db, addon_id, &receiver.runtime.local_node_id);
+            }
+            open_contacts_table(addon_id);
+
+            let insert_op = addon_sql_operation(&source, capture(addon_id, "person-1", "Anna"));
+            let update_op =
+                addon_sql_operation(&source, update_capture(addon_id, "person-1", "Anna Nowak"));
+            let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
+
+            // The UPDATE arrives before its INSERT and is deferred. The idempotency
+            // marker MUST have been rolled back: if it stuck, the retried apply
+            // would short-circuit on `inserted == 0` and silently skip the write.
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), update_op.clone(), &HexNodeIdOperationVerifier)
+                .expect("inbox update");
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply deferred update");
+
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+                .expect("open addon db");
+            let marker_count: i64 = pool
+                .get()
+                .expect("conn")
+                .query_row(
+                    "SELECT COUNT(*) FROM __tentaflow_sync_applied WHERE operation_id = ?1",
+                    rusqlite::params![update_op.op_id.to_hex()],
+                    |row| row.get(0),
+                )
+                .expect("marker count");
+            assert_eq!(
+                marker_count, 0,
+                "a deferred apply must roll back its idempotency marker"
+            );
+
+            // The INSERT arrives; the retried UPDATE must now actually take effect.
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), insert_op, &HexNodeIdOperationVerifier)
+                .expect("inbox insert");
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("apply convergence");
+
+            let name: String = pool
+                .get()
+                .expect("conn")
+                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row.get(0))
+                .expect("row exists");
+            assert_eq!(name, "Anna Nowak");
+        });
+    }
+
+    /// Opens an addon SQLite with a self-referential parent chain: each row's
+    /// `parent_id` FKs the previous row. Inserting N rows in reverse order forces
+    /// the inbox drain through N retry passes — one row becomes applicable per pass
+    /// — which is exactly the shape that used to over-count deferrals per pass.
+    fn open_chain_schema(addon_id: &str) {
+        let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+            .expect("open addon db");
+        let conn = pool.get().expect("addon conn");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chain (\
+                 id INTEGER PRIMARY KEY, \
+                 parent_id INTEGER REFERENCES chain(id), \
+                 label TEXT NOT NULL);",
+        )
+        .expect("create chain schema");
+    }
+
+    fn chain_insert_capture(addon_id: &str, id: i64, parent_id: Option<i64>) -> SqlWriteCapture {
+        // resource_id is zero-padded so the partition-id string sort used by
+        // `inbox_apply_order` matches numeric order. Each row lives in its own
+        // partition (distinct resource_id), so the cross-partition tie-break is the
+        // partition-id string — padding keeps that deterministic for the chain.
+        SqlWriteCapture {
+            capture_id: format!("{addon_id}-chain-{id:04}"),
+            org_id: "org-default".to_string(),
+            addon_id: addon_id.to_string(),
+            table_name: "chain".to_string(),
+            action: SqlWriteAction::Insert,
+            resource_type: "chain".to_string(),
+            resource_id: format!("{id:04}"),
+            query: "INSERT INTO chain (id, parent_id, label) VALUES (?1, ?2, ?3)".to_string(),
+            params: vec![
+                JsonValue::from(id),
+                match parent_id {
+                    Some(p) => JsonValue::from(p),
+                    None => JsonValue::Null,
+                },
+                JsonValue::String(format!("node-{id}")),
+            ],
+            rows_affected: 1,
+            last_insert_id: id,
+            actor_user_id: Some("00000000-0000-0000-0000-000000000007".to_string()),
+            created_at_ms: now_ms(),
+        }
+    }
+
+    #[test]
+    fn long_dependency_chain_converges_in_one_drain_without_false_escalation() {
+        with_tmp_home(|| {
+            let source = make_runtime(97);
+            let receiver = make_runtime(98);
+            let addon_id = "sync-addon-sql-long-chain";
+            for db in [&source.runtime.db, &receiver.runtime.db] {
+                seed_authority_target(db, addon_id, &receiver.runtime.local_node_id);
+            }
+            open_chain_schema(addon_id);
+
+            // A chain longer than MAX_INBOX_DEFER_ATTEMPTS where row k's FK parent is
+            // row k+1 (the largest id is the parentless root). `inbox_apply_order`
+            // sorts by the zero-padded partition id (= numeric id) ascending, so each
+            // pass processes children strictly before their parent — only the current
+            // root applies per pass. Convergence therefore needs one pass per row, far
+            // more passes than the deferral budget. With the OLD per-pass counter the
+            // low-id rows (deepest children) would each accrue ~chain_len deferrals
+            // mid-drain, exceed the budget, and land as terminal conflicts even though
+            // their prerequisite arrives a few passes later in the SAME drain.
+            let chain_len: i64 = (MAX_INBOX_DEFER_ATTEMPTS as i64) + 6;
+            let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
+            let mut ops: Vec<SyncOperation> = Vec::new();
+            for id in 1..=chain_len {
+                let parent = if id == chain_len { None } else { Some(id + 1) };
+                ops.push(addon_sql_operation(
+                    &source,
+                    chain_insert_capture(addon_id, id, parent),
+                ));
+            }
+
+            for op in &ops {
+                receiver
+                    .runtime
+                    .ledger
+                    .put_verified_in_inbox(peer.clone(), op.clone(), &HexNodeIdOperationVerifier)
+                    .expect("inbox chain op");
+            }
+
+            let applied = receiver
+                .runtime
+                .apply_unapplied_inbox((chain_len as usize) + 16)
+                .expect("apply chain");
+            assert_eq!(
+                applied, chain_len as usize,
+                "every chain op must apply in the single drain"
+            );
+
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+                .expect("open addon db");
+            let row_count: i64 = pool
+                .get()
+                .expect("conn")
+                .query_row("SELECT COUNT(*) FROM chain", [], |row| row.get(0))
+                .expect("chain count");
+            assert_eq!(row_count, chain_len, "all chain rows must be present");
+
+            assert!(
+                crate::addon::storage_sql_exec::list_sync_conflicts(
+                    "org-default",
+                    addon_id,
+                    Some("open"),
+                    (chain_len as usize) + 16,
+                )
+                .expect("conflicts")
+                .is_empty(),
+                "a converging chain must produce zero terminal conflicts"
+            );
+
+            // No entry may carry more than a single deferral: each was deferred at
+            // most once (this one drain) before applying, so the per-drain counter
+            // never accumulates across the retry passes.
+            for op in &ops {
+                let entry = receiver
+                    .runtime
+                    .ledger
+                    .get_inbox_entry(peer.clone(), op.op_id)
+                    .expect("chain inbox entry");
+                assert!(entry.applied, "chain op {} must be applied", op.op_id.to_hex());
+                assert!(!entry.conflicted);
+                assert!(
+                    entry.deferred_count <= 1,
+                    "deferred_count must be <= 1 per drain, was {}",
+                    entry.deferred_count
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn genuinely_orphaned_update_escalates_to_conflict_after_budget_exhausted() {
+        with_tmp_home(|| {
+            let source = make_runtime(99);
+            let mut receiver = make_runtime(100);
+            // Shrink the deferral budget for this test only; the prerequisite never
+            // arrives, so we must escalate after a bounded number of drains rather
+            // than run the full production budget.
+            receiver.runtime.max_inbox_defer_attempts = 3;
+            let addon_id = "sync-addon-sql-orphan-update";
+            for db in [&source.runtime.db, &receiver.runtime.db] {
+                seed_authority_target(db, addon_id, &receiver.runtime.local_node_id);
+            }
+            open_contacts_table(addon_id);
+
+            // An UPDATE whose INSERT will NEVER be delivered: a genuine orphan.
+            let update_op =
+                addon_sql_operation(&source, update_capture(addon_id, "person-1", "Ghost"));
+            let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), update_op.clone(), &HexNodeIdOperationVerifier)
+                .expect("inbox update");
+
+            // Each drain bumps the deferral counter by exactly one. The entry stays
+            // retryable for `budget` drains, then escalates on the next.
+            let budget = receiver.runtime.max_inbox_defer_attempts;
+            for drain in 1..=budget {
+                receiver
+                    .runtime
+                    .apply_unapplied_inbox(128)
+                    .expect("deferring drain");
+                let entry = receiver
+                    .runtime
+                    .ledger
+                    .get_inbox_entry(peer.clone(), update_op.op_id)
+                    .expect("entry mid-defer");
+                assert!(!entry.conflicted, "still within budget at drain {drain}");
+                assert_eq!(entry.deferred_count, drain);
+            }
+
+            // One more drain exceeds the budget → terminal conflict.
+            receiver
+                .runtime
+                .apply_unapplied_inbox(128)
+                .expect("escalating drain");
+            let entry = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer, update_op.op_id)
+                .expect("entry after escalation");
+            assert!(
+                entry.conflicted,
+                "an orphan must become a terminal conflict once the budget is exhausted"
+            );
+            assert!(!entry.applied);
+            let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+                "org-default",
+                addon_id,
+                Some("open"),
+                10,
+            )
+            .expect("conflicts");
+            assert_eq!(conflicts.len(), 1, "escalation must record an operator conflict");
+            assert_eq!(conflicts[0].resource_id, "person-1");
         });
     }
 

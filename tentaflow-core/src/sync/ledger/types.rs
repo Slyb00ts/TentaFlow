@@ -73,6 +73,12 @@ pub enum SyncLedgerError {
     Fjall(#[from] fjall::Error),
     #[error("błąd runtime sync: {0}")]
     Runtime(String),
+    /// A purely ordering-related failure: the operation could not be applied yet
+    /// because a causally-prior operation (the INSERT that creates the target row
+    /// of an UPDATE) has not landed. NOT a data conflict — the inbox entry must
+    /// stay retryable so a later drain applies it once the prerequisite arrives.
+    #[error("operacja odroczona (brak operacji przyczynowej): {0}")]
+    DeferredOrdering(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -408,6 +414,11 @@ pub struct InboxEntry {
     pub conflicted: bool,
     #[serde(default)]
     pub conflict_message: Option<String>,
+    /// Number of times this entry was deferred for ordering reasons (target row
+    /// of an UPDATE not yet created). Bounded so a genuinely orphaned UPDATE is
+    /// eventually surfaced as a conflict instead of being retried forever.
+    #[serde(default)]
+    pub deferred_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,6 +512,15 @@ pub trait SyncLedgerStore: Send + Sync {
         op_id: OperationId,
         message: String,
     ) -> LedgerResult<()>;
+    /// Marks an entry as deferred (retryable) for ordering reasons and returns the
+    /// new deferral count, so the caller can give up after a bounded number of
+    /// fruitless retries. The entry stays in `list_unapplied_inbox`.
+    fn mark_inbox_deferred(
+        &self,
+        source: PeerId,
+        op_id: OperationId,
+        message: String,
+    ) -> LedgerResult<u32>;
     fn mark_delivered(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn mark_acknowledged(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     /// Removes a single outbox entry keyed by `(target, op_id)`. Used to lazily
