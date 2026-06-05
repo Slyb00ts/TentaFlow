@@ -164,7 +164,6 @@ const USER_NAV = [
     items: [
       { id: 'profile', labelKey: 'nav.profile', icon: 'user' },
       { id: 'my-accounts', labelKey: 'nav.my_accounts', icon: 'share' },
-      { id: 'settings-user', labelKey: 'nav.settings_user', icon: 'settings' },
     ],
   },
 ];
