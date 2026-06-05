@@ -75,6 +75,12 @@ pub struct IrohMeshConfig {
     /// DHT listening + bootstrap dodaje ~0.5-1s do starta i na mobile nie
     /// jest potrzebne (LAN Bonjour + iroh relay wystarcza).
     pub enable_dht_discovery: bool,
+    /// Gotowy filtr adresow publikowanych przez iroh (relay + mDNS). Buduje go
+    /// pipeline na bazie ustawien GUI (`mesh.bind_mode` + filtry advertise) i
+    /// wstrzykuje tutaj — iroh_manager nie dotyka DbPool.
+    pub addr_filter: Option<iroh::address_lookup::AddrFilter>,
+    /// Wylacz portmapper iroh (UPnP/NAT-PMP/PCP) — przy pinowanym interfejsie.
+    pub disable_portmapper: bool,
 }
 
 impl Default for IrohMeshConfig {
@@ -85,6 +91,8 @@ impl Default for IrohMeshConfig {
             relay_url: None,
             enable_lan_discovery: true,
             enable_dht_discovery: true,
+            addr_filter: None,
+            disable_portmapper: false,
         }
     }
 }
@@ -361,6 +369,8 @@ impl IrohMeshManager {
             relay_url: config.relay_url.clone(),
             enable_lan_discovery: config.enable_lan_discovery,
             enable_dht_discovery: config.enable_dht_discovery,
+            addr_filter: config.addr_filter.clone(),
+            disable_portmapper: config.disable_portmapper,
         };
 
         let endpoint = IrohEndpoint::bind(iroh_config)
@@ -2703,6 +2713,7 @@ mod tie_break_tests {
             relay_url: None,
             enable_lan_discovery: false,
             enable_dht_discovery: false,
+            ..Default::default()
         };
         IrohMeshManager::new(cfg, security)
             .await

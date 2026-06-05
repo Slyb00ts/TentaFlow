@@ -2540,6 +2540,7 @@ mod tests {
             relay_url: None,
             enable_lan_discovery: false,
             enable_dht_discovery: false,
+            ..Default::default()
         };
         IrohMeshManager::new(cfg, runtime.signer.security.clone())
             .await

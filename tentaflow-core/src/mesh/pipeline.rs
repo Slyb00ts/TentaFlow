@@ -185,12 +185,54 @@ pub async fn start_mesh_pipeline(
         background_shutdown.clone(),
     );
 
+    // Pin interfejsu + filtry advertise z GUI musza dotrzec do transportu iroh,
+    // nie tylko do warstwy NodeInfo. Bez tego iroh enumeruje wszystkie karty
+    // hosta (docker/tailscale/zapasowe NIC) i rozglasza je peerom jako
+    // kandydatow hole-punchingu — selekcja sciezki QUIC oscyluje p2p<->relay i
+    // polaczenia migocza. Snapshot wczytujemy raz (closure musi byc
+    // Send+Sync+'static, bez DbPool); zmiana ustawien i tak restartuje pipeline.
+    let (addr_filter, disable_portmapper) = match &db_pool {
+        Some(db) => {
+            let snapshot = crate::mesh::network_interfaces::build_addr_filter_snapshot(db);
+            let disable_portmapper = matches!(
+                snapshot.bind_mode,
+                crate::mesh::network_interfaces::BindModeSnapshot::Custom(_)
+            );
+            let filter = iroh::address_lookup::AddrFilter::new(move |addrs| {
+                use iroh::TransportAddr;
+                std::borrow::Cow::Owned(
+                    addrs
+                        .iter()
+                        .filter(|a| match a {
+                            // Relay zawsze przepuszczamy — to fallback dla NAT.
+                            TransportAddr::Relay(_) => true,
+                            TransportAddr::Ip(sa) => match sa.ip() {
+                                std::net::IpAddr::V4(v4) => snapshot.keep_transport_ip(v4),
+                                // Logika advertise jest v4-only; IPv6 transport
+                                // (link-local) zostawiamy iroh bez ingerencji.
+                                std::net::IpAddr::V6(_) => true,
+                            },
+                            // TransportAddr jest non_exhaustive — przyszle warianty
+                            // (np. nowy transport) przepuszczamy, nie blokujemy.
+                            _ => true,
+                        })
+                        .cloned()
+                        .collect(),
+                )
+            });
+            (Some(filter), disable_portmapper)
+        }
+        None => (None, false),
+    };
+
     let iroh_cfg = IrohMeshConfig {
         node_id: app_node_id.clone(),
         bind_addr,
         relay_url,
         enable_lan_discovery: mesh_config.mdns_enabled,
         enable_dht_discovery: enable_dht,
+        addr_filter,
+        disable_portmapper,
     };
 
     let security_for_mesh = mesh_security.clone();
