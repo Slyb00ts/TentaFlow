@@ -140,6 +140,12 @@ impl ReconnectManager {
         if self.is_self(&id) {
             return;
         }
+        // Asymetria: proaktywnie reconnectuje tylko węzeł z niższym node_id;
+        // wyższy czeka na incoming (fallback po grace). Bez tego oba dialują
+        // naraz → kolizje i spam tie-break.
+        if !self.iroh.should_proactively_dial(&hex::encode(id)) {
+            return;
+        }
         let detail = self.registry.snapshot_detail(&id);
         let attempts_before = detail.as_ref().map(|d| d.retry.attempts).unwrap_or(0);
         let hints_present = detail
