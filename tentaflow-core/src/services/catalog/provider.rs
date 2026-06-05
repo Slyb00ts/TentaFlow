@@ -710,7 +710,7 @@ mod tests {
             let conn = pool.lock().unwrap();
             conn.execute(
                 "UPDATE flows SET published_model_name = 'chat-pl' \
-                 WHERE name = 'Standardowy pipeline LLM'",
+                 WHERE name = 'Default Chat'",
                 [],
             )
             .unwrap();
@@ -1019,7 +1019,7 @@ mod tests {
             let conn = pool.lock().unwrap();
             conn.execute(
                 "UPDATE flows SET published_model_name = 'chat-pl', status = 'draft' \
-                 WHERE name = 'Standardowy pipeline LLM'",
+                 WHERE name = 'Default Chat'",
                 [],
             )
             .unwrap();
@@ -1049,7 +1049,7 @@ mod tests {
             .unwrap();
             conn.execute(
                 "UPDATE flows SET published_model_name = 'test-alias' \
-                 WHERE name = 'Standardowy pipeline LLM'",
+                 WHERE name = 'Default Chat'",
                 [],
             )
             .unwrap();
