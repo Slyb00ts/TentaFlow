@@ -15,6 +15,13 @@ use crate::crypto;
 /// ma staly '00000000-0000-4000-8000-000000000001'.
 const DEFAULT_ADMIN_ID: &str = "00000000-0000-4000-8000-000000000002";
 
+/// Staly UUID domyslnego flow "Default Chat". Musi byc identyczny na kazdym
+/// node, bo to zasob seedowany lokalnie, a synchronizowany po `id` (UPDATE
+/// trafia `WHERE id = ?`). Losowy `new_v4()` per-node sprawial, ze ten sam
+/// logiczny flow mial inny id na kazdej maszynie i edycje nie propagowaly sie
+/// (UPDATE 0 wierszy -> "target row not found").
+const DEFAULT_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
+
 /// Seeduje domyslne dane. Leci przy kazdym starcie i jest idempotentne
 /// (INSERT OR IGNORE), wiec dopelnia braki na istniejacych bazach — m.in.
 /// org_membership admina. Caly seed w jednej transakcji (jedno fsync).
@@ -658,10 +665,14 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
              ) \
          )",
     )?;
+    // Guard po nazwie ORAZ po kanonicznym id (?6). Bez czesci `id = ?6` zmiana
+    // nazwy domyslnego flow powodowalaby przy nastepnym starcie INSERT na zajety
+    // staly id -> kolizja PRIMARY KEY i wywrotka seedu (od kiedy id jest staly,
+    // nie losowy).
     let mut insert_stmt = conn.prepare(
         "INSERT INTO flows (id, name, description, service_type, flow_json, status, is_default) \
          SELECT ?6, ?1, ?2, ?3, ?4, 'active', ?5 \
-         WHERE NOT EXISTS (SELECT 1 FROM flows WHERE name = ?1)",
+         WHERE NOT EXISTS (SELECT 1 FROM flows WHERE name = ?1 OR id = ?6)",
     )?;
 
     for (name, description, service_type, flow_json, is_default) in flows {
@@ -689,7 +700,7 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
             service_type,
             flow_json,
             is_default,
-            uuid::Uuid::new_v4().to_string()
+            DEFAULT_CHAT_FLOW_ID
         ])?;
         if inserted > 0 {
             debug!("Utworzono domyslny flow: {}", name);
@@ -800,6 +811,40 @@ mod tests {
         );
         assert_eq!(st, "chat");
         assert_eq!(def, 1, "Default Chat jest jedynym i domyslnym flow");
+    }
+
+    /// Regresja: zmiana nazwy domyslnego flow nie moze powodowac kolizji
+    /// PRIMARY KEY przy ponownym seedzie. Od kiedy id jest staly (a nie losowy),
+    /// seed gatowany tylko po nazwie probowalby wstawic na zajety staly id i
+    /// wywracal start. Guard musi tez sprawdzac kanoniczny id.
+    #[test]
+    fn reseed_after_rename_does_not_collide() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.lock().unwrap();
+
+        // Uzytkownik zmienia nazwe domyslnego flow.
+        conn.execute(
+            "UPDATE flows SET name = 'Moj Czat' WHERE id = ?1",
+            rusqlite::params![super::DEFAULT_CHAT_FLOW_ID],
+        )
+        .unwrap();
+
+        // Ponowny seed (jak przy kolejnym starcie) — nie moze wybuchnac.
+        super::seed_default_flows(&conn).expect("ponowny seed po rename nie moze sie wywrocic");
+
+        // Nadal dokladnie jeden flow: kanoniczny id zachowany, nazwa nie nadpisana
+        // i nie zduplikowana.
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "rename nie moze tworzyc drugiego flow");
+        let (id, name): (String, String) = conn
+            .query_row("SELECT id, name FROM flows", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(id, super::DEFAULT_CHAT_FLOW_ID);
+        assert_eq!(name, "Moj Czat", "rename musi przetrwac ponowny seed");
     }
 
     /// Regresja: po pelnym migrations::run + seed_defaults na swiezej bazie
