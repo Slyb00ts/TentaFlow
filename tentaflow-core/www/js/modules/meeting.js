@@ -29,6 +29,7 @@ let historyDetail = null;
 let historyTab = 'summary';
 let settings = {
   bot_name: 'TentaFlow Bot',
+  flow_alias: '',
   stt_alias: '',
   tts_alias: '',
   llm_alias: '',
@@ -41,6 +42,8 @@ let settings = {
 };
 let sessionListTimer = null;
 let errorMessage = '';
+// Lista dostepnych flow do pickera "flow orchestratora" w ustawieniach.
+let availableFlows = [];
 
 // Lifecycle state tracked during 'joining' screen. Stage strings mirror
 // LIFECYCLE_* constants in tentaflow-protocol; 'idle' means no event received
@@ -152,6 +155,11 @@ async function loadSettings() {
     }
   } catch (_) {
     // ignore
+  }
+  try {
+    availableFlows = (await ApiBinary.list('flowListRequest')) || [];
+  } catch (_) {
+    availableFlows = [];
   }
 }
 
@@ -720,6 +728,11 @@ function renderSettingsScreen() {
           .join('')}
       </select>
     </div>`;
+  // Picker flow orchestratora — pusty value = DEFAULT_FLOW_ALIAS ("Default Chat").
+  const flowOptions = [
+    { value: '', label: I18n.t('meeting.sett_flow_default') },
+    ...availableFlows.map((f) => ({ value: f.name, label: f.name })),
+  ];
   return `
     ${header}
     <div class="meeting-settings-body" id="meeting-settings-form">
@@ -752,6 +765,7 @@ function renderSettingsScreen() {
       <div class="settings-section">
         <h3>${escapeHtml(I18n.t('meeting.sett_ai_title'))}</h3>
         <div class="section-sub">${escapeHtml(I18n.t('meeting.sett_ai_sub'))}</div>
+        ${selectField('flow_alias', I18n.t('meeting.sett_flow'), I18n.t('meeting.sett_flow_hint'), flowOptions)}
         ${textField('llm_alias', 'LLM', I18n.t('meeting.sett_llm_hint'), 'qwen-3.5-0.8b')}
         ${selectField('insights_frequency', I18n.t('meeting.sett_insights'), I18n.t('meeting.sett_insights_hint'), [
           { value: 'auto', label: I18n.t('meeting.insights_auto') },
