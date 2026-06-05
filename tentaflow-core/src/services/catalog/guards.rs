@@ -176,7 +176,7 @@ mod tests {
     fn publish_seeded_llm_flow(pool: &DbPool, name: &str) {
         let conn = pool.lock().unwrap();
         conn.execute(
-            "UPDATE flows SET published_model_name = ?1 WHERE name = 'Standardowy pipeline LLM'",
+            "UPDATE flows SET published_model_name = ?1 WHERE name = 'Default Chat'",
             rusqlite::params![name],
         )
         .unwrap();
@@ -254,7 +254,7 @@ mod tests {
         let flow_id = {
             let conn = pool.lock().unwrap();
             conn.query_row(
-                "SELECT id FROM flows WHERE name = 'Standardowy pipeline LLM'",
+                "SELECT id FROM flows WHERE name = 'Default Chat'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -300,7 +300,7 @@ mod tests {
             let conn = pool.lock().unwrap();
             conn.execute(
                 "UPDATE flows SET published_model_name = 'chat-pl', status = 'draft' \
-                 WHERE name = 'Standardowy pipeline LLM'",
+                 WHERE name = 'Default Chat'",
                 [],
             )
             .unwrap();
