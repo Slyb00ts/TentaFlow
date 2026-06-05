@@ -77,15 +77,17 @@ impl IrohEndpoint {
         // QUIC keep-alive + idle timeout. Bez tego iroh zostawia polaczenie
         // kompletnie na lasce ruchu aplikacyjnego — gdy peer na chwile zamilczy
         // (NAT rebind, wifi roam, krotki packet-loss), Quinn nie wysyla PINGow,
-        // idle timer po swojemu zabija sesje a my dopiero po 30s liveness
-        // wykrywamy zgon. Keep-alive co 10s + idle 25s daje stabilna sesje i
-        // szybkie wykrycie realnej awarii bez spamu rekonektow.
+        // idle timer po swojemu zabija sesje a my dopiero pozniej przez liveness
+        // wykrywamy zgon. Keep-alive co 10s utrzymuje sesje przy zyciu; idle 40s
+        // (ponizej liveness-reconnect 45s) daje wygranemu polaczeniu zapas na
+        // krotkie blipy sieci, zeby nie padalo "z byle powodu" — realna awaria
+        // i tak konczy sie idle-closem zanim liveness wymusi reconnect.
         let transport_config = QuicTransportConfig::builder()
             .keep_alive_interval(Duration::from_secs(10))
             .max_idle_timeout(Some(
-                Duration::from_secs(25)
+                Duration::from_secs(40)
                     .try_into()
-                    .expect("25s fits in VarInt"),
+                    .expect("40s fits in VarInt"),
             ))
             .build();
 
