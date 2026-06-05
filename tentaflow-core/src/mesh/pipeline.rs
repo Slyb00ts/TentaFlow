@@ -273,6 +273,9 @@ pub async fn start_mesh_pipeline(
                         let nid = node.node_id.clone();
                         let sec = sec.clone();
                         tokio::spawn(async move {
+                            if !qm.should_proactively_dial(&nid) {
+                                return;
+                            }
                             if let Some(hints) = trusted_contact_hints_for_peer(sec.as_ref(), &nid)
                             {
                                 if let Err(e) = qm.connect_to_peer_with_hints(&hints).await {
@@ -808,6 +811,9 @@ async fn handle_peer_disconnected(
             let node_id2 = node_id.clone();
             let hints = trusted_contact_hints_for_peer(sec.as_ref(), &node_id);
             tokio::spawn(async move {
+                if !qm2.should_proactively_dial(&node_id2) {
+                    return;
+                }
                 if let Some(hints) = hints {
                     if let Err(e) = qm2.connect_to_peer_with_hints(&hints).await {
                         debug!(
@@ -970,6 +976,12 @@ fn spawn_quic_event_handler(
                         }
                         peer_store.set_status(&entry.node_id, "discovered");
                         if !target_trusted {
+                            continue;
+                        }
+                        // Asymetria: nizszy node_id dialuje od razu, wyzszy czeka na
+                        // incoming (fallback po grace). Bez tego oba dialuja naraz →
+                        // kolizje i spam tie-break.
+                        if !qm_events.should_proactively_dial(&entry.node_id) {
                             continue;
                         }
                         let recent = last_dial_at
@@ -1156,6 +1168,11 @@ fn spawn_quic_event_handler(
                                 continue;
                             }
                             if peer_store.is_quic_connected(&entry.node_id) {
+                                continue;
+                            }
+                            // Asymetria: tylko nizszy node_id dialuje od razu; wyzszy
+                            // czeka na incoming (fallback po grace).
+                            if !qm_events.should_proactively_dial(&entry.node_id) {
                                 continue;
                             }
                             let recent = last_dial_at
@@ -1923,7 +1940,11 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(IrohMeshEvent::PeerDiscovered { node_id, addresses }) => {
+                Ok(IrohMeshEvent::PeerDiscovered {
+                    node_id,
+                    addresses,
+                    hostname,
+                }) => {
                     // mDNS/DHT zobaczylo peera. Jesli peer juz polaczony, NodeInfo
                     // jest zrodlem prawdy — nie nadpisujemy. Inaczej dodaj do
                     // peer_store zeby UI pokazal go jako "discovered" (dashed
@@ -1945,6 +1966,12 @@ fn spawn_quic_event_handler(
                     }
                     let ips: Vec<std::net::IpAddr> = addresses.iter().map(|sa| sa.ip()).collect();
                     peer_store.set_addresses(&node_id, ips);
+                    // Nazwa z mDNS user_data — pozwala UI pokazac czytelna nazwe
+                    // peera juz na karcie "discovered" (przed parowaniem). Nie
+                    // nadpisujemy istniejacej niepusta nazwy pusta wartoscia.
+                    if !hostname.is_empty() {
+                        peer_store.set_hostname(&node_id, &hostname);
+                    }
                     peer_store.set_status(&node_id, "discovered");
                     debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
                 }

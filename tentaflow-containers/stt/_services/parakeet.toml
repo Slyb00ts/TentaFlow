@@ -23,7 +23,7 @@ runtime = "python-bundle"
 bundle_path = "stt/python/parakeet"
 
 [[model_preset]]
-id = "parakeet-tdt-1-1b"
-display_name = "Parakeet TDT 1.1B"
-repo = "nvidia/parakeet-tdt-1.1b"
+id = "parakeet-tdt-0.6b-v3"
+display_name = "Parakeet TDT 0.6B v3 (multilingual)"
+repo = "nvidia/parakeet-tdt-0.6b-v3"
 recommended = true

@@ -215,6 +215,9 @@ pub enum IrohMeshEvent {
     PeerDiscovered {
         node_id: String,
         addresses: Vec<std::net::SocketAddr>,
+        /// Nazwa rozgłaszana przez peera w mDNS `user_data` (hostname). Pusta,
+        /// gdy peer nie podał — UI spada wtedy na skrócony node_id.
+        hostname: String,
     },
     /// Pull request: peer prosi nas o pelny snapshot lokalnych serwisow
     /// (`MESH_MSG_SERVICES_GET`).
@@ -335,7 +338,18 @@ struct PeerLogState {
     last_discovery_log: Option<Instant>,
     consecutive_dial_failures: u32,
     last_dial_attempt: Option<Instant>,
+    /// Od kiedy ten (nie-preferowany, wyzszy node_id) wezel widzi peera bez
+    /// polaczenia. Po `NONPREFERRED_DIAL_GRACE` wolno mu dialowac jako fallback,
+    /// gdy preferowany (nizszy) nie zdolal nas dosiegnac. Resetowane gdy
+    /// polaczenie istnieje.
+    nonpreferred_defer_since: Option<Instant>,
 }
+
+/// Ile czeka nie-preferowany (wyzszy node_id) wezel zanim zacznie dialowac
+/// jako fallback. Normalnie proaktywnie dialuje tylko nizszy node_id; wyzszy
+/// czeka na incoming. Grace pokrywa przypadek, gdy nizszy nie moze nas dosiegnac
+/// (NAT/asymetryczna lacznosc) — wtedy wyzszy przejmuje inicjatywe.
+const NONPREFERRED_DIAL_GRACE: Duration = Duration::from_secs(12);
 
 impl IrohMeshManager {
     /// Tworzy manager bind'ujac iroh Endpoint z discovery (LAN + DHT + relay).
@@ -352,6 +366,19 @@ impl IrohMeshManager {
         let endpoint = IrohEndpoint::bind(iroh_config)
             .await
             .map_err(|e: IrohEndpointError| anyhow::anyhow!("iroh endpoint bind: {e:?}"))?;
+
+        // Rozglaszamy nazwe urzadzenia w mDNS user_data (TXT), zeby inne nody
+        // widzialy czytelna nazwe peera JESZCZE przed parowaniem zamiast hex
+        // node_id. To samo zrodlo co `NodeInfo.hostname`, wiec nazwa w sekcji
+        // "Wykryte" zgadza sie z ta po sparowaniu.
+        let device_name = crate::mesh::node_info_collector::local_hostname();
+        if !device_name.is_empty() {
+            if let Ok(user_data) = device_name.parse::<iroh::address_lookup::UserData>() {
+                endpoint
+                    .inner()
+                    .set_user_data_for_address_lookup(Some(user_data));
+            }
+        }
 
         let local_id_hex = hex::encode(endpoint.id().as_bytes());
         info!(
@@ -432,6 +459,37 @@ impl IrohMeshManager {
     fn note_dial_success(&self, peer_hex: &str) {
         if let Some(mut entry) = self.peer_log_state.get_mut(peer_hex) {
             entry.consecutive_dial_failures = 0;
+            entry.nonpreferred_defer_since = None;
+        }
+    }
+
+    /// Czy powinniśmy PROAKTYWNIE (z discovery/reconnect) dialować tego peera.
+    ///
+    /// Asymetria zapobiega kolizjom: stale dialuje tylko węzeł z niższym
+    /// `node_id`; wyższy czeka na incoming i dialuje dopiero jako fallback po
+    /// `NONPREFERRED_DIAL_GRACE` bez połączenia (gdy niższy nie może nas
+    /// dosięgnąć). Jeśli połączenie już istnieje — nikt nie dialuje. Jawne diale
+    /// (pairing, baseline, sync) NIE używają tej bramki — wołają `connect_*`
+    /// bezpośrednio.
+    pub fn should_proactively_dial(&self, peer_hex: &str) -> bool {
+        if self.connections.contains_key(peer_hex) {
+            if let Some(mut entry) = self.peer_log_state.get_mut(peer_hex) {
+                entry.nonpreferred_defer_since = None;
+            }
+            return false;
+        }
+        let we_are_preferred = self.local_node_id.read().as_str() < peer_hex;
+        if we_are_preferred {
+            return true;
+        }
+        let mut entry = self.peer_log_state.entry(peer_hex.to_string()).or_default();
+        let now = Instant::now();
+        match entry.nonpreferred_defer_since {
+            None => {
+                entry.nonpreferred_defer_since = Some(now);
+                false
+            }
+            Some(since) => now.duration_since(since) >= NONPREFERRED_DIAL_GRACE,
         }
     }
 
@@ -515,15 +573,30 @@ impl IrohMeshManager {
                         }
                         let addresses: Vec<std::net::SocketAddr> =
                             endpoint_info.data.ip_addrs().copied().collect();
+                        // Nazwa urzadzenia rozglaszana w mDNS user_data (TXT) —
+                        // pozwala pokazac czytelna nazwe peera JESZCZE przed
+                        // parowaniem (bez tego UI ma tylko hex node_id).
+                        let advertised_name = endpoint_info
+                            .data
+                            .user_data()
+                            .map(|u| u.to_string())
+                            .unwrap_or_default();
                         let _ = self_arc.event_tx.send(IrohMeshEvent::PeerDiscovered {
                             node_id: peer_hex.clone(),
                             addresses: addresses.clone(),
+                            hostname: advertised_name,
                         });
                         let is_trusted = self_arc.security.is_trusted(&peer_hex);
                         if !is_trusted {
                             continue;
                         }
                         if self_arc.is_connected(&peer_hex).await {
+                            continue;
+                        }
+                        // Asymetria: tylko nizszy node_id dialuje proaktywnie;
+                        // wyzszy czeka na incoming (fallback po grace). Bez tego
+                        // oba dialuja naraz → kolizje i spam tie-break.
+                        if !self_arc.should_proactively_dial(&peer_hex) {
                             continue;
                         }
                         // Tlumimy rapid re-dial tego samego trusted peera.
@@ -2634,6 +2707,25 @@ mod tie_break_tests {
         IrohMeshManager::new(cfg, security)
             .await
             .expect("manager new")
+    }
+
+    /// Asymetria dialowania: nizszy node_id dialuje od razu, wyzszy odracza
+    /// (czeka na incoming). `node_id` to 64-hex; "0"*64 jest mniejszy od
+    /// kazdego realnego self_hex, "f"*64 wiekszy — wiec test jest
+    /// deterministyczny niezaleznie od losowego klucza endpointu.
+    #[tokio::test]
+    async fn should_proactively_dial_respects_asymmetry() {
+        let mgr = make_manager().await;
+        let peer_low = "0".repeat(64);
+        assert!(
+            !mgr.should_proactively_dial(&peer_low),
+            "wyzszy node_id nie powinien dialowac od razu — czeka na incoming"
+        );
+        let peer_high = "f".repeat(64);
+        assert!(
+            mgr.should_proactively_dial(&peer_high),
+            "nizszy node_id powinien dialowac proaktywnie"
+        );
     }
 
     /// Nawiazuje JEDNO fizyczne polaczenie QUIC: A dial do B (znany EndpointId).

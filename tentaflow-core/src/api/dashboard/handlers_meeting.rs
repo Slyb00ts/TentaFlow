@@ -141,6 +141,18 @@ pub async fn meeting_session_start(
         return Err(bad_request("meeting_url za dlugi"));
     }
     let owner = current_user_id(ctx);
+    // Flow orchestratora bota jest konfigurowalny per-user w ustawieniach
+    // Meeting Bota (klucz `flow_alias`). Pusty/brak → DEFAULT_FLOW_ALIAS
+    // ("Default Chat") rozwiazany w `resolve_aliases`.
+    let configured_flow = owner
+        .as_deref()
+        .and_then(|uid| {
+            crate::db::repository::transcripts::get_user_setting(&ctx.state.db, uid, "flow_alias")
+                .ok()
+                .flatten()
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let start = StartSessionRequest {
         meeting_url: r.meeting_url.clone(),
         title: if r.title.is_empty() {
@@ -181,7 +193,7 @@ pub async fn meeting_session_start(
         } else {
             Some(r.llm_alias.clone())
         },
-        flow_alias: None,
+        flow_alias: configured_flow,
         llm_alias: if r.llm_alias.is_empty() {
             None
         } else {

@@ -615,57 +615,23 @@ N'ajoute pas de champs absents du schéma ci-dessus. Ne commente pas. Renvoie un
 
 /// Seeduje domyslne diagramy flow reprezentujace pipeline routera.
 fn seed_default_flows(conn: &Connection) -> Result<()> {
-    // R3d (plan v7): zestaw default flows do wystawienia z fresh DB.
-    // - "Standardowy pipeline LLM" (Safe Chat) — z filtrem PII, default=1
-    // - "Default Chat" — bez PII, opt-in dla scenariuszy ktore nie chca filtru
-    // - "Standardowy pipeline TTS" — czyszczenie tekstu + TTS, default=1
-    // - "Audio Chat" — STT (z diarization) → LLM → output, dla `audio_input`
-    //   requestow (D.18: graph z STT na trigger -> input_modalities=[Audio]
-    //   auto-inferred przez catalog provider)
-    // - "teams-flow" — flow dla teams-bot (non-default)
+    // Fresh DB seeduje tylko jeden domyslny flow: "Default Chat" (streaming
+    // chat z filtrem PII, default=1). Reszta pipeline'ow (TTS, Audio Chat,
+    // teams-flow, osobny "Standardowy pipeline LLM") nie jest zakladana —
+    // brakujace service_type/modality rozwiazuje synthetic fallback
+    // (synthetic.rs), a uzytkownik buduje wlasne flowy w Flow Builderze.
     //
-    // RAG flows usuniete razem z RAG path; nowa implementacja RAG bedzie
-    // miala wlasne default flows.
-    // Wszystkie chat/agents flowy seedowane jako STREAMING (LLM -> pii_filter
-    // -> output z mode=stream, edges od LLM dalej z from_port=stream).
-    // Bez tego try_dispatch_streaming wpada na is_streaming=false ->
-    // wrap_blocking_as_stream -> single chunk z całością odpowiedzi
-    // (klient widzi calosc po EOF zamiast token-by-token).
+    // Flow seedowany jako STREAMING (LLM -> pii_filter -> output z mode=stream,
+    // edges od LLM dalej z from_port=stream). Bez tego try_dispatch_streaming
+    // wpada na is_streaming=false -> wrap_blocking_as_stream -> single chunk z
+    // całością odpowiedzi (klient widzi calosc po EOF zamiast token-by-token).
     let flows: &[(&str, &str, &str, &str, i64)] = &[
-        (
-            "Standardowy pipeline LLM",
-            "Streaming pipeline LLM z filtrem PII na odpowiedzi.",
-            "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
-            1,
-        ),
         (
             "Default Chat",
             "Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).",
             "chat",
             r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
-            0,
-        ),
-        (
-            "Standardowy pipeline TTS",
-            "Prosty pipeline syntezy mowy: czyszczenie tekstu i TTS.",
-            "tts",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"c1","type":"tts_clean","position":{"x":200,"y":0},"config":{}},{"id":"s1","type":"tts","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"c1","from_port":"text","data_type":"text"},{"from_node":"c1","to_node":"s1"},{"from_node":"s1","to_node":"o1","to_port":"audio","data_type":"audio"}]}"#,
             1,
-        ),
-        (
-            "Audio Chat",
-            "Voice conversation streaming: STT (z diarization) -> LLM -> pii_filter -> output(stream). Wlaczany dla audio_input.",
-            "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":200,"y":0},"config":{"diarization":true}},{"id":"l1","type":"llm","position":{"x":400,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":600,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":800,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"s1","from_port":"audio","data_type":"audio"},{"from_node":"s1","to_node":"l1"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
-            0,
-        ),
-        (
-            "teams-flow",
-            "Streaming flow dla teams-bot: trigger -> llm -> pii_filter -> output(stream).",
-            "agents",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{"model_alias":"teams-summarization"}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
-            0,
         ),
     ];
 
@@ -787,8 +753,8 @@ mod tests {
         assert_eq!(is_system_all, 5);
     }
 
-    /// Swieza baza ma dokladnie 3 domyslne flows: LLM, TTS, teams-flow.
-    /// Kazdy ma zdefiniowany DAG trigger -> ... -> output z odpowiednimi nodami.
+    /// Swieza baza ma dokladnie jeden domyslny flow: "Default Chat" (default=1).
+    /// Reszta service_type/modality rozwiazuje synthetic fallback.
     #[test]
     fn fresh_db_has_expected_default_flows() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
@@ -797,7 +763,7 @@ mod tests {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 5, "oczekiwane 5 domyslnych flows, jest {}", total);
+        assert_eq!(total, 1, "oczekiwany 1 domyslny flow, jest {}", total);
 
         let names: Vec<String> = conn
             .prepare("SELECT name FROM flows ORDER BY name")
@@ -806,18 +772,9 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .collect();
-        assert_eq!(
-            names,
-            vec![
-                "Audio Chat".to_string(),
-                "Default Chat".to_string(),
-                "Standardowy pipeline LLM".to_string(),
-                "Standardowy pipeline TTS".to_string(),
-                "teams-flow".to_string(),
-            ]
-        );
+        assert_eq!(names, vec!["Default Chat".to_string()]);
 
-        // Sprawdz kazdy flow strukturalnie.
+        // Sprawdz flow strukturalnie.
         let assert_dag = |name: &str, expected_types: &[&str], expected_edges: usize| {
             let (flow_json, service_type, is_default): (String, String, i64) = conn
                 .query_row(
@@ -837,62 +794,12 @@ mod tests {
         };
 
         let (st, def) = assert_dag(
-            "Standardowy pipeline LLM",
-            &["trigger", "llm", "pii_filter", "output"],
-            3,
-        );
-        // R0a: service_type "llm" zostalo przemianowane na "chat" (chat
-        // router dispatchuje z service_type='chat'); seed odzwierciedla
-        // ten kontrakt.
-        assert_eq!(st, "chat");
-        assert_eq!(def, 1);
-
-        let (st, def) = assert_dag(
-            "Standardowy pipeline TTS",
-            &["trigger", "tts_clean", "tts", "output"],
-            3,
-        );
-        assert_eq!(st, "tts");
-        assert_eq!(def, 1);
-
-        let (st, def) = assert_dag(
             "Default Chat",
             &["trigger", "llm", "pii_filter", "output"],
             3,
         );
         assert_eq!(st, "chat");
-        assert_eq!(
-            def, 0,
-            "Default Chat nie jest default w db (Standardowy pipeline LLM jest)"
-        );
-
-        let (st, def) = assert_dag(
-            "Audio Chat",
-            &["trigger", "stt", "llm", "pii_filter", "output"],
-            4,
-        );
-        assert_eq!(st, "chat");
-        assert_eq!(def, 0, "Audio Chat jest opt-in (wymaga audio_input)");
-
-        let (st, _) = assert_dag("teams-flow", &["trigger", "llm", "pii_filter", "output"], 3);
-        assert_eq!(st, "agents");
-
-        // teams-flow: llm node musi miec model_alias = teams-summarization.
-        let teams_json: String = conn
-            .query_row(
-                "SELECT flow_json FROM flows WHERE name = 'teams-flow'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let teams_parsed: serde_json::Value = serde_json::from_str(&teams_json).unwrap();
-        let llm_node = teams_parsed["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|n| n["type"] == "llm")
-            .unwrap();
-        assert_eq!(llm_node["config"]["model_alias"], "teams-summarization");
+        assert_eq!(def, 1, "Default Chat jest jedynym i domyslnym flow");
     }
 
     /// Regresja: po pelnym migrations::run + seed_defaults na swiezej bazie

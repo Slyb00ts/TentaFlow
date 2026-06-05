@@ -84,7 +84,7 @@ pub struct StartSessionRequest {
 pub const DEFAULT_STT_ALIAS: &str = "teams-stt";
 pub const DEFAULT_SUMMARIZATION_ALIAS: &str = "teams-summarization";
 pub const DEFAULT_TTS_ALIAS: &str = "teams-tts";
-pub const DEFAULT_FLOW_ALIAS: &str = "teams-flow";
+pub const DEFAULT_FLOW_ALIAS: &str = "Default Chat";
 pub const DEFAULT_LLM_ALIAS: &str = "teams-llm";
 /// Aliasy vision dla sesji meeting bota — face detection (SCRFD/YOLOv8-Face)
 /// i emotion classifier (HSEmotion). Pipeline per-uczestnik w
