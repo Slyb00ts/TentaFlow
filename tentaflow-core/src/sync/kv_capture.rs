@@ -308,6 +308,12 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db = db::init(&dir.path().join("core.db")).expect("db init");
         let mut conn = db.lock().expect("db lock");
+        // actor_user_id has an FK to user_accounts(id); seed the referenced row.
+        conn.execute(
+            "INSERT INTO user_accounts (id, username, password_hash) VALUES ('1','test-user','x')",
+            [],
+        )
+        .expect("seed actor user");
         let tx = conn.transaction().expect("begin tx");
         let capture = KvWriteCapture::new(
             "org-default",
