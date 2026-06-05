@@ -1083,10 +1083,14 @@ fn apply_sync_explicit_share(
     }
 }
 
+/// UPDATE matched no row: the INSERT that creates this resource has not been
+/// materialized yet (causal-ordering gap), not a data conflict. Surface it as a
+/// deferred-ordering error so the inbox keeps the entry retryable until the
+/// prerequisite INSERT lands via push or repair.
 fn require_existing(operation: &SyncOperation) -> impl FnOnce(usize) -> LedgerResult<usize> + '_ {
     |rows| {
         if rows == 0 {
-            Err(SyncLedgerError::Runtime(format!(
+            Err(SyncLedgerError::DeferredOrdering(format!(
                 "core sync target row not found: {}/{}",
                 operation.body.resource_type, operation.body.resource_id
             )))
