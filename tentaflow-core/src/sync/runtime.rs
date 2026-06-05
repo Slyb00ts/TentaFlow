@@ -1655,11 +1655,25 @@ impl SyncRuntime {
             entry.operation.op_id,
             error.to_string(),
         )?;
-        warn!(
-            "sync runtime: incoming operation {} recorded as conflict: {}",
-            entry.operation.op_id.to_hex(),
-            error
-        );
+        // For addon-SQL conflicts the error may carry raw rusqlite text
+        // (StorageSqlError::Internal); keep it out of the tracing log to avoid
+        // leaking schema detail. Full detail still lands in the addon conflict
+        // table and the ledger conflict_message above. Core/kv/blob errors are
+        // our own SyncLedgerError with safe resource-id messages, so log those.
+        if capture.is_some() {
+            warn!(
+                op_id = %entry.operation.op_id.to_hex(),
+                resource_type = %entry.operation.body.resource_type,
+                resource_id = %entry.operation.body.resource_id,
+                "sync runtime: incoming operation recorded as conflict: addon sql data conflict"
+            );
+        } else {
+            warn!(
+                "sync runtime: incoming operation {} recorded as conflict: {}",
+                entry.operation.op_id.to_hex(),
+                error
+            );
+        }
         Ok(())
     }
 
@@ -1697,11 +1711,13 @@ impl SyncRuntime {
         }
         self.ledger
             .mark_inbox_conflicted(source.clone(), op_id, context.message.clone())?;
+        // context.message can embed raw rusqlite text (e.g. OrderingGap FK detail);
+        // keep it out of tracing. Full detail still reaches the addon conflict
+        // table and the ledger conflict_message above.
         warn!(
-            "sync runtime: incoming operation {} recorded as conflict after {} deferrals: {}",
-            op_id.to_hex(),
-            deferred_count,
-            context.message
+            op_id = %op_id.to_hex(),
+            deferrals = deferred_count,
+            "sync runtime: incoming operation recorded as conflict: ordering budget exhausted"
         );
         Ok(())
     }
