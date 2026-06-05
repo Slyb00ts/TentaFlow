@@ -8,34 +8,56 @@
 import io
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import soundfile as sf
+import torch
 from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.responses import JSONResponse
 import nemo.collections.asr as nemo_asr
 
 
-MODEL_NAME = os.environ.get("NEMO_MODEL", "nvidia/parakeet-tdt-0.6b-v3")
+# `MODEL` to zmienna, ktora ustawia deploy (resolve_model_repo z wybranego
+# presetu). `NEMO_MODEL` zostaje jako jawny override, a literal to ostatni
+# fallback. Wczesniej server czytal tylko `NEMO_MODEL`, przez co ignorowal
+# preset z panelu i zawsze ladowal zaszyty domyslny model.
+MODEL_NAME = (
+    os.environ.get("MODEL")
+    or os.environ.get("NEMO_MODEL")
+    or "nvidia/parakeet-tdt-0.6b-v3"
+)
 
-app = FastAPI()
-
-# Lazy-load — pierwszy request przyciaga model
 _asr_model: Optional["nemo_asr.models.ASRModel"] = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Eager-load: readiness (`/v1/models`) odpowiada dopiero gdy model jest
+    # realnie zaladowany na urzadzenie. Dzieki temu brak pamieci GPU ubija
+    # proces PODCZAS startu (deploy widzi ProcessExited i ustawia czerwony
+    # 'failed'), a nie dopiero przy pierwszej transkrypcji w niewidzialnej
+    # petli respawnow z zielonym statusem "dziala".
+    get_model()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def get_model():
     global _asr_model
     if _asr_model is None:
         print(f"[parakeet] laduje model {MODEL_NAME}", flush=True)
-        _asr_model = nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
-        _asr_model.eval()
-        if hasattr(_asr_model, "to"):
-            try:
-                _asr_model.to("cuda")
-            except Exception:
-                pass
-        print("[parakeet] model gotowy", flush=True)
+        model = nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
+        model.eval()
+        # Jawny wybor urzadzenia, bez polykania wyjatkow: CUDA OOM ma poleciec
+        # wyzej i ubic start (-> widoczny blad deployu), zamiast zostawic model
+        # w polowicznym stanie i crashowac twardo dopiero w transcribe.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+        print(f"[parakeet] model gotowy na {device}", flush=True)
+        _asr_model = model
     return _asr_model
 
 
