@@ -2989,8 +2989,16 @@ input, textarea, select {
   position: relative;
   padding: 24px max(24px, calc((100% - 800px) / 2));
 }
-/* VirtualList absolute-positions items inside .vlist-viewport; spacing
-   between bubbles comes from itemHeight() padding rather than CSS gap. */
+/* Odstęp między bąbelkami musi być REALNYM CSS, bo wirtualizator mierzy
+   offsetHeight itemu i koryguje nim wysokość slotu. Margin NIE wchodzi do
+   offsetHeight (sloty by się skurczyły o gap po pomiarze i wiadomości by się
+   skleiły), więc używamy padding-bottom. box-sizing:border-box wlicza padding
+   w wymiar — spójnie z min-height ustawianym przez render(). Scoped do
+   .chat-body, by nie ruszyć .transcript-list (meeting.js ma własne paddingi). */
+.chat-body .vlist-item {
+  padding-bottom: 20px;
+  box-sizing: border-box;
+}
 
 .msg-row {
   display: grid;
