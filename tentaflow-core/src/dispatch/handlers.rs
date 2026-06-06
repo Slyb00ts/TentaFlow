@@ -3459,13 +3459,10 @@ pub async fn service_manifest_deploy(
         let forwarded_config_json = if payload.config_json.is_empty() {
             payload.config_json.clone()
         } else {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&payload.config_json).map_err(|e| {
-                    ProtocolError::bad_request(format!("invalid config_json: {}", e))
-                })?;
+            let parsed: serde_json::Value = serde_json::from_str(&payload.config_json)
+                .map_err(|e| ProtocolError::bad_request(format!("invalid config_json: {}", e)))?;
             let sanitized = crate::services::deploy::strip_hf_token(&parsed);
-            serde_json::to_string(&sanitized)
-                .map_err(|e| ProtocolError::internal(e.to_string()))?
+            serde_json::to_string(&sanitized).map_err(|e| ProtocolError::internal(e.to_string()))?
         };
         let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeployRemote {
             engine_id: payload.engine_id.clone(),
@@ -3910,7 +3907,7 @@ pub async fn deploy_vllm_recommend(
 ) -> Result<MessageBody, ProtocolError> {
     use crate::deploy::vram_calculator::{
         analyze_gpu_compatibility, auto_fit_config, build_vllm_args_string, estimate_vllm_vram,
-        fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
+        fetch_gguf_spec, fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
         parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest,
     };
 
@@ -3936,20 +3933,48 @@ pub async fn deploy_vllm_recommend(
         .map_err(|e| ProtocolError::internal(format!("reqwest client: {e}")))?;
 
     let hf_token = effective_hf_token(ctx, payload.hf_token.as_deref());
-    let config_json = fetch_hf_config(&client, &payload.model, hf_token.as_deref())
-        .await
-        .map_err(|e| {
-            ProtocolError::not_found(format!(
-                "Nie udalo sie pobrac config.json z HF: {e}. Sprawdz nazwe modelu i ewentualnie HF token (gated repo)."
+
+    // Sciezka GGUF (llama.cpp): repo GGUF nie ma config.json - metadane czytamy
+    // z naglowka pliku .gguf, a rozmiar pliku JEST dokladnym footprintem wag.
+    // Aktywna gdy frontend poda `gguf_file` albo gdy sama nazwa modelu wskazuje GGUF.
+    let model_lower = payload.model.to_lowercase();
+    let looks_gguf = payload.gguf_file.is_some()
+        || model_lower.ends_with("-gguf")
+        || model_lower.contains("gguf");
+
+    let (spec, weights_override) = if looks_gguf {
+        let gguf_file = payload.gguf_file.clone().ok_or_else(|| {
+            ProtocolError::bad_request(format!(
+                "Model {} wyglada na GGUF ale nie podano sciezki pliku .gguf (gguf_file).",
+                payload.model
             ))
         })?;
-
-    let spec = parse_hf_config_with_override(
-        &config_json,
-        &payload.model,
-        payload.quantization_override.as_deref(),
-    )
-    .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
+        let (spec, file_size) =
+            fetch_gguf_spec(&client, &payload.model, &gguf_file, hf_token.as_deref())
+                .await
+                .map_err(|e| {
+                    ProtocolError::not_found(format!(
+                        "Nie udalo sie odczytac metadanych GGUF z {}/{}: {e}",
+                        payload.model, gguf_file
+                    ))
+                })?;
+        (spec, Some(file_size))
+    } else {
+        let config_json = fetch_hf_config(&client, &payload.model, hf_token.as_deref())
+            .await
+            .map_err(|e| {
+                ProtocolError::not_found(format!(
+                    "Nie udalo sie pobrac config.json z HF: {e}. Sprawdz nazwe modelu i ewentualnie HF token (gated repo)."
+                ))
+            })?;
+        let spec = parse_hf_config_with_override(
+            &config_json,
+            &payload.model,
+            payload.quantization_override.as_deref(),
+        )
+        .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
+        (spec, None)
+    };
 
     let gpu_count = payload.gpus.len() as u32;
     let gpu_memory_gb = payload
@@ -3982,6 +4007,7 @@ pub async fn deploy_vllm_recommend(
             lock_max_model_len: lock_ctx,
             lock_max_num_seqs: lock_seqs,
             lock_tensor_parallel: lock_tp,
+            weights_bytes_override: weights_override,
         },
     );
 
@@ -4179,6 +4205,7 @@ pub async fn engine_recommend(
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
+                weights_bytes_override: None,
             };
             let outcome = auto_fit_config(&spec, &req_fit);
             let cfg = outcome.applied;

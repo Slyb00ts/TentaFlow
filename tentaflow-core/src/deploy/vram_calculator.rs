@@ -267,6 +267,10 @@ pub struct VramEstimateInput {
     pub gpu_memory_utilization: f64,
     /// Activation memory overhead jako % weights+kv. Empirycznie 8-15%.
     pub activation_overhead_pct: f64,
+    /// Dokladny rozmiar wag w bajtach. Dla GGUF plik .gguf JEST dokladnym
+    /// skwantyzowanym footprintem wag, wiec nie liczymy ich z params×bytes_per_param.
+    /// `None` = licz z ModelSpec (klasyczne safetensors). `Some` = uzyj wprost.
+    pub weights_bytes_override: Option<u64>,
 }
 
 impl Default for VramEstimateInput {
@@ -281,6 +285,7 @@ impl Default for VramEstimateInput {
             kv_cache_dtype: "auto".to_string(),
             gpu_memory_utilization: 0.9,
             activation_overhead_pct: 10.0,
+            weights_bytes_override: None,
         }
     }
 }
@@ -310,10 +315,13 @@ pub struct VramEstimate {
 pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEstimate {
     let mut warnings: Vec<String> = Vec::new();
 
-    // Weights: pelne parametry (nie active - MoE w vllm ladowane sa wszystkie experty)
-    let total_params = model.estimated_params();
-    let bytes_per_param = model.bytes_per_param();
-    let model_weights_bytes = total_params as f64 * bytes_per_param;
+    // Weights: gdy override podany (GGUF - dokladny rozmiar pliku to footprint wag)
+    // uzywamy go wprost; inaczej pelne parametry × bytes_per_param (safetensors).
+    // MoE: w vllm ladowane sa wszystkie experty, wiec liczymy pelne params.
+    let model_weights_bytes = match input.weights_bytes_override {
+        Some(bytes) => bytes as f64,
+        None => model.estimated_params() as f64 * model.bytes_per_param(),
+    };
     let model_weights_gb = bytes_to_gib(model_weights_bytes);
 
     // KV cache GQA: `num_key_value_heads` (NOT num_attention_heads) decyduje o
@@ -556,11 +564,18 @@ pub fn recommend_parallelism(model: &ModelSpec, gpu_count: u32) -> (u32, u32) {
 /// minimalne KV (1024 ctx × 1 seq) + activations w `gpu_capacity × util`.
 /// Gdy zaden nie pasuje - fallback `recommend_parallelism` (najszerszy podzial
 /// dostepny architektonicznie). Zwraca (TP, PP).
+///
+/// `weights_bytes_override` MUSI byc tym samym dokladnym rozmiarem wag co finalny
+/// estimate (GGUF: rozmiar pliku z `fetch_gguf_spec`). Bez niego probe liczyl wagi
+/// heurystyka params×bytes - niedoszacowanie dla MoE/mixed-quant powodowalo dobor
+/// zbyt waskiego TP/PP, ktory potem realnie raportowal OOM na shardzie. Sciezka
+/// safetensors przekazuje `None` (heurystyka jest tam jedyna dostepna).
 pub fn recommend_parallelism_vram_aware(
     model: &ModelSpec,
     gpu_count: u32,
     gpu_memory_gb_each: f64,
     gpu_memory_utilization: f64,
+    weights_bytes_override: Option<u64>,
 ) -> (u32, u32) {
     if gpu_count <= 1 {
         return (1, 1);
@@ -591,6 +606,7 @@ pub fn recommend_parallelism_vram_aware(
             kv_cache_dtype: "auto".into(),
             gpu_memory_utilization,
             activation_overhead_pct: 10.0,
+            weights_bytes_override,
         };
         let est = estimate_vllm_vram(model, &probe);
         if est.fits_per_gpu {
@@ -622,6 +638,9 @@ pub struct AutoFitRequest {
     pub lock_max_model_len: bool,
     pub lock_max_num_seqs: bool,
     pub lock_tensor_parallel: bool,
+    /// Dokladny rozmiar wag w bajtach (GGUF). Propagowany do `applied`
+    /// VramEstimateInput i uzywany do liczenia budzetu KV (GPU − wagi − activations).
+    pub weights_bytes_override: Option<u64>,
 }
 
 /// Wynik auto-fit. `applied` zawiera realnie uzywane parametry. `auto_adjusted`
@@ -654,6 +673,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
         req.gpu_count,
         req.gpu_memory_gb_each,
         req.gpu_memory_utilization,
+        req.weights_bytes_override,
     );
     let chosen_tp = if req.lock_tensor_parallel {
         req.requested_tensor_parallel.unwrap_or(rec_tp)
@@ -663,8 +683,12 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     let chosen_pp = req.requested_pipeline_parallel.unwrap_or(rec_pp);
     let parallel = (chosen_tp.max(1) * chosen_pp.max(1)) as f64;
 
-    // 2. KV budget per GPU.
-    let weights_gb = bytes_to_gib(model.estimated_params() as f64 * model.bytes_per_param());
+    // 2. KV budget per GPU. Wagi z override (GGUF) lub z params×bytes_per_param.
+    let weights_bytes = match req.weights_bytes_override {
+        Some(bytes) => bytes as f64,
+        None => model.estimated_params() as f64 * model.bytes_per_param(),
+    };
+    let weights_gb = bytes_to_gib(weights_bytes);
     let weights_per_gpu = weights_gb / parallel;
     let activations_per_gpu = 5.0 + weights_per_gpu * 0.10;
     let usable_per_gpu = req.gpu_memory_gb_each * req.gpu_memory_utilization;
@@ -684,6 +708,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
                 kv_cache_dtype: req.kv_cache_dtype.clone(),
                 gpu_memory_utilization: req.gpu_memory_utilization,
                 activation_overhead_pct: 10.0,
+                weights_bytes_override: req.weights_bytes_override,
             },
             auto_adjusted: Vec::new(),
             at_limit: true,
@@ -730,6 +755,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
                         kv_cache_dtype: req.kv_cache_dtype.clone(),
                         gpu_memory_utilization: req.gpu_memory_utilization,
                         activation_overhead_pct: 10.0,
+                        weights_bytes_override: req.weights_bytes_override,
                     },
                     auto_adjusted: Vec::new(),
                     at_limit: true,
@@ -829,6 +855,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             kv_cache_dtype: req.kv_cache_dtype.clone(),
             gpu_memory_utilization: req.gpu_memory_utilization,
             activation_overhead_pct: 10.0,
+            weights_bytes_override: req.weights_bytes_override,
         },
         auto_adjusted,
         at_limit,
@@ -1136,6 +1163,432 @@ pub async fn fetch_hf_config(
     }
     let json: serde_json::Value = resp.json().await.context("HF config JSON parse")?;
     Ok(json)
+}
+
+// =============================================================================
+// Parser naglowka GGUF (v2/v3, little-endian).
+//
+// Repozytoria GGUF nie maja config.json - parametry architektury (block_count,
+// embedding_length, head_count, ...) siedza w naglowku metadanych pliku .gguf.
+// Czytamy tylko poczatek pliku (range request) i parsujemy bloki metadanych KV.
+// Sam plik .gguf JEST dokladnym skwantyzowanym footprintem wag, wiec jego rozmiar
+// (Content-Length) zwracamy osobno jako weights_bytes.
+// =============================================================================
+
+/// Wartosc metadanych GGUF. Trzymamy tylko typy ktorych faktycznie uzywamy
+/// (liczby + string + count tablicy); reszta jest poprawnie pomijana przez kursor.
+#[derive(Debug, Clone)]
+enum GgufValue {
+    U64(u64),
+    String(String),
+    /// Tablica - przechowujemy tylko liczbe elementow (potrzebna dla vocab_size
+    /// liczonego z dlugosci `tokenizer.ggml.tokens`).
+    ArrayLen(u64),
+    /// Tablica, ktorej elementy urwaly sie na granicy bufora. Count jest znany
+    /// (stoi przed elementami), wiec vocab_size dalej da sie odczytac; sygnalizuje
+    /// callerowi ze parsowanie kolejnych KV nie ma sensu (early-stop).
+    ArrayTruncated(u64),
+    /// Wartosc istnieje ale nie mapujemy jej na nic uzytecznego.
+    Other,
+}
+
+/// Sekwencyjny czytnik bajtow naglowka GGUF. Trzyma kursor i sygnalizuje
+/// brak bajtow bledem (caller moze wtedy dociagnac wiekszy zakres).
+struct GgufReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> GgufReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| anyhow!("GGUF: przepelnienie kursora"))?;
+        if end > self.buf.len() {
+            return Err(anyhow!(
+                "GGUF: za malo bajtow (potrzeba {n} przy offset {}, mam {})",
+                self.pos,
+                self.buf.len()
+            ));
+        }
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    /// String GGUF: u64 length + tyle bajtow UTF-8 (lossy gdy niepoprawne).
+    fn string(&mut self) -> Result<String> {
+        let len = self.u64()? as usize;
+        let bytes = self.take(len)?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// Pomija pojedyncza wartosc skalarną danego typu (bez stringa i tablicy).
+    /// Zwraca rozmiar w bajtach dla typow stalej dlugosci.
+    fn scalar_size(value_type: u32) -> Result<usize> {
+        Ok(match value_type {
+            0 | 1 | 7 => 1,  // u8 / i8 / bool
+            2 | 3 => 2,      // u16 / i16
+            4 | 5 | 6 => 4,  // u32 / i32 / f32
+            10 | 11 | 12 => 8, // u64 / i64 / f64
+            other => {
+                return Err(anyhow!(
+                    "GGUF: nieobslugiwany typ skalarny {other} w tablicy"
+                ))
+            }
+        })
+    }
+
+    /// Czyta wartosc dla podanego value_type. MUSI poprawnie przejsc przez KAZDY
+    /// typ (takze tablice i typy ktorych nie uzywamy) inaczej kursor sie rozjedzie.
+    fn read_value(&mut self, value_type: u32) -> Result<GgufValue> {
+        match value_type {
+            0 => Ok(GgufValue::U64(self.u8()? as u64)),
+            1 => Ok(GgufValue::U64(self.u8()? as i8 as i64 as u64)),
+            2 => Ok(GgufValue::U64(self.u16()? as u64)),
+            3 => Ok(GgufValue::U64(self.u16()? as i16 as i64 as u64)),
+            4 => Ok(GgufValue::U64(self.u32()? as u64)),
+            5 => Ok(GgufValue::U64(self.u32()? as i32 as i64 as u64)),
+            6 => {
+                let _ = self.u32()?; // f32 - nie uzywamy
+                Ok(GgufValue::Other)
+            }
+            7 => Ok(GgufValue::U64(self.u8()? as u64)), // bool
+            8 => Ok(GgufValue::String(self.string()?)),
+            9 => {
+                // Tablica: elem_type (u32) + count (u64) + count elementow.
+                // Count odczytujemy ZAWSZE (stoi przed elementami) - dzieki temu
+                // vocab_size z `tokenizer.ggml.tokens` znamy nie pobierajac stringow.
+                // Skip elementow moze sie urwac na granicy bufora; zwracamy wtedy
+                // ArrayTruncated z juz znanym count, a caller decyduje czy
+                // wszystkie wymagane pola juz zebral (early-stop).
+                let elem_type = self.u32()?;
+                let count = self.u64()?;
+                if elem_type == 9 {
+                    return Err(anyhow!("GGUF: zagniezdzona tablica nieobslugiwana"));
+                }
+                for _ in 0..count {
+                    if elem_type == 8 {
+                        // String o zmiennej dlugosci - musimy przeczytac kazdy.
+                        if self.string().is_err() {
+                            return Ok(GgufValue::ArrayTruncated(count));
+                        }
+                    } else {
+                        let sz = Self::scalar_size(elem_type)?;
+                        if self.take(sz).is_err() {
+                            return Ok(GgufValue::ArrayTruncated(count));
+                        }
+                    }
+                }
+                Ok(GgufValue::ArrayLen(count))
+            }
+            10 => Ok(GgufValue::U64(self.u64()?)),
+            11 => Ok(GgufValue::U64(self.u64()? as i64 as u64)),
+            12 => {
+                let _ = self.u64()?; // f64 - nie uzywamy
+                Ok(GgufValue::Other)
+            }
+            other => Err(anyhow!("GGUF: nieznany value_type {other}")),
+        }
+    }
+}
+
+/// Parsuje naglowek GGUF z bufora i buduje `ModelSpec`. Quantization wyprowadzana
+/// jednoznacznie z nazwy pliku (Q4_K_M itd.) - file_type w naglowku bywa
+/// niejednoznaczny przy mixed-quant. Zwraca blad gdy magic/wersja niepoprawne
+/// albo bufor jest za krotki (caller dociaga wiekszy zakres).
+pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
+    let mut r = GgufReader::new(buf);
+
+    let magic = r.take(4)?;
+    if magic != b"GGUF" {
+        return Err(anyhow!(
+            "GGUF: zly magic {:02x?} (oczekiwano 'GGUF')",
+            magic
+        ));
+    }
+    let version = r.u32()?;
+    if version < 2 {
+        return Err(anyhow!(
+            "GGUF: wersja {version} nieobslugiwana (wymagane v2/v3)"
+        ));
+    }
+    // GGUFv2/v3 uzywaja u64 dla obu countow.
+    let _tensor_count = r.u64()?;
+    let kv_count = r.u64()?;
+
+    let get_u64 = |kv: &std::collections::HashMap<String, GgufValue>, key: &str| -> Option<u64> {
+        match kv.get(key) {
+            Some(GgufValue::U64(v)) => Some(*v),
+            _ => None,
+        }
+    };
+    let get_str = |kv: &std::collections::HashMap<String, GgufValue>, key: &str| -> Option<String> {
+        match kv.get(key) {
+            Some(GgufValue::String(s)) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    let get_arr_len =
+        |kv: &std::collections::HashMap<String, GgufValue>, key: &str| -> Option<u64> {
+            match kv.get(key) {
+                Some(GgufValue::ArrayLen(n)) | Some(GgufValue::ArrayTruncated(n)) => Some(*n),
+                _ => None,
+            }
+        };
+
+    // Komplet wymaganych pol: architektura + wszystkie wymiary `{arch}.*` + vocab
+    // (jawny klucz albo dlugosc tablicy tokenizera). Gdy zebrane, wolno przerwac
+    // parsowanie - tablice tokenizera 128k/150k vocab sa za duze by je dociagac.
+    let has_all_required = |kv: &std::collections::HashMap<String, GgufValue>| -> bool {
+        let Some(arch) = get_str(kv, "general.architecture") else {
+            return false;
+        };
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+        get_u64(kv, &key("block_count")).is_some()
+            && get_u64(kv, &key("embedding_length")).is_some()
+            && get_u64(kv, &key("attention.head_count")).is_some()
+            && get_u64(kv, &key("feed_forward_length")).is_some()
+            && get_u64(kv, &key("context_length")).is_some()
+            && (get_u64(kv, &key("vocab_size")).is_some()
+                || get_arr_len(kv, "tokenizer.ggml.tokens").is_some())
+    };
+
+    let mut kv: std::collections::HashMap<String, GgufValue> = std::collections::HashMap::new();
+    for _ in 0..kv_count {
+        // Gdy bufor sie urywa na granicy kolejnego KV, ale komplet wymaganych pol
+        // juz mamy - to early-stop (sukces), nie blad. W przeciwnym razie blad
+        // propaguje sie i caller dociaga wiekszy zakres.
+        let key = match r.string() {
+            Ok(k) => k,
+            Err(e) if has_all_required(&kv) => {
+                let _ = e;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let value_type = match r.u32() {
+            Ok(t) => t,
+            Err(e) if has_all_required(&kv) => {
+                let _ = e;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let value = match r.read_value(value_type) {
+            Ok(v) => v,
+            Err(e) if has_all_required(&kv) => {
+                let _ = e;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let truncated = matches!(value, GgufValue::ArrayTruncated(_));
+        kv.insert(key, value);
+        // Urwana tablica oznacza koniec uzytecznego bufora; jesli komplet pol mamy,
+        // konczymy sukcesem, inaczej zglaszamy brak bajtow do dociagniecia.
+        if truncated {
+            if has_all_required(&kv) {
+                break;
+            }
+            return Err(anyhow!(
+                "GGUF: tablica metadanych urwana przed zebraniem pol architektury"
+            ));
+        }
+    }
+
+    let arch = get_str(&kv, "general.architecture")
+        .ok_or_else(|| anyhow!("GGUF: brak general.architecture"))?;
+
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+
+    let num_hidden_layers = get_u64(&kv, &key("block_count")).unwrap_or(0);
+    let hidden_size = get_u64(&kv, &key("embedding_length")).unwrap_or(0);
+    let num_attention_heads = get_u64(&kv, &key("attention.head_count")).unwrap_or(0);
+    let num_key_value_heads =
+        get_u64(&kv, &key("attention.head_count_kv")).unwrap_or(num_attention_heads);
+    let intermediate_size = get_u64(&kv, &key("feed_forward_length")).unwrap_or(0);
+    let max_position_embeddings = get_u64(&kv, &key("context_length")).unwrap_or(0);
+
+    let head_dim = get_u64(&kv, &key("attention.key_length")).unwrap_or_else(|| {
+        if num_attention_heads > 0 {
+            hidden_size / num_attention_heads
+        } else {
+            0
+        }
+    });
+
+    // vocab_size: jawny klucz, inaczej dlugosc tablicy tokenizer.ggml.tokens.
+    let vocab_size = get_u64(&kv, &key("vocab_size"))
+        .or_else(|| get_arr_len(&kv, "tokenizer.ggml.tokens"))
+        .unwrap_or(0);
+
+    // Quantization z nazwy pliku (jednoznaczna). Fallback: bf16 gdy nazwa milczy.
+    let quant_label = detect_quant_from_name(gguf_file);
+    let dtype = quant_label.clone().unwrap_or_else(|| "bfloat16".to_string());
+
+    Ok(ModelSpec {
+        model_type: arch,
+        architectures: Vec::new(),
+        dtype,
+        hidden_size,
+        num_attention_heads,
+        num_key_value_heads,
+        num_hidden_layers,
+        vocab_size,
+        head_dim,
+        intermediate_size,
+        max_position_embeddings,
+        has_vision: false,
+        has_audio: false,
+        num_parameters: 0,
+        num_active_parameters: 0,
+        quantization: quant_label,
+    })
+}
+
+/// Pobiera rozmiar pliku (Content-Length) przez HEAD. HF zwraca 302 do CDN,
+/// reqwest podaza za redirectem i Content-Length przychodzi z finalnej odpowiedzi.
+/// Gdy HEAD nie da dlugosci, robi GET z Range: bytes=0-0 i czyta Content-Range.
+async fn fetch_gguf_size(
+    client: &reqwest::Client,
+    url: &str,
+    hf_token: Option<&str>,
+) -> Result<u64> {
+    let mut head = client.head(url);
+    if let Some(t) = hf_token {
+        if !t.is_empty() {
+            head = head.bearer_auth(t);
+        }
+    }
+    let resp = head.send().await.with_context(|| format!("HEAD {url}"))?;
+    if resp.status().is_success() {
+        if let Some(len) = resp.content_length() {
+            if len > 0 {
+                return Ok(len);
+            }
+        }
+    }
+
+    // Fallback: Range bytes=0-0 -> naglowek Content-Range: "bytes 0-0/TOTAL".
+    let mut probe = client.get(url).header("Range", "bytes=0-0");
+    if let Some(t) = hf_token {
+        if !t.is_empty() {
+            probe = probe.bearer_auth(t);
+        }
+    }
+    let resp = probe
+        .send()
+        .await
+        .with_context(|| format!("GET range {url}"))?;
+    if let Some(cr) = resp.headers().get("content-range") {
+        let cr = cr.to_str().unwrap_or("");
+        if let Some((_, total)) = cr.rsplit_once('/') {
+            if let Ok(n) = total.trim().parse::<u64>() {
+                if n > 0 {
+                    return Ok(n);
+                }
+            }
+        }
+    }
+    Err(anyhow!(
+        "Nie udalo sie ustalic rozmiaru pliku GGUF (brak Content-Length / Content-Range): {url}"
+    ))
+}
+
+/// Pobiera zakres bajtow z poczatku pliku (Range request) dla naglowka GGUF.
+async fn fetch_gguf_range(
+    client: &reqwest::Client,
+    url: &str,
+    end_inclusive: u64,
+    hf_token: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut req = client
+        .get(url)
+        .header("Range", format!("bytes=0-{end_inclusive}"));
+    if let Some(t) = hf_token {
+        if !t.is_empty() {
+            req = req.bearer_auth(t);
+        }
+    }
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("GET range header {url}"))?;
+    if !resp.status().is_success() && resp.status().as_u16() != 206 {
+        return Err(anyhow!(
+            "GGUF range fetch status={} dla {url}",
+            resp.status()
+        ));
+    }
+    let bytes = resp.bytes().await.context("GGUF range body read")?;
+    Ok(bytes.to_vec())
+}
+
+/// Czyta metadane modelu GGUF z repo HF. Zwraca `ModelSpec` (architektura z
+/// naglowka) oraz rozmiar pliku w bajtach (dokladny footprint wag dla VRAM).
+///
+/// 1. HEAD/Range -> rozmiar pliku.
+/// 2. Range-fetch poczatku pliku (1 MiB; gdy pola architektury leza dalej niz
+///    1 MiB - dociaga do 8 MiB) i parsuje naglowek.
+///
+/// Parser ma early-stop: gdy zbierze komplet pol `{arch}.*` + vocab, konczy
+/// sukcesem nawet jesli bufor urywa sie w srodku duzej tablicy tokenizera
+/// (modele 128k/150k vocab - Qwen, Llama3). Dlatego nie potrzebujemy dociagac
+/// calej sekcji tokenizera (czesto >8 MiB) - 8 MiB wystarcza na same wymiary.
+pub async fn fetch_gguf_spec(
+    client: &reqwest::Client,
+    repo: &str,
+    gguf_file: &str,
+    hf_token: Option<&str>,
+) -> Result<(ModelSpec, u64)> {
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{gguf_file}");
+
+    let file_size = fetch_gguf_size(client, &url, hf_token).await?;
+
+    // Probuj 1 MiB; przy braku bajtow na tablice tokenizera dociagnij 8 MiB.
+    const CHUNK_1MIB: u64 = 1024 * 1024 - 1;
+    const CHUNK_8MIB: u64 = 8 * 1024 * 1024 - 1;
+    let first = fetch_gguf_range(client, &url, CHUNK_1MIB.min(file_size.saturating_sub(1)), hf_token)
+        .await?;
+    let spec = match parse_gguf_header(&first, gguf_file) {
+        Ok(spec) => spec,
+        Err(_) if file_size > CHUNK_1MIB + 1 => {
+            let bigger =
+                fetch_gguf_range(client, &url, CHUNK_8MIB.min(file_size.saturating_sub(1)), hf_token)
+                    .await?;
+            parse_gguf_header(&bigger, gguf_file)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    Ok((spec, file_size))
 }
 
 #[inline]
@@ -1477,6 +1930,7 @@ mod tests {
             lock_max_model_len: false,
             lock_max_num_seqs: false,
             lock_tensor_parallel: false,
+            weights_bytes_override: None,
         };
         let fit = auto_fit_config(&m, &req);
         assert!(fit.error.is_none(), "Powinno fits: {:?}", fit.error);
@@ -1528,6 +1982,7 @@ mod tests {
                 lock_max_model_len: true,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
+                weights_bytes_override: None,
             },
         );
         assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
@@ -1557,6 +2012,7 @@ mod tests {
                 lock_max_model_len: true,
                 lock_max_num_seqs: true,
                 lock_tensor_parallel: false,
+                weights_bytes_override: None,
             },
         );
         assert!(fit.error.is_some(), "Oba locked + overflow musi dac error");
@@ -1586,6 +2042,7 @@ mod tests {
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
+                weights_bytes_override: None,
             },
         );
         if fit.error.is_none() {
@@ -1614,6 +2071,7 @@ mod tests {
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
+                weights_bytes_override: None,
             },
         );
         assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
@@ -1660,6 +2118,7 @@ mod tests {
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
+                weights_bytes_override: None,
             },
         );
         assert!(fit.error.is_none(), "Powinno fits: {:?}", fit.error);
@@ -1844,6 +2303,7 @@ mod tests {
             kv_cache_dtype: "auto".into(),
             gpu_memory_utilization: 0.9,
             activation_overhead_pct: 10.0,
+            weights_bytes_override: None,
         };
         let est = estimate_vllm_vram(&m, &input);
         // Wagi powinny byc ~16-18 GB (vs 56.9 GB w bf16).
@@ -1880,6 +2340,7 @@ mod tests {
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
+                weights_bytes_override: None,
             },
         );
         assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
@@ -1895,5 +2356,203 @@ mod tests {
             fit.applied.max_model_len
         );
         assert!(fit.applied.max_model_len <= m.max_position_embeddings);
+    }
+
+    // --- Pomocniki budujace syntetyczny naglowek GGUF (v3, little-endian) ---
+
+    fn gguf_push_string(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    fn gguf_kv_u32(buf: &mut Vec<u8>, key: &str, val: u32) {
+        gguf_push_string(buf, key);
+        buf.extend_from_slice(&4u32.to_le_bytes()); // value_type 4 = u32
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+
+    fn gguf_kv_string(buf: &mut Vec<u8>, key: &str, val: &str) {
+        gguf_push_string(buf, key);
+        buf.extend_from_slice(&8u32.to_le_bytes()); // value_type 8 = string
+        gguf_push_string(buf, val);
+    }
+
+    /// Tablica stringow (value_type 9, elem_type 8) - test poprawnego przejscia.
+    fn gguf_kv_string_array(buf: &mut Vec<u8>, key: &str, items: &[&str]) {
+        gguf_push_string(buf, key);
+        buf.extend_from_slice(&9u32.to_le_bytes()); // value_type 9 = array
+        buf.extend_from_slice(&8u32.to_le_bytes()); // elem_type 8 = string
+        buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
+        for it in items {
+            gguf_push_string(buf, it);
+        }
+    }
+
+    #[test]
+    fn parse_gguf_header_maps_qwen2_spec() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+                                                    // metadata_kv_count = 8
+        buf.extend_from_slice(&8u64.to_le_bytes());
+
+        gguf_kv_string(&mut buf, "general.architecture", "qwen2");
+        gguf_kv_u32(&mut buf, "qwen2.block_count", 24);
+        gguf_kv_u32(&mut buf, "qwen2.embedding_length", 896);
+        gguf_kv_u32(&mut buf, "qwen2.attention.head_count", 14);
+        gguf_kv_u32(&mut buf, "qwen2.attention.head_count_kv", 2);
+        gguf_kv_u32(&mut buf, "qwen2.context_length", 32768);
+        gguf_kv_u32(&mut buf, "qwen2.feed_forward_length", 4864);
+        // Tablica tokenizera (3 stringi) - vocab_size z dlugosci + test array skip.
+        gguf_kv_string_array(
+            &mut buf,
+            "tokenizer.ggml.tokens",
+            &["<pad>", "hello", "world"],
+        );
+
+        let spec = parse_gguf_header(&buf, "qwen2.5-0.5b-instruct-q4_k_m.gguf")
+            .expect("parser GGUF powinien przejsc");
+
+        assert_eq!(spec.model_type, "qwen2");
+        assert_eq!(spec.num_hidden_layers, 24);
+        assert_eq!(spec.hidden_size, 896);
+        assert_eq!(spec.num_attention_heads, 14);
+        assert_eq!(spec.num_key_value_heads, 2);
+        assert_eq!(spec.max_position_embeddings, 32768);
+        assert_eq!(spec.intermediate_size, 4864);
+        // head_dim wyliczone: 896 / 14 = 64.
+        assert_eq!(spec.head_dim, 64);
+        // vocab_size z dlugosci tablicy tokenow = 3 (poprawne przejscie array).
+        assert_eq!(spec.vocab_size, 3);
+        // Quantization z nazwy pliku Q4_K_M -> int4.
+        assert_eq!(spec.quantization.as_deref(), Some("int4"));
+    }
+
+    #[test]
+    fn parse_gguf_header_rejects_bad_magic() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"XXXX");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        assert!(parse_gguf_header(&buf, "x.gguf").is_err());
+    }
+
+    #[test]
+    fn parse_gguf_header_rejects_v1() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // v1 martwy - odrzuc
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        assert!(parse_gguf_header(&buf, "x.gguf").is_err());
+    }
+
+    #[test]
+    fn parse_gguf_header_early_stops_on_truncated_tokenizer_array() {
+        // Symuluje model 128k+ vocab: tablica tokenizera urywa sie w polowie
+        // (bufor 1/8 MiB konczy sie przed jej koncem), ale wszystkie pola
+        // architektury + count tablicy juz przeczytane. Early-stop musi zwrocic
+        // poprawny ModelSpec z vocab_size = zadeklarowany count, NIE blad.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&8u64.to_le_bytes()); // metadata_kv_count = 8
+
+        gguf_kv_string(&mut buf, "general.architecture", "qwen2");
+        gguf_kv_u32(&mut buf, "qwen2.block_count", 24);
+        gguf_kv_u32(&mut buf, "qwen2.embedding_length", 896);
+        gguf_kv_u32(&mut buf, "qwen2.attention.head_count", 14);
+        gguf_kv_u32(&mut buf, "qwen2.attention.head_count_kv", 2);
+        gguf_kv_u32(&mut buf, "qwen2.context_length", 32768);
+        gguf_kv_u32(&mut buf, "qwen2.feed_forward_length", 4864);
+
+        // Tablica tokenizera: deklaruje 150000 elementow, ale dostarczamy tylko 2
+        // stringi a potem bufor sie urywa - tak jak przy capie 8 MiB na realnym modelu.
+        gguf_push_string(&mut buf, "tokenizer.ggml.tokens");
+        buf.extend_from_slice(&9u32.to_le_bytes()); // value_type 9 = array
+        buf.extend_from_slice(&8u32.to_le_bytes()); // elem_type 8 = string
+        buf.extend_from_slice(&150_000u64.to_le_bytes()); // zadeklarowany vocab
+        gguf_push_string(&mut buf, "<pad>");
+        gguf_push_string(&mut buf, "hello");
+        // ... reszta tablicy "ucieta" - bufor konczy sie tutaj.
+
+        let spec = parse_gguf_header(&buf, "qwen2.5-0.5b-instruct-q4_k_m.gguf")
+            .expect("early-stop powinien zwrocic ModelSpec mimo urwanej tablicy");
+
+        assert_eq!(spec.model_type, "qwen2");
+        assert_eq!(spec.num_hidden_layers, 24);
+        assert_eq!(spec.hidden_size, 896);
+        assert_eq!(spec.num_attention_heads, 14);
+        assert_eq!(spec.num_key_value_heads, 2);
+        assert_eq!(spec.intermediate_size, 4864);
+        assert_eq!(spec.max_position_embeddings, 32768);
+        // vocab_size z zadeklarowanego count tablicy (odczytany PRZED elementami).
+        assert_eq!(spec.vocab_size, 150_000);
+    }
+
+    #[test]
+    fn parse_gguf_header_truncated_array_before_fields_is_error() {
+        // Tablica urywa sie ZANIM zebralismy komplet pol architektury - to musi
+        // byc blad (caller dociaga wiekszy zakres), a NIE cichy ModelSpec z zerami.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&5u64.to_le_bytes()); // metadata_kv_count = 5
+
+        gguf_kv_string(&mut buf, "general.architecture", "qwen2");
+        gguf_kv_u32(&mut buf, "qwen2.block_count", 24);
+        // Brak embedding_length/head_count/feed_forward_length/context_length.
+
+        // Duza tablica urywa sie - wymagane pola NIE sa kompletne.
+        gguf_push_string(&mut buf, "tokenizer.ggml.tokens");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&150_000u64.to_le_bytes());
+        gguf_push_string(&mut buf, "<pad>");
+        // bufor urwany.
+
+        let err = parse_gguf_header(&buf, "x-q4_k_m.gguf")
+            .expect_err("urwana tablica przed kompletem pol musi byc bledem");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("urwana") || msg.contains("za malo"),
+            "blad powinien jasno wskazywac na brak bajtow: {msg}"
+        );
+    }
+
+    #[test]
+    fn gguf_quant_from_filename_is_4bit() {
+        // Q4_K_M w nazwie pliku -> etykieta int4 -> ~4-bit footprint per param.
+        let label = detect_quant_from_name("qwen2.5-0.5b-instruct-q4_k_m.gguf")
+            .expect("Q4_K_M powinno dac etykiete");
+        assert_eq!(label, "int4");
+        let bytes = quant_label_to_bytes(&label).expect("int4 ma znana szerokosc");
+        assert!(
+            (0.5..=0.6).contains(&bytes),
+            "int4 powinno byc ~4-bit (0.5-0.5625 B/param), got {bytes}"
+        );
+    }
+
+    #[test]
+    fn weights_override_drives_estimate_weights() {
+        // Override wag (GGUF) musi nadpisac model_weights_gb niezaleznie od params.
+        let m = qwen_05b();
+        let exact_bytes: u64 = 491_000_000; // ~0.49 GB skwantyzowanych wag
+        let input = VramEstimateInput {
+            gpu_count: 1,
+            gpu_memory_gb_each: 24.0,
+            weights_bytes_override: Some(exact_bytes),
+            ..Default::default()
+        };
+        let est = estimate_vllm_vram(&m, &input);
+        let expected_gb = exact_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        assert!(
+            (est.model_weights_gb - expected_gb).abs() < 0.001,
+            "model_weights_gb {} powinno = override {}",
+            est.model_weights_gb,
+            expected_gb
+        );
     }
 }
