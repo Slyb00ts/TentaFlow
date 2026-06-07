@@ -325,6 +325,9 @@ function Install-Base {
     # Git
     Winget-Install -Id 'Git.Git' -Label 'Git' | Out-Null
 
+    # Git LFS — natywne biblioteki w native-libs/ sa wersjonowane przez LFS.
+    Winget-Install -Id 'GitHub.GitLFS' -Label 'Git LFS' | Out-Null
+
     # pkg-config-lite — pkgconf.pkgconf nie ma Windows installera w winget,
     # bloodrock.pkg-config-lite tak (wersja 0.28 bez zaleznosci glib).
     Winget-Install -Id 'bloodrock.pkg-config-lite' -Label 'pkg-config-lite' | Out-Null
@@ -342,6 +345,26 @@ function Install-Base {
 
     Refresh-Path
     Log-Ok "Bazowe narzedzia zainstalowane"
+}
+
+function Install-GitLfs {
+    Log-Section "Git LFS"
+
+    Refresh-Path
+    if (-not (Test-Command 'git')) {
+        Log-Error "git nie jest dostepny — Git LFS wymaga Git."
+        exit 1
+    }
+
+    $version = Invoke-NativeCapture { git lfs version } | Select-Object -First 1
+    if ($LASTEXITCODE -ne 0 -or -not $version) {
+        Log-Error "Git LFS nie jest dostepny mimo instalacji. Otworz nowy PowerShell albo zainstaluj GitHub.GitLFS recznie."
+        exit 1
+    }
+
+    Invoke-NativeCapture { git lfs install } | Out-Host
+    Log-Ok "Git LFS: $version"
+    $script:Installed += 'git lfs install'
 }
 
 function Configure-CmakeGenerator {
@@ -868,6 +891,15 @@ function Verify-Installation {
     Check-Tool 'ninja'      'ninja'      { & ninja --version }
     Check-Tool 'protoc'     'protoc'     { & protoc --version }     -Required
     Check-Tool 'git'        'git'        { & git --version }        -Required
+    if (Test-Command 'git') {
+        $gitLfsVersion = Invoke-NativeCapture { git lfs version } | Select-Object -First 1
+        if ($LASTEXITCODE -eq 0 -and $gitLfsVersion) {
+            Log-Ok "git-lfs: $gitLfsVersion"
+        } else {
+            Log-Error "git-lfs: NIE ZNALEZIONO"
+            $ok = $false
+        }
+    }
     Check-Tool 'wasm-bindgen' 'wasm-bindgen' { & wasm-bindgen --version }
 
     # zvec — binarka tentaflow zawsze wlacza feature `vector`, wiec natywna
@@ -1003,6 +1035,7 @@ function Main {
     Get-SileroVad
 
     Install-Base
+    Install-GitLfs
     Install-Zvec
     Install-Rust
     Install-WasmTargets

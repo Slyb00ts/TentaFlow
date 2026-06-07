@@ -122,7 +122,11 @@ fn hf_list_files(client: &reqwest::blocking::Client, repo: &str) -> Result<Vec<S
         .and_then(|s| s.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|s| s.get("rfilename").and_then(|v| v.as_str()).map(String::from))
+                .filter_map(|s| {
+                    s.get("rfilename")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -150,8 +154,7 @@ fn hf_download_file(
         .with_context(|| format!("download {rfilename}"))?;
     let mut file =
         std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
-    std::io::copy(&mut resp, &mut file)
-        .with_context(|| format!("write {}", dest.display()))?;
+    std::io::copy(&mut resp, &mut file).with_context(|| format!("write {}", dest.display()))?;
     Ok(())
 }
 

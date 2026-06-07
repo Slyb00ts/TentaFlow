@@ -199,6 +199,118 @@ protocol uses `MessageBody::ComplianceAdminBody` + `tentaflow-protocol/src/compl
 (CBOR carries category/retention/AI-event summaries, never prompt/response bodies). Admin
 access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write`.
 
+## Native Libraries
+
+- `scripts/native-libs/build-all.sh` (Linux/macOS) i `scripts/native-libs/build-all.ps1`
+  (Windows) wykrywają platformę i budują natywne zależności do `native-libs/<platform>/`.
+- Źródła pobierane przez skrypty trafiają poza repo do `TENTAFLOW_NATIVE_CACHE`
+  (domyślnie `/tmp/tentaflow-native-libs`), więc repo przechowuje tylko skrypty,
+  manifesty i świadomie dodane artefakty.
+- Układ platformy: `include/`, `lib-static/`, `lib-dynamic/`, `manifest.toml`.
+  Biblioteki statyczne są preferowane, a dynamiczne są kopiowane przez `tentaflow/build.rs`
+  obok budowanej binarki z `native-libs/<platform>/lib-dynamic`.
+- Aktualizacja źródeł: uruchom `build-all.sh --update` albo `build-all.ps1 -Update`.
+- `build-llama-cpp.sh` domyślnie buduje **pinowany commit** `LLAMA_CPP_REF=6b80c74f`
+  (świeży master z 2026-06-06 — Qwen3.6 MTP/NextN wymaga nowego `llama.cpp`), żeby
+  wszyscy mieli identyczną wersję jako prebuilt w `native-libs`. Świeży master:
+  `LLAMA_CPP_REF=origin/master`. Stare vendored źródła: `LLAMA_CPP_REF=vendored`
+  (drzewo `vendor/crates/*/llama.cpp/` NIE jest w repo — patrz `.gitignore`).
+- Prebuilt biblioteki statyczne są wersjonowane w repo przez **Git LFS** (`.gitattributes`:
+  `native-libs/**/*.a|*.so|*.dylib|…`). Idea: jedna osoba buduje (kontrola wersji),
+  reszta klonuje gotowe artefakty → szybki build. `.gitignore` odsłania artefakty
+  (`!native-libs/**/*.a`), ignoruje `native-libs/**/{cache,build}/`. Wariant wybiera
+  `LLAMA_CPP_NATIVE_VARIANT` (domyślnie `multi` = cuda+rocm+vulkan+cpu w jednym; linkowanie
+  `multi` wymaga obecności WSZYSTKICH trzech runtime'ów — pod różne GPU buduj warianty
+  jednobackendowe przez `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm`).
+- `build-llama-cpp.sh` aplikuje lokalne patche z `scripts/native-libs/patches/llama-cpp/`.
+  Obecny patch usuwa `SIGABRT` w auto-detekcji fused Gated Delta Net dla Qwen3.6/MTP
+  na CUDA: nieznana nazwa tensora wyłącza fused GDN i loguje warning zamiast ubijać proces.
+- `tentaflow-wrappers/` centralizuje własne wrappery dla `llama.cpp`, `whisper.cpp`
+  i kolejnych silników. Ten crate definiuje kontrakt konfiguracji oraz mapowanie
+  artefaktów z `native-libs`, żeby stopniowo odchodzić od high-level bindingów
+  blokujących nowe funkcje upstreamu, m.in. `mtp` i `ngram-simple` w `llama.cpp`.
+- `tentaflow-wrappers/examples/llama_smoke.rs` służy do szybkiego testu GGUF:
+  `--metadata-only` czyta metadane bez ładowania wag i wykrywa MTP po
+  `*.nextn_predict_layers`; bez tej flagi ładuje model PRZEZ SILNIK (`LlamaEngine`,
+  jedyna ścieżka generacji) i sprawdza streaming pojedynczego requestu. MTP bez
+  głowy nextn degraduje do `Off` już z nagłówka GGUF (`mtp_layers==0`).
+- `tentaflow-wrappers/src/llama_engine.rs` to silnik continuous batching nad
+  llama.cpp (jeden model, jeden ctx, wiele slotów sekwencji, anty-hang per-slot).
+  `SpeculativeMode` ma trzy tryby: `Off`, `NgramSimple` (drafter ngram bez modelu
+  draftującego) i `Mtp { n_max }` (self-speculative przez głowę MTP/NextN W TYM
+  SAMYM modelu — zero duplikacji wag). Dla MTP scheduler tworzy drugi kontekst
+  `ctx_dft` na tym samym modelu (`ctx_type=LLAMA_CONTEXT_TYPE_MTP`, `n_rs_seq=0`)
+  i wpina go do shimu `common_speculative`. Pętla MTP: `llama_decode(ctx_tgt)` →
+  `common_speculative_process` (mirror nextn embd target→draft) → sample + verify
+  jak ngram. Kluczowe rollbacki KV ctx_dft: do `base_pos` po `draft()` (kasuje
+  autoregresyjne pre-advancement draftera) oraz do nowej wolnej pozycji po
+  akceptacji (lustrza rollback ctx_tgt) — bez nich M-RoPE ctx_dft odrzuca batch.
+  Oba konteksty i uchwyt speculative żyją wyłącznie w wątku schedulera. Pomiar:
+  MTP daje realne przyspieszenie tylko gdy GPU nie jest wysycone (pojedynczy /
+  rzadki strumień ~1.8x na Qwen3.6-27B Q4_K_S, RTX 4090); przy 4 równoległych
+  sekwencjach narzut draftu przewyższa zysk.
+- `tentaflow-wrappers/examples/llama_engine_smoke.rs` testuje silnik:
+  `--speculative off|ngram|mtp`, realny licznik tokenów (pole
+  `StreamToken.generated_tokens` na tokenie finalnym), per-request tok/s oraz
+  dowód anty-hangu przy `--slow-consumer` (porównanie 1. fali requestów).
+  Scenariusze regresji anty-hang (CR-001): `--drop-mid` (konsument porzuca
+  Receiver w połowie → slot zwolniony, `LlamaEngine::inflight()` wraca do 0),
+  `--silent-consumer` (konsument żywy ale niemy → po `stream_stall_timeout`,
+  w teście 3s, slot zwolniony z Error, inne sloty działają), `--queue-overflow`
+  (12 req na 4 sloty → wszystkie kolejkują i kończą, inflight=0, brak wycieku).
+- `inference/llamacpp.rs` (`LlamaCppEngine`) wpina `LlamaEngine` jako backend
+  `InferenceEngine` w core. Silnik trzymany jest w `RwLock<Option<Arc<LlamaEngine>>>`;
+  `generate`/`generate_stream` biorą KRÓTKI read-lock, klonują `Arc` i zwalniają lock
+  PRZED `submit` — żaden lock nie jest trzymany podczas generacji (anty-hang). Most
+  stream→tokio nie tworzy wątku-per-request: `LlamaEngine::submit_with_sink` przyjmuje
+  `Box<dyn EngineSink>`, a scheduler woła `sink.try_send` wprost ze swojego wątku.
+  Core dostarcza `StreamSink`/`CollectSink` owijające `tokio::mpsc::Sender`
+  (`try_send` → `SinkStatus::{Delivered|Full|Closed}`), więc setki równoległych
+  requestów dzielą jeden wątek-scheduler bez globalnego locka i bez kanału std mpsc
+  per slot. `tentaflow-wrappers` pozostaje BEZ zależności od tokio (sink jest
+  generyczny). Anty-hang per-slot zachowany: `Full` odkłada token do `pending`
+  slotu, terminalny token też idzie przez `pending` (deferred finish — `release_slot`
+  zwalnia slot dopiero po opróżnieniu ogona, zero blokującego `send`). CR-001:
+  `EngineConfig.stream_stall_timeout` (z deploy `stream_stall_timeout_secs`,
+  domyślnie 60s) wymusza deadline POSTĘPU dostarczania — slot z niepustym `pending`,
+  który od progu nie zmniejszył `pending` (konsument „żywy ale niemy", nigdy nie
+  czyta i nie rozłącza się), jest siłą zwalniany z `FinishReason::Error`, więc po
+  wyczerpaniu `queue_capacity` silnik nie odmawia w nieskończoność (cichy hang
+  admission). CR-003: rdzeniowy `StreamToken` niesie `finish_reason: Option<StopReason>`
+  + `error: Option<String>` na finale; `StreamSink` przekłada `FinishReason::Error`
+  silnika na `error` (+`warn!`), a `stream_tokens_to_chunks` mapuje realny
+  finish_reason (`length`/`stop`/`error`) zamiast twardego "stop". CR-004:
+  `generate` liczy `tokens_per_second` od pierwszego tokena (TTFT) i raportuje
+  realne `prompt_tokens` (pole `StreamToken.prompt_tokens` z silnika, nie 0).
+  Deploy params → `EngineConfig`: `n_seq_max` z `n_parallel`/`max_concurrency`
+  (domyślnie 8), `ctx_per_seq`=ctx_size, `n_batch`=batch_size, reszta z load-configu;
+  speculative z `speculative_method`/`num_speculative_tokens`/`size_ngram`/`size_mgram`
+  → `SpeculativeMode` (silnik sam ustawia `n_rs_seq` i odrzuca MTP bez głowy nextn).
+- Embeddingi: silnik jest generation-only, więc `LlamaCppEngine::embeddings` używa
+  ODRĘBNEJ, leniwie tworzonej ścieżki `LlamaRuntime` (kontekst `embeddings=true`)
+  obok silnika generacji — zero regresji. Pełna unifikacja (embeddingi w silniku)
+  jest świadomie odłożona. `LlamaRuntime` jest TYLKO ścieżką embeddingów: w Fazie 4
+  usunięto z niego martwą generację (`generate`/`generate_streaming`/`generate_inner`
+  + ręczny speculative `draft_tokens`/`verify_draft`/`rollback_memory`/
+  `ngram_simple_draft` oraz martwe typy `LlamaGenerateConfig`/`LlamaGenerateOutput`/
+  `LlamaStopReason`). Zostają `load`/`metadata`/`embeddings`/`tokenize`/`context`
+  oraz współdzielone z silnikiem `build_sampler_chain`/`is_eog_with_model`/
+  `token_to_piece_with_model`/`check_stop_sequence`. `SpeculativeConfig` zostaje
+  (parsuje deploy params w `inference/llamacpp.rs`). Integracyjny test core
+  `tentaflow-core/tests/llamacpp_engine_e2e.rs` (`#[ignore]`, env
+  `TENTAFLOW_LLAMA_TEST_MODEL`) ładuje GGUF i sprawdza generate/stream + unload.
+- `tentaflow-wrappers/examples/whisper_smoke.rs` ładuje model whisper.cpp przez
+  nasz wrapper i wykonuje krótką transkrypcję ciszy, żeby sprawdzić runtime bez
+  uruchamiania całego API.
+- `inference-whisper` nie jest częścią domyślnego ani `gpu-*` buildu `tentaflow`.
+  Statyczne `llama.cpp` i `whisper.cpp` mają kolidujące symbole `ggml/ggml-cuda`;
+  linkowanie obu do jednej binarki może mieszać implementacje CUDA i kończyć się
+  `SIGABRT` podczas inferencji LLM. Whisper włączaj jawnie tylko do testów albo
+  wydziel jako osobny proces/dylib z odizolowanymi symbolami.
+- Deploy `llama.cpp` z HuggingFace GGUF musi wskazywać pojedynczy plik `.gguf`
+  (`config_json.model_file`) albo preset z `quantization`; downloader nie powinien
+  pobierać wszystkich kwantyzacji z repozytorium.
+
 ## Conventions
 
 - Code comments, variable/function names, commit messages: **English**. Commit format:

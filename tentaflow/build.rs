@@ -13,41 +13,11 @@ use std::process::Command;
 
 fn main() {
     set_linux_rpath();
+    copy_native_dynamic_libs();
     copy_versioned_shared_libs_linux();
-    copy_zvec_dll_windows();
     build_mlx_bridge();
     build_kokoro_bridge();
     build_meeting_bot();
-}
-
-// Windows nie ma rpath — `tentaflow.exe` znajduje `zvec_c_api.dll` tylko w PATH
-// albo obok siebie. Kopiujemy zwendorowany dll z tentaflow-zvec-sys do
-// target/<profile>/ (tam laduje binarka), zeby `cargo run` i spakowany build
-// dzialaly bez recznego ustawiania PATH. No-op poza Windowsem i gdy dll jeszcze
-// nie zwendorowany (build.rs zvec-sys i tak failuje glosno na brak importu .lib).
-fn copy_zvec_dll_windows() {
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os != "windows" {
-        return;
-    }
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let platform = match arch.as_str() {
-        "x86_64" => "windows-x86_64",
-        _ => return,
-    };
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let dll_src = manifest
-        .join("../tentaflow-zvec-sys/vendor/lib")
-        .join(platform)
-        .join("zvec_c_api.dll");
-    println!("cargo:rerun-if-changed={}", dll_src.display());
-    if !dll_src.exists() {
-        return;
-    }
-    let dll_dest = cargo_target_dir().join("zvec_c_api.dll");
-    if let Err(e) = std::fs::copy(&dll_src, &dll_dest) {
-        println!("cargo:warning=tentaflow: copy zvec_c_api.dll nieudane: {}", e);
-    }
 }
 
 // ----- Linux linker flags ----------------------------------------------------
@@ -57,38 +27,29 @@ fn copy_zvec_dll_windows() {
 //    (/usr/lib, LD_LIBRARY_PATH) i pada z "error while loading shared
 //    libraries". Rpath $ORIGIN mowi linkerowi: szukaj obok exe. macOS uzywa
 //    @loader_path (ustawione w build_mlx_bridge).
-// 2. --allow-multiple-definition: whisper-rs (whisper-rs-sys) i llama-cpp-2
-//    (llama-cpp-sys-2) OBIE staty­cznie linkuja wlasna kopie ggml-quants.c
-//    (whisper.cpp i llama.cpp uzywaja tego samego ggml runtime'u). Linker
-//    GNU ld widzi te same symbole `quantize_*`, `ggml_validate_row_data` itd.
-//    w obu rlibach i wykrzykuje "multiple definition". Funkcje sa bit-by-bit
-//    identyczne (te same tagi wersji ggml), wiec --allow-multiple-definition
-//    ka linkerowi wybrac pierwsza i ignorowac kolejne. Komentarz w
-//    tentaflow-core/Cargo.toml:11-14 ostrzegal o tym konflikcie — alternatywa
-//    bylaby wykluczenie inference-whisper przy gpu-cuda/vulkan/rocm, ale
-//    user moze potrzebowac obu jednoczesnie (LLM + STT lokalnie).
+// 2. --allow-multiple-definition: whisper.cpp i llama.cpp moga statycznie
+//    linkowac wlasna kopie ggml-quants.c. Linker GNU ld widzi wtedy te same
+//    symbole `quantize_*`, `ggml_validate_row_data` itd. w obu rlibach.
+//    Funkcje pochodza z tego samego runtime'u ggml, wiec linker moze wybrac
+//    pierwsza definicje i ignorowac kolejne.
 fn set_linux_rpath() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "linux" => {
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
             println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
-            // zvec ships as a shared lib in tentaflow-zvec-sys/vendor/lib/<platform>
-            // (not copied next to the binary). $ORIGIN finds it only in a packaged
-            // layout; for `cargo run` from the repo, add the vendored dir to rpath
-            // by absolute path so the loader resolves libzvec_c_api.so.
-            add_zvec_vendor_rpath();
+            add_native_dynamic_rpath();
         }
         "macos" => {
             // Na macOS dylib zvec ma install name `@rpath/libzvec_c_api.dylib`,
             // wiec binarka potrzebuje absolutnego rpath do zwendorowanego katalogu
             // (analogicznie jak Linux). Rpath @loader_path/target_dir ustawia
             // build_mlx_bridge — tu chodzi tylko o vendor zvec.
-            add_zvec_vendor_rpath();
+            add_native_dynamic_rpath();
         }
         "windows" => {
-            // MSVC odpowiednik --allow-multiple-definition. whisper-rs-sys i
-            // llama-cpp-sys-2 obie linkuja wlasna kopie ggml-quants.c, na
+            // MSVC odpowiednik --allow-multiple-definition. whisper.cpp i
+            // llama.cpp moga linkowac wlasna kopie ggml-quants.c, na
             // Windowsie link.exe pada z LNK2005 dla kazdego quantize_row_*.
             // /FORCE:MULTIPLE kaze wybrac pierwsza definicje i ignorowac
             // kolejne (identyczne bo to ten sam ggml).
@@ -101,39 +62,123 @@ fn set_linux_rpath() {
     }
 }
 
-/// Emit an absolute rpath to the vendored zvec shared lib so `cargo run` from the
-/// repo finds the zvec library (`libzvec_c_api.so` on Linux, `libzvec_c_api.dylib`
-/// on macOS) without `LD_LIBRARY_PATH`. Platform mapping mirrors
-/// `tentaflow-zvec-sys/build.rs`. No-op if the dir is absent (e.g. zvec not
-/// vendored for this target) — the rpath entry is then simply unused.
-fn add_zvec_vendor_rpath() {
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let platform = match (target_os.as_str(), arch.as_str()) {
-        ("linux", "x86_64") => "linux-x86_64",
-        ("linux", "aarch64") => "linux-aarch64",
-        ("macos", "aarch64") => "macos-arm64",
-        _ => return,
+fn add_native_dynamic_rpath() {
+    let platform = match native_platform() {
+        Some(v) => v,
+        None => return,
     };
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let lib_dir = manifest
-        .join("../tentaflow-zvec-sys/vendor/lib")
-        .join(platform);
+        .join("../native-libs")
+        .join(platform)
+        .join("lib-dynamic");
     if let Ok(abs) = lib_dir.canonicalize() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", abs.display());
     }
 }
 
-// llama-cpp-sys-2 build.rs:124 ma glob "*.so" ktory matchuje tylko symlinki bez
-// wersji (libllama.so), ale binarka kompiluje sie z SONAME libllama.so.0 i tego
-// szuka w runtime. Dociagamy wersjonowane pliki sami, dopoki upstream nie
-// naprawi tego globa. Dotyczy buildow z `dynamic-link` (np. gpu-cuda na CUDA 13,
-// gdzie statyczne cublas_static.a nie istnieje).
-//
-// Cargo nie gwarantuje ze llama-cpp-sys-2 cmake build skonczy sie przed naszym
-// build.rs (build skrypty roznych krat moga sie nakladac z ich kompilacjami),
-// wiec pollujemy az versioned libe sie pojawia. `cargo:rerun-if-changed` na
-// out/lib zapewnia ze cargo invaliduje nasz cache gdy llama sie przebuduje.
+// Kopiuje dynamiczne biblioteki przygotowane przez scripts/native-libs/build-all.*
+// obok binarki. Biblioteki z DT_NEEDED muszą istnieć przed startem procesu, więc
+// build.rs jest właściwym miejscem na ten krok dla lokalnych i release buildów.
+fn copy_native_dynamic_libs() {
+    let platform = match native_platform() {
+        Some(v) => v,
+        None => return,
+    };
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let dynamic_dir = manifest
+        .join("../native-libs")
+        .join(platform)
+        .join("lib-dynamic");
+    println!("cargo:rerun-if-changed={}", dynamic_dir.display());
+    if !dynamic_dir.exists() {
+        return;
+    }
+
+    let target_dir = cargo_target_dir();
+    let entries = match std::fs::read_dir(&dynamic_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            println!(
+                "cargo:warning=tentaflow: nie moge odczytac {}: {}",
+                dynamic_dir.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let dest = target_dir.join(entry.file_name());
+        if let Err(e) = copy_runtime_entry(&entry.path(), &dest) {
+            println!(
+                "cargo:warning=tentaflow: copy native runtime {} -> {} nieudane: {}",
+                entry.path().display(),
+                dest.display(),
+                e
+            );
+        }
+    }
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
+    }
+}
+
+fn native_platform() -> Option<String> {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").ok()?;
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").ok()?;
+    let arch = match target_arch.as_str() {
+        "x86_64" => "x86_64",
+        "aarch64" => {
+            if target_os == "linux" {
+                "aarch64"
+            } else {
+                "arm64"
+            }
+        }
+        _ => return None,
+    };
+    let os = match target_os.as_str() {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => return None,
+    };
+    Some(format!("{os}-{arch}"))
+}
+
+fn copy_runtime_entry(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if metadata.is_dir() {
+        let _ = std::fs::remove_dir_all(dst);
+        return copy_dir_recursive(src, dst);
+    }
+    let _ = std::fs::remove_file(dst);
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(src)?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, dst)?;
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let resolved = src.parent().unwrap_or_else(|| std::path::Path::new(".")).join(target);
+            std::fs::copy(resolved, dst)?;
+            return Ok(());
+        }
+    }
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => std::fs::copy(src, dst).map(|_| ()),
+    }
+}
+
+// Starsze buildy llama-cpp-sys-2 mogly zostawic wersjonowane .so w out/lib.
+// Kopiujemy je, jesli juz istnieja, ale nie czekamy na nie: obecny build
+// korzysta z native-libs i nie powinien blokowac sie na dawnym CMake output.
 fn copy_versioned_shared_libs_linux() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "linux" {
@@ -156,33 +201,16 @@ fn copy_versioned_shared_libs_linux() {
     }
     for lib_dir in &lib_dirs {
         println!("cargo:rerun-if-changed={}", lib_dir.display());
-        // Safety net: dorzuc out/lib jako rpath linker arg. Gdy polling
-        // ponizej nie zdazy (cmake build llama+CUDA potrafi trwac 13+ min),
-        // binarka i tak znajdzie versioned .so bezposrednio w build dir.
-        // Sciezka jest absolutna i hash-zalezna, wiec nie nadaje sie do
-        // deploymentu — tylko fallback dla local dev workflow.
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     }
 
-    // Polling do 20 min (cmake llama+CUDA build moze trwac ~13 min na NGC).
-    // Build.rs i tak musi czekac az llama-cpp-sys-2 dostarczy symbole, wiec
-    // ten wait nie blokuje zadnej rownoleglej pracy cargo.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1200);
-    let mut copied = 0usize;
-    loop {
-        copied = 0;
-        for lib_dir in &lib_dirs {
-            copied += copy_versioned_from(lib_dir, &target_dir);
-        }
-        if copied > 0 || std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(5));
-    }
+    let copied = lib_dirs
+        .iter()
+        .map(|lib_dir| copy_versioned_from(lib_dir, &target_dir))
+        .sum::<usize>();
     if copied == 0 {
         println!(
-            "cargo:warning=tentaflow: nie skopiowano versioned .so w 20 min — fallback rpath \
-             na out/lib aktywny, ale binarka przeniesiona w inne miejsce nie zadziala."
+            "cargo:warning=tentaflow: brak versioned llama .so w dawnych out/lib — uzywam native-libs"
         );
     }
 }

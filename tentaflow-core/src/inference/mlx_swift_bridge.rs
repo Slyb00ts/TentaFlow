@@ -169,8 +169,15 @@ extern "C" fn rust_token_callback(
             .to_string()
     };
 
-    // Ignorujemy blad wyslania — moze sie zdarzyc jesli odbiorca zostal porzucony
-    let _ = tx.blocking_send(StreamToken { text, is_final });
+    // Ignorujemy blad wyslania — moze sie zdarzyc jesli odbiorca zostal porzucony.
+    // Swift nie przekazuje powodu zakonczenia w tym callbacku, wiec finish_reason
+    // zostawiamy None (konsument mapuje finalny token bez bledu na EndOfText).
+    let _ = tx.blocking_send(StreamToken {
+        text,
+        is_final,
+        finish_reason: None,
+        error: None,
+    });
 }
 
 // =============================================================================
@@ -437,8 +444,10 @@ impl InferenceEngine for MlxSwiftEngine {
                     format!("[BLAD: Swift MLX zwrocil kod {}]", result)
                 };
                 let _ = tx.blocking_send(StreamToken {
-                    text: msg,
+                    text: String::new(),
                     is_final: true,
+                    finish_reason: None,
+                    error: Some(msg),
                 });
             }
 

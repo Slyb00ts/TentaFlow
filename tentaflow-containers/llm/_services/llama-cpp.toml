@@ -23,6 +23,51 @@ platforms = ["linux", "macos", "windows", "ios", "android"]
 runtime = "embedded"
 feature_flag = "inference-llamacpp"
 
+[[parameter]]
+key = "speculative_method"
+label_pl = "Speculative decoding"
+label_en = "Speculative decoding"
+kind = "enum"
+options = ["off", "mtp", "ngram-simple"]
+default = "off"
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "speculative_method" } ]
+
+[[parameter]]
+key = "flash_attn"
+label_pl = "Flash Attention"
+label_en = "Flash Attention"
+kind = "enum"
+options = ["auto", "off", "on"]
+default = "auto"
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "flash_attn" } ]
+
+[[parameter]]
+key = "num_speculative_tokens"
+label_pl = "Tokeny MTP"
+label_en = "MTP tokens"
+kind = "int"
+default = 4
+range = { min = 1.0, max = 16.0, step = 1.0 }
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "num_speculative_tokens" } ]
+
+[[parameter]]
+key = "size_ngram"
+label_pl = "Ngram lookback"
+label_en = "Ngram lookback"
+kind = "int"
+default = 3
+range = { min = 1.0, max = 16.0, step = 1.0 }
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "size_ngram" } ]
+
+[[parameter]]
+key = "size_mgram"
+label_pl = "Ngram draft"
+label_en = "Ngram draft"
+kind = "int"
+default = 4
+range = { min = 1.0, max = 64.0, step = 1.0 }
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "size_mgram" } ]
+
 [[model_preset]]
 id = "qwen3-5-0-8b-q4"
 display_name = "Qwen 3.5 0.8B Q4_K_M"
