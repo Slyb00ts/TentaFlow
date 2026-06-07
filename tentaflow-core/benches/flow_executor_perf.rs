@@ -106,7 +106,9 @@ fn fanout_json(n: usize) -> String {
     for i in 0..n {
         nodes.push_str(&format!(r#",{{"id":"b{i}","type":"noop","config":{{}}}}"#));
     }
-    nodes.push_str(r#",{"id":"c","type":"combine","config":{}},{"id":"o","type":"output","config":{}}"#);
+    nodes.push_str(
+        r#",{"id":"c","type":"combine","config":{}},{"id":"o","type":"output","config":{}}"#,
+    );
 
     let mut edges = String::new();
     for i in 0..n {
@@ -138,7 +140,8 @@ fn bench(c: &mut Criterion) {
 
     let mut linear = c.benchmark_group("flow_executor/linear");
     for n in SIZES {
-        let compiled = Arc::new(CompiledFlow::from_json(0, &linear_json(n), &reg).expect("compile"));
+        let compiled =
+            Arc::new(CompiledFlow::from_json(0, &linear_json(n), &reg).expect("compile"));
         linear.throughput(Throughput::Elements(n as u64 + 2));
         linear.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
@@ -159,7 +162,8 @@ fn bench(c: &mut Criterion) {
 
     let mut fanout = c.benchmark_group("flow_executor/fanout");
     for n in SIZES {
-        let compiled = Arc::new(CompiledFlow::from_json(0, &fanout_json(n), &reg).expect("compile"));
+        let compiled =
+            Arc::new(CompiledFlow::from_json(0, &fanout_json(n), &reg).expect("compile"));
         fanout.throughput(Throughput::Elements(n as u64 + 3));
         fanout.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {

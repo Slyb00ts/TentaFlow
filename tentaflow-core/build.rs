@@ -81,11 +81,20 @@ fn main() {
                     println!("cargo:rerun-if-changed={}", src_entry.display());
                 }
             }
-            println!("cargo:rerun-if-changed={}", addon_dir.join("Cargo.toml").display());
-            println!("cargo:rerun-if-changed={}", addon_dir.join("manifest.toml").display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                addon_dir.join("Cargo.toml").display()
+            );
+            println!(
+                "cargo:rerun-if-changed={}",
+                addon_dir.join("manifest.toml").display()
+            );
             println!("cargo:rerun-if-changed={}", addon_dir.join("src").display());
             if addon_dir.join("migrations").exists() {
-                println!("cargo:rerun-if-changed={}", addon_dir.join("migrations").display());
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    addon_dir.join("migrations").display()
+                );
             }
 
             println!(
@@ -1940,13 +1949,11 @@ fn validate_wasm_imports(wasm_path: &Path) -> Result<(), String> {
             for _ in 0..count {
                 let (mod_len, adv) = read_leb128_u32(&bytes[p..]);
                 p += adv;
-                let module = std::str::from_utf8(&bytes[p..p + mod_len as usize])
-                    .unwrap_or("?");
+                let module = std::str::from_utf8(&bytes[p..p + mod_len as usize]).unwrap_or("?");
                 p += mod_len as usize;
                 let (name_len, adv) = read_leb128_u32(&bytes[p..]);
                 p += adv;
-                let name = std::str::from_utf8(&bytes[p..p + name_len as usize])
-                    .unwrap_or("?");
+                let name = std::str::from_utf8(&bytes[p..p + name_len as usize]).unwrap_or("?");
                 p += name_len as usize;
                 // Skip import descriptor (kind: u8 + type index)
                 let kind = bytes[p];
@@ -1955,14 +1962,24 @@ fn validate_wasm_imports(wasm_path: &Path) -> Result<(), String> {
                 p += adv;
                 if kind == 1 {
                     // table import: extra (limits)
-                    let _flags = bytes[p]; p += 1;
-                    let (_init, adv) = read_leb128_u32(&bytes[p..]); p += adv;
-                    if _flags & 1 != 0 { let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv; }
+                    let _flags = bytes[p];
+                    p += 1;
+                    let (_init, adv) = read_leb128_u32(&bytes[p..]);
+                    p += adv;
+                    if _flags & 1 != 0 {
+                        let (_, adv) = read_leb128_u32(&bytes[p..]);
+                        p += adv;
+                    }
                 } else if kind == 2 {
                     // memory import: (limits)
-                    let _flags = bytes[p]; p += 1;
-                    let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv;
-                    if _flags & 1 != 0 { let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv; }
+                    let _flags = bytes[p];
+                    p += 1;
+                    let (_, adv) = read_leb128_u32(&bytes[p..]);
+                    p += adv;
+                    if _flags & 1 != 0 {
+                        let (_, adv) = read_leb128_u32(&bytes[p..]);
+                        p += adv;
+                    }
                 } else if kind == 3 {
                     // global import: valtype + mut
                     p += 2;

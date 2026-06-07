@@ -339,11 +339,7 @@ impl SttManager {
         // Auto-pick musi zwrocic `&'static str`, zeby immutable borrow przez
         // `available_backends()` zakonczyl sie przed `&mut self.load_model`.
         let engine_id: &str = engine_id.unwrap_or_else(|| {
-            if self
-                .available_backends()
-                .iter()
-                .any(|b| b == "mlx-whisper")
-            {
+            if self.available_backends().iter().any(|b| b == "mlx-whisper") {
                 "mlx-whisper"
             } else {
                 "whisper"

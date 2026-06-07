@@ -139,10 +139,7 @@ pub async fn prepare_model(
         mlx_repo_id, oai_id
     );
     if let Some(sink) = log_sink {
-        sink.phase(
-            "downloading-stt",
-            &format!("Pobieram {} …", mlx_repo_id),
-        );
+        sink.phase("downloading-stt", &format!("Pobieram {} …", mlx_repo_id));
     }
 
     // Pliki MLX (wymagane) — blad propaguje. Tokenizer (opcjonalny) — brak/404
@@ -193,7 +190,13 @@ fn progress_for_sink(
             0
         };
         let line = if total > 0 {
-            format!("{}: {}/{} KB ({}%)", label, downloaded / 1024, total / 1024, pct)
+            format!(
+                "{}: {}/{} KB ({}%)",
+                label,
+                downloaded / 1024,
+                total / 1024,
+                pct
+            )
         } else {
             format!("{}: {} KB", label, downloaded / 1024)
         };

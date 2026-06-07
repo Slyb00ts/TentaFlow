@@ -391,8 +391,21 @@ impl LocalInferenceHandler {
         }
 
         while let Some(token) = token_rx.recv().await {
+            // CR-003: na finale mapujemy REALNY powód zakończenia silnika; twardy
+            // błąd silnika sygnalizujemy jako finish_reason "error" zamiast cichego
+            // "stop", żeby konsument SSE nie traktował awarii jak normalnego końca.
             let finish_reason = if token.is_final {
-                Some("stop".to_string())
+                if let Some(err) = &token.error {
+                    warn!("Strumień inferencji zakończony błędem silnika: {err}");
+                    Some("error".to_string())
+                } else {
+                    Some(match &token.finish_reason {
+                        Some(StopReason::MaxTokens) => "length",
+                        Some(StopReason::StopSequence(_)) => "stop",
+                        Some(StopReason::EndOfText) | None => "stop",
+                    }
+                    .to_string())
+                }
             } else {
                 None
             };

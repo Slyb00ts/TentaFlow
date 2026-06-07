@@ -166,6 +166,15 @@ pub enum StopReason {
 pub struct StreamToken {
     pub text: String,
     pub is_final: bool,
+    /// Powód zakończenia — ustawiany WYŁĄCZNIE na tokenie finalnym (is_final=true).
+    /// `None` dla fragmentów. Pozwala konsumentowi zmapować realny finish_reason
+    /// zamiast twardego "stop". Backendy, które nie znają powodu, ustawiają
+    /// `Some(StopReason::EndOfText)` na finale.
+    pub finish_reason: Option<StopReason>,
+    /// Twardy błąd silnika (np. llama_decode rc!=0, błąd MTP process). Ustawiany
+    /// tylko na tokenie finalnym, gdy generacja przerwana błędem. Konsument musi
+    /// propagować ten błąd zamiast cicho kończyć strumień jako "stop".
+    pub error: Option<String>,
 }
 
 /// Parametry embeddingów

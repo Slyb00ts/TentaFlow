@@ -1,0 +1,47 @@
+# =============================================================================
+# Plik: Cargo.toml
+# Opis: Manifest crate'a z własnymi wrapperami TentaFlow dla natywnych silników.
+# =============================================================================
+
+[package]
+name = "tentaflow-wrappers"
+version = "0.1.0"
+edition = "2021"
+description = "Własne wrappery TentaFlow dla llama.cpp, whisper.cpp i kolejnych natywnych silników"
+
+[features]
+default = []
+llama = ["dep:llama-cpp-sys-2"]
+whisper = ["dep:whisper-rs-sys"]
+sherpa = ["dep:sherpa-rs-sys"]
+all = ["llama", "whisper", "sherpa"]
+
+[[example]]
+name = "llama_smoke"
+required-features = ["llama"]
+
+[[example]]
+name = "llama_engine_smoke"
+required-features = ["llama"]
+
+[[example]]
+name = "seq_rm_probe"
+required-features = ["llama"]
+
+[[example]]
+name = "whisper_smoke"
+required-features = ["whisper"]
+
+[dependencies]
+encoding_rs = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+llama-cpp-sys-2 = { version = "0.1.146", optional = true }
+whisper-rs-sys = { version = "0.15.0", optional = true }
+sherpa-rs-sys = { version = "0.6.8", optional = true }
+
+[patch.crates-io]
+llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
+sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
+whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }

@@ -8,9 +8,7 @@
     feature = "inference-mlx-kokoro"
 )))]
 fn main() {
-    eprintln!(
-        "tts_e2e wymaga macOS/iOS + feature inference-mlx-kokoro — pomijam"
-    );
+    eprintln!("tts_e2e wymaga macOS/iOS + feature inference-mlx-kokoro — pomijam");
 }
 
 #[cfg(all(
