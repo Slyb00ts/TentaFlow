@@ -2090,26 +2090,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enumflags2"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
-dependencies = [
- "enumflags2_derive",
-]
-
-[[package]]
-name = "enumflags2_derive"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "env_filter"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4154,24 +4134,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
-name = "llama-cpp-2"
-version = "0.1.146"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3b0f368c76cc0fe475e8257aeeec269e0d6569bd48b1f503efd0963fc3ee397"
-dependencies = [
- "encoding_rs",
- "enumflags2",
- "llama-cpp-sys-2",
- "thiserror 2.0.18",
- "tracing",
- "tracing-core",
-]
-
-[[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.146"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b291e4bc2d10c43cd8dec16d49b6104cb3cb125f596ec380a753a5db1d965dd"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -7052,8 +7016,6 @@ dependencies = [
 [[package]]
 name = "sherpa-rs-sys"
 version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "591c9432b20f41d47f622a73c2888b188c321e313d820824df7d9fa51dbada43"
 dependencies = [
  "bindgen 0.69.5",
  "bzip2 0.4.4",
@@ -7730,7 +7692,6 @@ dependencies = [
  "dashmap",
  "dirs 6.0.0",
  "ed25519-dalek 2.2.0",
- "encoding_rs",
  "fjall",
  "flate2",
  "futures",
@@ -7754,7 +7715,6 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "libloading 0.9.0",
- "llama-cpp-2",
  "lru 0.12.5",
  "minicbor",
  "multer",
@@ -7793,6 +7753,7 @@ dependencies = [
  "tentaflow-protocol",
  "tentaflow-sdk-spec",
  "tentaflow-transport",
+ "tentaflow-wrappers",
  "tentaflow-zvec",
  "thiserror 2.0.18",
  "tokio",
@@ -7877,6 +7838,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "tentaflow-wrappers"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+ "llama-cpp-sys-2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

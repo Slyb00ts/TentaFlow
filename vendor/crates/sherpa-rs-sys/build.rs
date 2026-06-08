@@ -26,7 +26,7 @@ fn main() {
     require(&lib_dir.join(static_name("sherpa-onnx-core", &target)));
     require(&lib_dir.join(static_name("onnxruntime", &target)));
 
-    generate_bindings(&include_dir);
+    generate_bindings(&include_dir, &target);
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-search=native={}", dynamic_dir.display());
@@ -75,6 +75,8 @@ fn platform_name(target: &str) -> &'static str {
         "x86_64-unknown-linux-gnu" => "linux-x86_64",
         "aarch64-unknown-linux-gnu" => "linux-aarch64",
         "aarch64-apple-darwin" => "macos-arm64",
+        "aarch64-apple-ios" => "ios-arm64",
+        "aarch64-apple-ios-sim" => "ios-sim-arm64",
         "x86_64-pc-windows-msvc" => "windows-x86_64",
         other => panic!("sherpa-rs-sys: brak native-libs dla targetu {other}"),
     }
@@ -97,11 +99,19 @@ fn require(path: &Path) {
     }
 }
 
-fn generate_bindings(include_dir: &Path) {
-    let bindings = bindgen::Builder::default()
+fn generate_bindings(include_dir: &Path, target: &str) {
+    let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", include_dir.display()))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
+
+    // clang nie rozumie triple Rusta `arm64-apple-ios-sim` ('sim' to nieprawidłowa
+    // wersja) — dla symulatora podajemy poprawny triple ze środowiskiem `simulator`.
+    if target == "aarch64-apple-ios-sim" {
+        builder = builder.clang_arg("--target=arm64-apple-ios-simulator");
+    }
+
+    let bindings = builder
         .generate()
         .expect("sherpa-rs-sys: bindgen nie wygenerowal bindings.rs");
 

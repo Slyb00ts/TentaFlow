@@ -47,7 +47,7 @@ detect_backends() {
       fi
       printf '%s\n' "${detected[@]}"
       ;;
-    macos-*)
+    macos-*|ios-*)
       printf '%s\n' "metal"
       ;;
     *)
@@ -108,6 +108,24 @@ build_backend() {
     -DCMAKE_CUDA_COMPILER_LAUNCHER=
     -DCMAKE_HIP_COMPILER_LAUNCHER=
   )
+
+  case "$PLATFORM" in
+    ios-arm64|ios-sim-arm64)
+      # Cross-compile na iOS: metallib wbudowujemy w bibliotekę (EMBED), żeby
+      # prebuilt .a był samowystarczalny i nie wymagał osobnego pliku .metallib
+      # obok aplikacji. Generator domyślny (Makefiles) + CMAKE_SYSTEM_NAME=iOS.
+      [ "$(uname -s)" = "Darwin" ] || { echo "Build iOS llama wymaga macOS + Xcode." >&2; exit 1; }
+      local ios_sdk
+      if [ "$PLATFORM" = "ios-arm64" ]; then ios_sdk="iphoneos"; else ios_sdk="iphonesimulator"; fi
+      cmake_args+=(
+        -DCMAKE_SYSTEM_NAME=iOS
+        -DCMAKE_OSX_ARCHITECTURES=arm64
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk "$ios_sdk" --show-sdk-path)"
+        -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+        -DGGML_METAL_EMBED_LIBRARY=ON
+      )
+      ;;
+  esac
 
   if [ "$backend" = "multi" ]; then
     enabled_backends=("${MULTI_BACKENDS[@]}")
