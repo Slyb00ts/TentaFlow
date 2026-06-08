@@ -144,7 +144,12 @@ build_backend() {
     -u CMAKE_CUDA_COMPILER_LAUNCHER \
     -u CMAKE_HIP_COMPILER_LAUNCHER \
     cmake "${cmake_args[@]}"
-  if cmake --build "$build" --target help | grep -q '^... llama-common$'; then
+  # Output łapiemy do zmiennej i grepujemy z here-stringa, a nie przez potok:
+  # pod `set -o pipefail` `grep -q` zamyka potok po dopasowaniu, cmake dostaje
+  # SIGPIPE (exit 141) i pipefail zgłasza błąd całego potoku mimo trafienia.
+  local target_help
+  target_help="$(cmake --build "$build" --target help 2>/dev/null)"
+  if grep -q '^... llama-common$' <<<"$target_help"; then
     targets+=(llama-common)
   else
     targets+=(common)
