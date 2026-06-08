@@ -120,7 +120,7 @@ copy_matching() {
   local dst="$2"
   shift 2
   mkdir -p "$dst"
-  find "$src" -type f \( "$@" \) -exec cp {} "$dst/" \;
+  find "$src" -type f \( "$@" \) -exec cp -f {} "$dst/" \;
 }
 
 write_manifest_header() {

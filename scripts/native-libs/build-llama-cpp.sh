@@ -170,12 +170,12 @@ for backend in "${BACKEND_LIST[@]}"; do
 done
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/llama"
-find "$SRC/include" "$SRC/ggml/include" -type f -name '*.h' -exec cp {} "$NATIVE_ROOT/$PLATFORM/include/llama/" \;
+find "$SRC/include" "$SRC/ggml/include" -type f -name '*.h' -exec cp -f {} "$NATIVE_ROOT/$PLATFORM/include/llama/" \;
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/llama/common" "$NATIVE_ROOT/$PLATFORM/include/llama/nlohmann"
 while IFS= read -r header; do
   target="$NATIVE_ROOT/$PLATFORM/include/llama/common/${header#"$SRC/common/"}"
   mkdir -p "$(dirname "$target")"
-  cp "$header" "$target"
+  cp -f "$header" "$target"
 done < <(find "$SRC/common" -type f \( -name '*.h' -o -name '*.hpp' \))
-cp "$SRC/vendor/nlohmann/json.hpp" "$NATIVE_ROOT/$PLATFORM/include/llama/nlohmann/json.hpp"
-cp "$SRC/vendor/nlohmann/json_fwd.hpp" "$NATIVE_ROOT/$PLATFORM/include/llama/nlohmann/json_fwd.hpp"
+cp -f "$SRC/vendor/nlohmann/json.hpp" "$NATIVE_ROOT/$PLATFORM/include/llama/nlohmann/json.hpp"
+cp -f "$SRC/vendor/nlohmann/json_fwd.hpp" "$NATIVE_ROOT/$PLATFORM/include/llama/nlohmann/json_fwd.hpp"

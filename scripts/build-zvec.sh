@@ -185,7 +185,7 @@ case "$PLATFORM" in
         chown -R '"$(id -u):$(id -g)"' /src/build_zvec
       '
     fi
-    cp "$SRC_DIR/build_zvec/lib/libzvec_c_api.so" "$OUT_LIB_DIR/libzvec_c_api.so"
+    cp -f "$SRC_DIR/build_zvec/lib/libzvec_c_api.so" "$OUT_LIB_DIR/libzvec_c_api.so"
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.so"
     ;;
   macos-arm64)
@@ -194,7 +194,7 @@ case "$PLATFORM" in
     ( cd "$SRC_DIR" && rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
       cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON ..
       ninja zvec_c_api -j"$(sysctl -n hw.ncpu)" )
-    cp "$SRC_DIR/build_zvec/lib/libzvec_c_api.dylib" "$OUT_LIB_DIR/libzvec_c_api.dylib"
+    cp -f "$SRC_DIR/build_zvec/lib/libzvec_c_api.dylib" "$OUT_LIB_DIR/libzvec_c_api.dylib"
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.dylib"
     ;;
   ios-arm64|ios-sim-arm64)
@@ -329,7 +329,7 @@ case "$PLATFORM" in
 esac
 
 # Vendor the header (committed) — keep it in sync with the built lib.
-cp "$SRC_DIR/src/include/zvec/c_api.h" "$VENDOR_INCLUDE/c_api.h"
+cp -f "$SRC_DIR/src/include/zvec/c_api.h" "$VENDOR_INCLUDE/c_api.h"
 
 echo ""
 echo "=========================================="
