@@ -181,6 +181,9 @@ fn link_native(lib_dir: &Path, target: &str, target_os: &TargetOs) {
     link_static_if_exists(lib_dir, "ggml", target);
     link_static_if_exists(lib_dir, "ggml-base", target);
     link_static_if_exists(lib_dir, "ggml-cpu", target);
+    // Apple builds enable the BLAS (Accelerate) backend, so ggml's backend
+    // registry references ggml_backend_blas_reg; link it when the archive exists.
+    link_static_if_exists(lib_dir, "ggml-blas", target);
     link_static_if_exists(lib_dir, "ggml-vulkan", target);
     link_static_if_exists(lib_dir, "ggml-cuda", target);
     link_static_if_exists(lib_dir, "ggml-hip", target);
