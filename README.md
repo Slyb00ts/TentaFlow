@@ -146,7 +146,7 @@ your other nodes to share their models, or run it standalone on a plane. Same ca
 
 - **Web dashboard** - a fast vanilla-JS SPA on port `8090` with 20+ views (chat, playground, services,
   mesh, models, flows, addons, scheduler, audit, users, compliance, profiling…). It never uses REST — it
-  talks to the core over a binary CBOR protocol.
+  talks to the core over a binary CBOR protocol.https://github.com/Slyb00ts/TentaFlow
 - **OpenAI-compatible API** — `POST /v1/chat/completions`, `/v1/audio/*`, `/v1/embeddings` for external
   apps that want to use your TentaFlow models, authenticated with an API key.
 - **Compliance core (GDPR/RODO)** - built-in AI audit, retention policies, ROPA, DSAR, consents, DPIA and
@@ -207,7 +207,7 @@ your other nodes to share their models, or run it standalone on a plane. Same ca
 | `tentaflow-ui` / `-ui-schema` | Shared UI framework + declarative addon-UI schema |
 | `tentaflow-client` | Client SDKs — native Rust FFI + .NET wrapper |
 | `tentaflow-models` | Training pipeline for the orchestrator model |
-
+https://github.com/Slyb00ts/TentaFlow
 ---
 
 ## Getting started
@@ -244,7 +244,7 @@ drop your own into `certs/cert.pem` + `certs/key.pem` to override.
 ### Build & run
 
 ```bash
-cd tentaflow && cargo build --release
+cd tentaflow && cargo build --release --features gpu-cuda
 ./target/release/tentaflow --config ../config.toml
 ```
 
@@ -258,17 +258,6 @@ Useful `tentaflow-core` features: `dashboard-api` (web UI + API), `inference-lla
 
 A single TOML file passed with `--config`. Main sections: `[server]`, `[server.mtls]`,
 `[protocols.quic]`, `[mesh]`, `[load_balancing]`, `[monitoring]`. Default HTTPS/QUIC port **8090**.
-
----
-
-## Refreshing the screenshots
-
-The images live in `docs/screenshots/` (`chat.png`, `mesh.png`, `service-catalog.png`,
-`flow-builder.png`, `addons.png`). To update them, run a node with the dashboard enabled, open
-`https://localhost:8090` (accept the self-signed cert), and capture each view at a consistent width
-(~1440px) — either with your browser's screenshot tool or a short Playwright script (the repo already
-uses Playwright for E2E in `.github/workflows/e2e-ui.yml`). Seed a couple of paired nodes and a sample
-flow first so the mesh and Flow Builder shots aren't empty.
 
 ---
 
