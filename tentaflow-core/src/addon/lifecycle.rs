@@ -383,9 +383,7 @@ fn install_core(
         // Replicate the package BYTES so other mesh nodes can install this
         // uploaded addon (bundled packages already live in every node's binary,
         // so they skip this). Best-effort: failure never fails the local install.
-        if let Err(e) =
-            capture_addon_package_blob(db, package_id, package_version, &package_dir)
-        {
+        if let Err(e) = capture_addon_package_blob(db, package_id, package_version, &package_dir) {
             tracing::warn!(
                 "addon package '{package_id}' v{package_version}: blob sync capture nieudany: {e}"
             );
@@ -498,7 +496,10 @@ fn install_core(
 
 /// Upsert per-addon resource limits from the manifest's `[resources]` (or
 /// defaults = no limit). Idempotent. Shared by install + sync reconcile.
-fn upsert_addon_resource_limits(conn: &rusqlite::Connection, manifest: &AddonManifest) -> Result<()> {
+fn upsert_addon_resource_limits(
+    conn: &rusqlite::Connection,
+    manifest: &AddonManifest,
+) -> Result<()> {
     if let Some(ref res) = manifest.resources {
         conn.execute(
             "INSERT OR REPLACE INTO addon_resource_limits \
@@ -1333,11 +1334,7 @@ fn upgrade_core(
 /// katalog pakietu, aplikuje brakujace migracje do wlasnego SQLite instancji i
 /// zwraca docelowy manifest (manager re-rejestruje toole/flow bloki). NIE rusza
 /// uruchomionych instancji wasm — to robi warstwa managera (hot reload).
-pub fn update_instance(
-    db: &DbPool,
-    addon_id: &str,
-    target_version: &str,
-) -> Result<AddonManifest> {
+pub fn update_instance(db: &DbPool, addon_id: &str, target_version: &str) -> Result<AddonManifest> {
     let (package_id, current_version) =
         crate::db::repository::get_addon_instance_package_ref(db, addon_id)?
             .ok_or_else(|| anyhow::anyhow!("instancja '{addon_id}' nie istnieje"))?;
@@ -2439,18 +2436,14 @@ fn parse_vector_namespaces(
                     .get("name")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "[[vector_namespace]][{idx}].fields[{fidx}] missing 'name'"
-                        )
+                        anyhow::anyhow!("[[vector_namespace]][{idx}].fields[{fidx}] missing 'name'")
                     })?
                     .to_string();
                 let ftype = f
                     .get("type")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "[[vector_namespace]][{idx}].fields[{fidx}] missing 'type'"
-                        )
+                        anyhow::anyhow!("[[vector_namespace]][{idx}].fields[{fidx}] missing 'type'")
                     })?
                     .to_string();
                 if !matches!(ftype.as_str(), "str" | "int" | "float" | "bool") {
@@ -2467,7 +2460,10 @@ fn parse_vector_namespaces(
                 });
             }
         }
-        let sparse = item.get("sparse").and_then(|v| v.as_bool()).unwrap_or(false);
+        let sparse = item
+            .get("sparse")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         out.push(crate::addon::manifest::VectorNamespaceSpec {
             name,
             dimensions,

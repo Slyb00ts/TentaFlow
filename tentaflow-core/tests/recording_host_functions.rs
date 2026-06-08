@@ -211,10 +211,8 @@ async fn test_save_snapshot_invalid_frame_ref_format() {
     let camera = uniq("cam_badref");
     seed_camera(&db, &addon, &camera);
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
-    let (rc, _) = rec::save_snapshot_with_raw_input(
-        &state,
-        &snapshot_payload(&camera, "bogus_no_prefix"),
-    );
+    let (rc, _) =
+        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, "bogus_no_prefix"));
     assert_eq!(
         rc,
         AbiError::Operation.as_i32(),
@@ -231,8 +229,7 @@ async fn test_save_snapshot_nonexistent_frame_ref() {
     seed_camera(&db, &addon, &camera);
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
     let made_up = format!("frame_{}", uuid::Uuid::new_v4());
-    let (rc, _) =
-        rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &made_up));
+    let (rc, _) = rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &made_up));
     assert_eq!(rc, AbiError::NotFound.as_i32());
 }
 
@@ -249,10 +246,8 @@ async fn test_save_snapshot_cross_addon_frame_denied() {
     // `cameras` for addon_b must surface NotFound.
     let state_b = make_state(&db, &addon_b, vec!["recording.write".into()]);
     let frame_ref = insert_frame(&camera_a, 8, 8, rgb_buf(8, 8));
-    let (rc, _) = rec::save_snapshot_with_raw_input(
-        &state_b,
-        &snapshot_payload(&camera_a, &frame_ref),
-    );
+    let (rc, _) =
+        rec::save_snapshot_with_raw_input(&state_b, &snapshot_payload(&camera_a, &frame_ref));
     assert_eq!(
         rc,
         AbiError::NotFound.as_i32(),
@@ -426,10 +421,8 @@ async fn test_get_url_cross_addon_denied() {
         vec!["recording.write".into(), "recording.read".into()],
     );
     let frame_ref = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
-    let (_rc, out) = rec::save_snapshot_with_raw_input(
-        &state_a,
-        &snapshot_payload(&camera, &frame_ref),
-    );
+    let (_rc, out) =
+        rec::save_snapshot_with_raw_input(&state_a, &snapshot_payload(&camera, &frame_ref));
     let parsed: SaveRecordingOut = decode(&out);
     let recording_ref = parsed.recording_ref.as_str();
 
@@ -638,8 +631,7 @@ async fn test_stats_basic_aggregation() {
     // Save 3 snapshots.
     for _ in 0..3 {
         let fr = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
-        let (rc, _) =
-            rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &fr));
+        let (rc, _) = rec::save_snapshot_with_raw_input(&state, &snapshot_payload(&camera, &fr));
         assert_eq!(rc, AbiError::Ok.as_i32());
     }
     let (rc, out) = rec::stats_with_raw_input(&state, b"");

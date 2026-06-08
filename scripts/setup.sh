@@ -318,6 +318,8 @@ install_base() {
                 cmake
                 clang
                 lld
+                git
+                git-lfs
                 pkg-config
                 glib2
                 gstreamer
@@ -344,7 +346,7 @@ install_base() {
                 run_privileged pacman -S --needed --noconfirm protobuf
                 INSTALLED+=("protobuf")
             fi
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "glib2" "gstreamer" "gst-plugins-base-libs" "vulkan-loader" "sqlite" "perf" "sysstat")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "git-lfs" "glib2" "gstreamer" "gst-plugins-base-libs" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -355,6 +357,8 @@ install_base() {
                 cmake
                 clang
                 lld
+                git
+                git-lfs
                 pkg-config
                 libglib2.0-dev
                 libgstreamer1.0-dev
@@ -374,7 +378,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
@@ -384,6 +388,8 @@ install_base() {
                 cmake
                 clang
                 lld
+                git
+                git-lfs
                 pkg-config
                 glib2-devel
                 gstreamer1-devel
@@ -399,7 +405,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "git" "git-lfs" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -415,6 +421,8 @@ install_base() {
                 cmake
                 ninja
                 llvm
+                git
+                git-lfs
                 pkg-config
                 glib
                 gstreamer
@@ -427,11 +435,42 @@ install_base() {
             brew install "${pkgs[@]}"
             configure_macos_gstreamer_pkg_config
             ensure_macos_metal_toolchain
-            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
+            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "git" "git-lfs" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
             ;;
     esac
 
     log_ok "Bazowe zaleznosci zainstalowane"
+}
+
+install_git_lfs() {
+    log_section "Git LFS"
+
+    if ! command -v git-lfs &>/dev/null && ! git lfs version &>/dev/null; then
+        log_error "Git LFS nie jest dostepny mimo instalacji pakietow bazowych."
+        log_error "Zainstaluj recznie pakiet git-lfs dla swojego systemu i uruchom setup ponownie."
+        exit 1
+    fi
+
+    git lfs install
+    log_ok "Git LFS: $(git lfs version)"
+    INSTALLED+=("git lfs install")
+
+    # Materializuj artefakty LFS (prebuilt native-libs/*.a|*.so). Jesli repo
+    # sklonowano ZANIM git-lfs byl w systemie, te pliki sa tekstowymi pointerami
+    # — `git lfs install` rejestruje tylko filtry i NIE sciaga juz
+    # wyewidencjonowanych pointerow. Bez `git lfs pull` build.rs pada na
+    # "brak native-libs" (linkuje pointer zamiast biblioteki).
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [[ -n "$repo_root" ]]; then
+        log_info "Pobieranie artefaktow Git LFS (prebuilt native-libs)..."
+        if git -C "$repo_root" lfs pull; then
+            log_ok "Git LFS: artefakty pobrane"
+            INSTALLED+=("git lfs pull")
+        else
+            log_warn "git lfs pull nieudane — uruchom recznie w repo: git lfs pull"
+        fi
+    fi
 }
 
 # --- zvec (wbudowana baza wektorowa — statyczny artefakt per platforma) ---
@@ -1155,6 +1194,14 @@ verify_installation() {
         ok=false
     fi
 
+    # git lfs
+    if git lfs version &>/dev/null; then
+        log_ok "git-lfs: $(git lfs version)"
+    else
+        log_error "git-lfs: NIE ZNALEZIONO"
+        ok=false
+    fi
+
     # wasm targets
     if rustup target list --installed 2>/dev/null | grep -q "wasm32-wasip1"; then
         log_ok "wasm32-wasip1: zainstalowany"
@@ -1427,6 +1474,7 @@ main() {
     download_meeting_bot_assets
 
     install_base
+    install_git_lfs
     install_zvec
     install_rust
     install_wasm_target

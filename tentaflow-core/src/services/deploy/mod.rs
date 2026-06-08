@@ -312,11 +312,12 @@ pub async fn deploy(
     // wlasnego. Wartosci nie logujemy. Jednoczesnie usuwamy `hf_token` z configu
     // przekazywanego strategiom, bo ich `prepare/commit` serializuje go do
     // config_json (services + deployments). Sekret leci dalej tylko jako ENV.
-    let hf_token = crate::db::repository::get_setting_secure(db, HF_TOKEN_CONFIG_KEY, settings_cipher)
-        .ok()
-        .flatten()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let hf_token =
+        crate::db::repository::get_setting_secure(db, HF_TOKEN_CONFIG_KEY, settings_cipher)
+            .ok()
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
     let user_config = &strip_hf_token(user_config);
     let sink = log_sink.map(|sender| LogSink {
         slug: slug.clone(),
@@ -829,7 +830,11 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         config_json: prepared.config_json.clone(),
         active_deploy_id: String::new(),
         last_deploy_id: String::new(),
-        deployment_progress_pct: if status == ServiceStatus::Running { 100 } else { 0 },
+        deployment_progress_pct: if status == ServiceStatus::Running {
+            100
+        } else {
+            0
+        },
         deployed_source_hash,
     }
 }
@@ -1116,8 +1121,8 @@ pub(crate) fn engine_uses_hf_model(
     // Wymagana POZYTYWNA deklaracja modelu HF z manifestu: albo jawne
     // `requires_model = true`, albo niepusta lista `model_presets`. Bez tego
     // manifest nie deklaruje realnie modelu i token nie wycieka.
-    let declares_hf_model = matches!(manifest.engine.requires_model, Some(true))
-        || !manifest.model_presets.is_empty();
+    let declares_hf_model =
+        matches!(manifest.engine.requires_model, Some(true)) || !manifest.model_presets.is_empty();
     if !declares_hf_model {
         return false;
     }
@@ -1759,7 +1764,11 @@ mod hf_token_gate_tests {
     #[test]
     fn model_capable_engine_with_repo_gets_token() {
         // Pozytywna deklaracja modelu: niepusta lista presetow.
-        let m = manifest(Some(ResourceKind::Ai), Some(true), vec![preset("Qwen/Qwen3-0.6B")]);
+        let m = manifest(
+            Some(ResourceKind::Ai),
+            Some(true),
+            vec![preset("Qwen/Qwen3-0.6B")],
+        );
         assert!(engine_uses_hf_model(&m, &json!({})));
         // Pozytywna deklaracja przez `requires_model = true` + custom repo z wizarda.
         let m2 = manifest(None, Some(true), vec![]);
@@ -1791,7 +1800,12 @@ mod hf_token_gate_tests {
             &json!({ "model_repo": "Qwen/Qwen3-0.6B" })
         ));
         // Nawet jesli ktos doda presety do manifestu Agents — wciaz brak tokenu.
-        let m2 = manifest_cat(Category::Agents, None, None, vec![preset("Qwen/Qwen3-0.6B")]);
+        let m2 = manifest_cat(
+            Category::Agents,
+            None,
+            None,
+            vec![preset("Qwen/Qwen3-0.6B")],
+        );
         assert!(!engine_uses_hf_model(&m2, &json!({})));
     }
 
@@ -2700,7 +2714,9 @@ mod tests {
             Some("speakleash/Bielik")
         );
         assert_eq!(
-            stripped.get("gpu_memory_utilization").and_then(|v| v.as_f64()),
+            stripped
+                .get("gpu_memory_utilization")
+                .and_then(|v| v.as_f64()),
             Some(0.9)
         );
     }

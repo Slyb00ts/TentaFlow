@@ -375,6 +375,103 @@ pub fn resolve_bind_addr(db: &DbPool, mesh_port: u16) -> SocketAddr {
     }
 }
 
+/// Tryb bind iroh wczytany raz przy starcie pipeline. `Custom(ip)` oznacza pin
+/// na konkretny interfejs (uzytkownik wybral go w GUI); `Auto` => bez pinu.
+#[derive(Debug, Clone)]
+pub enum BindModeSnapshot {
+    Auto,
+    Custom(Ipv4Addr),
+}
+
+/// Migawka calej logiki advertise zebrana RAZ przy starcie pipeline. iroh
+/// `AddrFilter` wymaga closure `Send + Sync + 'static`, wiec nie mozemy
+/// trzymac w niej `DbPool` — zamiast tego materializujemy filtry + mapy NIC
+/// tutaj i `move`'ujemy ten snapshot do filtra. Zmiana ustawien i tak wymaga
+/// restartu mesh pipeline, wiec statyczny snapshot na czas zycia endpointu jest
+/// poprawny.
+#[derive(Debug, Clone)]
+pub struct AddrFilterSnapshot {
+    pub bind_mode: BindModeSnapshot,
+    pub filters: AdvertiseFilters,
+    pub kind_map: std::collections::HashMap<Ipv4Addr, String>,
+    pub name_map: std::collections::HashMap<Ipv4Addr, String>,
+    /// Nazwy kart, na ktorych zyje pinowane `bind_ipv4`. Pusta gdy `Auto`.
+    /// Pin custom przepuszcza WSZYSTKIE adresy IPv4 tej samej karty (jedna karta
+    /// moze miec kilka adresow), nie tylko dokladnie `bind_ipv4`.
+    pub pinned_iface_names: Vec<String>,
+}
+
+impl AddrFilterSnapshot {
+    /// Czysta decyzja dla pojedynczego IPv4 (bez `TransportAddr`, testowalna).
+    /// Relay nigdy nie przechodzi przez te funkcje — caller przepuszcza relay
+    /// bezwarunkowo, zeby nie zabic fallbacku NAT.
+    pub fn keep_transport_ip(&self, ip: Ipv4Addr) -> bool {
+        match &self.bind_mode {
+            BindModeSnapshot::Custom(pinned) => {
+                if ip == *pinned {
+                    return true;
+                }
+                // Ta sama karta co pin (kilka adresow na jednym interfejsie).
+                match self.name_map.get(&ip) {
+                    Some(name) => self.pinned_iface_names.iter().any(|n| n == name),
+                    None => false,
+                }
+            }
+            BindModeSnapshot::Auto => {
+                should_advertise_ip(ip, &self.filters, &self.kind_map, &self.name_map)
+            }
+        }
+    }
+}
+
+/// Buduje snapshot decyzyjny dla iroh `AddrFilter` z ustawien GUI. Wczytuje
+/// `bind_mode` + `bind_ipv4` + filtry advertise + mapy NIC RAZ, zeby filtr byl
+/// statyczny i thread-safe.
+pub fn build_addr_filter_snapshot(db: &DbPool) -> AddrFilterSnapshot {
+    let filters = load_advertise_filters(db);
+    let kind_map = ipv4_kind_map();
+    let name_map = ipv4_name_map();
+
+    let mode = repository::get_setting(db, SETTING_BIND_MODE)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "auto".to_string());
+
+    let (bind_mode, pinned_iface_names) = if mode == "custom" {
+        let parsed: Option<Ipv4Addr> = repository::get_setting(db, SETTING_BIND_IPV4)
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.parse().ok());
+        match parsed {
+            Some(ip) => {
+                // Nazwa karty pinowanego adresu — wszystkie jej IP przejda filtr.
+                let names: Vec<String> = name_map
+                    .get(&ip)
+                    .map(|n| vec![n.clone()])
+                    .unwrap_or_default();
+                if names.is_empty() {
+                    tracing::warn!(
+                        pinned = %ip,
+                        "mesh.bind_mode=custom: pinowany bind_ipv4 zniknal z interfejsow — filtr odrzuci wszystkie kandydatury IP, transport iroh zejdzie do relay-only"
+                    );
+                }
+                (BindModeSnapshot::Custom(ip), names)
+            }
+            None => (BindModeSnapshot::Auto, Vec::new()),
+        }
+    } else {
+        (BindModeSnapshot::Auto, Vec::new())
+    };
+
+    AddrFilterSnapshot {
+        bind_mode,
+        filters,
+        kind_map,
+        name_map,
+        pinned_iface_names,
+    }
+}
+
 /// Filtr listy `IpAddr` (typowo z `collect_local_addresses`) przez
 /// `AdvertiseFilters`. IPv6 jest wycinane — mesh advertise dziala tylko po v4.
 /// Adresy nieznane w `ipv4_kind_map()` (np. ghost addresses z sysinfo) traktujemy
@@ -584,6 +681,88 @@ mod tests {
         let out = filter_advertise_ips(&input, &filters, &kind_map, &name_map);
         // eth3 wykluczony per-karta, eth2 zostaje — mimo ze oba to ethernet.
         assert_eq!(out, vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))]);
+    }
+
+    fn pinned_snapshot() -> AddrFilterSnapshot {
+        use std::collections::HashMap;
+        // Pin na karcie "eth0" (192.168.1.50); docker + tailscale na osobnych
+        // kartach. eth0 ma drugi adres alias 192.168.1.51 — pin custom musi
+        // przepuscic oba (ta sama karta), ale juz nie docker/tailscale.
+        let mut name_map: HashMap<Ipv4Addr, String> = HashMap::new();
+        name_map.insert(Ipv4Addr::new(192, 168, 1, 50), "eth0".to_string());
+        name_map.insert(Ipv4Addr::new(192, 168, 1, 51), "eth0".to_string());
+        name_map.insert(Ipv4Addr::new(172, 17, 0, 1), "docker0".to_string());
+        name_map.insert(Ipv4Addr::new(100, 100, 1, 1), "tailscale0".to_string());
+        let mut kind_map: HashMap<Ipv4Addr, String> = HashMap::new();
+        kind_map.insert(Ipv4Addr::new(192, 168, 1, 50), "ethernet".to_string());
+        kind_map.insert(Ipv4Addr::new(192, 168, 1, 51), "ethernet".to_string());
+        kind_map.insert(Ipv4Addr::new(172, 17, 0, 1), "docker".to_string());
+        kind_map.insert(Ipv4Addr::new(100, 100, 1, 1), "tunnel".to_string());
+        AddrFilterSnapshot {
+            bind_mode: BindModeSnapshot::Custom(Ipv4Addr::new(192, 168, 1, 50)),
+            filters: AdvertiseFilters::default(),
+            kind_map,
+            name_map,
+            pinned_iface_names: vec!["eth0".to_string()],
+        }
+    }
+
+    #[test]
+    fn custom_pin_keeps_only_pinned_iface_ips() {
+        let snap = pinned_snapshot();
+        assert!(snap.keep_transport_ip(Ipv4Addr::new(192, 168, 1, 50)));
+        assert!(snap.keep_transport_ip(Ipv4Addr::new(192, 168, 1, 51)));
+        assert!(!snap.keep_transport_ip(Ipv4Addr::new(172, 17, 0, 1)));
+        assert!(!snap.keep_transport_ip(Ipv4Addr::new(100, 100, 1, 1)));
+        // Adres spoza zadnej znanej karty (np. WAN portmap kandydat) — odrzucony.
+        assert!(!snap.keep_transport_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn auto_mode_applies_advertise_filters() {
+        use std::collections::HashMap;
+        let mut kind_map: HashMap<Ipv4Addr, String> = HashMap::new();
+        kind_map.insert(Ipv4Addr::new(192, 168, 1, 50), "ethernet".to_string());
+        kind_map.insert(Ipv4Addr::new(172, 17, 0, 1), "docker".to_string());
+        let snap = AddrFilterSnapshot {
+            bind_mode: BindModeSnapshot::Auto,
+            filters: all_on(),
+            kind_map,
+            name_map: HashMap::new(),
+            pinned_iface_names: Vec::new(),
+        };
+        assert!(snap.keep_transport_ip(Ipv4Addr::new(192, 168, 1, 50)));
+        // docker schowany przez hide_docker w trybie auto.
+        assert!(!snap.keep_transport_ip(Ipv4Addr::new(172, 17, 0, 1)));
+    }
+
+    #[test]
+    fn transport_addr_filter_keeps_relay_and_pinned_only() {
+        use iroh::TransportAddr;
+        let snap = pinned_snapshot();
+        let input: Vec<TransportAddr> = vec![
+            TransportAddr::Relay("https://relay.example".parse().unwrap()),
+            TransportAddr::Ip("192.168.1.50:8090".parse().unwrap()),
+            TransportAddr::Ip("172.17.0.1:8090".parse().unwrap()),
+            TransportAddr::Ip("100.100.1.1:8090".parse().unwrap()),
+        ];
+        let kept: Vec<TransportAddr> = input
+            .iter()
+            .filter(|a| match a {
+                TransportAddr::Relay(_) => true,
+                TransportAddr::Ip(sa) => match sa.ip() {
+                    std::net::IpAddr::V4(v4) => snap.keep_transport_ip(v4),
+                    std::net::IpAddr::V6(_) => true,
+                },
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|a| a.is_relay()));
+        assert!(kept
+            .iter()
+            .any(|a| matches!(a, TransportAddr::Ip(sa) if sa.ip() == std::net::IpAddr::V4(Ipv4Addr::new(192,168,1,50)))));
     }
 
     #[test]

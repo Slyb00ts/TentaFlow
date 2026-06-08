@@ -755,25 +755,30 @@ pub fn vector_hybrid_search_v1(
         return AbiError::Permission.as_i32();
     }
 
-    let input: VectorHybridSearchInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::VectorItem) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(
-                    caller.data(),
-                    "vector.hybrid_search",
-                    None,
-                    RiskClass::B,
-                    "denied",
-                    Some(if e == AbiError::PayloadTooLarge {
-                        "payload_too_large"
-                    } else {
-                        "invalid_payload"
-                    }),
-                );
-                return e.as_i32();
-            }
-        };
+    let input: VectorHybridSearchInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::VectorItem,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "vector.hybrid_search",
+                None,
+                RiskClass::B,
+                "denied",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
 
     if input.k == 0 || input.k > MAX_SEARCH_K {
         audit(

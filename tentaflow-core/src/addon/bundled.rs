@@ -44,9 +44,8 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
             .sum::<usize>()
     );
 
-    std::fs::create_dir_all(packages_root()).map_err(|e| {
-        anyhow::anyhow!("Nie udalo sie utworzyc katalogu pakietow addonow: {e}")
-    })?;
+    std::fs::create_dir_all(packages_root())
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc katalogu pakietow addonow: {e}"))?;
 
     let mut reconciled: std::collections::HashSet<String> = std::collections::HashSet::new();
     for addon in BUNDLED_ADDONS {
@@ -88,21 +87,22 @@ fn prune_pre_split_bundled_installs(db: &DbPool, reconciled: &std::collections::
         // Pre-split sygnatura: zainstalowany addon o addon_id DOKLADNIE rownym id
         // pakietu. Instancje maja sufiks `-<hex>`, wiec nigdy tu nie wpadaja.
         match crate::db::repository::get_addon(db, package_id) {
-            Ok(Some(_)) => {
-                match crate::addon::lifecycle::uninstall_instance(package_id, db) {
-                    Ok(()) => info!(
-                        "Migracja pakiet/instancja: usunieto pre-split instalacje bundled '{}' \
+            Ok(Some(_)) => match crate::addon::lifecycle::uninstall_instance(package_id, db) {
+                Ok(()) => info!(
+                    "Migracja pakiet/instancja: usunieto pre-split instalacje bundled '{}' \
                          (teraz dostepna tylko w katalogu)",
-                        package_id
-                    ),
-                    Err(e) => error!(
-                        "Nie udalo sie usunac pre-split instalacji bundled '{}': {}",
-                        package_id, e
-                    ),
-                }
-            }
+                    package_id
+                ),
+                Err(e) => error!(
+                    "Nie udalo sie usunac pre-split instalacji bundled '{}': {}",
+                    package_id, e
+                ),
+            },
             Ok(None) => {}
-            Err(e) => error!("Blad sprawdzania pre-split instalacji '{}': {}", package_id, e),
+            Err(e) => error!(
+                "Blad sprawdzania pre-split instalacji '{}': {}",
+                package_id, e
+            ),
         }
     }
 }
@@ -113,9 +113,7 @@ fn prune_pre_split_bundled_installs(db: &DbPool, reconciled: &std::collections::
 fn looks_like_instance_id(id: &str) -> bool {
     match id.rsplit_once('-') {
         Some((base, suffix)) => {
-            !base.is_empty()
-                && suffix.len() == 8
-                && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+            !base.is_empty() && suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
         }
         None => false,
     }

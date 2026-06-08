@@ -16,10 +16,10 @@ use rusqlite::Transaction;
 
 use super::{
     auto_gpu_memory_utilization, build_endpoint_url, build_new_service, category_tag,
-    host_os_supported, is_cuda_vllm_engine, models_from_manifest,
-    parse_gpu_memory_utilization_arg, query_cuda0_vram_mib, resolve_display_name,
-    smart_health_probe, strip_gpu_memory_utilization, DeployError, DeployResult, DeployStrategy,
-    LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+    host_os_supported, is_cuda_vllm_engine, models_from_manifest, parse_gpu_memory_utilization_arg,
+    query_cuda0_vram_mib, resolve_display_name, smart_health_probe, strip_gpu_memory_utilization,
+    DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
+    SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::deploy::process_ctl;
 use crate::deploy::python_venv::{self, NativeDeployRequest};
@@ -233,9 +233,7 @@ impl DeployStrategy for PythonBundleDeploy {
         // the served name MUST equal that slug or every dispatch 404s when the
         // preset id differs from its repo. bundle.toml `[launch] args` reference
         // it via `${SERVED_MODEL_NAME}`; non-vllm engines simply ignore the var.
-        if let Some(served) =
-            super::resolve_served_model_name(&self.manifest, &self.user_config)
-        {
+        if let Some(served) = super::resolve_served_model_name(&self.manifest, &self.user_config) {
             env.insert("SERVED_MODEL_NAME".into(), served);
         }
         let is_cuda_vllm = is_cuda_vllm_engine(&engine_id);

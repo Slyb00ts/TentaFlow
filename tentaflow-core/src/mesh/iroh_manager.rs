@@ -75,6 +75,12 @@ pub struct IrohMeshConfig {
     /// DHT listening + bootstrap dodaje ~0.5-1s do starta i na mobile nie
     /// jest potrzebne (LAN Bonjour + iroh relay wystarcza).
     pub enable_dht_discovery: bool,
+    /// Gotowy filtr adresow publikowanych przez iroh (relay + mDNS). Buduje go
+    /// pipeline na bazie ustawien GUI (`mesh.bind_mode` + filtry advertise) i
+    /// wstrzykuje tutaj — iroh_manager nie dotyka DbPool.
+    pub addr_filter: Option<iroh::address_lookup::AddrFilter>,
+    /// Wylacz portmapper iroh (UPnP/NAT-PMP/PCP) — przy pinowanym interfejsie.
+    pub disable_portmapper: bool,
 }
 
 impl Default for IrohMeshConfig {
@@ -85,6 +91,8 @@ impl Default for IrohMeshConfig {
             relay_url: None,
             enable_lan_discovery: true,
             enable_dht_discovery: true,
+            addr_filter: None,
+            disable_portmapper: false,
         }
     }
 }
@@ -361,6 +369,8 @@ impl IrohMeshManager {
             relay_url: config.relay_url.clone(),
             enable_lan_discovery: config.enable_lan_discovery,
             enable_dht_discovery: config.enable_dht_discovery,
+            addr_filter: config.addr_filter.clone(),
+            disable_portmapper: config.disable_portmapper,
         };
 
         let endpoint = IrohEndpoint::bind(iroh_config)
@@ -531,6 +541,14 @@ impl IrohMeshManager {
             Self::run_discovery_loop(me).await;
         }));
 
+        // DIAGNOSTYKA (mesh::pathdiag) — do usuniecia po debugu niestabilnosci
+        // QUIC. Periodycznie loguje stan sciezek iroh kazdego aktywnego
+        // polaczenia, zeby zobaczyc skoki selected_transport relay<->p2p.
+        let me = Arc::clone(self);
+        handles.push(tokio::spawn(async move {
+            Self::run_path_diag_loop(me).await;
+        }));
+
         handles
     }
 
@@ -638,6 +656,53 @@ impl IrohMeshManager {
                                 }
                             }
                         });
+                    }
+                }
+            }
+        }
+    }
+
+    // DIAGNOSTYKA (mesh::pathdiag) — instrumentacja do usuniecia po debugu.
+    // Co 3 s wypisuje, na jakiej sciezce (relay/p2p) siedzi kazde aktywne
+    // polaczenie oraz pelna liste sciezek iroh. Dzieki temu w logach widac,
+    // czy selected_transport danego peera skacze relay<->direct w czasie.
+    async fn run_path_diag_loop(self_arc: Arc<Self>) {
+        loop {
+            tokio::select! {
+                _ = self_arc.shutdown.cancelled() => {
+                    info!(target: "mesh::pathdiag", "path diag loop shutdown");
+                    return;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(3)) => {
+                    for entry in self_arc.connections.iter() {
+                        let active = entry.value();
+                        let snap = connection_snapshot_from_connection(&active.connection);
+                        // Skrocony peer id: pierwsze 8 znakow hex klucza.
+                        let peer_short: String = entry.key().chars().take(8).collect();
+                        let paths = snap
+                            .paths
+                            .iter()
+                            .map(|p| {
+                                format!(
+                                    "{}@{} selected={} closed={}",
+                                    p.transport, p.address, p.selected, p.closed
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        info!(
+                            target: "mesh::pathdiag",
+                            peer = %peer_short,
+                            direction = ?active.direction,
+                            connection_id = active.id,
+                            selected_transport = %snap.transport,
+                            scope = ?snap.scope,
+                            address = ?snap.address,
+                            relay_url = ?snap.relay_url,
+                            path_count = snap.paths.len(),
+                            paths = %paths,
+                            "iroh_mesh path diag"
+                        );
                     }
                 }
             }
@@ -2027,6 +2092,31 @@ impl IrohMeshManagerRef {
         };
         let reason = close_reason.as_deref().unwrap_or("stream closed");
         if was_current {
+            // DIAGNOSTYKA (mesh::pathdiag) — best-effort snapshot stanu sciezki
+            // TUZ przed smiercia polaczenia. `connection` nadal w scope; po
+            // bledzie accept_* paths() zwraca ostatni znany stan (akceptowalne).
+            // Do usuniecia po debugu niestabilnosci QUIC.
+            let close_snap = connection_snapshot_from_connection(&connection);
+            let close_paths = close_snap
+                .paths
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}@{} selected={} closed={}",
+                        p.transport, p.address, p.selected, p.closed
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            info!(
+                target: "mesh::pathdiag",
+                peer = %remote_hex,
+                reason,
+                last_transport = %close_snap.transport,
+                last_scope = ?close_snap.scope,
+                paths = %close_paths,
+                "iroh_mesh path diag: connection close snapshot"
+            );
             info!(peer = %remote_hex, reason, "iroh_mesh: polaczenie zamkniete");
             if reason.contains("tie-break-loser") {
                 let connections = Arc::clone(&self.connections);
@@ -2703,6 +2793,7 @@ mod tie_break_tests {
             relay_url: None,
             enable_lan_discovery: false,
             enable_dht_discovery: false,
+            ..Default::default()
         };
         IrohMeshManager::new(cfg, security)
             .await

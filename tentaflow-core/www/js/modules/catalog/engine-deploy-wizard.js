@@ -25,12 +25,17 @@ let hfSearchTimer = null;
 let hfResults = [];
 let hfSearching = false;
 let hfSearchQuery = '';
+let hfGgufFiles = [];
+let hfGgufFilesRepo = '';
+let hfGgufFilesLoading = false;
+let hfGgufFilesError = '';
 
 let selection = {
   nodeId: null,
   deployMethod: null,
   modelPresetId: null,
   modelRepo: null,
+  modelFile: null,
   port: null,
   containerName: null,
   gpuSelectMode: 'all',   // 'all' | 'specific' | 'none'
@@ -85,11 +90,16 @@ export async function openDeployWizard(engineId, opts = {}) {
   modelSourceMode = 'preset';
   hfResults = [];
   hfSearchQuery = '';
+  hfGgufFiles = [];
+  hfGgufFilesRepo = '';
+  hfGgufFilesLoading = false;
+  hfGgufFilesError = '';
   selection = {
     nodeId: opts.nodeId || null,
     deployMethod: null,
     modelPresetId: null,
     modelRepo: null,
+    modelFile: null,
     port: null,
     containerName: null,
     gpuSelectMode: 'all',
@@ -501,6 +511,7 @@ function renderHfSearch() {
         hint="${escapeAttr(hintText)}"></tf-input>
     </div>
     <div class="model-list" id="edw-hf-results">${renderHfResultsHtml()}</div>
+    <div id="edw-hf-gguf-files">${renderHfGgufFilesHtml()}</div>
   `;
 }
 
@@ -529,17 +540,70 @@ function renderHfResultsHtml() {
   }).join('');
 }
 
+function renderHfGgufFilesHtml() {
+  if (!isLlamaCppEngine() || !selection.modelRepo) return '';
+  if (hfGgufFilesLoading) {
+    return `<p class="form-hint">${escapeHtml(I18n.t('common.loading'))}</p>`;
+  }
+  if (hfGgufFilesError) {
+    return `<p class="form-hint">${escapeHtml(hfGgufFilesError)}</p>`;
+  }
+  if (hfGgufFilesRepo !== selection.modelRepo) return '';
+  if (hfGgufFiles.length === 0) {
+    return `<p class="form-hint">${escapeHtml(I18n.t('wizard.ggufNoFiles') || 'No GGUF files found in this repository.')}</p>`;
+  }
+  const rows = hfGgufFiles.map((file) => {
+    const sel = selection.modelFile === file.path ? ' selected' : '';
+    const size = file.size ? formatBytes(file.size) : '';
+    const quant = detectGgufQuantization(file.path);
+    const info = [quant, size].filter(Boolean).join(' · ');
+    return `
+      <div class="model-item${sel}" data-gguf-file="${escapeAttr(file.path)}">
+        <div class="model-item-main">
+          <div class="model-item-name mono">${escapeHtml(file.path)}</div>
+          ${info ? `<div class="model-item-info">${escapeHtml(info)}</div>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+  return `
+    <div class="form-group" style="margin-top:12px;">
+      <label>${escapeHtml(I18n.t('wizard.ggufFileLabel') || 'GGUF file')}</label>
+      <div class="model-list">${rows}</div>
+      <p class="form-hint">${escapeHtml(I18n.t('wizard.ggufFileHint') || 'Choose one GGUF quantization file. TentaFlow will download only this file, not the whole repository.')}</p>
+    </div>
+  `;
+}
+
 function hfSearchFilterHint() {
+  if (isLlamaCppEngine()) return 'GGUF';
   const id = String(engineEntry?.engine?.id || '').toLowerCase();
-  if (id.includes('llama') || id.includes('llamacpp')) return 'GGUF';
   if (id === 'mlx') return 'mlx-community/*';
   return '';
+}
+
+function isLlamaCppEngine() {
+  const id = String(engineEntry?.engine?.id || '').toLowerCase();
+  return id.includes('llama') || id.includes('llamacpp');
 }
 
 function formatCount(n) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+function formatBytes(n) {
+  if (n >= 1024 ** 3) return `${(n / (1024 ** 3)).toFixed(1)} GB`;
+  if (n >= 1024 ** 2) return `${(n / (1024 ** 2)).toFixed(0)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${n} B`;
+}
+
+function detectGgufQuantization(path) {
+  const name = String(path || '').replace(/\.gguf$/i, '');
+  const match = name.match(/(?:^|[-_])((?:IQ|Q)\d(?:_[A-Z0-9]+)+|BF16|F16|F32)(?:$|[-_])/i);
+  return match ? match[1].toUpperCase() : '';
 }
 
 // ---- Step Advanced: vLLM Auto-tuned -------------------------------------
@@ -592,6 +656,13 @@ async function fetchVllmRecommendation(overrides = {}) {
     gpus,
     ...overrides,
   };
+  // llama.cpp/GGUF: repo nie ma config.json, wiec backend liczy VRAM z metadanych
+  // wybranego pliku .gguf. Bez sciezki pliku backend nie ma czego odczytac.
+  // Wysylamy pole tylko gdy plik jest wybrany — pusty string oznaczalby dla
+  // backendu "podano sciezke", a to nieprawda.
+  if (isLlamaCppEngine() && selection.modelFile) {
+    body.gguf_file = selection.modelFile;
+  }
   try {
     const wireResp = await ApiBinary.action('deployVllmRecommendRequest', body);
     // Decoder pakuje cala odpowiedz w pole `json` (60+ pol w 4 zagniezdzonych
@@ -732,10 +803,21 @@ function renderStepAdvanced() {
   `;
 
   // VRAM calculator section.
+  // `rec.error` to TWARDY blad pobrania/odczytu konfiguracji modelu (404
+  // config.json, parse, brak pliku .gguf) — NIE przepelnienie VRAM. Realne
+  // przepelnienie wraca jako poprawna odpowiedz z vram_estimate.fits_total ===
+  // false i jest renderowane w renderVramCard (pill_oom + baner).
   const vramCard = isLoading
     ? `<div class="adv-section"><div class="adv-loading">${escapeHtml(tk('loading_config'))}</div></div>`
     : hasError
-      ? `<div class="adv-section"><div class="adv-error">${escapeHtml(rec.error)}</div></div>`
+      ? `
+        <div class="adv-section">
+          <div class="adv-error-box">
+            <strong>${escapeHtml(tk('error_config_failed'))}</strong>
+            ${escapeHtml(rec.error)}
+            <div class="adv-error-hint">${escapeHtml(tk('error_config_hint'))}</div>
+          </div>
+        </div>`
       : renderVramCard(rec, totalVramGb, gpus.length);
 
   // Mode card with auto/manual toggle and lock reset (only in manual when locked).
@@ -743,19 +825,6 @@ function renderStepAdvanced() {
   const resetBtn = showReset
     ? `<button type="button" class="adv-reset-lock" id="edw-adv-reset-lock" title="${escapeAttr(tk('reset_lock_title'))}">🔄 ${escapeHtml(tk('reset_lock'))}</button>`
     : '';
-  // Error box: backend returned 409 (e.g. two locked parameters whose combo
-  // exceeds VRAM). Suggest Reset or lower the locked parameter.
-  let errorBox = '';
-  if (hasError && adv.mode === 'manual') {
-    errorBox = `
-      <div class="adv-error-box">
-        <strong>${escapeHtml(tk('error_no_fit'))}</strong>
-        ${escapeHtml(rec.error)}
-        <div class="adv-error-hint">${escapeHtml(tk('error_hint'))}</div>
-      </div>
-    `;
-  }
-
   const modeCard = `
     <div class="adv-section">
       <div class="adv-sec-title">
@@ -767,7 +836,6 @@ function renderStepAdvanced() {
         <option value="auto" variant="neutral">${escapeHtml(tk('mode_auto'))}</option>
         <option value="manual" variant="neutral">${escapeHtml(tk('mode_manual'))}</option>
       </tf-segmented>
-      ${errorBox}
       ${adv.mode === 'auto'
         ? renderAutoAlert(rec)
         : `<div class="adv-manual">${renderAdvancedManualControls(adv, rec)}</div>`}
@@ -883,6 +951,14 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   const overflow = totalUsed > totalVramGb;
   const freeGb = Math.max(0, totalVramGb - totalUsed);
 
+  // Realne przepelnienie VRAM (jedyne miejsce uzycia error_no_fit). Backend
+  // sygnalizuje to przez vram_estimate.fits_total === false; dodatkowo lapiemy
+  // przekroczenie policzone client-side (overflow / pctUsed > 95).
+  const doesNotFit = v.fits_total === false || overflow || pctUsed > 95;
+  const noFitBanner = doesNotFit
+    ? `<div class="adv-error-box"><strong>${escapeHtml(tAdv('error_no_fit'))}</strong>${escapeHtml(tAdv('error_no_fit_hint'))}</div>`
+    : '';
+
   return `
     <div class="adv-section">
       <div class="adv-sec-title">
@@ -890,6 +966,7 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
         ${escapeHtml(tAdv('vram_calc_title'))}
         <div class="adv-sec-actions"><span class="${pillCls}">${escapeHtml(pillTxt)}</span></div>
       </div>
+      ${noFitBanner}
       <div class="adv-kpi-grid" id="edw-adv-kpi">
         <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
         <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(tAdv('kpi_kv_cache'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_kv_sub', { ctx: (r.max_model_len || 0).toLocaleString(), dtype: r.kv_cache_dtype || 'auto' }))}</div></div>
@@ -1397,10 +1474,14 @@ function renderStepRuntime() {
 
   let summary = '';
   if (selection.modelRepo) {
+    const fileHtml = selection.modelFile
+      ? `<div><code>${escapeHtml(selection.modelFile)}</code> <span class="form-hint inline">GGUF</span></div>`
+      : '';
     summary = `
       <div class="form-group">
         <label>${escapeHtml(I18n.t('wizard.modelLabel'))}</label>
         <div><code>${escapeHtml(selection.modelRepo)}</code> <span class="form-hint inline">(HuggingFace)</span></div>
+        ${fileHtml}
       </div>
     `;
   } else if (selection.modelPresetId) {
@@ -1690,6 +1771,7 @@ function bindStepModelInputs() {
     it.addEventListener('click', () => {
       selection.modelPresetId = it.dataset.presetId;
       selection.modelRepo = null;
+      selection.modelFile = null;
       document.querySelectorAll('.model-item[data-preset-id]').forEach((x) => x.classList.remove('selected'));
       it.classList.add('selected');
       const preset = Manifest.modelPresets(engineEntry).find((p) => p?.id === selection.modelPresetId);
@@ -1725,11 +1807,30 @@ function bindHfResultClicks() {
     it.addEventListener('click', () => {
       selection.modelRepo = it.dataset.repo;
       selection.modelPresetId = null;
+      selection.modelFile = null;
       document.querySelectorAll('.model-item[data-repo]').forEach((x) => x.classList.remove('selected'));
       it.classList.add('selected');
       // Free-form HF model nie ma sparowanego speculatora w manifescie —
       // reset, niech user wpisze recznie jak chce.
       applySpeculatorPreset(null);
+      advancedRecommendation = null;
+      cachedModelSpec = null;
+      if (isLlamaCppEngine()) {
+        loadHfGgufFiles(selection.modelRepo);
+      }
+    });
+  });
+  bindGgufFileClicks();
+}
+
+function bindGgufFileClicks() {
+  document.querySelectorAll('.model-item[data-gguf-file]').forEach((it) => {
+    it.addEventListener('click', () => {
+      selection.modelFile = it.dataset.ggufFile;
+      const quant = detectGgufQuantization(selection.modelFile);
+      selection.advanced.quantization = quant || null;
+      document.querySelectorAll('.model-item[data-gguf-file]').forEach((x) => x.classList.remove('selected'));
+      it.classList.add('selected');
       advancedRecommendation = null;
       cachedModelSpec = null;
     });
@@ -1803,6 +1904,10 @@ function canAdvance() {
         toast(I18n.t('wizard.selectModel'), 'error');
         return false;
       }
+      if (isLlamaCppEngine() && selection.modelRepo && !selection.modelFile) {
+        toast(I18n.t('wizard.selectGgufFile') || 'Choose a GGUF file to download.', 'error');
+        return false;
+      }
       return true;
     case 'gpu':
       if (selection.gpuSelectMode === 'specific' && selection.gpuIds.length === 0) {
@@ -1828,7 +1933,7 @@ async function doHfSearch(query) {
     if (!Array.isArray(data)) data = [];
 
     const engId = String(engineEntry?.engine?.id || '').toLowerCase();
-    if (engId.includes('llama') || engId.includes('llamacpp')) {
+    if (isLlamaCppEngine()) {
       data = data.filter((m) => String(m.id || '').toLowerCase().includes('gguf'));
     } else if (engId === 'mlx') {
       data = data.filter((m) => {
@@ -1851,6 +1956,49 @@ function updateHfResults() {
   if (!box) return;
   box.innerHTML = renderHfResultsHtml();
   bindHfResultClicks();
+  updateHfGgufFiles();
+}
+
+async function loadHfGgufFiles(repo) {
+  if (!repo) return;
+  hfGgufFiles = [];
+  hfGgufFilesRepo = repo;
+  hfGgufFilesError = '';
+  hfGgufFilesLoading = true;
+  updateHfGgufFiles();
+  try {
+    const url = `https://huggingface.co/api/models/${encodeHfRepo(repo)}/tree/main?recursive=true`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HF API ${resp.status}`);
+    let data = await resp.json();
+    if (!Array.isArray(data)) data = [];
+    hfGgufFiles = data
+      .map((entry) => ({
+        path: entry.rfilename || entry.path || '',
+        size: entry.size || 0,
+        type: entry.type || 'file',
+      }))
+      .filter((entry) => entry.type === 'file' && /\.gguf$/i.test(entry.path))
+      .sort((a, b) => a.path.localeCompare(b.path));
+  } catch (err) {
+    console.error('[wizard] HF GGUF files error:', err);
+    hfGgufFiles = [];
+    hfGgufFilesError = I18n.t('wizard.ggufFilesError') || 'Could not load GGUF files for this repository.';
+  } finally {
+    hfGgufFilesLoading = false;
+    updateHfGgufFiles();
+  }
+}
+
+function encodeHfRepo(repo) {
+  return String(repo || '').split('/').map((part) => encodeURIComponent(part)).join('/');
+}
+
+function updateHfGgufFiles() {
+  const box = document.getElementById('edw-hf-gguf-files');
+  if (!box) return;
+  box.innerHTML = renderHfGgufFilesHtml();
+  bindGgufFileClicks();
 }
 
 // ---- Deploy ---------------------------------------------------------------
@@ -1939,6 +2087,7 @@ async function startDeploy() {
     parameters: mlxParameters,
     model_preset_id: selection.modelPresetId || null,
     model_repo: selection.modelRepo || null,
+    model_file: selection.modelFile || null,
     // Native (python-bundle / binary / embedded) zawsze dostaje port z
     // PortAllocatora — wartosc z formularza jest ignorowana po stronie
     // backendu, wiec wysylamy null. Docker honoruje user-provided host port:

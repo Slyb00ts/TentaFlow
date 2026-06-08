@@ -448,8 +448,9 @@ impl Router {
     pub fn set_mesh_manager(&self, manager: Arc<crate::mesh::iroh_manager::IrohMeshManager>) {
         *self.mesh_manager.write() = Some(manager.clone());
         if let Some(db) = self.db.as_ref() {
-            let transport =
-                Arc::new(crate::mesh::vector_transport::MeshVectorTransport::new(manager));
+            let transport = Arc::new(crate::mesh::vector_transport::MeshVectorTransport::new(
+                manager,
+            ));
             crate::services::vector_namespace_manager(db).set_remote_transport(transport);
         }
     }
@@ -549,9 +550,7 @@ impl Router {
     }
 
     /// Slot residency — dla memory guard (lifecycle) zeby wyladowac wszystko.
-    pub fn model_residency(
-        &self,
-    ) -> Option<Arc<crate::services::model_residency::ModelResidency>> {
+    pub fn model_residency(&self) -> Option<Arc<crate::services::model_residency::ModelResidency>> {
         self.model_residency.read().clone()
     }
 

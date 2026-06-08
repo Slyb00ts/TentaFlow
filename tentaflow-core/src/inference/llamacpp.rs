@@ -1,306 +1,232 @@
 // =============================================================================
 // Plik: inference/llamacpp.rs
-// Opis: Adapter llama-cpp-rs (llama.cpp) dla lokalnej inferencji modeli GGUF.
-//       Implementuje trait InferenceEngine z wykorzystaniem crate llama-cpp-2.
+// Opis: Adapter llama.cpp dla lokalnej inferencji GGUF oparty o silnik continuous
+//       batching (LlamaEngine) z własnego wrappera TentaFlow — równoległe zapytania
+//       na jednym modelu/kontekście, streaming bez wątku-per-request (anty-hang).
+// Przykład: InferenceManager ładuje GGUF i wywołuje generate/generate_stream/
+//           embeddings przez ten adapter.
 // =============================================================================
 
-use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::sampling::LlamaSampler;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info, warn};
+use tentaflow_wrappers::llama::{LlamaLoadConfig, LlamaRuntime, SpeculativeConfig};
+use tentaflow_wrappers::llama_engine::{
+    EngineConfig, EngineSink, FinishReason, GenRequest, LlamaEngine, SamplingParams, SinkStatus,
+    SpeculativeMode, StreamToken as WrapperStreamToken,
+};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{info, warn};
 
 use crate::inference::{
     EmbeddingParams, EmbeddingResult, GenerateParams, GenerateResult, InferenceEngine, ModelInfo,
     StopReason, StreamToken,
 };
 
-/// Domyslny rozmiar kontekstu
-const DEFAULT_CTX_SIZE: u32 = 4096;
+// Domyślna liczba slotów sekwencji, gdy deploy nie poda jawnie równoległości.
+// Daje realną współbieżność out-of-the-box bez zalewania VRAM.
+const DEFAULT_N_SEQ_MAX: u32 = 8;
 
-/// Domyslna liczba warstw na GPU (99 = wszystkie)
-const DEFAULT_GPU_LAYERS: u32 = 99;
-
-/// Rozmiar batcha do przetwarzania prompt
-const BATCH_SIZE: usize = 512;
-
-/// Zaladowany model llama.cpp ze wszystkimi zasobami
+// Stan jednego załadowanego modelu. `engine` to silnik continuous batching
+// (generation-only). `embed_runtime` to leniwie tworzona, osobna ścieżka
+// embeddingów (patrz niżej — silnik nie liczy embeddingów). Oba żyją tu, żeby
+// unload mógł je czysto zdropować.
 struct LoadedModel {
-    model: LlamaModel,
-    backend: LlamaBackend,
-    ctx_size: u32,
+    engine: Arc<LlamaEngine>,
     info: ModelInfo,
+    // Materiał do leniwego utworzenia runtime embeddingów: ścieżka modelu i
+    // konfiguracja load (ctx/gpu/threads/flash-attn). Tworzymy go dopiero przy
+    // pierwszym żądaniu embeddingów, by deploy generacyjny nie ładował drugi raz
+    // modelu, jeśli embeddingi nie są używane.
+    embed_source: (PathBuf, LlamaLoadConfig),
+    embed_runtime: RwLock<Option<Arc<LlamaRuntime>>>,
 }
 
-// LlamaModel i LlamaBackend z llama-cpp-2 implementuja Send + Sync
-unsafe impl Send for LoadedModel {}
-unsafe impl Sync for LoadedModel {}
-
-/// Adapter llama.cpp — lokalna inferencja modeli GGUF
 pub struct LlamaCppEngine {
-    state: Arc<Mutex<Option<LoadedModel>>>,
+    state: Arc<RwLock<Option<LoadedModel>>>,
+}
+
+// Ujście streamingu: konwertuje wrapperowy StreamToken na rdzeniowy i wkłada do
+// kanału tokio bez blokowania scheduler-a silnika. `try_send` na tokio Senderze
+// jest nieblokujący; pełny kanał → Full (silnik odłoży token do pending tego
+// slotu), zamknięty → Closed (silnik zwolni slot).
+struct StreamSink {
+    tx: mpsc::Sender<StreamToken>,
+}
+
+impl EngineSink for StreamSink {
+    fn try_send(&mut self, token: WrapperStreamToken) -> SinkStatus {
+        // CR-003: na tokenie finalnym przenosimy realny finish_reason oraz twardy
+        // błąd silnika do rdzeniowego StreamToken, zamiast maskować je jako "stop".
+        let (finish_reason, error) = if token.is_final {
+            match &token.finish_reason {
+                Some(FinishReason::Error(msg)) => {
+                    warn!("Strumień llama.cpp zakończony błędem silnika: {msg}");
+                    (None, Some(msg.clone()))
+                }
+                other => (LlamaCppEngine::finish_reason_opt(other.clone()), None),
+            }
+        } else {
+            (None, None)
+        };
+        let core = StreamToken {
+            text: token.text,
+            is_final: token.is_final,
+            finish_reason,
+            error,
+        };
+        match self.tx.try_send(core) {
+            Ok(()) => SinkStatus::Delivered,
+            Err(mpsc::error::TrySendError::Full(core)) => SinkStatus::Full(WrapperStreamToken {
+                text: core.text,
+                is_final: core.is_final,
+                finish_reason: token.finish_reason,
+                generated_tokens: token.generated_tokens,
+                prompt_tokens: token.prompt_tokens,
+            }),
+            Err(mpsc::error::TrySendError::Closed(_)) => SinkStatus::Closed,
+        }
+    }
+}
+
+// Ujście dla blokującego `generate`: przekazuje PEŁNY wrapperowy StreamToken
+// (z finish_reason i liczbą tokenów na finale) do kanału tokio, skąd zbieramy
+// cały wynik. Kanał ma pojemność równą limitowi strumienia silnika, więc Full
+// realizuje backpressure per-slot tak samo jak w streamingu.
+struct CollectSink {
+    tx: mpsc::Sender<WrapperStreamToken>,
+}
+
+impl EngineSink for CollectSink {
+    fn try_send(&mut self, token: WrapperStreamToken) -> SinkStatus {
+        match self.tx.try_send(token) {
+            Ok(()) => SinkStatus::Delivered,
+            Err(mpsc::error::TrySendError::Full(t)) => SinkStatus::Full(t),
+            Err(mpsc::error::TrySendError::Closed(_)) => SinkStatus::Closed,
+        }
+    }
 }
 
 impl LlamaCppEngine {
     pub fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(None)),
+            state: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Buduje lancuch samplerow na podstawie parametrow generowania
-    fn build_sampler(params: &GenerateParams) -> LlamaSampler {
-        let mut samplers: Vec<LlamaSampler> = Vec::new();
-
-        // Kara za powtorzenia
-        if params.repeat_penalty > 1.0 {
-            samplers.push(LlamaSampler::penalties(
-                64, // okno ostatnich tokenow do sprawdzenia
-                params.repeat_penalty,
-                0.0, // frequency_penalty
-                0.0, // presence_penalty
-            ));
-        }
-
-        // Top-K filtrowanie
-        if params.top_k > 0 {
-            samplers.push(LlamaSampler::top_k(params.top_k as i32));
-        }
-
-        // Top-P (nucleus sampling)
-        if params.top_p < 1.0 {
-            samplers.push(LlamaSampler::top_p(params.top_p, 1));
-        }
-
-        // Temperatura
-        samplers.push(LlamaSampler::temp(params.temperature));
-
-        // Koncowy sampler: greedy jesli temp <= 0, losowy w przeciwnym razie
-        if params.temperature <= 0.0 {
-            samplers.push(LlamaSampler::greedy());
-        } else {
-            samplers.push(LlamaSampler::dist(0));
-        }
-
-        LlamaSampler::chain_simple(samplers)
+    fn load_config(deploy_params: &super::DeployParamsSnapshot) -> LlamaLoadConfig {
+        LlamaLoadConfig::from_deploy_hash_map(&deploy_params.llamacpp)
     }
 
-    /// Sprawdza czy wygenerowany tekst konczy sie na stop sequence
-    fn check_stop_sequence<'a>(text: &str, stop_sequences: &'a [String]) -> Option<&'a str> {
-        for stop in stop_sequences {
-            if text.ends_with(stop.as_str()) {
-                return Some(stop.as_str());
-            }
-        }
-        None
+    // Liczba slotów sekwencji z deploy params (`n_parallel` lub `max_concurrency`),
+    // z sensownym domyślnym fallbackiem. Wartość 0 traktujemy jak brak.
+    fn n_seq_max(deploy_params: &super::DeployParamsSnapshot) -> u32 {
+        let map = &deploy_params.llamacpp;
+        let read = |key: &str| map.get(key).and_then(|v| v.as_u64()).map(|v| v as u32);
+        read("n_parallel")
+            .or_else(|| read("max_concurrency"))
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_N_SEQ_MAX)
     }
 
-    /// Laduje model z pliku GGUF (operacja synchroniczna)
-    fn load_model_sync(model_path: &Path, gpu_layers: u32, ctx_size: u32) -> Result<LoadedModel> {
-        info!("Inicjalizacja backendu llama.cpp...");
-
-        let backend = LlamaBackend::init().map_err(|e| {
-            if matches!(e, llama_cpp_2::LlamaCppError::BackendAlreadyInitialized) {
-                warn!("Backend llama.cpp juz zainicjalizowany — kontynuuje");
-            }
-            anyhow::anyhow!("Blad inicjalizacji backendu llama.cpp: {}", e)
-        })?;
-
-        // Przekierowanie logow llama.cpp do tracing
-        llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
-
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
-
-        info!(
-            "Ladowanie modelu GGUF: {} (gpu_layers={})",
-            model_path.display(),
-            gpu_layers,
-        );
-
-        let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
-            .map_err(|e| anyhow::anyhow!("Nie udalo sie zaladowac modelu GGUF: {}", e))?;
-
-        let n_params = model.n_params();
-        let size_bytes = model.size() as u64;
-        let n_ctx_train = model.n_ctx_train();
-
-        info!(
-            "Model zaladowany: vocab={}, n_ctx_train={}, params={}M, size={}MB",
-            model.n_vocab(),
-            n_ctx_train,
-            n_params / 1_000_000,
-            size_bytes / (1024 * 1024),
-        );
-
-        // Okreslenie kwantyzacji na podstawie rozszerzenia nazwy pliku
-        let quantization = model_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|name| {
-                // Typowe wzorce: model-Q4_K_M.gguf, model.Q5_K_S.gguf
-                let upper = name.to_uppercase();
-                [
-                    "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M", "Q5_0",
-                    "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0", "F16", "F32",
-                ]
-                .iter()
-                .find(|q| upper.contains(*q))
-                .map(|q| q.to_string())
-            });
-
-        let info = ModelInfo {
-            name: model_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            path: model_path.to_string_lossy().to_string(),
-            size_bytes,
-            parameters: format!("{}M", n_params / 1_000_000),
-            quantization,
-            context_length: ctx_size.min(n_ctx_train),
-            loaded: true,
-            vram_used_mb: 0, // llama.cpp nie udostepnia tego bezposrednio
-            backend: "llamacpp".to_string(),
-            chat_template: None,
-        };
-
-        Ok(LoadedModel {
-            model,
-            backend,
-            ctx_size: ctx_size.min(n_ctx_train),
-            info,
-        })
+    // Mapuje deploy params na tryb speculative silnika. MTP/ngram konfiguruje się
+    // przez te same klucze co dotychczas (`speculative_method`,
+    // `num_speculative_tokens`, `size_ngram`, `size_mgram`). Silnik sam wymusza
+    // n_rs_seq i zwróci błąd przy MTP bez głowy nextn — nie zgadujemy tu obecności
+    // MTP, tylko przekładamy konfigurację.
+    fn speculative_mode(deploy_params: &super::DeployParamsSnapshot) -> SpeculativeMode {
+        match SpeculativeConfig::from_deploy_hash_map(&deploy_params.llamacpp) {
+            SpeculativeConfig::Off => SpeculativeMode::Off,
+            SpeculativeConfig::Mtp { num_tokens } => SpeculativeMode::Mtp {
+                n_max: num_tokens.max(1),
+            },
+            SpeculativeConfig::NgramSimple {
+                size_ngram,
+                size_mgram,
+            } => SpeculativeMode::NgramSimple {
+                // size_mgram = maksymalna długość draftu (n_max), size_ngram =
+                // minimalny wzorzec (n_min). Pilnujemy 1 <= n_min <= n_max.
+                n_max: (size_mgram as u32).max(1),
+                n_min: (size_ngram as u32).clamp(1, (size_mgram as u32).max(1)),
+            },
+        }
     }
 
-    /// Generuje tekst synchronicznie (wywoływane w spawn_blocking)
-    fn generate_sync(state: &LoadedModel, params: &GenerateParams) -> Result<GenerateResult> {
-        let start = Instant::now();
+    fn engine_config(
+        deploy_params: &super::DeployParamsSnapshot,
+        load: &LlamaLoadConfig,
+    ) -> EngineConfig {
+        let defaults = EngineConfig::default();
+        let map = &deploy_params.llamacpp;
+        let read_u32 = |key: &str| map.get(key).and_then(|v| v.as_u64()).map(|v| v as u32);
 
-        // Polacz system prompt z promptem uzytkownika
-        let full_prompt = match &params.system_prompt {
-            Some(sys) => format!("{}\n\n{}", sys, params.prompt),
-            None => params.prompt.clone(),
-        };
-
-        // Tokenizacja
-        let tokens = state
-            .model
-            .str_to_token(&full_prompt, AddBos::Always)
-            .map_err(|e| anyhow::anyhow!("Blad tokenizacji: {}", e))?;
-
-        let prompt_tokens = tokens.len() as u32;
-        debug!(
-            "Prompt: {} znakow -> {} tokenow",
-            full_prompt.len(),
-            prompt_tokens
-        );
-
-        // Kontekst inferencji
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(state.ctx_size))
-            .with_n_batch(BATCH_SIZE as u32);
-
-        let mut ctx = state
-            .model
-            .new_context(&state.backend, ctx_params)
-            .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc kontekstu: {}", e))?;
-
-        // Batch z prompt tokenami
-        let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
-        let last_idx = tokens.len() - 1;
-        for (i, token) in tokens.iter().enumerate() {
-            batch
-                .add(*token, i as i32, &[0], i == last_idx)
-                .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
+        EngineConfig {
+            n_seq_max: Self::n_seq_max(deploy_params),
+            ctx_per_seq: load.ctx_size,
+            // n_batch dziedziczy z batch_size load-configu (ten sam klucz co dawniej);
+            // n_ubatch z deploy lub domyślny. Silnik docina ubatch do batch.
+            n_batch: load.batch_size.max(1),
+            n_ubatch: read_u32("n_ubatch").unwrap_or(defaults.n_ubatch),
+            n_gpu_layers: load.n_gpu_layers,
+            threads: load.threads,
+            flash_attn: load.flash_attn,
+            kv_unified: map
+                .get("kv_unified")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.kv_unified),
+            // Silnik podbije n_rs_seq sam wg trybu speculative — zostawiamy 0.
+            n_rs_seq: 0,
+            speculative: Self::speculative_mode(deploy_params),
+            queue_capacity: read_u32("queue_capacity")
+                .map(|v| v as usize)
+                .unwrap_or(defaults.queue_capacity),
+            stream_capacity: read_u32("stream_capacity")
+                .map(|v| v as usize)
+                .unwrap_or(defaults.stream_capacity),
+            // CR-001: deadline postępu dostarczania (w sekundach z deploy params).
+            stream_stall_timeout: read_u32("stream_stall_timeout_secs")
+                .map(|v| std::time::Duration::from_secs(v as u64))
+                .unwrap_or(defaults.stream_stall_timeout),
         }
+    }
 
-        // Dekodowanie prompt
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow::anyhow!("Blad dekodowania prompt: {}", e))?;
-
-        // Sampler
-        let mut sampler = Self::build_sampler(params);
-
-        let mut generated_text = String::new();
-        let mut generated_tokens: u32 = 0;
-        let mut stop_reason = StopReason::MaxTokens;
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut n_cur = tokens.len() as i32;
-
-        for _ in 0..params.max_tokens {
-            let new_token = sampler.sample(&ctx, -1);
-            sampler.accept(new_token);
-
-            // Sprawdz koniec generowania (EOS)
-            if state.model.is_eog_token(new_token) {
-                stop_reason = StopReason::EndOfText;
-                break;
-            }
-
-            // Dekoduj token na tekst
-            let piece = state
-                .model
-                .token_to_piece(new_token, &mut decoder, false, None)
-                .unwrap_or_default();
-
-            generated_text.push_str(&piece);
-            generated_tokens += 1;
-
-            // Sprawdz stop sequences
-            if let Some(matched) =
-                Self::check_stop_sequence(&generated_text, &params.stop_sequences)
-            {
-                let trim_len = matched.len();
-                let new_len = generated_text.len() - trim_len;
-                generated_text.truncate(new_len);
-                stop_reason = StopReason::StopSequence(matched.to_string());
-                break;
-            }
-
-            // Sprawdz limit kontekstu
-            if n_cur + 1 >= state.ctx_size as i32 {
-                stop_reason = StopReason::MaxTokens;
-                break;
-            }
-
-            // Przygotuj nastepny batch
-            batch.clear();
-            batch
-                .add(new_token, n_cur, &[0], true)
-                .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
-            n_cur += 1;
-
-            ctx.decode(&mut batch)
-                .map_err(|e| anyhow::anyhow!("Blad dekodowania: {}", e))?;
+    fn gen_request(params: &GenerateParams) -> GenRequest {
+        GenRequest {
+            prompt: params.prompt.clone(),
+            system_prompt: params.system_prompt.clone(),
+            sampling: SamplingParams {
+                temperature: params.temperature,
+                top_p: params.top_p,
+                top_k: params.top_k,
+                repeat_penalty: params.repeat_penalty,
+                seed: 0,
+            },
+            max_tokens: params.max_tokens,
+            stop_sequences: params.stop_sequences.clone(),
         }
+    }
 
-        let elapsed = start.elapsed();
-        let tokens_per_second = if elapsed.as_secs_f64() > 0.0 {
-            generated_tokens as f64 / elapsed.as_secs_f64()
-        } else {
-            0.0
-        };
+    fn stop_reason(reason: Option<FinishReason>) -> StopReason {
+        match reason {
+            Some(FinishReason::StopSequence(value)) => StopReason::StopSequence(value),
+            Some(FinishReason::MaxTokens) => StopReason::MaxTokens,
+            // ContextFull/PromptTooLong/Error/EndOfText/None → traktujemy jak
+            // naturalne zakończenie; twarde błędy lecą osobną ścieżką (poniżej).
+            _ => StopReason::EndOfText,
+        }
+    }
 
-        Ok(GenerateResult {
-            text: generated_text,
-            tokens_generated: generated_tokens,
-            tokens_per_second,
-            prompt_tokens,
-            stop_reason,
-            time_to_first_token_ms: None,
-            total_time_ms: Some(elapsed.as_millis() as u64),
-        })
+    // Mapuje powód zakończenia silnika na rdzeniowy StopReason dla strumienia.
+    // Twardy błąd (FinishReason::Error) NIE trafia tu — jest obsługiwany osobno
+    // jako `error` w StreamToken. Pozostałe powody mapujemy na realny StopReason.
+    fn finish_reason_opt(reason: Option<FinishReason>) -> Option<StopReason> {
+        match reason {
+            Some(FinishReason::Error(_)) | None => Some(StopReason::EndOfText),
+            other => Some(Self::stop_reason(other)),
+        }
     }
 }
 
@@ -320,48 +246,77 @@ impl InferenceEngine for LlamaCppEngine {
         deploy_params: &super::DeployParamsSnapshot,
     ) -> Result<ModelInfo> {
         let path = model_path.to_path_buf();
-        let llamacpp = &deploy_params.llamacpp;
-        let layers = llamacpp
-            .get("n_gpu_layers")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as u32)
-            .unwrap_or(DEFAULT_GPU_LAYERS);
-        let ctx_size = llamacpp
-            .get("ctx_size")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(DEFAULT_CTX_SIZE);
+        let load = Self::load_config(deploy_params);
+        let engine_config = Self::engine_config(deploy_params, &load);
 
         info!(
-            "Ladowanie modelu: {} (gpu_layers={}, ctx={})",
+            "Ladowanie modelu GGUF (continuous batching): {} (n_seq_max={}, ctx_per_seq={}, n_batch={}, n_ubatch={}, gpu_layers={}, threads={:?}, flash_attn={:?}, speculative={:?})",
             path.display(),
-            layers,
-            ctx_size,
+            engine_config.n_seq_max,
+            engine_config.ctx_per_seq,
+            engine_config.n_batch,
+            engine_config.n_ubatch,
+            engine_config.n_gpu_layers,
+            engine_config.threads,
+            engine_config.flash_attn,
+            engine_config.speculative,
         );
 
-        // Ladowanie w osobnym watku (operacja synchroniczna C FFI)
-        let loaded =
-            tokio::task::spawn_blocking(move || Self::load_model_sync(&path, layers, ctx_size))
-                .await
-                .context("Blad w spawn_blocking podczas ladowania modelu")?
-                .context("Nie udalo sie zaladowac modelu")?;
+        // Silnik ładuje model w swoim wątku-schedulerze; spawn_blocking trzyma
+        // pulę tokio wolną na czas ładowania (sekundy dla dużych GGUF).
+        let load_path = path.clone();
+        let cfg = engine_config.clone();
+        let engine = tokio::task::spawn_blocking(move || LlamaEngine::load(&load_path, cfg))
+            .await
+            .context("Blad w spawn_blocking podczas ladowania silnika")?
+            .context("Nie udalo sie zaladowac modelu do silnika llama.cpp")?;
 
-        let info = loaded.info.clone();
-        *self.state.lock().await = Some(loaded);
+        // Metadane modelu czytamy osobno z GGUF (silnik nie wystawia ich, a info
+        // dashboardu ich potrzebuje). Tani odczyt nagłówka, bez ładowania wag.
+        let gguf = tentaflow_wrappers::llama::inspect_gguf(&path)
+            .context("Nie udalo sie odczytac metadanych GGUF")?;
+        let context_train = gguf.context_length.unwrap_or(0) as u32;
+        let info = ModelInfo {
+            name: gguf.name.clone(),
+            path: path.to_string_lossy().to_string(),
+            size_bytes: gguf.size_bytes,
+            // Liczba parametrów nie jest dostępna z samego nagłówka GGUF bez
+            // ładowania wag; silnik nie wystawia metadanych, więc zostawiamy puste.
+            parameters: String::new(),
+            quantization: gguf.quantization_version.map(|v| format!("v{v}")),
+            context_length: if context_train > 0 {
+                engine_config.ctx_per_seq.min(context_train)
+            } else {
+                engine_config.ctx_per_seq
+            },
+            loaded: true,
+            vram_used_mb: 0,
+            backend: "llamacpp".to_string(),
+            chat_template: if gguf.mtp_layers > 0 {
+                Some(format!("mtp:{}-layers", gguf.mtp_layers))
+            } else {
+                None
+            },
+        };
+
+        let loaded = LoadedModel {
+            engine: Arc::new(engine),
+            info: info.clone(),
+            embed_source: (path, load),
+            embed_runtime: RwLock::new(None),
+        };
+        *self.state.write().await = Some(loaded);
 
         info!("Model zaladowany pomyslnie: {}", info.name);
         Ok(info)
     }
 
     async fn unload_model(&self) -> Result<()> {
-        let mut guard = self.state.lock().await;
-        if guard.is_some() {
-            let name = guard
-                .as_ref()
-                .map(|m| m.info.name.clone())
-                .unwrap_or_default();
-            *guard = None;
-            info!("Model '{}' wyladowany z pamieci", name);
+        // Drop silnika kończy wątek-scheduler czysto; drop runtime embeddingów
+        // zwalnia drugi kontekst, jeśli był utworzony.
+        let mut guard = self.state.write().await;
+        if let Some(loaded) = guard.take() {
+            info!("Model '{}' wyladowany z pamieci", loaded.info.name);
         } else {
             warn!("Proba wyladowania modelu gdy zaden nie jest zaladowany");
         }
@@ -369,277 +324,163 @@ impl InferenceEngine for LlamaCppEngine {
     }
 
     fn model_info(&self) -> Option<ModelInfo> {
-        // Probujem zdobyc lock bez blokowania — jesli nie uda sie, zwracamy None
         self.state
-            .try_lock()
+            .try_read()
             .ok()
             .and_then(|guard| guard.as_ref().map(|m| m.info.clone()))
     }
 
     async fn generate(&self, params: GenerateParams) -> Result<GenerateResult> {
-        {
-            let guard = self.state.lock().await;
-            if guard.is_none() {
-                anyhow::bail!("Model nie jest zaladowany — wywolaj load_model() najpierw");
+        // Krótki read-lock: klonujemy Arc<LlamaEngine> i NATYCHMIAST zwalniamy
+        // lock — generacja biegnie bez trzymania jakiegokolwiek locka (anty-hang).
+        let engine = {
+            let guard = self.state.read().await;
+            let loaded = guard.as_ref().context("Model nie jest zaladowany")?;
+            Arc::clone(&loaded.engine)
+        };
+
+        let start = Instant::now();
+        let request = Self::gen_request(&params);
+        let (tx, mut rx) = mpsc::channel::<WrapperStreamToken>(256);
+        engine
+            .submit_with_sink(request, Box::new(CollectSink { tx }))
+            .map_err(|e| anyhow::anyhow!("Silnik odrzucil request: {e}"))?;
+
+        let mut text = String::new();
+        let mut generated_tokens = 0_u32;
+        let mut prompt_tokens = 0_u32;
+        let mut stop = StopReason::EndOfText;
+        let mut ttft: Option<Instant> = None;
+        let mut hard_error: Option<String> = None;
+
+        while let Some(token) = rx.recv().await {
+            if !token.text.is_empty() {
+                if ttft.is_none() {
+                    ttft = Some(Instant::now());
+                }
+                text.push_str(&token.text);
+            }
+            if token.is_final {
+                generated_tokens = token.generated_tokens;
+                // CR-004: realna liczba tokenów promptu z silnika (slot zna prompt.len()).
+                prompt_tokens = token.prompt_tokens;
+                if let Some(FinishReason::Error(msg)) = &token.finish_reason {
+                    hard_error = Some(msg.clone());
+                }
+                stop = Self::stop_reason(token.finish_reason);
+                break;
             }
         }
 
-        let state = self.state.clone();
-        let params_clone = params;
+        if let Some(msg) = hard_error {
+            anyhow::bail!("Generacja llama.cpp nie powiodla sie: {msg}");
+        }
 
-        tokio::task::spawn_blocking(move || {
-            // Blokujacy lock w watku spawn_blocking
-            let rt = tokio::runtime::Handle::current();
-            let guard = rt.block_on(state.lock());
-            let loaded = guard
-                .as_ref()
-                .context("Model zostal wyladowany w trakcie generowania")?;
+        let elapsed = start.elapsed();
+        let ttft_ms = ttft.map(|t| t.duration_since(start).as_millis() as u64);
+        // CR-004: tok/s liczymy od PIERWSZEGO tokena (TTFT), nie od startu — czas
+        // prefillu/TTFT nie zaniża tempa dekodowania. Bez pierwszego tokena (0 lub 1
+        // wygenerowany) tempo nie ma sensu → 0.0.
+        let decode_secs = match ttft {
+            Some(t) => elapsed.saturating_sub(t.duration_since(start)).as_secs_f64(),
+            None => 0.0,
+        };
+        let tokens_per_second = if decode_secs > 0.0 && generated_tokens > 1 {
+            (generated_tokens.saturating_sub(1)) as f64 / decode_secs
+        } else {
+            0.0
+        };
 
-            Self::generate_sync(loaded, &params_clone)
+        Ok(GenerateResult {
+            text,
+            tokens_generated: generated_tokens,
+            tokens_per_second,
+            prompt_tokens,
+            stop_reason: stop,
+            time_to_first_token_ms: ttft_ms,
+            total_time_ms: Some(elapsed.as_millis() as u64),
         })
-        .await
-        .context("Blad w spawn_blocking podczas generowania")?
     }
 
     async fn generate_stream(&self, params: GenerateParams) -> Result<mpsc::Receiver<StreamToken>> {
-        // Sprawdz czy model jest zaladowany
-        {
-            let guard = self.state.lock().await;
-            if guard.is_none() {
-                anyhow::bail!("Model nie jest zaladowany — wywolaj load_model() najpierw");
-            }
-        }
+        // Krótki read-lock → klon Arc → zwolnienie locka → submit. Scheduler
+        // silnika oddaje tokeny wprost do tego kanału tokio przez StreamSink,
+        // bez wątku-per-request i bez trzymania locka podczas generacji.
+        let engine = {
+            let guard = self.state.read().await;
+            let loaded = guard
+                .as_ref()
+                .context("Model nie jest zaladowany — wywolaj load_model() najpierw")?;
+            Arc::clone(&loaded.engine)
+        };
 
         let (tx, rx) = mpsc::channel::<StreamToken>(64);
-        let state = self.state.clone();
-        let params_clone = params;
-
-        // Generacja w osobnym watku
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            let guard = rt.block_on(state.lock());
-            let loaded = match guard.as_ref() {
-                Some(m) => m,
-                None => {
-                    warn!("Model wyladowany przed rozpoczeciem streamingu");
-                    return;
-                }
-            };
-
-            if let Err(e) = Self::stream_tokens(loaded, &params_clone, &tx) {
-                warn!("Blad podczas streamingu tokenow: {}", e);
-            }
-        });
+        let request = Self::gen_request(&params);
+        engine
+            .submit_with_sink(request, Box::new(StreamSink { tx }))
+            .map_err(|e| anyhow::anyhow!("Silnik odrzucil request: {e}"))?;
 
         Ok(rx)
     }
 
     async fn embeddings(&self, params: EmbeddingParams) -> Result<EmbeddingResult> {
-        let guard = self.state.lock().await;
-        let loaded = guard.as_ref().context("Model nie jest zaladowany")?;
+        // Silnik continuous batching jest generation-only. Embeddingi liczymy
+        // osobną, leniwie tworzoną ścieżką LlamaRuntime (kontekst z embeddings=true),
+        // obok silnika generacji — bez regresji wobec poprzedniej implementacji.
+        // Pełną unifikację (jeden model, kontekst embeddingów w silniku) zostawiamy
+        // na później; tu liczy się zero regresji.
+        let (runtime, source) = {
+            let guard = self.state.read().await;
+            let loaded = guard.as_ref().context("Model nie jest zaladowany")?;
+            let existing = loaded.embed_runtime.read().await.clone();
+            (existing, loaded.embed_source.clone())
+        };
 
-        // Sprawdz czy model wspiera embeddingi
-        // llama.cpp obsluguje embeddingi tylko dla modeli embedding
-        let n_embd = loaded.model.n_embd() as usize;
-        if n_embd == 0 {
-            anyhow::bail!("Model nie wspiera embedddingow");
-        }
+        let runtime = match runtime {
+            Some(rt) => rt,
+            None => {
+                // Utwórz runtime embeddingów raz, pod write-lockiem pola (double-check).
+                let (path, load) = source;
+                let built = tokio::task::spawn_blocking(move || LlamaRuntime::load(&path, load))
+                    .await
+                    .context("Blad w spawn_blocking podczas ladowania runtime embeddingow")?
+                    .context("Nie udalo sie zaladowac runtime embeddingow")?;
+                let built = Arc::new(built);
 
-        drop(guard);
-
-        let state = self.state.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            let guard = rt.block_on(state.lock());
-            let loaded = guard
-                .as_ref()
-                .context("Model zostal wyladowany w trakcie obliczania embedddingow")?;
-
-            let n_embd = loaded.model.n_embd() as usize;
-            let mut all_embeddings = Vec::with_capacity(params.texts.len());
-
-            for text in &params.texts {
-                let tokens = loaded
-                    .model
-                    .str_to_token(text, AddBos::Always)
-                    .map_err(|e| anyhow::anyhow!("Blad tokenizacji: {}", e))?;
-
-                let ctx_params = LlamaContextParams::default()
-                    .with_n_ctx(NonZeroU32::new(loaded.ctx_size))
-                    .with_n_batch(BATCH_SIZE as u32)
-                    .with_embeddings(true);
-
-                let mut ctx = loaded
-                    .model
-                    .new_context(&loaded.backend, ctx_params)
-                    .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc kontekstu: {}", e))?;
-
-                let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
-                let last_idx = tokens.len() - 1;
-                for (i, token) in tokens.iter().enumerate() {
-                    batch
-                        .add(*token, i as i32, &[0], i == last_idx)
-                        .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
+                let guard = self.state.read().await;
+                let loaded = guard.as_ref().context("Model nie jest zaladowany")?;
+                let mut slot = loaded.embed_runtime.write().await;
+                if let Some(existing) = slot.as_ref() {
+                    Arc::clone(existing)
+                } else {
+                    *slot = Some(Arc::clone(&built));
+                    built
                 }
-
-                ctx.decode(&mut batch)
-                    .map_err(|e| anyhow::anyhow!("Blad dekodowania: {}", e))?;
-
-                // Pobierz embedding z ostatniego tokena
-                let embd = ctx
-                    .embeddings_seq_ith(0)
-                    .map_err(|e| anyhow::anyhow!("Nie udalo sie pobrac embeddingu: {}", e))?;
-
-                let mut embedding: Vec<f32> = embd.to_vec();
-
-                // Normalizacja L2 jesli wymagana
-                if params.normalize {
-                    let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if norm > 0.0 {
-                        for val in &mut embedding {
-                            *val /= norm;
-                        }
-                    }
-                }
-
-                all_embeddings.push(embedding);
             }
+        };
 
+        let normalize = params.normalize;
+        let texts = params.texts;
+        let result = tokio::task::spawn_blocking(move || -> Result<EmbeddingResult> {
+            let dimensions = runtime.metadata().embedding_size as usize;
+            let mut embeddings = Vec::with_capacity(texts.len());
+            for text in &texts {
+                embeddings.push(runtime.embeddings(text, normalize)?);
+            }
             Ok(EmbeddingResult {
-                embeddings: all_embeddings,
-                dimensions: n_embd,
+                embeddings,
+                dimensions,
             })
         })
         .await
-        .context("Blad w spawn_blocking podczas obliczania embedddingow")?
+        .context("Blad w spawn_blocking podczas obliczania embeddingow")??;
+
+        Ok(result)
     }
 }
 
-impl LlamaCppEngine {
-    /// Generuje tokeny i wysyla je przez kanal (operacja synchroniczna)
-    fn stream_tokens(
-        loaded: &LoadedModel,
-        params: &GenerateParams,
-        tx: &mpsc::Sender<StreamToken>,
-    ) -> Result<()> {
-        // Polacz system prompt z promptem uzytkownika
-        let full_prompt = match &params.system_prompt {
-            Some(sys) => format!("{}\n\n{}", sys, params.prompt),
-            None => params.prompt.clone(),
-        };
-
-        // Tokenizacja
-        let tokens = loaded
-            .model
-            .str_to_token(&full_prompt, AddBos::Always)
-            .map_err(|e| anyhow::anyhow!("Blad tokenizacji: {}", e))?;
-
-        debug!(
-            "Stream: prompt {} znakow -> {} tokenow",
-            full_prompt.len(),
-            tokens.len()
-        );
-
-        // Kontekst
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(loaded.ctx_size))
-            .with_n_batch(BATCH_SIZE as u32);
-
-        let mut ctx = loaded
-            .model
-            .new_context(&loaded.backend, ctx_params)
-            .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc kontekstu: {}", e))?;
-
-        // Batch z prompt tokenami
-        let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
-        let last_idx = tokens.len() - 1;
-        for (i, token) in tokens.iter().enumerate() {
-            batch
-                .add(*token, i as i32, &[0], i == last_idx)
-                .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
-        }
-
-        // Dekodowanie prompt
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow::anyhow!("Blad dekodowania prompt: {}", e))?;
-
-        // Sampler
-        let mut sampler = Self::build_sampler(params);
-
-        let mut generated_text = String::new();
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut n_cur = tokens.len() as i32;
-
-        for _ in 0..params.max_tokens {
-            let new_token = sampler.sample(&ctx, -1);
-            sampler.accept(new_token);
-
-            // Sprawdz EOS
-            if loaded.model.is_eog_token(new_token) {
-                let _ = tx.blocking_send(StreamToken {
-                    text: String::new(),
-                    is_final: true,
-                });
-                return Ok(());
-            }
-
-            // Dekoduj token
-            let piece = loaded
-                .model
-                .token_to_piece(new_token, &mut decoder, false, None)
-                .unwrap_or_default();
-
-            generated_text.push_str(&piece);
-
-            // Sprawdz stop sequences
-            if let Some(_matched) =
-                Self::check_stop_sequence(&generated_text, &params.stop_sequences)
-            {
-                let _ = tx.blocking_send(StreamToken {
-                    text: String::new(),
-                    is_final: true,
-                });
-                return Ok(());
-            }
-
-            // Wyslij token — jesli odbiorca zamknal kanal, konczymy
-            if tx
-                .blocking_send(StreamToken {
-                    text: piece,
-                    is_final: false,
-                })
-                .is_err()
-            {
-                return Ok(());
-            }
-
-            // Sprawdz limit kontekstu
-            if n_cur + 1 >= loaded.ctx_size as i32 {
-                let _ = tx.blocking_send(StreamToken {
-                    text: String::new(),
-                    is_final: true,
-                });
-                return Ok(());
-            }
-
-            // Przygotuj nastepny batch
-            batch.clear();
-            batch
-                .add(new_token, n_cur, &[0], true)
-                .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
-            n_cur += 1;
-
-            ctx.decode(&mut batch)
-                .map_err(|e| anyhow::anyhow!("Blad dekodowania: {}", e))?;
-        }
-
-        // Osiagnieto max_tokens
-        let _ = tx.blocking_send(StreamToken {
-            text: String::new(),
-            is_final: true,
-        });
-
-        Ok(())
+impl Default for LlamaCppEngine {
+    fn default() -> Self {
+        Self::new()
     }
 }

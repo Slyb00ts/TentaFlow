@@ -44,7 +44,10 @@ impl FrameStream for DuplexFrameStream {
             .map_err(|e| transport_err(label, format!("read len: {e}")))?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_BASELINE_FRAME_BYTES {
-            return Err(transport_err(label, format!("frame too large: {len} bytes")));
+            return Err(transport_err(
+                label,
+                format!("frame too large: {len} bytes"),
+            ));
         }
         let mut body = vec![0u8; len];
         self.inner
@@ -198,7 +201,11 @@ fn insert_trusted_node(pool: &DbPool, node_id: &str, public_key_hex: &str) {
 
 /// Buduje `MeshSecurity` dawcy z `peer_node_id` juz w `trusted_nodes`. Zwraca
 /// `(security, donor_node_id)`. `donor_node_id` to ed25519 hex tozsamosci dawcy.
-fn donor_security(pool: DbPool, peer_node_id: &str, peer_pubkey_hex: &str) -> (Arc<MeshSecurity>, String) {
+fn donor_security(
+    pool: DbPool,
+    peer_node_id: &str,
+    peer_pubkey_hex: &str,
+) -> (Arc<MeshSecurity>, String) {
     insert_trusted_node(&pool, peer_node_id, peer_pubkey_hex);
     let security = MeshSecurity::new(pool, test_cipher()).expect("security new");
     let donor_node_id = security.ed25519_public_key_hex();
@@ -255,7 +262,13 @@ async fn happy_path_joiner_and_donor_reach_completed() {
         let donor_node_id = donor_node_id.clone();
         let joiner_node_id = joiner_node_id.clone();
         tokio::spawn(async move {
-            run_donor_session(&mut donor_stream, &security, &donor_node_id, &joiner_node_id).await
+            run_donor_session(
+                &mut donor_stream,
+                &security,
+                &donor_node_id,
+                &joiner_node_id,
+            )
+            .await
         })
     };
 
@@ -302,11 +315,15 @@ async fn happy_path_joiner_and_donor_reach_completed() {
     }
 
     // Obie strony: faza Completed.
-    let donor_state = load_adopt_state(&security.db).unwrap().expect("donor state");
+    let donor_state = load_adopt_state(&security.db)
+        .unwrap()
+        .expect("donor state");
     assert_eq!(donor_state.role, BaselineRole::Donor);
     assert_eq!(donor_state.phase, BaselinePhase::Completed);
 
-    let joiner_state = load_adopt_state(&joiner_pool).unwrap().expect("joiner state");
+    let joiner_state = load_adopt_state(&joiner_pool)
+        .unwrap()
+        .expect("joiner state");
     assert_eq!(joiner_state.role, BaselineRole::Joiner);
     assert_eq!(joiner_state.phase, BaselinePhase::Completed);
 }
@@ -330,8 +347,7 @@ async fn reroll_happy_path() {
         if donor_node_id >= joiner_node_id {
             continue;
         }
-        let (security, donor_node_id) =
-            donor_security(donor_pool, &joiner_node_id, &joiner_pubkey);
+        let (security, donor_node_id) = donor_security(donor_pool, &joiner_node_id, &joiner_pubkey);
 
         let joiner_pool = new_pool();
         seed_joiner_org(&joiner_pool);
@@ -344,8 +360,13 @@ async fn reroll_happy_path() {
             let donor_node_id = donor_node_id.clone();
             let joiner_node_id = joiner_node_id.clone();
             tokio::spawn(async move {
-                run_donor_session(&mut donor_stream, &security, &donor_node_id, &joiner_node_id)
-                    .await
+                run_donor_session(
+                    &mut donor_stream,
+                    &security,
+                    &donor_node_id,
+                    &joiner_node_id,
+                )
+                .await
             })
         };
         let joiner_pool_for_task = joiner_pool.clone();
@@ -367,7 +388,9 @@ async fn reroll_happy_path() {
         let report = joiner_task.await.unwrap().expect("joiner ok");
         assert_eq!(report.donor_org_id, "org-donor");
 
-        let joiner_state = load_adopt_state(&joiner_pool).unwrap().expect("joiner state");
+        let joiner_state = load_adopt_state(&joiner_pool)
+            .unwrap()
+            .expect("joiner state");
         assert_eq!(joiner_state.phase, BaselinePhase::Completed);
         return;
     }
@@ -485,7 +508,9 @@ async fn joiner_detects_corrupted_chunk() {
                 epoch: 0,
             };
             write_frame(&mut fake_donor, &ack, "ack").await.unwrap();
-            write_frame(&mut fake_donor, &header, "header").await.unwrap();
+            write_frame(&mut fake_donor, &header, "header")
+                .await
+                .unwrap();
             // Uszkadzamy bajt w pierwszym chunku ZACHOWUJAC content_hash — joiner
             // wykryje to przez per-chunk hash przy skladaniu.
             if let Some(b) = chunks[0].bytes.first_mut() {
@@ -559,7 +584,9 @@ async fn joiner_rejects_header_over_hard_cap_without_buffering() {
                 max_bytes: BASELINE_MAX_TOTAL_BYTES + 1,
                 content_hash: [0u8; 32],
             };
-            write_frame(&mut fake_donor, &header, "header").await.unwrap();
+            write_frame(&mut fake_donor, &header, "header")
+                .await
+                .unwrap();
             // Intentionally send NO chunks; the joiner must already be aborting.
         })
     };
@@ -651,15 +678,19 @@ async fn joiner_aborts_when_stream_overshoots_declared_total() {
                 epoch: 0,
             };
             write_frame(&mut fake_donor, &ack, "ack").await.unwrap();
-            write_frame(&mut fake_donor, &header, "header").await.unwrap();
+            write_frame(&mut fake_donor, &header, "header")
+                .await
+                .unwrap();
             // First chunk fills the declared total and is ACKed.
-            write_frame(&mut fake_donor, &chunk0, "chunk").await.unwrap();
-            let _ack: BaselineChunkAck =
-                read_frame(&mut fake_donor, "chunk_ack").await.unwrap();
+            write_frame(&mut fake_donor, &chunk0, "chunk")
+                .await
+                .unwrap();
+            let _ack: BaselineChunkAck = read_frame(&mut fake_donor, "chunk_ack").await.unwrap();
             // Second chunk overshoots — joiner must NACK and abort.
-            write_frame(&mut fake_donor, &chunk1, "chunk").await.unwrap();
-            let nack: BaselineChunkAck =
-                read_frame(&mut fake_donor, "chunk_ack").await.unwrap();
+            write_frame(&mut fake_donor, &chunk1, "chunk")
+                .await
+                .unwrap();
+            let nack: BaselineChunkAck = read_frame(&mut fake_donor, "chunk_ack").await.unwrap();
             assert!(!nack.ok, "joiner must NACK the overshooting chunk");
         })
     };
@@ -699,7 +730,13 @@ async fn donor_rejects_untrusted_peer() {
         let donor_node_id = donor_node_id.clone();
         let joiner_node_id = joiner_node_id.clone();
         tokio::spawn(async move {
-            run_donor_session(&mut donor_stream, &security, &donor_node_id, &joiner_node_id).await
+            run_donor_session(
+                &mut donor_stream,
+                &security,
+                &donor_node_id,
+                &joiner_node_id,
+            )
+            .await
         })
     };
 
@@ -709,7 +746,9 @@ async fn donor_rejects_untrusted_peer() {
         proposed_donor: String::new(),
         epoch_seen: 0,
     };
-    write_frame(&mut joiner_stream, &elect, "elect").await.unwrap();
+    write_frame(&mut joiner_stream, &elect, "elect")
+        .await
+        .unwrap();
     let ack: BaselineAck = read_frame(&mut joiner_stream, "ack").await.unwrap();
     assert!(!ack.accepted, "untrusted peer must get rejection");
 

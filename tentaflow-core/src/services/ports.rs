@@ -160,9 +160,8 @@ impl PortAllocator {
     pub fn peek_free(&self) -> Option<u16> {
         let (lo, hi) = self.range;
         let inner = self.inner.lock().ok()?;
-        (lo..=hi).find(|c| {
-            !inner.leased.contains(c) && !inner.excluded.contains(c) && is_port_free(*c)
-        })
+        (lo..=hi)
+            .find(|c| !inner.leased.contains(c) && !inner.excluded.contains(c) && is_port_free(*c))
     }
 
     /// Releases a previously acquired port so future calls may hand it out

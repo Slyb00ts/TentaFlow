@@ -21,10 +21,11 @@ target-dir = "target_shared"
 # per-machine przez ENV: `export CARGO_BUILD_JOBS=N` w shell rc, albo
 # inline: `cargo build --jobs N`.
 
-# Incremental compilation cache zostaje miedzy buildami — kluczowe dla
-# szybkich iteracji. Po zmianie 1 pliku rustc rekompiluje TYLKO ten plik
-# zamiast calego drzewa.
-incremental = true
+# Incremental NIE wymuszany globalnie. W [build] wlaczal incremental TAKZE dla
+# release (target_shared/release/incremental ~12 GB bez korzysci — release nie
+# iteruje plik-po-pliku). Bez tej linii Cargo stosuje domyslne per-profil:
+# dev/test = incremental ON (szybkie iteracje zostaja), release/bench = OFF
+# (mniej smieci na dysku). Override per-build: CARGO_INCREMENTAL=0/1.
 
 # Sccache jako rustc wrapper — cache'uje skompilowane jednostki na dysku,
 # wspoldzielone miedzy clean buildami i miedzy projektami.
@@ -50,10 +51,11 @@ incremental = true
 # =============================================================================
 
 [target.x86_64-unknown-linux-gnu]
-# Mold linker. Aktywacja: `sudo apt install mold` (debian/ubuntu) lub
-# `sudo dnf install mold` (fedora), potem odkomentuj 2 linijki:
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# Szybki linker (opt-in). lld/mold przyspieszaja link duzych binarek; lld jest
+# zainstalowany i dziala z profilem `release` (fat LTO). Domyslnie linker
+# systemowy, zeby nie wymuszac zaleznosci per-maszyna. Wlacz dla szybszego linku:
+#   linker = "clang"
+#   rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [target.aarch64-unknown-linux-gnu]
 # Linux ARM64 (Jetson, Graviton, Orin). Mold dziala identycznie.

@@ -14,9 +14,10 @@ use std::net::SocketAddr;
 use futures::Stream;
 use iroh::{
     address_lookup::{
-        DhtAddressLookup, DiscoveryEvent, DnsAddressLookup, MdnsAddressLookup, PkarrPublisher,
+        AddrFilter, DhtAddressLookup, DiscoveryEvent, DnsAddressLookup, MdnsAddressLookup,
+        PkarrPublisher,
     },
-    endpoint::{presets, QuicTransportConfig},
+    endpoint::{presets, PortmapperConfig, QuicTransportConfig},
     protocol::Router,
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
@@ -38,6 +39,16 @@ pub struct IrohConfig {
     pub enable_lan_discovery: bool,
     /// Wlacz DHT (pkarr-mainline) dla internetu.
     pub enable_dht_discovery: bool,
+    /// Filtr adresow publikowanych przez iroh (relay + mDNS). `None` => iroh
+    /// rozglasza wszystkie wykryte adresy hosta. Gdy `Some`, ten sam filtr
+    /// trafia do `AddressLookupServices` i do `MdnsAddressLookupBuilder`, zeby
+    /// pin interfejsu / filtry advertise z GUI obowiazywaly rowniez transport
+    /// iroh, nie tylko warstwe aplikacyjna NodeInfo.
+    pub addr_filter: Option<AddrFilter>,
+    /// Wylacz portmapper (UPnP/NAT-PMP/PCP). Przy pinowanym interfejsie
+    /// uzytkownik nie chce, zeby iroh dorzucal zewnetrzne kandydatury WAN z
+    /// mapowania portow na routerze.
+    pub disable_portmapper: bool,
 }
 
 impl IrohConfig {
@@ -49,6 +60,8 @@ impl IrohConfig {
             relay_url: None,
             enable_lan_discovery: true,
             enable_dht_discovery: true,
+            addr_filter: None,
+            disable_portmapper: false,
         }
     }
 }
@@ -119,6 +132,18 @@ impl IrohEndpoint {
             None => builder.relay_mode(RelayMode::Disabled),
         };
 
+        // Pin interfejsu / filtry advertise z GUI: ten filtr przycina liste
+        // adresow JESZCZE przed publikacja na poziomie AddressLookupServices,
+        // wiec peer nigdy nie dostaje kandydatow z docker/tailscale/zapasowych
+        // NIC — to gasi oscylacje selekcji sciezki QUIC (p2p<->relay flapping).
+        if let Some(filter) = config.addr_filter.clone() {
+            builder = builder.addr_filter(filter);
+        }
+        // Pin custom = bez zewnetrznych kandydatur WAN z mapowania portow.
+        if config.disable_portmapper {
+            builder = builder.portmapper_config(PortmapperConfig::Disabled);
+        }
+
         // Pkarr/DNS n0 swiadomie nie podlaczone — patrz komentarz przy
         // `presets::Minimal` wyzej. `_` na importy zostawia je w prelude
         // gdyby pozniejsza konfiguracja chciala je opcjonalnie dolaczyc.
@@ -134,7 +159,14 @@ impl IrohEndpoint {
         // zeby mozna bylo subskrybowac DiscoveryEvent-y. Builder przekazany
         // do Endpoint pre-bind nie daje uchwytu do subscribe — bug 137#.
         let mdns = if config.enable_lan_discovery {
-            let m = MdnsAddressLookup::builder()
+            // mDNS publikuje adresy lokalnie niezaleznie od relay/AddressLookup,
+            // wiec ten sam filtr musi trafic na jego builder — inaczej peerzy w
+            // LAN nadal zobaczyliby odfiltrowane (docker/tailscale) adresy.
+            let mut mdns_builder = MdnsAddressLookup::builder();
+            if let Some(filter) = config.addr_filter.clone() {
+                mdns_builder = mdns_builder.addr_filter(filter);
+            }
+            let m = mdns_builder
                 .build(endpoint.id())
                 .map_err(|e| IrohEndpointError::Bind(format!("mdns build: {e:?}")))?;
             endpoint

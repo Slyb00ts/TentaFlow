@@ -11,14 +11,14 @@ use std::sync::Arc;
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
-    BaselineAdoptClearResponse, BaselineAdoptPhaseTag, BaselineAdoptReport, BaselineAdoptStartRequest,
-    BaselineAdoptStartResponse, BaselineAdoptStatusResponse, BaselineDonorCandidate,
-    BaselineDonorListResponse, MeshConnectRequest, MeshConnectResponse, MeshNodeCommandRequest,
-    MeshNodeCommandResponse, MeshNodeNetworkConfigRequest, MeshNodeNetworkConfigResponse,
-    MeshPairingConfirmRequest, MeshPairingConfirmResponse, MeshPairingRejectRequest,
-    MeshPairingRejectResponse, MeshPairingStartRequest, MeshPairingStartResponse,
-    MeshTrustRetrustRequest, MeshTrustRetrustResponse, MeshTrustRevokeRequest,
-    MeshTrustRevokeResponse, MessageBody, ProtocolError, ProtocolErrorCode,
+    BaselineAdoptClearResponse, BaselineAdoptPhaseTag, BaselineAdoptReport,
+    BaselineAdoptStartRequest, BaselineAdoptStartResponse, BaselineAdoptStatusResponse,
+    BaselineDonorCandidate, BaselineDonorListResponse, MeshConnectRequest, MeshConnectResponse,
+    MeshNodeCommandRequest, MeshNodeCommandResponse, MeshNodeNetworkConfigRequest,
+    MeshNodeNetworkConfigResponse, MeshPairingConfirmRequest, MeshPairingConfirmResponse,
+    MeshPairingRejectRequest, MeshPairingRejectResponse, MeshPairingStartRequest,
+    MeshPairingStartResponse, MeshTrustRetrustRequest, MeshTrustRetrustResponse,
+    MeshTrustRevokeRequest, MeshTrustRevokeResponse, MessageBody, ProtocolError, ProtocolErrorCode,
 };
 use tracing::warn;
 
@@ -519,9 +519,7 @@ pub async fn mesh_node_network_config(
 // zyje w mesh::admin_ops / sync::core_baseline — tu robimy walidacje i mapowanie.
 // =============================================================================
 
-fn map_baseline_phase(
-    phase: crate::sync::core_baseline::BaselinePhase,
-) -> BaselineAdoptPhaseTag {
+fn map_baseline_phase(phase: crate::sync::core_baseline::BaselinePhase) -> BaselineAdoptPhaseTag {
     use crate::sync::core_baseline::BaselinePhase;
     match phase {
         BaselinePhase::Elected => BaselineAdoptPhaseTag::Elected,
@@ -649,8 +647,7 @@ pub fn baseline_adopt_status(
         load_adopt_report, load_adopt_state, BaselinePhase, BaselineRole,
     };
 
-    let state =
-        load_adopt_state(&ctx.state.db).map_err(baseline_ledger_err)?;
+    let state = load_adopt_state(&ctx.state.db).map_err(baseline_ledger_err)?;
 
     let response = match state {
         None => BaselineAdoptStatusResponse {
@@ -697,8 +694,7 @@ pub fn baseline_adopt_clear(
 ) -> Result<MessageBody, ProtocolError> {
     use crate::sync::core_baseline::{clear_adopt_state, load_adopt_state, BaselinePhase};
 
-    let state =
-        load_adopt_state(&ctx.state.db).map_err(baseline_ledger_err)?;
+    let state = load_adopt_state(&ctx.state.db).map_err(baseline_ledger_err)?;
 
     let response = match state {
         None => BaselineAdoptClearResponse {
@@ -1292,7 +1288,10 @@ mod baseline_adopt_handler_tests {
             .expect("status ok");
         match res {
             MessageBody::BaselineAdoptStatusResponseBody(r) => {
-                assert_eq!(r.phase, tentaflow_protocol::BaselineAdoptPhaseTag::Receiving);
+                assert_eq!(
+                    r.phase,
+                    tentaflow_protocol::BaselineAdoptPhaseTag::Receiving
+                );
                 assert_eq!(r.peer.as_deref(), Some("donor-node"));
                 assert_eq!(r.is_joiner, Some(true));
                 // Report only attached at Completed.

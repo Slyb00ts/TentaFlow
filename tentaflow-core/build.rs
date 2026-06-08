@@ -81,11 +81,20 @@ fn main() {
                     println!("cargo:rerun-if-changed={}", src_entry.display());
                 }
             }
-            println!("cargo:rerun-if-changed={}", addon_dir.join("Cargo.toml").display());
-            println!("cargo:rerun-if-changed={}", addon_dir.join("manifest.toml").display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                addon_dir.join("Cargo.toml").display()
+            );
+            println!(
+                "cargo:rerun-if-changed={}",
+                addon_dir.join("manifest.toml").display()
+            );
             println!("cargo:rerun-if-changed={}", addon_dir.join("src").display());
             if addon_dir.join("migrations").exists() {
-                println!("cargo:rerun-if-changed={}", addon_dir.join("migrations").display());
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    addon_dir.join("migrations").display()
+                );
             }
 
             println!(
@@ -118,10 +127,13 @@ fn main() {
             // a relative "target" interpretowane od nowego CWD = duplikacja
             // (addon_dir/addon_dir/target). Canonicalize z addon_dir (relative
             // od tentaflow-core/) → absolute.
-            let addon_target = match addon_dir.canonicalize() {
-                Ok(p) => p.join("target"),
-                Err(_) => addon_dir.join("target"),
-            };
+            // Wspoldzielony katalog wasm dla WSZYSTKICH addonow — addon-sdk i
+            // wspolne deps kompiluja sie RAZ, nie 18x (per-addon target/ to bylo
+            // ~25 GB i 18-krotna rekompilacja sdk). Katalog jest SIBLINGIEM
+            // target_shared (nie pod nim) → wlasny lock pliku, brak deadlocku z
+            // parent cargo. Buildy addonow sa sekwencyjne (status() blokuje),
+            // wiec jeden wspoldzielony katalog nie ma kontencji locka.
+            let addon_target = shared_addon_wasm_target();
             let status = Command::new("cargo")
                 .args(["build", "--target", "wasm32-wasip1", "--release"])
                 .current_dir(&addon_dir)
@@ -160,8 +172,8 @@ fn main() {
             let wasm_crate_name = read_crate_name(&addon_dir)
                 .unwrap_or_else(|| format!("tentaflow_addon_{}", addon_name));
             let wasm_filename = format!("{}.wasm", wasm_crate_name);
-            let wasm_path = addon_dir
-                .join("target/wasm32-wasip1/release")
+            let wasm_path = addon_target
+                .join("wasm32-wasip1/release")
                 .join(&wasm_filename);
 
             if !wasm_path.exists() {
@@ -319,6 +331,17 @@ fn check_wasm_target() -> bool {
             false
         }
     }
+}
+
+// Wspoldzielony katalog target dla buildow WASM wszystkich addonow. Sibling
+// `target_shared` (repo_root/target-addon-wasm) — NIE pod target_shared, zeby
+// miec osobny lock pliku i nie deadlockowac z parent cargo trzymajacym lock na
+// target_shared. Dzieki wspoldzieleniu addon-sdk + wspolne deps kompiluja sie
+// raz dla wszystkich addonow zamiast osobno per addon.
+fn shared_addon_wasm_target() -> PathBuf {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let repo_root = manifest.parent().unwrap_or(&manifest);
+    repo_root.join("target-addon-wasm")
 }
 
 // =============================================================================
@@ -1940,13 +1963,11 @@ fn validate_wasm_imports(wasm_path: &Path) -> Result<(), String> {
             for _ in 0..count {
                 let (mod_len, adv) = read_leb128_u32(&bytes[p..]);
                 p += adv;
-                let module = std::str::from_utf8(&bytes[p..p + mod_len as usize])
-                    .unwrap_or("?");
+                let module = std::str::from_utf8(&bytes[p..p + mod_len as usize]).unwrap_or("?");
                 p += mod_len as usize;
                 let (name_len, adv) = read_leb128_u32(&bytes[p..]);
                 p += adv;
-                let name = std::str::from_utf8(&bytes[p..p + name_len as usize])
-                    .unwrap_or("?");
+                let name = std::str::from_utf8(&bytes[p..p + name_len as usize]).unwrap_or("?");
                 p += name_len as usize;
                 // Skip import descriptor (kind: u8 + type index)
                 let kind = bytes[p];
@@ -1955,14 +1976,24 @@ fn validate_wasm_imports(wasm_path: &Path) -> Result<(), String> {
                 p += adv;
                 if kind == 1 {
                     // table import: extra (limits)
-                    let _flags = bytes[p]; p += 1;
-                    let (_init, adv) = read_leb128_u32(&bytes[p..]); p += adv;
-                    if _flags & 1 != 0 { let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv; }
+                    let _flags = bytes[p];
+                    p += 1;
+                    let (_init, adv) = read_leb128_u32(&bytes[p..]);
+                    p += adv;
+                    if _flags & 1 != 0 {
+                        let (_, adv) = read_leb128_u32(&bytes[p..]);
+                        p += adv;
+                    }
                 } else if kind == 2 {
                     // memory import: (limits)
-                    let _flags = bytes[p]; p += 1;
-                    let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv;
-                    if _flags & 1 != 0 { let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv; }
+                    let _flags = bytes[p];
+                    p += 1;
+                    let (_, adv) = read_leb128_u32(&bytes[p..]);
+                    p += adv;
+                    if _flags & 1 != 0 {
+                        let (_, adv) = read_leb128_u32(&bytes[p..]);
+                        p += adv;
+                    }
                 } else if kind == 3 {
                     // global import: valtype + mut
                     p += 2;

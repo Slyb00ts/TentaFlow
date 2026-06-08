@@ -5114,8 +5114,12 @@ mod tests {
             .unwrap();
 
         // Run the identity flip.
-        core_identity_int_to_uuid(&conn, CORE_IDENTITY_FLIP_VERSION, "core_identity_int_to_uuid")
-            .unwrap();
+        core_identity_int_to_uuid(
+            &conn,
+            CORE_IDENTITY_FLIP_VERSION,
+            "core_identity_int_to_uuid",
+        )
+        .unwrap();
 
         // (a) PKs are now TEXT UUIDs.
         for table in [
@@ -5332,7 +5336,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(joined_new, 1, "JOIN over the freshly written UUID must match");
+        assert_eq!(
+            joined_new, 1,
+            "JOIN over the freshly written UUID must match"
+        );
     }
 
     /// Regresja v58: migracja repair_admin_non_uuid_id naprawia stara instalacje,
@@ -5427,7 +5434,10 @@ mod tests {
 
         // (d) brak naruszen integralnosci referencyjnej.
         let violations = foreign_key_check(&conn).unwrap();
-        assert!(violations.is_empty(), "naruszenia FK po naprawie: {violations:?}");
+        assert!(
+            violations.is_empty(),
+            "naruszenia FK po naprawie: {violations:?}"
+        );
 
         // (e) migracja zostala oznaczona jako wykonana.
         let stamped: i64 = conn
@@ -5509,11 +5519,9 @@ mod tests {
 
         // (b) dziecko (binding) zremapowane na ten sam id.
         let binding_flow_id: String = conn
-            .query_row(
-                "SELECT flow_id FROM flow_model_bindings LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT flow_id FROM flow_model_bindings LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(
             binding_flow_id, CANONICAL,
@@ -5522,7 +5530,10 @@ mod tests {
 
         // (c) brak naruszen FK.
         let violations = foreign_key_check(&conn).unwrap();
-        assert!(violations.is_empty(), "naruszenia FK po naprawie: {violations:?}");
+        assert!(
+            violations.is_empty(),
+            "naruszenia FK po naprawie: {violations:?}"
+        );
 
         // (d) v61 zapisane w _migrations.
         let stamped: i64 = conn

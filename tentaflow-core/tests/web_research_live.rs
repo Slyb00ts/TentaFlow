@@ -7,9 +7,7 @@
 use tentaflow_core::web_research::browser_renderer;
 use tentaflow_core::web_research::reader;
 use tentaflow_core::web_research::search;
-use tentaflow_core::web_research::{
-    ReadMode, ReadUrlRequest, SearchProviderConfig, SearchRequest,
-};
+use tentaflow_core::web_research::{ReadMode, ReadUrlRequest, SearchProviderConfig, SearchRequest};
 
 #[test]
 #[ignore = "requires public internet and a running browser-renderer service"]
@@ -89,7 +87,10 @@ fn iphone_17_pro_max_price_research_through_core() {
         }
     }
 
-    assert!(rendered_pages > 0, "browser-renderer did not render any result");
+    assert!(
+        rendered_pages > 0,
+        "browser-renderer did not render any result"
+    );
     assert!(
         combined_text.contains("$1,199") || combined_text.contains("1,199"),
         "core search/read pages did not include expected iPhone 17 Pro Max starting price"

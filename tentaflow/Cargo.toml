@@ -13,12 +13,13 @@ gpu-cuda = ["tentaflow-core/gpu-cuda"]
 gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
 gpu-rocm = ["tentaflow-core/gpu-rocm"]
 gpu-metal = ["tentaflow-core/gpu-metal"]
+inference-whisper = ["tentaflow-core/inference-whisper"]
 
 [dependencies]
-# default-features = false wycina domyslny `inference-whisper` (whisper-rs /
-# whisper.cpp na CPU). Na macOS STT idzie WYLACZNIE przez mlx-whisper (GPU,
-# inference-mlx-whisper ponizej). whisper-rs zostaje tylko dla Linux/Windows.
-# `camera` re-dodane jawnie (tez bylo w default).
+# default-features = false nie linkuje whisper.cpp do tej samej binarki co llama.cpp.
+# Statyczne ggml/ggml-cuda z tych projektów kolidują symbolami; whisper trzeba
+# wlaczyc jawnie przez feature `inference-whisper` albo uruchamiac jako osobny serwis.
+# `camera` re-dodane jawnie.
 tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa", "inference-supertonic", "camera", "vector-milvus"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.52.2", features = ["full"] }
@@ -38,14 +39,10 @@ axoupdater = { version = "0.10.0", features = ["blocking"] }
 # (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i
 # src/mlx_swift_init.rs.
 # default-features = false KONIECZNE tez tutaj — inaczej cargo unifikuje
-# default (= inference-whisper) z bazowym depem i whisper-rs wraca na macOS.
+# default (= inference-whisper) z bazowym depem i wlacza whisper.cpp na macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
 tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro"] }
 libloading = "0.9.0"
-
-# whisper-rs (whisper.cpp) — tylko Linux/Windows. Apple (macOS/iOS) uzywa MLX.
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["inference-whisper"] }
 
 [profile.release]
 opt-level = 3
@@ -60,18 +57,20 @@ panic = "abort"
 # release-fast: dev iteracje gdzie chcesz produkcyjny opt-level ale BEZ
 # wielominutowego LTO + single-codegen. Buduj przez `cargo build --profile
 # release-fast`. Roznice vs release:
-#   * lto = "thin"        — 80% korzysci LTO za ~30% czasu (8x szybszy link)
-#   * codegen-units = 32  — codegen rownolegly. Wartosc dobrana zeby maszyny
-#                            16/32 cpu mialy pelna paralelizacje (codegen
-#                            jest threadowany w rustc); na 8-cpu nadmiarowe
-#                            unity czekaja w kolejce — koszt minimalny.
-#                            Override per-machine ENV:
-#                              CARGO_PROFILE_RELEASE_FAST_CODEGEN_UNITS=64
-# Binarka tylko ~2-5% wolniejsza w runtime — nieistotne dla dev.
+#   * lto = false         — BEZ whole-program LTO. thin/fat-LTO tej binarki
+#                            (200MB+: llama.cpp static + sherpa + wgpu + CUDA)
+#                            przy rownoleglym codegen (cu>1) ma peak RAM >61GB
+#                            -> OOM (SIGKILL) na finalnym linku. fat-LTO dziala
+#                            tylko bo cu=1 (serial, niski peak) — ale to te
+#                            wielominutowe 361s. Bez LTO codegen jest rownolegly
+#                            (cu=16) i NIE robi skoku RAM -> szybko i bez OOM.
+#   * codegen-units = 16  — rownolegly codegen na wszystkich rdzeniach.
+#   Runtime ~10-20% wolniejszy niz pelny `release` (brak inliningu cross-crate)
+#   — nieistotne dla dev/testow. Do WYDANIA uzywaj `release` (fat LTO).
 [profile.release-fast]
 inherits = "release"
-lto = "thin"
-codegen-units = 32
+lto = false
+codegen-units = 4
 strip = false   # debuginfo zostaje — backtrace przy crashu pokazuje funkcje
 
 # Szybszy dev `cargo build` (bez --release). Domyslny profil.dev ma
@@ -85,3 +84,9 @@ debug = 1
 incremental = true
 codegen-units = 256
 opt-level = 0
+
+[patch.crates-io]
+ed25519-dalek = { path = "../vendor/ed25519-dalek" }
+llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
+sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
+whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }
