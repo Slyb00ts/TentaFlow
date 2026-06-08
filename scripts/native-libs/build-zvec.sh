@@ -38,4 +38,4 @@ case "$PLATFORM" in
 esac
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/zvec"
-cp "$ROOT/tentaflow-zvec-sys/vendor/include/zvec/c_api.h" "$NATIVE_ROOT/$PLATFORM/include/zvec/c_api.h"
+cp -f "$ROOT/tentaflow-zvec-sys/vendor/include/zvec/c_api.h" "$NATIVE_ROOT/$PLATFORM/include/zvec/c_api.h"
