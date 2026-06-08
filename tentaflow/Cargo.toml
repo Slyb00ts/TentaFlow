@@ -57,18 +57,20 @@ panic = "abort"
 # release-fast: dev iteracje gdzie chcesz produkcyjny opt-level ale BEZ
 # wielominutowego LTO + single-codegen. Buduj przez `cargo build --profile
 # release-fast`. Roznice vs release:
-#   * lto = "thin"        — 80% korzysci LTO za ~30% czasu (8x szybszy link)
-#   * codegen-units = 32  — codegen rownolegly. Wartosc dobrana zeby maszyny
-#                            16/32 cpu mialy pelna paralelizacje (codegen
-#                            jest threadowany w rustc); na 8-cpu nadmiarowe
-#                            unity czekaja w kolejce — koszt minimalny.
-#                            Override per-machine ENV:
-#                              CARGO_PROFILE_RELEASE_FAST_CODEGEN_UNITS=64
-# Binarka tylko ~2-5% wolniejsza w runtime — nieistotne dla dev.
+#   * lto = false         — BEZ whole-program LTO. thin/fat-LTO tej binarki
+#                            (200MB+: llama.cpp static + sherpa + wgpu + CUDA)
+#                            przy rownoleglym codegen (cu>1) ma peak RAM >61GB
+#                            -> OOM (SIGKILL) na finalnym linku. fat-LTO dziala
+#                            tylko bo cu=1 (serial, niski peak) — ale to te
+#                            wielominutowe 361s. Bez LTO codegen jest rownolegly
+#                            (cu=16) i NIE robi skoku RAM -> szybko i bez OOM.
+#   * codegen-units = 16  — rownolegly codegen na wszystkich rdzeniach.
+#   Runtime ~10-20% wolniejszy niz pelny `release` (brak inliningu cross-crate)
+#   — nieistotne dla dev/testow. Do WYDANIA uzywaj `release` (fat LTO).
 [profile.release-fast]
 inherits = "release"
-lto = "thin"
-codegen-units = 32
+lto = false
+codegen-units = 4
 strip = false   # debuginfo zostaje — backtrace przy crashu pokazuje funkcje
 
 # Szybszy dev `cargo build` (bez --release). Domyslny profil.dev ma
