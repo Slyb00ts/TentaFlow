@@ -365,6 +365,18 @@ function Install-GitLfs {
     Invoke-NativeCapture { git lfs install } | Out-Host
     Log-Ok "Git LFS: $version"
     $script:Installed += 'git lfs install'
+
+    # Materializuj artefakty LFS (prebuilt native-libs/*.a|*.lib|*.dll). Jesli
+    # repo sklonowano ZANIM git-lfs byl zainstalowany, pliki sa pointerami a
+    # `git lfs install` rejestruje tylko filtry. Bez `git lfs pull` build.rs
+    # pada na brakujace native-libs.
+    $repoRoot = (Invoke-NativeCapture { git rev-parse --show-toplevel } | Select-Object -First 1)
+    if ($repoRoot) {
+        Log-Info 'Pobieranie artefaktow Git LFS (prebuilt native-libs)...'
+        Invoke-NativeCapture { git -C "$repoRoot" lfs pull } | Out-Host
+        Log-Ok 'Git LFS: artefakty pobrane'
+        $script:Installed += 'git lfs pull'
+    }
 }
 
 function Configure-CmakeGenerator {
