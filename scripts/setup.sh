@@ -473,6 +473,74 @@ install_git_lfs() {
     fi
 }
 
+# --- Docker (wymagany przez TentaFlow runtime + build zvec) ---
+#
+# TentaFlow w runtime uruchamia kontenery z silnikami AI przez bollard
+# (services/deploy/docker.rs), wiec biezacy user MUSI miec dostep do socketu
+# dockera bez sudo — inaczej deploy silnikow pada na "permission denied
+# /var/run/docker.sock". Build zvec (kontener gcc-11) tez tego potrzebuje.
+# Dlatego instalujemy Docker, startujemy daemon i dodajemy usera do grupy
+# 'docker' ZAWSZE (nie tylko gdy zvec idzie przez kontener).
+ensure_docker() {
+    log_section "Docker"
+
+    if [[ "$DISTRO" == "macos" ]]; then
+        if command -v docker &>/dev/null; then
+            log_ok "Docker: $(docker --version 2>/dev/null)"
+        else
+            log_warn "Docker nie znaleziony — zainstaluj Docker Desktop recznie: https://www.docker.com/products/docker-desktop"
+        fi
+        return
+    fi
+
+    if ! command -v docker &>/dev/null; then
+        log_info "Instaluje Docker (TentaFlow uruchamia kontenery z silnikami AI)..."
+        case "$DISTRO" in
+            arch)   run_privileged pacman -S --needed --noconfirm docker ;;
+            debian) run_privileged apt-get install -y docker.io ;;
+            fedora) run_privileged dnf install -y docker || run_privileged dnf install -y moby-engine ;;
+        esac
+    fi
+    if ! command -v docker &>/dev/null; then
+        log_error "Nie udalo sie zainstalowac Dockera — zainstaluj recznie i uruchom setup ponownie."
+        return
+    fi
+    log_ok "Docker: $(docker --version 2>/dev/null)"
+
+    # Daemon (systemd)
+    if command -v systemctl &>/dev/null; then
+        run_privileged systemctl enable --now docker 2>/dev/null || true
+    fi
+
+    # Grupa 'docker' dla usera — bez tego ani build, ani TentaFlow w runtime nie
+    # siegna socketu bez sudo. Przy `sudo ./setup.sh` realnym userem jest
+    # $SUDO_USER, nie root.
+    local docker_user="${SUDO_USER:-$(id -un)}"
+    if [[ -n "$docker_user" && "$docker_user" != "root" ]]; then
+        if id -nG "$docker_user" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+            log_ok "Uzytkownik '$docker_user' jest juz w grupie 'docker'."
+        else
+            run_privileged groupadd -f docker 2>/dev/null || true
+            if run_privileged usermod -aG docker "$docker_user" 2>/dev/null; then
+                log_warn "Dodano '$docker_user' do grupy 'docker'."
+                log_warn "  WAZNE: wyloguj sie i zaloguj ponownie (lub 'newgrp docker') — inaczej ani"
+                log_warn "  build, ani TentaFlow runtime nie siegna socketu dockera bez sudo."
+                NEED_DOCKER_RELOGIN=true
+                INSTALLED+=("usermod -aG docker $docker_user")
+            fi
+        fi
+    fi
+
+    # Weryfikacja dostepu w biezacej sesji
+    if docker info &>/dev/null; then
+        log_ok "Docker dostepny dla biezacej sesji (bez sudo)."
+    elif run_privileged docker info &>/dev/null; then
+        log_warn "Docker dziala, ale ta sesja nie ma jeszcze dostepu — wymagany re-login/'newgrp docker'."
+    else
+        log_warn "Docker zainstalowany, ale daemon nie odpowiada — sprawdz: sudo systemctl status docker"
+    fi
+}
+
 # --- zvec (wbudowana baza wektorowa — statyczny artefakt per platforma) ---
 
 install_zvec() {
@@ -1460,6 +1528,12 @@ print_summary() {
     fi
 
     echo ""
+    if [[ "${NEED_DOCKER_RELOGIN:-}" == true ]]; then
+        log_warn "UWAGA: dodano Cie do grupy 'docker'. WYLOGUJ SIE I ZALOGUJ PONOWNIE"
+        log_warn "(albo uruchom 'newgrp docker') ZANIM zbudujesz/uruchomisz TentaFlow —"
+        log_warn "inaczej build zvec i deploy silnikow AI pada na 'permission denied docker.sock'."
+        echo ""
+    fi
     log_info "Mozesz teraz zbudowac TentaFlow:"
     echo -e "  ${BOLD}cd tentaflow && cargo build --release${NC}"
     echo ""
@@ -1491,6 +1565,7 @@ main() {
 
     install_base
     install_git_lfs
+    ensure_docker
     install_zvec
     install_rust
     install_wasm_target
