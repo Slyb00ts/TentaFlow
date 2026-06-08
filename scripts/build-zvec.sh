@@ -119,7 +119,24 @@ fi
   git submodule foreach --recursive 'git clean -fdxq' 2>/dev/null || true )
 
 OUT_LIB_DIR="$SYS_CRATE/vendor/lib/$PLATFORM"
-mkdir -p "$OUT_LIB_DIR" "$VENDOR_INCLUDE"
+# Zapewnij, ze katalogi docelowe naleza do biezacego usera. Jesli istnieja jako
+# root-owned (np. po wczesniejszym sudo-buildzie albo klonie repo jako root w
+# /opt), odzyskaj wlasnosc przez sudo chown — inaczej cp ponizej pada na
+# "Permission denied". Uniwersalnie, niezaleznie od sposobu sklonowania repo.
+for _dir in "$OUT_LIB_DIR" "$VENDOR_INCLUDE"; do
+  if ! ( mkdir -p "$_dir" 2>/dev/null && [ -w "$_dir" ] ); then
+    _owner="$(id -un):$(id -gn)"
+    echo ">>> $_dir nie jest zapisywalny (root-owned?) — odzyskuje wlasnosc dla $_owner (sudo moze poprosic o haslo)..." >&2
+    if command -v sudo >/dev/null 2>&1; then
+      sudo mkdir -p "$_dir" || true
+      sudo chown -R "$_owner" "$_dir" || true
+    fi
+    if [ ! -w "$_dir" ]; then
+      echo "BLAD: nadal brak zapisu w $_dir. Uruchom: sudo chown -R $_owner \"$_dir\"" >&2
+      exit 1
+    fi
+  fi
+done
 
 # Desktop builds link zvec's self-contained shared library (it bundles RocksDB/
 # Arrow/protobuf + a static libstdc++ and exports only the C API). Mobile builds
@@ -139,7 +156,24 @@ case "$PLATFORM" in
         ninja zvec_c_api -j"$(nproc)" )
     else
       echo "  Brak natywnego gcc-11/ninja/cmake<4 — buduje w Dockerze (Ubuntu 22.04/gcc-11)."
-      docker run --rm -v "$SRC_DIR:/src" -w /src ubuntu:22.04 bash -c '
+      # Wybor wywolania dockera: jesli biezacy user nie ma dostepu do socketu
+      # (nie nalezy do grupy 'docker' ALBO dodano go do niej, ale zmiana wejdzie
+      # dopiero po re-loginie), spadnij na 'sudo docker'. Artefakty i tak sa
+      # chown-owane z powrotem do usera w kontenerze (ponizej), wiec nie zostaja
+      # root-owned. Dzieki temu build-all.sh dziala bez wylogowywania sie.
+      DOCKER="docker"
+      if ! docker info >/dev/null 2>&1; then
+        if command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+          echo "  (brak dostepu do socketu dockera dla biezacego usera — uzywam 'sudo docker';"
+          echo "   aby dzialac bez sudo: 'sudo usermod -aG docker \$USER' i przeloguj sie / 'newgrp docker')"
+          DOCKER="sudo docker"
+        else
+          echo "  BLAD: docker niedostepny (ani bezposrednio, ani przez sudo). Uruchom daemon dockera" >&2
+          echo "  (sudo systemctl enable --now docker) albo dodaj sie do grupy 'docker' i przeloguj." >&2
+          exit 1
+        fi
+      fi
+      $DOCKER run --rm -v "$SRC_DIR:/src" -w /src ubuntu:22.04 bash -c '
         set -e
         export DEBIAN_FRONTEND=noninteractive CC=gcc-11 CXX=g++-11
         apt-get update -qq && apt-get install -y -qq build-essential gcc-11 g++-11 git python3 python3-pip libssl-dev pkg-config curl ca-certificates >/dev/null 2>&1
@@ -151,7 +185,7 @@ case "$PLATFORM" in
         chown -R '"$(id -u):$(id -g)"' /src/build_zvec
       '
     fi
-    cp "$SRC_DIR/build_zvec/lib/libzvec_c_api.so" "$OUT_LIB_DIR/libzvec_c_api.so"
+    cp -f "$SRC_DIR/build_zvec/lib/libzvec_c_api.so" "$OUT_LIB_DIR/libzvec_c_api.so"
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.so"
     ;;
   macos-arm64)
@@ -160,7 +194,7 @@ case "$PLATFORM" in
     ( cd "$SRC_DIR" && rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
       cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON ..
       ninja zvec_c_api -j"$(sysctl -n hw.ncpu)" )
-    cp "$SRC_DIR/build_zvec/lib/libzvec_c_api.dylib" "$OUT_LIB_DIR/libzvec_c_api.dylib"
+    cp -f "$SRC_DIR/build_zvec/lib/libzvec_c_api.dylib" "$OUT_LIB_DIR/libzvec_c_api.dylib"
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.dylib"
     ;;
   ios-arm64|ios-sim-arm64)
@@ -295,7 +329,7 @@ case "$PLATFORM" in
 esac
 
 # Vendor the header (committed) — keep it in sync with the built lib.
-cp "$SRC_DIR/src/include/zvec/c_api.h" "$VENDOR_INCLUDE/c_api.h"
+cp -f "$SRC_DIR/src/include/zvec/c_api.h" "$VENDOR_INCLUDE/c_api.h"
 
 echo ""
 echo "=========================================="

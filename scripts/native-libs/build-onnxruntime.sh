@@ -61,12 +61,12 @@ case "$ARCHIVE" in
     require_cmd unzip
     unzip -q "$ARCHIVE_PATH" -d "$UNPACK/raw"
     first_dir="$(find "$UNPACK/raw" -mindepth 1 -maxdepth 1 -type d | head -n1)"
-    cp -R "$first_dir/"* "$UNPACK/"
+    cp -Rf "$first_dir/"* "$UNPACK/"
     ;;
 esac
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/onnxruntime"
-cp -R "$UNPACK/include/"* "$NATIVE_ROOT/$PLATFORM/include/onnxruntime/"
+cp -Rf "$UNPACK/include/"* "$NATIVE_ROOT/$PLATFORM/include/onnxruntime/"
 copy_matching "$UNPACK" "$NATIVE_ROOT/$PLATFORM/lib-dynamic" -name 'libonnxruntime*.so*' -o -name 'libonnxruntime*.dylib' -o -name 'onnxruntime.dll'
 
 append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" "Domyślnie pobierany oficjalny runtime; ustaw ONNXRUNTIME_MODE=static aby budować ze źródeł."

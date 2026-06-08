@@ -50,14 +50,40 @@ require_cmd() {
   [ "$missing" -eq 0 ]
 }
 
+# Zapewnia, ze katalog istnieje i jest WLASNOSCIA biezacego usera. Jesli istnieje,
+# ale jest root-owned / niezapisywalny (np. po wczesniejszym sudo-buildzie albo
+# klonie repo jako root w /opt), odzyskuje wlasnosc przez `sudo chown`. Dzieki
+# temu kolejne user-owe mkdir/cp NIE padaja na "Permission denied" — niezaleznie
+# od tego jak repo zostalo sklonowane (uniwersalnie). Bez tego buildy zostawialy
+# root-owned artefakty i nastepne uruchomienia jako user sie wywalaly.
+ensure_owned_dir() {
+  local dir="$1"
+  if mkdir -p "$dir" 2>/dev/null && [ -w "$dir" ]; then
+    return 0
+  fi
+  # Katalog jest root-owned / niezapisywalny. Odzyskujemy wlasnosc przez sudo —
+  # WIDOCZNIE (bez 2>/dev/null), zeby ewentualny prompt o haslo sie pokazal i
+  # zeby blad sudo nie zostal po cichu polkniety (wczesniej dlatego "self-heal"
+  # nie dzialal). Po probie weryfikujemy i failujemy GLOSNO z gotowa komenda.
+  local owner; owner="$(id -un):$(id -gn)"
+  echo ">>> $dir nie jest zapisywalny (root-owned?) — odzyskuje wlasnosc dla $owner (sudo moze poprosic o haslo)..." >&2
+  if command -v sudo >/dev/null 2>&1; then
+    sudo mkdir -p "$dir" || true
+    sudo chown -R "$owner" "$dir" || true
+  fi
+  if [ ! -w "$dir" ]; then
+    echo "BLAD: nadal brak zapisu w $dir." >&2
+    echo "      Uruchom recznie:  sudo chown -R $owner \"$dir\"" >&2
+    return 1
+  fi
+}
+
 prepare_layout() {
   local platform="$1"
-  mkdir -p \
-    "$NATIVE_ROOT/$platform/include" \
-    "$NATIVE_ROOT/$platform/lib-static" \
-    "$NATIVE_ROOT/$platform/lib-dynamic" \
-    "$NATIVE_CACHE/src" \
-    "$NATIVE_CACHE/build"
+  ensure_owned_dir "$NATIVE_ROOT/$platform/include"
+  ensure_owned_dir "$NATIVE_ROOT/$platform/lib-static"
+  ensure_owned_dir "$NATIVE_ROOT/$platform/lib-dynamic"
+  mkdir -p "$NATIVE_CACHE/src" "$NATIVE_CACHE/build"
 }
 
 repo_checkout() {
@@ -94,7 +120,7 @@ copy_matching() {
   local dst="$2"
   shift 2
   mkdir -p "$dst"
-  find "$src" -type f \( "$@" \) -exec cp {} "$dst/" \;
+  find "$src" -type f \( "$@" \) -exec cp -f {} "$dst/" \;
 }
 
 write_manifest_header() {
