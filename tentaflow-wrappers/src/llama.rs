@@ -917,7 +917,9 @@ fn model_meta_string(read: impl Fn(*mut std::os::raw::c_char, usize) -> i32) -> 
     if needed < 0 {
         return None;
     }
-    let mut buf = vec![0_i8; needed as usize + 1];
+    // c_char jest i8 na x86_64, ale u8 na aarch64 (char domyslnie unsigned na
+    // ARM). Buforujemy jako c_char, zeby wskaznik pasowal do FFI na obu ABI.
+    let mut buf = vec![0 as std::os::raw::c_char; needed as usize + 1];
     let written = read(buf.as_mut_ptr(), buf.len());
     if written < 0 {
         return None;
@@ -1034,7 +1036,8 @@ pub(crate) fn token_to_piece_with_model(
     decoder: &mut encoding_rs::Decoder,
 ) -> String {
     let vocab = unsafe { sys::llama_model_get_vocab(model) };
-    let mut buf = vec![0_i8; 256];
+    // c_char = i8 (x86_64) / u8 (aarch64) — patrz model_meta_string.
+    let mut buf = vec![0 as std::os::raw::c_char; 256];
     let mut n = unsafe {
         sys::llama_token_to_piece(vocab, token, buf.as_mut_ptr(), buf.len() as i32, 0, false)
     };
