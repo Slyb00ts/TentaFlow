@@ -3,6 +3,7 @@
 # =============================================================================
 target/
 target_shared/
+target-addon-wasm/
 target-service-context-test/*
 
 # Runtime data (SQLite, HMAC keys, container bundles, model cache).
