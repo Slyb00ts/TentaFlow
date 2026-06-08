@@ -633,11 +633,13 @@ install_zvec() {
     log_info "Buduje zvec ($plat) — dlugi build (RocksDB+Arrow), jednorazowo na maszyne..."
     local build_sh="$(dirname "$0")/build-zvec.sh"
     local built=false
-    if [[ "$need_sudo" == true ]]; then
-        run_privileged bash "$build_sh" "$plat" && built=true
-    else
-        bash "$build_sh" "$plat" && built=true
-    fi
+    # ZAWSZE jako biezacy user — NIE przez sudo na cały skrypt. Inaczej
+    # mkdir/cp do tentaflow-zvec-sys/vendor/lib/ tworzylo pliki root-owned i
+    # pozniejszy user-owy build (np. ./scripts/native-libs/build-all.sh) padal na
+    # "cp: Permission denied". build-zvec.sh sam siega po 'sudo docker' tylko dla
+    # kontenera i chown-uje jego output — reszta (mkdir/cp/git) leci jako user.
+    # (need_sudo zostaje wyliczone wyzej tylko do diagnostyki/komunikatu.)
+    bash "$build_sh" "$plat" && built=true
     if [[ "$built" == true ]]; then
         INSTALLED+=("zvec ($plat)")
     else
