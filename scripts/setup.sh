@@ -327,6 +327,8 @@ install_base() {
                 openssl
                 vulkan-icd-loader
                 sqlite
+                # ALSA — sherpa-rs linkuje -lasound (audio/portaudio).
+                alsa-lib
                 # Profiling: perf zbiera CPU samples + PMU counters + uncore IMC.
                 # which jest potrzebne dla collectors/permissions auto-discovery.
                 perf
@@ -366,6 +368,9 @@ install_base() {
                 libssl-dev
                 libvulkan1
                 libsqlite3-dev
+                # ALSA — sherpa-rs (audio/portaudio) linkuje -lasound; bez tego
+                # link sherpa-rs pada na "cannot find -lasound".
+                libasound2-dev
                 protobuf-compiler
                 # Profiling: linux-tools dostarcza perf, sysstat dostarcza iostat.
                 # linux-tools-generic to meta-package ktory dociaga linux-tools-<kernel>
@@ -397,6 +402,8 @@ install_base() {
                 openssl-devel
                 vulkan-loader
                 sqlite-devel
+                # ALSA — sherpa-rs linkuje -lasound (audio/portaudio).
+                alsa-lib-devel
                 protobuf-compiler
                 # Profiling: perf jest w pakiecie 'perf' na Fedora 38+.
                 # sysstat dostarcza iostat dla linux.iostat.disk collector.
