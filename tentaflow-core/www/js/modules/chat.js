@@ -353,7 +353,11 @@ function itemHeight(msg) {
   }
 
   const txtHeight = measureBubbleHeight(measuredText, bubbleMax);
-  // Bubble padding (24) + meta row (18) + row gap (20) + actions (28).
+  // Estymata przybliża PEŁNY offsetHeight itemu: bubble padding (24) + meta row
+  // (18) + actions (28) + 20px odstępu, który teraz jest realnym
+  // padding-bottom na `.chat-body .vlist-item` (więc wchodzi do offsetHeight).
+  // Dzięki temu estymata pierwszego renderu ≈ wartość zmierzona przez
+  // measureRendered i widok nie skacze, zanim pomiar skoryguje cache.
   return Math.max(60, txtHeight + extra + 90);
 }
 
@@ -395,6 +399,7 @@ function mountVList() {
   vlist = createVirtualList(host, {
     items: messages,
     pinToBottom: true,
+    measureHeights: true,
     overscan: 10,
     getItemHeight: (_i, msg) => itemHeight(msg),
     renderItem: (_i, msg) => renderBubble(msg),

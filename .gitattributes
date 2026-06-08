@@ -1,0 +1,8 @@
+native-libs/**/*.so.* filter=lfs diff=lfs merge=lfs -text
+native-libs/**/*.dylib filter=lfs diff=lfs merge=lfs -text
+native-libs/**/*.dll filter=lfs diff=lfs merge=lfs -text
+native-libs/**/*.lib filter=lfs diff=lfs merge=lfs -text
+native-libs/**/*.framework/** filter=lfs diff=lfs merge=lfs -text
+native-libs/**/*.bundle/** filter=lfs diff=lfs merge=lfs -text
+native-libs/**/*.a filter=lfs diff=lfs merge=lfs -text
+native-libs/**/*.so filter=lfs diff=lfs merge=lfs -text

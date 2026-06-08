@@ -17,10 +17,10 @@ pub mod zvec_backend;
 
 pub use backend::{Metric, SearchHit, VectorBackend};
 pub use error::{Result as VectorResult, VectorError};
-pub use remote::RemoteVectorTransport;
+#[cfg(feature = "vector-milvus")]
+pub use milvus_backend::MilvusBackend;
 pub use namespace::{
     NamespaceManager, ReconcileReport, MAX_NAMESPACES_PER_ADDON, MAX_VECTORS_PER_ADDON,
 };
+pub use remote::RemoteVectorTransport;
 pub use zvec_backend::ZvecBackend;
-#[cfg(feature = "vector-milvus")]
-pub use milvus_backend::MilvusBackend;

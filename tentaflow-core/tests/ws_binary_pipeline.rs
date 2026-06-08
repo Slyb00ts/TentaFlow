@@ -26,13 +26,11 @@ fn encode_request(correlation_id: u64, body: MessageBody) -> Vec<u8> {
 
 /// Helper: serwer-side flow — decode envelope + body, dispatch, encode response.
 fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
-    let env =
-        tentaflow_protocol::cbor::decode::<Envelope>(request_bytes).expect("decode envelope");
+    let env = tentaflow_protocol::cbor::decode::<Envelope>(request_bytes).expect("decode envelope");
     assert!(matches!(env.routing, Routing::Direct));
     assert_eq!(env.schema_version, tentaflow_protocol::SCHEMA_VERSION);
 
-    let body =
-        tentaflow_protocol::cbor::decode::<MessageBody>(&env.body).expect("decode body");
+    let body = tentaflow_protocol::cbor::decode::<MessageBody>(&env.body).expect("decode body");
 
     let ctx = HandlerContext {
         session,
@@ -62,8 +60,7 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
 /// Helper: klient decoduje response, wyciaga body.
 fn decode_response(bytes: &[u8]) -> (Envelope, MessageBody) {
     let env = tentaflow_protocol::cbor::decode::<Envelope>(bytes).expect("decode env");
-    let body =
-        tentaflow_protocol::cbor::decode::<MessageBody>(&env.body).expect("decode body");
+    let body = tentaflow_protocol::cbor::decode::<MessageBody>(&env.body).expect("decode body");
     (env, body)
 }
 

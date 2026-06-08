@@ -844,14 +844,20 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         },
         MessageBody::AddonStorageBody(p) => match p {
             tentaflow_protocol::AddonStoragePayload::StatsRequest(_) => "AddonStorageStatsRequest",
-            tentaflow_protocol::AddonStoragePayload::StatsResponse(_) => "AddonStorageStatsResponse",
+            tentaflow_protocol::AddonStoragePayload::StatsResponse(_) => {
+                "AddonStorageStatsResponse"
+            }
         },
         MessageBody::AddonVectorBody(p) => match p {
-            tentaflow_protocol::AddonVectorPayload::GetConfigRequest(_) => "AddonVectorGetConfigRequest",
+            tentaflow_protocol::AddonVectorPayload::GetConfigRequest(_) => {
+                "AddonVectorGetConfigRequest"
+            }
             tentaflow_protocol::AddonVectorPayload::GetConfigResponse(_) => {
                 "AddonVectorGetConfigResponse"
             }
-            tentaflow_protocol::AddonVectorPayload::SetConfigRequest(_) => "AddonVectorSetConfigRequest",
+            tentaflow_protocol::AddonVectorPayload::SetConfigRequest(_) => {
+                "AddonVectorSetConfigRequest"
+            }
             tentaflow_protocol::AddonVectorPayload::SetConfigResponse(_) => {
                 "AddonVectorSetConfigResponse"
             }

@@ -18,7 +18,11 @@ fn url() -> String {
 
 // Milvus makes freshly-inserted rows queryable asynchronously; retry the search
 // briefly so the test is not racy against segment flush/visibility.
-fn search_until_nonempty(be: &dyn VectorBackend, q: &[f32], k: usize) -> Vec<tentaflow_core::services::vector::SearchHit> {
+fn search_until_nonempty(
+    be: &dyn VectorBackend,
+    q: &[f32],
+    k: usize,
+) -> Vec<tentaflow_core::services::vector::SearchHit> {
     // Freshly-inserted rows become searchable after a short consistency delay,
     // and the client surfaces "no results" as an Err — retry on both.
     for _ in 0..40 {
@@ -36,11 +40,24 @@ fn search_until_nonempty(be: &dyn VectorBackend, q: &[f32], k: usize) -> Vec<ten
 #[ignore = "requires a running Milvus server (set MILVUS_URL)"]
 fn milvus_insert_search_delete_roundtrip() {
     let collection = format!("tf_it_{}", std::process::id());
-    let be = MilvusBackend::connect(&url(), None, None, &collection, 4, Metric::Cosine, &[], false).expect("connect");
+    let be = MilvusBackend::connect(
+        &url(),
+        None,
+        None,
+        &collection,
+        4,
+        Metric::Cosine,
+        &[],
+        false,
+    )
+    .expect("connect");
 
-    be.upsert(10, &[1.0, 0.0, 0.0, 0.0], &[], None).expect("upsert 10");
-    be.upsert(20, &[0.0, 1.0, 0.0, 0.0], &[], None).expect("upsert 20");
-    be.upsert(30, &[0.0, 0.0, 1.0, 0.0], &[], None).expect("upsert 30");
+    be.upsert(10, &[1.0, 0.0, 0.0, 0.0], &[], None)
+        .expect("upsert 10");
+    be.upsert(20, &[0.0, 1.0, 0.0, 0.0], &[], None)
+        .expect("upsert 20");
+    be.upsert(30, &[0.0, 0.0, 1.0, 0.0], &[], None)
+        .expect("upsert 30");
 
     let hits = search_until_nonempty(&be, &[0.9, 0.1, 0.0, 0.0], 2);
     assert!(!hits.is_empty(), "search returned no hits after retries");
@@ -60,18 +77,41 @@ fn milvus_metadata_fields_filter_and_return() {
 
     let collection = format!("tf_meta_{}", std::process::id());
     let schema = vec![
-        FieldSpec { name: "source".into(), field_type: FieldType::Str, indexed: true },
-        FieldSpec { name: "score".into(), field_type: FieldType::Int, indexed: true },
+        FieldSpec {
+            name: "source".into(),
+            field_type: FieldType::Str,
+            indexed: true,
+        },
+        FieldSpec {
+            name: "score".into(),
+            field_type: FieldType::Int,
+            indexed: true,
+        },
     ];
-    let be = MilvusBackend::connect(&url(), None, None, &collection, 4, Metric::Cosine, &schema, false)
-        .expect("connect with schema");
+    let be = MilvusBackend::connect(
+        &url(),
+        None,
+        None,
+        &collection,
+        4,
+        Metric::Cosine,
+        &schema,
+        false,
+    )
+    .expect("connect with schema");
 
     be.upsert(
         1,
         &[1.0, 0.0, 0.0, 0.0],
         &[
-            Field { name: "source".into(), value: FieldValue::Str("inbox".into()) },
-            Field { name: "score".into(), value: FieldValue::Int(42) },
+            Field {
+                name: "source".into(),
+                value: FieldValue::Str("inbox".into()),
+            },
+            Field {
+                name: "score".into(),
+                value: FieldValue::Int(42),
+            },
         ],
         None,
     )
@@ -80,8 +120,14 @@ fn milvus_metadata_fields_filter_and_return() {
         2,
         &[0.0, 1.0, 0.0, 0.0],
         &[
-            Field { name: "source".into(), value: FieldValue::Str("web".into()) },
-            Field { name: "score".into(), value: FieldValue::Int(5) },
+            Field {
+                name: "source".into(),
+                value: FieldValue::Str("web".into()),
+            },
+            Field {
+                name: "score".into(),
+                value: FieldValue::Int(5),
+            },
         ],
         None,
     )
@@ -107,7 +153,11 @@ fn milvus_metadata_fields_filter_and_return() {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    assert_eq!(hits.len(), 1, "only id 1 matches source=inbox AND score>=10");
+    assert_eq!(
+        hits.len(),
+        1,
+        "only id 1 matches source=inbox AND score>=10"
+    );
     assert_eq!(hits[0].ref_id, 1);
     let src = hits[0].fields.iter().find(|f| f.name == "source");
     assert!(matches!(src.map(|f| &f.value), Some(FieldValue::Str(s)) if s == "inbox"));
@@ -121,21 +171,36 @@ fn milvus_hybrid_search_dense_plus_sparse() {
     use tentaflow_sdk_spec::{Fusion, SparseVector};
 
     let collection = format!("tf_hybrid_{}", std::process::id());
-    let be = MilvusBackend::connect(&url(), None, None, &collection, 4, Metric::Cosine, &[], true)
-        .expect("connect with sparse");
+    let be = MilvusBackend::connect(
+        &url(),
+        None,
+        None,
+        &collection,
+        4,
+        Metric::Cosine,
+        &[],
+        true,
+    )
+    .expect("connect with sparse");
 
     be.upsert(
         1,
         &[1.0, 0.0, 0.0, 0.0],
         &[],
-        Some(&SparseVector { indices: vec![100, 200], values: vec![0.9, 0.1] }),
+        Some(&SparseVector {
+            indices: vec![100, 200],
+            values: vec![0.9, 0.1],
+        }),
     )
     .expect("upsert 1");
     be.upsert(
         2,
         &[0.0, 1.0, 0.0, 0.0],
         &[],
-        Some(&SparseVector { indices: vec![300, 400], values: vec![0.8, 0.2] }),
+        Some(&SparseVector {
+            indices: vec![300, 400],
+            values: vec![0.8, 0.2],
+        }),
     )
     .expect("upsert 2");
 
@@ -144,7 +209,10 @@ fn milvus_hybrid_search_dense_plus_sparse() {
     for _ in 0..40 {
         if let Ok(h) = be.hybrid_search(
             &[0.9, 0.1, 0.0, 0.0],
-            &SparseVector { indices: vec![300], values: vec![1.0] },
+            &SparseVector {
+                indices: vec![300],
+                values: vec![1.0],
+            },
             5,
             None,
             &[],
@@ -158,7 +226,10 @@ fn milvus_hybrid_search_dense_plus_sparse() {
         std::thread::sleep(Duration::from_millis(500));
     }
     let ids: std::collections::HashSet<u64> = hits.iter().map(|h| h.ref_id).collect();
-    assert!(ids.contains(&1) && ids.contains(&2), "hybrid should fuse dense + sparse");
+    assert!(
+        ids.contains(&1) && ids.contains(&2),
+        "hybrid should fuse dense + sparse"
+    );
 }
 
 #[test]
@@ -187,13 +258,26 @@ fn namespace_manager_routes_to_milvus_per_addon_config() {
 
     let mgr = NamespaceManager::with_root(pool, root.path().to_path_buf());
     let be = mgr
-        .get_or_create("org-test", "addon_milvus", "faces", 4, Metric::Cosine, &[], false)
+        .get_or_create(
+            "org-test",
+            "addon_milvus",
+            "faces",
+            4,
+            Metric::Cosine,
+            &[],
+            false,
+        )
         .expect("get_or_create routed to milvus");
 
-    be.upsert(101, &[1.0, 0.0, 0.0, 0.0], &[], None).expect("upsert via milvus");
-    be.upsert(202, &[0.0, 1.0, 0.0, 0.0], &[], None).expect("upsert via milvus");
+    be.upsert(101, &[1.0, 0.0, 0.0, 0.0], &[], None)
+        .expect("upsert via milvus");
+    be.upsert(202, &[0.0, 1.0, 0.0, 0.0], &[], None)
+        .expect("upsert via milvus");
 
     let hits = search_until_nonempty(be.as_ref(), &[0.95, 0.05, 0.0, 0.0], 1);
-    assert!(!hits.is_empty(), "manager-routed Milvus search returned nothing");
+    assert!(
+        !hits.is_empty(),
+        "manager-routed Milvus search returned nothing"
+    );
     assert_eq!(hits[0].ref_id, 101);
 }

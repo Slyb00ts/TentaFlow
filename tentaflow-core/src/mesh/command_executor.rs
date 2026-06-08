@@ -396,9 +396,7 @@ impl MeshCommandExecutor {
             MeshCommandType::WebResearch { request_json } => {
                 self.handle_web_research(request_json).await
             }
-            MeshCommandType::VectorOp { request_cbor } => {
-                self.handle_vector_op(request_cbor).await
-            }
+            MeshCommandType::VectorOp { request_cbor } => self.handle_vector_op(request_cbor).await,
         }
     }
 

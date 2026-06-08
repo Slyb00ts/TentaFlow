@@ -22,20 +22,16 @@ use tentaflow_core::db;
 use tentaflow_sdk_spec::protocol::ui::ui_payload::UiPayload;
 use tentaflow_sdk_spec::validate_canonical;
 
-const E2E_SMOKE_WASM: &str =
-    "addons/e2e-smoke/target/wasm32-wasip1/release/e2e_smoke.wasm";
+const E2E_SMOKE_WASM: &str = "addons/e2e-smoke/target/wasm32-wasip1/release/e2e_smoke.wasm";
 
 // =============================================================================
 // Fixtures
 // =============================================================================
 
 fn create_test_db() -> db::DbPool {
-    let conn =
-        rusqlite::Connection::open_in_memory().expect("open in-memory DB");
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
-    )
-    .expect("pragmas");
+    let conn = rusqlite::Connection::open_in_memory().expect("open in-memory DB");
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .expect("pragmas");
     db::migrations::run(&conn).expect("migrations");
     Arc::new(Mutex::new(conn))
 }
@@ -123,15 +119,18 @@ fn on_start_emits_canonical_panel_shell() {
 
     // Verify PanelShell was stored in ui_panels cache.
     let cache = ui_panels.read();
-    let key = (String::new(), "e2e-smoke".to_string(), "cbor_msg".to_string());
+    let key = (
+        String::new(),
+        "e2e-smoke".to_string(),
+        "cbor_msg".to_string(),
+    );
     let cbor_bytes = cache.get(&key).expect("PanelShell not in ui_panels cache");
 
     // Verify canonical CBOR encoding.
     validate_canonical(cbor_bytes).expect("CBOR is not canonical");
 
     // Decode as UiPayload and verify it's a PanelShell.
-    let payload: UiPayload =
-        minicbor::decode(cbor_bytes).expect("failed to decode UiPayload");
+    let payload: UiPayload = minicbor::decode(cbor_bytes).expect("failed to decode UiPayload");
 
     match &payload {
         UiPayload::PanelShell(shell) => {
@@ -176,8 +175,7 @@ fn increment_action_emits_canonical_state_patch() {
     let memory = instance
         .get_memory(&mut store, "memory")
         .expect("memory export");
-    memory.data_mut(&mut store)
-        [input_ptr as usize..input_ptr as usize + request_bytes.len()]
+    memory.data_mut(&mut store)[input_ptr as usize..input_ptr as usize + request_bytes.len()]
         .copy_from_slice(&request_bytes);
 
     let out_cap: i32 = 4096;
@@ -204,15 +202,18 @@ fn increment_action_emits_canonical_state_patch() {
 
     // The StatePatch should now be in the ui_panels cache (overwrites the PanelShell).
     let cache = ui_panels.read();
-    let key = (String::new(), "e2e-smoke".to_string(), "cbor_msg".to_string());
+    let key = (
+        String::new(),
+        "e2e-smoke".to_string(),
+        "cbor_msg".to_string(),
+    );
     let cbor_bytes = cache.get(&key).expect("StatePatch not in ui_panels cache");
 
     // Verify canonical encoding.
     validate_canonical(cbor_bytes).expect("CBOR is not canonical");
 
     // Decode and verify StatePatch.
-    let payload: UiPayload =
-        minicbor::decode(cbor_bytes).expect("failed to decode UiPayload");
+    let payload: UiPayload = minicbor::decode(cbor_bytes).expect("failed to decode UiPayload");
 
     match &payload {
         UiPayload::StatePatch(patch) => {
@@ -265,8 +266,7 @@ fn multiple_increments_advance_revision() {
             .call(&mut store, request_bytes.len() as i32)
             .expect("alloc input");
         let memory = instance.get_memory(&mut store, "memory").unwrap();
-        memory.data_mut(&mut store)
-            [input_ptr as usize..input_ptr as usize + request_bytes.len()]
+        memory.data_mut(&mut store)[input_ptr as usize..input_ptr as usize + request_bytes.len()]
             .copy_from_slice(&request_bytes);
 
         let out_ptr = alloc_fn.call(&mut store, out_cap).expect("alloc out");
@@ -275,7 +275,13 @@ fn multiple_increments_advance_revision() {
         let result = on_request
             .call(
                 &mut store,
-                (input_ptr, request_bytes.len() as i32, out_ptr, out_cap, out_len_ptr),
+                (
+                    input_ptr,
+                    request_bytes.len() as i32,
+                    out_ptr,
+                    out_cap,
+                    out_len_ptr,
+                ),
             )
             .expect("on_request");
         assert_eq!(result, 0);
@@ -283,7 +289,11 @@ fn multiple_increments_advance_revision() {
 
     // Verify the last StatePatch has counter=3 and revision 2->3.
     let cache = ui_panels.read();
-    let key = (String::new(), "e2e-smoke".to_string(), "cbor_msg".to_string());
+    let key = (
+        String::new(),
+        "e2e-smoke".to_string(),
+        "cbor_msg".to_string(),
+    );
     let cbor_bytes = cache.get(&key).unwrap();
 
     validate_canonical(cbor_bytes).expect("canonical");
@@ -315,7 +325,11 @@ fn cbor_roundtrip_bit_identical() {
     on_start.call(&mut store, ()).expect("on_start");
 
     let cache = ui_panels.read();
-    let key = (String::new(), "e2e-smoke".to_string(), "cbor_msg".to_string());
+    let key = (
+        String::new(),
+        "e2e-smoke".to_string(),
+        "cbor_msg".to_string(),
+    );
     let original = cache.get(&key).unwrap().clone();
 
     // Decode then re-encode — must produce identical bytes (canonical determinism).

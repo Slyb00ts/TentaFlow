@@ -395,7 +395,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("persist.usearch");
         {
-            let be = ZvecBackend::open_or_create(path.clone(), 3, Metric::Cosine, &[], false).unwrap();
+            let be =
+                ZvecBackend::open_or_create(path.clone(), 3, Metric::Cosine, &[], false).unwrap();
             be.upsert(7, &[1.0, 0.0, 0.0], &[], None).unwrap();
             be.upsert(8, &[0.0, 1.0, 0.0], &[], None).unwrap();
         }
@@ -410,15 +411,38 @@ mod tests {
         use tentaflow_sdk_spec::{Field, FieldSpec, FieldType, FieldValue, Filter};
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("ns.usearch");
-        let schema = vec![FieldSpec { name: "source".into(), field_type: FieldType::Str, indexed: true }];
+        let schema = vec![FieldSpec {
+            name: "source".into(),
+            field_type: FieldType::Str,
+            indexed: true,
+        }];
         let be = ZvecBackend::open_or_create(path, 3, Metric::Cosine, &schema, false).unwrap();
-        be.upsert(1, &[1.0, 0.0, 0.0], &[Field { name: "source".into(), value: FieldValue::Str("web".into()) }], None).unwrap();
-        be.upsert(2, &[0.9, 0.1, 0.0], &[Field { name: "source".into(), value: FieldValue::Str("inbox".into()) }], None).unwrap();
+        be.upsert(
+            1,
+            &[1.0, 0.0, 0.0],
+            &[Field {
+                name: "source".into(),
+                value: FieldValue::Str("web".into()),
+            }],
+            None,
+        )
+        .unwrap();
+        be.upsert(
+            2,
+            &[0.9, 0.1, 0.0],
+            &[Field {
+                name: "source".into(),
+                value: FieldValue::Str("inbox".into()),
+            }],
+            None,
+        )
+        .unwrap();
         let f = Filter::Eq("source".into(), FieldValue::Str("inbox".into()));
-        let hits = be.search(&[1.0, 0.0, 0.0], 5, Some(&f), &["source".to_string()]).unwrap();
+        let hits = be
+            .search(&[1.0, 0.0, 0.0], 5, Some(&f), &["source".to_string()])
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].ref_id, 2);
         assert!(matches!(&hits[0].fields[0].value, FieldValue::Str(s) if s == "inbox"));
     }
-
 }

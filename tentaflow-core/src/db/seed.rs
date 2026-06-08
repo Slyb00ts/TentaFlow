@@ -632,15 +632,13 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
     // edges od LLM dalej z from_port=stream). Bez tego try_dispatch_streaming
     // wpada na is_streaming=false -> wrap_blocking_as_stream -> single chunk z
     // całością odpowiedzi (klient widzi calosc po EOF zamiast token-by-token).
-    let flows: &[(&str, &str, &str, &str, i64)] = &[
-        (
-            "Default Chat",
-            "Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).",
-            "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
-            1,
-        ),
-    ];
+    let flows: &[(&str, &str, &str, &str, i64)] = &[(
+        "Default Chat",
+        "Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).",
+        "chat",
+        r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
+        1,
+    )];
 
     // Migracja seedów. Dwie generacje legacy do nadpisania:
     // 1) Stary blocking seed sprzed Krok 6/7 — flow_json bez `from_port":"stream"`.
@@ -889,8 +887,9 @@ mod tests {
             member_user_id, admin_id,
             "group_members.user_id musi byc tym samym UUID co user_accounts.id admina"
         );
-        uuid::Uuid::parse_str(&member_user_id)
-            .unwrap_or_else(|e| panic!("group_members.user_id '{member_user_id}' nie jest UUID: {e}"));
+        uuid::Uuid::parse_str(&member_user_id).unwrap_or_else(|e| {
+            panic!("group_members.user_id '{member_user_id}' nie jest UUID: {e}")
+        });
     }
 
     /// Regresja: po pelnym migrations::run + seed_defaults na swiezej bazie

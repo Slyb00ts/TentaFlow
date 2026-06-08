@@ -2312,6 +2312,11 @@ pub struct DeployVllmRecommendRequest {
     pub lock_max_model_len: Option<bool>,
     pub lock_max_num_seqs: Option<bool>,
     pub lock_tensor_parallel: Option<bool>,
+    /// Sciezka pliku .gguf w repo (np. `model-q4_k_m.gguf`). Ustawiana przez
+    /// frontend gdy silnik to llama.cpp - repozytoria GGUF nie maja config.json,
+    /// wiec metadane architektury czytamy z naglowka pliku zamiast config.json.
+    #[serde(default)]
+    pub gguf_file: Option<String>,
 }
 
 #[derive(

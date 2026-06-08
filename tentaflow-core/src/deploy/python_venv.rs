@@ -1713,11 +1713,7 @@ pub(crate) fn dedup_cli_args_last_wins(args: Vec<String>) -> Vec<String> {
             None => kept_rev.push(seg),
         }
     }
-    kept_rev
-        .into_iter()
-        .rev()
-        .flat_map(|s| s.tokens)
-        .collect()
+    kept_rev.into_iter().rev().flat_map(|s| s.tokens).collect()
 }
 
 /// Buduje `Command` ktora opakowuje docelowa binarke w `nice` + `ionice`
@@ -2640,7 +2636,8 @@ mod tests {
             .position(|a| a == "--speculative-config")
             .expect("flaga --speculative-config musi byc w argv");
         assert_eq!(
-            args[pos + 1], json,
+            args[pos + 1],
+            json,
             "JSON musi byc jednym nietknietym elementem, dostalem: {:?}",
             args
         );
@@ -2694,7 +2691,10 @@ mod tests {
             "0.70".into(),
         ];
         let out = dedup_cli_args_last_wins(args);
-        assert_eq!(out, vec!["--dtype", "auto", "--gpu-memory-utilization", "0.70"]);
+        assert_eq!(
+            out,
+            vec!["--dtype", "auto", "--gpu-memory-utilization", "0.70"]
+        );
     }
 
     #[test]
@@ -2725,9 +2725,18 @@ mod tests {
             "--no-enable-prefix-caching".into(),
         ];
         let out = dedup_cli_args_last_wins(args);
-        assert!(out.iter().any(|a| a == "file"), "pozycjonalny zniknal: {out:?}");
-        assert!(out.iter().any(|a| a == "--no-enable-prefix-caching"), "{out:?}");
-        assert!(!out.iter().any(|a| a == "--enable-prefix-caching"), "{out:?}");
+        assert!(
+            out.iter().any(|a| a == "file"),
+            "pozycjonalny zniknal: {out:?}"
+        );
+        assert!(
+            out.iter().any(|a| a == "--no-enable-prefix-caching"),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter().any(|a| a == "--enable-prefix-caching"),
+            "{out:?}"
+        );
         assert_eq!(out, vec!["file", "--no-enable-prefix-caching"]);
     }
 
@@ -2781,7 +2790,11 @@ mod tests {
         env.insert("VLLM_ARGS".to_string(), "--max-model-len 32768".into());
         let args = build_engine_args(&spec, &env, &[], Path::new("/tmp/b"), Path::new("/tmp/v"));
         let count = args.iter().filter(|a| *a == "--max-model-len").count();
-        assert_eq!(count, 1, "tylko jedna --max-model-len, dostalem: {:?}", args);
+        assert_eq!(
+            count, 1,
+            "tylko jedna --max-model-len, dostalem: {:?}",
+            args
+        );
         let pos = args.iter().position(|a| a == "--max-model-len").unwrap();
         assert_eq!(args[pos + 1], "32768");
     }
@@ -2910,7 +2923,10 @@ mod tests {
         )
         .unwrap();
         let id_toml = template_identity(&base, None, dir.path()).unwrap();
-        assert_eq!(id0, id_toml, "tresc bundle.toml nie moze zmieniac template_id");
+        assert_eq!(
+            id0, id_toml,
+            "tresc bundle.toml nie moze zmieniac template_id"
+        );
 
         // 3) Zmiana requirements.lock — INNY id.
         std::fs::write(&lock, "vllm==0.21.1\n").unwrap();

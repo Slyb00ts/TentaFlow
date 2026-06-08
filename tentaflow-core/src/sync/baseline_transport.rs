@@ -416,7 +416,10 @@ impl FrameStream for IrohFrameStream {
                 .map_err(|e| transport_err(label, format!("read len: {e}")))?;
             let len = u32::from_be_bytes(len_buf) as usize;
             if len > MAX_BASELINE_FRAME_BYTES {
-                return Err(transport_err(label, format!("frame too large: {len} bytes")));
+                return Err(transport_err(
+                    label,
+                    format!("frame too large: {len} bytes"),
+                ));
             }
             let mut body = vec![0u8; len];
             self.recv

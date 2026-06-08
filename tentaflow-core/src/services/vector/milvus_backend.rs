@@ -24,7 +24,9 @@ use milvus::index::{IndexParams, IndexType, MetricType};
 use milvus::mutate::{DeleteOptions, UpsertOptions};
 use milvus::proto::common::KeyValuePair;
 use milvus::proto::schema::SparseFloatArray;
-use milvus::query::{AnnSearchRequest, BaseRanker, QueryOptions, RrfRanker, SearchOptions, WeightedRanker};
+use milvus::query::{
+    AnnSearchRequest, BaseRanker, QueryOptions, RrfRanker, SearchOptions, WeightedRanker,
+};
 use milvus::schema::{CollectionSchemaBuilder, FieldSchema};
 use milvus::value::{Value, ValueVec};
 use tokio::runtime::{Builder, Runtime};
@@ -44,7 +46,11 @@ const SPARSE_FIELD: &str = "sparse";
 /// `(u32 index LE, f32 value LE)` sorted by ascending index. Returns the row
 /// bytes plus the implied dimensionality (max index + 1).
 fn sparse_row(indices: &[u32], values: &[f32]) -> (Vec<u8>, u32) {
-    let mut pairs: Vec<(u32, f32)> = indices.iter().copied().zip(values.iter().copied()).collect();
+    let mut pairs: Vec<(u32, f32)> = indices
+        .iter()
+        .copied()
+        .zip(values.iter().copied())
+        .collect();
     pairs.sort_by_key(|(i, _)| *i);
     let mut bytes = Vec::with_capacity(pairs.len() * 8);
     let mut dim = 0u32;
@@ -79,9 +85,10 @@ fn scalar_field(spec: &FieldSpec) -> FieldSchema {
 /// insert one row at a time).
 fn value_column(field: &Field) -> FieldColumn {
     match &field.value {
-        FieldValue::Str(s) => {
-            FieldColumn::new(&FieldSchema::new_varchar(&field.name, "", 65535), vec![s.clone()])
-        }
+        FieldValue::Str(s) => FieldColumn::new(
+            &FieldSchema::new_varchar(&field.name, "", 65535),
+            vec![s.clone()],
+        ),
         FieldValue::Int(i) => FieldColumn::new(&FieldSchema::new_int64(&field.name, ""), vec![*i]),
         FieldValue::Float(f) => {
             FieldColumn::new(&FieldSchema::new_double(&field.name, ""), vec![*f])
@@ -140,7 +147,8 @@ where
     rt.spawn(async move {
         let _ = tx.send(fut.await);
     });
-    rx.recv().expect("milvus runtime task dropped before completion")
+    rx.recv()
+        .expect("milvus runtime task dropped before completion")
 }
 
 pub struct MilvusBackend {
@@ -184,14 +192,23 @@ impl MilvusBackend {
         let client = run_blocking(&rt, async move {
             let client = match (user, password) {
                 (Some(u), Some(p)) => {
-                    ClientBuilder::new(url).username(&u).password(&p).build().await?
+                    ClientBuilder::new(url)
+                        .username(&u)
+                        .password(&p)
+                        .build()
+                        .await?
                 }
                 _ => Client::new(url).await?,
             };
             if !client.has_collection(coll_async.clone()).await? {
-                let mut builder = CollectionSchemaBuilder::new(&coll_async, "tentaflow vector namespace");
+                let mut builder =
+                    CollectionSchemaBuilder::new(&coll_async, "tentaflow vector namespace");
                 builder.add_field(FieldSchema::new_primary_int64(PK_FIELD, "ref id", false));
-                builder.add_field(FieldSchema::new_float_vector(VEC_FIELD, "embedding", dim as i64));
+                builder.add_field(FieldSchema::new_float_vector(
+                    VEC_FIELD,
+                    "embedding",
+                    dim as i64,
+                ));
                 for spec in &fields {
                     builder.add_field(scalar_field(spec));
                 }
@@ -209,7 +226,9 @@ impl MilvusBackend {
                         ("efConstruction".to_string(), "200".to_string()),
                     ]),
                 );
-                client.create_index(coll_async.clone(), VEC_FIELD, index).await?;
+                client
+                    .create_index(coll_async.clone(), VEC_FIELD, index)
+                    .await?;
                 if sparse {
                     // Sparse vectors use an inverted index with inner-product metric.
                     let sp_index = IndexParams::new(
@@ -218,7 +237,9 @@ impl MilvusBackend {
                         MetricType::IP,
                         HashMap::new(),
                     );
-                    client.create_index(coll_async.clone(), SPARSE_FIELD, sp_index).await?;
+                    client
+                        .create_index(coll_async.clone(), SPARSE_FIELD, sp_index)
+                        .await?;
                 }
             }
             client.load_collection(coll_async, None).await?;
@@ -381,8 +402,12 @@ impl VectorBackend for MilvusBackend {
                 key: "metric_type".to_string(),
                 value: "IP".to_string(),
             }];
-            let mut dense_req =
-                AnnSearchRequest::new(vec![Value::from(dense_q)], VEC_FIELD.to_string(), dense_param, k);
+            let mut dense_req = AnnSearchRequest::new(
+                vec![Value::from(dense_q)],
+                VEC_FIELD.to_string(),
+                dense_param,
+                k,
+            );
             let mut sparse_req = AnnSearchRequest::new(
                 vec![Value::SparseFloat(Cow::Owned(sparse_arr))],
                 SPARSE_FIELD.to_string(),
@@ -441,7 +466,9 @@ impl VectorBackend for MilvusBackend {
             if !out_fields.is_empty() {
                 options = options.output_fields(out_fields.clone());
             }
-            let results = client.search(coll, vec![Value::from(q)], Some(options)).await?;
+            let results = client
+                .search(coll, vec![Value::from(q)], Some(options))
+                .await?;
             Ok(result_to_hits(results.into_iter().next(), &out_fields))
         });
         hits.map_err(backend_err)
@@ -485,7 +512,9 @@ impl VectorBackend for MilvusBackend {
         let coll = self.collection.clone();
         let stats: MilvusResult<u64> = self.block(async move {
             let m = client.get_collection_stats(&coll).await?;
-            Ok(m.get("row_count").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0))
+            Ok(m.get("row_count")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0))
         });
         stats.unwrap_or(0)
     }
@@ -495,12 +524,7 @@ impl VectorBackend for MilvusBackend {
         // change. Compute the diff and apply the additions; surface a clear
         // error for any drop / type change (the admin must recreate the
         // collection) rather than silently leaving the schema inconsistent.
-        let stored_type = |name: &str| {
-            stored
-                .iter()
-                .find(|f| f.name == name)
-                .map(|f| f.field_type)
-        };
+        let stored_type = |name: &str| stored.iter().find(|f| f.name == name).map(|f| f.field_type);
         let desired_type = |name: &str| {
             desired
                 .iter()

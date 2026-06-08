@@ -325,6 +325,9 @@ function Install-Base {
     # Git
     Winget-Install -Id 'Git.Git' -Label 'Git' | Out-Null
 
+    # Git LFS — natywne biblioteki w native-libs/ sa wersjonowane przez LFS.
+    Winget-Install -Id 'GitHub.GitLFS' -Label 'Git LFS' | Out-Null
+
     # pkg-config-lite — pkgconf.pkgconf nie ma Windows installera w winget,
     # bloodrock.pkg-config-lite tak (wersja 0.28 bez zaleznosci glib).
     Winget-Install -Id 'bloodrock.pkg-config-lite' -Label 'pkg-config-lite' | Out-Null
@@ -342,6 +345,38 @@ function Install-Base {
 
     Refresh-Path
     Log-Ok "Bazowe narzedzia zainstalowane"
+}
+
+function Install-GitLfs {
+    Log-Section "Git LFS"
+
+    Refresh-Path
+    if (-not (Test-Command 'git')) {
+        Log-Error "git nie jest dostepny — Git LFS wymaga Git."
+        exit 1
+    }
+
+    $version = Invoke-NativeCapture { git lfs version } | Select-Object -First 1
+    if ($LASTEXITCODE -ne 0 -or -not $version) {
+        Log-Error "Git LFS nie jest dostepny mimo instalacji. Otworz nowy PowerShell albo zainstaluj GitHub.GitLFS recznie."
+        exit 1
+    }
+
+    Invoke-NativeCapture { git lfs install } | Out-Host
+    Log-Ok "Git LFS: $version"
+    $script:Installed += 'git lfs install'
+
+    # Materializuj artefakty LFS (prebuilt native-libs/*.a|*.lib|*.dll). Jesli
+    # repo sklonowano ZANIM git-lfs byl zainstalowany, pliki sa pointerami a
+    # `git lfs install` rejestruje tylko filtry. Bez `git lfs pull` build.rs
+    # pada na brakujace native-libs.
+    $repoRoot = (Invoke-NativeCapture { git rev-parse --show-toplevel } | Select-Object -First 1)
+    if ($repoRoot) {
+        Log-Info 'Pobieranie artefaktow Git LFS (prebuilt native-libs)...'
+        Invoke-NativeCapture { git -C "$repoRoot" lfs pull } | Out-Host
+        Log-Ok 'Git LFS: artefakty pobrane'
+        $script:Installed += 'git lfs pull'
+    }
 }
 
 function Configure-CmakeGenerator {
@@ -868,6 +903,15 @@ function Verify-Installation {
     Check-Tool 'ninja'      'ninja'      { & ninja --version }
     Check-Tool 'protoc'     'protoc'     { & protoc --version }     -Required
     Check-Tool 'git'        'git'        { & git --version }        -Required
+    if (Test-Command 'git') {
+        $gitLfsVersion = Invoke-NativeCapture { git lfs version } | Select-Object -First 1
+        if ($LASTEXITCODE -eq 0 -and $gitLfsVersion) {
+            Log-Ok "git-lfs: $gitLfsVersion"
+        } else {
+            Log-Error "git-lfs: NIE ZNALEZIONO"
+            $ok = $false
+        }
+    }
     Check-Tool 'wasm-bindgen' 'wasm-bindgen' { & wasm-bindgen --version }
 
     # zvec — binarka tentaflow zawsze wlacza feature `vector`, wiec natywna
@@ -1003,6 +1047,7 @@ function Main {
     Get-SileroVad
 
     Install-Base
+    Install-GitLfs
     Install-Zvec
     Install-Rust
     Install-WasmTargets

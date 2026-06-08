@@ -3,6 +3,7 @@
 # =============================================================================
 target/
 target_shared/
+target-addon-wasm/
 target-service-context-test/*
 
 # Runtime data (SQLite, HMAC keys, container bundles, model cache).
@@ -16,6 +17,7 @@ bin/
 *.so
 *.dylib
 *.dll
+*.lib
 *.exe
 *.wasm
 plans/*
@@ -185,6 +187,21 @@ notes/*.md.claude/
 # Python
 __pycache__/
 
+# Wstecznie wendorowane źródło llama.cpp — używane tylko przy LLAMA_CPP_REF=vendored.
+# Nie commitujemy: kanoniczna ścieżka to pinowany SHA klonowany świeżo + prebuilt native-libs.
+vendor/crates/*/llama.cpp/
+
+native-libs/**/cache/
+native-libs/**/build/
+!native-libs/**/*.a
+!native-libs/**/*.so
+!native-libs/**/*.so.*
+!native-libs/**/*.dylib
+!native-libs/**/*.dll
+!native-libs/**/*.lib
+!native-libs/**/*.framework/
+!native-libs/**/*.bundle/
+
 # Notatki robocze — nie wysylamy do remote
 notes/
 
@@ -194,4 +211,3 @@ notes/
 # npm lockfiles — repo nie używa Node poza tests/e2e (Playwright)
 package-lock.json
 tests/e2e/package-lock.json
-

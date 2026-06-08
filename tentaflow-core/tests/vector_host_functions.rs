@@ -147,21 +147,29 @@ fn e2e_vector_upsert_search_delete_roundtrip() {
         .get_or_create(ORG, "addon_a", "faces", 4, Metric::Cosine, &[], false)
         .expect("open ns");
 
-    be.upsert(1, &[1.0, 0.0, 0.0, 0.0], &[], None).expect("upsert 1");
-    be.upsert(2, &[0.0, 1.0, 0.0, 0.0], &[], None).expect("upsert 2");
-    be.upsert(3, &[0.0, 0.0, 1.0, 0.0], &[], None).expect("upsert 3");
+    be.upsert(1, &[1.0, 0.0, 0.0, 0.0], &[], None)
+        .expect("upsert 1");
+    be.upsert(2, &[0.0, 1.0, 0.0, 0.0], &[], None)
+        .expect("upsert 2");
+    be.upsert(3, &[0.0, 0.0, 1.0, 0.0], &[], None)
+        .expect("upsert 3");
     be.save().expect("persist");
-    mgr.update_count(ORG, "addon_a", "faces", be.count()).unwrap();
+    mgr.update_count(ORG, "addon_a", "faces", be.count())
+        .unwrap();
 
     // Search: query close to vector 1 returns it first.
-    let hits = be.search(&[0.99, 0.01, 0.0, 0.0], 2, None, &[]).expect("search");
+    let hits = be
+        .search(&[0.99, 0.01, 0.0, 0.0], 2, None, &[])
+        .expect("search");
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].ref_id, 1);
 
     // Delete vector 1, search again: vector 2 wins.
     assert!(be.delete(1).expect("delete"));
     be.save().expect("persist after delete");
-    let hits2 = be.search(&[0.99, 0.01, 0.0, 0.0], 1, None, &[]).expect("search 2");
+    let hits2 = be
+        .search(&[0.99, 0.01, 0.0, 0.0], 1, None, &[])
+        .expect("search 2");
     assert_eq!(hits2.len(), 1);
     assert_ne!(hits2[0].ref_id, 1);
 }
@@ -195,8 +203,16 @@ fn e2e_quota_enforcement_at_namespace_limit() {
     let mgr = mgr_with_temproot(pool, root.path().to_path_buf());
 
     for i in 0..MAX_NAMESPACES_PER_ADDON {
-        mgr.get_or_create(ORG, "addon_a", &format!("ns_{i}"), 4, Metric::Cosine, &[], false)
-            .unwrap();
+        mgr.get_or_create(
+            ORG,
+            "addon_a",
+            &format!("ns_{i}"),
+            4,
+            Metric::Cosine,
+            &[],
+            false,
+        )
+        .unwrap();
     }
     // 11th namespace must be rejected by the quota check.
     let res = mgr.get_or_create(ORG, "addon_a", "overflow", 4, Metric::Cosine, &[], false);
@@ -241,7 +257,8 @@ fn e2e_delete_namespace_clears_db_and_file() {
     be.upsert(1, &[1.0, 0.0, 0.0], &[], None).unwrap();
     be.save().unwrap();
 
-    mgr.delete_namespace(ORG, "addon_a", "scratch").expect("delete");
+    mgr.delete_namespace(ORG, "addon_a", "scratch")
+        .expect("delete");
 
     // DB row gone.
     let conn = pool.lock().unwrap();
@@ -346,8 +363,20 @@ fn upsert_with_quota_concurrent_at_cap_blocks_all_new_inserts() {
     // the cap. The quota check sums the `count` column, so this is a valid
     // shortcut to the "addon is saturated" state without inserting 1M
     // real vectors.
-    mgr.upsert_with_quota(ORG, "addon_a", "ns", 1, &[1.0, 0.0, 0.0], 3, Metric::Cosine, &[], &[], false, None)
-        .unwrap();
+    mgr.upsert_with_quota(
+        ORG,
+        "addon_a",
+        "ns",
+        1,
+        &[1.0, 0.0, 0.0],
+        3,
+        Metric::Cosine,
+        &[],
+        &[],
+        false,
+        None,
+    )
+    .unwrap();
     {
         let conn = pool.lock().unwrap();
         conn.execute(
