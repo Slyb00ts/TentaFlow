@@ -53,11 +53,9 @@ impl RemoteVectorTransport for MeshVectorTransport {
         }
         .map_err(|e| VectorError::Backend(format!("mesh vector op ({node_id}): {e}")))?;
         if !response.ok {
-            return Err(VectorError::Backend(
-                response
-                    .error
-                    .unwrap_or_else(|| format!("remote vector op failed on node {node_id}")),
-            ));
+            return Err(VectorError::Backend(response.error.unwrap_or_else(|| {
+                format!("remote vector op failed on node {node_id}")
+            })));
         }
         match response.payload {
             MeshCommandResponsePayload::VectorOpResult { result_cbor } => Ok(result_cbor),

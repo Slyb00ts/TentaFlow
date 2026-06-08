@@ -779,8 +779,7 @@ impl AddonManager {
             self.unregister_addon_runtime(addon_id);
             return;
         }
-        let pkg_dir =
-            crate::addon::bundled::package_dir(&addon.package_id, &addon.package_version);
+        let pkg_dir = crate::addon::bundled::package_dir(&addon.package_id, &addon.package_version);
         if !pkg_dir.join("manifest.toml").exists() {
             // Package bytes not here yet (uploaded package whose blob is still in
             // flight). The sync runtime re-reconciles this instance once the
@@ -788,7 +787,8 @@ impl AddonManager {
             tracing::debug!(
                 "sync reconcile addon '{addon_id}': pakiet '{}' v{} jeszcze niedostepny — \
                  czekam na blob pakietu",
-                addon.package_id, addon.package_version
+                addon.package_id,
+                addon.package_version
             );
             return;
         }

@@ -509,7 +509,10 @@ mod owner {
     /// Reject pathological / malformed requests before opening Milvus.
     fn validate(req: &VectorOpRequest) -> Result<()> {
         if !(1..=MAX_DIM).contains(&req.dim) {
-            return Err(VectorError::Backend(format!("dim {} poza zakresem", req.dim)));
+            return Err(VectorError::Backend(format!(
+                "dim {} poza zakresem",
+                req.dim
+            )));
         }
         if !valid_collection(&req.collection) {
             return Err(VectorError::Backend(
@@ -722,7 +725,9 @@ mod owner {
         #[test]
         fn collection_format_guard() {
             // Canonical isolation forms produced by milvus_collection_name.
-            assert!(valid_collection("v_o_0123456789ab_a_0123456789ab_n_0123456789ab"));
+            assert!(valid_collection(
+                "v_o_0123456789ab_a_0123456789ab_n_0123456789ab"
+            ));
             assert!(valid_collection(
                 "v_o_0123456789ab_a_0123456789ab_n_0123456789ab_prod"
             ));
@@ -731,7 +736,9 @@ mod owner {
             assert!(!valid_collection("some_other_collection"));
             assert!(!valid_collection("v_o_xyz_a_0123456789ab_n_0123456789ab"));
             assert!(!valid_collection("v_o_0123456789ab_a_0123456789ab"));
-            assert!(!valid_collection("v_o_0123456789ab_a_0123456789ab_n_0123456789ab_"));
+            assert!(!valid_collection(
+                "v_o_0123456789ab_a_0123456789ab_n_0123456789ab_"
+            ));
             assert!(!valid_collection(
                 "v_o_0123456789ab_a_0123456789ab_n_0123456789ab_bad-suffix"
             ));

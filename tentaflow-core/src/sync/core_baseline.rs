@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
 use tentaflow_protocol::mesh::{BaselineAck, BaselineChunk, BaselineEpoch, BaselineHeader};
+use tracing::{info, warn};
 
 use crate::db::{self, DbPool};
 use crate::sync::ledger::{LedgerResult, SyncLedgerError};
@@ -93,10 +93,7 @@ pub fn store_adopt_state(db: &DbPool, state: &BaselineAdoptState) -> LedgerResul
 /// tabel (ten sam `tx.commit()`). Bez tego istnialo okno: commit merge'a, potem
 /// osobny zapis fazy — crash pomiedzy zostawial DB scalony z faza `Importing`,
 /// wiec re-pair importowal drugi raz.
-fn store_adopt_state_tx(
-    tx: &Transaction<'_>,
-    state: &BaselineAdoptState,
-) -> LedgerResult<()> {
+fn store_adopt_state_tx(tx: &Transaction<'_>, state: &BaselineAdoptState) -> LedgerResult<()> {
     let json = serde_json::to_string(state)
         .map_err(|e| SyncLedgerError::Codec(format!("baseline adopt state encode: {e}")))?;
     tx.execute(
@@ -163,8 +160,7 @@ fn conflicts_with(
     if existing.phase == BaselinePhase::Completed {
         return false;
     }
-    let same_target =
-        existing.role == desired && existing.peer == peer && &existing.epoch == epoch;
+    let same_target = existing.role == desired && existing.peer == peer && &existing.epoch == epoch;
     !same_target
 }
 
@@ -214,11 +210,13 @@ pub fn begin_adopt_atomic(
         // Wznowienie tej samej adopcji (same peer+epoch+rola) w fazie
         // przetrwalej awarie post-commit lub juz zakonczonej: DB jest scalony,
         // wiec wywolujacy ma tylko dokonczyc post-commit, nie importowac od nowa.
-        let same_target = existing.role == desired
-            && existing.peer == peer
-            && &existing.epoch == epoch;
+        let same_target =
+            existing.role == desired && existing.peer == peer && &existing.epoch == epoch;
         if same_target
-            && matches!(existing.phase, BaselinePhase::Imported | BaselinePhase::Completed)
+            && matches!(
+                existing.phase,
+                BaselinePhase::Imported | BaselinePhase::Completed
+            )
         {
             return Ok(BeginOutcome::Resume(existing));
         }
@@ -791,9 +789,7 @@ fn capture_baseline_snapshot_tx(
     drop(stmt);
 
     let mut stmt = tx
-        .prepare(
-            "SELECT node_id, user_id, assignment_mode, created_by FROM node_user_assignments",
-        )
+        .prepare("SELECT node_id, user_id, assignment_mode, created_by FROM node_user_assignments")
         .map_err(map_err)?;
     let node_user_assignments = stmt
         .query_map([], |r| {
@@ -1273,8 +1269,11 @@ fn import_baseline_tx(
                 .map(|e| (e.to_string(), u.id.clone()))
         })
         .collect();
-    let donor_ids: std::collections::BTreeSet<&str> =
-        snapshot.user_accounts.iter().map(|u| u.id.as_str()).collect();
+    let donor_ids: std::collections::BTreeSet<&str> = snapshot
+        .user_accounts
+        .iter()
+        .map(|u| u.id.as_str())
+        .collect();
 
     // Lokalni (joinera) userzy PRZED importem — uzywane do remapu i kolizji.
     let local_users = read_local_users(tx)?;
@@ -1296,7 +1295,11 @@ fn import_baseline_tx(
         if donor_ids.contains(local.id.as_str()) {
             continue;
         }
-        let local_email = local.email.as_deref().map(str::trim).filter(|e| !e.is_empty());
+        let local_email = local
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty());
         let mapped_donor_id = local_email.and_then(|e| donor_email_to_id.get(e));
 
         if let Some(donor_id) = mapped_donor_id {
@@ -1476,7 +1479,15 @@ fn suffix_local_collisions(
             .map_err(map_err)?;
         if let Some(local_id) = local_id {
             let suffixed = probe_free_value(&donor.username, &local_id, |cand| {
-                value_taken(tx, "user_accounts", "username", "id", cand, &local_id, map_err)
+                value_taken(
+                    tx,
+                    "user_accounts",
+                    "username",
+                    "id",
+                    cand,
+                    &local_id,
+                    map_err,
+                )
             })?;
             tx.execute(
                 "UPDATE user_accounts SET username = ?1 WHERE id = ?2",
@@ -1499,7 +1510,15 @@ fn suffix_local_collisions(
             .map_err(map_err)?;
         if let Some(local_id) = local_id {
             let suffixed = probe_free_value(&donor.slug, &local_id, |cand| {
-                value_taken(tx, "organizations", "slug", "org_id", cand, &local_id, map_err)
+                value_taken(
+                    tx,
+                    "organizations",
+                    "slug",
+                    "org_id",
+                    cand,
+                    &local_id,
+                    map_err,
+                )
             })?;
             tx.execute(
                 "UPDATE organizations SET slug = ?1 WHERE org_id = ?2",
@@ -1785,7 +1804,13 @@ fn upsert_donor_rows(
             "DELETE FROM sync_policies \
              WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
                AND policy_id <> ?5",
-            params![p.org_id, p.addon_id, p.resource_type, p.resource_id, p.policy_id],
+            params![
+                p.org_id,
+                p.addon_id,
+                p.resource_type,
+                p.resource_id,
+                p.policy_id
+            ],
         )
         .map_err(map_err)?;
         tx.execute(
@@ -2075,11 +2100,8 @@ fn remap_user_owned_rows(
 
     // org_memberships joinera dla tego usera znikna z `drop_foreign_org_rows`;
     // usuwamy lokalny wiersz usera joinera (dane juz przepiete na dawce).
-    tx.execute(
-        "DELETE FROM user_accounts WHERE id = ?1",
-        params![local_id],
-    )
-    .map_err(map_err)?;
+    tx.execute("DELETE FROM user_accounts WHERE id = ?1", params![local_id])
+        .map_err(map_err)?;
 
     Ok(())
 }

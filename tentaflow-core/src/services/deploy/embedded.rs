@@ -30,6 +30,7 @@ struct EmbeddedLlmSelection {
     model_name: String,
     repo: String,
     quantization: Option<String>,
+    model_file: Option<String>,
 }
 
 pub struct EmbeddedDeploy {
@@ -238,6 +239,13 @@ impl EmbeddedDeploy {
                 model_name: repo.to_string(),
                 repo: repo.to_string(),
                 quantization: None,
+                model_file: self
+                    .user_config
+                    .get("model_file")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
             });
         }
 
@@ -255,6 +263,7 @@ impl EmbeddedDeploy {
             model_name: p.id.clone(),
             repo: p.repo.clone(),
             quantization: p.quantization.clone(),
+            model_file: None,
         })
     }
 
@@ -338,8 +347,38 @@ impl EmbeddedDeploy {
                         }
                     }
                 });
+                let download_selection = match preferred_backend {
+                    "llamacpp" => {
+                        if let Some(file) = selection.model_file.as_deref() {
+                            if !crate::hub::model_store::valid_hf_relative_path(file) {
+                                return Err(DeployError::Other(format!(
+                                    "invalid GGUF filename '{}'",
+                                    file
+                                )));
+                            }
+                            crate::hub::model_store::ModelDownloadSelection::ExactFile(
+                                file.to_string(),
+                            )
+                        } else if let Some(quantization) = selection.quantization.as_deref() {
+                            crate::hub::model_store::ModelDownloadSelection::GgufQuantization(
+                                quantization.to_string(),
+                            )
+                        } else {
+                            return Err(DeployError::Other(
+                                "llama.cpp GGUF deploy requires model_file or preset quantization"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    _ => crate::hub::model_store::ModelDownloadSelection::All,
+                };
                 let path = store
-                    .download_model(&selection.repo, None, progress_tx)
+                    .download_model_selection(
+                        &selection.repo,
+                        None,
+                        progress_tx,
+                        download_selection,
+                    )
                     .await
                     .map_err(|e| {
                         DeployError::Other(format!("download model {}: {}", selection.repo, e))
@@ -405,7 +444,7 @@ impl EmbeddedDeploy {
                 .await
                 .map_err(|e| {
                     DeployError::Other(format!(
-                        "load embedded model '{}' with backend '{}': {}",
+                        "load embedded model '{}' with backend '{}': {:#}",
                         load_path.display(),
                         preferred_backend,
                         e

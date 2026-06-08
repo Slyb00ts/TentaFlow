@@ -13,15 +13,14 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     AddonConfigField, AddonConfigGetResponse, AddonConfigSetResponse, AddonInstallResponse,
     AddonInstanceInstallResponse, AddonInstancePayload, AddonInstanceUpdateResponse,
-    AddonInstanceVersionsResponse, AddonLogEntry, AddonLogsResponse, AddonNetworkRuleDecl,
-    AddonNetworkRulesGetResponse, AddonNetworkRulesSetResponse, AddonPackageInfo,
-    AddonKvStats, AddonMilvusService, AddonRecordingStats, AddonReloadResponse,
+    AddonInstanceVersionsResponse, AddonKvStats, AddonLogEntry, AddonLogsResponse,
+    AddonMilvusService, AddonNetworkRuleDecl, AddonNetworkRulesGetResponse,
+    AddonNetworkRulesSetResponse, AddonPackageInfo, AddonRecordingStats, AddonReloadResponse,
     AddonResourcesGetResponse, AddonResourcesSetResponse, AddonSqlStats, AddonSqlTable,
     AddonStoragePayload, AddonStorageStatsResponse, AddonToggleResponse, AddonToolDecl,
     AddonToolParam, AddonToolsResponse, AddonUninstallResponse, AddonVectorConfig,
-    AddonVectorConfigResponse, AddonVectorPayload,
-    AddonVectorSetConfigResponse, AddonVectorStats, MessageBody, ProtocolError, ProtocolErrorCode,
-    SessionAuth,
+    AddonVectorConfigResponse, AddonVectorPayload, AddonVectorSetConfigResponse, AddonVectorStats,
+    MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth,
 };
 
 use crate::db::repository;
@@ -430,8 +429,7 @@ pub fn addon_uninstall(
         .map_err(db_err)
         .unwrap_or(false)
     {
-        if let Err(e) =
-            repository::capture_addon_instance_delete(&ctx.state.db, &payload.addon_id)
+        if let Err(e) = repository::capture_addon_instance_delete(&ctx.state.db, &payload.addon_id)
         {
             tracing::warn!(
                 "addon uninstall: capture delete sync nieudany dla '{}': {e}",
@@ -704,19 +702,18 @@ pub fn addon_tools(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     // Jedno zrodlo prawdy z LLM: kanoniczny parser manifestu (`[[tool]]`), ten
     // sam, ktory zasila tool_dispatch. `registered_tools` nie nadaje sie tu, bo
     // to stan runtime (pusty gdy addon wylaczony / nie wystartowal).
-    let mut tools: Vec<AddonToolDecl> = match crate::addon::lifecycle::parse_manifest_toml(
-        &addon.manifest_json,
-    ) {
-        Ok(manifest) => manifest.tools.iter().map(tool_decl_from_manifest).collect(),
-        Err(e) => {
-            tracing::warn!(
-                "addon '{}': nie udalo sie sparsowac manifestu dla listy tools: {}",
-                payload.addon_id,
-                e
-            );
-            Vec::new()
-        }
-    };
+    let mut tools: Vec<AddonToolDecl> =
+        match crate::addon::lifecycle::parse_manifest_toml(&addon.manifest_json) {
+            Ok(manifest) => manifest.tools.iter().map(tool_decl_from_manifest).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    "addon '{}': nie udalo sie sparsowac manifestu dla listy tools: {}",
+                    payload.addon_id,
+                    e
+                );
+                Vec::new()
+            }
+        };
     tools.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(MessageBody::AddonToolsResponseBody(AddonToolsResponse {
@@ -730,7 +727,11 @@ pub fn addon_tools(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 /// jakiej parser przechowuje parametry (wymagana przez host functions/LLM).
 fn tool_decl_from_manifest(t: &crate::addon::ManifestTool) -> AddonToolDecl {
     let mut parameters: Vec<AddonToolParam> = Vec::new();
-    if let Some(props) = t.parameters_schema.get("properties").and_then(|v| v.as_object()) {
+    if let Some(props) = t
+        .parameters_schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+    {
         let required: std::collections::HashSet<&str> = t
             .parameters_schema
             .get("required")
@@ -1465,7 +1466,8 @@ fn addon_sql_stats(org_id: &str, addon_id: &str) -> AddonSqlStats {
     if !path.exists() {
         return unavailable();
     }
-    let conn = match rusqlite::Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+    let conn = match rusqlite::Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    {
         Ok(c) => c,
         Err(_) => return unavailable(),
     };
@@ -1482,8 +1484,12 @@ fn addon_sql_stats(org_id: &str, addon_id: &str) -> AddonSqlStats {
         return unavailable();
     }
 
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(-1);
-    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(-1);
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap_or(-1);
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap_or(-1);
     let db_size_bytes = if page_count >= 0 && page_size >= 0 {
         page_count * page_size
     } else {
@@ -1679,9 +1685,11 @@ pub fn addon_vector_dispatch(
                     _ => {}
                 }
             }
-            if r.milvus_user.as_deref().map(|u| u.len() > MAX_VECTOR_SECRET_LEN).unwrap_or(false)
-                || r
-                    .milvus_password
+            if r.milvus_user
+                .as_deref()
+                .map(|u| u.len() > MAX_VECTOR_SECRET_LEN)
+                .unwrap_or(false)
+                || r.milvus_password
                     .as_deref()
                     .map(|p| p.len() > MAX_VECTOR_SECRET_LEN)
                     .unwrap_or(false)
@@ -1769,7 +1777,9 @@ fn validate_vector_config(cfg: &AddonVectorConfig) -> Result<(), ProtocolError> 
             Some("manual") => {
                 let uri = cfg.manual_uri.as_deref().map(str::trim).unwrap_or("");
                 if uri.is_empty() {
-                    return Err(ProtocolError::bad_request("milvus_source=manual wymaga manual_uri"));
+                    return Err(ProtocolError::bad_request(
+                        "milvus_source=manual wymaga manual_uri",
+                    ));
                 }
                 if uri.len() > MAX_VECTOR_URI_LEN {
                     return Err(ProtocolError::bad_request("manual_uri za dlugie"));
@@ -1782,7 +1792,11 @@ fn validate_vector_config(cfg: &AddonVectorConfig) -> Result<(), ProtocolError> 
                 Ok(())
             }
             Some("service_ref") => {
-                if cfg.service_ref.as_ref().map(|s| !s.service_id.trim().is_empty()).unwrap_or(false)
+                if cfg
+                    .service_ref
+                    .as_ref()
+                    .map(|s| !s.service_id.trim().is_empty())
+                    .unwrap_or(false)
                 {
                     Ok(())
                 } else {
@@ -1825,7 +1839,13 @@ fn discover_milvus_services(ctx: &HandlerContext) -> Vec<AddonMilvusService> {
 /// bez klienta w Core) konczy sie jasnym bledem przy pierwszej operacji, jak inne
 /// proxy mesh (web_research degraduje tak samo) — nie cicha utrata danych.
 fn discover_remote_milvus_services(ctx: &HandlerContext) -> Vec<AddonMilvusService> {
-    let registry = match ctx.state.service_manager.mesh_services_registry.read().clone() {
+    let registry = match ctx
+        .state
+        .service_manager
+        .mesh_services_registry
+        .read()
+        .clone()
+    {
         Some(r) => r,
         None => return Vec::new(),
     };
@@ -1837,7 +1857,10 @@ fn discover_remote_milvus_services(ctx: &HandlerContext) -> Vec<AddonMilvusServi
         .map(|s| {
             let reachable = !s.paused
                 && matches!(s.status.as_str(), "running" | "degraded")
-                && s.endpoint_url.as_deref().map(|u| !u.is_empty()).unwrap_or(false);
+                && s.endpoint_url
+                    .as_deref()
+                    .map(|u| !u.is_empty())
+                    .unwrap_or(false);
             AddonMilvusService {
                 node_id: s.node_id,
                 local: false,

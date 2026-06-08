@@ -7129,7 +7129,10 @@ mod tests {
                 },
             )
             .expect("drain pending captures");
-            assert!(drained >= 1, "the drain must process the pending capture(s)");
+            assert!(
+                drained >= 1,
+                "the drain must process the pending capture(s)"
+            );
 
             // AFTER drain: the core.flow op is now in the peer's outbox.
             let push = node
@@ -7356,7 +7359,9 @@ mod tests {
     }
 
     fn flow_name(db: &DbPool, id: &str) -> Option<String> {
-        repository::get_flow(db, id).expect("get flow").map(|f| f.name)
+        repository::get_flow(db, id)
+            .expect("get flow")
+            .map(|f| f.name)
     }
 
     /// Records a flow capture on `node` (signs + queues it) and returns the
@@ -7498,7 +7503,10 @@ mod tests {
             assert_eq!(ack.operation_ids.len(), 1, "one op accepted into inbox");
 
             // The inbound op materialized into the receiver's flows table.
-            assert_eq!(flow_name(&receiver.runtime.db, "1").as_deref(), Some("Pushed Flow"));
+            assert_eq!(
+                flow_name(&receiver.runtime.db, "1").as_deref(),
+                Some("Pushed Flow")
+            );
         });
     }
 
@@ -7554,8 +7562,14 @@ mod tests {
                     "standard",
                 )
                 .expect("sync node");
-                repository::assign_node_to_user(&source.runtime.db, node_id, user_id, "primary", None)
-                    .expect("assign node");
+                repository::assign_node_to_user(
+                    &source.runtime.db,
+                    node_id,
+                    user_id,
+                    "primary",
+                    None,
+                )
+                .expect("assign node");
             }
             repository::upsert_sync_policy(
                 &source.runtime.db,
@@ -7599,9 +7613,18 @@ mod tests {
                 .build_push_payload_for_target(&denied.runtime.local_node_id, 16)
                 .expect("denied push");
 
-            assert!(permitted_push.is_some(), "permitted node must receive the push");
-            assert!(denied_push.is_none(), "denied node must NOT receive any push");
-            assert_eq!(recorded.queued_targets, 1, "exactly one permitted target queued");
+            assert!(
+                permitted_push.is_some(),
+                "permitted node must receive the push"
+            );
+            assert!(
+                denied_push.is_none(),
+                "denied node must NOT receive any push"
+            );
+            assert_eq!(
+                recorded.queued_targets, 1,
+                "exactly one permitted target queued"
+            );
         });
     }
 
@@ -7636,14 +7659,21 @@ mod tests {
                 .ledger
                 .get_operation(recorded.op_id)
                 .expect("operation");
-            assert_eq!(stale_op.body.epoch.counter, 0, "op stamped under genesis epoch");
+            assert_eq!(
+                stale_op.body.epoch.counter, 0,
+                "op stamped under genesis epoch"
+            );
 
             // Receiver adopts a NEWER baseline epoch (as it would after pairing).
             let new_epoch = BaselineEpoch {
                 counter: 7,
                 origin_node: receiver.runtime.local_node_id.clone(),
             };
-            receiver.runtime.ledger.set_epoch(new_epoch.clone()).expect("set epoch");
+            receiver
+                .runtime
+                .ledger
+                .set_epoch(new_epoch.clone())
+                .expect("set epoch");
 
             // The push carries the stale-epoch op; the receiver's inbox fences it.
             let push = source

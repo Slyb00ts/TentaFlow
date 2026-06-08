@@ -77,7 +77,32 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
     const chip = statusChip();
     if (!chip) return;
     chip.setAttribute('status', statusToChipVariant(status));
+    if (status === 'deploying') {
+      chip.setAttribute('dot', '');
+    } else {
+      chip.removeAttribute('dot');
+    }
     chip.textContent = I18n.t(`deploy.status_${status}`) || status;
+  }
+
+  function applyDeploymentSummary(summary) {
+    if (!summary) return;
+    const status = summary.status || 'deploying';
+    applyStatus(status);
+    applyPhase(summary.phase || '');
+    applyProgress(Number.isFinite(summary.progressPct) ? summary.progressPct : 0);
+    if (summary.logTail && logLines.length === 0) {
+      for (const line of String(summary.logTail).split('\n')) {
+        appendLine(line);
+      }
+    }
+    if (['failed', 'interrupted', 'cancelled'].includes(status)) {
+      const box = errorBox();
+      if (box) {
+        box.textContent = summary.errorMessage || I18n.t('deploy.err_generic');
+        box.hidden = false;
+      }
+    }
   }
 
   function onChunk(body) {
@@ -118,6 +143,8 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
 
   (async () => {
     try {
+      const status = await ApiBinary.one('deploymentStatusRequest', { deployId });
+      applyDeploymentSummary(status?.deployment);
       unsubscribe = await ApiBinary.subscribe(
         'deploymentLogStreamRequest',
         { deployId, replayTail: true },

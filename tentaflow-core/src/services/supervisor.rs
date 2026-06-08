@@ -336,11 +336,11 @@ impl Supervisor {
             }
 
             let health = if Self::engine_is_infra(&svc.engine_id) {
-                    HealthStatus::Ok
-                } else {
-                    self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
-                        .await
-                };
+                HealthStatus::Ok
+            } else {
+                self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
+                    .await
+            };
             self.apply_health(svc, health, /*allow_restart=*/ false)
                 .await;
         }
@@ -545,9 +545,9 @@ impl Supervisor {
                     );
                 }
                 Err(e) => {
-                    let msg = format!("{}: {}", label, e);
+                    let msg = format!("{}: {:#}", label, e);
                     tracing::warn!(
-                        "supervisor: {} failed for {} ({}): {}",
+                        "supervisor: {} failed for {} ({}): {:#}",
                         label,
                         svc_id,
                         engine_id,
@@ -598,22 +598,37 @@ impl Supervisor {
                 if svc.paused {
                     continue;
                 }
-                // Status=Starting znaczy ze detached deploy task wciaz pracuje
+                // Status=Starting/Deploying znaczy ze deploy task wciaz pracuje
                 // (vLLM cold-start ~3 min). Endpoint_url jest NULL do momentu
                 // gdy `write_runtime` zapisze go po sukcesie deploy. Bez tego
                 // skipa health probe widzi NULL endpoint_url → Failed →
                 // run_loop wola deploy::respawn rownoczesnie z trwajacym
-                // deployem → dwie instancje walcza o ten sam port. Detached
-                // task sam ustawi status na Running albo Failed gdy skonczy.
-                if svc.status == ServiceStatus::Starting {
+                // deployem → dwie instancje walcza o ten sam port. Failed /
+                // Interrupted / Stopped obsluguje auto-start pinned, a nie
+                // health probe.
+                if !matches!(
+                    svc.status,
+                    ServiceStatus::Running | ServiceStatus::Degraded
+                ) {
+                    continue;
+                }
+                if Self::service_requires_registered_model(svc)
+                    && self.model_count(svc.id).await.unwrap_or(0) == 0
+                {
+                    self.mark_status(
+                        svc.id,
+                        ServiceStatus::Failed,
+                        Some("service has no registered models"),
+                    )
+                    .await;
                     continue;
                 }
                 let health = if Self::engine_is_infra(&svc.engine_id) {
-                        HealthStatus::Ok
-                    } else {
-                        self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
-                            .await
-                    };
+                    HealthStatus::Ok
+                } else {
+                    self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
+                        .await
+                };
                 self.apply_health(svc, health, /*allow_restart=*/ true)
                     .await;
             }
@@ -672,6 +687,19 @@ impl Supervisor {
             Ok(())
         })
         .await;
+    }
+
+    async fn model_count(&self, service_id: i64) -> Result<i64, SupervisorError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|e| SupervisorError::Database(format!("pool poisoned: {}", e)))?;
+            crate::services_repo::models::count_for_service(&conn, service_id)
+                .map_err(|e| SupervisorError::Database(e.to_string()))
+        })
+        .await
+        .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
     }
 
     async fn write_runtime(&self, id: i64, runtime: &RuntimeHandle) -> Result<(), SupervisorError> {
@@ -976,10 +1004,28 @@ impl Supervisor {
     fn engine_is_infra(engine_id: &str) -> bool {
         crate::services::manifest::registry()
             .by_id(engine_id)
-            .map(|m| {
-                m.engine.resource_kind == Some(crate::services::manifest::ResourceKind::Infra)
-            })
+            .map(|m| m.engine.resource_kind == Some(crate::services::manifest::ResourceKind::Infra))
             .unwrap_or(false)
+    }
+
+    fn service_requires_registered_model(svc: &ServiceRow) -> bool {
+        crate::services::manifest::registry()
+            .by_id(&svc.engine_id)
+            .map(|m| !m.engine.is_model_less() && m.engine.requires_model != Some(false))
+            .unwrap_or_else(|| {
+                matches!(
+                    svc.category.as_str(),
+                    "llm"
+                        | "stt"
+                        | "tts"
+                        | "embeddings"
+                        | "vision"
+                        | "image-gen"
+                        | "video-gen"
+                        | "music-gen"
+                        | "model-3d-gen"
+                )
+            })
     }
 
     async fn check_health(

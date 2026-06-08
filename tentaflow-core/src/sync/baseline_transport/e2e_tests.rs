@@ -44,7 +44,10 @@ impl FrameStream for DuplexFrameStream {
             .map_err(|e| transport_err(label, format!("read len: {e}")))?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_BASELINE_FRAME_BYTES {
-            return Err(transport_err(label, format!("frame too large: {len} bytes")));
+            return Err(transport_err(
+                label,
+                format!("frame too large: {len} bytes"),
+            ));
         }
         let mut body = vec![0u8; len];
         self.inner
@@ -217,7 +220,13 @@ async fn run_pairing(
         let donor_node_id = donor_node_id.clone();
         let joiner_node_id = joiner_node_id.clone();
         tokio::spawn(async move {
-            run_donor_session(&mut donor_stream, &security, &donor_node_id, &joiner_node_id).await
+            run_donor_session(
+                &mut donor_stream,
+                &security,
+                &donor_node_id,
+                &joiner_node_id,
+            )
+            .await
         })
     };
     let joiner_task = tokio::spawn(async move {
@@ -232,8 +241,14 @@ async fn run_pairing(
         .await
     });
 
-    donor_task.await.expect("donor join").expect("donor session ok");
-    joiner_task.await.expect("joiner join").expect("joiner session ok")
+    donor_task
+        .await
+        .expect("donor join")
+        .expect("donor session ok");
+    joiner_task
+        .await
+        .expect("joiner join")
+        .expect("joiner session ok")
 }
 
 fn count(pool: &DbPool, sql: &str) -> i64 {
@@ -277,17 +292,25 @@ async fn e2e_independent_bootstrap_first_resources_get_distinct_uuids() {
 
     let user_a =
         repository::create_user_account(&node_a, "alice", "h", "Alice", "alice@a.io").unwrap();
-    let user_b =
-        repository::create_user_account(&node_b, "bob", "h", "Bob", "bob@b.io").unwrap();
+    let user_b = repository::create_user_account(&node_b, "bob", "h", "Bob", "bob@b.io").unwrap();
 
     let group_a = repository::create_group(&node_a, "Team", "first group").unwrap();
     let group_b = repository::create_group(&node_b, "Team", "first group").unwrap();
 
     // The "first" resources are NOT id=1 — they are UUIDs, and they differ
     // across the two independent installs.
-    assert_ne!(flow_a, flow_b, "first-flow ids must not collide across nodes");
-    assert_ne!(user_a, user_b, "first-user ids must not collide across nodes");
-    assert_ne!(group_a, group_b, "first-group ids must not collide across nodes");
+    assert_ne!(
+        flow_a, flow_b,
+        "first-flow ids must not collide across nodes"
+    );
+    assert_ne!(
+        user_a, user_b,
+        "first-user ids must not collide across nodes"
+    );
+    assert_ne!(
+        group_a, group_b,
+        "first-group ids must not collide across nodes"
+    );
     for id in [&flow_a, &flow_b, &user_a, &user_b, &group_a, &group_b] {
         assert_ne!(id.as_str(), "1", "ids must be UUIDs, not autoincrement");
         assert_eq!(id.len(), 36, "uuid v4 string length");
@@ -329,9 +352,14 @@ async fn e2e_pairing_adopt_merges_into_single_org_no_role_duplication() {
 
     // Donor user-created account (must reach the joiner) and joiner user-created
     // account with a DIFFERENT email (must survive as a member of the donor org).
-    let donor_user =
-        repository::create_user_account(&donor_pool, "donor_alice", "h", "Donor Alice", "alice@donor.io")
-            .unwrap();
+    let donor_user = repository::create_user_account(
+        &donor_pool,
+        "donor_alice",
+        "h",
+        "Donor Alice",
+        "alice@donor.io",
+    )
+    .unwrap();
     {
         let conn = donor_pool.lock().unwrap();
         conn.execute(
@@ -341,9 +369,14 @@ async fn e2e_pairing_adopt_merges_into_single_org_no_role_duplication() {
         )
         .unwrap();
     }
-    let joiner_user =
-        repository::create_user_account(&joiner_pool, "joiner_bob", "h", "Joiner Bob", "bob@joiner.io")
-            .unwrap();
+    let joiner_user = repository::create_user_account(
+        &joiner_pool,
+        "joiner_bob",
+        "h",
+        "Joiner Bob",
+        "bob@joiner.io",
+    )
+    .unwrap();
     {
         let conn = joiner_pool.lock().unwrap();
         conn.execute(
@@ -422,13 +455,20 @@ async fn e2e_pairing_adopt_merges_into_single_org_no_role_duplication() {
         )
         .unwrap()
     };
-    assert_eq!(joiner_user_org, NODE_ORG_ID, "joiner user is in the merged org");
+    assert_eq!(
+        joiner_user_org, NODE_ORG_ID,
+        "joiner user is in the merged org"
+    );
 
     // Epoch parity: after adopt both report the same baseline epoch counter.
     // (In-process there is no runtime ledger, so the adopt epoch is the donor's
     // current core_epoch the donor session captured.)
-    let donor_state = load_adopt_state(&security.db).unwrap().expect("donor state");
-    let joiner_state = load_adopt_state(&joiner_pool).unwrap().expect("joiner state");
+    let donor_state = load_adopt_state(&security.db)
+        .unwrap()
+        .expect("donor state");
+    let joiner_state = load_adopt_state(&joiner_pool)
+        .unwrap()
+        .expect("joiner state");
     assert_eq!(donor_state.role, BaselineRole::Donor);
     assert_eq!(joiner_state.role, BaselineRole::Joiner);
     assert_eq!(donor_state.phase, BaselinePhase::Completed);
@@ -455,11 +495,9 @@ async fn e2e_both_nodes_published_version2_flow_no_unique_error_after_adopt() {
 
     // Each node independently published a flow as "version 2" advertising the
     // same model name — the exact symptom from the original bug report.
-    let donor_flow = repository::create_flow(
-        &donor_pool,
-        &flow_params("version 2", Some("shared/model")),
-    )
-    .unwrap();
+    let donor_flow =
+        repository::create_flow(&donor_pool, &flow_params("version 2", Some("shared/model")))
+            .unwrap();
     let joiner_flow = repository::create_flow(
         &joiner_pool,
         &flow_params("version 2", Some("shared/model")),
@@ -477,7 +515,10 @@ async fn e2e_both_nodes_published_version2_flow_no_unique_error_after_adopt() {
 
     // Both flows kept under their own UUIDs.
     assert_eq!(
-        count(&joiner_pool, "SELECT COUNT(*) FROM flows WHERE name = 'version 2'"),
+        count(
+            &joiner_pool,
+            "SELECT COUNT(*) FROM flows WHERE name = 'version 2'"
+        ),
         2,
         "both 'version 2' flows survive after adopt"
     );
@@ -509,8 +550,15 @@ async fn e2e_both_nodes_published_version2_flow_no_unique_error_after_adopt() {
         )
         .unwrap()
     };
-    assert_eq!(donor_model.as_deref(), Some("shared/model"), "donor stays published");
-    assert_eq!(joiner_model, None, "joiner flow unpublished on model-name collision");
+    assert_eq!(
+        donor_model.as_deref(),
+        Some("shared/model"),
+        "donor stays published"
+    );
+    assert_eq!(
+        joiner_model, None,
+        "joiner flow unpublished on model-name collision"
+    );
 
     // No published_model_name appears twice — the UNIQUE invariant holds post-merge.
     assert_eq!(

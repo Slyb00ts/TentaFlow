@@ -248,7 +248,11 @@ impl DockerDeploy {
         }
 
         let transport = self.pick_transport();
-        let endpoint_url = Some(build_endpoint_url("127.0.0.1", port, self.manifest.engine.api));
+        let endpoint_url = Some(build_endpoint_url(
+            "127.0.0.1",
+            port,
+            self.manifest.engine.api,
+        ));
 
         let runtime = RuntimeHandle {
             pid: None,
@@ -576,9 +580,7 @@ impl DeployStrategy for DockerDeploy {
             Some(p) => p,
             None => {
                 let compose_path = docker_section.compose_path.clone().ok_or_else(|| {
-                    DeployError::Manifest(
-                        "docker deploy needs context_path or compose_path".into(),
-                    )
+                    DeployError::Manifest("docker deploy needs context_path or compose_path".into())
                 })?;
                 return self.prepare_compose(&compose_path).await;
             }
@@ -681,9 +683,7 @@ impl DeployStrategy for DockerDeploy {
         // See python_bundle.rs: the served name must equal the advertised slug
         // (`models_from_manifest` model_name) or dispatch 404s when preset id
         // differs from the repo. entrypoint.sh reads `$SERVED_MODEL_NAME`.
-        if let Some(served) =
-            super::resolve_served_model_name(&self.manifest, &self.user_config)
-        {
+        if let Some(served) = super::resolve_served_model_name(&self.manifest, &self.user_config) {
             env.insert("SERVED_MODEL_NAME".into(), served);
         }
         // Argumenty CLI silnika budowane jako strukturalny Vec<String> i

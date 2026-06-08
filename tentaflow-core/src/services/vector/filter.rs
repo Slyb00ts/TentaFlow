@@ -27,7 +27,9 @@ fn validate_field(name: &str) -> Result<()> {
     if ok {
         Ok(())
     } else {
-        Err(invalid(format!("field name '{name}' must match ^[A-Za-z_][A-Za-z0-9_]{{0,63}}$")))
+        Err(invalid(format!(
+            "field name '{name}' must match ^[A-Za-z_][A-Za-z0-9_]{{0,63}}$"
+        )))
     }
 }
 
@@ -79,7 +81,10 @@ fn join(fs: &[Filter], op: &str, eq: &str, ne: &str) -> Result<String> {
     if fs.is_empty() {
         return Err(invalid(format!("empty '{op}' group")));
     }
-    let parts: Result<Vec<String>> = fs.iter().map(|f| Ok(format!("({})", render(f, eq, ne)?))).collect();
+    let parts: Result<Vec<String>> = fs
+        .iter()
+        .map(|f| Ok(format!("({})", render(f, eq, ne)?)))
+        .collect();
     Ok(parts?.join(&format!(" {op} ")))
 }
 
@@ -110,9 +115,18 @@ mod tests {
 
     #[test]
     fn numeric_and_bool() {
-        assert_eq!(to_milvus(&Filter::Gte("age".into(), FieldValue::Int(18))).unwrap(), "age >= 18");
-        assert_eq!(to_zvec(&Filter::Lt("score".into(), FieldValue::Float(0.5))).unwrap(), "score < 0.5");
-        assert_eq!(to_milvus(&Filter::Eq("flag".into(), FieldValue::Bool(true))).unwrap(), "flag == true");
+        assert_eq!(
+            to_milvus(&Filter::Gte("age".into(), FieldValue::Int(18))).unwrap(),
+            "age >= 18"
+        );
+        assert_eq!(
+            to_zvec(&Filter::Lt("score".into(), FieldValue::Float(0.5))).unwrap(),
+            "score < 0.5"
+        );
+        assert_eq!(
+            to_milvus(&Filter::Eq("flag".into(), FieldValue::Bool(true))).unwrap(),
+            "flag == true"
+        );
     }
 
     #[test]

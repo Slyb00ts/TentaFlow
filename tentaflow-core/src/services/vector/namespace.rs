@@ -402,7 +402,9 @@ impl NamespaceManager {
             None => Ok(VectorBackendConfig::default()),
             Some(s) if s.trim().is_empty() => Ok(VectorBackendConfig::default()),
             Some(s) => serde_json::from_str(&s).map_err(|e| {
-                VectorError::Backend(format!("addon {addon_id}: niepoprawny __vector_config: {e}"))
+                VectorError::Backend(format!(
+                    "addon {addon_id}: niepoprawny __vector_config: {e}"
+                ))
             }),
         }
     }
@@ -435,8 +437,9 @@ impl NamespaceManager {
                     Some(sr) => self.build_remote_milvus(
                         org_id, addon_id, namespace, dim, metric, fields, sparse, &cfg, sr,
                     ),
-                    None => self
-                        .build_milvus(org_id, addon_id, namespace, dim, metric, fields, sparse, &cfg),
+                    None => self.build_milvus(
+                        org_id, addon_id, namespace, dim, metric, fields, sparse, &cfg,
+                    ),
                 }
             }
             // Nieznany backend => blad, nie cichy fallback na zvec (ochrona przed
@@ -471,8 +474,12 @@ impl NamespaceManager {
                 sr.node_id
             ))
         })?;
-        let collection =
-            milvus_collection_name(org_id, addon_id, namespace, cfg.collection_override.as_deref());
+        let collection = milvus_collection_name(
+            org_id,
+            addon_id,
+            namespace,
+            cfg.collection_override.as_deref(),
+        );
         let user = self.addon_cfg(addon_id, CFG_MILVUS_USER);
         let password = self.addon_cfg(addon_id, CFG_MILVUS_PASSWORD);
         let be = super::remote::RemoteMeshVectorBackend::new(
@@ -505,8 +512,12 @@ impl NamespaceManager {
         let uri = self.resolve_milvus_uri(addon_id, cfg)?;
         let user = self.addon_cfg(addon_id, CFG_MILVUS_USER);
         let password = self.addon_cfg(addon_id, CFG_MILVUS_PASSWORD);
-        let collection =
-            milvus_collection_name(org_id, addon_id, namespace, cfg.collection_override.as_deref());
+        let collection = milvus_collection_name(
+            org_id,
+            addon_id,
+            namespace,
+            cfg.collection_override.as_deref(),
+        );
         let be = super::milvus_backend::MilvusBackend::connect(
             &uri,
             user.as_deref(),
@@ -652,7 +663,13 @@ impl NamespaceManager {
         let existing = self.load_row(org_id, addon_id, namespace)?;
         let (resolved_dim, resolved_metric, file_path, resolved_fields, resolved_sparse) =
             match existing {
-                Some((existing_dim, existing_metric, existing_path, existing_fields, existing_sparse)) => {
+                Some((
+                    existing_dim,
+                    existing_metric,
+                    existing_path,
+                    existing_fields,
+                    existing_sparse,
+                )) => {
                     if existing_dim != dim {
                         return Err(VectorError::DimMismatch {
                             expected: existing_dim,
@@ -669,12 +686,20 @@ impl NamespaceManager {
                     // set on reopen does not silently reshape the collection.
                     // Reconciliation (add/drop column on addon update) is a separate,
                     // explicit operation.
-                    (existing_dim, existing_metric, existing_path, existing_fields, existing_sparse)
+                    (
+                        existing_dim,
+                        existing_metric,
+                        existing_path,
+                        existing_fields,
+                        existing_sparse,
+                    )
                 }
                 None => {
                     self.check_namespace_quota(org_id, addon_id)?;
                     let path = self.file_path_for(org_id, addon_id, namespace)?;
-                    self.insert_row(org_id, addon_id, namespace, dim, metric, &path, fields, sparse)?;
+                    self.insert_row(
+                        org_id, addon_id, namespace, dim, metric, &path, fields, sparse,
+                    )?;
                     (dim, metric, path, fields.to_vec(), sparse)
                 }
             };
@@ -747,8 +772,15 @@ impl NamespaceManager {
         sparse_flag: bool,
         sparse_value: Option<&SparseVector>,
     ) -> Result<u64> {
-        let backend =
-            self.get_or_create(org_id, addon_id, namespace, dim, metric, field_specs, sparse_flag)?;
+        let backend = self.get_or_create(
+            org_id,
+            addon_id,
+            namespace,
+            dim,
+            metric,
+            field_specs,
+            sparse_flag,
+        )?;
         let is_replace = backend.has_ref(ref_id);
 
         let conn = self
@@ -844,7 +876,13 @@ impl NamespaceManager {
                     let path: String = r.get(2)?;
                     let fields_json: String = r.get(3)?;
                     let sparse: i64 = r.get(4)?;
-                    Ok((dim as u32, metric, PathBuf::from(path), fields_json, sparse != 0))
+                    Ok((
+                        dim as u32,
+                        metric,
+                        PathBuf::from(path),
+                        fields_json,
+                        sparse != 0,
+                    ))
                 },
             )
             .ok();
@@ -853,7 +891,13 @@ impl NamespaceManager {
         };
         let metric = Metric::parse(&metric_str)
             .ok_or_else(|| VectorError::Db(format!("invalid metric '{metric_str}' in DB row")))?;
-        Ok(Some((dim, metric, path, parse_field_specs(&fields_json), sparse)))
+        Ok(Some((
+            dim,
+            metric,
+            path,
+            parse_field_specs(&fields_json),
+            sparse,
+        )))
     }
 
     fn insert_row(
@@ -940,8 +984,12 @@ impl NamespaceManager {
         };
 
         let stored_type = |name: &str| stored.iter().find(|f| f.name == name).map(|f| f.field_type);
-        let desired_type =
-            |name: &str| desired.iter().find(|f| f.name == name).map(|f| f.field_type);
+        let desired_type = |name: &str| {
+            desired
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.field_type)
+        };
 
         let mut to_drop: Vec<String> = Vec::new();
         let mut to_add: Vec<FieldSpec> = Vec::new();
@@ -1124,8 +1172,16 @@ mod tests {
     fn test_quota_exceeded_at_max_namespaces() {
         let (_dir, mgr) = mgr();
         for i in 0..MAX_NAMESPACES_PER_ADDON {
-            mgr.get_or_create(ORG_A, "addon_a", &format!("ns{i}"), 4, Metric::Cosine, &[], false)
-                .unwrap();
+            mgr.get_or_create(
+                ORG_A,
+                "addon_a",
+                &format!("ns{i}"),
+                4,
+                Metric::Cosine,
+                &[],
+                false,
+            )
+            .unwrap();
         }
         let res = mgr.get_or_create(ORG_A, "addon_a", "overflow", 4, Metric::Cosine, &[], false);
         assert!(matches!(
@@ -1198,8 +1254,16 @@ mod tests {
         // org_id filter directly: even with the row physically present in
         // org A, a lookup under org B sees nothing.
         let (_dir, mgr) = mgr();
-        mgr.get_or_create(ORG_A, "addon_x_query", "faces", 3, Metric::Cosine, &[], false)
-            .unwrap();
+        mgr.get_or_create(
+            ORG_A,
+            "addon_x_query",
+            "faces",
+            3,
+            Metric::Cosine,
+            &[],
+            false,
+        )
+        .unwrap();
         let res = mgr.get(ORG_B, "addon_x_query", "faces");
         assert!(matches!(res, Err(VectorError::NamespaceNotFound { .. })));
     }
@@ -1334,7 +1398,11 @@ mod tests {
                 &["source".to_string()],
             )
             .unwrap();
-        assert_eq!(hits.len(), 1, "filter source='inbox' should match one vector");
+        assert_eq!(
+            hits.len(),
+            1,
+            "filter source='inbox' should match one vector"
+        );
         assert_eq!(hits[0].ref_id, 1);
         assert_eq!(
             hits[0].fields.first().map(|f| &f.value),
@@ -1434,14 +1502,20 @@ mod tests {
             1,
             &[1.0, 0.0, 0.0, 0.0],
             &[],
-            Some(&SparseVector { indices: vec![100], values: vec![0.9] }),
+            Some(&SparseVector {
+                indices: vec![100],
+                values: vec![0.9],
+            }),
         )
         .unwrap();
         be.upsert(
             2,
             &[0.0, 1.0, 0.0, 0.0],
             &[],
-            Some(&SparseVector { indices: vec![300], values: vec![0.8] }),
+            Some(&SparseVector {
+                indices: vec![300],
+                values: vec![0.8],
+            }),
         )
         .unwrap();
 
@@ -1449,7 +1523,10 @@ mod tests {
         let hits = be
             .hybrid_search(
                 &[0.9, 0.1, 0.0, 0.0],
-                &SparseVector { indices: vec![300], values: vec![1.0] },
+                &SparseVector {
+                    indices: vec![300],
+                    values: vec![1.0],
+                },
                 5,
                 None,
                 &[],
@@ -1468,7 +1545,10 @@ mod tests {
                 1,
                 &[1.0, 0.0, 0.0, 0.0],
                 &[],
-                Some(&SparseVector { indices: vec![1], values: vec![1.0] })
+                Some(&SparseVector {
+                    indices: vec![1],
+                    values: vec![1.0]
+                })
             )
             .is_err());
     }
@@ -1499,10 +1579,10 @@ mod tests {
             &[1.0, 0.0, 0.0],
             3,
             Metric::Cosine,
-                &[],
-                &[],
-                false,
-                None,
+            &[],
+            &[],
+            false,
+            None,
         )
         .unwrap();
         {
