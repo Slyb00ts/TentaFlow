@@ -22,7 +22,13 @@ detect_platform() {
 
   case "$(uname -m | tr '[:upper:]' '[:lower:]')" in
     x86_64|amd64) arch="x86_64" ;;
-    aarch64|arm64) arch="arm64" ;;
+    aarch64|arm64)
+      # Nazwa arch zalezy od OS — konsumenci (build.rs zvec/llama, setup.sh,
+      # build-zvec.sh) oczekuja "linux-aarch64" ale "macos-arm64". Bez tego
+      # rozroznienia producent pisal do native-libs/linux-arm64/, a build.rs
+      # szukal w linux-aarch64/ → "missing libzvec_c_api.so" na ARM Linux.
+      if [ "$os" = "linux" ]; then arch="aarch64"; else arch="arm64"; fi
+      ;;
     *) echo "Nieobsługiwana architektura: $(uname -m)" >&2; return 1 ;;
   esac
 

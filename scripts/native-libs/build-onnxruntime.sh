@@ -38,7 +38,7 @@ require_cmd curl tar
 VERSION="${ONNXRUNTIME_REF#v}"
 case "$PLATFORM" in
   linux-x86_64) ARCHIVE="onnxruntime-linux-x64-$VERSION.tgz" ;;
-  linux-arm64) ARCHIVE="onnxruntime-linux-aarch64-$VERSION.tgz" ;;
+  linux-aarch64) ARCHIVE="onnxruntime-linux-aarch64-$VERSION.tgz" ;;
   macos-arm64) ARCHIVE="onnxruntime-osx-arm64-$VERSION.tgz" ;;
   windows-x86_64) ARCHIVE="onnxruntime-win-x64-$VERSION.zip" ;;
   *) echo "Brak oficjalnej paczki ONNX Runtime dla $PLATFORM" >&2; exit 1 ;;
