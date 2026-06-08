@@ -536,6 +536,22 @@ install_zvec() {
             if docker info &>/dev/null; then
                 : # biezacy user ma dostep do socketu
             elif run_privileged docker info &>/dev/null; then
+                # Daemon dziala, ale biezacy user nie ma dostepu do socketu
+                # (nie nalezy do grupy 'docker') — stad "permission denied ...
+                # /var/run/docker.sock". Dodajemy go do grupy, zeby docker
+                # dzialal BEZ sudo przy kolejnych uruchomieniach (np. bezposrednie
+                # ./scripts/native-libs/build-all.sh). Czlonkostwo grupy wchodzi
+                # w zycie dopiero po re-loginie, wiec TEN build leci jeszcze przez
+                # sudo (need_sudo). Przy `sudo ./setup.sh` realnym userem jest
+                # $SUDO_USER, nie root.
+                local docker_user="${SUDO_USER:-$(id -un)}"
+                if [[ -n "$docker_user" && "$docker_user" != "root" ]]; then
+                    run_privileged groupadd -f docker 2>/dev/null || true
+                    if run_privileged usermod -aG docker "$docker_user" 2>/dev/null; then
+                        log_warn "Dodano '$docker_user' do grupy 'docker' — zadziala po WYLOGOWANIU i ponownym zalogowaniu (albo od razu w tej sesji: 'newgrp docker')."
+                        INSTALLED+=("usermod -aG docker $docker_user")
+                    fi
+                fi
                 need_sudo=true
             else
                 log_error "Ani natywny gcc-11, ani Docker (nawet przez sudo) nie sa dostepne."
