@@ -57,7 +57,11 @@ fn new_pool() -> DbPool {
 }
 
 /// Wrapper na import z domyslnymi parametrami testowymi (lokalny node + cipher).
-fn import(joiner: &DbPool, snap: &BaselineSnapshot, donor: &str) -> LedgerResult<BaselineImportReport> {
+fn import(
+    joiner: &DbPool,
+    snap: &BaselineSnapshot,
+    donor: &str,
+) -> LedgerResult<BaselineImportReport> {
     import_baseline(joiner, snap, donor, JOINER_LOCAL_NODE, &test_cipher())
 }
 
@@ -165,12 +169,7 @@ fn seed_sync_node(pool: &DbPool, node_id: &str, display: &str) {
     .unwrap();
 }
 
-fn seed_explicit_share(
-    pool: &DbPool,
-    org_id: &str,
-    subject_id: &str,
-    granted_by: &str,
-) {
+fn seed_explicit_share(pool: &DbPool, org_id: &str, subject_id: &str, granted_by: &str) {
     let conn = pool.lock().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO sync_explicit_shares \
@@ -256,18 +255,27 @@ fn set_secret(pool: &DbPool, cipher: &SettingsCipher, key: &str, value: &str) {
 fn get_secret(pool: &DbPool, cipher: &SettingsCipher, key: &str) -> Option<String> {
     let conn = pool.lock().unwrap();
     let raw: Option<String> = conn
-        .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
         .optional()
         .unwrap();
-    raw.filter(|v| !v.is_empty()).map(|v| cipher.decrypt(&v).unwrap())
+    raw.filter(|v| !v.is_empty())
+        .map(|v| cipher.decrypt(&v).unwrap())
 }
 
 fn node_exists(pool: &DbPool, node_id: &str) -> bool {
     let conn = pool.lock().unwrap();
-    conn.query_row("SELECT 1 FROM sync_nodes WHERE node_id = ?1", params![node_id], |_| Ok(()))
-        .optional()
-        .unwrap()
-        .is_some()
+    conn.query_row(
+        "SELECT 1 FROM sync_nodes WHERE node_id = ?1",
+        params![node_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .unwrap()
+    .is_some()
 }
 
 fn explicit_share_count(pool: &DbPool, org_id: &str, subject_id: &str) -> i64 {
@@ -567,7 +575,8 @@ fn whole_snapshot_hash_mismatch_rejected() {
         content_hash: *blake3::hash(b"different content").as_bytes(),
     };
     let chunks = chunk_snapshot(&bytes);
-    let err = reassemble_chunks(&chunks, &header).expect_err("whole-snapshot tamper must be caught");
+    let err =
+        reassemble_chunks(&chunks, &header).expect_err("whole-snapshot tamper must be caught");
     assert!(format!("{err}").contains("whole-snapshot hash mismatch"));
 }
 
@@ -618,7 +627,10 @@ fn import_brings_donor_user_created_row() {
     import(&joiner, &snap, "donor-node").unwrap();
 
     assert!(user_exists(&joiner, "u-donor-only"));
-    assert_eq!(membership_org(&joiner, "u-donor-only").as_deref(), Some("org-donor"));
+    assert_eq!(
+        membership_org(&joiner, "u-donor-only").as_deref(),
+        Some("org-donor")
+    );
 }
 
 #[test]
@@ -638,7 +650,10 @@ fn import_username_collision_donor_wins_joiner_suffixed() {
     import(&joiner, &snap, "donor-node").unwrap();
 
     // Dawca zachowuje czysta nazwe.
-    assert_eq!(username_of(&joiner, "u-donor").as_deref(), Some("shared_name"));
+    assert_eq!(
+        username_of(&joiner, "u-donor").as_deref(),
+        Some("shared_name")
+    );
     // Joiner dostal suffix.
     let joiner_name = username_of(&joiner, "u-joiner").expect("joiner user present");
     assert!(
@@ -664,7 +679,10 @@ fn import_joiner_user_other_email_becomes_member_of_donor_org() {
 
     // Bob zostaje wlasnym userem, ale w org dawcy.
     assert!(user_exists(&joiner, "u-joiner"));
-    assert_eq!(membership_org(&joiner, "u-joiner").as_deref(), Some("org-donor"));
+    assert_eq!(
+        membership_org(&joiner, "u-joiner").as_deref(),
+        Some("org-donor")
+    );
 }
 
 #[test]
@@ -752,7 +770,10 @@ fn import_both_have_version_2_flow_no_unique_error_both_kept() {
         )
         .unwrap();
     assert_eq!(donor_model.as_deref(), Some("shared/model"));
-    assert_eq!(joiner_model, None, "joiner flow unpublished przy kolizji modelu");
+    assert_eq!(
+        joiner_model, None,
+        "joiner flow unpublished przy kolizji modelu"
+    );
 }
 
 #[test]
@@ -802,7 +823,10 @@ fn import_rollback_leaves_joiner_untouched_on_injected_error() {
     // Joiner nietkniety: jego user i org dalej istnieja, dawcy nie wniknal.
     assert!(user_exists(&joiner, "u-joiner"));
     assert!(!user_exists(&joiner, "u-donor"));
-    assert_eq!(membership_org(&joiner, "u-joiner").as_deref(), Some("org-joiner"));
+    assert_eq!(
+        membership_org(&joiner, "u-joiner").as_deref(),
+        Some("org-joiner")
+    );
 }
 
 #[test]
@@ -823,9 +847,19 @@ fn run_baseline_adopt_drives_full_path_from_bytes() {
     let chunks = chunk_snapshot(&bytes);
     let rebuilt = reassemble_chunks(&chunks, &header).unwrap();
 
-    run_baseline_adopt(&joiner, "donor-node", JOINER_LOCAL_NODE, &rebuilt, &test_cipher()).unwrap();
+    run_baseline_adopt(
+        &joiner,
+        "donor-node",
+        JOINER_LOCAL_NODE,
+        &rebuilt,
+        &test_cipher(),
+    )
+    .unwrap();
     assert!(user_exists(&joiner, "u-donor"));
-    assert_eq!(membership_org(&joiner, "u-donor").as_deref(), Some("org-donor"));
+    assert_eq!(
+        membership_org(&joiner, "u-donor").as_deref(),
+        Some("org-donor")
+    );
 }
 
 // =============================================================================
@@ -846,7 +880,11 @@ fn multi_org_donor_snapshot_is_rejected() {
     // Joiner nietkniety — jego org dalej istnieje.
     let conn = joiner.lock().unwrap();
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-joiner'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM organizations WHERE org_id = 'org-joiner'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 1);
 }
@@ -923,7 +961,14 @@ fn import_donor_secret_wins_and_is_reencrypted() {
     // Snapshot dawcy odszyfrowuje sekret dawcy do plaintextu (jego cipher).
     let snap = capture_baseline_snapshot(&donor, epoch(1, "donor-node"), &donor_cipher).unwrap();
     // Joiner importuje swoim cipherem (re-encrypt).
-    import_baseline(&joiner, &snap, "donor-node", JOINER_LOCAL_NODE, &joiner_cipher).unwrap();
+    import_baseline(
+        &joiner,
+        &snap,
+        "donor-node",
+        JOINER_LOCAL_NODE,
+        &joiner_cipher,
+    )
+    .unwrap();
 
     // Donor-wins: wartosc dawcy, odczytywalna joinerowym cipherem.
     assert_eq!(
@@ -938,7 +983,7 @@ fn import_email_match_to_admin_donor_does_not_merge() {
     let joiner = new_pool();
     seed_org(&donor, "org-donor", "donor");
     seed_role(&donor, "role-user", "user"); // nieuprzywilejowana rola dla nowego czlonka
-    // Donor admin (is_admin=1) z emailem X.
+                                            // Donor admin (is_admin=1) z emailem X.
     seed_admin_user(&donor, "u-donor-admin", "admin", Some("shared@x.io"));
 
     seed_org(&joiner, "org-joiner", "joiner");
@@ -950,10 +995,16 @@ fn import_email_match_to_admin_donor_does_not_merge() {
     let report = import(&joiner, &snap, "donor-node").unwrap();
 
     // NIE scalony — joiner user zostaje osobny, dolacza jako zwykly czlonek.
-    assert!(user_exists(&joiner, "u-joiner"), "joiner user musi przetrwac (brak przejecia admina)");
+    assert!(
+        user_exists(&joiner, "u-joiner"),
+        "joiner user musi przetrwac (brak przejecia admina)"
+    );
     assert_eq!(report.users_merged_by_email, 0);
     assert_eq!(report.users_joined_donor_org, 1);
-    assert_eq!(membership_org(&joiner, "u-joiner").as_deref(), Some("org-donor"));
+    assert_eq!(
+        membership_org(&joiner, "u-joiner").as_deref(),
+        Some("org-donor")
+    );
 }
 
 #[test]
@@ -974,7 +1025,10 @@ fn import_email_match_to_admin_via_role_does_not_merge() {
     let report = import(&joiner, &snap, "donor-node").unwrap();
 
     assert!(user_exists(&joiner, "u-joiner"));
-    assert_eq!(report.users_merged_by_email, 0, "match na admina-przez-role nie scala");
+    assert_eq!(
+        report.users_merged_by_email, 0,
+        "match na admina-przez-role nie scala"
+    );
 }
 
 #[test]
@@ -1055,11 +1109,19 @@ fn import_sync_policy_same_logical_key_donor_wins() {
     let conn = joiner.lock().unwrap();
     // Wiersz joinera o tym samym kluczu logicznym usuniety (donor-wins).
     let joiner_pol: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sync_policies WHERE policy_id = 'pol-joiner'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM sync_policies WHERE policy_id = 'pol-joiner'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(joiner_pol, 0, "wiersz joinera ustapil dawcy");
     let donor_pol: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sync_policies WHERE policy_id = 'pol-donor'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM sync_policies WHERE policy_id = 'pol-donor'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(donor_pol, 1, "wiersz dawcy obecny");
 }
@@ -1084,11 +1146,17 @@ fn import_username_collision_probes_next_free_variant() {
     import(&joiner, &snap, "donor-node").unwrap();
 
     // Dawca czysty.
-    assert_eq!(username_of(&joiner, "u-donor").as_deref(), Some("shared_name"));
+    assert_eq!(
+        username_of(&joiner, "u-donor").as_deref(),
+        Some("shared_name")
+    );
     // Joiner dostal kolejny wariant (nie kolidujacy z occupantem) — brak abort.
     let jn = username_of(&joiner, "u-joiner").unwrap();
     assert!(jn.starts_with("shared_name-"));
-    assert_ne!(jn, first_variant, "musi sondowac dalej, occupant zajmuje pierwszy wariant");
+    assert_ne!(
+        jn, first_variant,
+        "musi sondowac dalej, occupant zajmuje pierwszy wariant"
+    );
     assert!(user_exists(&joiner, "u-occupant"));
 }
 
@@ -1309,20 +1377,38 @@ fn merge_identity_remaps_security_tables_no_dangling_refs() {
     assert!(user_exists(&joiner, "u-donor"));
 
     // sync_nodes.owner_user_id przepiete na dawce (nie wyzerowane przez FK).
-    assert_eq!(node_owner_of(&joiner, "joiner-owned-node").as_deref(), Some("u-donor"));
+    assert_eq!(
+        node_owner_of(&joiner, "joiner-owned-node").as_deref(),
+        Some("u-donor")
+    );
 
     // sync_explicit_shares: subject_id i granted_by przepiete na dawce (org_id
     // share'a nie jest remapowany — to zasob w org joinera, ktora wciaz istnieje).
     assert_eq!(explicit_share_count(&joiner, "org-joiner", "u-donor"), 1);
     assert_eq!(explicit_share_count(&joiner, "org-joiner", "u-joiner"), 0);
-    assert_eq!(share_granted_by(&joiner, "u-donor").as_deref(), Some("u-donor"));
+    assert_eq!(
+        share_granted_by(&joiner, "u-donor").as_deref(),
+        Some("u-donor")
+    );
 
     // user_identity_keys: donor-wins. Klucz joinera usuniety, klucz dawcy zostaje.
-    assert_eq!(identity_key_count(&joiner, "u-joiner"), 0, "klucz joinera usuniety");
-    assert_eq!(identity_key_count(&joiner, "u-donor"), 1, "klucz dawcy zachowany");
+    assert_eq!(
+        identity_key_count(&joiner, "u-joiner"),
+        0,
+        "klucz joinera usuniety"
+    );
+    assert_eq!(
+        identity_key_count(&joiner, "u-donor"),
+        1,
+        "klucz dawcy zachowany"
+    );
 
     // Brak zadnych dangling refs (FK check czysty).
-    assert_eq!(foreign_key_violations(&joiner), 0, "brak naruszen FK po merge tozsamosci");
+    assert_eq!(
+        foreign_key_violations(&joiner),
+        0,
+        "brak naruszen FK po merge tozsamosci"
+    );
 }
 
 // =============================================================================

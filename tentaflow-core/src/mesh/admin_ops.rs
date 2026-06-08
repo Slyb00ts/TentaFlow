@@ -114,11 +114,8 @@ fn begin_baseline_adopt_after_confirm(
     };
 
     let donor_epoch = crate::sync::runtime::core_epoch();
-    let (donor, _joiner) = crate::sync::core_baseline::decide_roles(
-        local_node_id,
-        remote_node_id,
-        None,
-    );
+    let (donor, _joiner) =
+        crate::sync::core_baseline::decide_roles(local_node_id, remote_node_id, None);
     let role = local_role(local_node_id, &donor);
 
     // Atomowy single-flight: check+write w jednej transakcji zamiast goly zapis.
@@ -152,7 +149,10 @@ fn begin_baseline_adopt_after_confirm(
                 let donor_node_id = remote_node_id.to_string();
                 let epoch_seen = donor_epoch.counter;
                 tokio::spawn(async move {
-                    if let Err(e) = qm.pull_baseline_from_donor(&donor_node_id, epoch_seen).await {
+                    if let Err(e) = qm
+                        .pull_baseline_from_donor(&donor_node_id, epoch_seen)
+                        .await
+                    {
                         warn!(
                             donor = %donor_node_id,
                             "baseline adopt: pobranie snapshotu nieudane (wznowi przy starcie): {}",
@@ -978,14 +978,8 @@ mod baseline_adopt_admin_tests {
     fn rejects_untrusted_donor() {
         let db = setup_test_db();
         let security = Arc::new(MeshSecurity::new(db.clone(), test_cipher()).unwrap());
-        let err = admin_start_baseline_adopt(
-            &db,
-            &security,
-            "local-node",
-            "donor-node",
-            &None,
-        )
-        .expect_err("untrusted donor must be rejected");
+        let err = admin_start_baseline_adopt(&db, &security, "local-node", "donor-node", &None)
+            .expect_err("untrusted donor must be rejected");
         assert!(matches!(err.kind, AdminErrorKind::BadRequest));
         // No state must be written when the donor is rejected.
         assert!(load_adopt_state(&db).unwrap().is_none());
@@ -995,14 +989,8 @@ mod baseline_adopt_admin_tests {
     fn rejects_self_as_donor() {
         let db = setup_test_db();
         let security = security_with_trusted_donor(&db, "local-node");
-        let err = admin_start_baseline_adopt(
-            &db,
-            &security,
-            "local-node",
-            "local-node",
-            &None,
-        )
-        .expect_err("self donor must be rejected");
+        let err = admin_start_baseline_adopt(&db, &security, "local-node", "local-node", &None)
+            .expect_err("self donor must be rejected");
         assert!(matches!(err.kind, AdminErrorKind::BadRequest));
     }
 
@@ -1010,14 +998,8 @@ mod baseline_adopt_admin_tests {
     fn starts_adopt_as_joiner_for_trusted_donor() {
         let db = setup_test_db();
         let security = security_with_trusted_donor(&db, "donor-node");
-        let outcome = admin_start_baseline_adopt(
-            &db,
-            &security,
-            "local-node",
-            "donor-node",
-            &None,
-        )
-        .expect("trusted donor must start adopt");
+        let outcome = admin_start_baseline_adopt(&db, &security, "local-node", "donor-node", &None)
+            .expect("trusted donor must start adopt");
         assert!(outcome.started);
 
         let state = load_adopt_state(&db).unwrap().expect("state persisted");

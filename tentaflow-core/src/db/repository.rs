@@ -3472,14 +3472,20 @@ pub(crate) fn addon_instance_changed_fields(
     f.insert("description".to_string(), field_string(&row.description));
     f.insert("author".to_string(), field_string(&row.author));
     f.insert("platforms".to_string(), field_string(&row.platforms));
-    f.insert("manifest_json".to_string(), field_string(&row.manifest_json));
+    f.insert(
+        "manifest_json".to_string(),
+        field_string(&row.manifest_json),
+    );
     f.insert("is_enabled".to_string(), FieldValue::Bool(row.is_enabled));
     f.insert("is_system".to_string(), FieldValue::Bool(row.is_system));
     f.insert(
         "skill_md".to_string(),
         field_optional_string(row.skill_md.as_deref()),
     );
-    f.insert("keywords_json".to_string(), field_string(&row.keywords_json));
+    f.insert(
+        "keywords_json".to_string(),
+        field_string(&row.keywords_json),
+    );
     f.insert("category".to_string(), field_string(&row.category));
     f.insert(
         "disambiguation_json".to_string(),
@@ -5397,9 +5403,8 @@ pub fn get_addon_instance_package_ref(
     addon_id: &str,
 ) -> Result<Option<(String, String)>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT package_id, package_version FROM addons WHERE addon_id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare_cached("SELECT package_id, package_version FROM addons WHERE addon_id = ?1")?;
     let row = stmt
         .query_row(rusqlite::params![addon_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -10406,9 +10411,8 @@ pub fn installed_addon_ids_for_package(
     version: &str,
 ) -> Result<Vec<String>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
-        "SELECT addon_id FROM addons WHERE package_id = ?1 AND package_version = ?2",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT addon_id FROM addons WHERE package_id = ?1 AND package_version = ?2")?;
     let ids = stmt
         .query_map(rusqlite::params![package_id, version], |r| {
             r.get::<_, String>(0)

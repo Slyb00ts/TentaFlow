@@ -69,7 +69,10 @@ async fn embedded_sherpa_loads_and_registers_under_engine_id() {
         !result.samples.is_empty(),
         "synthesis must produce PCM samples"
     );
-    assert!(result.sample_rate > 0, "synthesis must report a sample rate");
+    assert!(
+        result.sample_rate > 0,
+        "synthesis must report a sample rate"
+    );
     println!(
         "sherpa synthesized {} samples @ {} Hz",
         result.samples.len(),

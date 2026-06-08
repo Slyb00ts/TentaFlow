@@ -312,7 +312,14 @@ async fn deploy_vllm_metal() {
     let ports = make_ports(47_500, 47_599);
     let manifest = load_manifest("vllm-metal");
     let cfg = serde_json::json!({ "model_preset_id": "qwen3-5-0-8b-mlx-4bit" });
-    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
+    let outcome = run_deploy(
+        DeployMethod::NativePythonBundle,
+        &manifest,
+        &cfg,
+        &ports,
+        &db,
+    )
+    .await;
     assert_deployed(&db, &outcome, "vllm-metal");
 }
 
@@ -323,7 +330,14 @@ async fn deploy_chatterbox_mlx() {
     let ports = make_ports(47_600, 47_699);
     let manifest = load_manifest("chatterbox-mlx");
     let cfg = serde_json::json!({ "model_preset_id": "chatterbox-turbo-4bit" });
-    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
+    let outcome = run_deploy(
+        DeployMethod::NativePythonBundle,
+        &manifest,
+        &cfg,
+        &ports,
+        &db,
+    )
+    .await;
     assert_deployed(&db, &outcome, "chatterbox-mlx");
 }
 
@@ -334,7 +348,14 @@ async fn deploy_kyutai_tts() {
     let ports = make_ports(47_700, 47_799);
     let manifest = load_manifest("kyutai-tts");
     let cfg = serde_json::json!({ "model_preset_id": "pocket-tts-en" });
-    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
+    let outcome = run_deploy(
+        DeployMethod::NativePythonBundle,
+        &manifest,
+        &cfg,
+        &ports,
+        &db,
+    )
+    .await;
     assert_deployed(&db, &outcome, "kyutai-tts");
 }
 
@@ -345,7 +366,14 @@ async fn deploy_chatterbox() {
     let ports = make_ports(47_800, 47_899);
     let manifest = load_manifest("chatterbox");
     let cfg = serde_json::json!({ "model_preset_id": "chatterbox-multilingual" });
-    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
+    let outcome = run_deploy(
+        DeployMethod::NativePythonBundle,
+        &manifest,
+        &cfg,
+        &ports,
+        &db,
+    )
+    .await;
     assert_deployed(&db, &outcome, "chatterbox");
 }
 
@@ -356,7 +384,14 @@ async fn deploy_xtts() {
     let ports = make_ports(47_900, 47_999);
     let manifest = load_manifest("xtts");
     let cfg = serde_json::json!({ "model_preset_id": "xtts-v2" });
-    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
+    let outcome = run_deploy(
+        DeployMethod::NativePythonBundle,
+        &manifest,
+        &cfg,
+        &ports,
+        &db,
+    )
+    .await;
     assert_deployed(&db, &outcome, "xtts");
 }
 
@@ -367,6 +402,13 @@ async fn deploy_voxcpm() {
     let ports = make_ports(48_000, 48_099);
     let manifest = load_manifest("voxcpm");
     let cfg = serde_json::json!({ "model_preset_id": "voxcpm-base" });
-    let outcome = run_deploy(DeployMethod::NativePythonBundle, &manifest, &cfg, &ports, &db).await;
+    let outcome = run_deploy(
+        DeployMethod::NativePythonBundle,
+        &manifest,
+        &cfg,
+        &ports,
+        &db,
+    )
+    .await;
     assert_deployed(&db, &outcome, "voxcpm");
 }

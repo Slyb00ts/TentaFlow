@@ -101,7 +101,10 @@ impl ModelResidency {
             let model = models::get_by_name(&conn, model_name)?
                 .ok_or_else(|| anyhow::anyhow!("model_residency: nieznany model '{model_name}'"))?;
             services::get(&conn, model.service_id)?.ok_or_else(|| {
-                anyhow::anyhow!("model_residency: brak serwisu {} dla '{model_name}'", model.service_id)
+                anyhow::anyhow!(
+                    "model_residency: brak serwisu {} dla '{model_name}'",
+                    model.service_id
+                )
             })?
         };
 
@@ -172,7 +175,10 @@ impl ModelResidency {
         };
         for (name, info) in to_evict {
             unload_engine(&info.category, &info.engine_id).await;
-            info!("model_residency: evicted '{}' (load {})", name, new_category);
+            info!(
+                "model_residency: evicted '{}' (load {})",
+                name, new_category
+            );
         }
     }
 
@@ -287,7 +293,10 @@ async fn unload_engine(category: &str, engine_id: &str) {
                 .unregister(engine_id);
         }
         other => {
-            warn!("model_residency: nieznana kategoria '{}' przy unload", other);
+            warn!(
+                "model_residency: nieznana kategoria '{}' przy unload",
+                other
+            );
         }
     }
 }

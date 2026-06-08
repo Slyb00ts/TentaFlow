@@ -7,7 +7,6 @@
 //          end-to-end (validity window, signers, scope).
 // =============================================================================
 
-
 use std::sync::Arc;
 
 use tempfile::TempDir;

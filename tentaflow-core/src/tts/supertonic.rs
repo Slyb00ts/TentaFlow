@@ -114,8 +114,8 @@ fn load_voice_style(path: &Path) -> Result<Style> {
 
     let ttl = flatten_style(&data.style_ttl)
         .with_context(|| format!("style_ttl w {}", path.display()))?;
-    let dp = flatten_style(&data.style_dp)
-        .with_context(|| format!("style_dp w {}", path.display()))?;
+    let dp =
+        flatten_style(&data.style_dp).with_context(|| format!("style_dp w {}", path.display()))?;
     Ok(Style { ttl, dp })
 }
 
@@ -221,17 +221,42 @@ fn preprocess_text(text: &str, lang: &str) -> Result<String> {
         text = text.replace(symbol, "");
     }
 
-    for (from, to) in &[("@", " at "), ("e.g.,", "for example, "), ("i.e.,", "that is, ")] {
+    for (from, to) in &[
+        ("@", " at "),
+        ("e.g.,", "for example, "),
+        ("i.e.,", "that is, "),
+    ] {
         text = text.replace(from, to);
     }
 
-    text = Regex::new(r" ,").unwrap().replace_all(&text, ",").to_string();
-    text = Regex::new(r" \.").unwrap().replace_all(&text, ".").to_string();
-    text = Regex::new(r" !").unwrap().replace_all(&text, "!").to_string();
-    text = Regex::new(r" \?").unwrap().replace_all(&text, "?").to_string();
-    text = Regex::new(r" ;").unwrap().replace_all(&text, ";").to_string();
-    text = Regex::new(r" :").unwrap().replace_all(&text, ":").to_string();
-    text = Regex::new(r" '").unwrap().replace_all(&text, "'").to_string();
+    text = Regex::new(r" ,")
+        .unwrap()
+        .replace_all(&text, ",")
+        .to_string();
+    text = Regex::new(r" \.")
+        .unwrap()
+        .replace_all(&text, ".")
+        .to_string();
+    text = Regex::new(r" !")
+        .unwrap()
+        .replace_all(&text, "!")
+        .to_string();
+    text = Regex::new(r" \?")
+        .unwrap()
+        .replace_all(&text, "?")
+        .to_string();
+    text = Regex::new(r" ;")
+        .unwrap()
+        .replace_all(&text, ";")
+        .to_string();
+    text = Regex::new(r" :")
+        .unwrap()
+        .replace_all(&text, ":")
+        .to_string();
+    text = Regex::new(r" '")
+        .unwrap()
+        .replace_all(&text, "'")
+        .to_string();
 
     while text.contains("\"\"") {
         text = text.replace("\"\"", "\"");
@@ -243,21 +268,23 @@ fn preprocess_text(text: &str, lang: &str) -> Result<String> {
         text = text.replace("``", "`");
     }
 
-    text = Regex::new(r"\s+").unwrap().replace_all(&text, " ").to_string();
+    text = Regex::new(r"\s+")
+        .unwrap()
+        .replace_all(&text, " ")
+        .to_string();
     text = text.trim().to_string();
 
     if !text.is_empty() {
         let ends_with_punct =
-            Regex::new(r#"[.!?;:,'"\u{201C}\u{201D}\u{2018}\u{2019})\]}…。」』】〉》›»]$"#).unwrap();
+            Regex::new(r#"[.!?;:,'"\u{201C}\u{201D}\u{2018}\u{2019})\]}…。」』】〉》›»]$"#)
+                .unwrap();
         if !ends_with_punct.is_match(&text) {
             text.push('.');
         }
     }
 
     if !is_valid_lang(lang) {
-        bail!(
-            "nieobslugiwany jezyk '{lang}' dla Supertonic (dostepne: {AVAILABLE_LANGS:?})"
-        );
+        bail!("nieobslugiwany jezyk '{lang}' dla Supertonic (dostepne: {AVAILABLE_LANGS:?})");
     }
 
     Ok(format!("<{lang}>{text}</{lang}>"))
@@ -460,8 +487,8 @@ impl Loaded {
     fn infer_chunk(&mut self, text: &str, lang: &str, speed: f32) -> Result<(Vec<f32>, f32)> {
         let (text_ids, text_mask) = self.processor.call(text, lang)?;
         let len = text_ids.len();
-        let text_ids_arr = Array::from_shape_vec((1, len), text_ids)
-            .context("Array text_ids [1,len]")?;
+        let text_ids_arr =
+            Array::from_shape_vec((1, len), text_ids).context("Array text_ids [1,len]")?;
 
         let sample_rate = self.cfg.ae.sample_rate;
 
@@ -600,9 +627,7 @@ const MODEL_FILES: &[(&str, &str)] = &[
 ];
 
 /// Voice presety pobierane do `voice_styles/` (5 zenskich + 5 meskich).
-const VOICE_PRESETS: &[&str] = &[
-    "F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5",
-];
+const VOICE_PRESETS: &[&str] = &["F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5"];
 
 /// Pobiera model + voice_styles z `Supertone/supertonic-3` do
 /// `models/supertonic/<repo_sanitized>/`. Idempotentne — jezeli komplet plikow
@@ -621,11 +646,18 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
         .all(|(_, local)| target.join(local).exists())
         && target.join("voice_styles/M1.json").exists();
     if complete {
-        info!("[supertonic] uzywam istniejacego cache: {}", target.display());
+        info!(
+            "[supertonic] uzywam istniejacego cache: {}",
+            target.display()
+        );
         return Ok(target);
     }
 
-    info!("[supertonic] pobieranie {} -> {}", repo_id, target.display());
+    info!(
+        "[supertonic] pobieranie {} -> {}",
+        repo_id,
+        target.display()
+    );
     let base = format!("https://huggingface.co/{repo_id}/resolve/main");
 
     for (remote, local) in MODEL_FILES {
@@ -642,7 +674,8 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
         let dest = target.join(&remote);
         // 404 = brak presetu w repo, nie failujemy (komplet glosow opcjonalny).
         if let Err(e) =
-            crate::services::model_download::download_with_progress(&url, &dest, &remote, None).await
+            crate::services::model_download::download_with_progress(&url, &dest, &remote, None)
+                .await
         {
             info!("[supertonic] pomijam voice {}: {}", voice, e);
         }
@@ -714,10 +747,11 @@ fn pick_voice_style(dir: &Path, hint: Option<&str>) -> Option<PathBuf> {
     if let Some(hint) = hint {
         let hint_lc = hint.to_ascii_lowercase();
         // Dokladne dopasowanie nazwy pliku (np. `M1`).
-        if let Some(exact) = available
-            .iter()
-            .find(|p| stem(p).map(|s| s.eq_ignore_ascii_case(hint)).unwrap_or(false))
-        {
+        if let Some(exact) = available.iter().find(|p| {
+            stem(p)
+                .map(|s| s.eq_ignore_ascii_case(hint))
+                .unwrap_or(false)
+        }) {
             return Some(exact.clone());
         }
         // Preset opakowany (np. `supertonic-3-m1`) — szukamy voice id jako

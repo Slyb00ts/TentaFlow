@@ -36,6 +36,13 @@ pub struct DownloadProgress {
     pub percent: f32,
 }
 
+#[derive(Debug, Clone)]
+pub enum ModelDownloadSelection {
+    All,
+    ExactFile(String),
+    GgufQuantization(String),
+}
+
 impl ModelStore {
     /// Tworzy magazyn z domyslnym katalogiem per platforma
     pub fn default_for_platform() -> Self {
@@ -153,6 +160,17 @@ impl ModelStore {
         hf_token: Option<&str>,
         progress_tx: mpsc::Sender<DownloadProgress>,
     ) -> Result<PathBuf, String> {
+        self.download_model_selection(model_id, hf_token, progress_tx, ModelDownloadSelection::All)
+            .await
+    }
+
+    pub async fn download_model_selection(
+        &self,
+        model_id: &str,
+        hf_token: Option<&str>,
+        progress_tx: mpsc::Sender<DownloadProgress>,
+        selection: ModelDownloadSelection,
+    ) -> Result<PathBuf, String> {
         let model_dir = self.model_dir(model_id);
         std::fs::create_dir_all(&model_dir)
             .map_err(|e| format!("Blad tworzenia katalogu: {}", e))?;
@@ -204,7 +222,7 @@ impl ModelStore {
             .map_err(|e| format!("HF tree parse error: {}", e))?;
 
         // Filtruj pliki do pobrania (pomijamy duze pliki niepotrzebne)
-        let downloadable: Vec<_> = entries
+        let mut downloadable: Vec<_> = entries
             .iter()
             .filter(|e| {
                 let etype = e.entry_type.as_deref().unwrap_or("file");
@@ -212,15 +230,34 @@ impl ModelStore {
                     return false;
                 }
                 let path = e.path.as_deref().unwrap_or("");
-                // Pobieraj kluczowe pliki
-                path.ends_with(".safetensors")
-                    || path.ends_with(".gguf")
-                    || path.ends_with(".json")
-                    || path.ends_with(".txt")
-                    || path.ends_with(".model")
-                    || path.ends_with(".tiktoken")
+                selected_hf_path(path, &selection)
             })
             .collect();
+
+        if downloadable.is_empty() {
+            return Err(match &selection {
+                ModelDownloadSelection::All => "HF repo has no supported model files".to_string(),
+                ModelDownloadSelection::ExactFile(file) => {
+                    format!("HF repo does not contain selected file '{}'", file)
+                }
+                ModelDownloadSelection::GgufQuantization(quant) => {
+                    format!("HF repo has no GGUF file matching quantization '{}'", quant)
+                }
+            });
+        }
+
+        if matches!(selection, ModelDownloadSelection::GgufQuantization(_)) {
+            downloadable.sort_by_key(|entry| entry.path.as_deref().unwrap_or_default());
+            downloadable.truncate(1);
+        }
+
+        let selected_file_path = match &selection {
+            ModelDownloadSelection::All => None,
+            _ => downloadable
+                .first()
+                .and_then(|entry| entry.path.as_deref())
+                .map(|path| model_dir.join(path)),
+        };
 
         for entry in &downloadable {
             let file_name = entry.path.as_deref().unwrap_or("unknown");
@@ -337,13 +374,50 @@ impl ModelStore {
                 .map_err(|e| format!("Flush error: {}", e))?;
         }
 
-        // Zapisz marker kompletnego pobrania — is_downloaded() sprawdza ten plik
-        let marker_path = model_dir.join(".download_complete");
-        let _ = tokio::fs::write(&marker_path, chrono::Utc::now().to_rfc3339().as_bytes()).await;
+        if matches!(selection, ModelDownloadSelection::All) {
+            // Zapisz marker kompletnego pobrania — is_downloaded() sprawdza ten plik
+            let marker_path = model_dir.join(".download_complete");
+            let _ =
+                tokio::fs::write(&marker_path, chrono::Utc::now().to_rfc3339().as_bytes()).await;
+        }
 
         info!(model_id = %model_id, path = %model_dir.display(), "Model pobrany");
-        Ok(model_dir)
+        Ok(selected_file_path.unwrap_or(model_dir))
     }
+}
+
+fn selected_hf_path(path: &str, selection: &ModelDownloadSelection) -> bool {
+    if !valid_hf_relative_path(path) {
+        return false;
+    }
+    match selection {
+        ModelDownloadSelection::All => {
+            path.ends_with(".safetensors")
+                || path.ends_with(".gguf")
+                || path.ends_with(".json")
+                || path.ends_with(".txt")
+                || path.ends_with(".model")
+                || path.ends_with(".tiktoken")
+        }
+        ModelDownloadSelection::ExactFile(file) => {
+            valid_hf_relative_path(file) && path == file && path.ends_with(".gguf")
+        }
+        ModelDownloadSelection::GgufQuantization(quant) => {
+            let path_lc = path.to_ascii_lowercase();
+            path_lc.ends_with(".gguf") && path_lc.contains(&quant.to_ascii_lowercase())
+        }
+    }
+}
+
+pub fn valid_hf_relative_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('/')
+        && !trimmed.starts_with('\\')
+        && !trimmed.contains('\\')
+        && !trimmed
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
 /// Domyslny katalog modeli per platforma
@@ -448,4 +522,37 @@ fn dir_size(dir: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{selected_hf_path, valid_hf_relative_path, ModelDownloadSelection};
+
+    #[test]
+    fn exact_file_selection_accepts_only_selected_gguf() {
+        let selection = ModelDownloadSelection::ExactFile("model-Q4_K_M.gguf".to_string());
+        assert!(selected_hf_path("model-Q4_K_M.gguf", &selection));
+        assert!(!selected_hf_path("model-Q4_K_S.gguf", &selection));
+        assert!(!selected_hf_path("config.json", &selection));
+    }
+
+    #[test]
+    fn quantization_selection_matches_one_gguf_family() {
+        let selection = ModelDownloadSelection::GgufQuantization("Q4_K_M".to_string());
+        assert!(selected_hf_path("repo/model-Q4_K_M.gguf", &selection));
+        assert!(!selected_hf_path("repo/model-Q4_K_S.gguf", &selection));
+        assert!(!selected_hf_path(
+            "repo/model-Q4_K_M.safetensors",
+            &selection
+        ));
+    }
+
+    #[test]
+    fn hf_relative_path_rejects_traversal() {
+        assert!(valid_hf_relative_path("nested/model.gguf"));
+        assert!(!valid_hf_relative_path("../model.gguf"));
+        assert!(!valid_hf_relative_path("nested/../model.gguf"));
+        assert!(!valid_hf_relative_path("/tmp/model.gguf"));
+        assert!(!valid_hf_relative_path("nested\\model.gguf"));
+    }
 }

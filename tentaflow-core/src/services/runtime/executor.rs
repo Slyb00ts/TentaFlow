@@ -128,9 +128,8 @@ pub struct ModelRuntimeExecutor {
     /// Lazy-load + memory guard dla embedded modeli (unpinned). Planted przez
     /// `Router::start` (potrzebuje db+ports). `None` na nodach bez residency —
     /// wtedy `ensure_resident` to no-op (model musi byc juz zaladowany jak dotad).
-    model_residency: Arc<
-        parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>,
-    >,
+    model_residency:
+        Arc<parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>>,
     /// DbPool dla czyszczenia tekstu TTS (`clean_cache::clean` — substytucja z
     /// `tts_cleaning_rules` + strip emoji/punktuacji). `None` w testach DB-less.
     db: Option<crate::db::DbPool>,
@@ -166,10 +165,7 @@ impl ModelRuntimeExecutor {
 
     /// Lazy-load embedded model do pamieci przed dispatch (no-op gdy residency
     /// nie podpiete, target nie jest Local/Embedded, albo serwis pinned/nie-embedded).
-    async fn ensure_resident(
-        &self,
-        target: &ResolvedExecutionTarget,
-    ) -> Result<(), ExecutorError> {
+    async fn ensure_resident(&self, target: &ResolvedExecutionTarget) -> Result<(), ExecutorError> {
         if let ResolvedExecutionTarget::Local {
             model_name, handle, ..
         } = target
@@ -1447,7 +1443,9 @@ impl ModelRuntimeExecutor {
                             Some(model_name_owned.as_str()),
                         )
                         .await
-                        .map_err(|e| ExecutorError::Internal(format!("embedded TTS load: {e:#}")))?;
+                        .map_err(|e| {
+                            ExecutorError::Internal(format!("embedded TTS load: {e:#}"))
+                        })?;
                     }
                     // Czysci tekst przed synteza: substytucja z `tts_cleaning_rules`
                     // (cache) + strip emoji/punktuacji. Robione TU (nie w
@@ -1727,11 +1725,7 @@ impl ModelRuntimeExecutor {
                     let stt_residency = self.model_residency.read().clone();
                     if let Some(res) = stt_residency {
                         if let Err(e) = res.ensure_loaded(&model_name).await {
-                            tracing::warn!(
-                                "STT residency ensure_loaded '{}': {}",
-                                model_name,
-                                e
-                            );
+                            tracing::warn!("STT residency ensure_loaded '{}': {}", model_name, e);
                         }
                     }
                     return runtime

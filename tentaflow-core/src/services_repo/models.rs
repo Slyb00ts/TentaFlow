@@ -105,6 +105,15 @@ pub fn list_for_service(conn: &Connection, service_id: i64) -> Result<Vec<ModelR
     Ok(rows)
 }
 
+pub fn count_for_service(conn: &Connection, service_id: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM model_registry WHERE service_id = ?1",
+        params![service_id],
+        |row| row.get(0),
+    )
+    .context("count model_registry for service")
+}
+
 pub fn list_all(conn: &Connection) -> Result<Vec<ModelRow>> {
     let sql = format!("SELECT {} FROM model_registry ORDER BY id ASC", COLS);
     let mut stmt = conn.prepare(&sql)?;
