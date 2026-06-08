@@ -119,7 +119,18 @@ fi
   git submodule foreach --recursive 'git clean -fdxq' 2>/dev/null || true )
 
 OUT_LIB_DIR="$SYS_CRATE/vendor/lib/$PLATFORM"
-mkdir -p "$OUT_LIB_DIR" "$VENDOR_INCLUDE"
+# Zapewnij, ze katalogi docelowe naleza do biezacego usera. Jesli istnieja jako
+# root-owned (np. po wczesniejszym sudo-buildzie albo klonie repo jako root w
+# /opt), odzyskaj wlasnosc przez sudo chown — inaczej cp ponizej pada na
+# "Permission denied". Uniwersalnie, niezaleznie od sposobu sklonowania repo.
+for _dir in "$OUT_LIB_DIR" "$VENDOR_INCLUDE"; do
+  if ! ( mkdir -p "$_dir" 2>/dev/null && [ -w "$_dir" ] ); then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo mkdir -p "$_dir" 2>/dev/null || true
+      sudo chown -R "$(id -un):$(id -gn)" "$_dir" 2>/dev/null || true
+    fi
+  fi
+done
 
 # Desktop builds link zvec's self-contained shared library (it bundles RocksDB/
 # Arrow/protobuf + a static libstdc++ and exports only the C API). Mobile builds
