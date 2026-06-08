@@ -76,7 +76,15 @@ case "$PLATFORM" in
     cmake --build "$BUILD" -j"$(platform_cpu_count)"
 
     copy_matching "$BUILD" "$NATIVE_ROOT/$PLATFORM/lib-static" -name '*.a'
-    cp "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" "$NATIVE_ROOT/$PLATFORM/lib-static/libonnxruntime.a"
+    # Slice symulatora w xcframework jest fat (x86_64 + arm64), a rustc/LLVM nie
+    # linkuje uniwersalnych archiwów ("Unsupported archive identifier") — wycinamy
+    # czysty arm64. Slice device jest już single-arch, więc cp wystarcza.
+    ORT_DST="$NATIVE_ROOT/$PLATFORM/lib-static/libonnxruntime.a"
+    if lipo -info "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" 2>/dev/null | grep -q 'fat file'; then
+      lipo "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" -thin arm64 -output "$ORT_DST"
+    else
+      cp "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" "$ORT_DST"
+    fi
 
     mkdir -p "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx"
     find "$SRC/sherpa-onnx/c-api" "$SRC/sherpa-onnx/csrc" -type f -name '*.h' -exec cp {} "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx/" \;

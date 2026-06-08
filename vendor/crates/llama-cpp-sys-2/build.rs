@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 enum TargetOs {
     Linux,
     Macos,
+    Ios,
     Windows,
 }
 
@@ -52,7 +53,7 @@ fn main() {
     require(&lib_dir.join(static_name("ggml-base", &target)));
     require(&lib_dir.join(static_name("ggml-cpu", &target)));
 
-    generate_bindings(&include_dir);
+    generate_bindings(&include_dir, &target);
     compile_wrappers(&include_dir, &target_os);
     link_native(&lib_dir, &target, &target_os);
 }
@@ -78,6 +79,8 @@ fn platform_name(target: &str) -> &'static str {
         "x86_64-unknown-linux-gnu" => "linux-x86_64",
         "aarch64-unknown-linux-gnu" => "linux-aarch64",
         "aarch64-apple-darwin" => "macos-arm64",
+        "aarch64-apple-ios" => "ios-arm64",
+        "aarch64-apple-ios-sim" => "ios-sim-arm64",
         "x86_64-pc-windows-msvc" => "windows-x86_64",
         other => panic!("llama-cpp-sys-2: brak native-libs dla targetu {other}"),
     }
@@ -86,6 +89,8 @@ fn platform_name(target: &str) -> &'static str {
 fn target_os(target: &str) -> TargetOs {
     if target.contains("windows") {
         TargetOs::Windows
+    } else if target.contains("apple-ios") {
+        TargetOs::Ios
     } else if target.contains("apple-darwin") {
         TargetOs::Macos
     } else if target.contains("linux") {
@@ -112,8 +117,8 @@ fn require(path: &Path) {
     }
 }
 
-fn generate_bindings(include_dir: &Path) {
-    let bindings = bindgen::Builder::default()
+fn generate_bindings(include_dir: &Path, target: &str) {
+    let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", include_dir.display()))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
@@ -126,7 +131,15 @@ fn generate_bindings(include_dir: &Path) {
         .allowlist_type("llama_.*")
         .allowlist_function("llama_rs_.*")
         .allowlist_type("llama_rs_.*")
-        .prepend_enum_name(false)
+        .prepend_enum_name(false);
+
+    // clang nie rozumie triple Rusta `arm64-apple-ios-sim` ('sim' to nieprawidłowa
+    // wersja) — dla symulatora podajemy poprawny triple ze środowiskiem `simulator`.
+    if target == "aarch64-apple-ios-sim" {
+        builder = builder.clang_arg("--target=arm64-apple-ios-simulator");
+    }
+
+    let bindings = builder
         .generate()
         .expect("llama-cpp-sys-2: bindgen nie wygenerowal bindings.rs");
 
@@ -178,7 +191,7 @@ fn link_native(lib_dir: &Path, target: &str, target_os: &TargetOs) {
             println!("cargo:rustc-link-lib=dylib=stdc++");
             println!("cargo:rustc-link-lib=dylib=gomp");
         }
-        TargetOs::Macos => {
+        TargetOs::Macos | TargetOs::Ios => {
             println!("cargo:rustc-link-lib=c++");
             println!("cargo:rustc-link-lib=framework=Foundation");
             println!("cargo:rustc-link-lib=framework=Metal");
