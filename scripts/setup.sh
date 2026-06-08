@@ -1117,7 +1117,8 @@ install_vulkan() {
             ;;
         fedora)
             local pkgs=(
-                vulkan-devel
+                vulkan-loader-devel
+                vulkan-headers
                 vulkan-validation-layers-devel
                 glslang-devel
                 spirv-tools
@@ -1194,24 +1195,29 @@ install_rocm() {
             fi
             ;;
         fedora)
-            log_info "Sprawdzanie dostepnosci ROCm w repo..."
-            local rocm_pkgs=(rocm-dev hipblas-devel rocblas-devel)
-            if run_privileged dnf install -y "${rocm_pkgs[@]}" 2>/dev/null; then
-                INSTALLED+=("rocm-dev hipblas-devel rocblas-devel")
+            # Nazwy pakietow ROCm na Fedorze sie zmieniaja miedzy wydaniami, wiec
+            # NIE hardcodujemy ich. Instalujemy to, co dostarcza konkretne
+            # biblioteki wymagane przy linkowaniu wariantu 'multi' llama.cpp
+            # (libamdhip64/librocblas/libhipblas) — przez `dnf whatprovides`.
+            # Dziala niezaleznie od dokladnej nazwy pakietu (Fedora pakuje ROCm
+            # w swoich repo od F36+).
+            log_info "Szukam pakietow ROCm dostarczajacych libamdhip64/librocblas/libhipblas..."
+            local rocm_libs=(libamdhip64.so librocblas.so libhipblas.so)
+            local got=()
+            local lib pkg
+            for lib in "${rocm_libs[@]}"; do
+                pkg="$(dnf -q repoquery --whatprovides "*/$lib" 2>/dev/null | head -1)"
+                if [ -n "$pkg" ]; then
+                    if run_privileged dnf install -y "$pkg"; then
+                        got+=("$pkg")
+                    fi
+                fi
+            done
+            if [ ${#got[@]} -gt 0 ]; then
+                INSTALLED+=("rocm: ${got[*]}")
             else
-                log_warn "ROCm nie jest dostepny w obecnych repo. Dodaj repo AMD:"
-                echo ""
-                log_info "  sudo tee /etc/yum.repos.d/rocm.repo <<'REPO'"
-                log_info "  [ROCm]"
-                log_info "  name=ROCm"
-                log_info "  baseurl=https://repo.radeon.com/rocm/rhel9/latest/main"
-                log_info "  enabled=1"
-                log_info "  gpgcheck=1"
-                log_info "  gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key"
-                log_info "  REPO"
-                log_info "  sudo dnf install -y ${rocm_pkgs[*]}"
-                echo ""
-                log_warn "Po dodaniu repo uruchom skrypt ponownie z --rocm"
+                log_warn "ROCm nie znaleziony w repo Fedory. Dodaj repo AMD (repo.radeon.com)"
+                log_warn "lub odpal z --no-rocm jesli ta maszyna nie ma karty AMD."
             fi
 
             # PATH
