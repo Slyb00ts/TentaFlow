@@ -454,6 +454,23 @@ install_git_lfs() {
     git lfs install
     log_ok "Git LFS: $(git lfs version)"
     INSTALLED+=("git lfs install")
+
+    # Materializuj artefakty LFS (prebuilt native-libs/*.a|*.so). Jesli repo
+    # sklonowano ZANIM git-lfs byl w systemie, te pliki sa tekstowymi pointerami
+    # — `git lfs install` rejestruje tylko filtry i NIE sciaga juz
+    # wyewidencjonowanych pointerow. Bez `git lfs pull` build.rs pada na
+    # "brak native-libs" (linkuje pointer zamiast biblioteki).
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [[ -n "$repo_root" ]]; then
+        log_info "Pobieranie artefaktow Git LFS (prebuilt native-libs)..."
+        if git -C "$repo_root" lfs pull; then
+            log_ok "Git LFS: artefakty pobrane"
+            INSTALLED+=("git lfs pull")
+        else
+            log_warn "git lfs pull nieudane — uruchom recznie w repo: git lfs pull"
+        fi
+    fi
 }
 
 # --- zvec (wbudowana baza wektorowa — statyczny artefakt per platforma) ---
