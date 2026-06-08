@@ -1206,7 +1206,7 @@ install_rocm() {
             local got=()
             local lib pkg
             for lib in "${rocm_libs[@]}"; do
-                pkg="$(dnf -q repoquery --whatprovides "*/$lib" 2>/dev/null | head -1)"
+                pkg="$(dnf -y -q repoquery --whatprovides "*/$lib" </dev/null 2>/dev/null | head -1)"
                 if [ -n "$pkg" ]; then
                     if run_privileged dnf install -y "$pkg"; then
                         got+=("$pkg")
