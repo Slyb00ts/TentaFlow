@@ -138,7 +138,24 @@ build_backend() {
     *) echo "Nieobsługiwany backend llama.cpp: $backend" >&2; exit 1 ;;
   esac
 
-  backend_enabled cuda "${enabled_backends[@]}" && cmake_args+=(-DGGML_CUDA=ON)
+  if backend_enabled cuda "${enabled_backends[@]}"; then
+    cmake_args+=(-DGGML_CUDA=ON)
+    # Architektura CUDA. llama.cpp domyslnie uzywa "native" (nvcc -arch=native),
+    # ktory na nowych GPU (np. Blackwell GB10 / DGX Spark = sm_121) czesto nie
+    # jest wykrywany przez nvcc -> "Cannot find valid GPU for '-arch=native'" i
+    # build leci na ZLEJ domyslnej architekturze (lib nie ruszy na tym GPU).
+    # Ustawiamy jawnie: z env CMAKE_CUDA_ARCHITECTURES, albo z realnego GPU przez
+    # nvidia-smi compute_cap (np. "12.1" -> "121").
+    if [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
+      cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$CMAKE_CUDA_ARCHITECTURES")
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+      cuda_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
+      if [ -n "$cuda_cc" ]; then
+        cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$cuda_cc")
+        echo "[llama.cpp] CMAKE_CUDA_ARCHITECTURES=$cuda_cc (z nvidia-smi compute_cap)"
+      fi
+    fi
+  fi
   backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
   backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
   backend_enabled rocm "${enabled_backends[@]}" && cmake_args+=(-DGGML_HIP=ON)

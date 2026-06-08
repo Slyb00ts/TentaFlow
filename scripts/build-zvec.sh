@@ -178,6 +178,11 @@ case "$PLATFORM" in
         export DEBIAN_FRONTEND=noninteractive CC=gcc-11 CXX=g++-11
         apt-get update -qq && apt-get install -y -qq build-essential gcc-11 g++-11 git python3 python3-pip libssl-dev pkg-config curl ca-certificates >/dev/null 2>&1
         pip3 install -q "cmake<4" ninja >/dev/null 2>&1
+        # Kontener dziala jako root, ale /src jest zamontowane z hosta i nalezy do
+        # usera (inny uid) → git odmawia ("dubious ownership", CVE-2022-24765),
+        # przez co RocksDB/cmake nie wykryja wersji przez git. Ufamy zamontowanym
+        # repo (kontener jest --rm, wiec to per-build).
+        git config --global --add safe.directory "*" 2>/dev/null || true
         rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
           -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON ..

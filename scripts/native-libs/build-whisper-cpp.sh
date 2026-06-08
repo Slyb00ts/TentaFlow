@@ -96,7 +96,17 @@ build_backend() {
     *) echo "Nieobsługiwany backend whisper.cpp: $backend" >&2; exit 1 ;;
   esac
 
-  backend_enabled cuda "${enabled_backends[@]}" && cmake_args+=(-DGGML_CUDA=ON)
+  if backend_enabled cuda "${enabled_backends[@]}"; then
+    cmake_args+=(-DGGML_CUDA=ON)
+    # Architektura CUDA jawnie (jak w build-llama-cpp.sh) — "native" nie wykrywa
+    # nowych GPU jak Blackwell GB10/sm_121 -> build na zlej domyslnej arch.
+    if [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
+      cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$CMAKE_CUDA_ARCHITECTURES")
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+      cuda_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
+      [ -n "$cuda_cc" ] && cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$cuda_cc")
+    fi
+  fi
   backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
   backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
   backend_enabled rocm "${enabled_backends[@]}" && cmake_args+=(-DGGML_HIP=ON)
