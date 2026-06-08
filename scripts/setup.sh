@@ -14,10 +14,16 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Flagi GPU
-INSTALL_CUDA=false
-INSTALL_VULKAN=false
-INSTALL_ROCM=false
+# Flagi GPU. Domyslnie WSZYSTKIE wlaczone — srodowisko deweloperskie buduje
+# wariant 'multi' llama.cpp, ktory linkuje CUDA + ROCm + Vulkan naraz, wiec
+# runtime'y wszystkich trzech musza byc obecne, inaczej link binarki pada na
+# "unable to find library -lvulkan/-lamdhip64/...". Na maszynach bez danego
+# GPU instalacja jest nieszkodliwa (na Debian/Ubuntu ROCm bez repo AMD po prostu
+# sie pomija z ostrzezeniem). Wylacz pojedynczo: --no-cuda/--no-vulkan/--no-rocm,
+# albo wszystkie: --minimal (build CPU-only / per-backend variant).
+INSTALL_CUDA=true
+INSTALL_VULKAN=true
+INSTALL_ROCM=true
 
 # Wykryta dystrybucja
 DISTRO=""
@@ -42,17 +48,21 @@ ${BOLD}TentaFlow - instalator zaleznosci${NC}
 
 Uzycie: $0 [OPCJE]
 
+GPU backends sa DOMYSLNIE instalowane (CUDA + Vulkan + ROCm) — srodowisko
+deweloperskie buduje wariant 'multi' llama.cpp, ktory linkuje wszystkie trzy.
+
 Opcje:
-  --cuda        Zainstaluj NVIDIA CUDA toolkit
-  --vulkan      Zainstaluj pelny Vulkan SDK (headers, validation layers, shaderc)
-  --rocm        Zainstaluj AMD ROCm (HIP runtime)
-  --all-gpu     Zainstaluj wszystkie GPU backends (CUDA + Vulkan + ROCm)
+  --no-cuda     Pomin NVIDIA CUDA toolkit
+  --no-vulkan   Pomin Vulkan SDK
+  --no-rocm     Pomin AMD ROCm (HIP runtime)
+  --minimal     Pomin WSZYSTKIE GPU backends (build CPU-only / per-backend variant)
+  --cuda/--vulkan/--rocm/--all-gpu  (zachowane dla zgodnosci — wlaczaja dany backend)
   -h, --help    Pokaz te pomoc
 
 Przyklady:
-  $0                  # Tylko bazowe zaleznosci
-  $0 --cuda           # Baza + CUDA
-  $0 --all-gpu        # Baza + wszystkie GPU backends
+  $0                  # Baza + wszystkie GPU backends (domyslnie)
+  $0 --minimal        # Tylko bazowe zaleznosci (bez GPU)
+  $0 --no-rocm        # Baza + CUDA + Vulkan, bez ROCm
 
 Obslugiwane systemy:
   - Arch Linux / CachyOS / Manjaro
@@ -70,6 +80,10 @@ for arg in "$@"; do
         --vulkan)  INSTALL_VULKAN=true ;;
         --rocm)    INSTALL_ROCM=true ;;
         --all-gpu) INSTALL_CUDA=true; INSTALL_VULKAN=true; INSTALL_ROCM=true ;;
+        --no-cuda)   INSTALL_CUDA=false ;;
+        --no-vulkan) INSTALL_VULKAN=false ;;
+        --no-rocm)   INSTALL_ROCM=false ;;
+        --minimal|--cpu) INSTALL_CUDA=false; INSTALL_VULKAN=false; INSTALL_ROCM=false ;;
         --help|-h) usage; exit 0 ;;
         *)
             log_error "Nieznana opcja: $arg"
