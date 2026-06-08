@@ -12,6 +12,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "llama")]
+use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "llama")]
 use std::sync::{Mutex, Once, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -49,9 +51,83 @@ impl LlamaGgufInfo {
     }
 }
 
+// Specjalna wartosc progu oznaczajaca "nie drukuj nic" (sentinel powyzej CONT=5).
+// Pozwala odroznic tryb `none` od poziomu ERROR bez dodatkowego flagu.
+#[cfg(feature = "llama")]
+const LOG_THRESHOLD_SILENT: u32 = u32::MAX;
+
+// Globalny prog poziomu logow llama.cpp/ggml. Inicjalizowany RAZ z env
+// `TENTAFLOW_LLAMA_LOG_LEVEL`; `LOG_THRESHOLD_SILENT` = pelne wyciszenie.
+#[cfg(feature = "llama")]
+static LOG_THRESHOLD: AtomicU32 = AtomicU32::new(sys::GGML_LOG_LEVEL_WARN);
+
+#[cfg(feature = "llama")]
+static LOG_THRESHOLD_INIT: Once = Once::new();
+
+// Czyta env raz i ustawia globalny prog. Domyslnie WARN, co wycina spam
+// `GGML_LOG_LEVEL_DEBUG` (per-tokenowe "CUDA Graph id N reused", "warmup complete/reset")
+// oraz INFO, zachowujac WARN i ERROR.
+#[cfg(feature = "llama")]
+fn ensure_log_threshold() {
+    LOG_THRESHOLD_INIT.call_once(|| {
+        let threshold = match std::env::var("TENTAFLOW_LLAMA_LOG_LEVEL") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "none" => LOG_THRESHOLD_SILENT,
+                "error" => sys::GGML_LOG_LEVEL_ERROR,
+                "warn" => sys::GGML_LOG_LEVEL_WARN,
+                "info" => sys::GGML_LOG_LEVEL_INFO,
+                "debug" => sys::GGML_LOG_LEVEL_DEBUG,
+                _ => sys::GGML_LOG_LEVEL_WARN,
+            },
+            Err(_) => sys::GGML_LOG_LEVEL_WARN,
+        };
+        LOG_THRESHOLD.store(threshold, Ordering::Relaxed);
+    });
+}
+
+// Callback filtrujacy wspolny dla obu kanalow (llama_log_set + ggml_log_set).
+// Drukuje na stderr tylko gdy poziom >= prog; CONT (kontynuacja poprzedniej linii)
+// traktujemy jak zwykly poziom wobec progu. ggml dostarcza wlasny `\n`, wiec
+// uzywamy `eprint!` bez dodatkowego znaku konca linii.
+#[cfg(feature = "llama")]
+unsafe extern "C" fn filtered_log(
+    level: sys::ggml_log_level,
+    text: *const std::os::raw::c_char,
+    _user_data: *mut std::os::raw::c_void,
+) {
+    let threshold = LOG_THRESHOLD.load(Ordering::Relaxed);
+    if threshold == LOG_THRESHOLD_SILENT || level < threshold {
+        return;
+    }
+    if text.is_null() {
+        return;
+    }
+    let message = CStr::from_ptr(text).to_string_lossy();
+    if message.is_empty() {
+        return;
+    }
+    eprint!("{message}");
+}
+
+// Instaluje filtr poziomu na OBU kanalach logow. Kanal ggml (`ggml_log_set`)
+// jest odpowiedzialny za per-tokenowe komunikaty CUDA Graph z `ggml-cuda.cu`,
+// ktorych `llama_log_set` nie obejmuje. Idempotentne.
+#[cfg(feature = "llama")]
+pub fn install_llama_log_filter() {
+    ensure_log_threshold();
+    unsafe {
+        sys::llama_log_set(Some(filtered_log), std::ptr::null_mut());
+        sys::ggml_log_set(Some(filtered_log), std::ptr::null_mut());
+    }
+}
+
+// Pelne wyciszenie obu kanalow dla przykladow chcacych absolutnej ciszy.
 #[cfg(feature = "llama")]
 pub fn silence_llama_logs() {
-    unsafe { sys::llama_log_set(Some(ignore_llama_log), std::ptr::null_mut()) };
+    unsafe {
+        sys::llama_log_set(Some(ignore_llama_log), std::ptr::null_mut());
+        sys::ggml_log_set(Some(ignore_llama_log), std::ptr::null_mut());
+    }
 }
 
 #[cfg(feature = "llama")]
@@ -495,9 +571,7 @@ impl LlamaRuntime {
             );
         }
         let raw = unsafe { sys::llama_model_load_from_file(c_path.as_ptr(), params) };
-        unsafe {
-            sys::llama_log_set(None, std::ptr::null_mut());
-        }
+        install_llama_log_filter();
         if raw.is_null() {
             return Err(LlamaError::LoadFailed(logs.summary()));
         }
@@ -619,7 +693,10 @@ pub(crate) struct LlamaBackendGuard;
 impl LlamaBackendGuard {
     pub(crate) fn init() -> Self {
         static INIT: Once = Once::new();
-        INIT.call_once(|| unsafe { sys::llama_backend_init() });
+        INIT.call_once(|| {
+            unsafe { sys::llama_backend_init() };
+            install_llama_log_filter();
+        });
         Self
     }
 }
