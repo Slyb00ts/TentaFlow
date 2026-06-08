@@ -61,12 +61,19 @@ ensure_owned_dir() {
   if mkdir -p "$dir" 2>/dev/null && [ -w "$dir" ]; then
     return 0
   fi
+  # Katalog jest root-owned / niezapisywalny. Odzyskujemy wlasnosc przez sudo —
+  # WIDOCZNIE (bez 2>/dev/null), zeby ewentualny prompt o haslo sie pokazal i
+  # zeby blad sudo nie zostal po cichu polkniety (wczesniej dlatego "self-heal"
+  # nie dzialal). Po probie weryfikujemy i failujemy GLOSNO z gotowa komenda.
+  local owner; owner="$(id -un):$(id -gn)"
+  echo ">>> $dir nie jest zapisywalny (root-owned?) — odzyskuje wlasnosc dla $owner (sudo moze poprosic o haslo)..." >&2
   if command -v sudo >/dev/null 2>&1; then
-    sudo mkdir -p "$dir" 2>/dev/null || true
-    sudo chown -R "$(id -un):$(id -gn)" "$dir" 2>/dev/null || true
+    sudo mkdir -p "$dir" || true
+    sudo chown -R "$owner" "$dir" || true
   fi
   if [ ! -w "$dir" ]; then
-    echo "Brak uprawnien do zapisu w $dir (sudo niedostepny lub nieudany)." >&2
+    echo "BLAD: nadal brak zapisu w $dir." >&2
+    echo "      Uruchom recznie:  sudo chown -R $owner \"$dir\"" >&2
     return 1
   fi
 }
