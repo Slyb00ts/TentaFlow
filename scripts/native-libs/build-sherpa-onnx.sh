@@ -114,6 +114,6 @@ copy_matching "$BUILD" "$NATIVE_ROOT/$PLATFORM/lib-static" -name '*.a' -o -name 
 copy_matching "$BUILD" "$NATIVE_ROOT/$PLATFORM/lib-dynamic" -name 'libonnxruntime*' -o -name '*.dll' -o -name '*.dylib' -o -name '*.so*'
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx"
-find "$SRC/sherpa-onnx/c-api" "$SRC/sherpa-onnx/csrc" -type f -name '*.h' -exec cp {} "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx/" \;
+find "$SRC/sherpa-onnx/c-api" "$SRC/sherpa-onnx/csrc" -type f -name '*.h' -exec cp -f {} "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx/" \;
 
 append_manifest_library "$PLATFORM" "sherpa-onnx" "static-preferred" "$SHERPA_ONNX_REF" "Backend: $BACKEND. ONNX Runtime może pozostać biblioteką dynamiczną."

@@ -133,4 +133,4 @@ for backend in "${BACKEND_LIST[@]}"; do
 done
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/whisper"
-find "$SRC/include" "$SRC/ggml/include" -type f -name '*.h' -exec cp {} "$NATIVE_ROOT/$PLATFORM/include/whisper/" \;
+find "$SRC/include" "$SRC/ggml/include" -type f -name '*.h' -exec cp -f {} "$NATIVE_ROOT/$PLATFORM/include/whisper/" \;
