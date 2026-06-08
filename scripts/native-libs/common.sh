@@ -50,14 +50,33 @@ require_cmd() {
   [ "$missing" -eq 0 ]
 }
 
+# Zapewnia, ze katalog istnieje i jest WLASNOSCIA biezacego usera. Jesli istnieje,
+# ale jest root-owned / niezapisywalny (np. po wczesniejszym sudo-buildzie albo
+# klonie repo jako root w /opt), odzyskuje wlasnosc przez `sudo chown`. Dzieki
+# temu kolejne user-owe mkdir/cp NIE padaja na "Permission denied" — niezaleznie
+# od tego jak repo zostalo sklonowane (uniwersalnie). Bez tego buildy zostawialy
+# root-owned artefakty i nastepne uruchomienia jako user sie wywalaly.
+ensure_owned_dir() {
+  local dir="$1"
+  if mkdir -p "$dir" 2>/dev/null && [ -w "$dir" ]; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo mkdir -p "$dir" 2>/dev/null || true
+    sudo chown -R "$(id -un):$(id -gn)" "$dir" 2>/dev/null || true
+  fi
+  if [ ! -w "$dir" ]; then
+    echo "Brak uprawnien do zapisu w $dir (sudo niedostepny lub nieudany)." >&2
+    return 1
+  fi
+}
+
 prepare_layout() {
   local platform="$1"
-  mkdir -p \
-    "$NATIVE_ROOT/$platform/include" \
-    "$NATIVE_ROOT/$platform/lib-static" \
-    "$NATIVE_ROOT/$platform/lib-dynamic" \
-    "$NATIVE_CACHE/src" \
-    "$NATIVE_CACHE/build"
+  ensure_owned_dir "$NATIVE_ROOT/$platform/include"
+  ensure_owned_dir "$NATIVE_ROOT/$platform/lib-static"
+  ensure_owned_dir "$NATIVE_ROOT/$platform/lib-dynamic"
+  mkdir -p "$NATIVE_CACHE/src" "$NATIVE_CACHE/build"
 }
 
 repo_checkout() {
