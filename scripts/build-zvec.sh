@@ -139,7 +139,24 @@ case "$PLATFORM" in
         ninja zvec_c_api -j"$(nproc)" )
     else
       echo "  Brak natywnego gcc-11/ninja/cmake<4 — buduje w Dockerze (Ubuntu 22.04/gcc-11)."
-      docker run --rm -v "$SRC_DIR:/src" -w /src ubuntu:22.04 bash -c '
+      # Wybor wywolania dockera: jesli biezacy user nie ma dostepu do socketu
+      # (nie nalezy do grupy 'docker' ALBO dodano go do niej, ale zmiana wejdzie
+      # dopiero po re-loginie), spadnij na 'sudo docker'. Artefakty i tak sa
+      # chown-owane z powrotem do usera w kontenerze (ponizej), wiec nie zostaja
+      # root-owned. Dzieki temu build-all.sh dziala bez wylogowywania sie.
+      DOCKER="docker"
+      if ! docker info >/dev/null 2>&1; then
+        if command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+          echo "  (brak dostepu do socketu dockera dla biezacego usera — uzywam 'sudo docker';"
+          echo "   aby dzialac bez sudo: 'sudo usermod -aG docker \$USER' i przeloguj sie / 'newgrp docker')"
+          DOCKER="sudo docker"
+        else
+          echo "  BLAD: docker niedostepny (ani bezposrednio, ani przez sudo). Uruchom daemon dockera" >&2
+          echo "  (sudo systemctl enable --now docker) albo dodaj sie do grupy 'docker' i przeloguj." >&2
+          exit 1
+        fi
+      fi
+      $DOCKER run --rm -v "$SRC_DIR:/src" -w /src ubuntu:22.04 bash -c '
         set -e
         export DEBIAN_FRONTEND=noninteractive CC=gcc-11 CXX=g++-11
         apt-get update -qq && apt-get install -y -qq build-essential gcc-11 g++-11 git python3 python3-pip libssl-dev pkg-config curl ca-certificates >/dev/null 2>&1
