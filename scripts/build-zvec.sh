@@ -125,9 +125,15 @@ OUT_LIB_DIR="$SYS_CRATE/vendor/lib/$PLATFORM"
 # "Permission denied". Uniwersalnie, niezaleznie od sposobu sklonowania repo.
 for _dir in "$OUT_LIB_DIR" "$VENDOR_INCLUDE"; do
   if ! ( mkdir -p "$_dir" 2>/dev/null && [ -w "$_dir" ] ); then
+    _owner="$(id -un):$(id -gn)"
+    echo ">>> $_dir nie jest zapisywalny (root-owned?) — odzyskuje wlasnosc dla $_owner (sudo moze poprosic o haslo)..." >&2
     if command -v sudo >/dev/null 2>&1; then
-      sudo mkdir -p "$_dir" 2>/dev/null || true
-      sudo chown -R "$(id -un):$(id -gn)" "$_dir" 2>/dev/null || true
+      sudo mkdir -p "$_dir" || true
+      sudo chown -R "$_owner" "$_dir" || true
+    fi
+    if [ ! -w "$_dir" ]; then
+      echo "BLAD: nadal brak zapisu w $_dir. Uruchom: sudo chown -R $_owner \"$_dir\"" >&2
+      exit 1
     fi
   fi
 done
