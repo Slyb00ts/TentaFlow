@@ -410,6 +410,12 @@ install_base() {
                 git
                 git-lfs
                 pkg-config
+                # sherpa-onnx (Eigen/openfst) buduje z -static-libstdc++ -static-libgcc;
+                # na Fedorze static libstdc++ to osobny pakiet. Bez niego KAZDY test
+                # kompilatora CMake pada (link bez -lstdc++), a Eigen konczy na
+                # "Can't link to the standard math library". glibc-static dla -static.
+                libstdc++-static
+                glibc-static
                 glib2-devel
                 gstreamer1-devel
                 gstreamer1-plugins-base-devel
@@ -426,7 +432,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "git" "git-lfs" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
