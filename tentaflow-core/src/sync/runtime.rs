@@ -950,23 +950,19 @@ impl SyncRuntime {
     /// the receiver upgrades redacted→full and materializes.
     ///
     /// Triggered by the per-org permission epoch advancing past a persisted marker;
-    /// every grant write bumps that epoch (`bump_sync_permission_epoch`). When no
-    /// grant happened the epoch is unchanged and this is a cheap marker read.
+    /// every grant write bumps that epoch (`bump_sync_permission_epoch`). The pre-gate
+    /// enumerates orgs from the cheap `organizations` table and compares each org's
+    /// permission epoch against its backfill marker. When NO org advanced (the common
+    /// case on every 5s tick) this returns early after `O(orgs)` marker reads, WITHOUT
+    /// a full ledger scan or any CBOR decode. The ledger is only scanned after a real
+    /// grant moved at least one org's epoch.
     /// Re-enqueue is idempotent: `put_in_outbox` is keyed by `(target, op_id)`, and
     /// we skip targets that already hold the op, so a redelivered grant is a no-op.
     fn backfill_outbox_for_permission_grants(&self) -> LedgerResult<usize> {
-        let operations = self.ledger.list_all_operations()?;
-        if operations.is_empty() {
-            return Ok(0);
-        }
-
-        // The permission epoch is per-org; only scan orgs whose epoch advanced.
-        let mut org_ids: Vec<String> = operations
-            .iter()
-            .map(|op| op.body.org_id.clone())
-            .collect();
-        org_ids.sort();
-        org_ids.dedup();
+        // Pre-gate: enumerate orgs from the cheap table (not the ledger) and find
+        // those whose permission epoch advanced past the persisted backfill marker.
+        let org_ids = repository::list_all_org_ids(&self.db)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
 
         let mut advanced_orgs = std::collections::HashSet::new();
         let mut org_epochs = std::collections::HashMap::new();
@@ -980,10 +976,18 @@ impl SyncRuntime {
                 .unwrap_or(0);
             if current > last {
                 advanced_orgs.insert(org_id.clone());
+                org_epochs.insert(org_id.clone(), current);
             }
-            org_epochs.insert(org_id.clone(), current);
         }
         if advanced_orgs.is_empty() {
+            return Ok(0);
+        }
+
+        // At least one org advanced: now the (rarely paid) ledger scan is justified.
+        // The `operations` keyspace is keyed by op_id, not org, so per-org filtering
+        // still requires decoding each op; we restrict work to advanced orgs below.
+        let operations = self.ledger.list_all_operations()?;
+        if operations.is_empty() {
             return Ok(0);
         }
 
@@ -4425,6 +4429,86 @@ mod tests {
                 .backfill_outbox_for_permission_grants()
                 .expect("idempotent backfill");
             assert_eq!(again, 0, "backfill is idempotent once the epoch is recorded");
+        });
+    }
+
+    #[test]
+    fn backfill_only_acts_on_orgs_whose_epoch_advanced() {
+        // Proves the epoch pre-gate is org-scoped: an op exists under `org-default`
+        // with a target it has NOT yet been fanned out to, so it WOULD be enqueued
+        // if `org-default` advanced. We instead advance ONLY a different org's epoch.
+        // The backfill must scan nothing for `org-default` (its marker is current)
+        // and therefore enqueue 0 — no over-share from an unrelated grant.
+        with_tmp_home(|| {
+            let source = make_runtime(160);
+            let receiver = make_runtime(161);
+
+            source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("flow-y", "Other-Org Flow"))
+                .expect("record");
+
+            // A genuine target exists for the op, but no grant bumped `org-default`,
+            // so the mint-time fan-out already covered it and the marker is current.
+            seed_core_authority_target_for_resource(
+                &source.runtime.db,
+                "core.flow",
+                "flow-y",
+                &receiver.runtime.local_node_id,
+            );
+            // Record `org-default`'s current epoch as the backfill marker so the only
+            // way this op gets re-enqueued is a FUTURE `org-default` epoch advance.
+            let baseline = repository::get_sync_permission_epoch(
+                &source.runtime.db,
+                crate::services::org::DEFAULT_ORG_ID,
+            )
+            .expect("epoch");
+            repository::set_setting(
+                &source.runtime.db,
+                &backfill_epoch_marker_key(crate::services::org::DEFAULT_ORG_ID),
+                &baseline.to_string(),
+            )
+            .expect("seed marker");
+
+            // Advance ONLY an unrelated org's permission epoch.
+            let other = crate::services::org::repo::create_organization(
+                &source.runtime.db,
+                "Other",
+                "other-org",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("create org");
+            repository::bump_sync_permission_epoch(&source.runtime.db, &other.org_id)
+                .expect("bump other org epoch");
+
+            // `org-default` did not advance, so its op is never scanned/enqueued.
+            let enqueued = source
+                .runtime
+                .backfill_outbox_for_permission_grants()
+                .expect("backfill");
+            assert_eq!(
+                enqueued, 0,
+                "an unrelated org's grant must not enqueue another org's op"
+            );
+            assert!(
+                source
+                    .runtime
+                    .ledger
+                    .list_outbox_for_operation(
+                        source
+                            .runtime
+                            .ledger
+                            .list_all_operations()
+                            .expect("ops")[0]
+                            .op_id
+                    )
+                    .expect("outbox")
+                    .is_empty(),
+                "no outbox entry was created for the non-advanced org's op"
+            );
         });
     }
 

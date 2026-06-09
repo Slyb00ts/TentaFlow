@@ -563,6 +563,17 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns just the org ids. Used by the sync backfill pre-gate, which must
+/// enumerate orgs WITHOUT a full ledger scan to compare permission epochs.
+pub fn list_all_org_ids(pool: &DbPool) -> Result<Vec<String>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare("SELECT org_id FROM organizations ORDER BY org_id ASC")?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
 fn sync_permission_epoch_key(org_id: &str) -> String {
     format!("sync.permission_epoch:{org_id}")
 }
