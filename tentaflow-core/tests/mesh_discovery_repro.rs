@@ -104,6 +104,8 @@ async fn iroh_endpoint_exposes_discovery_events_for_mesh() {
         relay_url: None,
         enable_lan_discovery: true,
         enable_dht_discovery: false,
+        addr_filter: None,
+        disable_portmapper: false,
     };
     let cfg_b = IrohConfig {
         secret_key: SecretKey::generate(),
@@ -111,6 +113,8 @@ async fn iroh_endpoint_exposes_discovery_events_for_mesh() {
         relay_url: None,
         enable_lan_discovery: true,
         enable_dht_discovery: false,
+        addr_filter: None,
+        disable_portmapper: false,
     };
 
     let ep_a = IrohEndpoint::bind(cfg_a).await.expect("bind A");
