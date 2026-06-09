@@ -614,6 +614,12 @@ pub trait SyncLedgerStore: Send + Sync {
     /// Every operation routed to a partition (materialization index), unordered
     /// across node chains. Callers order by HLC.
     fn get_operations(&self, query: OperationQuery) -> LedgerResult<Vec<SyncOperation>>;
+    /// Every full operation body the store currently holds (the content keyspace),
+    /// independent of partition. Used by the authority-side permission backfill to
+    /// re-evaluate outbox targets for ops minted BEFORE a grant: a redacted op
+    /// carries no partition/resource, so a freshly-permitted receiver cannot ask
+    /// for the right partition — the authority must reverse the gate and re-enqueue.
+    fn list_all_operations(&self) -> LedgerResult<Vec<SyncOperation>>;
     /// A contiguous slice of one node's chain ordered by `node_seq`. The dense
     /// axis pull/repair/snapshot-tail validate against.
     fn get_node_operations(&self, query: NodeLogQuery) -> LedgerResult<Vec<SyncOperation>>;

@@ -311,15 +311,28 @@ fn process_four_node_permission_gating_blocks_unshared_target() {
     receiver_b.command("WAIT_FLOW");
     receiver_c.command("ASSERT_NO_FLOW");
 
+    // Grant receiver_c access to the ALREADY-minted flow and let the authority's
+    // backfill re-enqueue it — no new mint, no manual payload. This is the active
+    // upgrade trigger: without the backfill the op never enters receiver_c's outbox
+    // and it would never materialize. BACKFILL_GRANTS runs the same code the sync
+    // repair scheduler tick runs in production.
     source.command(&format!("GRANT_SOURCE_TARGET {}", receiver_c.node_id));
-    let op_line = source.command("RECORD_FLOW");
-    let op_id = parse_record_flow_op_id(&op_line);
-    source.command(&format!("PUSH {}", receiver_a.node_id));
-    source.command(&format!("PUSH {}", receiver_b.node_id));
+    let backfilled = source.command("BACKFILL_GRANTS");
+    assert!(
+        backfilled.ends_with(" 1") || backfilled.contains(" 1"),
+        "grant must re-enqueue exactly the previously-redacted op, got: {backfilled}"
+    );
     source.command(&format!("PUSH {}", receiver_c.node_id));
-    receiver_c.command(&format!("SEND_REPAIR {}", source.node_id));
     source.command(&format!("WAIT_ACKS {} 3", op_id));
     receiver_c.command("WAIT_FLOW");
+
+    // A second backfill is a no-op (epoch watermark already current), so re-running
+    // the scheduler tick does not duplicate outbox entries.
+    let again = source.command("BACKFILL_GRANTS");
+    assert!(
+        again.ends_with(" 0"),
+        "backfill is idempotent once the epoch is recorded, got: {again}"
+    );
 }
 
 #[test]
@@ -1159,6 +1172,11 @@ async fn handle_child_command(
                 mesh.send_sync_push(target, &bytes).await?;
             }
             Ok("PUSH_IF_PENDING".to_string())
+        }
+        ["BACKFILL_GRANTS"] => {
+            let count = tentaflow_core::sync::runtime::backfill_outbox_for_permission_grants()?
+                .unwrap_or(0);
+            Ok(format!("BACKFILL_GRANTS {count}"))
         }
         ["SEND_REPAIR", peer] => {
             send_repair_pull(mesh, peer).await?;

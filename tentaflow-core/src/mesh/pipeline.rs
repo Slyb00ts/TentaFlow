@@ -2915,6 +2915,18 @@ pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>
     if let Err(e) = crate::sync::runtime::drain_pending_core_captures_online(256) {
         warn!("sync repair: core capture drain failed: {}", e);
     }
+    // Re-enqueue already-minted ops to receivers that gained access after the mint.
+    // A grant only bumps the permission epoch; without this the receiver — which may
+    // hold the position as a partition-less redacted placeholder — could never pull
+    // the full op. Runs before the per-peer push below so the backfilled entries ship
+    // in the same tick. Cheap when no epoch advanced.
+    match crate::sync::runtime::backfill_outbox_for_permission_grants() {
+        Ok(Some(count)) if count > 0 => {
+            debug!("sync repair: permission backfill re-enqueued {} outbox entries", count);
+        }
+        Ok(_) => {}
+        Err(e) => warn!("sync repair: permission backfill failed: {}", e),
+    }
     let peers = qm.connected_peers().await;
     for peer_id in peers {
         if !mesh_security.is_trusted(&peer_id) {
