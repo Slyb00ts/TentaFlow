@@ -1,0 +1,21 @@
+[engine]
+id = "wxmcpserver"
+provider = "ibm"
+category = "tools"
+name = "IBM WxMCPServer"
+description_pl = "Serwer webMethods wystawiajacy istniejace API jako narzedzia MCP."
+description_en = "webMethods server exposing existing APIs as MCP tools."
+homepage = "https://github.com/IBM/WxMCPServer"
+license = "Apache-2.0"
+resource_kind = "infra"
+icon = "cpu"
+default_port = 5555
+api = "custom"
+version = "11.1"
+requires_model = false
+gpu_supported = false
+
+[deploy.docker]
+context_path = "ibm/docker/wxmcpserver"
+platforms = ["linux", "windows"]
+transport = "direct-http"

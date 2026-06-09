@@ -70,6 +70,12 @@ export function resourceKind(service) {
   return raw === 'infra' ? 'infra' : 'ai';
 }
 
+/// Provider/vendor zakladki katalogu. Brak = "tentaflow" (domyslna zakladka).
+export function providerOf(service) {
+  const p = String(service?.engine?.provider || 'tentaflow').toLowerCase();
+  return p || 'tentaflow';
+}
+
 function normalizeSection(section) {
   if (!section || typeof section !== 'object') return null;
   const platforms = Array.isArray(section.platforms)

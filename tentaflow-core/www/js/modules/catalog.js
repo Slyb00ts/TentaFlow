@@ -104,6 +104,7 @@ function renderRoot() {
     <tf-tabs variant="underline" id="catalog-tabs" value="${escapeAttr(activeTab)}">
       <tf-tab id="tentaflow" icon="catalog" count="0">${escapeHtml(I18n.t('catalog.tab_tentaflow'))}</tf-tab>
       <tf-tab id="nim" icon="zap">${escapeHtml(I18n.t('catalog.tab_nim'))}</tf-tab>
+      <tf-tab id="ibm" icon="cpu">${escapeHtml(I18n.t('catalog.tab_ibm'))}</tf-tab>
     </tf-tabs>
 
     <div id="catalog-content">
@@ -293,8 +294,11 @@ function renderActiveTab() {
   if (activeTab === 'nim') {
     host.innerHTML = `<div id="nim-catalog-container"><div class="catalog-loading">${escapeHtml(I18n.t('nim.loading_catalog'))}</div></div>`;
     loadNimCatalog();
+  } else if (activeTab === 'ibm') {
+    host.innerHTML = renderProviderTab('ibm');
+    bindCards(host);
   } else {
-    host.innerHTML = renderTentaflowTab();
+    host.innerHTML = renderProviderTab('tentaflow');
     bindCards(host);
   }
 }
@@ -302,14 +306,22 @@ function renderActiveTab() {
 function updateCount() {
   if (!target) return;
   const targetOs = target.os || 'unknown';
-  const total = Manifest.all().filter((s) => Manifest.isEngineCompatible(s, targetOs, target)).length;
+  const tentaflowTotal = Manifest.all().filter((s) =>
+    Manifest.providerOf(s) === 'tentaflow' && Manifest.isEngineCompatible(s, targetOs, target)
+  ).length;
   const tab = document.querySelector('#catalog-tabs tf-tab#tentaflow');
-  if (tab) tab.setAttribute('count', String(total));
+  if (tab) tab.setAttribute('count', String(tentaflowTotal));
+
+  const ibmTotal = Manifest.all().filter((s) =>
+    Manifest.providerOf(s) === 'ibm' && Manifest.isEngineCompatible(s, targetOs, target)
+  ).length;
+  const ibmTab = document.querySelector('#catalog-tabs tf-tab#ibm');
+  if (ibmTab) ibmTab.setAttribute('count', String(ibmTotal));
 }
 
-// ---- TentaFlow tab --------------------------------------------------------
+// ---- Provider tab (TentaFlow Catalog / IBM) -------------------------------
 
-function renderTentaflowTab() {
+function renderProviderTab(provider) {
   const targetOs = target?.os || 'unknown';
   const categories = Manifest.nonEmptyCategories();
   const groups = [
@@ -324,7 +336,7 @@ function renderTentaflowTab() {
     let groupCount = 0;
     for (const cat of categories) {
       const engines = Manifest.byCategory(cat).filter((e) =>
-        Manifest.isEngineCompatible(e, targetOs, target) && Manifest.resourceKind(e) === group.id
+        Manifest.providerOf(e) === provider && Manifest.isEngineCompatible(e, targetOs, target) && Manifest.resourceKind(e) === group.id
       );
       if (engines.length === 0) continue;
 
@@ -439,7 +451,10 @@ function renderFeaturedCard(service, preset, targetOs, host) {
 }
 
 function bindCards(host) {
-  host.addEventListener('click', (e) => {
+  // onclick (nie addEventListener) — renderActiveTab woła bindCards przy kazdej
+  // zmianie zakladki na tym samym #catalog-content; przypisanie zastepuje
+  // poprzedni handler, addEventListener kumulowalby je (wielokrotny wizard).
+  host.onclick = (e) => {
     const btn = e.target.closest('[data-engine-deploy]');
     const card = e.target.closest('[data-engine-id]');
     const engineId = btn?.dataset.engineDeploy || card?.dataset.engineId;
@@ -450,7 +465,7 @@ function bindCards(host) {
       return;
     }
     openDeployWizard(engineId, { nodeId: target.id, hostOs: target.os, presetId });
-  });
+  };
 }
 
 // ---- NIM tab --------------------------------------------------------------

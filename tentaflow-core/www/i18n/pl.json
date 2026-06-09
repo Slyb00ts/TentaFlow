@@ -624,6 +624,7 @@
     "subtitle": "Serwisy i infrastruktura z manifestów TOML · wdrożenie w 3 krokach",
     "tab_tentaflow": "TentaFlow Catalog",
     "tab_nim": "NVIDIA NIM",
+    "tab_ibm": "IBM",
     "nim_soon": "Integracja NVIDIA NIM wkrótce",
     "noCompatible": "Brak silników kompatybilnych z tym systemem",
     "group_ai": "Serwisy AI",

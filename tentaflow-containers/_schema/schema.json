@@ -69,6 +69,11 @@
         "homepage": { "type": "string", "format": "uri" },
         "license": { "type": "string", "minLength": 1 },
         "icon": { "type": "string" },
+        "provider": {
+          "type": "string",
+          "enum": ["tentaflow", "ibm"],
+          "description": "Vendor grouping dla zakladki katalogu. Brak lub \"tentaflow\" = domyslna zakladka TentaFlow. \"ibm\" = dedykowana zakladka IBM."
+        },
         "resource_kind": { "type": "string", "enum": ["ai", "infra"] },
         "requires_model": { "type": "boolean" },
         "gpu_supported": { "type": "boolean" },

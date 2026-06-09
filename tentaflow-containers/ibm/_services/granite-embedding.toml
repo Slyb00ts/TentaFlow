@@ -1,0 +1,38 @@
+# Manifest serwisu IBM Granite Embedding — modele embeddingow serwowane przez
+# vLLM w trybie --task embed (dedykowany kontekst docker granite-embedding).
+
+[engine]
+id = "granite-embedding"
+provider = "ibm"
+category = "embeddings"
+name = "IBM Granite Embedding"
+description_pl = "Modele embeddingów IBM Granite serwowane przez vLLM (--task embed). Wybierz wariant w kreatorze."
+description_en = "IBM Granite embedding models served via vLLM (--task embed). Pick a variant in the wizard."
+homepage = "https://huggingface.co/ibm-granite"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "r2"
+dgx_spark = false
+
+[deploy.docker]
+context_path = "ibm/docker/granite-embedding"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[[model_preset]]
+id = "granite-embedding-30m-english"
+display_name = "Granite Embedding 30M English"
+repo = "ibm-granite/granite-embedding-30m-english"
+
+[[model_preset]]
+id = "granite-embedding-278m-multilingual"
+display_name = "Granite Embedding 278M Multilingual"
+repo = "ibm-granite/granite-embedding-278m-multilingual"
+recommended = true
+
+[[model_preset]]
+id = "granite-embedding-english-r2"
+display_name = "Granite Embedding English R2"
+repo = "ibm-granite/granite-embedding-english-r2"

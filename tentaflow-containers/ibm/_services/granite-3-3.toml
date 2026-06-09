@@ -1,0 +1,33 @@
+# Manifest serwisu IBM Granite 3.3 — modele instruct serwowane przez vLLM.
+# Reuzywa sprawdzonego kontekstu docker silnika vLLM (llm/docker/vllm).
+
+[engine]
+id = "granite-3-3"
+provider = "ibm"
+category = "llm"
+name = "IBM Granite 3.3"
+description_pl = "Modele IBM Granite 3.3 (instruct) serwowane przez vLLM. Wybierz rozmiar 2B/8B w kreatorze."
+description_en = "IBM Granite 3.3 instruct models served via vLLM. Pick 2B/8B size in the wizard."
+homepage = "https://huggingface.co/ibm-granite"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "3.3"
+dgx_spark = false
+
+[deploy.docker]
+context_path = "llm/docker/vllm"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[[model_preset]]
+id = "granite-3-3-2b"
+display_name = "Granite 3.3 2B Instruct"
+repo = "ibm-granite/granite-3.3-2b-instruct"
+
+[[model_preset]]
+id = "granite-3-3-8b"
+display_name = "Granite 3.3 8B Instruct"
+repo = "ibm-granite/granite-3.3-8b-instruct"
+recommended = true

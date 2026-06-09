@@ -110,6 +110,7 @@ recommended = true                         # OPTIONAL, default false
 | `homepage` | URL | tak | Strona projektu. |
 | `license` | string SPDX | tak | Identyfikator SPDX licencji. |
 | `icon` | string | nie | Klucz ikony w `www/js/modules/catalog/icons.js`. Brak = ikona kategorii. |
+| `provider` | enum | nie | Vendor grupujący serwis w zakładce katalogu: `tentaflow` albo `ibm`. Brak lub `tentaflow` = domyślna zakładka TentaFlow; `ibm` = dedykowana zakładka IBM. |
 | `resource_kind` | enum | nie | Wysoki poziom klasy zasobu: `ai` albo `infra`. Brak = `ai`. |
 | `requires_model` | bool | nie | Wymusza pokazanie lub ukrycie kroku wyboru modelu w wizardzie. |
 | `gpu_supported` | bool | nie | Pozwala ukryć krok wyboru GPU dla silników, które nigdy nie używają GPU. |

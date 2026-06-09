@@ -1,0 +1,38 @@
+# Manifest serwisu IBM Granite 4.1 — modele instruct serwowane przez vLLM.
+# Reuzywa sprawdzonego kontekstu docker silnika vLLM (llm/docker/vllm).
+
+[engine]
+id = "granite-4-1"
+provider = "ibm"
+category = "llm"
+name = "IBM Granite 4.1"
+description_pl = "Modele IBM Granite 4.1 (instruct) serwowane przez vLLM. Wybierz rozmiar 3B/8B/30B w kreatorze."
+description_en = "IBM Granite 4.1 instruct models served via vLLM. Pick 3B/8B/30B size in the wizard."
+homepage = "https://huggingface.co/ibm-granite"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "4.1"
+dgx_spark = false
+
+[deploy.docker]
+context_path = "llm/docker/vllm"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[[model_preset]]
+id = "granite-4-1-3b"
+display_name = "Granite 4.1 3B"
+repo = "ibm-granite/granite-4.1-3b"
+
+[[model_preset]]
+id = "granite-4-1-8b"
+display_name = "Granite 4.1 8B"
+repo = "ibm-granite/granite-4.1-8b"
+recommended = true
+
+[[model_preset]]
+id = "granite-4-1-30b"
+display_name = "Granite 4.1 30B"
+repo = "ibm-granite/granite-4.1-30b"
