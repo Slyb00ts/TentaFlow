@@ -204,8 +204,10 @@ access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write
 - `scripts/native-libs/build-all.sh` (Linux/macOS) i `scripts/native-libs/build-all.ps1`
   (Windows) wykrywają platformę i budują natywne zależności do `native-libs/<platform>/`.
 - Źródła pobierane przez skrypty trafiają poza repo do `TENTAFLOW_NATIVE_CACHE`
-  (domyślnie `/tmp/tentaflow-native-libs`), więc repo przechowuje tylko skrypty,
-  manifesty i świadomie dodane artefakty.
+  (domyślnie `/tmp/tentaflow-native-libs`), więc repo przechowuje **tylko skrypty**.
+  Cała zawartość `native-libs/<platform>/` (nagłówki, biblioteki, `manifest.toml`)
+  jest generowana lokalnie i NIE jest commitowana — `.gitignore` ignoruje `native-libs/*`
+  poza `README.md`. Każdy buduje u siebie: `./scripts/native-libs/build-all.sh`.
 - Układ platformy: `include/`, `lib-static/`, `lib-dynamic/`, `manifest.toml`.
   Biblioteki statyczne są preferowane, a dynamiczne są kopiowane przez `tentaflow/build.rs`
   obok budowanej binarki z `native-libs/<platform>/lib-dynamic`.
@@ -215,10 +217,9 @@ access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write
   wszyscy mieli identyczną wersję jako prebuilt w `native-libs`. Świeży master:
   `LLAMA_CPP_REF=origin/master`. Stare vendored źródła: `LLAMA_CPP_REF=vendored`
   (drzewo `vendor/crates/*/llama.cpp/` NIE jest w repo — patrz `.gitignore`).
-- Prebuilt biblioteki statyczne są wersjonowane w repo przez **Git LFS** (`.gitattributes`:
-  `native-libs/**/*.a|*.so|*.dylib|…`). Idea: jedna osoba buduje (kontrola wersji),
-  reszta klonuje gotowe artefakty → szybki build. `.gitignore` odsłania artefakty
-  (`!native-libs/**/*.a`), ignoruje `native-libs/**/{cache,build}/`. Wariant wybiera
+- Biblioteki NIE są w repo (porzucony Git LFS — przekraczał limity i blokował push).
+  Każdy buduje je lokalnie przez `build-all.sh`; pliki zostają na dysku, ale są
+  gitignorowane. Wariant llama.cpp wybiera
   `LLAMA_CPP_NATIVE_VARIANT` (domyślnie `multi` = cuda+rocm+vulkan+cpu w jednym; linkowanie
   `multi` wymaga obecności WSZYSTKICH trzech runtime'ów — pod różne GPU buduj warianty
   jednobackendowe przez `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm`).

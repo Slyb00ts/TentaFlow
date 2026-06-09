@@ -1563,7 +1563,13 @@ print_summary() {
         log_warn "inaczej build zvec i deploy silnikow AI pada na 'permission denied docker.sock'."
         echo ""
     fi
-    log_info "Mozesz teraz zbudowac TentaFlow:"
+    log_warn "REQUIRED STEP: build native libraries (no longer in the repo — each dev builds locally):"
+    echo -e "  ${BOLD}./scripts/native-libs/build-all.sh${NC}"
+    log_info "  Detects the platform and builds zvec, llama.cpp, whisper.cpp, sherpa-onnx, onnxruntime"
+    log_info "  into native-libs/<platform>/ (include + lib-static + lib-dynamic + manifest.toml)."
+    log_info "  Update sources: ${BOLD}build-all.sh --update${NC}. Single library: ${BOLD}--only llama-cpp${NC}."
+    echo ""
+    log_info "Only then can you build TentaFlow:"
     echo -e "  ${BOLD}cd tentaflow && cargo build --release${NC}"
     echo ""
 }

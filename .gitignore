@@ -191,16 +191,11 @@ __pycache__/
 # Nie commitujemy: kanoniczna ścieżka to pinowany SHA klonowany świeżo + prebuilt native-libs.
 vendor/crates/*/llama.cpp/
 
-native-libs/**/cache/
-native-libs/**/build/
-!native-libs/**/*.a
-!native-libs/**/*.so
-!native-libs/**/*.so.*
-!native-libs/**/*.dylib
-!native-libs/**/*.dll
-!native-libs/**/*.lib
-!native-libs/**/*.framework/
-!native-libs/**/*.bundle/
+# native-libs/<platform> jest w całości generowane przez scripts/native-libs/build-all.sh
+# (nagłówki, lib-static, lib-dynamic, manifest.toml). Nie commitujemy żadnych artefaktów —
+# każdy buduje biblioteki lokalnie. W repo zostaje tylko README.
+/native-libs/*
+!/native-libs/README.md
 
 # Notatki robocze — nie wysylamy do remote
 notes/
