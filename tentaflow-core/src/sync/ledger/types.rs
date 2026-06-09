@@ -65,6 +65,20 @@ pub enum SyncLedgerError {
         existing: OperationId,
         incoming: OperationId,
     },
+    /// `hlc_timestamp.node_id` must equal `actor_node_id`. A node mints HLC
+    /// timestamps only on its own behalf, so a divergence means a forged HLC
+    /// origin — an attempt to skew last-writer-wins resolution by pretending an
+    /// op came from a different (e.g. higher-priority) node. Rejected outright.
+    #[error("hlc.node_id nie zgadza sie z actor_node_id: actor={actor}, hlc={hlc}")]
+    HlcNodeMismatch { actor: String, hlc: String },
+    /// `node_seq` is 1-based and dense; seq 0 is never a valid chain position.
+    #[error("niepoprawny node_seq=0 dla noda {node}")]
+    InvalidNodeSeq { node: String },
+    /// The on-disk ledger schema does not match the version this build expects.
+    /// Triggers a wipe + reseed under a bumped epoch so a layout change (e.g.
+    /// per-partition → per-node chains) never silently restarts node_seq.
+    #[error("niezgodna wersja schematu ledgera: on_disk={on_disk}, expected={expected}")]
+    SchemaVersionMismatch { on_disk: u32, expected: u32 },
     #[error("operacja z innego epoch baseline: expected={expected:?}, actual={actual:?}")]
     EpochMismatch {
         expected: BaselineEpoch,
@@ -375,6 +389,22 @@ impl SyncOperation {
                 actual: self.op_id,
             });
         }
+        // node_seq is the 1-based dense chain position; 0 is structurally invalid.
+        if self.body.node_seq == 0 {
+            return Err(SyncLedgerError::InvalidNodeSeq {
+                node: self.body.actor_node_id.clone(),
+            });
+        }
+        // The HLC origin must be the authoring node: a forged hlc.node_id would
+        // let an attacker steer last-writer-wins resolution without touching the
+        // signed chain. The hash above already binds hlc into the op identity, so
+        // this rejects the forgery before it can ever influence materialization.
+        if self.body.hlc_timestamp.node_id != self.body.actor_node_id {
+            return Err(SyncLedgerError::HlcNodeMismatch {
+                actor: self.body.actor_node_id.clone(),
+                hlc: self.body.hlc_timestamp.node_id.clone(),
+            });
+        }
         Ok(())
     }
 }
@@ -528,6 +558,21 @@ pub trait SyncLedgerStore: Send + Sync {
     /// axis pull/repair/snapshot-tail validate against.
     fn get_node_operations(&self, query: NodeLogQuery) -> LedgerResult<Vec<SyncOperation>>;
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation>;
+    /// The `op_id` we actually recorded at `(node_id, node_seq)` on the per-node
+    /// chain axis, or `None` if that position was compacted away or never seen.
+    /// Equivocation detection compares this against the incoming op's `op_id`:
+    /// because ops are content-addressed, an op forged at an already-known seq has
+    /// a DIFFERENT op_id, which a by-op_id lookup would miss entirely.
+    fn get_node_log_entry(
+        &self,
+        node_id: &str,
+        node_seq: u64,
+    ) -> LedgerResult<Option<OperationId>>;
+    /// The lowest `node_seq` for `node_id` whose operation row is still present
+    /// (not compacted away), i.e. the earliest position this node can RELAY to a
+    /// peer. `None` if we hold nothing live for that chain. A pull asking below
+    /// this floor cannot be served from the log and must escalate to a snapshot.
+    fn earliest_live_node_seq(&self, node_id: &str) -> LedgerResult<Option<u64>>;
     fn put_in_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn get_outbox_entry(&self, target: SyncTarget, op_id: OperationId)
         -> LedgerResult<OutboxEntry>;
@@ -541,6 +586,18 @@ pub trait SyncLedgerStore: Send + Sync {
         &self,
         source: PeerId,
         operation: SyncOperation,
+        verifier: &dyn SyncOperationVerifier,
+    ) -> LedgerResult<()>;
+    /// Atomically verifies + stores an accepted op in the inbox AND advances the
+    /// author's node-frontier in ONE durable batch. The two MUST be atomic: if a
+    /// crash advanced the frontier without persisting the inbox entry, that seq
+    /// would be skipped forever (the op is neither pulled again — frontier is past
+    /// it — nor applied — it never reached the inbox), silently losing data.
+    fn admit_verified_operation(
+        &self,
+        source: PeerId,
+        operation: SyncOperation,
+        frontier: NodeFrontierEntry,
         verifier: &dyn SyncOperationVerifier,
     ) -> LedgerResult<()>;
     fn get_inbox_entry(&self, source: PeerId, op_id: OperationId) -> LedgerResult<InboxEntry>;
@@ -644,19 +701,27 @@ pub trait SyncLedgerStore: Send + Sync {
 /// Prefix shared by every core-owned partition_id (`core/org/<org>/<suffix>`).
 pub const CORE_PARTITION_PREFIX: &str = "core/";
 
-/// Canonical materialization order for operations within a partition. There is
-/// no global partition sequence under per-node chains, so this is the single
-/// deterministic total order every reader (snapshot prefix/tail, compaction,
-/// inbox drain) must agree on: HLC, then the authoring node and its `node_seq`
-/// (insertion order within a node), then the content hash as a final tie-break.
+/// Canonical leaf order for operations within a partition. This is the single
+/// deterministic total order every structural reader (Merkle leaves, snapshot
+/// prefix/tail build, compaction) must agree on so two honest nodes that hold the
+/// same operation set compute the SAME root_hash / state_hash.
+///
+/// It deliberately does NOT use the HLC: HLC carries a wall-clock component, so
+/// under clock skew two nodes can disagree on the relative HLC order of ops from
+/// different authors, which would make the Merkle root un-reconcilable. Instead
+/// the order is `(actor_node_id, node_seq)` — each per-node chain is dense and
+/// strictly monotonic in `node_seq`, so this is a stable total order regardless
+/// of clock skew. `operation_hash` is a final tie-break that can only matter if
+/// the input set is already Byzantine (equivocation), which the chain validators
+/// reject upstream. The HLC is used ONLY for last-writer-wins value resolution in
+/// the materializer (`incoming_hlc_wins`), never for leaf ordering.
 pub fn partition_materialization_order(
     a: &SyncOperation,
     b: &SyncOperation,
 ) -> std::cmp::Ordering {
     a.body
-        .hlc_timestamp
-        .cmp(&b.body.hlc_timestamp)
-        .then_with(|| a.body.actor_node_id.cmp(&b.body.actor_node_id))
+        .actor_node_id
+        .cmp(&b.body.actor_node_id)
         .then_with(|| a.body.node_seq.cmp(&b.body.node_seq))
         .then_with(|| a.operation_hash.cmp(&b.operation_hash))
 }

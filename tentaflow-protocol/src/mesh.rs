@@ -1048,6 +1048,17 @@ pub struct MeshSyncPullResponsePayload {
     pub target_node_id: String,
     pub from_node_seq: u64,
     pub operations: Vec<MeshSyncOperationWire>,
+    // The lowest node_seq the serving peer can still relay from its node_log for
+    // `target_node_id`. When the requester asked from a seq below this floor the
+    // peer has compacted that prefix away and cannot fill the gap from the log, so
+    // the requester must escalate to a snapshot pull instead of looping forever.
+    // `0` means "no compaction floor" (peer can serve from seq 1).
+    pub serving_floor_node_seq: u64,
+    // The highest node_seq the serving peer holds for `target_node_id`. Once the
+    // requester's frontier reaches this tip there is nothing more to pull, so the
+    // catch-up repair is satisfied and can be cleared. `0` means the peer holds
+    // nothing for that chain.
+    pub serving_tip_node_seq: u64,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
@@ -2056,6 +2067,8 @@ mod tests {
             target_node_id: "node-b".to_string(),
             from_node_seq: 2,
             operations: vec![op],
+            serving_floor_node_seq: 1,
+            serving_tip_node_seq: 2,
         };
         let bytes = crate::cbor::encode(&response).expect("encode response");
         let decoded = crate::cbor::decode::<MeshSyncPullResponsePayload>(&bytes)

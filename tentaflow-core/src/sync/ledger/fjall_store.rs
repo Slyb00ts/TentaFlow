@@ -30,7 +30,17 @@ const SNAPSHOTS: &str = "snapshots";
 const META: &str = "meta";
 const META_EPOCH_KEY: &[u8] = b"baseline_epoch";
 const META_HLC_KEY: &[u8] = b"hlc_state";
+const META_SCHEMA_KEY: &[u8] = b"schema_version";
 const SEP: u8 = 0;
+
+/// On-disk ledger layout version. Bump whenever the physical keyspace contract
+/// changes incompatibly (e.g. per-partition chains → per-node chains). A node
+/// that opens a ledger written under a different version cannot trust its
+/// node_heads/node_log axis, so `open` wipes the directory and the runtime
+/// reseeds from SQLite under a bumped epoch instead of silently restarting
+/// node_seq from 1 (which would equivocate the local node against live peers
+/// that still remember the old chain).
+pub const LEDGER_SCHEMA_VERSION: u32 = 2;
 
 pub struct FjallSyncLedgerStore {
     db: Database,
@@ -47,10 +57,65 @@ pub struct FjallSyncLedgerStore {
     // Guards only the LOCAL node's head: a node is single-writer over its own
     // chain, so this serializes node_seq minting without blocking reads.
     append_lock: Mutex<()>,
+    // True when `open` wiped a stale-schema directory. The runtime reads this to
+    // force a baseline reset (bump epoch + reseed from SQLite) so the freshly
+    // restarted node_seq chain is fenced from the pre-upgrade chain peers remember.
+    schema_wiped: bool,
 }
 
 impl FjallSyncLedgerStore {
     pub fn open(path: impl AsRef<Path>) -> LedgerResult<Self> {
+        let path = path.as_ref();
+        let mut store = Self::open_at(path)?;
+
+        // Schema fence: an on-disk layout written by a different build cannot be
+        // trusted, because the per-node chain axis (node_heads/node_log) may have
+        // a different meaning. Detect a missing/mismatched version, wipe the whole
+        // directory, and re-open fresh so the local node never reuses stale heads.
+        let on_disk = match store.meta.get(META_SCHEMA_KEY)? {
+            Some(value) => Some(decode::<u32>(value.as_ref())?),
+            None => None,
+        };
+        match on_disk {
+            Some(version) if version == LEDGER_SCHEMA_VERSION => {}
+            Some(version) => {
+                // Drop the open handle before removing files so no keyspace holds
+                // the directory, then rebuild from scratch.
+                drop(store);
+                wipe_ledger_dir(path)?;
+                store = Self::open_at(path)?;
+                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store.persist()?;
+                store.schema_wiped = true;
+                tracing::warn!(
+                    "sync ledger: on-disk schema v{version} != v{LEDGER_SCHEMA_VERSION}, \
+                     wiped ledger and forcing baseline reseed under a bumped epoch"
+                );
+            }
+            None if store_is_empty(&store)? => {
+                // Brand-new ledger: stamp the current version, nothing to migrate.
+                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store.persist()?;
+            }
+            None => {
+                // Populated but unversioned: predates the schema fence, so its
+                // layout is the pre-v2 per-partition chain. Wipe and reseed.
+                drop(store);
+                wipe_ledger_dir(path)?;
+                store = Self::open_at(path)?;
+                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store.persist()?;
+                store.schema_wiped = true;
+                tracing::warn!(
+                    "sync ledger: unversioned on-disk schema, wiped ledger and forcing \
+                     baseline reseed under a bumped epoch"
+                );
+            }
+        }
+        Ok(store)
+    }
+
+    fn open_at(path: &Path) -> LedgerResult<Self> {
         let db = Database::builder(path).open()?;
         Ok(Self {
             operations: db.keyspace(OPERATIONS, KeyspaceCreateOptions::default)?,
@@ -65,7 +130,14 @@ impl FjallSyncLedgerStore {
             meta: db.keyspace(META, KeyspaceCreateOptions::default)?,
             db,
             append_lock: Mutex::new(()),
+            schema_wiped: false,
         })
+    }
+
+    /// True if `open` wiped a stale-schema directory; the runtime then forces a
+    /// baseline reseed under a bumped epoch.
+    pub fn schema_wiped(&self) -> bool {
+        self.schema_wiped
     }
 
     fn persist(&self) -> LedgerResult<()> {
@@ -182,6 +254,35 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         decode(operation.as_ref())
     }
 
+    fn get_node_log_entry(
+        &self,
+        node_id: &str,
+        node_seq: u64,
+    ) -> LedgerResult<Option<OperationId>> {
+        match self.node_log.get(node_log_key(node_id, node_seq))? {
+            Some(value) => Ok(Some(operation_id_from_bytes(value.as_ref())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn earliest_live_node_seq(&self, node_id: &str) -> LedgerResult<Option<u64>> {
+        // node_log is keyed node_id||0x00||node_seq.be, so the prefix scan yields
+        // seqs in ascending order; the first entry whose `operations` row still
+        // exists is the earliest position we can relay.
+        let prefix = node_prefix(node_id);
+        for item in self.node_log.prefix(&prefix) {
+            let (key, value) = item.into_inner()?;
+            let Some(node_seq) = node_seq_from_node_log_key(key.as_ref()) else {
+                continue;
+            };
+            let op_id = operation_id_from_bytes(value.as_ref())?;
+            if self.operations.get(op_id.as_bytes())?.is_some() {
+                return Ok(Some(node_seq));
+            }
+        }
+        Ok(None)
+    }
+
     fn put_in_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()> {
         let entry = OutboxEntry {
             target: target.clone(),
@@ -277,6 +378,61 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         self.inbox
             .insert(inbox_key(&source, entry.operation.op_id), encode(&entry)?)?;
         self.persist()
+    }
+
+    fn admit_verified_operation(
+        &self,
+        source: PeerId,
+        operation: SyncOperation,
+        frontier: NodeFrontierEntry,
+        verifier: &dyn SyncOperationVerifier,
+    ) -> LedgerResult<()> {
+        verifier.verify_operation_signature(&operation)?;
+        let local_epoch = self.current_epoch()?;
+        if operation.body.epoch != local_epoch {
+            return Err(SyncLedgerError::EpochMismatch {
+                expected: local_epoch,
+                actual: operation.body.epoch.clone(),
+            });
+        }
+        // Build the inbox entry, preserving the re-delivery reset semantics of
+        // `put_verified_in_inbox` (a previously failed/deferred op becomes fresh
+        // again), then commit it together with the frontier advance in one batch.
+        let inbox_key = inbox_key(&source, operation.op_id);
+        let entry = match self.inbox.get(&inbox_key)? {
+            Some(existing) => {
+                let mut entry: InboxEntry = decode(existing.as_ref())?;
+                if entry.applied || (!entry.conflicted && entry.deferred_count == 0) {
+                    // Already in a clean/applied state: nothing to rewrite for the
+                    // inbox, but the frontier advance must still be durable.
+                    self.node_frontier
+                        .insert(frontier.node_id.as_bytes(), encode(&frontier)?)?;
+                    return self.persist();
+                }
+                entry.conflicted = false;
+                entry.conflict_message = None;
+                entry.deferred_count = 0;
+                entry
+            }
+            None => InboxEntry {
+                source: source.clone(),
+                operation,
+                applied: false,
+                conflicted: false,
+                conflict_message: None,
+                deferred_count: 0,
+            },
+        };
+
+        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+        batch.insert(&self.inbox, inbox_key, encode(&entry)?);
+        batch.insert(
+            &self.node_frontier,
+            frontier.node_id.as_bytes().to_vec(),
+            encode(&frontier)?,
+        );
+        batch.commit()?;
+        Ok(())
     }
 
     fn get_inbox_entry(&self, source: PeerId, op_id: OperationId) -> LedgerResult<InboxEntry> {
@@ -615,19 +771,15 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             matched_op_ids.insert(op_id);
         }
 
-        // node_log maps node_id||seq -> op_id; drop the entries pointing at the
-        // operations we just removed. node_heads / node_frontier span every
-        // partition a node ever wrote, so a per-partition reset MUST NOT touch
-        // them: the local node keeps minting a monotonic node_seq (single writer
-        // never resets its own chain) and remote frontiers stay valid — epoch
+        // node_log (node_id||seq -> op_id), node_heads and node_frontier are the
+        // per-NODE chain axis, not the per-partition materialization axis: a single
+        // node writes ops across many partitions on ONE dense, monotonic node_seq
+        // chain. A per-partition reset MUST leave that axis fully intact — punching
+        // holes in node_log would break chain density and make the local node mint
+        // duplicate node_seq positions (self-equivocation). The content rows are
+        // gone, so `get_node_operations` simply skips the now-dangling op_ids
+        // (it already filters entries whose `operations` row is absent), and epoch
         // fencing rejects any pre-reset operation that arrives late.
-        for item in self.node_log.iter() {
-            let (key, value) = item.into_inner()?;
-            let op_id = operation_id_from_bytes(value.as_ref())?;
-            if matched_op_ids.contains(&op_id) {
-                batch.remove(&self.node_log, key.to_vec());
-            }
-        }
 
         // Snapshots are keyed by partition_prefix too.
         for item in self.snapshots.prefix(prefix_bytes) {
@@ -667,6 +819,38 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         batch.commit()?;
         Ok(())
     }
+}
+
+/// True only for a freshly-created ledger (no chain state, no journal). Used to
+/// tell a brand-new directory (just stamp the schema version) apart from a
+/// populated but unversioned one (pre-fence layout — must wipe and reseed).
+fn store_is_empty(store: &FjallSyncLedgerStore) -> LedgerResult<bool> {
+    let any = store.node_heads.iter().next().is_some()
+        || store.operations.iter().next().is_some()
+        || store.node_log.iter().next().is_some()
+        || store.inbox.iter().next().is_some()
+        || store.outbox.iter().next().is_some();
+    Ok(!any)
+}
+
+/// Removes every entry under the ledger directory so it can be re-created from a
+/// clean state, without deleting the directory itself (its handle/permissions
+/// may be held by the caller). The schema fence calls this after dropping the DB.
+fn wipe_ledger_dir(path: &Path) -> LedgerResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path).map_err(|e| SyncLedgerError::Runtime(e.to_string()))? {
+        let entry = entry.map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        let child = entry.path();
+        let result = if child.is_dir() {
+            std::fs::remove_dir_all(&child)
+        } else {
+            std::fs::remove_file(&child)
+        };
+        result.map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn load_outbox_entry(
