@@ -1,0 +1,41 @@
+# Manifest serwisu IBM Granite Vision — multimodalne modele (tekst+obraz)
+# serwowane standardowym `vllm serve`. Reuzywa kontekstu docker silnika vLLM
+# (llm/docker/vllm) — bez nowego Dockerfile.
+
+[engine]
+id = "granite-vision"
+provider = "ibm"
+category = "llm"
+name = "IBM Granite Vision"
+description_pl = "Multimodalne modele IBM Granite Vision (tekst+obraz) serwowane przez vLLM. Wybierz wariant w kreatorze."
+description_en = "IBM Granite Vision multimodal models (text+image) served via vLLM. Pick a variant in the wizard."
+homepage = "https://huggingface.co/ibm-granite"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "3.3"
+dgx_spark = false
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+
+[deploy.docker]
+context_path = "llm/docker/vllm"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[[model_preset]]
+id = "granite-vision-3-3-2b"
+display_name = "Granite Vision 3.3 2B"
+repo = "ibm-granite/granite-vision-3.3-2b"
+recommended = true
+
+[[model_preset]]
+id = "granite-vision-3-2-2b"
+display_name = "Granite Vision 3.2 2B"
+repo = "ibm-granite/granite-vision-3.2-2b"
+
+[[model_preset]]
+id = "granite-vision-4-1-4b"
+display_name = "Granite Vision 4.1 4B"
+repo = "ibm-granite/granite-vision-4.1-4b"

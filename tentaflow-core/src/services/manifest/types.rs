@@ -38,6 +38,12 @@ pub struct Engine {
     pub icon: Option<String>,
     #[serde(default)]
     pub resource_kind: Option<ResourceKind>,
+    /// Provider/vendor grouping dla zakladki katalogu. `None` lub "tentaflow"
+    /// = domyslna zakladka TentaFlow. "ibm" = dedykowana zakladka IBM. Pozwala
+    /// trzymac definicje serwisow vendora jako zwykle manifesty TOML, a
+    /// renderowac je pod wlasna zakladka.
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub requires_model: Option<bool>,
     #[serde(default)]

@@ -827,6 +827,9 @@ mod services_manifest_build {
         pub icon: Option<String>,
         #[serde(default)]
         pub resource_kind: Option<ResourceKind>,
+        /// Mirror runtime Engine.provider.
+        #[serde(default)]
+        pub provider: Option<String>,
         #[serde(default)]
         pub requires_model: Option<bool>,
         #[serde(default)]

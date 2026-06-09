@@ -604,6 +604,7 @@
     "subtitle": "Services and infrastructure from TOML manifests · deploy in 3 steps",
     "tab_tentaflow": "TentaFlow Catalog",
     "tab_nim": "NVIDIA NIM",
+    "tab_ibm": "IBM",
     "nim_soon": "NVIDIA NIM integration coming soon",
     "noCompatible": "No engines compatible with this system",
     "group_ai": "AI Services",

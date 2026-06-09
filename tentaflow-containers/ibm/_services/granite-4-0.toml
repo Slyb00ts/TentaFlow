@@ -1,0 +1,38 @@
+# Manifest serwisu IBM Granite 4.0 — hybrydowe modele serwowane przez vLLM.
+# Reuzywa sprawdzonego kontekstu docker silnika vLLM (llm/docker/vllm).
+
+[engine]
+id = "granite-4-0"
+provider = "ibm"
+category = "llm"
+name = "IBM Granite 4.0"
+description_pl = "Hybrydowe modele IBM Granite 4.0 (H) serwowane przez vLLM. Wybierz rozmiar Micro/Tiny/Small w kreatorze."
+description_en = "IBM Granite 4.0 hybrid (H) models served via vLLM. Pick Micro/Tiny/Small size in the wizard."
+homepage = "https://huggingface.co/ibm-granite"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "4.0"
+dgx_spark = false
+
+[deploy.docker]
+context_path = "llm/docker/vllm"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[[model_preset]]
+id = "granite-4-0-h-micro"
+display_name = "Granite 4.0 H Micro"
+repo = "ibm-granite/granite-4.0-h-micro"
+
+[[model_preset]]
+id = "granite-4-0-h-tiny"
+display_name = "Granite 4.0 H Tiny"
+repo = "ibm-granite/granite-4.0-h-tiny"
+
+[[model_preset]]
+id = "granite-4-0-h-small"
+display_name = "Granite 4.0 H Small"
+repo = "ibm-granite/granite-4.0-h-small"
+recommended = true

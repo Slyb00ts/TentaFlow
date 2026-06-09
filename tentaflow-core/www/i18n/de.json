@@ -491,6 +491,7 @@
     "subtitle": "AI-Engines aus TOML-Manifesten · Deploy in 3 Schritten",
     "tab_tentaflow": "TentaFlow Catalog",
     "tab_nim": "NVIDIA NIM",
+    "tab_ibm": "IBM",
     "nim_soon": "NVIDIA NIM-Integration bald verfügbar",
     "noCompatible": "Keine Engines mit diesem System kompatibel",
     "deploy_as": "Deploy",

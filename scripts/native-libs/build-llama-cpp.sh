@@ -98,6 +98,9 @@ build_backend() {
     -B "$build"
     -DCMAKE_BUILD_TYPE=Release
     -DBUILD_SHARED_LIBS=OFF
+    # PIC wymagany — statyczne obiekty linkowane do binarki PIE (tentaflow).
+    # Bez tego rust-lld zglasza R_X86_64_32 against local symbol (jak sherpa).
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     -DGGML_CCACHE=OFF
     -DLLAMA_BUILD_TESTS=OFF
     -DLLAMA_BUILD_EXAMPLES=OFF

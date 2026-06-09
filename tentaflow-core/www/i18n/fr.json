@@ -491,6 +491,7 @@
     "subtitle": "Moteurs IA depuis manifestes TOML · déploiement en 3 étapes",
     "tab_tentaflow": "TentaFlow Catalog",
     "tab_nim": "NVIDIA NIM",
+    "tab_ibm": "IBM",
     "nim_soon": "Intégration NVIDIA NIM bientôt disponible",
     "noCompatible": "Aucun moteur compatible avec ce système",
     "deploy_as": "Déploiement",
