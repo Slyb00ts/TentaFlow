@@ -2455,14 +2455,45 @@ fn apply_kv_operation(db: &DbPool, operation: &SyncOperation) -> LedgerResult<us
     }
     let instance_id = field_string(operation, "instance_id")?;
     let key = field_string(operation, "key")?;
-    let conn = db
+    // Fold the incoming HLC into the local clock so a locally-minted KV write that
+    // follows is strictly later than anything observed from the mesh.
+    observe_core_hlc(&operation.body.hlc_timestamp);
+
+    let mut conn = db
         .lock()
         .map_err(|e| SyncLedgerError::Runtime(format!("Blad blokady bazy: {e}")))?;
-    match operation.body.action {
+    let tx = conn
+        .transaction()
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+
+    // HLC last-writer-wins gate keyed by the per-(instance_id, key) resource_id.
+    // Two nodes writing the same addon key concurrently used to materialize in
+    // delivery order (blind upsert), so the converged value depended on which push
+    // arrived last — the same convergence hole as `external-credentials`. Gating on
+    // the recorded HLC makes the outcome the operation with the greatest HLC under
+    // the total (wall, logical, node_id) order, regardless of delivery order. The
+    // gate, the row write and the version bump share one transaction so the bookmark
+    // can never drift from the materialized row. A re-delivered op (same op_hash)
+    // carries an HLC equal to the stored one, fails the strict `>` test, and is a
+    // no-op — idempotent. Delete is an LWW tombstone: a delete with a higher HLC
+    // wins over a later-delivered-but-older insert, and the version row survives the
+    // delete so a stale insert that arrives afterwards is still dropped.
+    if !crate::sync::core_materializer::incoming_hlc_wins(
+        &tx,
+        &operation.body.resource_type,
+        &operation.body.resource_id,
+        &operation.body.hlc_timestamp,
+    )? {
+        tx.commit()
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        return Ok(0);
+    }
+
+    let rows = match operation.body.action {
         ActionType::Update | ActionType::Insert => {
             let value = field_bytes(operation, "value")?;
             let value_size = value.len() as i64;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO addon_storage \
                  (addon_id, instance_id, storage_key, storage_value, value_size_bytes, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) \
@@ -2478,16 +2509,27 @@ fn apply_kv_operation(db: &DbPool, operation: &SyncOperation) -> LedgerResult<us
                     value_size
                 ],
             )
-            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
         }
-        ActionType::Delete => conn
+        ActionType::Delete => tx
             .execute(
                 "DELETE FROM addon_storage \
                  WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
                 rusqlite::params![&operation.body.addon_id, instance_id, key],
             )
-            .map_err(|e| SyncLedgerError::Runtime(e.to_string())),
-    }
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?,
+    };
+
+    crate::sync::core_materializer::upsert_resource_version(
+        &tx,
+        &operation.body.resource_type,
+        &operation.body.resource_id,
+        &operation.body.hlc_timestamp,
+    )?;
+
+    tx.commit()
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    Ok(rows)
 }
 
 enum BlobApplyOutcome {
@@ -8535,6 +8577,128 @@ mod tests {
 
             assert_eq!(flow_name(&db1, "1").as_deref(), Some("from-z"));
             assert_eq!(flow_name(&db2, "1").as_deref(), Some("from-z"));
+        });
+    }
+
+    /// Records an `addon.kv` write on `node` with a caller-chosen wall time, so the
+    /// resulting signed op carries a deterministic HLC (wall = `created_at_ms`,
+    /// node = the runtime's own id) for the LWW comparison.
+    fn signed_kv_op(
+        node: &RuntimeHarness,
+        addon_id: &str,
+        instance_id: &str,
+        key: &str,
+        value: Option<&[u8]>,
+        created_at_ms: i64,
+    ) -> SyncOperation {
+        let mut capture = KvWriteCapture::new(
+            "org-default",
+            addon_id,
+            instance_id,
+            key,
+            value.map(|v| v.to_vec()),
+            Some("00000000-0000-0000-0000-000000000007".to_string()),
+        );
+        capture.created_at_ms = created_at_ms;
+        let recorded = node
+            .runtime
+            .record_kv_capture(capture)
+            .expect("record kv capture");
+        node.runtime
+            .ledger
+            .get_operation(recorded.op_id)
+            .expect("operation")
+    }
+
+    fn kv_value(db: &DbPool, addon_id: &str, instance_id: &str, key: &str) -> Option<Vec<u8>> {
+        use rusqlite::OptionalExtension;
+        db.lock()
+            .expect("db lock")
+            .query_row(
+                "SELECT storage_value FROM addon_storage \
+                 WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
+                rusqlite::params![addon_id, instance_id, key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .expect("query kv")
+    }
+
+    /// Cross-node LWW for replicated `addon.kv`: the SAME key is written
+    /// concurrently on two nodes with different HLCs. Applying both ops in OPPOSITE
+    /// orders on two separate databases must converge to the newer-HLC value —
+    /// proving the winner is the higher HLC, not whichever push arrived last. This
+    /// is the convergence hole the blind upsert left open. Re-delivering either op
+    /// is a no-op, so the merge is idempotent (re-delivery), commutative and
+    /// associative (apply order does not change the fixed point): every db reaches
+    /// the same `max` over the total HLC order.
+    #[test]
+    fn e2e_cross_node_kv_lww_converges_to_newer_hlc_regardless_of_apply_order() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(141);
+            let node_b = make_runtime(142);
+
+            // Two concurrent writes of the same addon key: A older, B newer.
+            let op_older =
+                signed_kv_op(&node_a, "kv-addon", "inst-1", "settings/theme", Some(b"light"), 1_000);
+            let op_newer =
+                signed_kv_op(&node_b, "kv-addon", "inst-1", "settings/theme", Some(b"dark"), 2_000);
+
+            let db1 = make_db();
+            let db2 = make_db();
+
+            // DB 1 applies older THEN newer; DB 2 applies newer THEN older.
+            apply_kv_operation(&db1, &op_older).expect("db1 older");
+            apply_kv_operation(&db1, &op_newer).expect("db1 newer");
+
+            apply_kv_operation(&db2, &op_newer).expect("db2 newer");
+            // The older op arriving last must be DROPPED by the LWW gate (0 rows),
+            // not clobber the newer value.
+            let stale = apply_kv_operation(&db2, &op_older).expect("db2 older");
+            assert_eq!(stale, 0, "stale older kv op must be dropped by LWW");
+
+            // Both databases converge to the newer-HLC value.
+            assert_eq!(kv_value(&db1, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
+            assert_eq!(kv_value(&db2, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
+
+            // Re-delivering the winning op is idempotent: same HLC fails the strict
+            // `>` gate and applies nothing, value unchanged.
+            let redelivered = apply_kv_operation(&db1, &op_newer).expect("db1 re-deliver");
+            assert_eq!(redelivered, 0, "re-delivered op must be a no-op");
+            assert_eq!(kv_value(&db1, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
+        });
+    }
+
+    /// LWW tombstone for `addon.kv` delete: a delete carrying a HIGHER HLC must win
+    /// over a later-DELIVERED-but-older insert of the same key. The version row
+    /// survives the delete (tombstone), so the stale insert arriving afterwards is
+    /// dropped and the key stays absent on every node regardless of delivery order.
+    #[test]
+    fn e2e_cross_node_kv_delete_tombstone_beats_late_older_insert() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(143);
+            let node_b = make_runtime(144);
+
+            // Older insert on A, newer delete on B of the same key.
+            let op_insert =
+                signed_kv_op(&node_a, "kv-addon", "inst-1", "settings/theme", Some(b"light"), 1_000);
+            let op_delete =
+                signed_kv_op(&node_b, "kv-addon", "inst-1", "settings/theme", None, 2_000);
+
+            let db1 = make_db();
+            let db2 = make_db();
+
+            // DB 1: insert THEN delete (delete wins, key removed).
+            apply_kv_operation(&db1, &op_insert).expect("db1 insert");
+            apply_kv_operation(&db1, &op_delete).expect("db1 delete");
+            assert_eq!(kv_value(&db1, "kv-addon", "inst-1", "settings/theme"), None);
+
+            // DB 2: delete THEN late older insert. The tombstone's HLC outranks the
+            // insert, so the late insert is dropped and the key stays absent.
+            apply_kv_operation(&db2, &op_delete).expect("db2 delete");
+            let stale = apply_kv_operation(&db2, &op_insert).expect("db2 late insert");
+            assert_eq!(stale, 0, "older insert after a newer delete must be dropped");
+            assert_eq!(kv_value(&db2, "kv-addon", "inst-1", "settings/theme"), None);
         });
     }
 
