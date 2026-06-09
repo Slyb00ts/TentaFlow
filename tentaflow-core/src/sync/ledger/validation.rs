@@ -114,7 +114,7 @@ impl SyncOperationVerifier for HexNodeIdOperationVerifier {
 /// batch are verified. Equivocation — two distinct operations sharing
 /// `(actor_node_id, node_seq)` — is a Byzantine fault and rejected outright.
 pub fn validate_hash_chain(operations: &[SyncOperation]) -> LedgerResult<()> {
-    validate_per_node_chain(operations, None)
+    validate_per_node_chain(operations, &BTreeMap::new())
 }
 
 /// As `validate_hash_chain`, but `expected_previous_hash` seeds the chain of the
@@ -125,12 +125,34 @@ pub fn validate_hash_chain_from(
     operations: &[SyncOperation],
     expected_previous_hash: Option<[u8; 32]>,
 ) -> LedgerResult<()> {
-    validate_per_node_chain(operations, expected_previous_hash)
+    let mut seeds: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    if let (Some(seed), Some(first)) = (expected_previous_hash, operations.first()) {
+        seeds.insert(first.body.actor_node_id.clone(), seed);
+    }
+    validate_per_node_chain(operations, &seeds)
+}
+
+/// Anchors a multi-writer tail onto an attested per-node frontier. For every
+/// authoring node already present in `frontier`, that node's FIRST op in the tail
+/// MUST chain onto `frontier[node].hash` (the attested chain tip) — this rejects a
+/// relay that splices an authentically signed but stale/forked segment whose
+/// `prev_node_hash` does not continue the donor's chain (CR-W1). A writer absent
+/// from the frontier is new to the receiver: its first op anchors at genesis (the
+/// predecessor may live in a compacted prefix), exactly as `validate_hash_chain`.
+pub fn validate_hash_chain_anchored(
+    operations: &[SyncOperation],
+    frontier: &BTreeMap<String, (u64, [u8; 32])>,
+) -> LedgerResult<()> {
+    let seeds: BTreeMap<String, [u8; 32]> = frontier
+        .iter()
+        .map(|(node_id, (_, hash))| (node_id.clone(), *hash))
+        .collect();
+    validate_per_node_chain(operations, &seeds)
 }
 
 fn validate_per_node_chain(
     operations: &[SyncOperation],
-    seed: Option<[u8; 32]>,
+    seeds: &BTreeMap<String, [u8; 32]>,
 ) -> LedgerResult<()> {
     // (actor_node_id, node_seq) -> op_hash, to catch equivocation across the
     // whole batch, and last accepted hash per node to link the chain.
@@ -163,10 +185,12 @@ fn validate_per_node_chain(
         let first_of_node = current_node != Some(node);
         if first_of_node {
             current_node = Some(node);
-            // With an explicit seed the first op must chain onto it; without one
-            // the first op anchors the chain (predecessor may be compacted away).
-            if let Some(seed_hash) = seed {
-                if operation.body.prev_node_hash != Some(seed_hash) {
+            // With a seed for this node the first op must chain onto it; without
+            // one the first op anchors the chain (predecessor may be compacted
+            // away). Seeds are keyed per authoring node so an interleaved
+            // multi-writer tail anchors each writer onto its own attested tip.
+            if let Some(seed_hash) = seeds.get(node) {
+                if operation.body.prev_node_hash != Some(*seed_hash) {
                     return Err(SyncLedgerError::HashChainMismatch {
                         node: node.to_string(),
                         node_seq: operation.body.node_seq,
