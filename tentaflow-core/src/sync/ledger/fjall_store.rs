@@ -4,23 +4,27 @@
 // =============================================================================
 
 use super::types::{
-    decode, encode, AppendResult, BaselineEpoch, CompactionPolicy, HybridLogicalTimestamp,
-    InboxEntry, LedgerResult, NewSyncOperation, OperationId, OperationQuery, OutboxEntry,
-    PartitionHead, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
-    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier, SyncSnapshot,
-    SyncTarget,
+    decode, encode, partition_materialization_order, AppendResult, BaselineEpoch, CompactionPolicy,
+    HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, NodeFrontierEntry, NodeHead,
+    NodeLogQuery, OperationId, OperationQuery, OutboxEntry, PartitionId, PeerId, RepairQueueEntry,
+    SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner,
+    SyncOperationVerifier, SyncSnapshot, SyncTarget,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::Path;
 
+// Operations are content-addressed by op_id. `node_log` is the per-node chain
+// axis (actor_node_id || 0x00 || node_seq.be -> op_id); `partition_index` is the
+// materialization routing index (partition_id || 0x00 || op_id -> ()).
 const OPERATIONS: &str = "operations";
-const OPERATION_INDEX: &str = "operation_index";
-const PARTITION_HEADS: &str = "partition_heads";
+const NODE_LOG: &str = "node_log";
+const PARTITION_INDEX: &str = "partition_index";
+const NODE_HEADS: &str = "node_heads";
 const OUTBOX: &str = "outbox";
 const INBOX: &str = "inbox";
-const PEER_CURSORS: &str = "peer_cursors";
+const NODE_FRONTIER: &str = "node_frontier";
 const REPAIR_QUEUE: &str = "repair_queue";
 const SNAPSHOTS: &str = "snapshots";
 const META: &str = "meta";
@@ -31,14 +35,17 @@ const SEP: u8 = 0;
 pub struct FjallSyncLedgerStore {
     db: Database,
     operations: Keyspace,
-    operation_index: Keyspace,
-    partition_heads: Keyspace,
+    node_log: Keyspace,
+    partition_index: Keyspace,
+    node_heads: Keyspace,
     outbox: Keyspace,
     inbox: Keyspace,
-    peer_cursors: Keyspace,
+    node_frontier: Keyspace,
     repair_queue: Keyspace,
     snapshots: Keyspace,
     meta: Keyspace,
+    // Guards only the LOCAL node's head: a node is single-writer over its own
+    // chain, so this serializes node_seq minting without blocking reads.
     append_lock: Mutex<()>,
 }
 
@@ -47,11 +54,12 @@ impl FjallSyncLedgerStore {
         let db = Database::builder(path).open()?;
         Ok(Self {
             operations: db.keyspace(OPERATIONS, KeyspaceCreateOptions::default)?,
-            operation_index: db.keyspace(OPERATION_INDEX, KeyspaceCreateOptions::default)?,
-            partition_heads: db.keyspace(PARTITION_HEADS, KeyspaceCreateOptions::default)?,
+            node_log: db.keyspace(NODE_LOG, KeyspaceCreateOptions::default)?,
+            partition_index: db.keyspace(PARTITION_INDEX, KeyspaceCreateOptions::default)?,
+            node_heads: db.keyspace(NODE_HEADS, KeyspaceCreateOptions::default)?,
             outbox: db.keyspace(OUTBOX, KeyspaceCreateOptions::default)?,
             inbox: db.keyspace(INBOX, KeyspaceCreateOptions::default)?,
-            peer_cursors: db.keyspace(PEER_CURSORS, KeyspaceCreateOptions::default)?,
+            node_frontier: db.keyspace(NODE_FRONTIER, KeyspaceCreateOptions::default)?,
             repair_queue: db.keyspace(REPAIR_QUEUE, KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace(SNAPSHOTS, KeyspaceCreateOptions::default)?,
             meta: db.keyspace(META, KeyspaceCreateOptions::default)?,
@@ -64,8 +72,8 @@ impl FjallSyncLedgerStore {
         Ok(self.db.persist(PersistMode::SyncAll)?)
     }
 
-    fn load_partition_head(&self, partition: &PartitionId) -> LedgerResult<Option<PartitionHead>> {
-        match self.partition_heads.get(partition.as_str())? {
+    fn load_node_head(&self, node_id: &str) -> LedgerResult<Option<NodeHead>> {
+        match self.node_heads.get(node_id.as_bytes())? {
             Some(value) => Ok(Some(decode(value.as_ref())?)),
             None => Ok(None),
         }
@@ -79,69 +87,97 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         signer: &dyn SyncOperationSigner,
     ) -> LedgerResult<AppendResult> {
         let _guard = self.append_lock.lock();
+        let local_node = signer.node_id().to_string();
         let partition_id = operation.partition_id.clone();
-        let previous_head = self.load_partition_head(&partition_id)?;
+        let previous_head = self.load_node_head(&local_node)?;
         let previous_hash = previous_head.as_ref().map(|head| head.last_hash);
-        let partition_sequence = previous_head
+        let node_seq = previous_head
             .as_ref()
-            .map_or(1, |head| head.last_sequence.saturating_add(1));
-        let operation =
-            SyncOperation::from_new(operation, partition_sequence, previous_hash, signer)?;
+            .map_or(1, |head| head.last_seq.saturating_add(1));
+        let operation = SyncOperation::from_new(operation, node_seq, previous_hash, signer)?;
         operation.validate_integrity()?;
-        let head = PartitionHead {
-            partition_id: partition_id.clone(),
-            last_sequence: partition_sequence,
+        let head = NodeHead {
+            node_id: local_node.clone(),
+            last_seq: node_seq,
             last_hash: operation.operation_hash,
         };
 
-        let operation_key = operation_key(&partition_id, partition_sequence);
         let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
-        batch.insert(&self.operations, operation_key.clone(), encode(&operation)?);
         batch.insert(
-            &self.operation_index,
+            &self.operations,
             operation.op_id.as_bytes().to_vec(),
-            operation_key,
+            encode(&operation)?,
         );
-        batch.insert(&self.partition_heads, partition_id.as_str(), encode(&head)?);
+        batch.insert(
+            &self.node_log,
+            node_log_key(&local_node, node_seq),
+            operation.op_id.as_bytes().to_vec(),
+        );
+        batch.insert(
+            &self.partition_index,
+            partition_index_key(&partition_id, operation.op_id),
+            Vec::new(),
+        );
+        batch.insert(&self.node_heads, local_node.as_bytes(), encode(&head)?);
         batch.commit()?;
 
         Ok(AppendResult {
             op_id: operation.op_id,
             operation_hash: operation.operation_hash,
-            previous_partition_hash: previous_hash,
-            partition_sequence,
+            previous_node_hash: previous_hash,
+            node_seq,
         })
     }
 
     fn get_operations(&self, query: OperationQuery) -> LedgerResult<Vec<SyncOperation>> {
         let mut operations = Vec::new();
         let prefix = partition_prefix(&query.partition_id);
-        for item in self.operations.prefix(&prefix) {
+        for item in self.partition_index.prefix(&prefix) {
+            let (key, _) = item.into_inner()?;
+            let Some(op_id) = op_id_from_partition_index_key(key.as_ref()) else {
+                continue;
+            };
+            let Some(value) = self.operations.get(op_id.as_bytes())? else {
+                continue;
+            };
+            operations.push(decode(value.as_ref())?);
+            if query.limit.is_some_and(|limit| operations.len() >= limit) {
+                break;
+            }
+        }
+        Ok(operations)
+    }
+
+    fn get_node_operations(&self, query: NodeLogQuery) -> LedgerResult<Vec<SyncOperation>> {
+        let mut operations = Vec::new();
+        let prefix = node_prefix(&query.node_id);
+        for item in self.node_log.prefix(&prefix) {
             let (key, value) = item.into_inner()?;
-            if let Some(sequence) = sequence_from_operation_key(key.as_ref()) {
-                if query.from_sequence.is_some_and(|from| sequence < from) {
-                    continue;
-                }
-                if query.to_sequence.is_some_and(|to| sequence > to) {
-                    continue;
-                }
-                operations.push(decode(value.as_ref())?);
-                if query.limit.is_some_and(|limit| operations.len() >= limit) {
-                    break;
-                }
+            let Some(node_seq) = node_seq_from_node_log_key(key.as_ref()) else {
+                continue;
+            };
+            if query.from_node_seq.is_some_and(|from| node_seq < from) {
+                continue;
+            }
+            if query.to_node_seq.is_some_and(|to| node_seq > to) {
+                continue;
+            }
+            let op_id = operation_id_from_bytes(value.as_ref())?;
+            let Some(op_value) = self.operations.get(op_id.as_bytes())? else {
+                continue;
+            };
+            operations.push(decode(op_value.as_ref())?);
+            if query.limit.is_some_and(|limit| operations.len() >= limit) {
+                break;
             }
         }
         Ok(operations)
     }
 
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation> {
-        let key = self
-            .operation_index
-            .get(op_id.as_bytes().to_vec())?
-            .ok_or(SyncLedgerError::OperationNotFound(op_id))?;
         let operation = self
             .operations
-            .get(key.as_ref())?
+            .get(op_id.as_bytes())?
             .ok_or(SyncLedgerError::OperationNotFound(op_id))?;
         decode(operation.as_ref())
     }
@@ -328,32 +364,26 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         self.persist()
     }
 
-    fn get_peer_cursor(
-        &self,
-        peer: PeerId,
-        partition: PartitionId,
-    ) -> LedgerResult<Option<PeerCursor>> {
-        match self.peer_cursors.get(peer_cursor_key(&peer, &partition))? {
+    fn get_node_frontier(&self, node_id: &str) -> LedgerResult<Option<NodeFrontierEntry>> {
+        match self.node_frontier.get(node_id.as_bytes())? {
             Some(value) => Ok(Some(decode(value.as_ref())?)),
             None => Ok(None),
         }
     }
 
-    fn save_peer_cursor(&self, cursor: PeerCursor) -> LedgerResult<()> {
-        self.peer_cursors.insert(
-            peer_cursor_key(&cursor.peer, &cursor.partition_id),
-            encode(&cursor)?,
-        )?;
+    fn save_node_frontier(&self, frontier: NodeFrontierEntry) -> LedgerResult<()> {
+        self.node_frontier
+            .insert(frontier.node_id.as_bytes(), encode(&frontier)?)?;
         self.persist()
     }
 
     fn upsert_repair_request(&self, entry: RepairQueueEntry) -> LedgerResult<()> {
-        let key = repair_queue_key(&entry.peer, &entry.partition_id);
+        let key = repair_queue_key(&entry.peer, &entry.target_node_id);
         let entry = match self.repair_queue.get(&key)? {
             Some(value) => {
                 let mut existing: RepairQueueEntry = decode(value.as_ref())?;
-                if entry.from_sequence < existing.from_sequence {
-                    existing.from_sequence = entry.from_sequence;
+                if entry.from_node_seq < existing.from_node_seq {
+                    existing.from_node_seq = entry.from_node_seq;
                     existing.next_attempt_ms = entry.next_attempt_ms;
                     existing.retry_count = entry.retry_count;
                 }
@@ -390,11 +420,11 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
     fn mark_repair_attempted(
         &self,
         peer: PeerId,
-        partition: PartitionId,
+        target_node_id: &str,
         next_attempt_ms: i64,
         retry_count: u32,
     ) -> LedgerResult<()> {
-        let key = repair_queue_key(&peer, &partition);
+        let key = repair_queue_key(&peer, target_node_id);
         if let Some(value) = self.repair_queue.get(&key)? {
             let mut entry: RepairQueueEntry = decode(value.as_ref())?;
             entry.next_attempt_ms = next_attempt_ms;
@@ -405,9 +435,9 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         Ok(())
     }
 
-    fn remove_repair_request(&self, peer: PeerId, partition: PartitionId) -> LedgerResult<()> {
+    fn remove_repair_request(&self, peer: PeerId, target_node_id: &str) -> LedgerResult<()> {
         self.repair_queue
-            .remove(repair_queue_key(&peer, &partition))?;
+            .remove(repair_queue_key(&peer, target_node_id))?;
         self.persist()
     }
 
@@ -466,14 +496,14 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         Ok(latest)
     }
 
-    fn get_partition_head(&self, partition: PartitionId) -> LedgerResult<Option<PartitionHead>> {
-        self.load_partition_head(&partition)
+    fn get_node_head(&self, node_id: &str) -> LedgerResult<Option<NodeHead>> {
+        self.load_node_head(node_id)
     }
 
     fn list_outbox_for_partition(
         &self,
         partition: PartitionId,
-        up_to_sequence: u64,
+        _up_to_sequence: u64,
     ) -> LedgerResult<Vec<OutboxEntry>> {
         let mut entries = Vec::new();
         for item in self.outbox.iter() {
@@ -482,9 +512,9 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             let Ok(operation) = self.get_operation(entry.op_id) else {
                 continue;
             };
-            if operation.body.partition_id == partition
-                && operation.body.partition_sequence <= up_to_sequence
-            {
+            // The partition no longer carries a sequence watermark, so an outbox
+            // entry is in-scope purely by partition membership.
+            if operation.body.partition_id == partition {
                 entries.push(entry);
             }
         }
@@ -495,18 +525,40 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         let Some(keep_after_sequence) = policy.keep_operations_after_sequence else {
             return Ok(());
         };
+        // `keep_after_sequence` is a 1-based materialization watermark over the
+        // partition's HLC-ordered operations: drop the first `keep_after_sequence
+        // - 1` of them (those a snapshot already covers). Node-log entries and the
+        // node heads are left intact — only the per-partition materialization
+        // index and the content row are reaped, mirroring the old behaviour.
+        let keep_after = keep_after_sequence.saturating_sub(1) as usize;
+        if keep_after == 0 {
+            return Ok(());
+        }
+
+        // Drop the oldest operations first, in canonical materialization order, so
+        // the prefix removed here matches the snapshot prefix the watermark refers
+        // to even when several operations share an HLC.
+        let mut ordered: Vec<SyncOperation> = Vec::new();
+        let prefix = partition_prefix(&policy.partition_id);
+        for item in self.partition_index.prefix(&prefix) {
+            let (key, _) = item.into_inner()?;
+            let Some(op_id) = op_id_from_partition_index_key(key.as_ref()) else {
+                continue;
+            };
+            let Some(value) = self.operations.get(op_id.as_bytes())? else {
+                continue;
+            };
+            ordered.push(decode(value.as_ref())?);
+        }
+        ordered.sort_by(partition_materialization_order);
 
         let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
-        let prefix = partition_prefix(&policy.partition_id);
-        for item in self.operations.prefix(&prefix) {
-            let (key, value) = item.into_inner()?;
-            if sequence_from_operation_key(key.as_ref())
-                .is_some_and(|seq| seq < keep_after_sequence)
-            {
-                let operation: SyncOperation = decode(value.as_ref())?;
-                batch.remove(&self.operation_index, operation.op_id.as_bytes().to_vec());
-                batch.remove(&self.operations, key.to_vec());
-            }
+        for operation in ordered.into_iter().take(keep_after) {
+            batch.remove(
+                &self.partition_index,
+                partition_index_key(&policy.partition_id, operation.op_id),
+            );
+            batch.remove(&self.operations, operation.op_id.as_bytes().to_vec());
         }
         batch.commit()?;
         Ok(())
@@ -548,29 +600,39 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
 
         let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
 
-        // Operations + their op_id index. The operation key starts with the
-        // partition_id, so a byte-prefix match selects exactly the partitions
-        // under `partition_prefix`. Collect the matching op_ids while we are
-        // here so outbox/inbox cleanup below can match without re-reading.
+        // Operations are content-addressed, so the partition_index (keyed by
+        // partition_id || 0x00 || op_id) is the only way to attribute an op to a
+        // partition. Collect the matching op_ids and drop the content rows and
+        // their partition-index entries.
         let mut matched_op_ids: HashSet<OperationId> = HashSet::new();
-        for item in self.operations.prefix(prefix_bytes) {
+        for item in self.partition_index.prefix(prefix_bytes) {
+            let (key, _) = item.into_inner()?;
+            let Some(op_id) = op_id_from_partition_index_key(key.as_ref()) else {
+                continue;
+            };
+            batch.remove(&self.partition_index, key.to_vec());
+            batch.remove(&self.operations, op_id.as_bytes().to_vec());
+            matched_op_ids.insert(op_id);
+        }
+
+        // node_log maps node_id||seq -> op_id; drop the entries pointing at the
+        // operations we just removed. node_heads / node_frontier span every
+        // partition a node ever wrote, so a per-partition reset MUST NOT touch
+        // them: the local node keeps minting a monotonic node_seq (single writer
+        // never resets its own chain) and remote frontiers stay valid — epoch
+        // fencing rejects any pre-reset operation that arrives late.
+        for item in self.node_log.iter() {
             let (key, value) = item.into_inner()?;
-            let operation: SyncOperation = decode(value.as_ref())?;
-            batch.remove(&self.operation_index, operation.op_id.as_bytes().to_vec());
-            batch.remove(&self.operations, key.to_vec());
-            matched_op_ids.insert(operation.op_id);
+            let op_id = operation_id_from_bytes(value.as_ref())?;
+            if matched_op_ids.contains(&op_id) {
+                batch.remove(&self.node_log, key.to_vec());
+            }
         }
 
         // Snapshots are keyed by partition_prefix too.
         for item in self.snapshots.prefix(prefix_bytes) {
             let (key, _) = item.into_inner()?;
             batch.remove(&self.snapshots, key.to_vec());
-        }
-
-        // Partition heads are keyed directly by partition_id.
-        for item in self.partition_heads.prefix(prefix_bytes) {
-            let (key, _) = item.into_inner()?;
-            batch.remove(&self.partition_heads, key.to_vec());
         }
 
         // Outbox is keyed by (target, op_id) and stores no partition, so the only
@@ -599,24 +661,6 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
                 .starts_with(partition_prefix)
             {
                 batch.remove(&self.inbox, key.to_vec());
-            }
-        }
-
-        // Peer cursors and repair queue are keyed by (peer, partition) but the
-        // partition is concatenated raw, so decode the value to be safe.
-        for item in self.peer_cursors.iter() {
-            let (key, value) = item.into_inner()?;
-            let cursor: PeerCursor = decode(value.as_ref())?;
-            if cursor.partition_id.as_str().starts_with(partition_prefix) {
-                batch.remove(&self.peer_cursors, key.to_vec());
-            }
-        }
-
-        for item in self.repair_queue.iter() {
-            let (key, value) = item.into_inner()?;
-            let entry: RepairQueueEntry = decode(value.as_ref())?;
-            if entry.partition_id.as_str().starts_with(partition_prefix) {
-                batch.remove(&self.repair_queue, key.to_vec());
             }
         }
 
@@ -661,15 +705,41 @@ fn partition_prefix(partition: &PartitionId) -> Vec<u8> {
     key
 }
 
-fn operation_key(partition: &PartitionId, sequence: u64) -> Vec<u8> {
-    let mut key = partition_prefix(partition);
-    key.extend_from_slice(&sequence.to_be_bytes());
+fn node_prefix(node_id: &str) -> Vec<u8> {
+    let mut key = node_id.as_bytes().to_vec();
+    key.push(SEP);
     key
 }
 
-fn sequence_from_operation_key(key: &[u8]) -> Option<u64> {
+fn node_log_key(node_id: &str, node_seq: u64) -> Vec<u8> {
+    let mut key = node_prefix(node_id);
+    key.extend_from_slice(&node_seq.to_be_bytes());
+    key
+}
+
+fn node_seq_from_node_log_key(key: &[u8]) -> Option<u64> {
     let bytes: [u8; 8] = key.get(key.len().checked_sub(8)?..)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
+}
+
+fn partition_index_key(partition: &PartitionId, op_id: OperationId) -> Vec<u8> {
+    let mut key = partition_prefix(partition);
+    key.extend_from_slice(op_id.as_bytes());
+    key
+}
+
+fn op_id_from_partition_index_key(key: &[u8]) -> Option<OperationId> {
+    let bytes: [u8; 32] = key.get(key.len().checked_sub(32)?..)?.try_into().ok()?;
+    Some(OperationId::from_hash(bytes))
+}
+
+fn operation_id_from_bytes(bytes: &[u8]) -> LedgerResult<OperationId> {
+    let hash: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| SyncLedgerError::InvalidOperationIdHex {
+            value: hex::encode(bytes),
+        })?;
+    Ok(OperationId::from_hash(hash))
 }
 
 fn outbox_key(target: &SyncTarget, op_id: OperationId) -> Vec<u8> {
@@ -692,15 +762,11 @@ fn scoped_prefix(scope: &str) -> Vec<u8> {
     key
 }
 
-fn peer_cursor_key(peer: &PeerId, partition: &PartitionId) -> Vec<u8> {
+fn repair_queue_key(peer: &PeerId, target_node_id: &str) -> Vec<u8> {
     let mut key = peer.as_str().as_bytes().to_vec();
     key.push(SEP);
-    key.extend_from_slice(partition.as_str().as_bytes());
+    key.extend_from_slice(target_node_id.as_bytes());
     key
-}
-
-fn repair_queue_key(peer: &PeerId, partition: &PartitionId) -> Vec<u8> {
-    peer_cursor_key(peer, partition)
 }
 
 fn snapshot_key(partition: &PartitionId, sequence: u64, snapshot_id: &str) -> Vec<u8> {
@@ -788,13 +854,13 @@ mod tests {
             .append_operation(sample_operation(&signer, "person_2"), &signer)
             .unwrap();
 
-        assert_eq!(first.partition_sequence, 1);
-        assert_eq!(second.partition_sequence, 2);
-        assert_eq!(second.previous_partition_hash, Some(first.operation_hash));
+        assert_eq!(first.node_seq, 1);
+        assert_eq!(second.node_seq, 2);
+        assert_eq!(second.previous_node_hash, Some(first.operation_hash));
     }
 
     #[test]
-    fn get_operations_returns_partition_range() {
+    fn get_node_operations_returns_node_chain_range() {
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
         let signer = signer();
@@ -806,10 +872,10 @@ mod tests {
             .unwrap();
 
         let operations = store
-            .get_operations(OperationQuery {
-                partition_id: PartitionId::new("addon/contacts/persons").unwrap(),
-                from_sequence: Some(2),
-                to_sequence: Some(2),
+            .get_node_operations(NodeLogQuery {
+                node_id: signer.node_id().to_string(),
+                from_node_seq: Some(2),
+                to_node_seq: Some(2),
                 limit: None,
             })
             .unwrap();
@@ -969,22 +1035,19 @@ mod tests {
     }
 
     #[test]
-    fn peer_cursor_roundtrip() {
+    fn node_frontier_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
-        let partition = PartitionId::new("addon/contacts/persons").unwrap();
-        let peer = PeerId::new("node_b").unwrap();
-        let cursor = PeerCursor {
-            peer: peer.clone(),
-            partition_id: partition.clone(),
-            last_sequence: 7,
+        let frontier = NodeFrontierEntry {
+            node_id: "node_b".to_string(),
+            last_seq: 7,
             last_hash: [9; 32],
         };
 
-        store.save_peer_cursor(cursor.clone()).unwrap();
-        let loaded = store.get_peer_cursor(peer, partition).unwrap();
+        store.save_node_frontier(frontier.clone()).unwrap();
+        let loaded = store.get_node_frontier("node_b").unwrap();
 
-        assert_eq!(loaded, Some(cursor));
+        assert_eq!(loaded, Some(frontier));
     }
 
     #[test]
@@ -992,18 +1055,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
         let peer = PeerId::new("node_b").unwrap();
-        let partition = PartitionId::new("addon/contacts/persons").unwrap();
+        let target_node = "node_author";
         store
             .upsert_repair_request(RepairQueueEntry {
                 peer: peer.clone(),
-                partition_id: partition.clone(),
-                from_sequence: 4,
+                target_node_id: target_node.to_string(),
+                from_node_seq: 4,
                 next_attempt_ms: 100,
                 retry_count: 0,
             })
             .unwrap();
         store
-            .mark_repair_attempted(peer.clone(), partition.clone(), 500, 1)
+            .mark_repair_attempted(peer.clone(), target_node, 500, 1)
             .unwrap();
         drop(store);
 
@@ -1016,11 +1079,11 @@ mod tests {
             .list_due_repair_requests(peer.clone(), 500, 10)
             .unwrap();
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].from_sequence, 4);
+        assert_eq!(due[0].from_node_seq, 4);
         assert_eq!(due[0].retry_count, 1);
 
         reopened
-            .remove_repair_request(peer.clone(), partition.clone())
+            .remove_repair_request(peer.clone(), target_node)
             .unwrap();
         assert!(reopened
             .list_due_repair_requests(peer, 1_000, 10)
@@ -1134,7 +1197,7 @@ mod tests {
             )
             .unwrap();
 
-        // Populate outbox / inbox / cursors / repair for both core and non-core.
+        // Populate outbox / inbox for both core and non-core.
         let target = SyncTarget::new("node_b").unwrap();
         store
             .put_in_outbox(target.clone(), core_append.op_id)
@@ -1151,25 +1214,8 @@ mod tests {
             .put_verified_in_inbox(source.clone(), addon_op, &HexNodeIdOperationVerifier)
             .unwrap();
 
-        for partition in [core_partition, addon_partition] {
-            store
-                .save_peer_cursor(PeerCursor {
-                    peer: source.clone(),
-                    partition_id: PartitionId::new(partition).unwrap(),
-                    last_sequence: 1,
-                    last_hash: [3; 32],
-                })
-                .unwrap();
-            store
-                .upsert_repair_request(RepairQueueEntry {
-                    peer: source.clone(),
-                    partition_id: PartitionId::new(partition).unwrap(),
-                    from_sequence: 1,
-                    next_attempt_ms: 0,
-                    retry_count: 0,
-                })
-                .unwrap();
-        }
+        let local_node = signer.node_id().to_string();
+        let head_before = store.get_node_head(&local_node).unwrap().unwrap();
 
         store.reset_core_partitions().unwrap();
 
@@ -1177,8 +1223,6 @@ mod tests {
         assert!(store
             .get_operations(OperationQuery {
                 partition_id: PartitionId::new(core_partition).unwrap(),
-                from_sequence: None,
-                to_sequence: None,
                 limit: None,
             })
             .unwrap()
@@ -1187,8 +1231,6 @@ mod tests {
             store
                 .get_operations(OperationQuery {
                     partition_id: PartitionId::new(addon_partition).unwrap(),
-                    from_sequence: None,
-                    to_sequence: None,
                     limit: None,
                 })
                 .unwrap()
@@ -1199,8 +1241,6 @@ mod tests {
             store
                 .get_operations(OperationQuery {
                     partition_id: PartitionId::new(kv_partition).unwrap(),
-                    from_sequence: None,
-                    to_sequence: None,
                     limit: None,
                 })
                 .unwrap()
@@ -1208,20 +1248,15 @@ mod tests {
             1
         );
 
-        // op_id index for core is gone; addon/kv still resolvable.
+        // Content store for core is gone; addon/kv still resolvable.
         assert!(store.get_operation(core_append.op_id).is_err());
         assert!(store.get_operation(addon_append.op_id).is_ok());
         assert!(store.get_operation(kv_append.op_id).is_ok());
 
-        // Partition head only removed for core.
-        assert!(store
-            .get_partition_head(PartitionId::new(core_partition).unwrap())
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_partition_head(PartitionId::new(addon_partition).unwrap())
-            .unwrap()
-            .is_some());
+        // The local node head spans every partition the node ever wrote, so a
+        // per-partition reset must NOT touch it: the single writer keeps minting a
+        // monotonic node_seq across the reset.
+        assert_eq!(store.get_node_head(&local_node).unwrap(), Some(head_before));
 
         // Outbox: core entry removed, addon entry kept.
         assert!(store
@@ -1238,23 +1273,6 @@ mod tests {
             inbox[0].operation.body.partition_id.as_str(),
             addon_partition
         );
-
-        // Peer cursor: core gone, addon kept.
-        assert!(store
-            .get_peer_cursor(source.clone(), PartitionId::new(core_partition).unwrap())
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_peer_cursor(source.clone(), PartitionId::new(addon_partition).unwrap())
-            .unwrap()
-            .is_some());
-
-        // Repair queue: only the addon-partition request remains due.
-        let due = store
-            .list_due_repair_requests(source, i64::MAX, 10)
-            .unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].partition_id.as_str(), addon_partition);
     }
 
     #[test]

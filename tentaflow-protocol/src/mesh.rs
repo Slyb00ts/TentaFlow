@@ -1013,8 +1013,10 @@ pub struct MeshServicesUpdatePayload {
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncOperationWire {
     pub op_id: Vec<u8>,
+    // Partition stays for routing/materialization; the chain axis is now the
+    // authoring node's `node_seq`, carried inside the encoded operation body.
     pub partition_id: String,
-    pub partition_sequence: u64,
+    pub node_seq: u64,
     pub operation: Vec<u8>,
 }
 
@@ -1033,16 +1035,18 @@ pub struct MeshSyncAckPayload {
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncPullPayload {
     pub from_node_id: String,
-    pub partition_id: String,
-    pub from_sequence: u64,
+    // Authoring node whose chain we need from `from_node_seq` onward. Any peer
+    // may relay another node's chain, so this is independent of `from_node_id`.
+    pub target_node_id: String,
+    pub from_node_seq: u64,
     pub limit: u32,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct MeshSyncPullResponsePayload {
     pub from_node_id: String,
-    pub partition_id: String,
-    pub from_sequence: u64,
+    pub target_node_id: String,
+    pub from_node_seq: u64,
     pub operations: Vec<MeshSyncOperationWire>,
 }
 
@@ -2014,7 +2018,7 @@ mod tests {
         let op = MeshSyncOperationWire {
             op_id: vec![7; 32],
             partition_id: "addon/contacts/persons/1".to_string(),
-            partition_sequence: 4,
+            node_seq: 4,
             operation: vec![1, 2, 3, 4],
         };
         let push = MeshSyncPushPayload {
@@ -2025,7 +2029,7 @@ mod tests {
         let decoded = crate::cbor::decode::<MeshSyncPushPayload>(&bytes)
             .expect("decode push");
         assert_eq!(decoded.operations[0].op_id, op.op_id);
-        assert_eq!(decoded.operations[0].partition_sequence, 4);
+        assert_eq!(decoded.operations[0].node_seq, 4);
 
         let ack = MeshSyncAckPayload {
             from_node_id: "node-b".to_string(),
@@ -2038,19 +2042,19 @@ mod tests {
 
         let pull = MeshSyncPullPayload {
             from_node_id: "node-a".to_string(),
-            partition_id: "addon/contacts/persons/1".to_string(),
-            from_sequence: 2,
+            target_node_id: "node-b".to_string(),
+            from_node_seq: 2,
             limit: 128,
         };
         let bytes = crate::cbor::encode(&pull).expect("encode pull");
         let decoded = crate::cbor::decode::<MeshSyncPullPayload>(&bytes)
             .expect("decode pull");
-        assert_eq!(decoded.from_sequence, 2);
+        assert_eq!(decoded.from_node_seq, 2);
 
         let response = MeshSyncPullResponsePayload {
             from_node_id: "node-b".to_string(),
-            partition_id: "addon/contacts/persons/1".to_string(),
-            from_sequence: 2,
+            target_node_id: "node-b".to_string(),
+            from_node_seq: 2,
             operations: vec![op],
         };
         let bytes = crate::cbor::encode(&response).expect("encode response");
@@ -2083,7 +2087,7 @@ mod tests {
             operations_after_snapshot: vec![MeshSyncOperationWire {
                 op_id: vec![9; 32],
                 partition_id: "addon/contacts/persons/1".to_string(),
-                partition_sequence: 11,
+                node_seq: 11,
                 operation: vec![7, 8],
             }],
         };
