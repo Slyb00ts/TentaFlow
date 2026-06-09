@@ -87,6 +87,8 @@ async fn make_manager() -> (Arc<IrohMeshManager>, Arc<MeshSecurity>) {
         relay_url: None,
         enable_lan_discovery: false,
         enable_dht_discovery: false,
+        addr_filter: None,
+        disable_portmapper: false,
     };
     let mgr = IrohMeshManager::new(cfg, security.clone())
         .await

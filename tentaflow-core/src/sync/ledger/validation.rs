@@ -4,7 +4,7 @@
 // =============================================================================
 
 use super::types::{
-    hash_canonical, LedgerResult, SyncLedgerError, SyncMerkleSummary, SyncOperation,
+    hash_canonical, LedgerResult, OperationId, SyncLedgerError, SyncMerkleSummary, SyncOperation,
     SyncOperationSigner, SyncOperationVerifier,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -105,21 +105,102 @@ impl SyncOperationVerifier for HexNodeIdOperationVerifier {
     }
 }
 
+/// Validates every per-node hash chain present in `operations`. Operations may
+/// belong to multiple authoring nodes (a partition is written by many nodes);
+/// each `actor_node_id` is validated independently as its own dense, monotonic
+/// chain ordered by `node_seq`. The FIRST op seen for each node anchors that
+/// node's chain — its `prev_node_hash` is not checked, because the predecessor
+/// may live in a compacted snapshot prefix; only subsequent links within the
+/// batch are verified. Equivocation — two distinct operations sharing
+/// `(actor_node_id, node_seq)` — is a Byzantine fault and rejected outright.
 pub fn validate_hash_chain(operations: &[SyncOperation]) -> LedgerResult<()> {
-    validate_hash_chain_from(operations, None)
+    validate_per_node_chain(operations, &BTreeMap::new())
 }
 
+/// As `validate_hash_chain`, but `expected_previous_hash` seeds the chain of the
+/// SINGLE node whose operations follow on a snapshot/pull tail: the first op MUST
+/// chain onto that seed. Mixing several nodes with a non-None seed is meaningless,
+/// so a seed only applies when all operations share one `actor_node_id`.
 pub fn validate_hash_chain_from(
     operations: &[SyncOperation],
     expected_previous_hash: Option<[u8; 32]>,
 ) -> LedgerResult<()> {
-    let mut previous_hash = expected_previous_hash;
-    for operation in operations {
+    let mut seeds: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    if let (Some(seed), Some(first)) = (expected_previous_hash, operations.first()) {
+        seeds.insert(first.body.actor_node_id.clone(), seed);
+    }
+    validate_per_node_chain(operations, &seeds)
+}
+
+/// Anchors a multi-writer tail onto an attested per-node frontier. For every
+/// authoring node already present in `frontier`, that node's FIRST op in the tail
+/// MUST chain onto `frontier[node].hash` (the attested chain tip) — this rejects a
+/// relay that splices an authentically signed but stale/forked segment whose
+/// `prev_node_hash` does not continue the donor's chain (CR-W1). A writer absent
+/// from the frontier is new to the receiver: its first op anchors at genesis (the
+/// predecessor may live in a compacted prefix), exactly as `validate_hash_chain`.
+pub fn validate_hash_chain_anchored(
+    operations: &[SyncOperation],
+    frontier: &BTreeMap<String, (u64, [u8; 32])>,
+) -> LedgerResult<()> {
+    let seeds: BTreeMap<String, [u8; 32]> = frontier
+        .iter()
+        .map(|(node_id, (_, hash))| (node_id.clone(), *hash))
+        .collect();
+    validate_per_node_chain(operations, &seeds)
+}
+
+fn validate_per_node_chain(
+    operations: &[SyncOperation],
+    seeds: &BTreeMap<String, [u8; 32]>,
+) -> LedgerResult<()> {
+    // (actor_node_id, node_seq) -> op_hash, to catch equivocation across the
+    // whole batch, and last accepted hash per node to link the chain.
+    let mut seen: BTreeMap<(String, u64), [u8; 32]> = BTreeMap::new();
+    let mut sorted: Vec<&SyncOperation> = operations.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.body
+            .actor_node_id
+            .cmp(&b.body.actor_node_id)
+            .then_with(|| a.body.node_seq.cmp(&b.body.node_seq))
+    });
+
+    let mut current_node: Option<&str> = None;
+    let mut previous_hash: Option<[u8; 32]> = None;
+    for operation in sorted {
         operation.validate_integrity()?;
-        if operation.body.prev_partition_hash != previous_hash {
+        let node = operation.body.actor_node_id.as_str();
+        if let Some(existing) =
+            seen.insert((node.to_string(), operation.body.node_seq), operation.operation_hash)
+        {
+            if existing != operation.operation_hash {
+                return Err(SyncLedgerError::NodeEquivocation {
+                    node: node.to_string(),
+                    node_seq: operation.body.node_seq,
+                    existing: OperationId::from_hash(existing),
+                    incoming: operation.op_id,
+                });
+            }
+        }
+        let first_of_node = current_node != Some(node);
+        if first_of_node {
+            current_node = Some(node);
+            // With a seed for this node the first op must chain onto it; without
+            // one the first op anchors the chain (predecessor may be compacted
+            // away). Seeds are keyed per authoring node so an interleaved
+            // multi-writer tail anchors each writer onto its own attested tip.
+            if let Some(seed_hash) = seeds.get(node) {
+                if operation.body.prev_node_hash != Some(*seed_hash) {
+                    return Err(SyncLedgerError::HashChainMismatch {
+                        node: node.to_string(),
+                        node_seq: operation.body.node_seq,
+                    });
+                }
+            }
+        } else if operation.body.prev_node_hash != previous_hash {
             return Err(SyncLedgerError::HashChainMismatch {
-                partition: operation.body.partition_id.as_str().to_string(),
-                sequence: operation.body.partition_sequence,
+                node: node.to_string(),
+                node_seq: operation.body.node_seq,
             });
         }
         previous_hash = Some(operation.operation_hash);
@@ -127,15 +208,23 @@ pub fn validate_hash_chain_from(
     Ok(())
 }
 
+/// Builds a Merkle summary over one partition's operations. A partition is now
+/// written by several nodes, so there is no global partition sequence: the
+/// `from_sequence`/`to_sequence` fields are a 1-based count watermark over the
+/// HLC-ordered operation set (1..=N). The per-node hash chains are validated by
+/// the caller via `validate_hash_chain`; here the input must all share one
+/// partition and the leaves are taken in HLC order so the root is deterministic.
 pub fn build_merkle_summary(operations: &[SyncOperation]) -> LedgerResult<SyncMerkleSummary> {
     let first = operations
         .first()
         .ok_or(SyncLedgerError::EmptyMerkleSummary)?;
     let partition = first.body.partition_id.clone();
-    let mut expected_sequence = first.body.partition_sequence;
-    let mut leaves = Vec::with_capacity(operations.len());
 
-    for operation in operations {
+    let mut ordered: Vec<&SyncOperation> = operations.iter().collect();
+    ordered.sort_by(|a, b| super::types::partition_materialization_order(a, b));
+
+    let mut leaves = Vec::with_capacity(ordered.len());
+    for operation in &ordered {
         operation.validate_integrity()?;
         if operation.body.partition_id != partition {
             return Err(SyncLedgerError::MerklePartitionMismatch {
@@ -143,28 +232,38 @@ pub fn build_merkle_summary(operations: &[SyncOperation]) -> LedgerResult<SyncMe
                 actual: operation.body.partition_id.as_str().to_string(),
             });
         }
-        if operation.body.partition_sequence != expected_sequence {
-            return Err(SyncLedgerError::MerkleSequenceGap {
-                expected: expected_sequence,
-                actual: operation.body.partition_sequence,
-            });
-        }
         leaves.push(hash_leaf(operation.operation_hash));
-        expected_sequence = expected_sequence.saturating_add(1);
     }
 
-    let to_sequence = operations
-        .last()
-        .map(|operation| operation.body.partition_sequence)
-        .ok_or(SyncLedgerError::EmptyMerkleSummary)?;
-    let operation_count = operations.len() as u64;
+    let operation_count = ordered.len() as u64;
     Ok(SyncMerkleSummary {
         partition_id: partition,
-        from_sequence: first.body.partition_sequence,
-        to_sequence,
+        from_sequence: 1,
+        to_sequence: operation_count,
         operation_count,
         root_hash: merkle_root(leaves),
     })
+}
+
+/// Per-node coverage frontier over an operation set: for every authoring node
+/// present, the highest `node_seq` and that operation's `operation_hash`. The
+/// caller validates the per-node chains first (`validate_hash_chain`), so the
+/// highest `node_seq` per node is the dense tip of a contiguous chain — exactly
+/// the frontier a snapshot attests and a receiver advances to. Deterministic:
+/// it depends only on the (node, seq) maxima, never on insertion order.
+pub fn node_frontier_for_operations(
+    operations: &[SyncOperation],
+) -> BTreeMap<String, (u64, [u8; 32])> {
+    let mut frontier: BTreeMap<String, (u64, [u8; 32])> = BTreeMap::new();
+    for operation in operations {
+        let entry = frontier
+            .entry(operation.body.actor_node_id.clone())
+            .or_insert((0, [0u8; 32]));
+        if operation.body.node_seq >= entry.0 {
+            *entry = (operation.body.node_seq, operation.operation_hash);
+        }
+    }
+    frontier
 }
 
 fn parse_verifying_key(actor_node_id: &str, key_hex: &str) -> LedgerResult<VerifyingKey> {
@@ -324,6 +423,30 @@ mod tests {
             validate_hash_chain(&[first, second]),
             Err(SyncLedgerError::HashChainMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn hash_chain_rejects_node_equivocation() {
+        // Two distinct operations the same node minted at the same node_seq: a
+        // single-writer node can only produce this by signing two histories.
+        let signer = signer();
+        let first = operation(&signer, 1, None);
+        let forked = operation(&signer, 1, Some([4; 32]));
+        assert_ne!(first.operation_hash, forked.operation_hash);
+
+        assert!(matches!(
+            validate_hash_chain(&[first, forked]),
+            Err(SyncLedgerError::NodeEquivocation { node_seq: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn hash_chain_anchors_first_op_without_seed() {
+        // The first op of a node anchors its chain — its prev_node_hash is not
+        // checked, because the predecessor may live in a compacted prefix.
+        let signer = signer();
+        let tail = operation(&signer, 5, Some([7; 32]));
+        validate_hash_chain(&[tail]).unwrap();
     }
 
     #[test]

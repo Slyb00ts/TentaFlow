@@ -4,68 +4,182 @@
 // =============================================================================
 
 use super::types::{
-    decode, encode, AppendResult, BaselineEpoch, CompactionPolicy, HybridLogicalTimestamp,
-    InboxEntry, LedgerResult, NewSyncOperation, OperationId, OperationQuery, OutboxEntry,
-    PartitionHead, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
-    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier, SyncSnapshot,
-    SyncTarget,
+    decode, encode, partition_materialization_order, AppendResult, BaselineEpoch, CompactionPolicy,
+    HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, NodeFrontierEntry, NodeHead,
+    NodeLogQuery, OperationId, OperationQuery, OutboxEntry, PartitionId, PeerId, RepairQueueEntry,
+    SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner,
+    SyncOperationVerifier, SyncSnapshot, SyncTarget,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::Path;
 
+// Operations are content-addressed by op_id. `node_log` is the per-node chain
+// axis (actor_node_id || 0x00 || node_seq.be -> op_id); `partition_index` is the
+// materialization routing index (partition_id || 0x00 || op_id -> ()).
 const OPERATIONS: &str = "operations";
-const OPERATION_INDEX: &str = "operation_index";
-const PARTITION_HEADS: &str = "partition_heads";
+const NODE_LOG: &str = "node_log";
+const PARTITION_INDEX: &str = "partition_index";
+const NODE_HEADS: &str = "node_heads";
 const OUTBOX: &str = "outbox";
 const INBOX: &str = "inbox";
-const PEER_CURSORS: &str = "peer_cursors";
+const NODE_FRONTIER: &str = "node_frontier";
 const REPAIR_QUEUE: &str = "repair_queue";
 const SNAPSHOTS: &str = "snapshots";
 const META: &str = "meta";
 const META_EPOCH_KEY: &[u8] = b"baseline_epoch";
 const META_HLC_KEY: &[u8] = b"hlc_state";
+const META_SCHEMA_KEY: &[u8] = b"schema_version";
+// Durable "needs baseline reseed" marker. `open` sets it in the SAME persist as
+// the schema-version stamp + wipe, so a crash after stamping v2 but before the
+// runtime bumps the epoch and reseeds is recoverable: the next boot still sees
+// the marker and repeats the (idempotent) reseed. The runtime clears it only
+// AFTER a successful bump+reseed. Without it the on-disk v2 stamp would suppress
+// the wipe on the retry boot, skipping the reseed and letting the local mint
+// restart node_seq=1 under genesis epoch=0 — self-equivocation against peers.
+const META_NEEDS_BASELINE_RESET_KEY: &[u8] = b"needs_baseline_reset";
 const SEP: u8 = 0;
+
+/// On-disk ledger layout version. Bump whenever the physical keyspace contract
+/// changes incompatibly (e.g. per-partition chains → per-node chains). A node
+/// that opens a ledger written under a different version cannot trust its
+/// node_heads/node_log axis, so `open` wipes the directory and the runtime
+/// reseeds from SQLite under a bumped epoch instead of silently restarting
+/// node_seq from 1 (which would equivocate the local node against live peers
+/// that still remember the old chain).
+pub const LEDGER_SCHEMA_VERSION: u32 = 2;
 
 pub struct FjallSyncLedgerStore {
     db: Database,
     operations: Keyspace,
-    operation_index: Keyspace,
-    partition_heads: Keyspace,
+    node_log: Keyspace,
+    partition_index: Keyspace,
+    node_heads: Keyspace,
     outbox: Keyspace,
     inbox: Keyspace,
-    peer_cursors: Keyspace,
+    node_frontier: Keyspace,
     repair_queue: Keyspace,
     snapshots: Keyspace,
     meta: Keyspace,
+    // Guards only the LOCAL node's head: a node is single-writer over its own
+    // chain, so this serializes node_seq minting without blocking reads.
     append_lock: Mutex<()>,
+    // Mirror of the durable `META_NEEDS_BASELINE_RESET_KEY` marker read at `open`.
+    // The runtime reads it to force a baseline reset (bump epoch + reseed from
+    // SQLite) so the freshly restarted node_seq chain is fenced from the
+    // pre-upgrade chain peers remember. The on-disk marker — not this flag — is
+    // the source of truth: it survives a crash before the reseed completes, so a
+    // retry boot re-runs the (idempotent) reseed. `clear_baseline_reset_marker`
+    // erases it only after a successful bump+reseed.
+    needs_baseline_reset: bool,
 }
 
 impl FjallSyncLedgerStore {
     pub fn open(path: impl AsRef<Path>) -> LedgerResult<Self> {
+        let path = path.as_ref();
+        let mut store = Self::open_at(path)?;
+
+        // Schema fence: an on-disk layout written by a different build cannot be
+        // trusted, because the per-node chain axis (node_heads/node_log) may have
+        // a different meaning. Detect a missing/mismatched version, wipe the whole
+        // directory, and re-open fresh so the local node never reuses stale heads.
+        let on_disk = match store.meta.get(META_SCHEMA_KEY)? {
+            Some(value) => Some(decode::<u32>(value.as_ref())?),
+            None => None,
+        };
+        match on_disk {
+            Some(version) if version == LEDGER_SCHEMA_VERSION => {
+                // Current schema, but a prior boot may have wiped + stamped v2 and
+                // then crashed before the runtime finished the reseed. The durable
+                // marker tells us the reseed still owes us; pick it up so the
+                // runtime repeats it instead of minting under genesis epoch=0.
+                store.needs_baseline_reset = match store.meta.get(META_NEEDS_BASELINE_RESET_KEY)? {
+                    Some(value) => decode::<bool>(value.as_ref())?,
+                    None => false,
+                };
+            }
+            Some(version) => {
+                // Drop the open handle before removing files so no keyspace holds
+                // the directory, then rebuild from scratch.
+                drop(store);
+                wipe_ledger_dir(path)?;
+                store = Self::open_at(path)?;
+                // Stamp the version AND the durable reseed marker in one persist:
+                // the marker must survive a crash before the runtime reseeds.
+                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store.meta.insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
+                store.persist()?;
+                store.needs_baseline_reset = true;
+                tracing::warn!(
+                    "sync ledger: on-disk schema v{version} != v{LEDGER_SCHEMA_VERSION}, \
+                     wiped ledger and forcing baseline reseed under a bumped epoch"
+                );
+            }
+            None if store_is_empty(&store)? => {
+                // Brand-new ledger: stamp the current version, nothing to migrate.
+                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store.persist()?;
+            }
+            None => {
+                // Populated but unversioned: predates the schema fence, so its
+                // layout is the pre-v2 per-partition chain. Wipe and reseed.
+                drop(store);
+                wipe_ledger_dir(path)?;
+                store = Self::open_at(path)?;
+                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store.meta.insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
+                store.persist()?;
+                store.needs_baseline_reset = true;
+                tracing::warn!(
+                    "sync ledger: unversioned on-disk schema, wiped ledger and forcing \
+                     baseline reseed under a bumped epoch"
+                );
+            }
+        }
+        Ok(store)
+    }
+
+    fn open_at(path: &Path) -> LedgerResult<Self> {
         let db = Database::builder(path).open()?;
         Ok(Self {
             operations: db.keyspace(OPERATIONS, KeyspaceCreateOptions::default)?,
-            operation_index: db.keyspace(OPERATION_INDEX, KeyspaceCreateOptions::default)?,
-            partition_heads: db.keyspace(PARTITION_HEADS, KeyspaceCreateOptions::default)?,
+            node_log: db.keyspace(NODE_LOG, KeyspaceCreateOptions::default)?,
+            partition_index: db.keyspace(PARTITION_INDEX, KeyspaceCreateOptions::default)?,
+            node_heads: db.keyspace(NODE_HEADS, KeyspaceCreateOptions::default)?,
             outbox: db.keyspace(OUTBOX, KeyspaceCreateOptions::default)?,
             inbox: db.keyspace(INBOX, KeyspaceCreateOptions::default)?,
-            peer_cursors: db.keyspace(PEER_CURSORS, KeyspaceCreateOptions::default)?,
+            node_frontier: db.keyspace(NODE_FRONTIER, KeyspaceCreateOptions::default)?,
             repair_queue: db.keyspace(REPAIR_QUEUE, KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace(SNAPSHOTS, KeyspaceCreateOptions::default)?,
             meta: db.keyspace(META, KeyspaceCreateOptions::default)?,
             db,
             append_lock: Mutex::new(()),
+            needs_baseline_reset: false,
         })
+    }
+
+    /// True if a durable baseline-reset marker is set (stale-schema wipe, possibly
+    /// from a prior boot that crashed mid-reseed); the runtime then forces a
+    /// baseline reseed under a bumped epoch and clears the marker on success.
+    pub fn needs_baseline_reset(&self) -> bool {
+        self.needs_baseline_reset
+    }
+
+    /// Erases the durable baseline-reset marker. The runtime calls this ONLY after
+    /// a successful bump+reseed, so a crash anywhere before this point leaves the
+    /// marker in place and the next boot repeats the idempotent reseed.
+    pub fn clear_baseline_reset_marker(&self) -> LedgerResult<()> {
+        self.meta.remove(META_NEEDS_BASELINE_RESET_KEY)?;
+        self.persist()
     }
 
     fn persist(&self) -> LedgerResult<()> {
         Ok(self.db.persist(PersistMode::SyncAll)?)
     }
 
-    fn load_partition_head(&self, partition: &PartitionId) -> LedgerResult<Option<PartitionHead>> {
-        match self.partition_heads.get(partition.as_str())? {
+    fn load_node_head(&self, node_id: &str) -> LedgerResult<Option<NodeHead>> {
+        match self.node_heads.get(node_id.as_bytes())? {
             Some(value) => Ok(Some(decode(value.as_ref())?)),
             None => Ok(None),
         }
@@ -79,71 +193,128 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         signer: &dyn SyncOperationSigner,
     ) -> LedgerResult<AppendResult> {
         let _guard = self.append_lock.lock();
+        let local_node = signer.node_id().to_string();
         let partition_id = operation.partition_id.clone();
-        let previous_head = self.load_partition_head(&partition_id)?;
+        let previous_head = self.load_node_head(&local_node)?;
         let previous_hash = previous_head.as_ref().map(|head| head.last_hash);
-        let partition_sequence = previous_head
+        let node_seq = previous_head
             .as_ref()
-            .map_or(1, |head| head.last_sequence.saturating_add(1));
-        let operation =
-            SyncOperation::from_new(operation, partition_sequence, previous_hash, signer)?;
+            .map_or(1, |head| head.last_seq.saturating_add(1));
+        let operation = SyncOperation::from_new(operation, node_seq, previous_hash, signer)?;
         operation.validate_integrity()?;
-        let head = PartitionHead {
-            partition_id: partition_id.clone(),
-            last_sequence: partition_sequence,
+        let head = NodeHead {
+            node_id: local_node.clone(),
+            last_seq: node_seq,
             last_hash: operation.operation_hash,
         };
 
-        let operation_key = operation_key(&partition_id, partition_sequence);
         let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
-        batch.insert(&self.operations, operation_key.clone(), encode(&operation)?);
         batch.insert(
-            &self.operation_index,
+            &self.operations,
             operation.op_id.as_bytes().to_vec(),
-            operation_key,
+            encode(&operation)?,
         );
-        batch.insert(&self.partition_heads, partition_id.as_str(), encode(&head)?);
+        batch.insert(
+            &self.node_log,
+            node_log_key(&local_node, node_seq),
+            operation.op_id.as_bytes().to_vec(),
+        );
+        batch.insert(
+            &self.partition_index,
+            partition_index_key(&partition_id, operation.op_id),
+            Vec::new(),
+        );
+        batch.insert(&self.node_heads, local_node.as_bytes(), encode(&head)?);
         batch.commit()?;
 
         Ok(AppendResult {
             op_id: operation.op_id,
             operation_hash: operation.operation_hash,
-            previous_partition_hash: previous_hash,
-            partition_sequence,
+            previous_node_hash: previous_hash,
+            node_seq,
         })
     }
 
     fn get_operations(&self, query: OperationQuery) -> LedgerResult<Vec<SyncOperation>> {
         let mut operations = Vec::new();
         let prefix = partition_prefix(&query.partition_id);
-        for item in self.operations.prefix(&prefix) {
+        for item in self.partition_index.prefix(&prefix) {
+            let (key, _) = item.into_inner()?;
+            let Some(op_id) = op_id_from_partition_index_key(key.as_ref()) else {
+                continue;
+            };
+            let Some(value) = self.operations.get(op_id.as_bytes())? else {
+                continue;
+            };
+            operations.push(decode(value.as_ref())?);
+            if query.limit.is_some_and(|limit| operations.len() >= limit) {
+                break;
+            }
+        }
+        Ok(operations)
+    }
+
+    fn get_node_operations(&self, query: NodeLogQuery) -> LedgerResult<Vec<SyncOperation>> {
+        let mut operations = Vec::new();
+        let prefix = node_prefix(&query.node_id);
+        for item in self.node_log.prefix(&prefix) {
             let (key, value) = item.into_inner()?;
-            if let Some(sequence) = sequence_from_operation_key(key.as_ref()) {
-                if query.from_sequence.is_some_and(|from| sequence < from) {
-                    continue;
-                }
-                if query.to_sequence.is_some_and(|to| sequence > to) {
-                    continue;
-                }
-                operations.push(decode(value.as_ref())?);
-                if query.limit.is_some_and(|limit| operations.len() >= limit) {
-                    break;
-                }
+            let Some(node_seq) = node_seq_from_node_log_key(key.as_ref()) else {
+                continue;
+            };
+            if query.from_node_seq.is_some_and(|from| node_seq < from) {
+                continue;
+            }
+            if query.to_node_seq.is_some_and(|to| node_seq > to) {
+                continue;
+            }
+            let op_id = operation_id_from_bytes(value.as_ref())?;
+            let Some(op_value) = self.operations.get(op_id.as_bytes())? else {
+                continue;
+            };
+            operations.push(decode(op_value.as_ref())?);
+            if query.limit.is_some_and(|limit| operations.len() >= limit) {
+                break;
             }
         }
         Ok(operations)
     }
 
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation> {
-        let key = self
-            .operation_index
-            .get(op_id.as_bytes().to_vec())?
-            .ok_or(SyncLedgerError::OperationNotFound(op_id))?;
         let operation = self
             .operations
-            .get(key.as_ref())?
+            .get(op_id.as_bytes())?
             .ok_or(SyncLedgerError::OperationNotFound(op_id))?;
         decode(operation.as_ref())
+    }
+
+    fn get_node_log_entry(
+        &self,
+        node_id: &str,
+        node_seq: u64,
+    ) -> LedgerResult<Option<OperationId>> {
+        match self.node_log.get(node_log_key(node_id, node_seq))? {
+            Some(value) => Ok(Some(operation_id_from_bytes(value.as_ref())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn earliest_live_node_seq(&self, node_id: &str) -> LedgerResult<Option<u64>> {
+        // node_log is keyed node_id||0x00||node_seq.be, so the prefix scan yields
+        // seqs in ascending order; the first entry whose `operations` row still
+        // exists is the earliest position we can relay.
+        let prefix = node_prefix(node_id);
+        for item in self.node_log.prefix(&prefix) {
+            let (key, value) = item.into_inner()?;
+            let Some(node_seq) = node_seq_from_node_log_key(key.as_ref()) else {
+                continue;
+            };
+            let op_id = operation_id_from_bytes(value.as_ref())?;
+            if self.operations.get(op_id.as_bytes())?.is_some() {
+                return Ok(Some(node_seq));
+            }
+        }
+        Ok(None)
     }
 
     fn put_in_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()> {
@@ -243,6 +414,109 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         self.persist()
     }
 
+    fn admit_verified_operation(
+        &self,
+        source: PeerId,
+        operation: SyncOperation,
+        frontier: NodeFrontierEntry,
+        verifier: &dyn SyncOperationVerifier,
+    ) -> LedgerResult<()> {
+        verifier.verify_operation_signature(&operation)?;
+        let local_epoch = self.current_epoch()?;
+        if operation.body.epoch != local_epoch {
+            return Err(SyncLedgerError::EpochMismatch {
+                expected: local_epoch,
+                actual: operation.body.epoch.clone(),
+            });
+        }
+        // A foreign op must land on the SAME per-node axis a local mint writes to
+        // (`operations` + `node_log` + `partition_index`), not only in the inbox.
+        // Without it `get_node_log_entry(foreign_node, seq)` is always None, so an
+        // equivocation below the frontier (a different op at an already-recorded
+        // (node, seq)) cannot be detected and is silently swallowed as AlreadyKnown.
+        // It also makes foreign chains content-resolvable for relay/escalation and
+        // visible to materialization. We do NOT touch `node_heads`: that axis is the
+        // LOCAL mint's chain head only; a foreign node's frontier lives in
+        // `node_frontier`. These two write paths never collide: inbox is the
+        // not-yet-applied apply queue (drained via `mark_inbox_applied`), while
+        // operations/partition_index are the ledger VIEW (snapshot/merkle/relay),
+        // never a second apply path. Materialization is idempotent per resource
+        // version, so even if a partition scan ever re-observed an applied op it
+        // would not double-apply.
+        let actor_node_id = operation.body.actor_node_id.clone();
+        let node_seq = operation.body.node_seq;
+        let partition_id = operation.body.partition_id.clone();
+        let op_id = operation.op_id;
+        let operation_bytes = encode(&operation)?;
+
+        // Build the inbox entry, preserving the re-delivery reset semantics of
+        // `put_verified_in_inbox` (a previously failed/deferred op becomes fresh
+        // again), then commit it together with the frontier advance in one batch.
+        let inbox_key = inbox_key(&source, op_id);
+        let entry = match self.inbox.get(&inbox_key)? {
+            Some(existing) => {
+                let mut entry: InboxEntry = decode(existing.as_ref())?;
+                if entry.applied || (!entry.conflicted && entry.deferred_count == 0) {
+                    // Already in a clean/applied state: nothing to rewrite for the
+                    // inbox, but the frontier advance and the per-node axis must
+                    // still be durable (a re-delivery of an op we hold).
+                    let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+                    batch.insert(&self.operations, op_id.as_bytes().to_vec(), operation_bytes);
+                    batch.insert(
+                        &self.node_log,
+                        node_log_key(&actor_node_id, node_seq),
+                        op_id.as_bytes().to_vec(),
+                    );
+                    batch.insert(
+                        &self.partition_index,
+                        partition_index_key(&partition_id, op_id),
+                        Vec::new(),
+                    );
+                    batch.insert(
+                        &self.node_frontier,
+                        frontier.node_id.as_bytes().to_vec(),
+                        encode(&frontier)?,
+                    );
+                    batch.commit()?;
+                    return Ok(());
+                }
+                entry.conflicted = false;
+                entry.conflict_message = None;
+                entry.deferred_count = 0;
+                entry
+            }
+            None => InboxEntry {
+                source: source.clone(),
+                operation,
+                applied: false,
+                conflicted: false,
+                conflict_message: None,
+                deferred_count: 0,
+            },
+        };
+
+        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+        batch.insert(&self.inbox, inbox_key, encode(&entry)?);
+        batch.insert(&self.operations, op_id.as_bytes().to_vec(), operation_bytes);
+        batch.insert(
+            &self.node_log,
+            node_log_key(&actor_node_id, node_seq),
+            op_id.as_bytes().to_vec(),
+        );
+        batch.insert(
+            &self.partition_index,
+            partition_index_key(&partition_id, op_id),
+            Vec::new(),
+        );
+        batch.insert(
+            &self.node_frontier,
+            frontier.node_id.as_bytes().to_vec(),
+            encode(&frontier)?,
+        );
+        batch.commit()?;
+        Ok(())
+    }
+
     fn get_inbox_entry(&self, source: PeerId, op_id: OperationId) -> LedgerResult<InboxEntry> {
         load_inbox_entry(&self.inbox, &source, op_id)
     }
@@ -328,32 +602,26 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         self.persist()
     }
 
-    fn get_peer_cursor(
-        &self,
-        peer: PeerId,
-        partition: PartitionId,
-    ) -> LedgerResult<Option<PeerCursor>> {
-        match self.peer_cursors.get(peer_cursor_key(&peer, &partition))? {
+    fn get_node_frontier(&self, node_id: &str) -> LedgerResult<Option<NodeFrontierEntry>> {
+        match self.node_frontier.get(node_id.as_bytes())? {
             Some(value) => Ok(Some(decode(value.as_ref())?)),
             None => Ok(None),
         }
     }
 
-    fn save_peer_cursor(&self, cursor: PeerCursor) -> LedgerResult<()> {
-        self.peer_cursors.insert(
-            peer_cursor_key(&cursor.peer, &cursor.partition_id),
-            encode(&cursor)?,
-        )?;
+    fn save_node_frontier(&self, frontier: NodeFrontierEntry) -> LedgerResult<()> {
+        self.node_frontier
+            .insert(frontier.node_id.as_bytes(), encode(&frontier)?)?;
         self.persist()
     }
 
     fn upsert_repair_request(&self, entry: RepairQueueEntry) -> LedgerResult<()> {
-        let key = repair_queue_key(&entry.peer, &entry.partition_id);
+        let key = repair_queue_key(&entry.peer, &entry.target_node_id);
         let entry = match self.repair_queue.get(&key)? {
             Some(value) => {
                 let mut existing: RepairQueueEntry = decode(value.as_ref())?;
-                if entry.from_sequence < existing.from_sequence {
-                    existing.from_sequence = entry.from_sequence;
+                if entry.from_node_seq < existing.from_node_seq {
+                    existing.from_node_seq = entry.from_node_seq;
                     existing.next_attempt_ms = entry.next_attempt_ms;
                     existing.retry_count = entry.retry_count;
                 }
@@ -390,11 +658,11 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
     fn mark_repair_attempted(
         &self,
         peer: PeerId,
-        partition: PartitionId,
+        target_node_id: &str,
         next_attempt_ms: i64,
         retry_count: u32,
     ) -> LedgerResult<()> {
-        let key = repair_queue_key(&peer, &partition);
+        let key = repair_queue_key(&peer, target_node_id);
         if let Some(value) = self.repair_queue.get(&key)? {
             let mut entry: RepairQueueEntry = decode(value.as_ref())?;
             entry.next_attempt_ms = next_attempt_ms;
@@ -405,9 +673,9 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         Ok(())
     }
 
-    fn remove_repair_request(&self, peer: PeerId, partition: PartitionId) -> LedgerResult<()> {
+    fn remove_repair_request(&self, peer: PeerId, target_node_id: &str) -> LedgerResult<()> {
         self.repair_queue
-            .remove(repair_queue_key(&peer, &partition))?;
+            .remove(repair_queue_key(&peer, target_node_id))?;
         self.persist()
     }
 
@@ -466,14 +734,14 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         Ok(latest)
     }
 
-    fn get_partition_head(&self, partition: PartitionId) -> LedgerResult<Option<PartitionHead>> {
-        self.load_partition_head(&partition)
+    fn get_node_head(&self, node_id: &str) -> LedgerResult<Option<NodeHead>> {
+        self.load_node_head(node_id)
     }
 
     fn list_outbox_for_partition(
         &self,
         partition: PartitionId,
-        up_to_sequence: u64,
+        _up_to_sequence: u64,
     ) -> LedgerResult<Vec<OutboxEntry>> {
         let mut entries = Vec::new();
         for item in self.outbox.iter() {
@@ -482,9 +750,9 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             let Ok(operation) = self.get_operation(entry.op_id) else {
                 continue;
             };
-            if operation.body.partition_id == partition
-                && operation.body.partition_sequence <= up_to_sequence
-            {
+            // The partition no longer carries a sequence watermark, so an outbox
+            // entry is in-scope purely by partition membership.
+            if operation.body.partition_id == partition {
                 entries.push(entry);
             }
         }
@@ -495,18 +763,40 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         let Some(keep_after_sequence) = policy.keep_operations_after_sequence else {
             return Ok(());
         };
+        // `keep_after_sequence` is a 1-based materialization watermark over the
+        // partition's HLC-ordered operations: drop the first `keep_after_sequence
+        // - 1` of them (those a snapshot already covers). Node-log entries and the
+        // node heads are left intact — only the per-partition materialization
+        // index and the content row are reaped, mirroring the old behaviour.
+        let keep_after = keep_after_sequence.saturating_sub(1) as usize;
+        if keep_after == 0 {
+            return Ok(());
+        }
+
+        // Drop the oldest operations first, in canonical materialization order, so
+        // the prefix removed here matches the snapshot prefix the watermark refers
+        // to even when several operations share an HLC.
+        let mut ordered: Vec<SyncOperation> = Vec::new();
+        let prefix = partition_prefix(&policy.partition_id);
+        for item in self.partition_index.prefix(&prefix) {
+            let (key, _) = item.into_inner()?;
+            let Some(op_id) = op_id_from_partition_index_key(key.as_ref()) else {
+                continue;
+            };
+            let Some(value) = self.operations.get(op_id.as_bytes())? else {
+                continue;
+            };
+            ordered.push(decode(value.as_ref())?);
+        }
+        ordered.sort_by(partition_materialization_order);
 
         let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
-        let prefix = partition_prefix(&policy.partition_id);
-        for item in self.operations.prefix(&prefix) {
-            let (key, value) = item.into_inner()?;
-            if sequence_from_operation_key(key.as_ref())
-                .is_some_and(|seq| seq < keep_after_sequence)
-            {
-                let operation: SyncOperation = decode(value.as_ref())?;
-                batch.remove(&self.operation_index, operation.op_id.as_bytes().to_vec());
-                batch.remove(&self.operations, key.to_vec());
-            }
+        for operation in ordered.into_iter().take(keep_after) {
+            batch.remove(
+                &self.partition_index,
+                partition_index_key(&policy.partition_id, operation.op_id),
+            );
+            batch.remove(&self.operations, operation.op_id.as_bytes().to_vec());
         }
         batch.commit()?;
         Ok(())
@@ -548,29 +838,35 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
 
         let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
 
-        // Operations + their op_id index. The operation key starts with the
-        // partition_id, so a byte-prefix match selects exactly the partitions
-        // under `partition_prefix`. Collect the matching op_ids while we are
-        // here so outbox/inbox cleanup below can match without re-reading.
+        // Operations are content-addressed, so the partition_index (keyed by
+        // partition_id || 0x00 || op_id) is the only way to attribute an op to a
+        // partition. Collect the matching op_ids and drop the content rows and
+        // their partition-index entries.
         let mut matched_op_ids: HashSet<OperationId> = HashSet::new();
-        for item in self.operations.prefix(prefix_bytes) {
-            let (key, value) = item.into_inner()?;
-            let operation: SyncOperation = decode(value.as_ref())?;
-            batch.remove(&self.operation_index, operation.op_id.as_bytes().to_vec());
-            batch.remove(&self.operations, key.to_vec());
-            matched_op_ids.insert(operation.op_id);
+        for item in self.partition_index.prefix(prefix_bytes) {
+            let (key, _) = item.into_inner()?;
+            let Some(op_id) = op_id_from_partition_index_key(key.as_ref()) else {
+                continue;
+            };
+            batch.remove(&self.partition_index, key.to_vec());
+            batch.remove(&self.operations, op_id.as_bytes().to_vec());
+            matched_op_ids.insert(op_id);
         }
+
+        // node_log (node_id||seq -> op_id), node_heads and node_frontier are the
+        // per-NODE chain axis, not the per-partition materialization axis: a single
+        // node writes ops across many partitions on ONE dense, monotonic node_seq
+        // chain. A per-partition reset MUST leave that axis fully intact — punching
+        // holes in node_log would break chain density and make the local node mint
+        // duplicate node_seq positions (self-equivocation). The content rows are
+        // gone, so `get_node_operations` simply skips the now-dangling op_ids
+        // (it already filters entries whose `operations` row is absent), and epoch
+        // fencing rejects any pre-reset operation that arrives late.
 
         // Snapshots are keyed by partition_prefix too.
         for item in self.snapshots.prefix(prefix_bytes) {
             let (key, _) = item.into_inner()?;
             batch.remove(&self.snapshots, key.to_vec());
-        }
-
-        // Partition heads are keyed directly by partition_id.
-        for item in self.partition_heads.prefix(prefix_bytes) {
-            let (key, _) = item.into_inner()?;
-            batch.remove(&self.partition_heads, key.to_vec());
         }
 
         // Outbox is keyed by (target, op_id) and stores no partition, so the only
@@ -602,27 +898,41 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             }
         }
 
-        // Peer cursors and repair queue are keyed by (peer, partition) but the
-        // partition is concatenated raw, so decode the value to be safe.
-        for item in self.peer_cursors.iter() {
-            let (key, value) = item.into_inner()?;
-            let cursor: PeerCursor = decode(value.as_ref())?;
-            if cursor.partition_id.as_str().starts_with(partition_prefix) {
-                batch.remove(&self.peer_cursors, key.to_vec());
-            }
-        }
-
-        for item in self.repair_queue.iter() {
-            let (key, value) = item.into_inner()?;
-            let entry: RepairQueueEntry = decode(value.as_ref())?;
-            if entry.partition_id.as_str().starts_with(partition_prefix) {
-                batch.remove(&self.repair_queue, key.to_vec());
-            }
-        }
-
         batch.commit()?;
         Ok(())
     }
+}
+
+/// True only for a freshly-created ledger (no chain state, no journal). Used to
+/// tell a brand-new directory (just stamp the schema version) apart from a
+/// populated but unversioned one (pre-fence layout — must wipe and reseed).
+fn store_is_empty(store: &FjallSyncLedgerStore) -> LedgerResult<bool> {
+    let any = store.node_heads.iter().next().is_some()
+        || store.operations.iter().next().is_some()
+        || store.node_log.iter().next().is_some()
+        || store.inbox.iter().next().is_some()
+        || store.outbox.iter().next().is_some();
+    Ok(!any)
+}
+
+/// Removes every entry under the ledger directory so it can be re-created from a
+/// clean state, without deleting the directory itself (its handle/permissions
+/// may be held by the caller). The schema fence calls this after dropping the DB.
+fn wipe_ledger_dir(path: &Path) -> LedgerResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path).map_err(|e| SyncLedgerError::Runtime(e.to_string()))? {
+        let entry = entry.map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        let child = entry.path();
+        let result = if child.is_dir() {
+            std::fs::remove_dir_all(&child)
+        } else {
+            std::fs::remove_file(&child)
+        };
+        result.map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn load_outbox_entry(
@@ -661,15 +971,41 @@ fn partition_prefix(partition: &PartitionId) -> Vec<u8> {
     key
 }
 
-fn operation_key(partition: &PartitionId, sequence: u64) -> Vec<u8> {
-    let mut key = partition_prefix(partition);
-    key.extend_from_slice(&sequence.to_be_bytes());
+fn node_prefix(node_id: &str) -> Vec<u8> {
+    let mut key = node_id.as_bytes().to_vec();
+    key.push(SEP);
     key
 }
 
-fn sequence_from_operation_key(key: &[u8]) -> Option<u64> {
+fn node_log_key(node_id: &str, node_seq: u64) -> Vec<u8> {
+    let mut key = node_prefix(node_id);
+    key.extend_from_slice(&node_seq.to_be_bytes());
+    key
+}
+
+fn node_seq_from_node_log_key(key: &[u8]) -> Option<u64> {
     let bytes: [u8; 8] = key.get(key.len().checked_sub(8)?..)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
+}
+
+fn partition_index_key(partition: &PartitionId, op_id: OperationId) -> Vec<u8> {
+    let mut key = partition_prefix(partition);
+    key.extend_from_slice(op_id.as_bytes());
+    key
+}
+
+fn op_id_from_partition_index_key(key: &[u8]) -> Option<OperationId> {
+    let bytes: [u8; 32] = key.get(key.len().checked_sub(32)?..)?.try_into().ok()?;
+    Some(OperationId::from_hash(bytes))
+}
+
+fn operation_id_from_bytes(bytes: &[u8]) -> LedgerResult<OperationId> {
+    let hash: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| SyncLedgerError::InvalidOperationIdHex {
+            value: hex::encode(bytes),
+        })?;
+    Ok(OperationId::from_hash(hash))
 }
 
 fn outbox_key(target: &SyncTarget, op_id: OperationId) -> Vec<u8> {
@@ -692,15 +1028,11 @@ fn scoped_prefix(scope: &str) -> Vec<u8> {
     key
 }
 
-fn peer_cursor_key(peer: &PeerId, partition: &PartitionId) -> Vec<u8> {
+fn repair_queue_key(peer: &PeerId, target_node_id: &str) -> Vec<u8> {
     let mut key = peer.as_str().as_bytes().to_vec();
     key.push(SEP);
-    key.extend_from_slice(partition.as_str().as_bytes());
+    key.extend_from_slice(target_node_id.as_bytes());
     key
-}
-
-fn repair_queue_key(peer: &PeerId, partition: &PartitionId) -> Vec<u8> {
-    peer_cursor_key(peer, partition)
 }
 
 fn snapshot_key(partition: &PartitionId, sequence: u64, snapshot_id: &str) -> Vec<u8> {
@@ -788,13 +1120,70 @@ mod tests {
             .append_operation(sample_operation(&signer, "person_2"), &signer)
             .unwrap();
 
-        assert_eq!(first.partition_sequence, 1);
-        assert_eq!(second.partition_sequence, 2);
-        assert_eq!(second.previous_partition_hash, Some(first.operation_hash));
+        assert_eq!(first.node_seq, 1);
+        assert_eq!(second.node_seq, 2);
+        assert_eq!(second.previous_node_hash, Some(first.operation_hash));
     }
 
     #[test]
-    fn get_operations_returns_partition_range() {
+    fn baseline_reset_marker_survives_crash_before_reseed() {
+        // The schema fence stamps schema v2 AND a durable reseed marker in one
+        // persist. If the boot crashes after that stamp but before the runtime
+        // bumps the epoch + reseeds, the next boot must STILL see the marker and
+        // repeat the reseed — otherwise the v2 stamp suppresses the wipe and the
+        // local mint restarts node_seq=1 under genesis epoch (self-equivocation).
+        let dir = tempfile::tempdir().unwrap();
+
+        // Seed a populated, STALE-schema ledger: write some chain state, then
+        // stamp an old schema version so the next open trips the fence.
+        {
+            let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+            let signer = signer();
+            store
+                .append_operation(sample_operation(&signer, "person_1"), &signer)
+                .unwrap();
+            store
+                .meta
+                .insert(META_SCHEMA_KEY, encode(&(LEDGER_SCHEMA_VERSION - 1)).unwrap())
+                .unwrap();
+            store.persist().unwrap();
+        }
+
+        // First post-upgrade open: wipes, stamps v2, sets the durable marker.
+        {
+            let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+            assert!(
+                store.needs_baseline_reset(),
+                "stale-schema open must flag a baseline reset"
+            );
+            // Simulate a crash here: the runtime never ran the reseed, so the
+            // marker is NOT cleared.
+        }
+
+        // Crash-recovery open: schema is already v2, but the marker persisted, so
+        // the reset is still owed.
+        {
+            let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+            assert!(
+                store.needs_baseline_reset(),
+                "marker must survive a crash before the reseed completed"
+            );
+            // Now the runtime completes the reseed and clears the marker.
+            store.clear_baseline_reset_marker().unwrap();
+        }
+
+        // Subsequent opens see a clean, current ledger: no reset owed.
+        {
+            let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+            assert!(
+                !store.needs_baseline_reset(),
+                "cleared marker must not re-trigger a reset"
+            );
+        }
+    }
+
+    #[test]
+    fn get_node_operations_returns_node_chain_range() {
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
         let signer = signer();
@@ -806,10 +1195,10 @@ mod tests {
             .unwrap();
 
         let operations = store
-            .get_operations(OperationQuery {
-                partition_id: PartitionId::new("addon/contacts/persons").unwrap(),
-                from_sequence: Some(2),
-                to_sequence: Some(2),
+            .get_node_operations(NodeLogQuery {
+                node_id: signer.node_id().to_string(),
+                from_node_seq: Some(2),
+                to_node_seq: Some(2),
                 limit: None,
             })
             .unwrap();
@@ -969,22 +1358,19 @@ mod tests {
     }
 
     #[test]
-    fn peer_cursor_roundtrip() {
+    fn node_frontier_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
-        let partition = PartitionId::new("addon/contacts/persons").unwrap();
-        let peer = PeerId::new("node_b").unwrap();
-        let cursor = PeerCursor {
-            peer: peer.clone(),
-            partition_id: partition.clone(),
-            last_sequence: 7,
+        let frontier = NodeFrontierEntry {
+            node_id: "node_b".to_string(),
+            last_seq: 7,
             last_hash: [9; 32],
         };
 
-        store.save_peer_cursor(cursor.clone()).unwrap();
-        let loaded = store.get_peer_cursor(peer, partition).unwrap();
+        store.save_node_frontier(frontier.clone()).unwrap();
+        let loaded = store.get_node_frontier("node_b").unwrap();
 
-        assert_eq!(loaded, Some(cursor));
+        assert_eq!(loaded, Some(frontier));
     }
 
     #[test]
@@ -992,18 +1378,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
         let peer = PeerId::new("node_b").unwrap();
-        let partition = PartitionId::new("addon/contacts/persons").unwrap();
+        let target_node = "node_author";
         store
             .upsert_repair_request(RepairQueueEntry {
                 peer: peer.clone(),
-                partition_id: partition.clone(),
-                from_sequence: 4,
+                target_node_id: target_node.to_string(),
+                from_node_seq: 4,
                 next_attempt_ms: 100,
                 retry_count: 0,
             })
             .unwrap();
         store
-            .mark_repair_attempted(peer.clone(), partition.clone(), 500, 1)
+            .mark_repair_attempted(peer.clone(), target_node, 500, 1)
             .unwrap();
         drop(store);
 
@@ -1016,11 +1402,11 @@ mod tests {
             .list_due_repair_requests(peer.clone(), 500, 10)
             .unwrap();
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].from_sequence, 4);
+        assert_eq!(due[0].from_node_seq, 4);
         assert_eq!(due[0].retry_count, 1);
 
         reopened
-            .remove_repair_request(peer.clone(), partition.clone())
+            .remove_repair_request(peer.clone(), target_node)
             .unwrap();
         assert!(reopened
             .list_due_repair_requests(peer, 1_000, 10)
@@ -1040,6 +1426,7 @@ mod tests {
             operation_count: 10,
             root_hash: [4; 32],
             state_hash: [6; 32],
+            node_frontier: std::collections::BTreeMap::new(),
             last_operation_hash: Some([7; 32]),
             policy_epoch: 1,
             blob_kind: Some("sql_replay_v1".to_string()),
@@ -1077,6 +1464,7 @@ mod tests {
                     operation_count: sequence,
                     root_hash: [sequence as u8; 32],
                     state_hash: [sequence as u8; 32],
+                    node_frontier: std::collections::BTreeMap::new(),
                     last_operation_hash: Some([sequence as u8; 32]),
                     policy_epoch: 1,
                     blob_kind: Some("sql_replay_v1".to_string()),
@@ -1134,7 +1522,7 @@ mod tests {
             )
             .unwrap();
 
-        // Populate outbox / inbox / cursors / repair for both core and non-core.
+        // Populate outbox / inbox for both core and non-core.
         let target = SyncTarget::new("node_b").unwrap();
         store
             .put_in_outbox(target.clone(), core_append.op_id)
@@ -1151,25 +1539,8 @@ mod tests {
             .put_verified_in_inbox(source.clone(), addon_op, &HexNodeIdOperationVerifier)
             .unwrap();
 
-        for partition in [core_partition, addon_partition] {
-            store
-                .save_peer_cursor(PeerCursor {
-                    peer: source.clone(),
-                    partition_id: PartitionId::new(partition).unwrap(),
-                    last_sequence: 1,
-                    last_hash: [3; 32],
-                })
-                .unwrap();
-            store
-                .upsert_repair_request(RepairQueueEntry {
-                    peer: source.clone(),
-                    partition_id: PartitionId::new(partition).unwrap(),
-                    from_sequence: 1,
-                    next_attempt_ms: 0,
-                    retry_count: 0,
-                })
-                .unwrap();
-        }
+        let local_node = signer.node_id().to_string();
+        let head_before = store.get_node_head(&local_node).unwrap().unwrap();
 
         store.reset_core_partitions().unwrap();
 
@@ -1177,8 +1548,6 @@ mod tests {
         assert!(store
             .get_operations(OperationQuery {
                 partition_id: PartitionId::new(core_partition).unwrap(),
-                from_sequence: None,
-                to_sequence: None,
                 limit: None,
             })
             .unwrap()
@@ -1187,8 +1556,6 @@ mod tests {
             store
                 .get_operations(OperationQuery {
                     partition_id: PartitionId::new(addon_partition).unwrap(),
-                    from_sequence: None,
-                    to_sequence: None,
                     limit: None,
                 })
                 .unwrap()
@@ -1199,8 +1566,6 @@ mod tests {
             store
                 .get_operations(OperationQuery {
                     partition_id: PartitionId::new(kv_partition).unwrap(),
-                    from_sequence: None,
-                    to_sequence: None,
                     limit: None,
                 })
                 .unwrap()
@@ -1208,20 +1573,15 @@ mod tests {
             1
         );
 
-        // op_id index for core is gone; addon/kv still resolvable.
+        // Content store for core is gone; addon/kv still resolvable.
         assert!(store.get_operation(core_append.op_id).is_err());
         assert!(store.get_operation(addon_append.op_id).is_ok());
         assert!(store.get_operation(kv_append.op_id).is_ok());
 
-        // Partition head only removed for core.
-        assert!(store
-            .get_partition_head(PartitionId::new(core_partition).unwrap())
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_partition_head(PartitionId::new(addon_partition).unwrap())
-            .unwrap()
-            .is_some());
+        // The local node head spans every partition the node ever wrote, so a
+        // per-partition reset must NOT touch it: the single writer keeps minting a
+        // monotonic node_seq across the reset.
+        assert_eq!(store.get_node_head(&local_node).unwrap(), Some(head_before));
 
         // Outbox: core entry removed, addon entry kept.
         assert!(store
@@ -1238,23 +1598,6 @@ mod tests {
             inbox[0].operation.body.partition_id.as_str(),
             addon_partition
         );
-
-        // Peer cursor: core gone, addon kept.
-        assert!(store
-            .get_peer_cursor(source.clone(), PartitionId::new(core_partition).unwrap())
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_peer_cursor(source.clone(), PartitionId::new(addon_partition).unwrap())
-            .unwrap()
-            .is_some());
-
-        // Repair queue: only the addon-partition request remains due.
-        let due = store
-            .list_due_repair_requests(source, i64::MAX, 10)
-            .unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].partition_id.as_str(), addon_partition);
     }
 
     #[test]

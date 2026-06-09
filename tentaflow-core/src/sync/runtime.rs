@@ -19,9 +19,10 @@ use crate::paths;
 use crate::sync::hlc::HlcClock;
 use crate::sync::ledger::{
     ActionType, BaselineEpoch, FieldValue, FjallSyncLedgerStore, HexNodeIdOperationVerifier,
-    HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, OperationId,
-    OperationQuery, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
-    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
+    partition_materialization_order, HybridLogicalTimestamp, InboxEntry, LedgerResult,
+    NewSyncOperation, NodeFrontierEntry, NodeLogQuery, OperationId, OperationQuery, PartitionId,
+    PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation,
+    SyncOperationSigner, SyncSnapshot, SyncTarget,
 };
 use crate::sync::snapshot::{
     verify_snapshot_signature, SnapshotBuildRequest, SnapshotManager, SnapshotPackageStore,
@@ -143,6 +144,7 @@ pub fn init(
 ) -> LedgerResult<Arc<SyncRuntime>> {
     let ledger_path = paths::tentaflow_home().join("sync").join("ledger");
     let ledger = Arc::new(FjallSyncLedgerStore::open(&ledger_path)?);
+    let needs_baseline_reset = ledger.needs_baseline_reset();
     let local_node_id = signer.ed25519_public_key_hex();
     repository::ensure_local_node_in_sync_identity(&db, &local_node_id, &local_node_id)
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -165,10 +167,32 @@ pub fn init(
         max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
-    Ok(SYNC_RUNTIME
+    let runtime = SYNC_RUNTIME
         .get()
         .expect("sync runtime must be initialized")
-        .clone())
+        .clone();
+    // A schema wipe threw away the local chain heads, so the local node must NOT
+    // resume minting from a restarted node_seq against peers that still remember
+    // the old chain. Bumping the epoch fences the pre-upgrade history, then the
+    // reseed re-emits the current SQLite state under that fresh epoch — restarting
+    // node_seq at 1 is safe because no live peer accepts ops under the old epoch.
+    //
+    // The "needs reset" signal is the DURABLE on-disk marker, not the in-memory
+    // wipe flag: if a prior boot stamped schema v2 and crashed before this reseed
+    // finished, the marker is still set and we repeat the (idempotent) reseed.
+    // The marker is cleared ONLY after a successful bump+reseed, so any crash in
+    // the window leaves it set for the next boot.
+    if needs_baseline_reset {
+        match runtime.perform_core_baseline_reset(None) {
+            Ok(_) => {
+                if let Err(e) = runtime.ledger.clear_baseline_reset_marker() {
+                    warn!("sync runtime: clearing baseline reset marker failed: {e}");
+                }
+            }
+            Err(e) => warn!("sync runtime: post-wipe baseline reseed failed: {e}"),
+        }
+    }
+    Ok(runtime)
 }
 
 pub fn record_sql_capture(
@@ -354,6 +378,12 @@ pub fn acknowledged_outbox_count(operation_id: OperationId) -> LedgerResult<Opti
     runtime.acknowledged_outbox_count(operation_id).map(Some)
 }
 
+/// Local node id of the running sync runtime, if started. Used by callers that
+/// must address the local node's own chain (e.g. building a pull for it).
+pub fn local_node_id() -> Option<String> {
+    SYNC_RUNTIME.get().map(|runtime| runtime.local_node_id.clone())
+}
+
 pub fn handle_pull_payload(
     source_node_id: &str,
     payload: MeshSyncPullPayload,
@@ -531,6 +561,18 @@ impl SyncRuntime {
         let timestamp = self.hlc.now();
         let _ = self.ledger.save_hlc(&timestamp);
         timestamp
+    }
+
+    /// Re-stamps a capture HLC with the local node id while keeping its wall/
+    /// logical instant. The capture instant came from this node's clock, so this
+    /// is a no-op in production, but it guarantees the op's HLC origin equals its
+    /// `actor_node_id` (the invariant `validate_integrity` enforces).
+    fn local_hlc_from(&self, source: &HybridLogicalTimestamp) -> HybridLogicalTimestamp {
+        HybridLogicalTimestamp {
+            wall_time_ms: source.wall_time_ms,
+            logical: source.logical,
+            node_id: self.local_node_id.clone(),
+        }
     }
 
     fn run_pending_baseline_cutover(&self) -> LedgerResult<Option<usize>> {
@@ -716,15 +758,15 @@ impl SyncRuntime {
         for request in requests {
             payloads.push(MeshSyncPullPayload {
                 from_node_id: self.local_node_id.clone(),
-                partition_id: request.partition_id.as_str().to_string(),
-                from_sequence: request.from_sequence,
+                target_node_id: request.target_node_id.clone(),
+                from_node_seq: request.from_node_seq,
                 limit: operation_limit,
             });
             let retry_count = request.retry_count.saturating_add(1);
             let next_attempt_ms = now.saturating_add(repair_backoff_ms(retry_count));
             self.ledger.mark_repair_attempted(
                 peer.clone(),
-                request.partition_id,
+                &request.target_node_id,
                 next_attempt_ms,
                 retry_count,
             )?;
@@ -843,11 +885,8 @@ impl SyncRuntime {
                 .partition_id
                 .as_str()
                 .cmp(right.body.partition_id.as_str())
-                .then_with(|| {
-                    left.body
-                        .partition_sequence
-                        .cmp(&right.body.partition_sequence)
-                })
+                .then_with(|| left.body.actor_node_id.cmp(&right.body.actor_node_id))
+                .then_with(|| left.body.node_seq.cmp(&right.body.node_seq))
         });
         let mut operations = Vec::with_capacity(pending.len());
         for (op_id, operation) in pending {
@@ -938,35 +977,47 @@ impl SyncRuntime {
                 payload.from_node_id
             )));
         }
-        let partition_id = PartitionId::new(payload.partition_id.clone())?;
-        let operations = self.ledger.get_operations(OperationQuery {
-            partition_id: partition_id.clone(),
-            from_sequence: Some(payload.from_sequence),
-            to_sequence: None,
+        // The target node's chain is dense and monotonic, so a gap is filled by a
+        // contiguous slice from `from_node_seq`. `serving_floor_node_seq` is the
+        // lowest seq we can still relay from the log; if the requester asked BELOW
+        // it we compacted that prefix away and a log slice cannot anchor the
+        // requester's chain. In that case we escalate the same pull to a SNAPSHOT
+        // response (the prefix lives in the snapshot that compacted it), which the
+        // requester applies and which advances its node-frontier legitimately.
+        let serving_floor_node_seq = self
+            .ledger
+            .earliest_live_node_seq(&payload.target_node_id)?
+            .unwrap_or(0);
+        // The peer's tip of the target chain: its own head if it IS the target,
+        // else what it has observed of that node's chain. Lets the requester know
+        // when it has caught up to everything this peer can offer.
+        let serving_tip_node_seq = if payload.target_node_id == self.local_node_id {
+            self.ledger
+                .get_node_head(&payload.target_node_id)?
+                .map(|h| h.last_seq)
+                .unwrap_or(0)
+        } else {
+            self.ledger
+                .get_node_frontier(&payload.target_node_id)?
+                .map(|f| f.last_seq)
+                .unwrap_or(0)
+        };
+        if serving_floor_node_seq > payload.from_node_seq {
+            if let Some(result) =
+                self.escalate_pull_to_snapshot(source_node_id, &payload, serving_floor_node_seq)?
+            {
+                return Ok(result);
+            }
+        }
+        let mut operations = self.ledger.get_node_operations(NodeLogQuery {
+            node_id: payload.target_node_id.clone(),
+            from_node_seq: Some(payload.from_node_seq),
+            to_node_seq: None,
             limit: Some(payload.limit as usize),
         })?;
+        operations.sort_by(|a, b| a.body.node_seq.cmp(&b.body.node_seq));
         for operation in &operations {
             self.ensure_peer_target_allowed(operation, source_node_id)?;
-        }
-        if self.pull_needs_snapshot(&partition_id, payload.from_sequence, &operations)? {
-            let snapshot = self
-                .ledger
-                .latest_snapshot(partition_id, None)?
-                .ok_or_else(|| {
-                    SyncLedgerError::Runtime(
-                        "sync pull cannot be served contiguously and no snapshot exists"
-                            .to_string(),
-                    )
-                })?;
-            return self
-                .build_snapshot_response_from_snapshot(
-                    source_node_id,
-                    payload.partition_id,
-                    snapshot,
-                    true,
-                    payload.limit,
-                )
-                .map(MeshSyncPullResult::Snapshot);
         }
         let mut wire = Vec::with_capacity(operations.len());
         for operation in operations {
@@ -975,11 +1026,52 @@ impl SyncRuntime {
         Ok(MeshSyncPullResult::Operations(
             MeshSyncPullResponsePayload {
                 from_node_id: self.local_node_id.clone(),
-                partition_id: payload.partition_id,
-                from_sequence: payload.from_sequence,
+                target_node_id: payload.target_node_id,
+                from_node_seq: payload.from_node_seq,
                 operations: wire,
+                serving_floor_node_seq,
+                serving_tip_node_seq,
             },
         ))
+    }
+
+    /// Serves a SNAPSHOT in answer to a node-log pull whose `from_node_seq` is
+    /// below our compaction floor. The compacted prefix lives in the snapshot that
+    /// reaped it: we locate the partition of our earliest live op for the target
+    /// chain (`serving_floor`) and serve that partition's latest snapshot + tail.
+    /// Applying it advances the requester's node-frontier for every node the
+    /// snapshot covers; successive pulls then drive the remaining partitions until
+    /// the frontier passes the floor, so the catch-up is bounded by partition
+    /// count. `None` if we hold no snapshot to serve (the requester keeps retrying
+    /// the log pull, which is harmless).
+    fn escalate_pull_to_snapshot(
+        &self,
+        source_node_id: &str,
+        payload: &MeshSyncPullPayload,
+        serving_floor: u64,
+    ) -> LedgerResult<Option<MeshSyncPullResult>> {
+        let floor_op_id = match self
+            .ledger
+            .get_node_log_entry(&payload.target_node_id, serving_floor)?
+        {
+            Some(op_id) => op_id,
+            None => return Ok(None),
+        };
+        let partition_id = self.ledger.get_operation(floor_op_id)?.body.partition_id;
+        let Some(snapshot) = self
+            .ledger
+            .latest_snapshot(partition_id.clone(), None)?
+        else {
+            return Ok(None);
+        };
+        let response = self.build_snapshot_response_from_snapshot(
+            source_node_id,
+            partition_id.as_str().to_string(),
+            snapshot,
+            true,
+            payload.limit,
+        )?;
+        Ok(Some(MeshSyncPullResult::Snapshot(response)))
     }
 
     fn handle_pull_response_payload(
@@ -994,16 +1086,51 @@ impl SyncRuntime {
             )));
         }
         validate_pull_response_wire(&payload)?;
-        let response_partition = payload.partition_id.clone();
+        let target_node_id = payload.target_node_id.clone();
+        let serving_tip = payload.serving_tip_node_seq;
         let operation_ids = self.store_incoming_operations(source_node_id, payload.operations)?;
-        self.clear_repair_request(source_node_id, &response_partition);
         if let Err(e) = self.apply_unapplied_inbox(128) {
             warn!("sync runtime: apply pulled operations failed: {}", e);
         }
+        // Decide the repair's fate ONLY after admission, from whether the gap is
+        // actually closed — clearing it up-front (before admission) was the stall
+        // bug: an empty/short response left the gap open with no pending repair, so
+        // nothing ever retried.
+        let (expected, _) = self.initial_node_frontier(&target_node_id)?;
+        self.reconcile_repair_after_pull(source_node_id, &target_node_id, expected, serving_tip);
         Ok(MeshSyncAckPayload {
             from_node_id: self.local_node_id.clone(),
             operation_ids,
         })
+    }
+
+    /// Decides what to do with the catch-up repair after a pull RESPONSE (the
+    /// node-log variant) landed. `expected` is the next `node_seq` we still need;
+    /// `serving_tip` is the highest seq the peer holds for the target chain.
+    ///
+    /// The compacted-prefix case never reaches here: when the peer cannot serve
+    /// our `from_node_seq` from its log it answers a pull with a SNAPSHOT instead
+    /// (see `handle_pull_payload`), which `handle_snapshot_response_payload`
+    /// applies. So this only handles the log-served path:
+    ///  - our frontier reached/passed the peer's tip → there is nothing more this
+    ///    peer can offer, the catch-up is satisfied; clear the repair (a later
+    ///    push re-opens a gap if the peer advances, so we cannot strand);
+    ///  - otherwise the gap is still open (a short/empty response that did NOT
+    ///    reach the tip) → re-queue from the new `expected` so the next tick keeps
+    ///    pulling. Never leave a still-open gap without a pending repair (the stall
+    ///    bug: previously an empty response cleared the repair and froze forever).
+    fn reconcile_repair_after_pull(
+        &self,
+        peer_id: &str,
+        target_node_id: &str,
+        expected: u64,
+        serving_tip: u64,
+    ) {
+        if expected > serving_tip {
+            self.clear_repair_request(peer_id, target_node_id);
+            return;
+        }
+        self.queue_repair_request(peer_id, target_node_id, expected);
     }
 
     fn handle_snapshot_pull_payload(
@@ -1031,32 +1158,6 @@ impl SyncRuntime {
         )
     }
 
-    fn pull_needs_snapshot(
-        &self,
-        partition_id: &PartitionId,
-        from_sequence: u64,
-        operations: &[SyncOperation],
-    ) -> LedgerResult<bool> {
-        if operations
-            .first()
-            .is_some_and(|operation| operation.body.partition_sequence != from_sequence)
-        {
-            return Ok(true);
-        }
-        if operations.is_empty()
-            && self
-                .ledger
-                .get_partition_head(partition_id.clone())?
-                .is_some_and(|head| head.last_sequence >= from_sequence)
-        {
-            return Ok(self
-                .ledger
-                .latest_snapshot(partition_id.clone(), None)?
-                .is_some_and(|snapshot| snapshot.up_to_sequence >= from_sequence));
-        }
-        Ok(false)
-    }
-
     fn build_snapshot_response_from_snapshot(
         &self,
         target_node_id: &str,
@@ -1072,13 +1173,23 @@ impl SyncRuntime {
         for operation in &blob.operations {
             self.ensure_peer_target_allowed(operation, target_node_id)?;
         }
+        // The tail is every partition operation not already captured by the
+        // snapshot blob, ordered by HLC. The snapshot watermark is an op count,
+        // not a partition sequence, so membership (op_id in blob) is the boundary.
         let operations_after_snapshot = if include_tail && tail_limit > 0 {
-            let operations = self.ledger.get_operations(OperationQuery {
-                partition_id: snapshot.partition_id.clone(),
-                from_sequence: Some(snapshot.up_to_sequence.saturating_add(1)),
-                to_sequence: None,
-                limit: Some(tail_limit as usize),
-            })?;
+            let covered: std::collections::HashSet<OperationId> =
+                blob.operations.iter().map(|op| op.op_id).collect();
+            let mut operations: Vec<SyncOperation> = self
+                .ledger
+                .get_operations(OperationQuery {
+                    partition_id: snapshot.partition_id.clone(),
+                    limit: None,
+                })?
+                .into_iter()
+                .filter(|op| !covered.contains(&op.op_id))
+                .collect();
+            operations.sort_by(partition_materialization_order);
+            operations.truncate(tail_limit as usize);
             for operation in &operations {
                 self.ensure_peer_target_allowed(operation, target_node_id)?;
             }
@@ -1176,20 +1287,46 @@ impl SyncRuntime {
             &payload.blob_bytes,
             &tail_operations,
         )?;
-        let source_peer = PeerId::new(source_node_id.to_string())?;
-        let snapshot_cursor = snapshot.last_operation_hash.map(|last_hash| PeerCursor {
-            peer: source_peer,
-            partition_id: snapshot.partition_id.clone(),
-            last_sequence: snapshot.up_to_sequence,
-            last_hash,
-        });
+        let blob = crate::sync::snapshot::decode_snapshot_sql_blob(&payload.blob_bytes)?;
+        // The snapshot prefix + tail are applied straight to SQLite, bypassing the
+        // inbox, so advance each authoring node's frontier to the highest node_seq
+        // they cover. Without this the very next op of one of those nodes would be
+        // seen as a gap (its predecessor lives in the just-applied prefix). The
+        // snapshot carries an AUTHOR-ATTESTED `node_frontier` (bound into its
+        // signature, already verified above) for the prefix; seed from it, then let
+        // the tail (ops beyond the snapshot) extend each writer's frontier further.
+        let mut node_tips: HashMap<String, (u64, [u8; 32])> = snapshot
+            .node_frontier
+            .iter()
+            .map(|(node_id, (seq, hash))| (node_id.clone(), (*seq, *hash)))
+            .collect();
         self.ledger.save_snapshot(snapshot)?;
-        if let Some(cursor) = snapshot_cursor {
-            self.ledger.save_peer_cursor(cursor)?;
+        let mut operation_ids = Vec::with_capacity(blob.operations.len() + tail_operations.len());
+        for operation in blob.operations.iter().chain(tail_operations.iter()) {
+            operation_ids.push(operation.op_id.as_bytes().to_vec());
+            let entry = node_tips
+                .entry(operation.body.actor_node_id.clone())
+                .or_insert((0, [0u8; 32]));
+            if operation.body.node_seq >= entry.0 {
+                *entry = (operation.body.node_seq, operation.operation_hash);
+            }
         }
-        self.clear_repair_request(source_node_id, &payload.partition_id);
-        let operation_ids =
-            self.store_incoming_operations(source_node_id, payload.operations_after_snapshot)?;
+        for (node_id, (last_seq, last_hash)) in node_tips {
+            let advance = self
+                .ledger
+                .get_node_frontier(&node_id)?
+                .is_none_or(|frontier| frontier.last_seq < last_seq);
+            if advance {
+                self.ledger.save_node_frontier(NodeFrontierEntry {
+                    node_id,
+                    last_seq,
+                    last_hash,
+                })?;
+            }
+        }
+        // The snapshot + its tail caught us up on the source node's chain, so the
+        // catch-up repair we queued against it is satisfied.
+        self.clear_repair_request(source_node_id, source_node_id);
         if let Err(e) = self.apply_unapplied_inbox(128) {
             warn!("sync runtime: apply snapshot tail operations failed: {}", e);
         }
@@ -1205,158 +1342,153 @@ impl SyncRuntime {
         operations: Vec<MeshSyncOperationWire>,
     ) -> LedgerResult<Vec<Vec<u8>>> {
         let source = PeerId::new(source_node_id.to_string())?;
-        let mut accepted = Vec::with_capacity(operations.len());
-        let mut expected_sequences: HashMap<String, u64> = HashMap::new();
-        for wire in operations {
-            let operation = operation_from_wire(&wire)?;
+        // Admit each authoring node's chain in node_seq order. A batch may carry
+        // several nodes' ops interleaved across partitions, so decode and sort by
+        // (actor_node_id, node_seq) first; otherwise a higher-seq op processed
+        // before its predecessor would gap and be dropped within the same batch.
+        let mut decoded: Vec<SyncOperation> = Vec::with_capacity(operations.len());
+        for wire in &operations {
+            decoded.push(operation_from_wire(wire)?);
+        }
+        decoded.sort_by(|a, b| {
+            a.body
+                .actor_node_id
+                .cmp(&b.body.actor_node_id)
+                .then_with(|| a.body.node_seq.cmp(&b.body.node_seq))
+        });
+        let mut accepted = Vec::with_capacity(decoded.len());
+        // Per-node admission state for this batch, keyed by authoring node:
+        // the next expected `node_seq` and the hash of the last accepted op.
+        let mut expected_seqs: HashMap<String, u64> = HashMap::new();
+        let mut frontier_hashes: HashMap<String, Option<[u8; 32]>> = HashMap::new();
+        for operation in decoded {
             self.ensure_local_target_allowed(&operation)?;
-            let partition_key = operation.body.partition_id.as_str().to_string();
-            let expected_sequence = match expected_sequences.get(&partition_key).copied() {
-                Some(sequence) => sequence,
-                None => self.initial_expected_sequence(
-                    source.clone(),
-                    operation.body.partition_id.clone(),
-                )?,
-            };
-            if operation.body.partition_sequence < expected_sequence {
-                accepted.push(operation.op_id.as_bytes().to_vec());
-                expected_sequences.insert(partition_key, expected_sequence);
-                continue;
+            let node_id = operation.body.actor_node_id.clone();
+            if !expected_seqs.contains_key(&node_id) {
+                let (seq, hash) = self.initial_node_frontier(&node_id)?;
+                expected_seqs.insert(node_id.clone(), seq);
+                frontier_hashes.insert(node_id.clone(), hash);
             }
-            self.ensure_operation_follows_known_state(
+            let expected = expected_seqs[&node_id];
+            let frontier_hash = frontier_hashes[&node_id];
+
+            match self.admit_node_operation(
                 &source,
                 &operation,
-                &mut expected_sequences,
-            )?;
-            self.ledger.put_verified_in_inbox(
-                source.clone(),
-                operation.clone(),
-                &HexNodeIdOperationVerifier,
-            )?;
-            self.ledger.save_peer_cursor(PeerCursor {
-                peer: source.clone(),
-                partition_id: operation.body.partition_id.clone(),
-                last_sequence: operation.body.partition_sequence,
-                last_hash: operation.operation_hash,
-            })?;
-            accepted.push(operation.op_id.as_bytes().to_vec());
+                expected,
+                frontier_hash,
+            )? {
+                NodeAdmission::Accepted => {
+                    // Inbox insert + frontier advance must be one atomic batch: a
+                    // crash that advanced the frontier without the inbox entry
+                    // would skip this seq forever (never re-pulled, never applied).
+                    self.ledger.admit_verified_operation(
+                        source.clone(),
+                        operation.clone(),
+                        NodeFrontierEntry {
+                            node_id: node_id.clone(),
+                            last_seq: operation.body.node_seq,
+                            last_hash: operation.operation_hash,
+                        },
+                        &HexNodeIdOperationVerifier,
+                    )?;
+                    expected_seqs.insert(node_id.clone(), operation.body.node_seq.saturating_add(1));
+                    frontier_hashes.insert(node_id, Some(operation.operation_hash));
+                    accepted.push(operation.op_id.as_bytes().to_vec());
+                }
+                // Already known (node_seq below frontier): idempotent, ACK it.
+                NodeAdmission::AlreadyKnown => {
+                    accepted.push(operation.op_id.as_bytes().to_vec());
+                }
+                // Gap above the frontier: legal catch-up. Queue a per-node pull
+                // and stop advancing this node's batch state — later ops of the
+                // same node would also gap until the pull lands.
+                NodeAdmission::Gap => {}
+            }
         }
         Ok(accepted)
     }
 
-    fn ensure_operation_follows_known_state(
+    /// Decides whether an operation can join the local view of its author's
+    /// chain. A node is single-writer over its own chain, so equivocation — a
+    /// different op at the same `(node, node_seq)` — is Byzantine and rejected.
+    fn admit_node_operation(
         &self,
         source: &PeerId,
         operation: &SyncOperation,
-        expected_sequences: &mut HashMap<String, u64>,
-    ) -> LedgerResult<()> {
-        let partition = operation.body.partition_id.clone();
-        let partition_key = partition.as_str().to_string();
-        let expected_sequence = match expected_sequences.get(&partition_key).copied() {
-            Some(sequence) => sequence,
-            None => {
-                let sequence = self.initial_expected_sequence(source.clone(), partition.clone())?;
-                expected_sequences.insert(partition_key.clone(), sequence);
-                sequence
+        expected: u64,
+        frontier_hash: Option<[u8; 32]>,
+    ) -> LedgerResult<NodeAdmission> {
+        let node_id = operation.body.actor_node_id.as_str();
+        let node_seq = operation.body.node_seq;
+        if node_seq < expected {
+            // We have already advanced past this seq. To catch equivocation we must
+            // compare against what we ACTUALLY recorded at this chain position, not
+            // look the incoming op up by its own op_id: ops are content-addressed,
+            // so an equivocating op (same (node, seq), different body) has a
+            // different op_id and a by-op_id lookup would silently miss the fork.
+            // `admit_verified_operation` records foreign ops on `node_log` too, so
+            // this lookup resolves for foreign authors — not just the local node.
+            match self.ledger.get_node_log_entry(node_id, node_seq)? {
+                Some(stored) if stored != operation.op_id => {
+                    return Err(SyncLedgerError::NodeEquivocation {
+                        node: node_id.to_string(),
+                        node_seq,
+                        existing: stored,
+                        incoming: operation.op_id,
+                    });
+                }
+                // stored == incoming: idempotent re-delivery of the op we hold.
+                // None: compaction reaps the content row but KEEPS the node_log
+                // entry, so a compacted seq still resolves here; None means we
+                // genuinely never held this position (e.g. caught up via a snapshot
+                // that skipped the prefix) and cannot prove either way — treat as
+                // known (the chain head past it stands).
+                _ => return Ok(NodeAdmission::AlreadyKnown),
             }
-        };
-        if operation.body.partition_sequence != expected_sequence {
-            if operation.body.partition_sequence > expected_sequence {
-                self.queue_repair_request(
-                    source.as_str(),
-                    operation.body.partition_id.as_str(),
-                    expected_sequence,
-                );
-            }
-            return Err(SyncLedgerError::Runtime(format!(
-                "incoming operation sequence gap for {}: expected {}, actual {}",
-                operation.body.partition_id.as_str(),
-                expected_sequence,
-                operation.body.partition_sequence
-            )));
         }
-        if let Some(expected_previous_hash) =
-            self.expected_previous_hash(source.clone(), partition, expected_sequence)?
-        {
-            if operation.body.prev_partition_hash != Some(expected_previous_hash) {
-                self.queue_repair_request(
-                    source.as_str(),
-                    operation.body.partition_id.as_str(),
-                    expected_sequence,
-                );
-                return Err(SyncLedgerError::HashChainMismatch {
-                    partition: operation.body.partition_id.as_str().to_string(),
-                    sequence: operation.body.partition_sequence,
-                });
-            }
-        } else if operation.body.prev_partition_hash.is_some() {
-            self.queue_repair_request(
-                source.as_str(),
-                operation.body.partition_id.as_str(),
-                expected_sequence,
+        if node_seq > expected {
+            self.queue_repair_request(source.as_str(), node_id, expected);
+            return Ok(NodeAdmission::Gap);
+        }
+        // node_seq == expected: the prev_node_hash must chain onto our frontier.
+        // A mismatch at the SAME seq means the author signed two histories.
+        if operation.body.prev_node_hash != frontier_hash {
+            warn!(
+                "sync runtime: node equivocation detected from {node_id} at node_seq={node_seq}: \
+                 prev_node_hash does not chain onto known frontier"
             );
             return Err(SyncLedgerError::HashChainMismatch {
-                partition: operation.body.partition_id.as_str().to_string(),
-                sequence: operation.body.partition_sequence,
+                node: node_id.to_string(),
+                node_seq,
             });
         }
-        expected_sequences.insert(partition_key, expected_sequence.saturating_add(1));
-        Ok(())
+        Ok(NodeAdmission::Accepted)
     }
 
-    fn initial_expected_sequence(
-        &self,
-        source: PeerId,
-        partition: PartitionId,
-    ) -> LedgerResult<u64> {
-        if let Some(cursor) = self.ledger.get_peer_cursor(source, partition.clone())? {
-            return Ok(cursor.last_sequence.saturating_add(1));
+    /// Returns the next expected `node_seq` and the frontier hash for `node_id`,
+    /// reading the persisted node-frontier. A node never seen before starts at
+    /// seq 1 with no predecessor hash.
+    fn initial_node_frontier(&self, node_id: &str) -> LedgerResult<(u64, Option<[u8; 32]>)> {
+        match self.ledger.get_node_frontier(node_id)? {
+            Some(frontier) => Ok((
+                frontier.last_seq.saturating_add(1),
+                Some(frontier.last_hash),
+            )),
+            None => Ok((1, None)),
         }
-        Ok(self
-            .ledger
-            .latest_snapshot(partition, None)?
-            .map_or(1, |snapshot| snapshot.up_to_sequence.saturating_add(1)))
     }
 
-    fn expected_previous_hash(
-        &self,
-        source: PeerId,
-        partition: PartitionId,
-        expected_sequence: u64,
-    ) -> LedgerResult<Option<[u8; 32]>> {
-        if expected_sequence == 1 {
-            return Ok(None);
-        }
-        if let Some(cursor) = self.ledger.get_peer_cursor(source, partition.clone())? {
-            if cursor.last_sequence.saturating_add(1) == expected_sequence {
-                return Ok(Some(cursor.last_hash));
-            }
-        }
-        Ok(self
-            .ledger
-            .latest_snapshot(partition, Some(expected_sequence.saturating_sub(1)))?
-            .and_then(|snapshot| {
-                if snapshot.up_to_sequence.saturating_add(1) == expected_sequence {
-                    snapshot.last_operation_hash
-                } else {
-                    None
-                }
-            }))
-    }
-
-    fn queue_repair_request(&self, peer_id: &str, partition_id: &str, from_sequence: u64) {
-        let entry = match (
-            PeerId::new(peer_id.to_string()),
-            PartitionId::new(partition_id.to_string()),
-        ) {
-            (Ok(peer), Ok(partition_id)) => RepairQueueEntry {
+    fn queue_repair_request(&self, peer_id: &str, target_node_id: &str, from_node_seq: u64) {
+        let entry = match PeerId::new(peer_id.to_string()) {
+            Ok(peer) => RepairQueueEntry {
                 peer,
-                partition_id,
-                from_sequence,
+                target_node_id: target_node_id.to_string(),
+                from_node_seq,
                 next_attempt_ms: now_ms(),
                 retry_count: 0,
             },
-            (Err(e), _) | (_, Err(e)) => {
+            Err(e) => {
                 warn!("sync runtime: cannot queue repair request: {}", e);
                 return;
             }
@@ -1366,11 +1498,9 @@ impl SyncRuntime {
         }
     }
 
-    fn clear_repair_request(&self, peer_id: &str, partition_id: &str) {
-        let result = PeerId::new(peer_id.to_string()).and_then(|peer| {
-            PartitionId::new(partition_id.to_string())
-                .and_then(|partition| self.ledger.remove_repair_request(peer, partition))
-        });
+    fn clear_repair_request(&self, peer_id: &str, target_node_id: &str) {
+        let result = PeerId::new(peer_id.to_string())
+            .and_then(|peer| self.ledger.remove_repair_request(peer, target_node_id));
         if let Err(e) = result {
             warn!("sync runtime: repair request clear failed: {}", e);
         }
@@ -1828,9 +1958,11 @@ impl SyncRuntime {
                 .unwrap_or_else(|| "system".to_string()),
             actor_device_id: self.local_node_id.clone(),
             actor_node_id: self.local_node_id.clone(),
-            // Reuse the HLC minted inside the write transaction (stored on the
-            // capture row) so the operation carries the originating instant.
-            hlc_timestamp: capture.hlc.clone(),
+            // Reuse the HLC instant minted inside the write transaction (stored on
+            // the capture row) but stamp it with the authoring node's id: the op's
+            // HLC origin MUST be the actor (enforced by validate_integrity), and
+            // the local node is the single writer of this chain.
+            hlc_timestamp: self.local_hlc_from(&capture.hlc),
             epoch: self.ledger.current_epoch()?,
             payload_hash,
             acl_snapshot_hash: sha256(
@@ -2209,11 +2341,17 @@ impl SyncRuntime {
     }
 }
 
+enum NodeAdmission {
+    Accepted,
+    AlreadyKnown,
+    Gap,
+}
+
 fn operation_to_wire(operation: &SyncOperation) -> LedgerResult<MeshSyncOperationWire> {
     Ok(MeshSyncOperationWire {
         op_id: operation.op_id.as_bytes().to_vec(),
         partition_id: operation.body.partition_id.as_str().to_string(),
-        partition_sequence: operation.body.partition_sequence,
+        node_seq: operation.body.node_seq,
         operation: crate::sync::ledger::encode(operation)?,
     })
 }
@@ -2223,49 +2361,109 @@ fn operation_from_wire(wire: &MeshSyncOperationWire) -> LedgerResult<SyncOperati
     let op_id = operation_id_from_wire(&wire.op_id)?;
     if operation.op_id != op_id
         || operation.body.partition_id.as_str() != wire.partition_id
-        || operation.body.partition_sequence != wire.partition_sequence
+        || operation.body.node_seq != wire.node_seq
     {
         return Err(SyncLedgerError::Runtime(
             "sync operation wire metadata mismatch".to_string(),
         ));
     }
+    // Reject node_seq==0 centrally for every wire ingress (push / pull-response /
+    // snapshot tail): node_seq is 1-based and dense, so 0 is never a valid chain
+    // position and must never reach admission as a phantom predecessor.
+    if operation.body.node_seq == 0 {
+        return Err(SyncLedgerError::InvalidNodeSeq {
+            node: operation.body.actor_node_id.clone(),
+        });
+    }
     Ok(operation)
 }
 
+// The snapshot tail spans many authoring nodes, so it is validated per-node:
+// each node's chain must be dense and monotonic in `node_seq`. Operations of
+// different nodes may interleave on the wire — group and check each chain.
 fn validate_snapshot_tail_wire(payload: &MeshSyncSnapshotResponsePayload) -> LedgerResult<()> {
-    let mut expected_sequence = payload.up_to_sequence.saturating_add(1);
     for wire in &payload.operations_after_snapshot {
         if wire.partition_id != payload.partition_id {
             return Err(SyncLedgerError::Runtime(
                 "sync snapshot response tail partition mismatch".to_string(),
             ));
         }
-        if wire.partition_sequence != expected_sequence {
+    }
+    validate_node_dense_wire(
+        payload.operations_after_snapshot.iter(),
+        "sync snapshot response tail",
+    )
+}
+
+fn validate_pull_response_wire(payload: &MeshSyncPullResponsePayload) -> LedgerResult<()> {
+    for wire in &payload.operations {
+        if wire.node_seq == 0 {
+            return Err(SyncLedgerError::Runtime(
+                "sync pull response contains zero node_seq".to_string(),
+            ));
+        }
+    }
+    // A pull is for one target node's chain, but the wire only carries node_seq
+    // per op; the authoring node lives inside the encoded body. Decode and check
+    // every op belongs to `target_node_id` with a dense monotonic chain.
+    let mut decoded = Vec::with_capacity(payload.operations.len());
+    for wire in &payload.operations {
+        let operation = operation_from_wire(wire)?;
+        if operation.body.actor_node_id != payload.target_node_id {
+            return Err(SyncLedgerError::Runtime(
+                "sync pull response node mismatch".to_string(),
+            ));
+        }
+        decoded.push(wire.clone());
+    }
+    let mut expected = payload.from_node_seq;
+    let mut sorted: Vec<&MeshSyncOperationWire> = decoded.iter().collect();
+    sorted.sort_by_key(|wire| wire.node_seq);
+    for wire in sorted {
+        if wire.node_seq != expected {
             return Err(SyncLedgerError::Runtime(format!(
-                "sync snapshot response tail sequence gap: expected {expected_sequence}, actual {}",
-                wire.partition_sequence
+                "sync pull response node_seq gap: expected {expected}, actual {}",
+                wire.node_seq
             )));
         }
-        expected_sequence = expected_sequence.saturating_add(1);
+        expected = expected.saturating_add(1);
     }
     Ok(())
 }
 
-fn validate_pull_response_wire(payload: &MeshSyncPullResponsePayload) -> LedgerResult<()> {
-    let mut expected_sequence = payload.from_sequence;
-    for wire in &payload.operations {
-        if wire.partition_id != payload.partition_id {
-            return Err(SyncLedgerError::Runtime(
-                "sync pull response partition mismatch".to_string(),
-            ));
+/// Validates that, grouped by authoring node, every operation forms a dense
+/// monotonic `node_seq` run starting at each node's first seen seq. Used for the
+/// snapshot tail, where several nodes' chains arrive interleaved.
+fn validate_node_dense_wire<'a>(
+    operations: impl Iterator<Item = &'a MeshSyncOperationWire>,
+    context: &str,
+) -> LedgerResult<()> {
+    let mut decoded: Vec<SyncOperation> = Vec::new();
+    for wire in operations {
+        decoded.push(operation_from_wire(wire)?);
+    }
+    decoded.sort_by(|a, b| {
+        a.body
+            .actor_node_id
+            .cmp(&b.body.actor_node_id)
+            .then_with(|| a.body.node_seq.cmp(&b.body.node_seq))
+    });
+    let mut current: Option<(&str, u64)> = None;
+    for operation in &decoded {
+        let node = operation.body.actor_node_id.as_str();
+        let seq = operation.body.node_seq;
+        match current {
+            Some((prev_node, prev_seq)) if prev_node == node => {
+                if seq != prev_seq.saturating_add(1) {
+                    return Err(SyncLedgerError::Runtime(format!(
+                        "{context} node_seq gap for {node}: expected {}, actual {seq}",
+                        prev_seq.saturating_add(1)
+                    )));
+                }
+            }
+            _ => {}
         }
-        if wire.partition_sequence != expected_sequence {
-            return Err(SyncLedgerError::Runtime(format!(
-                "sync pull response sequence gap: expected {expected_sequence}, actual {}",
-                wire.partition_sequence
-            )));
-        }
-        expected_sequence = expected_sequence.saturating_add(1);
+        current = Some((node, seq));
     }
     Ok(())
 }
@@ -2279,14 +2477,45 @@ fn apply_kv_operation(db: &DbPool, operation: &SyncOperation) -> LedgerResult<us
     }
     let instance_id = field_string(operation, "instance_id")?;
     let key = field_string(operation, "key")?;
-    let conn = db
+    // Fold the incoming HLC into the local clock so a locally-minted KV write that
+    // follows is strictly later than anything observed from the mesh.
+    observe_core_hlc(&operation.body.hlc_timestamp);
+
+    let mut conn = db
         .lock()
         .map_err(|e| SyncLedgerError::Runtime(format!("Blad blokady bazy: {e}")))?;
-    match operation.body.action {
+    let tx = conn
+        .transaction()
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+
+    // HLC last-writer-wins gate keyed by the per-(instance_id, key) resource_id.
+    // Two nodes writing the same addon key concurrently used to materialize in
+    // delivery order (blind upsert), so the converged value depended on which push
+    // arrived last — the same convergence hole as `external-credentials`. Gating on
+    // the recorded HLC makes the outcome the operation with the greatest HLC under
+    // the total (wall, logical, node_id) order, regardless of delivery order. The
+    // gate, the row write and the version bump share one transaction so the bookmark
+    // can never drift from the materialized row. A re-delivered op (same op_hash)
+    // carries an HLC equal to the stored one, fails the strict `>` test, and is a
+    // no-op — idempotent. Delete is an LWW tombstone: a delete with a higher HLC
+    // wins over a later-delivered-but-older insert, and the version row survives the
+    // delete so a stale insert that arrives afterwards is still dropped.
+    if !crate::sync::core_materializer::incoming_hlc_wins(
+        &tx,
+        &operation.body.resource_type,
+        &operation.body.resource_id,
+        &operation.body.hlc_timestamp,
+    )? {
+        tx.commit()
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        return Ok(0);
+    }
+
+    let rows = match operation.body.action {
         ActionType::Update | ActionType::Insert => {
             let value = field_bytes(operation, "value")?;
             let value_size = value.len() as i64;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO addon_storage \
                  (addon_id, instance_id, storage_key, storage_value, value_size_bytes, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) \
@@ -2302,16 +2531,27 @@ fn apply_kv_operation(db: &DbPool, operation: &SyncOperation) -> LedgerResult<us
                     value_size
                 ],
             )
-            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
         }
-        ActionType::Delete => conn
+        ActionType::Delete => tx
             .execute(
                 "DELETE FROM addon_storage \
                  WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
                 rusqlite::params![&operation.body.addon_id, instance_id, key],
             )
-            .map_err(|e| SyncLedgerError::Runtime(e.to_string())),
-    }
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?,
+    };
+
+    crate::sync::core_materializer::upsert_resource_version(
+        &tx,
+        &operation.body.resource_type,
+        &operation.body.resource_id,
+        &operation.body.hlc_timestamp,
+    )?;
+
+    tx.commit()
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    Ok(rows)
 }
 
 enum BlobApplyOutcome {
@@ -2347,11 +2587,14 @@ fn core_apply_priority(operation: &SyncOperation) -> u8 {
     }
 }
 
-fn inbox_apply_order(entry: &InboxEntry) -> (u8, &str, u64) {
+fn inbox_apply_order(entry: &InboxEntry) -> (u8, &str, &HybridLogicalTimestamp) {
+    // Apply within a partition in HLC order: there is no global partition
+    // sequence anymore, and HLC is the total order materialization (LWW) relies
+    // on, so draining in HLC order keeps causal inserts ahead of their updates.
     (
         inbox_apply_priority(&entry.operation),
         entry.operation.body.partition_id.as_str(),
-        entry.operation.body.partition_sequence,
+        &entry.operation.body.hlc_timestamp,
     )
 }
 
@@ -4384,23 +4627,27 @@ mod tests {
                 .expect("second operation");
             let payload = MeshSyncPullResponsePayload {
                 from_node_id: source.runtime.local_node_id.clone(),
-                partition_id: second_operation.body.partition_id.as_str().to_string(),
-                from_sequence: second_operation.body.partition_sequence,
+                target_node_id: second_operation.body.actor_node_id.clone(),
+                from_node_seq: second_operation.body.node_seq,
                 operations: vec![operation_to_wire(&second_operation).expect("wire")],
+                serving_floor_node_seq: 1,
+                serving_tip_node_seq: second_operation.body.node_seq,
             };
 
-            let err = receiver
+            // A node_seq=2 op with no local seq=1 is a legal catch-up gap: it must
+            // queue a per-node repair pull from the missing seq, not error.
+            receiver
                 .runtime
                 .handle_pull_response_payload(&source.runtime.local_node_id, payload)
-                .expect_err("gap must fail");
-            assert!(matches!(err, SyncLedgerError::Runtime(_)));
+                .expect("gap queues repair, not an error");
 
             let pulls = receiver
                 .runtime
                 .build_repair_pull_payloads_for_peer(&source.runtime.local_node_id, 8, 64)
                 .expect("repair pulls");
             assert_eq!(pulls.len(), 1);
-            assert_eq!(pulls[0].from_sequence, 1);
+            assert_eq!(pulls[0].target_node_id, second_operation.body.actor_node_id);
+            assert_eq!(pulls[0].from_node_seq, 1);
         });
     }
 
@@ -5149,24 +5396,25 @@ mod tests {
                 .ledger
                 .get_operation(update.op_id)
                 .expect("update operation");
-            let partition = update_operation.body.partition_id.as_str().to_string();
             let gap_payload = MeshSyncPullResponsePayload {
                 from_node_id: source.runtime.local_node_id.clone(),
-                partition_id: partition.clone(),
-                from_sequence: update_operation.body.partition_sequence,
+                target_node_id: update_operation.body.actor_node_id.clone(),
+                from_node_seq: update_operation.body.node_seq,
                 operations: vec![operation_to_wire(&update_operation).expect("wire update")],
+                serving_floor_node_seq: 1,
+                serving_tip_node_seq: update_operation.body.node_seq,
             };
 
             receiver
                 .runtime
                 .handle_pull_response_payload(&source.runtime.local_node_id, gap_payload)
-                .expect_err("missing prefix must queue repair");
+                .expect("missing prefix queues repair, not an error");
             let pulls = receiver
                 .runtime
                 .build_repair_pull_payloads_for_peer(&source.runtime.local_node_id, 8, 64)
                 .expect("repair pulls");
             assert_eq!(pulls.len(), 1);
-            assert_eq!(pulls[0].from_sequence, 1);
+            assert_eq!(pulls[0].from_node_seq, 1);
 
             let response = source
                 .runtime
@@ -5817,12 +6065,13 @@ mod tests {
             .ledger
             .get_operation(update.op_id)
             .expect("update operation");
-        let partition = update_operation.body.partition_id.as_str().to_string();
         let gap_payload = MeshSyncPullResponsePayload {
             from_node_id: source.runtime.local_node_id.clone(),
-            partition_id: partition.clone(),
-            from_sequence: update_operation.body.partition_sequence,
+            target_node_id: update_operation.body.actor_node_id.clone(),
+            from_node_seq: update_operation.body.node_seq,
             operations: vec![operation_to_wire(&update_operation).expect("wire update")],
+            serving_floor_node_seq: 1,
+            serving_tip_node_seq: update_operation.body.node_seq,
         };
         let gap_bytes =
             tentaflow_protocol::cbor::encode(&gap_payload).expect("encode gap response");
@@ -5856,13 +6105,13 @@ mod tests {
         receiver
             .runtime
             .handle_pull_response_payload(&source.runtime.local_node_id, received_gap)
-            .expect_err("gap must queue repair");
+            .expect("gap queues repair, not an error");
         let repair_pulls = receiver
             .runtime
             .build_repair_pull_payloads_for_peer(&source.runtime.local_node_id, 8, 64)
             .expect("repair pulls");
         assert_eq!(repair_pulls.len(), 1);
-        assert_eq!(repair_pulls[0].from_sequence, 1);
+        assert_eq!(repair_pulls[0].from_node_seq, 1);
         let pull_bytes =
             tentaflow_protocol::cbor::encode(&repair_pulls[0]).expect("encode repair pull");
         receiver_mesh
@@ -6035,12 +6284,13 @@ mod tests {
             .ledger
             .get_operation(update.op_id)
             .expect("update operation");
-        let partition = update_operation.body.partition_id.as_str().to_string();
         let gap_payload = MeshSyncPullResponsePayload {
             from_node_id: source.runtime.local_node_id.clone(),
-            partition_id: partition.clone(),
-            from_sequence: update_operation.body.partition_sequence,
+            target_node_id: update_operation.body.actor_node_id.clone(),
+            from_node_seq: update_operation.body.node_seq,
             operations: vec![operation_to_wire(&update_operation).expect("wire update")],
+            serving_floor_node_seq: 1,
+            serving_tip_node_seq: update_operation.body.node_seq,
         };
         let gap_bytes =
             tentaflow_protocol::cbor::encode(&gap_payload).expect("encode gap response");
@@ -6074,7 +6324,7 @@ mod tests {
         receiver
             .runtime
             .handle_pull_response_payload(&source.runtime.local_node_id, received_gap)
-            .expect_err("gap must queue repair");
+            .expect("gap queues repair, not an error");
 
         let source_addr = loopback_addr_of(&source_mesh);
         let receiver_addr = loopback_addr_of(&receiver_mesh);
@@ -6132,7 +6382,7 @@ mod tests {
             tentaflow_protocol::mesh::MeshSyncPullPayload,
         >(&received_pull)
         .expect("decode scheduler repair pull");
-        assert_eq!(received_pull.from_sequence, 1);
+        assert_eq!(received_pull.from_node_seq, 1);
         let repair_response = source
             .runtime
             .handle_pull_payload(&receiver.runtime.local_node_id, received_pull)
@@ -6668,21 +6918,22 @@ mod tests {
                 keep_operations_after_sequence: Some(2),
             })
             .expect("compact");
-        receiver
+        // A partition snapshot is served through the explicit snapshot-pull path
+        // (per-node regular pulls only carry one node's dense chain). Request the
+        // compacted prefix as a snapshot package with its tail.
+        let pull = source
             .runtime
-            .queue_repair_request(&source.runtime.local_node_id, partition.as_str(), 1);
-
-        let pull = MeshSyncPullPayload {
+            .build_snapshot_pull_payload(partition.as_str(), 1, snapshot.snapshot_id.as_str(), true, 64)
+            .expect("build snapshot pull");
+        let pull = MeshSyncSnapshotPullPayload {
             from_node_id: receiver.runtime.local_node_id.clone(),
-            partition_id: partition.as_str().to_string(),
-            from_sequence: 1,
-            limit: 64,
+            ..pull
         };
         let pull_bytes = tentaflow_protocol::cbor::encode(&pull).expect("encode snapshot pull");
         receiver_mesh
             .send_ufp2_to_peer(
                 &source.runtime.local_node_id,
-                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_PULL,
                 &pull_bytes,
             )
             .await
@@ -6691,7 +6942,7 @@ mod tests {
         let received_pull = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match source_events.recv().await {
-                    Ok(IrohMeshEvent::SyncPullReceived { from_node_id, data })
+                    Ok(IrohMeshEvent::SyncSnapshotPullReceived { from_node_id, data })
                         if from_node_id == receiver.runtime.local_node_id =>
                     {
                         return data;
@@ -6703,16 +6954,13 @@ mod tests {
         .await
         .expect("snapshot pull event");
         let received_pull = tentaflow_protocol::cbor::decode::<
-            tentaflow_protocol::mesh::MeshSyncPullPayload,
+            tentaflow_protocol::mesh::MeshSyncSnapshotPullPayload,
         >(&received_pull)
         .expect("decode snapshot pull");
-        let response = source
+        let snapshot_response = source
             .runtime
-            .handle_pull_payload(&receiver.runtime.local_node_id, received_pull)
+            .handle_snapshot_pull_payload(&receiver.runtime.local_node_id, received_pull)
             .expect("handle snapshot pull");
-        let MeshSyncPullResult::Snapshot(snapshot_response) = response else {
-            panic!("expected snapshot response");
-        };
         assert_eq!(snapshot_response.snapshot_id, snapshot.snapshot_id.as_str());
         assert_eq!(snapshot_response.operations_after_snapshot.len(), 1);
         let response_bytes =
@@ -6884,7 +7132,7 @@ mod tests {
                 .expect("compact");
             receiver.runtime.queue_repair_request(
                 &source.runtime.local_node_id,
-                partition.as_str(),
+                &source.runtime.local_node_id,
                 1,
             );
             let queued_repairs = receiver
@@ -6898,32 +7146,34 @@ mod tests {
                 .expect("queued repairs");
             assert_eq!(queued_repairs.len(), 1);
 
-            let pull = MeshSyncPullPayload {
-                from_node_id: receiver.runtime.local_node_id.clone(),
-                partition_id: partition.as_str().to_string(),
-                from_sequence: 1,
-                limit: 64,
-            };
-            let response = source
+            let pull = source
                 .runtime
-                .handle_pull_payload(&receiver.runtime.local_node_id, pull)
-                .expect("handle pull");
-
-            match response {
-                MeshSyncPullResult::Snapshot(payload) => {
-                    assert_eq!(payload.snapshot_id, snapshot.snapshot_id.as_str());
-                    assert_eq!(payload.operations_after_snapshot.len(), 1);
-                    let ack = receiver
-                        .runtime
-                        .handle_snapshot_response_payload(&source.runtime.local_node_id, payload)
-                        .expect("handle snapshot response");
-                    source
-                        .runtime
-                        .handle_ack_payload(&receiver.runtime.local_node_id, ack)
-                        .expect("ack snapshot");
-                }
-                MeshSyncPullResult::Operations(_) => panic!("expected snapshot response"),
-            }
+                .build_snapshot_pull_payload(
+                    partition.as_str(),
+                    1,
+                    snapshot.snapshot_id.as_str(),
+                    true,
+                    64,
+                )
+                .expect("build snapshot pull");
+            let pull = MeshSyncSnapshotPullPayload {
+                from_node_id: receiver.runtime.local_node_id.clone(),
+                ..pull
+            };
+            let payload = source
+                .runtime
+                .handle_snapshot_pull_payload(&receiver.runtime.local_node_id, pull)
+                .expect("handle snapshot pull");
+            assert_eq!(payload.snapshot_id, snapshot.snapshot_id.as_str());
+            assert_eq!(payload.operations_after_snapshot.len(), 1);
+            let ack = receiver
+                .runtime
+                .handle_snapshot_response_payload(&source.runtime.local_node_id, payload)
+                .expect("handle snapshot response");
+            source
+                .runtime
+                .handle_ack_payload(&receiver.runtime.local_node_id, ack)
+                .expect("ack snapshot");
             let queued_repairs = receiver
                 .runtime
                 .ledger
@@ -8314,12 +8564,22 @@ mod tests {
             let node_a = make_runtime(93);
             let node_b = make_runtime(94);
 
-            // Identical wall+logical; tie-break decides. "node-z" > "node-a", so
-            // the "node-z" edit wins the total order deterministically.
-            let lower = flow_capture_with_hlc("1", "from-a", hlc_at(5_000, 0, "node-a"));
-            let higher = flow_capture_with_hlc("1", "from-z", hlc_at(5_000, 0, "node-z"));
-            let op_lower = signed_flow_op(&node_a, lower);
-            let op_higher = signed_flow_op(&node_b, higher);
+            // Identical wall+logical; the tie-break decides on the AUTHORING node
+            // id. `record_core_capture` stamps each op's HLC origin with its own
+            // runtime id (the real invariant: hlc.node_id == actor_node_id), so the
+            // winner is whichever runtime id sorts higher — derive it instead of
+            // hard-coding, because the ed25519 key hex ordering is not fixed.
+            let id_a = node_a.runtime.local_node_id.clone();
+            let id_b = node_b.runtime.local_node_id.clone();
+            let (lower_node, higher_node, expected_winner) = if id_a < id_b {
+                (&node_a, &node_b, "from-z")
+            } else {
+                (&node_b, &node_a, "from-z")
+            };
+            let lower = flow_capture_with_hlc("1", "from-a", hlc_at(5_000, 0, "ignored"));
+            let higher = flow_capture_with_hlc("1", expected_winner, hlc_at(5_000, 0, "ignored"));
+            let op_lower = signed_flow_op(lower_node, lower);
+            let op_higher = signed_flow_op(higher_node, higher);
 
             let db1 = make_db();
             let db2 = make_db();
@@ -8339,6 +8599,128 @@ mod tests {
 
             assert_eq!(flow_name(&db1, "1").as_deref(), Some("from-z"));
             assert_eq!(flow_name(&db2, "1").as_deref(), Some("from-z"));
+        });
+    }
+
+    /// Records an `addon.kv` write on `node` with a caller-chosen wall time, so the
+    /// resulting signed op carries a deterministic HLC (wall = `created_at_ms`,
+    /// node = the runtime's own id) for the LWW comparison.
+    fn signed_kv_op(
+        node: &RuntimeHarness,
+        addon_id: &str,
+        instance_id: &str,
+        key: &str,
+        value: Option<&[u8]>,
+        created_at_ms: i64,
+    ) -> SyncOperation {
+        let mut capture = KvWriteCapture::new(
+            "org-default",
+            addon_id,
+            instance_id,
+            key,
+            value.map(|v| v.to_vec()),
+            Some("00000000-0000-0000-0000-000000000007".to_string()),
+        );
+        capture.created_at_ms = created_at_ms;
+        let recorded = node
+            .runtime
+            .record_kv_capture(capture)
+            .expect("record kv capture");
+        node.runtime
+            .ledger
+            .get_operation(recorded.op_id)
+            .expect("operation")
+    }
+
+    fn kv_value(db: &DbPool, addon_id: &str, instance_id: &str, key: &str) -> Option<Vec<u8>> {
+        use rusqlite::OptionalExtension;
+        db.lock()
+            .expect("db lock")
+            .query_row(
+                "SELECT storage_value FROM addon_storage \
+                 WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
+                rusqlite::params![addon_id, instance_id, key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .expect("query kv")
+    }
+
+    /// Cross-node LWW for replicated `addon.kv`: the SAME key is written
+    /// concurrently on two nodes with different HLCs. Applying both ops in OPPOSITE
+    /// orders on two separate databases must converge to the newer-HLC value —
+    /// proving the winner is the higher HLC, not whichever push arrived last. This
+    /// is the convergence hole the blind upsert left open. Re-delivering either op
+    /// is a no-op, so the merge is idempotent (re-delivery), commutative and
+    /// associative (apply order does not change the fixed point): every db reaches
+    /// the same `max` over the total HLC order.
+    #[test]
+    fn e2e_cross_node_kv_lww_converges_to_newer_hlc_regardless_of_apply_order() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(141);
+            let node_b = make_runtime(142);
+
+            // Two concurrent writes of the same addon key: A older, B newer.
+            let op_older =
+                signed_kv_op(&node_a, "kv-addon", "inst-1", "settings/theme", Some(b"light"), 1_000);
+            let op_newer =
+                signed_kv_op(&node_b, "kv-addon", "inst-1", "settings/theme", Some(b"dark"), 2_000);
+
+            let db1 = make_db();
+            let db2 = make_db();
+
+            // DB 1 applies older THEN newer; DB 2 applies newer THEN older.
+            apply_kv_operation(&db1, &op_older).expect("db1 older");
+            apply_kv_operation(&db1, &op_newer).expect("db1 newer");
+
+            apply_kv_operation(&db2, &op_newer).expect("db2 newer");
+            // The older op arriving last must be DROPPED by the LWW gate (0 rows),
+            // not clobber the newer value.
+            let stale = apply_kv_operation(&db2, &op_older).expect("db2 older");
+            assert_eq!(stale, 0, "stale older kv op must be dropped by LWW");
+
+            // Both databases converge to the newer-HLC value.
+            assert_eq!(kv_value(&db1, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
+            assert_eq!(kv_value(&db2, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
+
+            // Re-delivering the winning op is idempotent: same HLC fails the strict
+            // `>` gate and applies nothing, value unchanged.
+            let redelivered = apply_kv_operation(&db1, &op_newer).expect("db1 re-deliver");
+            assert_eq!(redelivered, 0, "re-delivered op must be a no-op");
+            assert_eq!(kv_value(&db1, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
+        });
+    }
+
+    /// LWW tombstone for `addon.kv` delete: a delete carrying a HIGHER HLC must win
+    /// over a later-DELIVERED-but-older insert of the same key. The version row
+    /// survives the delete (tombstone), so the stale insert arriving afterwards is
+    /// dropped and the key stays absent on every node regardless of delivery order.
+    #[test]
+    fn e2e_cross_node_kv_delete_tombstone_beats_late_older_insert() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(143);
+            let node_b = make_runtime(144);
+
+            // Older insert on A, newer delete on B of the same key.
+            let op_insert =
+                signed_kv_op(&node_a, "kv-addon", "inst-1", "settings/theme", Some(b"light"), 1_000);
+            let op_delete =
+                signed_kv_op(&node_b, "kv-addon", "inst-1", "settings/theme", None, 2_000);
+
+            let db1 = make_db();
+            let db2 = make_db();
+
+            // DB 1: insert THEN delete (delete wins, key removed).
+            apply_kv_operation(&db1, &op_insert).expect("db1 insert");
+            apply_kv_operation(&db1, &op_delete).expect("db1 delete");
+            assert_eq!(kv_value(&db1, "kv-addon", "inst-1", "settings/theme"), None);
+
+            // DB 2: delete THEN late older insert. The tombstone's HLC outranks the
+            // insert, so the late insert is dropped and the key stays absent.
+            apply_kv_operation(&db2, &op_delete).expect("db2 delete");
+            let stale = apply_kv_operation(&db2, &op_insert).expect("db2 late insert");
+            assert_eq!(stale, 0, "older insert after a newer delete must be dropped");
+            assert_eq!(kv_value(&db2, "kv-addon", "inst-1", "settings/theme"), None);
         });
     }
 
@@ -8580,6 +8962,1039 @@ mod tests {
                     .expect("get flow")
                     .is_none(),
                 "stale-epoch op must not materialize after fencing"
+            );
+        });
+    }
+
+    // =========================================================================
+    // Convergence suite: per-node hash chains + HLC-LWW, conflict-free multi-writer.
+    //
+    // These tests are the correctness proof of the redesign. They drive several
+    // independent `SyncRuntime` instances (each its own ledger tempdir, db, HLC,
+    // and ed25519 node identity) through the REAL admission + materialization
+    // path and assert that, once every operation has reached every node in some
+    // order, all nodes converge: identical materialized SQLite state, identical
+    // ledger op-sets, and identical per-node frontiers.
+    //
+    // Determinism: a seeded SplitMix64 PRNG drives every choice (which node
+    // writes, which key, which value, the delivery permutation, the partition
+    // heal). HLC stamps are minted from a per-test logical counter so the LWW
+    // winner is fully determined by the seed — no wall-clock, no thread RNG.
+    // =========================================================================
+
+    /// Seeded SplitMix64 — a tiny, well-distributed deterministic PRNG. Used so
+    /// every randomized choice in the convergence suite is reproducible from its
+    /// seed alone (no `rand`, no wall-clock, no `thread_rng`).
+    struct SplitMix64 {
+        state: u64,
+    }
+
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+
+        /// Fisher–Yates shuffle driven entirely by this seeded PRNG.
+        fn shuffle<T>(&mut self, items: &mut [T]) {
+            for i in (1..items.len()).rev() {
+                let j = self.below(i + 1);
+                items.swap(i, j);
+            }
+        }
+    }
+
+    /// A single convergence node: an independent runtime plus the tempdirs that
+    /// must outlive it (Fjall ledger on disk).
+    struct ConvergenceNode {
+        runtime: SyncRuntime,
+        _ledger_dir: tempfile::TempDir,
+    }
+
+    impl ConvergenceNode {
+        fn node_id(&self) -> &str {
+            &self.runtime.local_node_id
+        }
+    }
+
+    /// Builds an isolated node with its own on-disk Fjall ledger and in-memory db.
+    /// `key_seed` must be unique per node so each gets a distinct ed25519 identity
+    /// (the node_id is the hex public key, which also keys its hash chain).
+    fn make_convergence_node(key_seed: u8) -> ConvergenceNode {
+        let ledger_dir = tempfile::tempdir().expect("ledger dir");
+        let db = make_db();
+        let security = make_security(db.clone(), key_seed);
+        let local_node_id = security.ed25519_public_key_hex();
+        let ledger = Arc::new(FjallSyncLedgerStore::open(ledger_dir.path()).expect("ledger"));
+        let hlc = HlcClock::new(local_node_id.clone(), None);
+        ConvergenceNode {
+            runtime: SyncRuntime {
+                db,
+                ledger,
+                signer: RuntimeSigner {
+                    node_id: local_node_id.clone(),
+                    security,
+                },
+                local_node_id,
+                settings_cipher: make_settings_cipher(key_seed),
+                hlc,
+                addon_reconciler: parking_lot::RwLock::new(None),
+                max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
+            },
+            _ledger_dir: ledger_dir,
+        }
+    }
+
+    /// Lets `node` accept incoming operations for `resource_type` by listing
+    /// itself as a sync target. Admission gates on `ensure_local_target_allowed`,
+    /// so without this a delivered op is refused before it reaches the inbox.
+    fn allow_self_target(node: &ConvergenceNode, resource_type: &str) {
+        seed_core_authority_target(&node.runtime.db, resource_type, node.node_id());
+    }
+
+    /// An Organization INSERT capture carrying `name`. Organization is LWW-tracked
+    /// and materializes to `organizations.name`, which is the value the suite reads
+    /// back to check cross-node convergence.
+    fn org_capture(
+        org_id: &str,
+        name: &str,
+        hlc: HybridLogicalTimestamp,
+    ) -> crate::sync::core_capture::CoreWriteCapture {
+        let mut fields = BTreeMap::new();
+        fields.insert("name".to_string(), FieldValue::String(name.to_string()));
+        fields.insert(
+            "slug".to_string(),
+            FieldValue::String(format!("slug-{org_id}")),
+        );
+        crate::sync::core_capture::CoreWriteCapture::new(
+            crate::sync::core_registry::CoreSyncResourceKind::Organization,
+            "org-default",
+            org_id,
+            SqlWriteAction::Insert,
+            fields,
+            None,
+            hlc,
+            test_epoch(),
+        )
+    }
+
+    /// Reads the materialized organization name on a node (`None` if absent). The
+    /// per-node convergence oracle: after every op reaches every node, this value
+    /// must be identical everywhere and equal the highest-HLC writer's name.
+    fn read_org_name(node: &ConvergenceNode, org_id: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        let conn = node.runtime.db.lock().expect("db lock");
+        conn.query_row(
+            "SELECT name FROM organizations WHERE org_id = ?1",
+            rusqlite::params![org_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query org name")
+    }
+
+    /// Whether `node` holds `op_id` authored by `author`: a locally-authored op
+    /// lives in the node-log/operations index; a received op lives in the inbox
+    /// keyed by the delivering peer (the author here). Either presence counts —
+    /// these are the two authoritative records of an operation on a node.
+    fn node_holds_op(node: &ConvergenceNode, author: &str, op_id: OperationId) -> bool {
+        if node.runtime.ledger.get_operation(op_id).is_ok() {
+            return true;
+        }
+        let Ok(peer) = PeerId::new(author.to_string()) else {
+            return false;
+        };
+        node.runtime.ledger.get_inbox_entry(peer, op_id).is_ok()
+    }
+
+    /// Counts how many ops from `expected` (the full authored set, as
+    /// `(author, op_id)`) are present on `node`. The convergence target is that
+    /// every node holds the entire set.
+    fn present_op_count(node: &ConvergenceNode, expected: &[(String, OperationId)]) -> usize {
+        expected
+            .iter()
+            .filter(|(author, op_id)| node_holds_op(node, author, *op_id))
+            .count()
+    }
+
+    /// The node-frontier as a sorted `(author, last_seq, last_hash)` vector — must
+    /// match across all nodes once they have seen the same chains.
+    fn frontier_snapshot(
+        node: &ConvergenceNode,
+        author_node_ids: &[String],
+    ) -> Vec<(String, u64, [u8; 32])> {
+        let mut frontier = Vec::new();
+        for author in author_node_ids {
+            if let Some(entry) = node
+                .runtime
+                .ledger
+                .get_node_frontier(author)
+                .expect("node frontier")
+            {
+                frontier.push((entry.node_id, entry.last_seq, entry.last_hash));
+            }
+        }
+        frontier.sort();
+        frontier
+    }
+
+    /// Counts every queued repair request across all peers — used to prove the
+    /// repair queue does not grow without bound under redelivery / legal
+    /// concurrent writes.
+    fn total_repair_queue_len(node: &ConvergenceNode, peer_ids: &[String]) -> usize {
+        let mut total = 0;
+        for peer in peer_ids {
+            total += node
+                .runtime
+                .ledger
+                .list_due_repair_requests(
+                    PeerId::new(peer.clone()).expect("peer"),
+                    i64::MAX,
+                    1024,
+                )
+                .expect("repair requests")
+                .len();
+        }
+        total
+    }
+
+    /// Delivers `operations` to `target` exactly as the mesh push path would:
+    /// wraps each op on the wire, admits it (per-node chain admission), then drains
+    /// the inbox (materialization + LWW). This is the REAL admission/apply code —
+    /// not a shortcut — so the test exercises gap/idempotent/equivocation handling.
+    fn deliver(
+        target: &ConvergenceNode,
+        source_node_id: &str,
+        operations: &[SyncOperation],
+    ) -> LedgerResult<()> {
+        let wire = operations
+            .iter()
+            .map(operation_to_wire)
+            .collect::<LedgerResult<Vec<_>>>()?;
+        target
+            .runtime
+            .store_incoming_operations(source_node_id, wire)?;
+        target.runtime.apply_unapplied_inbox(128)?;
+        Ok(())
+    }
+
+    /// One authored operation plus the id of the node that authored it (the
+    /// "in-flight" unit shuffled and replayed to every node).
+    #[derive(Clone)]
+    struct InFlightOp {
+        author_node_id: String,
+        operation: SyncOperation,
+    }
+
+    /// Drives one full convergence scenario for a given seed and returns nothing —
+    /// it asserts internally. N nodes each author M Organization writes against a
+    /// small key pool with seeded HLCs; the whole op-stream is delivered to every
+    /// node in a seeded permutation, with a simulated partition (a slice of
+    /// deliveries deferred, then healed). After healing, all nodes must converge.
+    fn run_convergence_scenario(seed: u64) {
+        let node_count = 3 + (seed as usize % 2); // 3 or 4 nodes
+        let writes_per_node = 6;
+        let key_pool = ["org-alpha", "org-beta", "org-gamma"];
+
+        let mut nodes: Vec<ConvergenceNode> = (0..node_count)
+            .map(|i| make_convergence_node(40u8.wrapping_add(i as u8)))
+            .collect();
+        let node_ids: Vec<String> = nodes.iter().map(|n| n.node_id().to_string()).collect();
+        for node in &nodes {
+            allow_self_target(node, "core.organization");
+        }
+
+        let mut rng = SplitMix64::new(seed);
+
+        // Each authored write gets a unique, strictly-increasing HLC wall time so
+        // the global LWW order is a total order the test can compute exactly. The
+        // authoring node mints the op through `record_core_capture`, which appends
+        // to its own per-node chain (node_seq) and signs it.
+        let mut in_flight: Vec<InFlightOp> = Vec::new();
+        // Expected per-key winner: (hlc, name). Highest HLC wins, ties broken by
+        // node_id exactly like `HybridLogicalTimestamp::Ord`.
+        let mut expected: std::collections::HashMap<String, (HybridLogicalTimestamp, String)> =
+            std::collections::HashMap::new();
+        let mut wall: i64 = 1_000;
+
+        for round in 0..writes_per_node {
+            for node_idx in 0..node_count {
+                let author_id = node_ids[node_idx].clone();
+                let key = key_pool[rng.below(key_pool.len())].to_string();
+                let value = format!("v-{author_id:.6}-{round}-{}", rng.next_u64());
+                wall += 1 + rng.below(3) as i64;
+                let hlc = hlc_at(wall, rng.below(4) as u32, &author_id);
+
+                let capture = org_capture(&key, &value, hlc.clone());
+                let result = nodes[node_idx]
+                    .runtime
+                    .record_core_capture(capture)
+                    .expect("author op");
+                let operation = nodes[node_idx]
+                    .runtime
+                    .ledger
+                    .get_operation(result.op_id)
+                    .expect("authored operation");
+
+                // The author has already materialized its own write locally.
+                let entry = expected.entry(key).or_insert((hlc.clone(), value.clone()));
+                if hlc > entry.0 {
+                    *entry = (hlc.clone(), value.clone());
+                }
+                in_flight.push(InFlightOp {
+                    author_node_id: author_id,
+                    operation,
+                });
+            }
+        }
+
+        // Deliver every op to every node in a seeded permutation. A leading slice
+        // of deliveries is held back to model a network partition; the rest are
+        // delivered first, then the partition "heals" and the held-back slice is
+        // delivered. Convergence must hold regardless of this split.
+        for target_idx in 0..node_count {
+            let target_id = node_ids[target_idx].clone();
+            let mut plan: Vec<InFlightOp> = in_flight
+                .iter()
+                .filter(|op| op.author_node_id != target_id)
+                .cloned()
+                .collect();
+            rng.shuffle(&mut plan);
+
+            let partition_at = if plan.is_empty() {
+                0
+            } else {
+                rng.below(plan.len())
+            };
+            let (first_wave, healed_wave) = plan.split_at(partition_at);
+
+            // First wave: many ops arrive out of order; gaps queue catch-up pulls
+            // but never corrupt state.
+            for op in first_wave {
+                let _ = deliver(
+                    &nodes[target_idx],
+                    &op.author_node_id,
+                    std::slice::from_ref(&op.operation),
+                );
+            }
+            // Heal: deliver the rest. Per-node chains are dense, so once a node's
+            // gap is filled, every deferred op of that chain applies.
+            for op in healed_wave {
+                let _ = deliver(
+                    &nodes[target_idx],
+                    &op.author_node_id,
+                    std::slice::from_ref(&op.operation),
+                );
+            }
+        }
+
+        // Snapshot every author's full, ordered chain (authored ops live in the
+        // author's local node-log). The author does NOT materialize its own writes
+        // by authoring alone — materialization only happens on the inbound apply
+        // path — so each chain is delivered to EVERY node, the author included.
+        let chains: Vec<(String, Vec<SyncOperation>)> = node_ids
+            .iter()
+            .map(|author| {
+                let chain = nodes
+                    .iter()
+                    .find(|n| n.node_id() == author)
+                    .expect("author node")
+                    .runtime
+                    .ledger
+                    .get_node_operations(NodeLogQuery {
+                        node_id: author.clone(),
+                        from_node_seq: Some(1),
+                        to_node_seq: None,
+                        limit: None,
+                    })
+                    .expect("author chain");
+                (author.clone(), chain)
+            })
+            .collect();
+
+        // Catch-up: deliver every full chain in order to every node. This models
+        // the repair-pull the real mesh performs for queued gaps and is what makes
+        // every node materialize the entire op-set under HLC-LWW.
+        for target_idx in 0..node_count {
+            for (author, chain) in &chains {
+                deliver(&nodes[target_idx], author, chain).expect("deliver full chain");
+            }
+        }
+
+        // The full authored set as (author, op_id) — the convergence target.
+        let authored: Vec<(String, OperationId)> = in_flight
+            .iter()
+            .map(|op| (op.author_node_id.clone(), op.operation.op_id))
+            .collect();
+
+        // ---- Convergence assertions ----
+
+        // (i) Materialized state identical on every node, and equal to the
+        // independently-computed LWW winner per key.
+        for key in key_pool {
+            let expected_name = expected.get(key).map(|(_, name)| name.clone());
+            let names: Vec<Option<String>> =
+                nodes.iter().map(|n| read_org_name(n, key)).collect();
+            for (idx, name) in names.iter().enumerate() {
+                assert_eq!(
+                    name, &expected_name,
+                    "seed {seed}: node {idx} materialized {name:?} for {key}, expected LWW winner {expected_name:?}"
+                );
+            }
+        }
+
+        // (ii) Ledger op-set identical on every node: every node holds the FULL
+        // authored set (own node-log for self-authored ops, inbox for received).
+        let total_ops = node_count * writes_per_node;
+        for (idx, node) in nodes.iter().enumerate() {
+            assert_eq!(
+                present_op_count(node, &authored),
+                total_ops,
+                "seed {seed}: node {idx} is missing operations from the authored set"
+            );
+        }
+
+        // (iii) Node-frontier identical on every node.
+        let frontiers: Vec<_> = nodes
+            .iter()
+            .map(|n| frontier_snapshot(n, &node_ids))
+            .collect();
+        for (idx, frontier) in frontiers.iter().enumerate() {
+            assert_eq!(
+                frontier, &frontiers[0],
+                "seed {seed}: node {idx} frontier diverged"
+            );
+        }
+
+        // Make tempdirs explicitly live until the end (defensive against early drop).
+        drop(nodes);
+    }
+
+    #[test]
+    fn convergence_property_across_seeds() {
+        with_tmp_home(|| {
+            // 24 distinct seeds (> the required K>=20). Each is an independent
+            // multi-node scenario with its own seeded write-stream, HLCs and
+            // delivery permutation. All must converge.
+            for seed in 0..24u64 {
+                run_convergence_scenario(seed.wrapping_mul(0x1234_5678_9ABC).wrapping_add(7));
+            }
+        });
+    }
+
+    #[test]
+    fn convergence_idempotent_under_repeated_delivery() {
+        with_tmp_home(|| {
+            let author = make_convergence_node(70);
+            let target = make_convergence_node(71);
+            allow_self_target(&target, "core.organization");
+
+            // Author two writes to two keys; the second key gets a higher HLC.
+            let op_a = {
+                let cap = org_capture("org-alpha", "alpha-1", hlc_at(2_000, 0, author.node_id()));
+                let result = author.runtime.record_core_capture(cap).expect("author a");
+                author
+                    .runtime
+                    .ledger
+                    .get_operation(result.op_id)
+                    .expect("op a")
+            };
+            let op_b = {
+                let cap = org_capture("org-beta", "beta-1", hlc_at(2_001, 0, author.node_id()));
+                let result = author.runtime.record_core_capture(cap).expect("author b");
+                author
+                    .runtime
+                    .ledger
+                    .get_operation(result.op_id)
+                    .expect("op b")
+            };
+            let chain = vec![op_a, op_b];
+            let author_id = author.node_id().to_string();
+
+            let authored: Vec<(String, OperationId)> = chain
+                .iter()
+                .map(|op| (author_id.clone(), op.op_id))
+                .collect();
+
+            // First delivery: full chain in order.
+            deliver(&target, &author_id, &chain).expect("first delivery");
+            let frontier_once = frontier_snapshot(&target, &[author_id.clone()]);
+            let names_once = (
+                read_org_name(&target, "org-alpha"),
+                read_org_name(&target, "org-beta"),
+            );
+            assert_eq!(
+                present_op_count(&target, &authored),
+                2,
+                "both ops admitted on first delivery"
+            );
+
+            // Deliver the SAME chain two more times. Every op is now below the
+            // frontier → AlreadyKnown → idempotent ACK, no state change, and the
+            // repair queue must not grow (no gaps were ever introduced).
+            deliver(&target, &author_id, &chain).expect("second delivery");
+            deliver(&target, &author_id, &chain).expect("third delivery");
+
+            assert_eq!(
+                frontier_snapshot(&target, &[author_id.clone()]),
+                frontier_once,
+                "frontier changed under redelivery"
+            );
+            assert_eq!(
+                present_op_count(&target, &authored),
+                2,
+                "ledger op-set changed under redelivery"
+            );
+            assert_eq!(
+                (
+                    read_org_name(&target, "org-alpha"),
+                    read_org_name(&target, "org-beta"),
+                ),
+                names_once,
+                "materialized state changed under redelivery"
+            );
+            assert_eq!(
+                total_repair_queue_len(&target, &[author_id]),
+                0,
+                "in-order full-chain redelivery must never queue a repair"
+            );
+        });
+    }
+
+    #[test]
+    fn convergence_concurrent_external_credentials_no_equivocation() {
+        // Direct regression for the external-credentials seq-7 bug: two nodes each
+        // independently write `hf_token` (different values, different HLCs) into the
+        // shared-secret partition, then exchange. Because each write lives in its
+        // OWN per-node chain, these are LEGAL concurrent writes — NOT a fork of one
+        // node's chain — so admission must NOT raise HashChainMismatch/equivocation,
+        // the repair queue must stay bounded, and both nodes must converge on the
+        // value with the higher HLC.
+        with_tmp_home(|| {
+            let node_a = make_convergence_node(80);
+            let node_b = make_convergence_node(81);
+            allow_self_target(&node_a, "core.shared_setting_secret");
+            allow_self_target(&node_b, "core.shared_setting_secret");
+            let a_id = node_a.node_id().to_string();
+            let b_id = node_b.node_id().to_string();
+
+            // Node A writes hf_token first (lower HLC); node B writes a different
+            // value with a strictly higher HLC — B must win the LWW everywhere.
+            // Wall times are anchored to `now_ms()` so they exceed any baseline a
+            // local write transaction would stamp, matching production scale.
+            let base = now_ms();
+            let op_a =
+                author_shared_secret(&node_a, "hf_token", "hf_from_a", hlc_at(base, 0, &a_id));
+            let op_b =
+                author_shared_secret(&node_b, "hf_token", "hf_from_b", hlc_at(base + 1, 0, &b_id));
+
+            // Exchange both directions. Delivering a legal concurrent write must
+            // succeed — these calls would Err with HashChainMismatch if the old
+            // single-partition-chain model were still in force.
+            deliver(&node_a, &b_id, std::slice::from_ref(&op_b)).expect("B->A must not equivocate");
+            deliver(&node_b, &a_id, std::slice::from_ref(&op_a)).expect("A->B must not equivocate");
+
+            // Re-exchange (redelivery) to confirm the repair queue does not grow.
+            deliver(&node_a, &b_id, std::slice::from_ref(&op_b)).expect("B->A redeliver");
+            deliver(&node_b, &a_id, std::slice::from_ref(&op_a)).expect("A->B redeliver");
+
+            let value_a = repository::get_setting_secure(
+                &node_a.runtime.db,
+                "hf_token",
+                &node_a.runtime.settings_cipher,
+            )
+            .expect("read secret on A");
+            let value_b = repository::get_setting_secure(
+                &node_b.runtime.db,
+                "hf_token",
+                &node_b.runtime.settings_cipher,
+            )
+            .expect("read secret on B");
+
+            assert_eq!(
+                value_a.as_deref(),
+                Some("hf_from_b"),
+                "node A must converge on the higher-HLC value"
+            );
+            assert_eq!(
+                value_b.as_deref(),
+                Some("hf_from_b"),
+                "node B must converge on the higher-HLC value"
+            );
+
+            // Both ledgers hold both ops (own chain for the local write, inbox for
+            // the received concurrent one).
+            let both_ops = [(a_id.clone(), op_a.op_id), (b_id.clone(), op_b.op_id)];
+            assert_eq!(
+                present_op_count(&node_a, &both_ops),
+                2,
+                "node A must hold both concurrent ops"
+            );
+            assert_eq!(
+                present_op_count(&node_b, &both_ops),
+                2,
+                "node B must hold both concurrent ops"
+            );
+
+            // Repair queue stays bounded (these were never gaps).
+            assert_eq!(
+                total_repair_queue_len(&node_a, &[b_id.clone()]),
+                0,
+                "legal concurrent write must not queue a repair on A"
+            );
+            assert_eq!(
+                total_repair_queue_len(&node_b, &[a_id]),
+                0,
+                "legal concurrent write must not queue a repair on B"
+            );
+        });
+    }
+
+    /// Forges an equivocating operation: a SECOND, distinct op that the same
+    /// author signs at an ALREADY-USED `(node, node_seq)`. We start from a real op
+    /// the author minted, change one content field (so the canonical hash, and thus
+    /// the op_id, differ), recompute hash/op_id, and re-sign with the author's
+    /// signer. This is exactly the Byzantine fork admission must reject below the
+    /// frontier — and the bug it guards: without foreign ops on the per-node axis,
+    /// the lookup at that seq was always None and the fork slipped through as
+    /// AlreadyKnown.
+    fn forge_equivocation(
+        author: &ConvergenceNode,
+        original: &SyncOperation,
+        new_value: &str,
+    ) -> SyncOperation {
+        let mut body = original.body.clone();
+        body.changed_fields
+            .insert("name".to_string(), FieldValue::String(new_value.to_string()));
+        let operation_hash =
+            crate::sync::ledger::hash_canonical(&body).expect("hash forged body");
+        let op_id = OperationId::from_hash(operation_hash);
+        let mut forged = SyncOperation {
+            op_id,
+            operation_hash,
+            body,
+            signature: Vec::new(),
+        };
+        forged.signature = author
+            .runtime
+            .signer
+            .sign_operation(&forged.signing_bytes())
+            .expect("sign forged op");
+        forged.validate_integrity().expect("forged op self-consistent");
+        assert_ne!(
+            forged.op_id, original.op_id,
+            "forged op must differ from the original at the same (node, seq)"
+        );
+        forged
+    }
+
+    #[test]
+    fn equivocation_below_frontier_foreign_node_rejected() {
+        // Direct regression for the foreign-axis equivocation hole: an equivocating
+        // op (same FOREIGN author + node_seq, different body) delivered BELOW the
+        // frontier must be rejected as NodeEquivocation, not silently accepted as
+        // AlreadyKnown. Pre-fix `get_node_log_entry(foreign, seq)` was always None
+        // (foreign ops never reached node_log), so the fork was swallowed.
+        with_tmp_home(|| {
+            let node_a = make_convergence_node(82); // observer
+            let node_b = make_convergence_node(83); // foreign author
+            allow_self_target(&node_a, "core.organization");
+            allow_self_target(&node_b, "core.organization");
+            let b_id = node_b.node_id().to_string();
+
+            // Author B mints a dense chain of 5 ops (node_seq 1..=5) and ships them
+            // to A, which advances B's frontier to 5.
+            let base = now_ms();
+            let mut chain: Vec<SyncOperation> = Vec::new();
+            for seq in 1..=5u64 {
+                let capture = org_capture(
+                    "org-equiv",
+                    &format!("b-real-{seq}"),
+                    hlc_at(base + seq as i64, 0, &b_id),
+                );
+                let result = node_b
+                    .runtime
+                    .record_core_capture(capture)
+                    .expect("author chain op");
+                chain.push(
+                    node_b
+                        .runtime
+                        .ledger
+                        .get_operation(result.op_id)
+                        .expect("authored op"),
+                );
+            }
+            for op in &chain {
+                deliver(&node_a, &b_id, std::slice::from_ref(op)).expect("deliver real chain");
+            }
+
+            let frontier_before = node_a
+                .runtime
+                .ledger
+                .get_node_frontier(&b_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(frontier_before.last_seq, 5, "B frontier must be at seq 5");
+            let materialized_before = read_org_name(&node_a, "org-equiv");
+
+            // Forge a DIFFERENT op at the already-recorded seq=3 and deliver it.
+            // It is below the frontier, so admission must compare against the op we
+            // actually recorded at (B, 3) — which now lives on node_log because
+            // foreign admission writes the per-node axis — and reject the fork.
+            let original_seq3 = &chain[2];
+            assert_eq!(original_seq3.body.node_seq, 3, "third op is seq 3");
+            let forged = forge_equivocation(&node_b, original_seq3, "b-FORK-3");
+
+            let err = deliver(&node_a, &b_id, std::slice::from_ref(&forged))
+                .expect_err("equivocation below frontier must be rejected");
+            assert!(
+                matches!(&err, SyncLedgerError::NodeEquivocation { node, node_seq, .. }
+                    if *node == b_id && *node_seq == 3),
+                "expected NodeEquivocation at (B, 3), got {err:?}"
+            );
+
+            // Frontier and materialized state are untouched by the rejected fork.
+            let frontier_after = node_a
+                .runtime
+                .ledger
+                .get_node_frontier(&b_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(
+                frontier_after, frontier_before,
+                "rejected equivocation must not move B's frontier"
+            );
+            assert_eq!(
+                read_org_name(&node_a, "org-equiv"),
+                materialized_before,
+                "rejected equivocation must not alter materialized state"
+            );
+            // The forged op_id must never have been recorded on A's view of B.
+            assert!(
+                node_a.runtime.ledger.get_operation(forged.op_id).is_err(),
+                "forged op must not be stored after rejection"
+            );
+        });
+    }
+
+    #[test]
+    fn foreign_chain_relayable_after_admission() {
+        // Once foreign ops are admitted they must be content-resolvable from the
+        // per-node axis (`operations` via `node_log`), so this node can relay /
+        // escalate a snapshot of a FOREIGN chain. Pre-fix foreign bodies lived only
+        // in the inbox and `get_node_operations` returned nothing for them.
+        with_tmp_home(|| {
+            let node_a = make_convergence_node(84); // relay node
+            let node_b = make_convergence_node(85); // foreign author
+            allow_self_target(&node_a, "core.organization");
+            allow_self_target(&node_b, "core.organization");
+            let b_id = node_b.node_id().to_string();
+
+            let base = now_ms();
+            let mut expected_ids: Vec<OperationId> = Vec::new();
+            for seq in 1..=4u64 {
+                let capture = org_capture(
+                    "org-relay",
+                    &format!("b-{seq}"),
+                    hlc_at(base + seq as i64, 0, &b_id),
+                );
+                let result = node_b
+                    .runtime
+                    .record_core_capture(capture)
+                    .expect("author op");
+                let op = node_b
+                    .runtime
+                    .ledger
+                    .get_operation(result.op_id)
+                    .expect("authored op");
+                expected_ids.push(op.op_id);
+                deliver(&node_a, &b_id, std::slice::from_ref(&op)).expect("deliver to relay");
+            }
+
+            // A holds the FULL foreign chain by author + node_seq, body resolvable.
+            let relayable = node_a
+                .runtime
+                .ledger
+                .get_node_operations(NodeLogQuery {
+                    node_id: b_id.clone(),
+                    from_node_seq: Some(1),
+                    to_node_seq: None,
+                    limit: None,
+                })
+                .expect("foreign chain query");
+            assert_eq!(
+                relayable.len(),
+                4,
+                "relay node must hold the complete foreign chain after admission"
+            );
+            for (idx, op) in relayable.iter().enumerate() {
+                assert_eq!(op.body.actor_node_id, b_id);
+                assert_eq!(op.body.node_seq, (idx + 1) as u64);
+                assert!(
+                    expected_ids.contains(&op.op_id),
+                    "relayed op must match an authored op_id"
+                );
+            }
+            // earliest_live_node_seq sees foreign content too (relay floor).
+            assert_eq!(
+                node_a
+                    .runtime
+                    .ledger
+                    .earliest_live_node_seq(&b_id)
+                    .expect("earliest live seq"),
+                Some(1),
+                "relay floor must reach the foreign chain genesis"
+            );
+        });
+    }
+
+    /// Authors a shared-secret (`external-credentials` partition) write on `node`:
+    /// builds the op on the node's own per-node chain with the supplied HLC and
+    /// materializes it locally (recording the resource version), exactly as a real
+    /// authoring node does. Returns the operation ready to ship to a peer.
+    ///
+    /// HLCs are passed by the caller from a `now_ms()` base so they sit above any
+    /// baseline version a real write transaction would stamp — concurrent writes
+    /// in production differ by small deltas at that scale, which is what this
+    /// mirrors.
+    fn author_shared_secret(
+        node: &ConvergenceNode,
+        key: &str,
+        value: &str,
+        hlc: HybridLogicalTimestamp,
+    ) -> SyncOperation {
+        let mut fields = BTreeMap::new();
+        fields.insert("key".to_string(), FieldValue::String(key.to_string()));
+        fields.insert("value".to_string(), FieldValue::String(value.to_string()));
+        let capture = crate::sync::core_capture::CoreWriteCapture::new(
+            crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
+            "org-default",
+            key,
+            SqlWriteAction::Insert,
+            fields,
+            None,
+            hlc,
+            test_epoch(),
+        );
+        let result = node
+            .runtime
+            .record_core_capture(capture)
+            .expect("author shared secret op");
+        let operation = node
+            .runtime
+            .ledger
+            .get_operation(result.op_id)
+            .expect("authored shared secret op");
+        // A real authoring node also materializes its own write, which records the
+        // resource's HLC in `core_resource_versions`. Without this, the local
+        // write would carry no version and a stale concurrent op from a peer would
+        // wrongly win the LWW gate (which compares against the version table).
+        crate::sync::core_materializer::apply_core_operation(
+            &node.runtime.db,
+            &node.runtime.settings_cipher,
+            &operation,
+        )
+        .expect("materialize own shared secret");
+        operation
+    }
+
+    #[test]
+    fn convergence_equivocation_is_rejected() {
+        // Byzantine fork: the SAME author signs two DIFFERENT histories. A node is
+        // single-writer over its own chain, so a second op at node_seq=2 that does
+        // NOT chain onto the seq=1 the victim already accepted can only mean the
+        // author forked its history. Admission must reject it (the per-node chain's
+        // hash link is exactly what catches this) and the accepted op must stand.
+        with_tmp_home(|| {
+            let victim = make_convergence_node(91);
+            allow_self_target(&victim, "core.organization");
+
+            // The honest author: real seq1 → seq2 chain.
+            let honest = make_convergence_node(90);
+            let author_id = honest.node_id().to_string();
+            let honest_op1 = {
+                let cap = org_capture("org-alpha", "honest-1", hlc_at(7_000, 0, &author_id));
+                let r = honest.runtime.record_core_capture(cap).expect("honest1");
+                honest.runtime.ledger.get_operation(r.op_id).expect("h1")
+            };
+            let honest_op2 = {
+                let cap = org_capture("org-alpha", "honest-2", hlc_at(7_001, 0, &author_id));
+                let r = honest.runtime.record_core_capture(cap).expect("honest2");
+                honest.runtime.ledger.get_operation(r.op_id).expect("h2")
+            };
+
+            // The forger: the SAME ed25519 identity over a fresh ledger, so it also
+            // mints seq1 → seq2, but its seq1 has different content (→ different
+            // hash). Its seq2 therefore chains onto a DIFFERENT seq1 than the honest
+            // history — a fork. Sharing the signer makes both histories validly
+            // signed under the same node_id, which is precisely the Byzantine case.
+            let forger = ConvergenceNode {
+                runtime: SyncRuntime {
+                    db: make_db(),
+                    ledger: Arc::new(
+                        FjallSyncLedgerStore::open(
+                            tempfile::tempdir().expect("forge dir").path(),
+                        )
+                        .expect("forge ledger"),
+                    ),
+                    signer: RuntimeSigner {
+                        node_id: author_id.clone(),
+                        security: honest.runtime.signer.security.clone(),
+                    },
+                    local_node_id: author_id.clone(),
+                    settings_cipher: make_settings_cipher(90),
+                    hlc: HlcClock::new(author_id.clone(), None),
+                    addon_reconciler: parking_lot::RwLock::new(None),
+                    max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
+                },
+                _ledger_dir: tempfile::tempdir().expect("forge tempdir"),
+            };
+            // Forged seq1 (different content → different hash than honest seq1).
+            let _forged_op1 = {
+                let cap = org_capture("org-alpha", "EVIL-1", hlc_at(7_500, 0, &author_id));
+                let r = forger.runtime.record_core_capture(cap).expect("evil1");
+                forger.runtime.ledger.get_operation(r.op_id).expect("e1")
+            };
+            let forged_op2 = {
+                let cap = org_capture("org-alpha", "EVIL-2", hlc_at(9_999, 0, &author_id));
+                let r = forger.runtime.record_core_capture(cap).expect("evil2");
+                forger.runtime.ledger.get_operation(r.op_id).expect("e2")
+            };
+            assert_eq!(honest_op2.body.node_seq, 2);
+            assert_eq!(forged_op2.body.node_seq, 2, "fork must reuse seq 2");
+            assert_ne!(
+                honest_op2.body.prev_node_hash, forged_op2.body.prev_node_hash,
+                "the forked seq2 must chain onto a different seq1 — that is the fork"
+            );
+
+            // Victim accepts the honest chain: frontier reaches seq2 = honest_op2.
+            deliver(&victim, &author_id, std::slice::from_ref(&honest_op1))
+                .expect("honest seq1 accepted");
+            deliver(&victim, &author_id, std::slice::from_ref(&honest_op2))
+                .expect("honest seq2 accepted");
+            assert_eq!(read_org_name(&victim, "org-alpha").as_deref(), Some("honest-2"));
+
+            // Now the forged seq2 arrives. Its node_seq (2) is below the frontier
+            // (next expected 3), so it is treated as already-known IF its op_id
+            // matches; here it does not, and the divergent prev-hash means the
+            // author forked. Re-deliver the forged seq2 as a FRESH chain so it lands
+            // at the expected slot and the hash-link guard fires.
+            let fresh_victim = make_convergence_node(92);
+            allow_self_target(&fresh_victim, "core.organization");
+            // Accept the honest seq1 so the next expected is seq2.
+            deliver(&fresh_victim, &author_id, std::slice::from_ref(&honest_op1))
+                .expect("honest seq1 on fresh victim");
+            // The forged seq2 at the expected slot does NOT chain onto honest seq1.
+            let wire = vec![operation_to_wire(&forged_op2).expect("wire")];
+            let err = fresh_victim
+                .runtime
+                .store_incoming_operations(&author_id, wire)
+                .expect_err("forked chain must be rejected");
+            match err {
+                SyncLedgerError::HashChainMismatch { node, node_seq } => {
+                    assert_eq!(node, author_id);
+                    assert_eq!(node_seq, 2);
+                }
+                other => panic!("expected HashChainMismatch (fork), got {other:?}"),
+            }
+
+            // The honest seq1 still stands; the fork did not advance the frontier.
+            let frontier = frontier_snapshot(&fresh_victim, &[author_id.clone()]);
+            assert_eq!(frontier.len(), 1);
+            assert_eq!(frontier[0].1, 1, "frontier must remain at the honest seq1");
+            assert_eq!(
+                read_org_name(&fresh_victim, "org-alpha").as_deref(),
+                Some("honest-1"),
+                "the forged history must not materialize"
+            );
+        });
+    }
+
+    #[test]
+    fn convergence_gap_defers_then_catches_up() {
+        // A chain hole: op at node_seq=3 arrives before 1 and 2. It must NOT apply
+        // prematurely (would gap the chain); it queues a catch-up pull. Once 1 and
+        // 2 are delivered, the whole chain applies in order and state is correct.
+        with_tmp_home(|| {
+            let author = make_convergence_node(100);
+            let target = make_convergence_node(101);
+            allow_self_target(&target, "core.organization");
+            let author_id = author.node_id().to_string();
+
+            // Author a 3-op chain. Use the SAME key so LWW order (by HLC) decides
+            // the final value; give seq 3 the highest HLC so the converged value is
+            // unambiguous once the chain is complete.
+            let op1 = {
+                let cap = org_capture("org-alpha", "seq1", hlc_at(8_000, 0, &author_id));
+                let r = author.runtime.record_core_capture(cap).expect("op1");
+                author.runtime.ledger.get_operation(r.op_id).expect("get op1")
+            };
+            let op2 = {
+                let cap = org_capture("org-alpha", "seq2", hlc_at(8_001, 0, &author_id));
+                let r = author.runtime.record_core_capture(cap).expect("op2");
+                author.runtime.ledger.get_operation(r.op_id).expect("get op2")
+            };
+            let op3 = {
+                let cap = org_capture("org-alpha", "seq3", hlc_at(8_002, 0, &author_id));
+                let r = author.runtime.record_core_capture(cap).expect("op3");
+                author.runtime.ledger.get_operation(r.op_id).expect("get op3")
+            };
+            assert_eq!((op1.body.node_seq, op2.body.node_seq, op3.body.node_seq), (1, 2, 3));
+
+            // Deliver seq 3 FIRST: it is a gap above the expected frontier (1).
+            deliver(&target, &author_id, std::slice::from_ref(&op3)).expect("deliver seq3 early");
+
+            // Nothing applied, frontier still empty, and a repair pull was queued.
+            assert_eq!(
+                read_org_name(&target, "org-alpha"),
+                None,
+                "out-of-order op must not apply prematurely"
+            );
+            assert!(
+                frontier_snapshot(&target, &[author_id.clone()]).is_empty(),
+                "frontier must not advance on a gap"
+            );
+            assert_eq!(
+                total_repair_queue_len(&target, &[author_id.clone()]),
+                1,
+                "a gap must queue exactly one catch-up pull"
+            );
+
+            // Catch-up: deliver 1, then 2. After 2 the contiguous chain 1..=3 is
+            // complete (seq 3 was buffered? no — it was dropped, so redeliver it).
+            deliver(&target, &author_id, std::slice::from_ref(&op1)).expect("deliver seq1");
+            deliver(&target, &author_id, std::slice::from_ref(&op2)).expect("deliver seq2");
+            deliver(&target, &author_id, std::slice::from_ref(&op3)).expect("redeliver seq3");
+
+            // The full chain applied in order; the highest-HLC write (seq3) wins.
+            assert_eq!(
+                read_org_name(&target, "org-alpha").as_deref(),
+                Some("seq3"),
+                "after catch-up the chain applies and LWW picks the latest"
+            );
+            let frontier = frontier_snapshot(&target, &[author_id.clone()]);
+            assert_eq!(frontier.len(), 1);
+            assert_eq!(frontier[0].1, 3, "frontier must reach node_seq 3");
+            let authored = [
+                (author_id.clone(), op1.op_id),
+                (author_id.clone(), op2.op_id),
+                (author_id.clone(), op3.op_id),
+            ];
+            assert_eq!(
+                present_op_count(&target, &authored),
+                3,
+                "all three ops present after catch-up"
             );
         });
     }
