@@ -27,6 +27,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::SyncPolicy
             | CoreSyncResourceKind::SyncResourceAcl
             | CoreSyncResourceKind::SyncUserOrgProfile
+            | CoreSyncResourceKind::SharedSettingSecret
             | CoreSyncResourceKind::AddonInstance
             | CoreSyncResourceKind::AddonConfig
     )
