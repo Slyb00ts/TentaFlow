@@ -41,6 +41,7 @@ async fn vllm_recommend_qwen_05b_fits_single_3090() {
         kv_cache_dtype: "auto".into(),
         gpu_memory_utilization: 0.9,
         activation_overhead_pct: 10.0,
+        ..Default::default()
     };
     let est = estimate_vllm_vram(&spec, &input);
     println!(
@@ -93,6 +94,7 @@ async fn vllm_recommend_gemma4_31b_picks_tp2_pp3_for_6_gpus() {
         kv_cache_dtype: "fp8".into(),
         gpu_memory_utilization: 0.95,
         activation_overhead_pct: 10.0,
+        ..Default::default()
     };
     let est = estimate_vllm_vram(&spec, &input);
     println!(

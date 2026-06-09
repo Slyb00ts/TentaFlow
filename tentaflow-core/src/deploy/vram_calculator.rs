@@ -252,9 +252,28 @@ pub fn detect_quantization(
     detect_quant_from_name(repo)
 }
 
+/// Silnik inferencji dla ktorego liczymy VRAM. Fizyka pamieci rozni sie
+/// fundamentalnie: vLLM trzyma staly ~5 GB workspace per worker, llama.cpp to
+/// jeden proces ze split-mode (compute buffer rzedu setek MB, KV liczony dla
+/// calego `-c`, nie `-c × max_num_seqs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeployEngine {
+    Vllm,
+    LlamaCpp,
+}
+
+impl Default for DeployEngine {
+    fn default() -> Self {
+        DeployEngine::Vllm
+    }
+}
+
 /// Konfiguracja runtime do estymacji.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VramEstimateInput {
+    /// Silnik docelowy — dispatch fizyki VRAM (`estimate_vram`).
+    #[serde(default)]
+    pub engine: DeployEngine,
     pub gpu_count: u32,
     pub gpu_memory_gb_each: f64,
     pub tensor_parallel: u32,
@@ -276,6 +295,7 @@ pub struct VramEstimateInput {
 impl Default for VramEstimateInput {
     fn default() -> Self {
         Self {
+            engine: DeployEngine::default(),
             gpu_count: 1,
             gpu_memory_gb_each: 24.0,
             tensor_parallel: 1,
@@ -305,7 +325,17 @@ pub struct VramEstimate {
     pub warnings: Vec<String>,
 }
 
-/// Glowna funkcja kalkulacji.
+/// Dispatch estymacji VRAM po silniku - fizyka pamieci rozni sie fundamentalnie
+/// (patrz `DeployEngine`). Binary-search budzetu (ctx/seqs/parallel) MUSI isc
+/// przez te funkcje, zeby fizyka odpowiadala faktycznemu silnikowi.
+pub fn estimate_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEstimate {
+    match input.engine {
+        DeployEngine::Vllm => estimate_vllm_vram(model, input),
+        DeployEngine::LlamaCpp => estimate_llamacpp_vram(model, input),
+    }
+}
+
+/// Estymacja VRAM dla vLLM.
 ///
 /// Modeluje cluster-wide totals (weights + kv_cache + activations + overhead) oraz
 /// realistyczne wartosci per-GPU po podziale przez TP*PP. KV cache uwzglednia GQA
@@ -435,6 +465,141 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
     }
 }
 
+/// Fizyczny ubatch llama.cpp (`-ub`, default 512). Compute buffer i logits skaluja
+/// sie z nim, nie z `max_num_seqs`.
+const LLAMACPP_UBATCH: f64 = 512.0;
+/// Realny primary CUDA context per device (GB) — alokowany na kazdej karcie
+/// trzymajacej fragment modelu.
+const LLAMACPP_CUDA_CTX_PER_GPU: f64 = 0.40;
+
+/// Compute buffer llama.cpp (GB): logits dla calego ubatch + scratch aktywacji
+/// grafu. Siedzi glownie na karcie main, dlatego liczony bez podzialu przez GPU.
+fn llamacpp_compute_buffer_gb(model: &ModelSpec) -> f64 {
+    let logits = model.vocab_size as f64 * LLAMACPP_UBATCH * 4.0;
+    // ~6 zywych tensorow aktywacji w grafie forward (residual, attn, mlp...).
+    let scratch = LLAMACPP_UBATCH * model.hidden_size as f64 * 4.0 * 6.0;
+    bytes_to_gib(logits + scratch)
+}
+
+/// Estymacja VRAM dla llama.cpp: jeden proces, multi-GPU przez split-mode.
+/// W przeciwienstwie do vLLM nie ma per-worker workspace ~5 GB — pamiec to wagi
+/// + KV (caly `-c`, NIE razy max_num_seqs) + jeden compute buffer (setki MB) +
+/// primary CUDA context per karta. TP/PP mapuja na liczbe kart w splicie.
+pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEstimate {
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Wagi: GGUF override to dokladny footprint pliku; inaczej params×bytes_per_param.
+    let model_weights_bytes = match input.weights_bytes_override {
+        Some(bytes) => bytes as f64,
+        None => model.estimated_params() as f64 * model.bytes_per_param(),
+    };
+    let weights_gb = bytes_to_gib(model_weights_bytes);
+
+    // KV dla calego kontekstu (-c). llama.cpp dzieli `-c` na `-np` slotow, wiec
+    // total KV = kv_per_token × n_ctx (NIE × max_num_seqs jak w vLLM page-cache).
+    let n_ctx = input.max_model_len;
+    let kv_per_token = kv_bytes_per_seq_per_token(model, &input.kv_cache_dtype);
+    let kv_cache_gb = bytes_to_gib(kv_per_token * n_ctx as f64);
+
+    let compute_buffer_gb = llamacpp_compute_buffer_gb(model);
+
+    // llama.cpp uzywa JEDNEGO split-mode; TP i PP mapuja na liczbe kart splicie.
+    let tp = input.tensor_parallel.max(1);
+    let pp = input.pipeline_parallel.max(1);
+    let gpus_used = ((tp * pp).min(input.gpu_count.max(1))).max(1) as f64;
+
+    let weights_per_gpu = weights_gb / gpus_used;
+    let kv_per_gpu = kv_cache_gb / gpus_used;
+    let overhead_gb = 0.3; // allocator / metadata
+
+    // Cluster-wide activations (do paska UI): compute buffer + CUDA context na kazdej
+    // karcie. To realny zywy footprint, nie sztuczne 5 GB × N jak w modelu vLLM.
+    let activations_gb = compute_buffer_gb + LLAMACPP_CUDA_CTX_PER_GPU * gpus_used;
+    let total_gb = weights_gb + kv_cache_gb + activations_gb + overhead_gb;
+
+    // Per-GPU konserwatywnie: compute buffer + logits siedza glownie na main GPU,
+    // wiec pelny compute liczymy na najciezszej karcie.
+    let per_gpu_gb = weights_per_gpu + kv_per_gpu + compute_buffer_gb + LLAMACPP_CUDA_CTX_PER_GPU;
+
+    if tp > 1 && pp > 1 {
+        warnings.push(format!(
+            "llama.cpp nie laczy split-mode row+layer jednoczesnie; uzyto row na wszystkich {} kartach",
+            gpus_used as u32
+        ));
+    }
+
+    // Domyslnie liczymy layer-split (KV shardsuje sie rowno). Gdy user wymusil
+    // row (TP>1), KV nie dzieli sie liniowo - main GPU dostaje wiekszy fragment,
+    // wiec model VRAM (kv/gpus_used) zanizają realne zuzycie na main GPU.
+    if tp > 1 {
+        warnings.push(
+            "split-mode row: KV cache nie dzieli sie rowno miedzy karty (main GPU ciezsza) \
+             - przy dlugim kontekscie mozliwy OOM na main GPU; rozwaz split-mode layer \
+             (pipeline_parallel)"
+                .to_string(),
+        );
+    }
+
+    // Zadany split przekracza liczbe kart - estymata uzyla gpus_used (capped),
+    // realny deploy nie ma tylu GPU dla shardow.
+    if tp.max(1) * pp.max(1) > input.gpu_count {
+        warnings.push(format!(
+            "zadany split (TP×PP={}) przekracza liczbe GPU {} - uzyto {} kart",
+            tp.max(1) * pp.max(1),
+            input.gpu_count,
+            gpus_used as u32
+        ));
+    }
+
+    if gpus_used < input.gpu_count as f64 {
+        warnings.push(format!(
+            "pozostale {} GPU nieuzywane",
+            input.gpu_count - gpus_used as u32
+        ));
+    }
+
+    // Compute buffer wymaga vocab_size + hidden_size z metadanych GGUF. Gdy ich
+    // brak liczymy 0 - user musi wiedziec ze ten skladnik jest pominiety.
+    if model.vocab_size == 0 || model.hidden_size == 0 {
+        warnings.push(
+            "compute buffer niepoliczony - brak vocab/hidden w metadanych GGUF".to_string(),
+        );
+    }
+
+    let usable_per_gpu = input.gpu_memory_gb_each * input.gpu_memory_utilization;
+    let fits_per_gpu = per_gpu_gb <= usable_per_gpu;
+    let fits_total = total_gb <= input.gpu_memory_gb_each * input.gpu_count as f64;
+
+    if !fits_per_gpu {
+        warnings.push(format!(
+            "VRAM per GPU {:.1} GB > dostepne {:.1} GB ({}% z {:.1} GB) - OOM przy starcie",
+            per_gpu_gb,
+            usable_per_gpu,
+            (input.gpu_memory_utilization * 100.0) as u32,
+            input.gpu_memory_gb_each
+        ));
+    }
+
+    if model.has_vision || model.has_audio {
+        warnings.push(
+            "Model multimodalny (vision/audio) - projektor mmproj nie jest tu policzony"
+                .to_string(),
+        );
+    }
+
+    VramEstimate {
+        model_weights_gb: weights_gb,
+        kv_cache_gb,
+        activations_gb,
+        overhead_gb,
+        total_gb,
+        per_gpu_gb,
+        fits_per_gpu,
+        fits_total,
+        warnings,
+    }
+}
+
 /// Wynik analizy zgodnosci liczby GPU z architektura modelu. GUI wykorzystuje
 /// to do pokazania warning chip-a "5 GPU nie dzieli sie dobrze - rekomendowane
 /// 4 lub 8" oraz listy sugerowanych counts.
@@ -527,6 +692,29 @@ pub fn analyze_gpu_compatibility(spec: &ModelSpec, gpu_count: u32) -> GpuCompati
     }
 }
 
+/// Wariant `analyze_gpu_compatibility` dla llama.cpp. llama.cpp NIE wymaga
+/// podzielnosci num_attention_heads przez TP ani num_hidden_layers przez PP -
+/// to ograniczenie vLLM. `--split-mode row` dzieli wiersze tensorow dowolnie,
+/// `--split-mode layer` rozklada warstwy po N kartach. Domyslnie wybieramy
+/// layer-split (PP=gpu_count, TP=1) - to natywny default llama.cpp i jedyny
+/// tryb shardujacy KV rowno miedzy karty (warstwa KV zyje na karcie tej warstwy),
+/// wlasciwy na PCIe bez NVLink. Dla N rownych kart uzywamy wszystkich, wiec
+/// partycja jest zawsze "czysta" i nie ma warningow o heads/layers.
+pub fn analyze_gpu_compatibility_llamacpp(
+    _spec: &ModelSpec,
+    gpu_count: u32,
+) -> GpuCompatibilityReport {
+    let gpus = gpu_count.max(1);
+    GpuCompatibilityReport {
+        used_tp: 1,
+        used_pp: gpus,
+        uses_all_gpus: true,
+        clean_partition: true,
+        better_gpu_counts: (1..=gpus).collect(),
+        warning: None,
+    }
+}
+
 /// Smart pick TP/PP dla danej liczby GPU + atrybutow modelu. Strategia:
 /// 1. Jesli gpu_count = 1: TP=1, PP=1.
 /// 2. Sprobuj TP=gpu_count (najprostsze, najnizszy comm overhead).
@@ -572,6 +760,7 @@ pub fn recommend_parallelism(model: &ModelSpec, gpu_count: u32) -> (u32, u32) {
 /// safetensors przekazuje `None` (heurystyka jest tam jedyna dostepna).
 pub fn recommend_parallelism_vram_aware(
     model: &ModelSpec,
+    engine: DeployEngine,
     gpu_count: u32,
     gpu_memory_gb_each: f64,
     gpu_memory_utilization: f64,
@@ -597,6 +786,7 @@ pub fn recommend_parallelism_vram_aware(
 
     for (tp, pp) in &candidates {
         let probe = VramEstimateInput {
+            engine,
             gpu_count,
             gpu_memory_gb_each,
             tensor_parallel: *tp,
@@ -608,7 +798,7 @@ pub fn recommend_parallelism_vram_aware(
             activation_overhead_pct: 10.0,
             weights_bytes_override,
         };
-        let est = estimate_vllm_vram(model, &probe);
+        let est = estimate_vram(model, &probe);
         if est.fits_per_gpu {
             return (*tp, *pp);
         }
@@ -627,6 +817,7 @@ pub fn recommend_parallelism_vram_aware(
 /// moze auto-cap'owac do dopasowania VRAM.
 #[derive(Debug, Clone)]
 pub struct AutoFitRequest {
+    pub engine: DeployEngine,
     pub gpu_count: u32,
     pub gpu_memory_gb_each: f64,
     pub kv_cache_dtype: String,
@@ -667,19 +858,23 @@ pub struct AutoFitOutcome {
 /// 5. Gdy nic nie locked - heurystyka defaults: ctx = min(8k, max_position),
 ///    seqs = 16, oba auto-skalowane do KV budget.
 pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcome {
-    // 1. Wybor TP/PP.
-    let (rec_tp, rec_pp) = recommend_parallelism_vram_aware(
-        model,
-        req.gpu_count,
-        req.gpu_memory_gb_each,
-        req.gpu_memory_utilization,
-        req.weights_bytes_override,
-    );
-    let chosen_tp = if req.lock_tensor_parallel {
-        req.requested_tensor_parallel.unwrap_or(rec_tp)
-    } else {
-        req.requested_tensor_parallel.unwrap_or(rec_tp)
+    // 1. Wybor TP/PP. llama.cpp nie ma ograniczenia podzielnosci heads/layers
+    // (split-mode row/layer dzieli dowolnie), wiec domyslnie uzywamy wszystkich
+    // kart w jednym splicie. Default = layer-split (PP=gpu_count, TP=1): to
+    // natywny tryb llama.cpp i jedyny shardujacy KV rowno (bezpieczny na PCIe
+    // bez NVLink). Jawne TP od usera nadal wygrywa przez requested_*.unwrap_or.
+    let (rec_tp, rec_pp) = match req.engine {
+        DeployEngine::LlamaCpp => (1, req.gpu_count.max(1)),
+        DeployEngine::Vllm => recommend_parallelism_vram_aware(
+            model,
+            req.engine,
+            req.gpu_count,
+            req.gpu_memory_gb_each,
+            req.gpu_memory_utilization,
+            req.weights_bytes_override,
+        ),
     };
+    let chosen_tp = req.requested_tensor_parallel.unwrap_or(rec_tp);
     let chosen_pp = req.requested_pipeline_parallel.unwrap_or(rec_pp);
     let parallel = (chosen_tp.max(1) * chosen_pp.max(1)) as f64;
 
@@ -690,15 +885,29 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     };
     let weights_gb = bytes_to_gib(weights_bytes);
     let weights_per_gpu = weights_gb / parallel;
-    let activations_per_gpu = 5.0 + weights_per_gpu * 0.10;
+    // Activations roznia sie fizyka per silnik: vLLM = staly ~5 GB workspace na
+    // worker + 10% wag; llama.cpp = jeden compute buffer (setki MB) + primary CUDA
+    // context na karte. Bez tego rozdzielenia llama.cpp dziedziczyl falszywe 5 GB.
+    let activations_per_gpu = match req.engine {
+        DeployEngine::Vllm => 5.0 + weights_per_gpu * 0.10,
+        DeployEngine::LlamaCpp => llamacpp_compute_buffer_gb(model) + LLAMACPP_CUDA_CTX_PER_GPU,
+    };
     let usable_per_gpu = req.gpu_memory_gb_each * req.gpu_memory_utilization;
-    let kv_budget_gb = (usable_per_gpu - weights_per_gpu - activations_per_gpu).max(0.0);
+    let kv_budget_per_gpu = (usable_per_gpu - weights_per_gpu - activations_per_gpu).max(0.0);
+    // llama.cpp trzyma JEDEN proces dzielacy `-c` na wszystkie karty, wiec calkowity
+    // budzet KV rosnie liniowo z liczba kart. vLLM liczy budzet per GPU (KV shardsuje
+    // sie symetrycznie z TP/PP) i porownuje per-GPU.
+    let kv_budget_gb = match req.engine {
+        DeployEngine::Vllm => kv_budget_per_gpu,
+        DeployEngine::LlamaCpp => kv_budget_per_gpu * parallel,
+    };
     let kv_budget_bytes = kv_budget_gb * 1024.0 * 1024.0 * 1024.0;
     let kv_per_seq_token = kv_bytes_per_seq_per_token(model, &req.kv_cache_dtype).max(1.0);
 
     if kv_budget_gb <= 0.0 {
         return AutoFitOutcome {
             applied: VramEstimateInput {
+                engine: req.engine,
                 gpu_count: req.gpu_count,
                 gpu_memory_gb_each: req.gpu_memory_gb_each,
                 tensor_parallel: chosen_tp,
@@ -737,15 +946,26 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     let req_ctx = req.requested_max_model_len.unwrap_or(default_ctx).max(512);
     let req_seqs = req.requested_max_num_seqs.unwrap_or(default_seqs).max(1);
 
+    // KV-volume mnoznik per seq: vLLM page-cache trzyma KV osobno per sekwencja
+    // (ctx × seqs), llama.cpp dzieli jeden `-c` na sloty `-np`, wiec KV zalezy
+    // TYLKO od ctx (mnoznik 1). Uzywany wszedzie gdzie liczymy volume KV.
+    let kv_seq_factor = |seqs: u64| -> f64 {
+        match req.engine {
+            DeployEngine::Vllm => seqs as f64,
+            DeployEngine::LlamaCpp => 1.0,
+        }
+    };
+
     // 4. Auto-cap pozostalych params zgodnie z lockami.
     let mut auto_adjusted: Vec<String> = Vec::new();
     let (final_ctx, final_seqs) = match (req.lock_max_model_len, req.lock_max_num_seqs) {
         (true, true) => {
             // Oba locked - sprawdz czy fits.
-            let needed = kv_per_seq_token * req_ctx as f64 * req_seqs as f64;
+            let needed = kv_per_seq_token * req_ctx as f64 * kv_seq_factor(req_seqs);
             if needed > kv_budget_bytes {
                 return AutoFitOutcome {
                     applied: VramEstimateInput {
+                        engine: req.engine,
                         gpu_count: req.gpu_count,
                         gpu_memory_gb_each: req.gpu_memory_gb_each,
                         tensor_parallel: chosen_tp,
@@ -773,17 +993,33 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             (req_ctx, req_seqs)
         }
         (true, false) => {
-            // ctx locked - skaluj seqs.
-            let max_seqs = (kv_budget_bytes / (kv_per_seq_token * req_ctx as f64)).floor() as u64;
-            let capped = max_seqs.max(1).min(req_seqs);
+            // ctx locked - skaluj seqs. Dla llama.cpp sloty `-np` nie konsumuja KV
+            // (jeden `-c` dzielony), wiec kv_seq_factor==1 zostawia req_seqs.
+            let ctx_fits = kv_per_seq_token * req_ctx as f64 <= kv_budget_bytes;
+            let capped = match req.engine {
+                DeployEngine::LlamaCpp => {
+                    if ctx_fits {
+                        req_seqs
+                    } else {
+                        1
+                    }
+                }
+                DeployEngine::Vllm => {
+                    let max_seqs =
+                        (kv_budget_bytes / (kv_per_seq_token * req_ctx as f64)).floor() as u64;
+                    max_seqs.max(1).min(req_seqs)
+                }
+            };
             if capped < req_seqs {
                 auto_adjusted.push("max_num_seqs".into());
             }
             (req_ctx, capped)
         }
         (false, true) => {
-            // seqs locked - skaluj ctx.
-            let max_ctx = (kv_budget_bytes / (kv_per_seq_token * req_seqs as f64)).floor() as u64;
+            // seqs locked - skaluj ctx. Dla llama.cpp ctx liczony z calego budzetu
+            // (seqs nie wchodza w KV), wiec kv_seq_factor==1.
+            let max_ctx =
+                (kv_budget_bytes / (kv_per_seq_token * kv_seq_factor(req_seqs))).floor() as u64;
             let capped = max_ctx.max(512).min(req_ctx);
             if capped < req_ctx {
                 auto_adjusted.push("max_model_len".into());
@@ -803,7 +1039,9 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             let kv_per_seq_full = kv_per_seq_token * req_ctx as f64;
             // Jesli przy zadanym ctx + seqs nie fits - obnizamy seqs (nie ctx).
             // Min 1 seq; jak nie fits przy 1 seq to dopiero kapujemy ctx.
-            if kv_per_seq_full * new_seqs as f64 > kv_budget_bytes {
+            // Dla llama.cpp seqs nie obciazaja KV (kv_seq_factor==1), wiec
+            // ten warunek redukuje seqs tylko dla vLLM.
+            if kv_per_seq_full * kv_seq_factor(new_seqs) > kv_budget_bytes {
                 let max_seqs_at_req_ctx = (kv_budget_bytes / kv_per_seq_full).floor() as u64;
                 new_seqs = max_seqs_at_req_ctx.max(1).min(target_seqs);
                 if new_seqs < target_seqs {
@@ -813,7 +1051,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             // Teraz wyznacz max ctx ktory fits przy ustalonym new_seqs. Bierzemy
             // wieksze z dwojga: req_ctx (jak fits) lub max mozliwy z VRAM.
             let max_ctx_from_vram =
-                (kv_budget_bytes / (kv_per_seq_token * new_seqs as f64)).floor() as u64;
+                (kv_budget_bytes / (kv_per_seq_token * kv_seq_factor(new_seqs))).floor() as u64;
             let max_ctx_capped = max_ctx_from_vram.min(model_ctx_ceiling);
             let final_ctx_unlocked = req_ctx.max(max_ctx_capped).min(max_ctx_from_vram).max(512);
             // Round down do wielokrotnosci 1024 zeby konfiguracja wygladala czysto.
@@ -825,27 +1063,14 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
         }
     };
 
-    // TP auto-adjust: gdy nie-locked i recommend_vram_aware wybral inny niz request.
-    if !req.lock_tensor_parallel {
-        if let Some(rt) = req.requested_tensor_parallel {
-            if rt != chosen_tp {
-                // user prosil ale zostal nadpisany - oznaczamy jako adjusted.
-                // (Aktualnie chosen_tp == requested gdy podany; ten branch zostawiamy
-                // na przyszlosc gdyby logika selekcji zmienila TP automatycznie.)
-            }
-        } else if rec_tp != 1 {
-            // TP wybrany przez heurystyke (nie z request) - to nie jest auto-adjust
-            // wzgledem requesta, wiec nie dodajemy do listy.
-        }
-    }
-
     // 5. at_limit: cokolwiek dopasowane albo headroom < 5%.
-    let used_kv_bytes = kv_per_seq_token * final_ctx as f64 * final_seqs as f64;
+    let used_kv_bytes = kv_per_seq_token * final_ctx as f64 * kv_seq_factor(final_seqs);
     let headroom = (kv_budget_bytes - used_kv_bytes) / kv_budget_bytes.max(1.0);
     let at_limit = !auto_adjusted.is_empty() || headroom < 0.05;
 
     AutoFitOutcome {
         applied: VramEstimateInput {
+            engine: req.engine,
             gpu_count: req.gpu_count,
             gpu_memory_gb_each: req.gpu_memory_gb_each,
             tensor_parallel: chosen_tp,
@@ -896,7 +1121,7 @@ pub fn max_context_for_budget(model: &ModelSpec, input: &VramEstimateInput) -> u
         let mid = (lo + hi) / 2;
         let mut try_input = input.clone();
         try_input.max_model_len = mid;
-        let est = estimate_vllm_vram(model, &try_input);
+        let est = estimate_vram(model, &try_input);
         if est.fits_per_gpu {
             lo = mid;
         } else {
@@ -914,7 +1139,7 @@ pub fn max_concurrent_seqs_for_budget(model: &ModelSpec, input: &VramEstimateInp
         let mid = (lo + hi) / 2;
         let mut try_input = input.clone();
         try_input.max_num_seqs = mid;
-        let est = estimate_vllm_vram(model, &try_input);
+        let est = estimate_vram(model, &try_input);
         if est.fits_per_gpu {
             lo = mid;
         } else {
@@ -1128,6 +1353,51 @@ pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> St
             }
             _ => {}
         }
+    }
+
+    parts.join(" ")
+}
+
+/// Buduje argumenty CLI llama.cpp (`llama-server`) z dopasowanej konfiguracji.
+/// Split-mode mapuje TP/PP na fizyczny rozklad jednego procesu na karty.
+/// Karty zakladamy rowne, wiec `--tensor-split` pomijamy.
+pub fn build_llamacpp_args_string(_spec: &ModelSpec, input: &VramEstimateInput) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    parts.push("-c".into());
+    parts.push(input.max_model_len.to_string());
+    parts.push("-ngl".into());
+    parts.push("999".into());
+    parts.push("-b".into());
+    parts.push("512".into());
+
+    if input.max_num_seqs > 1 {
+        parts.push("-np".into());
+        parts.push(input.max_num_seqs.to_string());
+    }
+
+    let tp = input.tensor_parallel.max(1);
+    let pp = input.pipeline_parallel.max(1);
+    let split_mode = match (tp > 1, pp > 1) {
+        // llama.cpp nie laczy row+layer; przy obu>1 padamy na row (warning w estimate).
+        (true, true) => "row",
+        (true, false) => "row",
+        (false, true) => "layer",
+        (false, false) => "none",
+    };
+    parts.push("--split-mode".into());
+    parts.push(split_mode.into());
+
+    // KV cache dtype: llama.cpp uzywa osobnych flag dla K i V.
+    if input.kv_cache_dtype != "auto" {
+        let cache_type = match input.kv_cache_dtype.as_str() {
+            "fp8" | "fp8_e5m2" | "fp8_e4m3" => "q8_0",
+            other => other,
+        };
+        parts.push("--cache-type-k".into());
+        parts.push(cache_type.into());
+        parts.push("--cache-type-v".into());
+        parts.push(cache_type.into());
     }
 
     parts.join(" ")
@@ -1636,6 +1906,97 @@ mod tests {
         }
     }
 
+    fn qwen36_27b_q4() -> ModelSpec {
+        ModelSpec {
+            model_type: "qwen3moe".into(),
+            architectures: vec!["Qwen3MoeForCausalLM".into()],
+            dtype: "bfloat16".into(),
+            hidden_size: 5120,
+            num_attention_heads: 40,
+            num_key_value_heads: 8,
+            num_hidden_layers: 64,
+            vocab_size: 151936,
+            head_dim: 128,
+            intermediate_size: 25600,
+            max_position_embeddings: 262144,
+            quantization: Some("int4".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn llamacpp_qwen36_27b_q4_total_is_realistic_not_vllm_inflated() {
+        // Regresja: vLLM model raportowal 41.6 GB "aktywacji" (5 GB × 8 GPU) i ~57 GB
+        // total dla deployu llama.cpp. Fizyka llama.cpp (jeden proces, compute buffer
+        // setki MB, KV dla calego -c) musi dac total ~18-21 GB i activations ~3-4 GB.
+        let m = qwen36_27b_q4();
+        let input = VramEstimateInput {
+            engine: DeployEngine::LlamaCpp,
+            gpu_count: 8,
+            gpu_memory_gb_each: 8.0,
+            tensor_parallel: 8,
+            pipeline_parallel: 1,
+            max_model_len: 1024,
+            max_num_seqs: 1,
+            kv_cache_dtype: "auto".into(),
+            gpu_memory_utilization: 0.9,
+            activation_overhead_pct: 10.0,
+            // 15.9 GB Q4 footprint pliku .gguf.
+            weights_bytes_override: Some((15.9 * 1024.0 * 1024.0 * 1024.0) as u64),
+        };
+        let est = estimate_llamacpp_vram(&m, &input);
+        assert!(
+            (est.model_weights_gb - 15.9).abs() < 0.1,
+            "wagi GGUF override: {}",
+            est.model_weights_gb
+        );
+        assert!(
+            est.total_gb > 18.0 && est.total_gb < 21.0,
+            "total ma byc ~20 GB (nie 57 GB vLLM): {}",
+            est.total_gb
+        );
+        assert!(
+            est.activations_gb > 3.0 && est.activations_gb < 4.5,
+            "activations (compute+cuda) ~3-4 GB (nie 41.6 GB): {}",
+            est.activations_gb
+        );
+    }
+
+    #[test]
+    fn estimate_vram_dispatches_per_engine() {
+        let m = qwen36_27b_q4();
+        let base = VramEstimateInput {
+            gpu_count: 8,
+            gpu_memory_gb_each: 24.0,
+            tensor_parallel: 8,
+            max_model_len: 1024,
+            max_num_seqs: 1,
+            weights_bytes_override: Some((15.9 * 1024.0 * 1024.0 * 1024.0) as u64),
+            ..Default::default()
+        };
+        let vllm = estimate_vram(
+            &m,
+            &VramEstimateInput {
+                engine: DeployEngine::Vllm,
+                ..base.clone()
+            },
+        );
+        let llama = estimate_vram(
+            &m,
+            &VramEstimateInput {
+                engine: DeployEngine::LlamaCpp,
+                ..base
+            },
+        );
+        // vLLM dziedziczy ~5 GB workspace × 8 GPU -> activations wielokrotnie wyzsze.
+        assert!(
+            vllm.activations_gb > llama.activations_gb * 5.0,
+            "vLLM activations {} vs llama.cpp {}",
+            vllm.activations_gb,
+            llama.activations_gb
+        );
+    }
+
     #[test]
     fn nvfp4_does_not_force_quantization_flag() {
         // Label nvfp4 jest dwuznaczny (modelopt vs compressed-tensors); vLLM
@@ -1774,6 +2135,67 @@ mod tests {
         assert!(r.better_gpu_counts.contains(&8));
         // 3 nie powinno byc na liscie better
         assert!(!r.better_gpu_counts.contains(&3));
+    }
+
+    #[test]
+    fn analyze_gpu_compat_llamacpp_no_heads_layers_warning() {
+        // Architektura ktora vLLM odrzuca dla 8 GPU (24 % 8 != 0 i 65 % 8 != 0):
+        // recommend_parallelism dalby fallback TP=1 PP=8. Dla llama.cpp split-mode
+        // layer/row dzieli dowolnie, wiec uzywamy wszystkich kart bez warningu.
+        // Default = layer-split (TP=1, PP=gpu_count).
+        let m = ModelSpec {
+            num_attention_heads: 24,
+            num_key_value_heads: 4,
+            num_hidden_layers: 65,
+            ..Default::default()
+        };
+        let r = analyze_gpu_compatibility_llamacpp(&m, 8);
+        assert_eq!(r.used_tp, 1);
+        assert_eq!(r.used_pp, 8);
+        assert!(r.uses_all_gpus);
+        assert!(r.clean_partition);
+        assert!(
+            r.warning.is_none(),
+            "llama.cpp na 8 kartach nie ma ograniczen podzielnosci: {r:?}"
+        );
+        // Kazda liczba kart 1..=8 dziala dla llama.cpp.
+        assert_eq!(r.better_gpu_counts, (1..=8).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn auto_fit_llamacpp_uses_all_gpus_without_head_divisibility() {
+        let m = ModelSpec {
+            num_attention_heads: 24,
+            num_key_value_heads: 4,
+            num_hidden_layers: 65,
+            hidden_size: 4096,
+            max_position_embeddings: 32768,
+            ..Default::default()
+        };
+        let req = AutoFitRequest {
+            engine: DeployEngine::LlamaCpp,
+            gpu_count: 8,
+            gpu_memory_gb_each: 8.0,
+            kv_cache_dtype: "auto".into(),
+            gpu_memory_utilization: 0.9,
+            requested_max_model_len: None,
+            requested_max_num_seqs: None,
+            requested_tensor_parallel: None,
+            requested_pipeline_parallel: None,
+            lock_max_model_len: false,
+            lock_max_num_seqs: false,
+            lock_tensor_parallel: false,
+            weights_bytes_override: Some(16 * 1024 * 1024 * 1024),
+        };
+        let out = auto_fit_config(&m, &req);
+        assert_eq!(
+            out.applied.pipeline_parallel, 8,
+            "llama.cpp domyslnie uzywa wszystkich kart w layer-split (PP=gpu_count): {out:?}"
+        );
+        assert_eq!(
+            out.applied.tensor_parallel, 1,
+            "llama.cpp default to layer-split, nie row (TP=1): {out:?}"
+        );
     }
 
     #[test]
@@ -1919,6 +2341,7 @@ mod tests {
     fn gemma2_27b_fits_on_4x24gb_at_32k_ctx() {
         let m = gemma2_27b_like();
         let req = AutoFitRequest {
+            engine: DeployEngine::Vllm,
             gpu_count: 4,
             gpu_memory_gb_each: 24.0,
             kv_cache_dtype: "auto".into(),
@@ -1971,6 +2394,7 @@ mod tests {
         let fit = auto_fit_config(
             &m,
             &AutoFitRequest {
+                engine: DeployEngine::Vllm,
                 gpu_count: 4,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
@@ -2001,6 +2425,7 @@ mod tests {
         let fit = auto_fit_config(
             &m,
             &AutoFitRequest {
+                engine: DeployEngine::Vllm,
                 gpu_count: 4,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
@@ -2031,6 +2456,7 @@ mod tests {
         let fit = auto_fit_config(
             &m,
             &AutoFitRequest {
+                engine: DeployEngine::Vllm,
                 gpu_count: 2,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
@@ -2060,6 +2486,7 @@ mod tests {
         let fit = auto_fit_config(
             &m,
             &AutoFitRequest {
+                engine: DeployEngine::Vllm,
                 gpu_count: 4,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
@@ -2107,6 +2534,7 @@ mod tests {
         let fit = auto_fit_config(
             &m,
             &AutoFitRequest {
+                engine: DeployEngine::Vllm,
                 gpu_count: 1,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
@@ -2294,6 +2722,7 @@ mod tests {
         m.quantization = Some("nvfp4".into());
 
         let input = VramEstimateInput {
+            engine: DeployEngine::default(),
             gpu_count: 4,
             gpu_memory_gb_each: 24.0,
             tensor_parallel: 2,
@@ -2329,6 +2758,7 @@ mod tests {
         let fit = auto_fit_config(
             &m,
             &AutoFitRequest {
+                engine: DeployEngine::Vllm,
                 gpu_count: 4,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),

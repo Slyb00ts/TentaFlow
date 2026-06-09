@@ -3906,9 +3906,11 @@ pub async fn deploy_vllm_recommend(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     use crate::deploy::vram_calculator::{
-        analyze_gpu_compatibility, auto_fit_config, build_vllm_args_string, estimate_vllm_vram,
-        fetch_gguf_spec, fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
-        parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest,
+        analyze_gpu_compatibility, analyze_gpu_compatibility_llamacpp, auto_fit_config,
+        build_llamacpp_args_string, build_vllm_args_string, estimate_vram, fetch_gguf_spec,
+        fetch_hf_config,
+        max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config_with_override,
+        AutoFitOutcome, AutoFitRequest, DeployEngine,
     };
 
     let payload = match req {
@@ -3941,6 +3943,21 @@ pub async fn deploy_vllm_recommend(
     let looks_gguf = payload.gguf_file.is_some()
         || model_lower.ends_with("-gguf")
         || model_lower.contains("gguf");
+
+    // Silnik: jawny `engine=llama-cpp` z requestu albo wykryty GGUF -> llama.cpp.
+    // GGUF deployuje sie wylacznie na llama.cpp, wiec jego fizyka VRAM jest tu
+    // jedyna poprawna. Normalizujemy etykiete (case + '.'/'-') zeby `llama.cpp`,
+    // `llamacpp`, `LLAMA-CPP` trafialy w ta sama galez zamiast cicho spadac na vLLM.
+    let eng_norm = payload
+        .engine
+        .as_deref()
+        .map(|s| s.to_lowercase().replace('.', "-"));
+    let engine = if matches!(eng_norm.as_deref(), Some("llama-cpp") | Some("llamacpp")) || looks_gguf
+    {
+        DeployEngine::LlamaCpp
+    } else {
+        DeployEngine::Vllm
+    };
 
     let (spec, weights_override) = if looks_gguf {
         let gguf_file = payload.gguf_file.clone().ok_or_else(|| {
@@ -3996,6 +4013,7 @@ pub async fn deploy_vllm_recommend(
     let fit = auto_fit_config(
         &spec,
         &AutoFitRequest {
+            engine,
             gpu_count,
             gpu_memory_gb_each: gpu_memory_gb,
             kv_cache_dtype: kv_dtype.clone(),
@@ -4023,7 +4041,7 @@ pub async fn deploy_vllm_recommend(
     // kalkulator z `fits=false` + ostrzezeniem. Inaczej kafelek nie mieszczacy
     // sie w VRAM gubil caly kalkulator (user nie widzial rozkladu ani nie mogl
     // zmienic quant/ctx/GPU zeby go dopasowac).
-    let mut estimate = estimate_vllm_vram(&spec, &applied_input);
+    let mut estimate = estimate_vram(&spec, &applied_input);
     if let Some(err) = fit_error {
         estimate.fits_per_gpu = false;
         estimate.fits_total = false;
@@ -4031,13 +4049,21 @@ pub async fn deploy_vllm_recommend(
     }
     let max_supported_model_len = max_context_for_budget(&spec, &applied_input);
     let max_supported_num_seqs = max_concurrent_seqs_for_budget(&spec, &applied_input);
-    let recommended_vllm_args = build_vllm_args_string(&spec, &applied_input);
+    // Pole odpowiedzi zostaje `recommended_vllm_args`, ale dla llama.cpp niesie jego
+    // argumenty CLI (frontend czyta to pole niezaleznie od silnika).
+    let recommended_vllm_args = match engine {
+        DeployEngine::LlamaCpp => build_llamacpp_args_string(&spec, &applied_input),
+        DeployEngine::Vllm => build_vllm_args_string(&spec, &applied_input),
+    };
 
     let estimated_params = spec.estimated_params() as f64 / 1_000_000_000.0;
     let bytes_per_param = spec.bytes_per_param();
 
     let mut warnings = estimate.warnings.clone();
-    let gpu_compat = analyze_gpu_compatibility(&spec, gpu_count);
+    let gpu_compat = match engine {
+        DeployEngine::LlamaCpp => analyze_gpu_compatibility_llamacpp(&spec, gpu_count),
+        DeployEngine::Vllm => analyze_gpu_compatibility(&spec, gpu_count),
+    };
     if let Some(w) = &gpu_compat.warning {
         warnings.push(w.clone());
     }
@@ -4171,6 +4197,7 @@ pub async fn engine_recommend(
             }
             use crate::deploy::vram_calculator::{
                 auto_fit_config, fetch_hf_config, parse_hf_config_with_override, AutoFitRequest,
+                DeployEngine,
             };
 
             let client = reqwest::Client::builder()
@@ -4194,6 +4221,7 @@ pub async fn engine_recommend(
                 .fold(f64::INFINITY, f64::min);
 
             let req_fit = AutoFitRequest {
+                engine: DeployEngine::Vllm,
                 gpu_count,
                 gpu_memory_gb_each: gpu_memory_gb,
                 kv_cache_dtype: "auto".to_string(),
