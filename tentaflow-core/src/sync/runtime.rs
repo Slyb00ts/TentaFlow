@@ -144,7 +144,7 @@ pub fn init(
 ) -> LedgerResult<Arc<SyncRuntime>> {
     let ledger_path = paths::tentaflow_home().join("sync").join("ledger");
     let ledger = Arc::new(FjallSyncLedgerStore::open(&ledger_path)?);
-    let schema_wiped = ledger.schema_wiped();
+    let needs_baseline_reset = ledger.needs_baseline_reset();
     let local_node_id = signer.ed25519_public_key_hex();
     repository::ensure_local_node_in_sync_identity(&db, &local_node_id, &local_node_id)
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -176,9 +176,20 @@ pub fn init(
     // the old chain. Bumping the epoch fences the pre-upgrade history, then the
     // reseed re-emits the current SQLite state under that fresh epoch — restarting
     // node_seq at 1 is safe because no live peer accepts ops under the old epoch.
-    if schema_wiped {
-        if let Err(e) = runtime.perform_core_baseline_reset(None) {
-            warn!("sync runtime: post-wipe baseline reseed failed: {e}");
+    //
+    // The "needs reset" signal is the DURABLE on-disk marker, not the in-memory
+    // wipe flag: if a prior boot stamped schema v2 and crashed before this reseed
+    // finished, the marker is still set and we repeat the (idempotent) reseed.
+    // The marker is cleared ONLY after a successful bump+reseed, so any crash in
+    // the window leaves it set for the next boot.
+    if needs_baseline_reset {
+        match runtime.perform_core_baseline_reset(None) {
+            Ok(_) => {
+                if let Err(e) = runtime.ledger.clear_baseline_reset_marker() {
+                    warn!("sync runtime: clearing baseline reset marker failed: {e}");
+                }
+            }
+            Err(e) => warn!("sync runtime: post-wipe baseline reseed failed: {e}"),
         }
     }
     Ok(runtime)
@@ -1410,6 +1421,8 @@ impl SyncRuntime {
             // look the incoming op up by its own op_id: ops are content-addressed,
             // so an equivocating op (same (node, seq), different body) has a
             // different op_id and a by-op_id lookup would silently miss the fork.
+            // `admit_verified_operation` records foreign ops on `node_log` too, so
+            // this lookup resolves for foreign authors — not just the local node.
             match self.ledger.get_node_log_entry(node_id, node_seq)? {
                 Some(stored) if stored != operation.op_id => {
                     return Err(SyncLedgerError::NodeEquivocation {
@@ -1420,8 +1433,11 @@ impl SyncRuntime {
                     });
                 }
                 // stored == incoming: idempotent re-delivery of the op we hold.
-                // None: that seq was compacted away, so we can no longer prove
-                // either way — treat as known (the chain head past it stands).
+                // None: compaction reaps the content row but KEEPS the node_log
+                // entry, so a compacted seq still resolves here; None means we
+                // genuinely never held this position (e.g. caught up via a snapshot
+                // that skipped the prefix) and cannot prove either way — treat as
+                // known (the chain head past it stands).
                 _ => return Ok(NodeAdmission::AlreadyKnown),
             }
         }
@@ -9535,6 +9551,204 @@ mod tests {
                 total_repair_queue_len(&node_b, &[a_id]),
                 0,
                 "legal concurrent write must not queue a repair on B"
+            );
+        });
+    }
+
+    /// Forges an equivocating operation: a SECOND, distinct op that the same
+    /// author signs at an ALREADY-USED `(node, node_seq)`. We start from a real op
+    /// the author minted, change one content field (so the canonical hash, and thus
+    /// the op_id, differ), recompute hash/op_id, and re-sign with the author's
+    /// signer. This is exactly the Byzantine fork admission must reject below the
+    /// frontier — and the bug it guards: without foreign ops on the per-node axis,
+    /// the lookup at that seq was always None and the fork slipped through as
+    /// AlreadyKnown.
+    fn forge_equivocation(
+        author: &ConvergenceNode,
+        original: &SyncOperation,
+        new_value: &str,
+    ) -> SyncOperation {
+        let mut body = original.body.clone();
+        body.changed_fields
+            .insert("name".to_string(), FieldValue::String(new_value.to_string()));
+        let operation_hash =
+            crate::sync::ledger::hash_canonical(&body).expect("hash forged body");
+        let op_id = OperationId::from_hash(operation_hash);
+        let mut forged = SyncOperation {
+            op_id,
+            operation_hash,
+            body,
+            signature: Vec::new(),
+        };
+        forged.signature = author
+            .runtime
+            .signer
+            .sign_operation(&forged.signing_bytes())
+            .expect("sign forged op");
+        forged.validate_integrity().expect("forged op self-consistent");
+        assert_ne!(
+            forged.op_id, original.op_id,
+            "forged op must differ from the original at the same (node, seq)"
+        );
+        forged
+    }
+
+    #[test]
+    fn equivocation_below_frontier_foreign_node_rejected() {
+        // Direct regression for the foreign-axis equivocation hole: an equivocating
+        // op (same FOREIGN author + node_seq, different body) delivered BELOW the
+        // frontier must be rejected as NodeEquivocation, not silently accepted as
+        // AlreadyKnown. Pre-fix `get_node_log_entry(foreign, seq)` was always None
+        // (foreign ops never reached node_log), so the fork was swallowed.
+        with_tmp_home(|| {
+            let node_a = make_convergence_node(82); // observer
+            let node_b = make_convergence_node(83); // foreign author
+            allow_self_target(&node_a, "core.organization");
+            allow_self_target(&node_b, "core.organization");
+            let b_id = node_b.node_id().to_string();
+
+            // Author B mints a dense chain of 5 ops (node_seq 1..=5) and ships them
+            // to A, which advances B's frontier to 5.
+            let base = now_ms();
+            let mut chain: Vec<SyncOperation> = Vec::new();
+            for seq in 1..=5u64 {
+                let capture = org_capture(
+                    "org-equiv",
+                    &format!("b-real-{seq}"),
+                    hlc_at(base + seq as i64, 0, &b_id),
+                );
+                let result = node_b
+                    .runtime
+                    .record_core_capture(capture)
+                    .expect("author chain op");
+                chain.push(
+                    node_b
+                        .runtime
+                        .ledger
+                        .get_operation(result.op_id)
+                        .expect("authored op"),
+                );
+            }
+            for op in &chain {
+                deliver(&node_a, &b_id, std::slice::from_ref(op)).expect("deliver real chain");
+            }
+
+            let frontier_before = node_a
+                .runtime
+                .ledger
+                .get_node_frontier(&b_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(frontier_before.last_seq, 5, "B frontier must be at seq 5");
+            let materialized_before = read_org_name(&node_a, "org-equiv");
+
+            // Forge a DIFFERENT op at the already-recorded seq=3 and deliver it.
+            // It is below the frontier, so admission must compare against the op we
+            // actually recorded at (B, 3) — which now lives on node_log because
+            // foreign admission writes the per-node axis — and reject the fork.
+            let original_seq3 = &chain[2];
+            assert_eq!(original_seq3.body.node_seq, 3, "third op is seq 3");
+            let forged = forge_equivocation(&node_b, original_seq3, "b-FORK-3");
+
+            let err = deliver(&node_a, &b_id, std::slice::from_ref(&forged))
+                .expect_err("equivocation below frontier must be rejected");
+            assert!(
+                matches!(&err, SyncLedgerError::NodeEquivocation { node, node_seq, .. }
+                    if *node == b_id && *node_seq == 3),
+                "expected NodeEquivocation at (B, 3), got {err:?}"
+            );
+
+            // Frontier and materialized state are untouched by the rejected fork.
+            let frontier_after = node_a
+                .runtime
+                .ledger
+                .get_node_frontier(&b_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(
+                frontier_after, frontier_before,
+                "rejected equivocation must not move B's frontier"
+            );
+            assert_eq!(
+                read_org_name(&node_a, "org-equiv"),
+                materialized_before,
+                "rejected equivocation must not alter materialized state"
+            );
+            // The forged op_id must never have been recorded on A's view of B.
+            assert!(
+                node_a.runtime.ledger.get_operation(forged.op_id).is_err(),
+                "forged op must not be stored after rejection"
+            );
+        });
+    }
+
+    #[test]
+    fn foreign_chain_relayable_after_admission() {
+        // Once foreign ops are admitted they must be content-resolvable from the
+        // per-node axis (`operations` via `node_log`), so this node can relay /
+        // escalate a snapshot of a FOREIGN chain. Pre-fix foreign bodies lived only
+        // in the inbox and `get_node_operations` returned nothing for them.
+        with_tmp_home(|| {
+            let node_a = make_convergence_node(84); // relay node
+            let node_b = make_convergence_node(85); // foreign author
+            allow_self_target(&node_a, "core.organization");
+            allow_self_target(&node_b, "core.organization");
+            let b_id = node_b.node_id().to_string();
+
+            let base = now_ms();
+            let mut expected_ids: Vec<OperationId> = Vec::new();
+            for seq in 1..=4u64 {
+                let capture = org_capture(
+                    "org-relay",
+                    &format!("b-{seq}"),
+                    hlc_at(base + seq as i64, 0, &b_id),
+                );
+                let result = node_b
+                    .runtime
+                    .record_core_capture(capture)
+                    .expect("author op");
+                let op = node_b
+                    .runtime
+                    .ledger
+                    .get_operation(result.op_id)
+                    .expect("authored op");
+                expected_ids.push(op.op_id);
+                deliver(&node_a, &b_id, std::slice::from_ref(&op)).expect("deliver to relay");
+            }
+
+            // A holds the FULL foreign chain by author + node_seq, body resolvable.
+            let relayable = node_a
+                .runtime
+                .ledger
+                .get_node_operations(NodeLogQuery {
+                    node_id: b_id.clone(),
+                    from_node_seq: Some(1),
+                    to_node_seq: None,
+                    limit: None,
+                })
+                .expect("foreign chain query");
+            assert_eq!(
+                relayable.len(),
+                4,
+                "relay node must hold the complete foreign chain after admission"
+            );
+            for (idx, op) in relayable.iter().enumerate() {
+                assert_eq!(op.body.actor_node_id, b_id);
+                assert_eq!(op.body.node_seq, (idx + 1) as u64);
+                assert!(
+                    expected_ids.contains(&op.op_id),
+                    "relayed op must match an authored op_id"
+                );
+            }
+            // earliest_live_node_seq sees foreign content too (relay floor).
+            assert_eq!(
+                node_a
+                    .runtime
+                    .ledger
+                    .earliest_live_node_seq(&b_id)
+                    .expect("earliest live seq"),
+                Some(1),
+                "relay floor must reach the foreign chain genesis"
             );
         });
     }

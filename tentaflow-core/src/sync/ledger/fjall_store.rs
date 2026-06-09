@@ -31,6 +31,14 @@ const META: &str = "meta";
 const META_EPOCH_KEY: &[u8] = b"baseline_epoch";
 const META_HLC_KEY: &[u8] = b"hlc_state";
 const META_SCHEMA_KEY: &[u8] = b"schema_version";
+// Durable "needs baseline reseed" marker. `open` sets it in the SAME persist as
+// the schema-version stamp + wipe, so a crash after stamping v2 but before the
+// runtime bumps the epoch and reseeds is recoverable: the next boot still sees
+// the marker and repeats the (idempotent) reseed. The runtime clears it only
+// AFTER a successful bump+reseed. Without it the on-disk v2 stamp would suppress
+// the wipe on the retry boot, skipping the reseed and letting the local mint
+// restart node_seq=1 under genesis epoch=0 — self-equivocation against peers.
+const META_NEEDS_BASELINE_RESET_KEY: &[u8] = b"needs_baseline_reset";
 const SEP: u8 = 0;
 
 /// On-disk ledger layout version. Bump whenever the physical keyspace contract
@@ -57,10 +65,14 @@ pub struct FjallSyncLedgerStore {
     // Guards only the LOCAL node's head: a node is single-writer over its own
     // chain, so this serializes node_seq minting without blocking reads.
     append_lock: Mutex<()>,
-    // True when `open` wiped a stale-schema directory. The runtime reads this to
-    // force a baseline reset (bump epoch + reseed from SQLite) so the freshly
-    // restarted node_seq chain is fenced from the pre-upgrade chain peers remember.
-    schema_wiped: bool,
+    // Mirror of the durable `META_NEEDS_BASELINE_RESET_KEY` marker read at `open`.
+    // The runtime reads it to force a baseline reset (bump epoch + reseed from
+    // SQLite) so the freshly restarted node_seq chain is fenced from the
+    // pre-upgrade chain peers remember. The on-disk marker — not this flag — is
+    // the source of truth: it survives a crash before the reseed completes, so a
+    // retry boot re-runs the (idempotent) reseed. `clear_baseline_reset_marker`
+    // erases it only after a successful bump+reseed.
+    needs_baseline_reset: bool,
 }
 
 impl FjallSyncLedgerStore {
@@ -77,16 +89,28 @@ impl FjallSyncLedgerStore {
             None => None,
         };
         match on_disk {
-            Some(version) if version == LEDGER_SCHEMA_VERSION => {}
+            Some(version) if version == LEDGER_SCHEMA_VERSION => {
+                // Current schema, but a prior boot may have wiped + stamped v2 and
+                // then crashed before the runtime finished the reseed. The durable
+                // marker tells us the reseed still owes us; pick it up so the
+                // runtime repeats it instead of minting under genesis epoch=0.
+                store.needs_baseline_reset = match store.meta.get(META_NEEDS_BASELINE_RESET_KEY)? {
+                    Some(value) => decode::<bool>(value.as_ref())?,
+                    None => false,
+                };
+            }
             Some(version) => {
                 // Drop the open handle before removing files so no keyspace holds
                 // the directory, then rebuild from scratch.
                 drop(store);
                 wipe_ledger_dir(path)?;
                 store = Self::open_at(path)?;
+                // Stamp the version AND the durable reseed marker in one persist:
+                // the marker must survive a crash before the runtime reseeds.
                 store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store.meta.insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
                 store.persist()?;
-                store.schema_wiped = true;
+                store.needs_baseline_reset = true;
                 tracing::warn!(
                     "sync ledger: on-disk schema v{version} != v{LEDGER_SCHEMA_VERSION}, \
                      wiped ledger and forcing baseline reseed under a bumped epoch"
@@ -104,8 +128,9 @@ impl FjallSyncLedgerStore {
                 wipe_ledger_dir(path)?;
                 store = Self::open_at(path)?;
                 store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store.meta.insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
                 store.persist()?;
-                store.schema_wiped = true;
+                store.needs_baseline_reset = true;
                 tracing::warn!(
                     "sync ledger: unversioned on-disk schema, wiped ledger and forcing \
                      baseline reseed under a bumped epoch"
@@ -130,14 +155,23 @@ impl FjallSyncLedgerStore {
             meta: db.keyspace(META, KeyspaceCreateOptions::default)?,
             db,
             append_lock: Mutex::new(()),
-            schema_wiped: false,
+            needs_baseline_reset: false,
         })
     }
 
-    /// True if `open` wiped a stale-schema directory; the runtime then forces a
-    /// baseline reseed under a bumped epoch.
-    pub fn schema_wiped(&self) -> bool {
-        self.schema_wiped
+    /// True if a durable baseline-reset marker is set (stale-schema wipe, possibly
+    /// from a prior boot that crashed mid-reseed); the runtime then forces a
+    /// baseline reseed under a bumped epoch and clears the marker on success.
+    pub fn needs_baseline_reset(&self) -> bool {
+        self.needs_baseline_reset
+    }
+
+    /// Erases the durable baseline-reset marker. The runtime calls this ONLY after
+    /// a successful bump+reseed, so a crash anywhere before this point leaves the
+    /// marker in place and the next boot repeats the idempotent reseed.
+    pub fn clear_baseline_reset_marker(&self) -> LedgerResult<()> {
+        self.meta.remove(META_NEEDS_BASELINE_RESET_KEY)?;
+        self.persist()
     }
 
     fn persist(&self) -> LedgerResult<()> {
@@ -395,19 +429,56 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
                 actual: operation.body.epoch.clone(),
             });
         }
+        // A foreign op must land on the SAME per-node axis a local mint writes to
+        // (`operations` + `node_log` + `partition_index`), not only in the inbox.
+        // Without it `get_node_log_entry(foreign_node, seq)` is always None, so an
+        // equivocation below the frontier (a different op at an already-recorded
+        // (node, seq)) cannot be detected and is silently swallowed as AlreadyKnown.
+        // It also makes foreign chains content-resolvable for relay/escalation and
+        // visible to materialization. We do NOT touch `node_heads`: that axis is the
+        // LOCAL mint's chain head only; a foreign node's frontier lives in
+        // `node_frontier`. These two write paths never collide: inbox is the
+        // not-yet-applied apply queue (drained via `mark_inbox_applied`), while
+        // operations/partition_index are the ledger VIEW (snapshot/merkle/relay),
+        // never a second apply path. Materialization is idempotent per resource
+        // version, so even if a partition scan ever re-observed an applied op it
+        // would not double-apply.
+        let actor_node_id = operation.body.actor_node_id.clone();
+        let node_seq = operation.body.node_seq;
+        let partition_id = operation.body.partition_id.clone();
+        let op_id = operation.op_id;
+        let operation_bytes = encode(&operation)?;
+
         // Build the inbox entry, preserving the re-delivery reset semantics of
         // `put_verified_in_inbox` (a previously failed/deferred op becomes fresh
         // again), then commit it together with the frontier advance in one batch.
-        let inbox_key = inbox_key(&source, operation.op_id);
+        let inbox_key = inbox_key(&source, op_id);
         let entry = match self.inbox.get(&inbox_key)? {
             Some(existing) => {
                 let mut entry: InboxEntry = decode(existing.as_ref())?;
                 if entry.applied || (!entry.conflicted && entry.deferred_count == 0) {
                     // Already in a clean/applied state: nothing to rewrite for the
-                    // inbox, but the frontier advance must still be durable.
-                    self.node_frontier
-                        .insert(frontier.node_id.as_bytes(), encode(&frontier)?)?;
-                    return self.persist();
+                    // inbox, but the frontier advance and the per-node axis must
+                    // still be durable (a re-delivery of an op we hold).
+                    let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+                    batch.insert(&self.operations, op_id.as_bytes().to_vec(), operation_bytes);
+                    batch.insert(
+                        &self.node_log,
+                        node_log_key(&actor_node_id, node_seq),
+                        op_id.as_bytes().to_vec(),
+                    );
+                    batch.insert(
+                        &self.partition_index,
+                        partition_index_key(&partition_id, op_id),
+                        Vec::new(),
+                    );
+                    batch.insert(
+                        &self.node_frontier,
+                        frontier.node_id.as_bytes().to_vec(),
+                        encode(&frontier)?,
+                    );
+                    batch.commit()?;
+                    return Ok(());
                 }
                 entry.conflicted = false;
                 entry.conflict_message = None;
@@ -426,6 +497,17 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
 
         let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
         batch.insert(&self.inbox, inbox_key, encode(&entry)?);
+        batch.insert(&self.operations, op_id.as_bytes().to_vec(), operation_bytes);
+        batch.insert(
+            &self.node_log,
+            node_log_key(&actor_node_id, node_seq),
+            op_id.as_bytes().to_vec(),
+        );
+        batch.insert(
+            &self.partition_index,
+            partition_index_key(&partition_id, op_id),
+            Vec::new(),
+        );
         batch.insert(
             &self.node_frontier,
             frontier.node_id.as_bytes().to_vec(),
@@ -1041,6 +1123,63 @@ mod tests {
         assert_eq!(first.node_seq, 1);
         assert_eq!(second.node_seq, 2);
         assert_eq!(second.previous_node_hash, Some(first.operation_hash));
+    }
+
+    #[test]
+    fn baseline_reset_marker_survives_crash_before_reseed() {
+        // The schema fence stamps schema v2 AND a durable reseed marker in one
+        // persist. If the boot crashes after that stamp but before the runtime
+        // bumps the epoch + reseeds, the next boot must STILL see the marker and
+        // repeat the reseed — otherwise the v2 stamp suppresses the wipe and the
+        // local mint restarts node_seq=1 under genesis epoch (self-equivocation).
+        let dir = tempfile::tempdir().unwrap();
+
+        // Seed a populated, STALE-schema ledger: write some chain state, then
+        // stamp an old schema version so the next open trips the fence.
+        {
+            let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+            let signer = signer();
+            store
+                .append_operation(sample_operation(&signer, "person_1"), &signer)
+                .unwrap();
+            store
+                .meta
+                .insert(META_SCHEMA_KEY, encode(&(LEDGER_SCHEMA_VERSION - 1)).unwrap())
+                .unwrap();
+            store.persist().unwrap();
+        }
+
+        // First post-upgrade open: wipes, stamps v2, sets the durable marker.
+        {
+            let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+            assert!(
+                store.needs_baseline_reset(),
+                "stale-schema open must flag a baseline reset"
+            );
+            // Simulate a crash here: the runtime never ran the reseed, so the
+            // marker is NOT cleared.
+        }
+
+        // Crash-recovery open: schema is already v2, but the marker persisted, so
+        // the reset is still owed.
+        {
+            let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+            assert!(
+                store.needs_baseline_reset(),
+                "marker must survive a crash before the reseed completed"
+            );
+            // Now the runtime completes the reseed and clears the marker.
+            store.clear_baseline_reset_marker().unwrap();
+        }
+
+        // Subsequent opens see a clean, current ledger: no reset owed.
+        {
+            let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+            assert!(
+                !store.needs_baseline_reset(),
+                "cleared marker must not re-trigger a reset"
+            );
+        }
     }
 
     #[test]
