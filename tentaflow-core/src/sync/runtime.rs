@@ -20,9 +20,9 @@ use crate::sync::hlc::HlcClock;
 use crate::sync::ledger::{
     ActionType, BaselineEpoch, FieldValue, FjallSyncLedgerStore, HexNodeIdOperationVerifier,
     partition_materialization_order, HybridLogicalTimestamp, InboxEntry, LedgerResult,
-    NewSyncOperation, NodeFrontierEntry, NodeLogQuery, OperationId, OperationQuery, PartitionId,
-    PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation,
-    SyncOperationSigner, SyncSnapshot, SyncTarget,
+    NewSyncOperation, NodeChainEntry, NodeFrontierEntry, NodeLogQuery, OperationId, OperationQuery,
+    PartitionId, PeerId, RedactedRecord, RepairQueueEntry, SnapshotId, SyncLedgerError,
+    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
 };
 use crate::sync::snapshot::{
     verify_snapshot_signature, SnapshotBuildRequest, SnapshotManager, SnapshotPackageStore,
@@ -30,6 +30,7 @@ use crate::sync::snapshot::{
 use tentaflow_protocol::mesh::{
     MeshSyncAckPayload, MeshSyncOperationWire, MeshSyncPullPayload, MeshSyncPullResponsePayload,
     MeshSyncPushPayload, MeshSyncSnapshotPullPayload, MeshSyncSnapshotResponsePayload,
+    RedactedOperationWire,
 };
 
 static SYNC_RUNTIME: OnceLock<Arc<SyncRuntime>> = OnceLock::new();
@@ -1003,25 +1004,41 @@ impl SyncRuntime {
                 .unwrap_or(0)
         };
         if serving_floor_node_seq > payload.from_node_seq {
-            if let Some(result) =
-                self.escalate_pull_to_snapshot(source_node_id, &payload, serving_floor_node_seq)?
-            {
-                return Ok(result);
+            match self.escalate_pull_to_snapshot(source_node_id, &payload, serving_floor_node_seq)? {
+                Some(result) => return Ok(result),
+                // CR-W3: the requester sits below our compaction floor but we hold
+                // no snapshot covering it. Serving the log slice would silently skip
+                // the compacted prefix and leave the requester looping on the gap
+                // forever (the floor advances every pull, the prefix never arrives).
+                // Compaction NEVER prunes a partition without first persisting a
+                // covering snapshot, so reaching here means that invariant was
+                // violated (e.g. a snapshot pruned out from under the floor). Fail
+                // loudly instead of spinning so the operator sees the broken state.
+                None => {
+                    return Err(SyncLedgerError::Runtime(format!(
+                        "sync pull below compaction floor {serving_floor_node_seq} for node {} \
+                         but no snapshot covers it (requested from {})",
+                        payload.target_node_id, payload.from_node_seq
+                    )));
+                }
             }
         }
-        let mut operations = self.ledger.get_node_operations(NodeLogQuery {
+        let mut entries = self.ledger.get_node_chain_entries(NodeLogQuery {
             node_id: payload.target_node_id.clone(),
             from_node_seq: Some(payload.from_node_seq),
             to_node_seq: None,
             limit: Some(payload.limit as usize),
         })?;
-        operations.sort_by(|a, b| a.body.node_seq.cmp(&b.body.node_seq));
-        for operation in &operations {
-            self.ensure_peer_target_allowed(operation, source_node_id)?;
-        }
-        let mut wire = Vec::with_capacity(operations.len());
-        for operation in operations {
-            wire.push(operation_to_wire(&operation)?);
+        entries.sort_by_key(|entry| entry.node_seq());
+        // Per-op permission gating: an op the requester is a sync target for is
+        // served in full; one it is NOT is served as a signed redacted placeholder
+        // (chain proof only, no body). This keeps the per-node chain DENSE for the
+        // requester — it can verify continuity and advance its frontier — while
+        // never leaking a resource the requester may not read. A position we
+        // ourselves hold only redacted is relayed as redacted unchanged.
+        let mut wire = Vec::with_capacity(entries.len());
+        for entry in entries {
+            wire.push(self.chain_entry_to_wire(entry, source_node_id)?);
         }
         Ok(MeshSyncPullResult::Operations(
             MeshSyncPullResponsePayload {
@@ -1170,6 +1187,11 @@ impl SyncRuntime {
         let store = SnapshotPackageStore::new(SnapshotPackageStore::default_root());
         let blob_bytes = store.get_sql_package(&snapshot)?;
         let blob = crate::sync::snapshot::decode_snapshot_sql_blob(&blob_bytes)?;
+        // A snapshot blob is a SQL package, not a per-op stream: it cannot be
+        // partially redacted, so we serve it ONLY when every op it covers is one
+        // the requester may receive. A central-only client never asks for a
+        // snapshot of a partition it cannot read (the chain pull serves it redacted
+        // ops instead), so this gate stays a hard deny without stalling catch-up.
         for operation in &blob.operations {
             self.ensure_peer_target_allowed(operation, target_node_id)?;
         }
@@ -1346,24 +1368,45 @@ impl SyncRuntime {
         // several nodes' ops interleaved across partitions, so decode and sort by
         // (actor_node_id, node_seq) first; otherwise a higher-seq op processed
         // before its predecessor would gap and be dropped within the same batch.
-        let mut decoded: Vec<SyncOperation> = Vec::with_capacity(operations.len());
+        // A batch mixes full ops and redacted placeholders — both advance the same
+        // per-node frontier, so they sort and admit on one axis.
+        let mut decoded: Vec<NodeChainEntry> = Vec::with_capacity(operations.len());
         for wire in &operations {
-            decoded.push(operation_from_wire(wire)?);
+            decoded.push(chain_entry_from_wire(wire)?);
         }
         decoded.sort_by(|a, b| {
-            a.body
-                .actor_node_id
-                .cmp(&b.body.actor_node_id)
-                .then_with(|| a.body.node_seq.cmp(&b.body.node_seq))
+            chain_entry_node_id(a)
+                .cmp(chain_entry_node_id(b))
+                .then_with(|| a.node_seq().cmp(&b.node_seq()))
         });
         let mut accepted = Vec::with_capacity(decoded.len());
         // Per-node admission state for this batch, keyed by authoring node:
         // the next expected `node_seq` and the hash of the last accepted op.
         let mut expected_seqs: HashMap<String, u64> = HashMap::new();
         let mut frontier_hashes: HashMap<String, Option<[u8; 32]>> = HashMap::new();
-        for operation in decoded {
-            self.ensure_local_target_allowed(&operation)?;
-            let node_id = operation.body.actor_node_id.clone();
+        for entry in decoded {
+            // A FULL op the local node may not materialize is admitted as redacted:
+            // we still advance the chain (so we don't loop on it) but never apply
+            // its body. A node that hands us a full op we are not a target for is
+            // not punished — we simply do not retain the body.
+            let entry = match &entry {
+                NodeChainEntry::Full(operation)
+                    if !self.local_target_allowed(operation)? =>
+                {
+                    NodeChainEntry::Redacted(RedactedRecord {
+                        op_id: operation.op_id,
+                        operation_hash: operation.operation_hash,
+                        actor_node_id: operation.body.actor_node_id.clone(),
+                        node_seq: operation.body.node_seq,
+                        prev_node_hash: operation.body.prev_node_hash,
+                        signature: operation.signature.clone(),
+                    })
+                }
+                _ => entry,
+            };
+            let node_id = chain_entry_node_id(&entry).to_string();
+            let node_seq = entry.node_seq();
+            let op_id = entry.op_id();
             if !expected_seqs.contains_key(&node_id) {
                 let (seq, hash) = self.initial_node_frontier(&node_id)?;
                 expected_seqs.insert(node_id.clone(), seq);
@@ -1372,33 +1415,16 @@ impl SyncRuntime {
             let expected = expected_seqs[&node_id];
             let frontier_hash = frontier_hashes[&node_id];
 
-            match self.admit_node_operation(
-                &source,
-                &operation,
-                expected,
-                frontier_hash,
-            )? {
+            match self.admit_chain_entry(&source, &entry, expected, frontier_hash)? {
                 NodeAdmission::Accepted => {
-                    // Inbox insert + frontier advance must be one atomic batch: a
-                    // crash that advanced the frontier without the inbox entry
-                    // would skip this seq forever (never re-pulled, never applied).
-                    self.ledger.admit_verified_operation(
-                        source.clone(),
-                        operation.clone(),
-                        NodeFrontierEntry {
-                            node_id: node_id.clone(),
-                            last_seq: operation.body.node_seq,
-                            last_hash: operation.operation_hash,
-                        },
-                        &HexNodeIdOperationVerifier,
-                    )?;
-                    expected_seqs.insert(node_id.clone(), operation.body.node_seq.saturating_add(1));
-                    frontier_hashes.insert(node_id, Some(operation.operation_hash));
-                    accepted.push(operation.op_id.as_bytes().to_vec());
+                    let advanced_hash = chain_entry_hash(&entry);
+                    expected_seqs.insert(node_id.clone(), node_seq.saturating_add(1));
+                    frontier_hashes.insert(node_id, Some(advanced_hash));
+                    accepted.push(op_id.as_bytes().to_vec());
                 }
                 // Already known (node_seq below frontier): idempotent, ACK it.
                 NodeAdmission::AlreadyKnown => {
-                    accepted.push(operation.op_id.as_bytes().to_vec());
+                    accepted.push(op_id.as_bytes().to_vec());
                 }
                 // Gap above the frontier: legal catch-up. Queue a per-node pull
                 // and stop advancing this node's batch state — later ops of the
@@ -1409,33 +1435,114 @@ impl SyncRuntime {
         Ok(accepted)
     }
 
-    /// Decides whether an operation can join the local view of its author's
-    /// chain. A node is single-writer over its own chain, so equivocation — a
-    /// different op at the same `(node, node_seq)` — is Byzantine and rejected.
-    fn admit_node_operation(
+    /// Admits one chain entry (full or redacted) for `source`. A full op lands in
+    /// the inbox + per-node axis and materializes; a redacted placeholder advances
+    /// only the per-node axis (chain proof, equivocation guard, frontier) and never
+    /// materializes. Both share the same equivocation/gap logic.
+    fn admit_chain_entry(
         &self,
         source: &PeerId,
-        operation: &SyncOperation,
+        entry: &NodeChainEntry,
         expected: u64,
         frontier_hash: Option<[u8; 32]>,
     ) -> LedgerResult<NodeAdmission> {
-        let node_id = operation.body.actor_node_id.as_str();
-        let node_seq = operation.body.node_seq;
+        let node_id = chain_entry_node_id(entry).to_string();
+        let node_seq = entry.node_seq();
+        let op_id = entry.op_id();
+
+        // Redacted→full upgrade. A full op the local node is now permitted to
+        // receive may arrive for a position we previously advanced past holding
+        // ONLY a redacted placeholder (we gained access after the frontier moved
+        // on). Materialize it without disturbing the frontier: same op_id, so it is
+        // a completion of a known position, never a fork. `admit_verified_operation`
+        // removes the redacted row and inserts the body into the inbox + view.
+        if let NodeChainEntry::Full(operation) = entry {
+            if node_seq < expected && self.ledger.get_redacted_record(op_id)?.is_some() {
+                self.ledger.admit_verified_operation(
+                    source.clone(),
+                    operation.clone(),
+                    NodeFrontierEntry {
+                        node_id: node_id.clone(),
+                        last_seq: node_seq,
+                        last_hash: chain_entry_hash(entry),
+                    },
+                    &HexNodeIdOperationVerifier,
+                )?;
+                return Ok(NodeAdmission::Accepted);
+            }
+        }
+
+        let admission = self.classify_chain_admission(
+            source,
+            &node_id,
+            node_seq,
+            op_id,
+            chain_entry_prev_hash(entry),
+            expected,
+            frontier_hash,
+        )?;
+        if admission != NodeAdmission::Accepted {
+            return Ok(admission);
+        }
+        let frontier = NodeFrontierEntry {
+            node_id: node_id.clone(),
+            last_seq: node_seq,
+            last_hash: chain_entry_hash(entry),
+        };
+        match entry {
+            NodeChainEntry::Full(operation) => {
+                // Inbox insert + frontier advance must be one atomic batch: a crash
+                // that advanced the frontier without the inbox entry would skip this
+                // seq forever (never re-pulled, never applied).
+                self.ledger.admit_verified_operation(
+                    source.clone(),
+                    operation.clone(),
+                    frontier,
+                    &HexNodeIdOperationVerifier,
+                )?;
+            }
+            NodeChainEntry::Redacted(record) => {
+                self.ledger.admit_redacted_operation(
+                    record.clone(),
+                    frontier,
+                    &HexNodeIdOperationVerifier,
+                )?;
+            }
+        }
+        Ok(NodeAdmission::Accepted)
+    }
+
+    /// Decides whether a chain position can join the local view of its author's
+    /// chain. A node is single-writer over its own chain, so equivocation — a
+    /// different op at the same `(node, node_seq)` — is Byzantine and rejected.
+    /// Works identically for full ops and redacted placeholders: both are keyed by
+    /// op_id on `node_log`, so the equivocation comparison is the same.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_chain_admission(
+        &self,
+        source: &PeerId,
+        node_id: &str,
+        node_seq: u64,
+        op_id: OperationId,
+        prev_node_hash: Option<[u8; 32]>,
+        expected: u64,
+        frontier_hash: Option<[u8; 32]>,
+    ) -> LedgerResult<NodeAdmission> {
         if node_seq < expected {
             // We have already advanced past this seq. To catch equivocation we must
             // compare against what we ACTUALLY recorded at this chain position, not
             // look the incoming op up by its own op_id: ops are content-addressed,
             // so an equivocating op (same (node, seq), different body) has a
             // different op_id and a by-op_id lookup would silently miss the fork.
-            // `admit_verified_operation` records foreign ops on `node_log` too, so
-            // this lookup resolves for foreign authors — not just the local node.
+            // `admit_verified_operation`/`admit_redacted_operation` record foreign
+            // ops on `node_log` too, so this lookup resolves for foreign authors.
             match self.ledger.get_node_log_entry(node_id, node_seq)? {
-                Some(stored) if stored != operation.op_id => {
+                Some(stored) if stored != op_id => {
                     return Err(SyncLedgerError::NodeEquivocation {
                         node: node_id.to_string(),
                         node_seq,
                         existing: stored,
-                        incoming: operation.op_id,
+                        incoming: op_id,
                     });
                 }
                 // stored == incoming: idempotent re-delivery of the op we hold.
@@ -1453,7 +1560,7 @@ impl SyncRuntime {
         }
         // node_seq == expected: the prev_node_hash must chain onto our frontier.
         // A mismatch at the SAME seq means the author signed two histories.
-        if operation.body.prev_node_hash != frontier_hash {
+        if prev_node_hash != frontier_hash {
             warn!(
                 "sync runtime: node equivocation detected from {node_id} at node_seq={node_seq}: \
                  prev_node_hash does not chain onto known frontier"
@@ -1888,15 +1995,51 @@ impl SyncRuntime {
         Ok(result)
     }
 
-    fn ensure_local_target_allowed(&self, operation: &SyncOperation) -> LedgerResult<()> {
-        self.ensure_peer_target_allowed(operation, &self.local_node_id)
+    /// Whether the LOCAL node is a sync target for the op's resource, i.e. whether
+    /// a received full op may be materialized here. A full op the local node is not
+    /// a target for is retained only as a redacted chain placeholder.
+    fn local_target_allowed(&self, operation: &SyncOperation) -> LedgerResult<bool> {
+        self.peer_target_allowed(operation, &self.local_node_id)
     }
 
-    fn ensure_peer_target_allowed(
+    /// Encodes one served chain position for `target_node_id`. A FULL op the
+    /// requester is permitted to receive becomes a full wire op; one it may not
+    /// (or that we ourselves hold only redacted) becomes a signed redacted
+    /// placeholder. The placeholder withholds the body AND the partition id, so a
+    /// requester learns only that an op exists at this `(node, seq)` — never which
+    /// resource it touched (op_id is a one-way hash of the body).
+    fn chain_entry_to_wire(
+        &self,
+        entry: NodeChainEntry,
+        target_node_id: &str,
+    ) -> LedgerResult<MeshSyncOperationWire> {
+        match entry {
+            NodeChainEntry::Full(operation) => {
+                if self.peer_target_allowed(&operation, target_node_id)? {
+                    operation_to_wire(&operation)
+                } else {
+                    Ok(operation_to_redacted_wire(&RedactedRecord {
+                        op_id: operation.op_id,
+                        operation_hash: operation.operation_hash,
+                        actor_node_id: operation.body.actor_node_id.clone(),
+                        node_seq: operation.body.node_seq,
+                        prev_node_hash: operation.body.prev_node_hash,
+                        signature: operation.signature.clone(),
+                    }))
+                }
+            }
+            NodeChainEntry::Redacted(record) => Ok(operation_to_redacted_wire(&record)),
+        }
+    }
+
+    /// Whether `target_node_id` is a sync target for the op's resource. Same query
+    /// as `ensure_peer_target_allowed` but returns a bool instead of erroring, so
+    /// the serving path can redact a denied op rather than abort the whole pull.
+    fn peer_target_allowed(
         &self,
         operation: &SyncOperation,
         target_node_id: &str,
-    ) -> LedgerResult<()> {
+    ) -> LedgerResult<bool> {
         let targets = repository::list_sync_targets_for_resource(
             &self.db,
             &operation.body.org_id,
@@ -1905,10 +2048,17 @@ impl SyncRuntime {
             &operation.body.resource_id,
         )
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
-        let allowed = targets
+        Ok(targets
             .iter()
-            .any(|target| target.node_id == target_node_id);
-        if allowed {
+            .any(|target| target.node_id == target_node_id))
+    }
+
+    fn ensure_peer_target_allowed(
+        &self,
+        operation: &SyncOperation,
+        target_node_id: &str,
+    ) -> LedgerResult<()> {
+        if self.peer_target_allowed(operation, target_node_id)? {
             Ok(())
         } else {
             Err(SyncLedgerError::Runtime(format!(
@@ -2341,10 +2491,32 @@ impl SyncRuntime {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeAdmission {
     Accepted,
     AlreadyKnown,
     Gap,
+}
+
+fn chain_entry_node_id(entry: &NodeChainEntry) -> &str {
+    match entry {
+        NodeChainEntry::Full(operation) => operation.body.actor_node_id.as_str(),
+        NodeChainEntry::Redacted(record) => record.actor_node_id.as_str(),
+    }
+}
+
+fn chain_entry_hash(entry: &NodeChainEntry) -> [u8; 32] {
+    match entry {
+        NodeChainEntry::Full(operation) => operation.operation_hash,
+        NodeChainEntry::Redacted(record) => record.operation_hash,
+    }
+}
+
+fn chain_entry_prev_hash(entry: &NodeChainEntry) -> Option<[u8; 32]> {
+    match entry {
+        NodeChainEntry::Full(operation) => operation.body.prev_node_hash,
+        NodeChainEntry::Redacted(record) => record.prev_node_hash,
+    }
 }
 
 fn operation_to_wire(operation: &SyncOperation) -> LedgerResult<MeshSyncOperationWire> {
@@ -2353,7 +2525,24 @@ fn operation_to_wire(operation: &SyncOperation) -> LedgerResult<MeshSyncOperatio
         partition_id: operation.body.partition_id.as_str().to_string(),
         node_seq: operation.body.node_seq,
         operation: crate::sync::ledger::encode(operation)?,
+        redacted: None,
     })
+}
+
+fn operation_to_redacted_wire(record: &RedactedRecord) -> MeshSyncOperationWire {
+    MeshSyncOperationWire {
+        op_id: record.op_id.as_bytes().to_vec(),
+        // Withhold the partition: the requester is not allowed to learn which
+        // resource the op touches, and the chain proof does not need it.
+        partition_id: String::new(),
+        node_seq: record.node_seq,
+        operation: Vec::new(),
+        redacted: Some(RedactedOperationWire {
+            actor_node_id: record.actor_node_id.clone(),
+            prev_node_hash: record.prev_node_hash,
+            signature: record.signature.clone(),
+        }),
+    }
 }
 
 fn operation_from_wire(wire: &MeshSyncOperationWire) -> LedgerResult<SyncOperation> {
@@ -2376,6 +2565,37 @@ fn operation_from_wire(wire: &MeshSyncOperationWire) -> LedgerResult<SyncOperati
         });
     }
     Ok(operation)
+}
+
+/// Decodes a wire op into the chain form it represents: a redacted placeholder
+/// (when `wire.redacted` is set) or a full operation. The redacted variant
+/// reconstructs `RedactedRecord` from the wire metadata + carried `op_id`; the
+/// signature is verified later at admission, so this only shapes the bytes.
+fn chain_entry_from_wire(wire: &MeshSyncOperationWire) -> LedgerResult<NodeChainEntry> {
+    match &wire.redacted {
+        Some(redacted) => {
+            if !wire.operation.is_empty() {
+                return Err(SyncLedgerError::Runtime(
+                    "redacted sync op carries a body".to_string(),
+                ));
+            }
+            if wire.node_seq == 0 {
+                return Err(SyncLedgerError::InvalidNodeSeq {
+                    node: redacted.actor_node_id.clone(),
+                });
+            }
+            let op_id = operation_id_from_wire(&wire.op_id)?;
+            Ok(NodeChainEntry::Redacted(RedactedRecord {
+                op_id,
+                operation_hash: *op_id.as_bytes(),
+                actor_node_id: redacted.actor_node_id.clone(),
+                node_seq: wire.node_seq,
+                prev_node_hash: redacted.prev_node_hash,
+                signature: redacted.signature.clone(),
+            }))
+        }
+        None => Ok(NodeChainEntry::Full(operation_from_wire(wire)?)),
+    }
 }
 
 // The snapshot tail spans many authoring nodes, so it is validated per-node:
@@ -2404,12 +2624,14 @@ fn validate_pull_response_wire(payload: &MeshSyncPullResponsePayload) -> LedgerR
         }
     }
     // A pull is for one target node's chain, but the wire only carries node_seq
-    // per op; the authoring node lives inside the encoded body. Decode and check
-    // every op belongs to `target_node_id` with a dense monotonic chain.
+    // per op; the authoring node lives inside the encoded body (full) or the
+    // redacted envelope. Decode each entry and check it belongs to
+    // `target_node_id` with a dense monotonic chain. Redacted placeholders count
+    // toward density exactly like full ops — they ARE chain positions.
     let mut decoded = Vec::with_capacity(payload.operations.len());
     for wire in &payload.operations {
-        let operation = operation_from_wire(wire)?;
-        if operation.body.actor_node_id != payload.target_node_id {
+        let entry = chain_entry_from_wire(wire)?;
+        if chain_entry_node_id(&entry) != payload.target_node_id {
             return Err(SyncLedgerError::Runtime(
                 "sync pull response node mismatch".to_string(),
             ));
@@ -3317,6 +3539,42 @@ mod tests {
         .expect("sync policy");
     }
 
+    /// Like `seed_core_authority_target` but scoped to a single `resource_id`, so a
+    /// node can be a sync target for ONE flow on the authority chain and not for
+    /// another flow authored on the same chain. Used to exercise per-op redaction.
+    fn seed_core_authority_target_for_resource(
+        db: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        target_node_id: &str,
+    ) {
+        repository::upsert_sync_node_identity(
+            db,
+            target_node_id,
+            "pub",
+            "ed25519",
+            "Authority",
+            "authority",
+            "trusted",
+            None,
+            "authority",
+        )
+        .expect("sync node");
+        repository::upsert_sync_policy(
+            db,
+            &format!("policy-core-{resource_type}-{resource_id}"),
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            Some(resource_type),
+            Some(resource_id),
+            "authority_write",
+            Some(target_node_id),
+            None,
+            true,
+        )
+        .expect("sync policy");
+    }
+
     /// Inserts the `test-actor` user the capture helpers reference. Required only
     /// when a test persists a capture row into SQLite (`record_core_write_capture`),
     /// because `__tentaflow_core_sync_captures.actor_user_id` is FK-bound to
@@ -3826,6 +4084,196 @@ mod tests {
             assert_eq!(flow.name, "Pushed Flow");
             assert_eq!(flow.status, "active");
             assert!(outbox.acknowledged);
+        });
+    }
+
+    #[test]
+    fn pull_redacts_unsubscribed_op_and_advances_chain() {
+        // Regression for the per-node chain serving deadlock: one authority chain
+        // mixes a flow the receiver subscribes to (flow-allow, seq 1) and one it
+        // does not (flow-deny, seq 2). A chain pull must not abort on the denied
+        // op — it serves a redacted placeholder for it so the receiver advances its
+        // frontier past BOTH and materializes only the allowed flow.
+        with_tmp_home(|| {
+            let source = make_runtime(140);
+            let receiver = make_runtime(141);
+            // Receiver is a sync target ONLY for flow-allow, on both sides.
+            seed_core_authority_target_for_resource(
+                &source.runtime.db,
+                "core.flow",
+                "flow-allow",
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target_for_resource(
+                &receiver.runtime.db,
+                "core.flow",
+                "flow-allow",
+                &receiver.runtime.local_node_id,
+            );
+
+            source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("flow-allow", "Allowed Flow"))
+                .expect("record allow");
+            source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("flow-deny", "Denied Flow"))
+                .expect("record deny");
+
+            let pull = MeshSyncPullPayload {
+                from_node_id: receiver.runtime.local_node_id.clone(),
+                target_node_id: source.runtime.local_node_id.clone(),
+                from_node_seq: 1,
+                limit: 64,
+            };
+            let response = source
+                .runtime
+                .handle_pull_payload(&receiver.runtime.local_node_id, pull)
+                .expect("pull serves both, denied one redacted");
+            let MeshSyncPullResult::Operations(payload) = response else {
+                panic!("expected operations response");
+            };
+            // Both chain positions are served; the denied one is redacted (no body,
+            // no partition leak), the allowed one is full.
+            assert_eq!(payload.operations.len(), 2);
+            let redacted: Vec<&MeshSyncOperationWire> = payload
+                .operations
+                .iter()
+                .filter(|op| op.redacted.is_some())
+                .collect();
+            assert_eq!(redacted.len(), 1, "exactly the denied op is redacted");
+            assert!(redacted[0].operation.is_empty(), "redacted op carries no body");
+            assert!(
+                redacted[0].partition_id.is_empty(),
+                "redacted op withholds the partition name"
+            );
+
+            receiver
+                .runtime
+                .handle_pull_response_payload(&source.runtime.local_node_id, payload)
+                .expect("apply pulled chain");
+
+            // Frontier advanced past BOTH positions — the chain is not stalled.
+            let frontier = receiver
+                .runtime
+                .ledger
+                .get_node_frontier(&source.runtime.local_node_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(frontier.last_seq, 2);
+
+            // Only the allowed flow materialized; the denied one never reached SQL.
+            assert!(
+                repository::get_flow(&receiver.runtime.db, "flow-allow")
+                    .expect("get allow")
+                    .is_some()
+            );
+            assert!(
+                repository::get_flow(&receiver.runtime.db, "flow-deny")
+                    .expect("get deny")
+                    .is_none(),
+                "redacted op must never materialize"
+            );
+        });
+    }
+
+    #[test]
+    fn redacted_op_upgrades_to_full_when_permission_is_granted() {
+        // A receiver first holds a denied op only as a redacted placeholder (its
+        // frontier advances past it). After it gains permission, the authority
+        // re-delivers the FULL op for the SAME seq/op_id; admission must treat this
+        // as an upgrade — materialize the body — not as equivocation.
+        with_tmp_home(|| {
+            let source = make_runtime(142);
+            let receiver = make_runtime(143);
+            seed_core_authority_target_for_resource(
+                &source.runtime.db,
+                "core.flow",
+                "flow-x",
+                &receiver.runtime.local_node_id,
+            );
+
+            let op = source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("flow-x", "Granted Flow"))
+                .expect("record");
+            let full = source
+                .runtime
+                .ledger
+                .get_operation(op.op_id)
+                .expect("full operation");
+
+            // Phase 1: deliver it redacted (receiver not yet a target). Build the
+            // redacted wire by hand from the signed op — exactly what the serving
+            // path emits to a non-target.
+            let redacted_wire = operation_to_redacted_wire(&RedactedRecord {
+                op_id: full.op_id,
+                operation_hash: full.operation_hash,
+                actor_node_id: full.body.actor_node_id.clone(),
+                node_seq: full.body.node_seq,
+                prev_node_hash: full.body.prev_node_hash,
+                signature: full.signature.clone(),
+            });
+            let redacted_payload = MeshSyncPullResponsePayload {
+                from_node_id: source.runtime.local_node_id.clone(),
+                target_node_id: source.runtime.local_node_id.clone(),
+                from_node_seq: full.body.node_seq,
+                operations: vec![redacted_wire],
+                serving_floor_node_seq: 1,
+                serving_tip_node_seq: full.body.node_seq,
+            };
+            receiver
+                .runtime
+                .handle_pull_response_payload(&source.runtime.local_node_id, redacted_payload)
+                .expect("apply redacted");
+            assert!(
+                receiver
+                    .runtime
+                    .ledger
+                    .get_redacted_record(full.op_id)
+                    .expect("redacted lookup")
+                    .is_some(),
+                "held as redacted placeholder"
+            );
+            assert!(repository::get_flow(&receiver.runtime.db, "flow-x")
+                .expect("get flow")
+                .is_none());
+
+            // Phase 2: receiver gains permission; the authority re-delivers the
+            // full op for the same op_id. It must upgrade and materialize.
+            seed_core_authority_target_for_resource(
+                &receiver.runtime.db,
+                "core.flow",
+                "flow-x",
+                &receiver.runtime.local_node_id,
+            );
+            let full_payload = MeshSyncPullResponsePayload {
+                from_node_id: source.runtime.local_node_id.clone(),
+                target_node_id: source.runtime.local_node_id.clone(),
+                from_node_seq: full.body.node_seq,
+                operations: vec![operation_to_wire(&full).expect("wire full")],
+                serving_floor_node_seq: 1,
+                serving_tip_node_seq: full.body.node_seq,
+            };
+            receiver
+                .runtime
+                .handle_pull_response_payload(&source.runtime.local_node_id, full_payload)
+                .expect("apply full upgrade");
+
+            // The redacted placeholder is gone and the flow is materialized.
+            assert!(
+                receiver
+                    .runtime
+                    .ledger
+                    .get_redacted_record(full.op_id)
+                    .expect("redacted lookup")
+                    .is_none(),
+                "redacted placeholder superseded by full op"
+            );
+            let flow = repository::get_flow(&receiver.runtime.db, "flow-x")
+                .expect("get flow")
+                .expect("flow materialized after upgrade");
+            assert_eq!(flow.name, "Granted Flow");
         });
     }
 
@@ -9057,8 +9505,9 @@ mod tests {
     }
 
     /// Lets `node` accept incoming operations for `resource_type` by listing
-    /// itself as a sync target. Admission gates on `ensure_local_target_allowed`,
-    /// so without this a delivered op is refused before it reaches the inbox.
+    /// itself as a sync target. Admission gates on `local_target_allowed`, so
+    /// without this a delivered full op is retained only as a redacted chain
+    /// placeholder and never materializes.
     fn allow_self_target(node: &ConvergenceNode, resource_type: &str) {
         seed_core_authority_target(&node.runtime.db, resource_type, node.node_id());
     }

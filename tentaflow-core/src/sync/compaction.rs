@@ -106,11 +106,24 @@ fn evaluate_finality(
     operations: &[crate::sync::ledger::SyncOperation],
     outbox: &[OutboxEntry],
 ) -> LedgerResult<CompactionFinalityReport> {
-    let required_operations = operations.len();
+    // Only LOCALLY-minted ops carry a delivery obligation: the local node enqueues
+    // an outbox entry for each op it mints, never for a foreign op it merely
+    // received and re-indexed into this partition. A foreign op is by definition
+    // already delivered (it reached us from its author), so it must NOT count
+    // toward the ack requirement — otherwise a partition that mixes foreign ops
+    // (per-node hash-chains let many nodes write one partition) could never reach
+    // finality (`target_entries.len()` would never match a count inflated by
+    // un-deliverable foreign ops). Obligation = "has at least one outbox entry".
+    let obligated_op_ids = outbox
+        .iter()
+        .map(|entry| entry.op_id.to_hex())
+        .collect::<HashSet<_>>();
     let operation_ids = operations
         .iter()
         .map(|operation| operation.op_id.to_hex())
+        .filter(|op_id| obligated_op_ids.contains(op_id))
         .collect::<HashSet<_>>();
+    let required_operations = operation_ids.len();
     let required_targets = match policy {
         CompactionFinalityPolicy::AllOutboxTargets => outbox
             .iter()
@@ -170,7 +183,8 @@ mod tests {
     use super::*;
     use crate::sync::ledger::{
         ActionType, Ed25519OperationSigner, FieldValue, FjallSyncLedgerStore,
-        HybridLogicalTimestamp, NewSyncOperation, OperationQuery, SyncOperationSigner, SyncTarget,
+        HexNodeIdOperationVerifier, HybridLogicalTimestamp, NewSyncOperation, NodeFrontierEntry,
+        OperationQuery, PeerId, SyncOperation, SyncOperationSigner, SyncTarget,
     };
     use crate::sync::snapshot::{SnapshotBuildRequest, SnapshotManager, SnapshotPackageStore};
     use ed25519_dalek::SigningKey;
@@ -383,6 +397,91 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.finality.acknowledged_targets, vec!["node-b"]);
+    }
+
+    #[test]
+    fn compaction_reaches_finality_with_foreign_ops_in_partition() {
+        // CR-W2: per-node hash-chains let MANY nodes write one partition, so after
+        // a foreign op is admitted it sits in `get_operations(partition)` but has
+        // NO outbox entry (the outbox only tracks locally-minted ops we owe peers).
+        // Finality must not count that foreign op toward the ack requirement —
+        // otherwise the partition could never compact. Here a local op (acked) and
+        // a foreign op share one partition; compaction must succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let blob_dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let local = signer();
+        let foreign = signer();
+        let partition = PartitionId::new("addon/contacts/persons/mixed").unwrap();
+
+        // Local mint (node_seq 1 on the local chain) — gets an outbox obligation.
+        let local_op = store
+            .append_operation(operation(&local, partition.clone(), "local-1"), &local)
+            .unwrap();
+
+        // Foreign op authored by another node, admitted into the SAME partition. It
+        // lands in operations/partition_index but carries no outbox entry.
+        let foreign_new = operation(&foreign, partition.clone(), "foreign-1");
+        let foreign_op =
+            SyncOperation::from_new(foreign_new, 1, None, &foreign).unwrap();
+        store
+            .admit_verified_operation(
+                PeerId::new("peer-foreign").unwrap(),
+                foreign_op.clone(),
+                NodeFrontierEntry {
+                    node_id: foreign.node_id().to_string(),
+                    last_seq: 1,
+                    last_hash: foreign_op.operation_hash,
+                },
+                &HexNodeIdOperationVerifier,
+            )
+            .unwrap();
+
+        // Both ops are in the partition view now.
+        assert_eq!(
+            store
+                .get_operations(OperationQuery {
+                    partition_id: partition.clone(),
+                    limit: None,
+                })
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let package_store = SnapshotPackageStore::new(blob_dir.path());
+        SnapshotManager::new(&store)
+            .build_sql_package_and_persist(
+                SnapshotBuildRequest {
+                    partition_id: partition.clone(),
+                    up_to_sequence: Some(2),
+                    created_at_ms: 1_765_000_000_100,
+                },
+                &local,
+                &package_store,
+            )
+            .unwrap();
+
+        // The local op is delivered + acked; the foreign op is already-delivered by
+        // definition (it reached us from its author) and must not block.
+        let target = SyncTarget::new("node-b").unwrap();
+        store.put_in_outbox(target.clone(), local_op.op_id).unwrap();
+        store.mark_acknowledged(target, local_op.op_id).unwrap();
+
+        let result = CompactionManager::new(&store)
+            .compact_with_snapshot_package(
+                SafeCompactionRequest {
+                    partition_id: partition,
+                    up_to_sequence: Some(2),
+                    finality: CompactionFinalityPolicy::all_outbox_targets(),
+                },
+                &package_store,
+            )
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "partition with a foreign op must still reach finality"
+        );
     }
 
     #[test]

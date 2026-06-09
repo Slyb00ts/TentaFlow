@@ -4,8 +4,8 @@
 // =============================================================================
 
 use super::types::{
-    hash_canonical, LedgerResult, OperationId, SyncLedgerError, SyncMerkleSummary, SyncOperation,
-    SyncOperationSigner, SyncOperationVerifier,
+    hash_canonical, signing_bytes_for_hash, LedgerResult, OperationId, RedactedRecord,
+    SyncLedgerError, SyncMerkleSummary, SyncOperation, SyncOperationSigner, SyncOperationVerifier,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::BTreeMap;
@@ -87,6 +87,27 @@ impl SyncOperationVerifier for TrustedKeyOperationVerifier {
             &operation.signature,
         )
     }
+
+    fn verify_redacted_signature(&self, record: &RedactedRecord) -> LedgerResult<()> {
+        if record.op_id != OperationId::from_hash(record.operation_hash) {
+            return Err(SyncLedgerError::InvalidOperationId {
+                expected: OperationId::from_hash(record.operation_hash),
+                actual: record.op_id,
+            });
+        }
+        let key = self
+            .keys
+            .get(&record.actor_node_id)
+            .ok_or_else(|| SyncLedgerError::InvalidPublicKey {
+                actor_node_id: record.actor_node_id.clone(),
+            })?;
+        verify_signature(
+            &record.actor_node_id,
+            key,
+            &signing_bytes_for_hash(record.operation_hash),
+            &record.signature,
+        )
+    }
 }
 
 pub struct HexNodeIdOperationVerifier;
@@ -101,6 +122,24 @@ impl SyncOperationVerifier for HexNodeIdOperationVerifier {
             &key,
             &operation.signing_bytes(),
             &operation.signature,
+        )
+    }
+
+    fn verify_redacted_signature(&self, record: &RedactedRecord) -> LedgerResult<()> {
+        // op_id MUST equal the carried operation_hash: the signature is over the
+        // hash, so this binds the receiver's chain key to the signed identity.
+        if record.op_id != OperationId::from_hash(record.operation_hash) {
+            return Err(SyncLedgerError::InvalidOperationId {
+                expected: OperationId::from_hash(record.operation_hash),
+                actual: record.op_id,
+            });
+        }
+        let key = parse_verifying_key(&record.actor_node_id, &record.actor_node_id)?;
+        verify_signature(
+            &record.actor_node_id,
+            &key,
+            &signing_bytes_for_hash(record.operation_hash),
+            &record.signature,
         )
     }
 }
@@ -456,6 +495,60 @@ mod tests {
         let second = operation(&signer, 2, Some(first.operation_hash));
 
         validate_hash_chain_from(&[second], Some(first.operation_hash)).unwrap();
+    }
+
+    fn redacted_from(operation: &SyncOperation) -> RedactedRecord {
+        RedactedRecord {
+            op_id: operation.op_id,
+            operation_hash: operation.operation_hash,
+            actor_node_id: operation.body.actor_node_id.clone(),
+            node_seq: operation.body.node_seq,
+            prev_node_hash: operation.body.prev_node_hash,
+            signature: operation.signature.clone(),
+        }
+    }
+
+    #[test]
+    fn verifier_accepts_redacted_signature_over_op_id() {
+        // The body is gone, but the signature is over operation_hash (== op_id), so
+        // a redacted placeholder is still fully signature-verifiable.
+        let signer = signer();
+        let verifier = HexNodeIdOperationVerifier;
+        let operation = operation(&signer, 1, None);
+        let record = redacted_from(&operation);
+
+        verifier.verify_redacted_signature(&record).unwrap();
+    }
+
+    #[test]
+    fn verifier_rejects_redacted_with_mismatched_op_id() {
+        // A redacted record whose op_id does not equal its carried operation_hash
+        // is rejected before any signature check — the receiver keys its chain by
+        // op_id, so this binding must hold.
+        let signer = signer();
+        let verifier = HexNodeIdOperationVerifier;
+        let operation = operation(&signer, 1, None);
+        let mut record = redacted_from(&operation);
+        record.op_id = OperationId::from_hash([0xAB; 32]);
+
+        assert!(matches!(
+            verifier.verify_redacted_signature(&record),
+            Err(SyncLedgerError::InvalidOperationId { .. })
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_redacted_with_forged_signature() {
+        let signer = signer();
+        let verifier = HexNodeIdOperationVerifier;
+        let operation = operation(&signer, 1, None);
+        let mut record = redacted_from(&operation);
+        record.signature = vec![0u8; 64];
+
+        assert!(matches!(
+            verifier.verify_redacted_signature(&record),
+            Err(SyncLedgerError::InvalidSignature { .. })
+        ));
     }
 
     #[test]

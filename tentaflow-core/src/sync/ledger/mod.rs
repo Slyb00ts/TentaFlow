@@ -12,8 +12,10 @@ pub(crate) use types::{decode, encode, hash_canonical};
 pub use types::{
     partition_materialization_order, ActionType, AppendResult, BaselineEpoch, CompactionPolicy,
     FieldValue, HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation,
-    NodeFrontierEntry, NodeHead, NodeLogQuery, OperationId, OperationQuery, OutboxEntry,
-    PartitionId, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError, SyncLedgerStore,
+    NodeChainEntry, NodeFrontierEntry, NodeHead, NodeLogQuery, OperationId, OperationQuery,
+    OutboxEntry,
+    PartitionId, PeerId, RedactedRecord, RepairQueueEntry, SnapshotId, SyncLedgerError,
+    SyncLedgerStore,
     SyncMerkleSummary, SyncOperation, SyncOperationBody, SyncOperationSigner, SyncOperationVerifier,
     SyncSnapshot, SyncTarget, CORE_PARTITION_PREFIX,
 };
