@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sync::ledger::{
-    build_merkle_summary, hash_canonical, partition_materialization_order, validate_hash_chain,
-    HexNodeIdOperationVerifier, LedgerResult, OperationQuery, PartitionId, SnapshotId,
-    SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier,
-    SyncSnapshot,
+    build_merkle_summary, hash_canonical, node_frontier_for_operations,
+    partition_materialization_order, validate_hash_chain, HexNodeIdOperationVerifier, LedgerResult,
+    OperationQuery, PartitionId, SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation,
+    SyncOperationSigner, SyncOperationVerifier, SyncSnapshot,
 };
+use std::collections::BTreeMap;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 const SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"tentaflow-sync-snapshot-v1";
@@ -96,6 +97,8 @@ pub struct SnapshotSqlBlobPackage {
     pub operation_count: u64,
     pub root_hash: [u8; 32],
     pub state_hash: [u8; 32],
+    #[serde(default)]
+    pub node_frontier: BTreeMap<String, (u64, [u8; 32])>,
     pub last_operation_hash: Option<[u8; 32]>,
     pub policy_epoch: u64,
     pub operations: Vec<SyncOperation>,
@@ -115,6 +118,7 @@ struct SnapshotSignaturePayload<'a> {
     operation_count: u64,
     root_hash: [u8; 32],
     state_hash: [u8; 32],
+    node_frontier: &'a BTreeMap<String, (u64, [u8; 32])>,
     last_operation_hash: Option<[u8; 32]>,
     policy_epoch: u64,
     blob_kind: Option<&'a str>,
@@ -192,6 +196,7 @@ impl<'a> SnapshotManager<'a> {
             .map(|operation| operation.body.policy_epoch)
             .unwrap_or_default();
         let state_hash = state_hash(&request.partition_id, &operations)?;
+        let node_frontier = node_frontier_for_operations(&operations);
         let snapshot_id = snapshot_id(&request.partition_id, up_to_sequence, summary.root_hash)?;
         let signature_payload = SnapshotSignaturePayload {
             snapshot_id: snapshot_id.as_str(),
@@ -201,6 +206,7 @@ impl<'a> SnapshotManager<'a> {
             operation_count: summary.operation_count,
             root_hash: summary.root_hash,
             state_hash,
+            node_frontier: &node_frontier,
             last_operation_hash,
             policy_epoch,
             blob_kind: None,
@@ -218,6 +224,7 @@ impl<'a> SnapshotManager<'a> {
             operation_count: summary.operation_count,
             root_hash: summary.root_hash,
             state_hash,
+            node_frontier,
             last_operation_hash,
             policy_epoch,
             blob_kind: None,
@@ -262,6 +269,7 @@ impl<'a> SnapshotManager<'a> {
             .map(|operation| operation.body.policy_epoch)
             .unwrap_or_default();
         let state_hash = state_hash(&request.partition_id, &operations)?;
+        let node_frontier = node_frontier_for_operations(&operations);
         let snapshot_id = snapshot_id(&request.partition_id, up_to_sequence, summary.root_hash)?;
         let blob = SnapshotSqlBlobPackage {
             version: 1,
@@ -272,6 +280,7 @@ impl<'a> SnapshotManager<'a> {
             operation_count: summary.operation_count,
             root_hash: summary.root_hash,
             state_hash,
+            node_frontier: node_frontier.clone(),
             last_operation_hash,
             policy_epoch,
             operations,
@@ -288,6 +297,7 @@ impl<'a> SnapshotManager<'a> {
             summary.operation_count,
             summary.root_hash,
             state_hash,
+            node_frontier,
             last_operation_hash,
             policy_epoch,
             SnapshotBlobMetadata {
@@ -542,6 +552,9 @@ impl<'a> SnapshotManager<'a> {
         if state_hash(&snapshot.partition_id, &operations)? != snapshot.state_hash {
             return Err(snapshot_mismatch(snapshot, "state_hash"));
         }
+        if node_frontier_for_operations(&operations) != snapshot.node_frontier {
+            return Err(snapshot_mismatch(snapshot, "node_frontier"));
+        }
         let last_operation = operations
             .last()
             .ok_or_else(|| snapshot_mismatch(snapshot, "last_operation_hash"))?;
@@ -566,6 +579,7 @@ impl<'a> SnapshotManager<'a> {
         operation_count: u64,
         root_hash: [u8; 32],
         state_hash: [u8; 32],
+        node_frontier: BTreeMap<String, (u64, [u8; 32])>,
         last_operation_hash: Option<[u8; 32]>,
         policy_epoch: u64,
         blob: SnapshotBlobMetadata<'_>,
@@ -578,6 +592,7 @@ impl<'a> SnapshotManager<'a> {
             operation_count,
             root_hash,
             state_hash,
+            node_frontier: &node_frontier,
             last_operation_hash,
             policy_epoch,
             blob_kind: blob.kind,
@@ -595,6 +610,7 @@ impl<'a> SnapshotManager<'a> {
             operation_count,
             root_hash,
             state_hash,
+            node_frontier,
             last_operation_hash,
             policy_epoch,
             blob_kind: blob.kind.map(str::to_string),
@@ -705,6 +721,7 @@ pub fn verify_snapshot_signature(snapshot: &SyncSnapshot) -> LedgerResult<()> {
         operation_count: snapshot.operation_count,
         root_hash: snapshot.root_hash,
         state_hash: snapshot.state_hash,
+        node_frontier: &snapshot.node_frontier,
         last_operation_hash: snapshot.last_operation_hash,
         policy_epoch: snapshot.policy_epoch,
         blob_kind: snapshot.blob_kind.as_deref(),
@@ -732,20 +749,27 @@ fn snapshot_id(
     ))
 }
 
+/// Deterministic digest of a snapshot's covered op set. It canonicalizes the
+/// input by `partition_materialization_order` (`(actor_node_id, node_seq)`)
+/// internally, so the result is independent of the order the caller supplies and
+/// of HLC/clock skew — two honest nodes holding the same op set always produce
+/// the same `state_hash`.
 fn state_hash(
     partition_id: &PartitionId,
     operations: &[crate::sync::ledger::SyncOperation],
 ) -> LedgerResult<[u8; 32]> {
+    let mut ordered: Vec<&crate::sync::ledger::SyncOperation> = operations.iter().collect();
+    ordered.sort_by(|a, b| partition_materialization_order(a, b));
     let payload = SnapshotStatePayload {
         partition_id: partition_id.as_str(),
-        // Count watermark over the HLC-ordered op set passed in by the caller.
-        from_sequence: if operations.is_empty() { 0 } else { 1 },
-        up_to_sequence: operations.len() as u64,
-        operation_ids: operations
+        // 1-based count watermark over the canonical-ordered op set.
+        from_sequence: if ordered.is_empty() { 0 } else { 1 },
+        up_to_sequence: ordered.len() as u64,
+        operation_ids: ordered
             .iter()
             .map(|operation| *operation.op_id.as_bytes())
             .collect(),
-        operation_hashes: operations
+        operation_hashes: ordered
             .iter()
             .map(|operation| operation.operation_hash)
             .collect(),
@@ -811,6 +835,9 @@ fn validate_snapshot_sql_blob(
     if blob.state_hash != snapshot.state_hash {
         return Err(snapshot_mismatch(snapshot, "state_hash"));
     }
+    if blob.node_frontier != snapshot.node_frontier {
+        return Err(snapshot_mismatch(snapshot, "node_frontier"));
+    }
     if blob.last_operation_hash != snapshot.last_operation_hash {
         return Err(snapshot_mismatch(snapshot, "last_operation_hash"));
     }
@@ -834,6 +861,9 @@ fn validate_snapshot_sql_blob(
     }
     if state_hash(&snapshot.partition_id, &blob.operations)? != snapshot.state_hash {
         return Err(snapshot_mismatch(snapshot, "state_hash"));
+    }
+    if node_frontier_for_operations(&blob.operations) != snapshot.node_frontier {
+        return Err(snapshot_mismatch(snapshot, "node_frontier"));
     }
     Ok(())
 }
@@ -1542,5 +1572,179 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Two operations from two writers, validly chained per node, built directly
+    /// so a test can shuffle them and prove the snapshot hashes are order-free.
+    fn two_writer_ops(
+        signer_a: &dyn SyncOperationSigner,
+        signer_b: &dyn SyncOperationSigner,
+        partition: &PartitionId,
+    ) -> Vec<SyncOperation> {
+        let op_a = SyncOperation::from_new(
+            operation_with_resource(signer_a, partition.clone(), "person_a", 1),
+            1,
+            None,
+            signer_a,
+        )
+        .unwrap();
+        let op_b = SyncOperation::from_new(
+            operation_with_resource(signer_b, partition.clone(), "person_b", 1),
+            1,
+            None,
+            signer_b,
+        )
+        .unwrap();
+        vec![op_a, op_b]
+    }
+
+    #[test]
+    fn snapshot_roundtrip_state_hash_canonical() {
+        // The snapshot is built off the canonical (actor_node_id, node_seq) order,
+        // never insertion order or HLC: the state_hash, node_frontier and root_hash
+        // must be identical for any permutation of the same op set, and survive a
+        // CBOR round-trip + signature verify unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let partition = PartitionId::new("addon/contacts/persons").unwrap();
+        store
+            .append_operation(operation(&signer, partition.clone()), &signer)
+            .unwrap();
+        store
+            .append_operation(
+                operation_with_resource(&signer, partition.clone(), "person_2", 2),
+                &signer,
+            )
+            .unwrap();
+        let manager = SnapshotManager::new(&store);
+        let snapshot = manager
+            .build_and_store(
+                SnapshotBuildRequest {
+                    partition_id: partition.clone(),
+                    up_to_sequence: None,
+                    created_at_ms: 1_765_000_000_001,
+                },
+                &signer,
+            )
+            .unwrap()
+            .expect("snapshot")
+            .snapshot;
+
+        // node_frontier covers the single writer up to its highest node_seq.
+        assert_eq!(snapshot.node_frontier.len(), 1);
+        let (last_seq, _) = snapshot.node_frontier[signer.node_id()];
+        assert_eq!(last_seq, 2);
+
+        let bytes = crate::sync::ledger::encode(&snapshot).unwrap();
+        let decoded: SyncSnapshot = crate::sync::ledger::decode(&bytes).unwrap();
+        assert_eq!(decoded, snapshot);
+        verify_snapshot_signature(&decoded).unwrap();
+
+        // Permutation independence at the structural level: the two pure functions
+        // that feed the snapshot signature must ignore slice order for a multi-
+        // writer set (different authors interleaved).
+        let signer_b = {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let node_id = hex::encode(signing_key.verifying_key().to_bytes());
+            Ed25519OperationSigner::new(node_id, signing_key).unwrap()
+        };
+        let ops = two_writer_ops(&signer, &signer_b, &partition);
+        let reversed: Vec<SyncOperation> = ops.iter().rev().cloned().collect();
+        assert_eq!(
+            super::state_hash(&partition, &ops).unwrap(),
+            super::state_hash(&partition, &reversed).unwrap()
+        );
+        assert_eq!(
+            crate::sync::ledger::node_frontier_for_operations(&ops),
+            crate::sync::ledger::node_frontier_for_operations(&reversed)
+        );
+        assert_eq!(
+            crate::sync::ledger::build_merkle_summary(&ops).unwrap().root_hash,
+            crate::sync::ledger::build_merkle_summary(&reversed).unwrap().root_hash
+        );
+    }
+
+    #[test]
+    fn new_node_adopt_converges() {
+        // A fresh node adopts a donor snapshot package: it learns the donor's
+        // attested node_frontier and recomputes state_hash/root_hash over the exact
+        // op set the donor signed. Both must equal the donor's signed values — that
+        // equality is precisely what makes the adopted state convergent with the
+        // donor, with no fork. `validate_snapshot_sql_blob` is the production gate
+        // that enforces this on every import; here we exercise it end-to-end.
+        let _home = pin_home();
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let addon_id = unique_addon_id("adopt-converge");
+        let partition = PartitionId::new(format!("addon/{addon_id}/contacts/1")).unwrap();
+        let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
+            .expect("open addon db");
+        {
+            let conn = pool.get().expect("conn");
+            conn.execute(
+                "CREATE TABLE contacts (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                [],
+            )
+            .expect("create table");
+        }
+        store
+            .append_operation(
+                sql_operation(
+                    &signer,
+                    partition.clone(),
+                    &addon_id,
+                    ActionType::Insert,
+                    "INSERT INTO contacts (id, name) VALUES (?1, ?2)",
+                    vec![JsonValue::from(1), JsonValue::String("Ola".to_string())],
+                    "adopt-capture-insert",
+                    1,
+                ),
+                &signer,
+            )
+            .unwrap();
+        let donor = SnapshotManager::new(&store)
+            .build_sql_package_and_store(
+                SnapshotBuildRequest {
+                    partition_id: partition.clone(),
+                    up_to_sequence: Some(1),
+                    created_at_ms: 1_765_000_000_010,
+                },
+                &signer,
+            )
+            .unwrap()
+            .expect("snapshot package");
+
+        // The fresh node decodes the donor blob and recomputes the canonical
+        // structural fields over the donor's op set; convergence == byte-equality
+        // with the donor's signed snapshot fields.
+        let blob = decode_snapshot_sql_blob(&donor.blob_bytes).unwrap();
+        let fresh_node = SnapshotManager::new(&store);
+        fresh_node
+            .restore_sql_from_package(SnapshotSqlPackageRestoreRequest {
+                partition_id: partition.clone(),
+                up_to_sequence: donor.snapshot.up_to_sequence,
+                snapshot_id: donor.snapshot.snapshot_id.clone(),
+                blob_bytes: donor.blob_bytes.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            super::state_hash(&partition, &blob.operations).unwrap(),
+            donor.snapshot.state_hash
+        );
+        assert_eq!(
+            crate::sync::ledger::node_frontier_for_operations(&blob.operations),
+            donor.snapshot.node_frontier
+        );
+        assert_eq!(
+            crate::sync::ledger::build_merkle_summary(&blob.operations)
+                .unwrap()
+                .root_hash,
+            donor.snapshot.root_hash
+        );
+        // The adopted frontier names the donor writer at its highest covered seq.
+        assert_eq!(donor.snapshot.node_frontier[signer.node_id()].0, 1);
     }
 }

@@ -384,4 +384,78 @@ mod tests {
 
         assert_eq!(result.finality.acknowledged_targets, vec!["node-b"]);
     }
+
+    #[test]
+    fn compaction_then_catchup_keeps_node_log_for_equivocation_check() {
+        // After a snapshot covers a writer's frontier and the prefix is compacted,
+        // the per-partition `operations`/`partition_index` rows are gone but the
+        // per-node chain axis (`node_log`) MUST survive: it is what equivocation
+        // detection and per-node catch-up pulls read. A peer whose frontier sits
+        // below the compacted floor is served the snapshot + tail, never a hole.
+        let dir = tempfile::tempdir().unwrap();
+        let blob_dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let partition = PartitionId::new("addon/contacts/persons/catchup").unwrap();
+        let first = store
+            .append_operation(operation(&signer, partition.clone(), "1"), &signer)
+            .unwrap();
+        store
+            .append_operation(operation(&signer, partition.clone(), "2"), &signer)
+            .unwrap();
+        let package_store = SnapshotPackageStore::new(blob_dir.path());
+        let snapshot = SnapshotManager::new(&store)
+            .build_sql_package_and_persist(
+                SnapshotBuildRequest {
+                    partition_id: partition.clone(),
+                    up_to_sequence: Some(1),
+                    created_at_ms: 1_765_000_000_100,
+                },
+                &signer,
+                &package_store,
+            )
+            .unwrap()
+            .expect("persisted snapshot package")
+            .snapshot;
+        // The snapshot's attested frontier covers exactly node_seq=1 for the writer.
+        assert_eq!(snapshot.node_frontier.len(), 1);
+        assert_eq!(snapshot.node_frontier[signer.node_id()].0, 1);
+
+        let target = SyncTarget::new("node-b").unwrap();
+        store.put_in_outbox(target.clone(), first.op_id).unwrap();
+        store.mark_acknowledged(target, first.op_id).unwrap();
+        CompactionManager::new(&store)
+            .compact_with_snapshot_package(
+                SafeCompactionRequest {
+                    partition_id: partition.clone(),
+                    up_to_sequence: Some(1),
+                    finality: CompactionFinalityPolicy::all_outbox_targets(),
+                },
+                &package_store,
+            )
+            .unwrap()
+            .unwrap();
+
+        // The per-partition view dropped the compacted prefix op...
+        let live = store
+            .get_operations(OperationQuery {
+                partition_id: partition.clone(),
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].body.node_seq, 2);
+        // ...but the node_log retains seq=1 so equivocation at that seq is still
+        // detectable and a peer below the floor can be caught up.
+        assert_eq!(
+            store
+                .get_node_log_entry(signer.node_id(), 1)
+                .unwrap(),
+            Some(first.op_id)
+        );
+        assert!(store
+            .get_node_log_entry(signer.node_id(), 2)
+            .unwrap()
+            .is_some());
+    }
 }

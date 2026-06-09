@@ -1288,14 +1288,20 @@ impl SyncRuntime {
             &tail_operations,
         )?;
         let blob = crate::sync::snapshot::decode_snapshot_sql_blob(&payload.blob_bytes)?;
-        self.ledger.save_snapshot(snapshot)?;
         // The snapshot prefix + tail are applied straight to SQLite, bypassing the
         // inbox, so advance each authoring node's frontier to the highest node_seq
         // they cover. Without this the very next op of one of those nodes would be
         // seen as a gap (its predecessor lives in the just-applied prefix). The
-        // dedicated snapshot.node_frontier mapping lands in phase 4-5.
+        // snapshot carries an AUTHOR-ATTESTED `node_frontier` (bound into its
+        // signature, already verified above) for the prefix; seed from it, then let
+        // the tail (ops beyond the snapshot) extend each writer's frontier further.
+        let mut node_tips: HashMap<String, (u64, [u8; 32])> = snapshot
+            .node_frontier
+            .iter()
+            .map(|(node_id, (seq, hash))| (node_id.clone(), (*seq, *hash)))
+            .collect();
+        self.ledger.save_snapshot(snapshot)?;
         let mut operation_ids = Vec::with_capacity(blob.operations.len() + tail_operations.len());
-        let mut node_tips: HashMap<String, (u64, [u8; 32])> = HashMap::new();
         for operation in blob.operations.iter().chain(tail_operations.iter()) {
             operation_ids.push(operation.op_id.as_bytes().to_vec());
             let entry = node_tips
