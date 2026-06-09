@@ -221,6 +221,27 @@ pub fn build_merkle_summary(operations: &[SyncOperation]) -> LedgerResult<SyncMe
     })
 }
 
+/// Per-node coverage frontier over an operation set: for every authoring node
+/// present, the highest `node_seq` and that operation's `operation_hash`. The
+/// caller validates the per-node chains first (`validate_hash_chain`), so the
+/// highest `node_seq` per node is the dense tip of a contiguous chain — exactly
+/// the frontier a snapshot attests and a receiver advances to. Deterministic:
+/// it depends only on the (node, seq) maxima, never on insertion order.
+pub fn node_frontier_for_operations(
+    operations: &[SyncOperation],
+) -> BTreeMap<String, (u64, [u8; 32])> {
+    let mut frontier: BTreeMap<String, (u64, [u8; 32])> = BTreeMap::new();
+    for operation in operations {
+        let entry = frontier
+            .entry(operation.body.actor_node_id.clone())
+            .or_insert((0, [0u8; 32]));
+        if operation.body.node_seq >= entry.0 {
+            *entry = (operation.body.node_seq, operation.operation_hash);
+        }
+    }
+    frontier
+}
+
 fn parse_verifying_key(actor_node_id: &str, key_hex: &str) -> LedgerResult<VerifyingKey> {
     let key_bytes = hex::decode(key_hex).map_err(|_| SyncLedgerError::InvalidPublicKey {
         actor_node_id: actor_node_id.to_string(),

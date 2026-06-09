@@ -515,6 +515,17 @@ pub struct SyncSnapshot {
     pub root_hash: [u8; 32],
     #[serde(default)]
     pub state_hash: [u8; 32],
+    /// Per-node coverage of this snapshot: `node_id -> (last_node_seq, last_hash)`
+    /// over every authoring node whose chain the snapshot prefix includes. This is
+    /// the AUTHORITATIVE coverage axis in the per-node model (`up_to_sequence` is
+    /// only a 1-based count watermark + storage key). A node that adopts this
+    /// snapshot sets its node-frontier to exactly this map, then pulls each
+    /// writer's chain forward from `last_node_seq` — so the catch-up tail is bounded
+    /// per writer with no fork. It is bound into the snapshot signature, so the
+    /// frontier a receiver commits to is attested by the author, not merely
+    /// reconstructed from the blob.
+    #[serde(default)]
+    pub node_frontier: std::collections::BTreeMap<String, (u64, [u8; 32])>,
     #[serde(default)]
     pub last_operation_hash: Option<[u8; 32]>,
     #[serde(default)]

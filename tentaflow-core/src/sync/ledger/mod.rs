@@ -18,6 +18,7 @@ pub use types::{
     SyncSnapshot, SyncTarget, CORE_PARTITION_PREFIX,
 };
 pub use validation::{
-    build_merkle_summary, operation_body_hash, validate_hash_chain, validate_hash_chain_from,
-    Ed25519OperationSigner, HexNodeIdOperationVerifier, TrustedKeyOperationVerifier,
+    build_merkle_summary, node_frontier_for_operations, operation_body_hash, validate_hash_chain,
+    validate_hash_chain_from, Ed25519OperationSigner, HexNodeIdOperationVerifier,
+    TrustedKeyOperationVerifier,
 };
