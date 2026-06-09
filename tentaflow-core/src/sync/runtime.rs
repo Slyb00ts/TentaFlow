@@ -310,6 +310,13 @@ pub fn adopt_donor_baseline_epoch(donor_epoch: &BaselineEpoch) -> LedgerResult<(
 /// Parses the baseline-cutover marker. Returns the recorded pre-cutover epoch
 /// counter when the marker has been upgraded to `pre_cutover_epoch=<n>`, or
 /// `None` for the migration's initial `"1"` sentinel (no counter recorded yet).
+/// Settings key holding the permission epoch the authority-side outbox backfill
+/// last reconciled for `org_id`. The backfill runs only when the live epoch is
+/// higher, so a tick with no permission change is a single marker read.
+fn backfill_epoch_marker_key(org_id: &str) -> String {
+    format!("sync.backfill_epoch:{org_id}")
+}
+
 fn parse_cutover_marker(marker: &str) -> Option<u64> {
     marker
         .strip_prefix("pre_cutover_epoch=")
@@ -511,6 +518,17 @@ pub fn drain_pending_core_captures_online(limit: usize) -> LedgerResult<Option<u
             Ok(Some(0))
         }
     }
+}
+
+/// Re-enqueues already-minted ops to receivers that gained access after the mint.
+/// Driven by the sync repair scheduler tick. Returns the number of outbox entries
+/// added (`Ok(None)` before the runtime is initialized). Cheap when no permission
+/// epoch advanced.
+pub fn backfill_outbox_for_permission_grants() -> LedgerResult<Option<usize>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    runtime.backfill_outbox_for_permission_grants().map(Some)
 }
 
 pub fn resolve_addon_sync_conflict(
@@ -919,6 +937,109 @@ impl SyncRuntime {
         Ok(targets
             .iter()
             .any(|target| target.node_id == target_node_id))
+    }
+
+    /// Re-enqueues already-minted operations to receivers that gained access AFTER
+    /// the op was minted. The mint-time outbox fan-out (`queue_targets_for_resource`)
+    /// only reaches the targets allowed at mint time; a later grant never revisits
+    /// it. The push side has a revoke path (`outbox_target_still_allowed`) but no
+    /// inverse, and a receiver that holds the position as a redacted placeholder
+    /// cannot self-heal: a redacted op carries no partition, so a frontier pull
+    /// never re-fetches it. The authority therefore reverses the permission gate
+    /// here and re-enqueues. The full op then flows through `build_push_payload`,
+    /// the receiver upgrades redacted→full and materializes.
+    ///
+    /// Triggered by the per-org permission epoch advancing past a persisted marker;
+    /// every grant write bumps that epoch (`bump_sync_permission_epoch`). When no
+    /// grant happened the epoch is unchanged and this is a cheap marker read.
+    /// Re-enqueue is idempotent: `put_in_outbox` is keyed by `(target, op_id)`, and
+    /// we skip targets that already hold the op, so a redelivered grant is a no-op.
+    fn backfill_outbox_for_permission_grants(&self) -> LedgerResult<usize> {
+        let operations = self.ledger.list_all_operations()?;
+        if operations.is_empty() {
+            return Ok(0);
+        }
+
+        // The permission epoch is per-org; only scan orgs whose epoch advanced.
+        let mut org_ids: Vec<String> = operations
+            .iter()
+            .map(|op| op.body.org_id.clone())
+            .collect();
+        org_ids.sort();
+        org_ids.dedup();
+
+        let mut advanced_orgs = std::collections::HashSet::new();
+        let mut org_epochs = std::collections::HashMap::new();
+        for org_id in &org_ids {
+            let current = repository::get_sync_permission_epoch(&self.db, org_id)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            let marker_key = backfill_epoch_marker_key(org_id);
+            let last = repository::get_setting(&self.db, &marker_key)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if current > last {
+                advanced_orgs.insert(org_id.clone());
+            }
+            org_epochs.insert(org_id.clone(), current);
+        }
+        if advanced_orgs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut enqueued = 0usize;
+        for operation in &operations {
+            if !advanced_orgs.contains(&operation.body.org_id) {
+                continue;
+            }
+            // Reverse the SAME gate the mint-time fan-out uses, so a target is only
+            // backfilled for ops it is NOW genuinely permitted to receive.
+            let targets = repository::list_sync_targets_for_resource(
+                &self.db,
+                &operation.body.org_id,
+                &operation.body.addon_id,
+                &operation.body.resource_type,
+                &operation.body.resource_id,
+            )
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            if targets.is_empty() {
+                continue;
+            }
+            let existing = self.ledger.list_outbox_for_operation(operation.op_id)?;
+            for target in targets {
+                if target.node_id == self.local_node_id {
+                    continue;
+                }
+                if existing
+                    .iter()
+                    .any(|entry| entry.target.as_str() == target.node_id)
+                {
+                    continue;
+                }
+                match SyncTarget::new(target.node_id) {
+                    Ok(sync_target) => {
+                        self.ledger.put_in_outbox(sync_target, operation.op_id)?;
+                        enqueued += 1;
+                    }
+                    Err(e) => warn!("sync runtime: backfill skipping invalid target: {}", e),
+                }
+            }
+        }
+
+        // Persist the per-org watermark only after the scan succeeds, so a failure
+        // mid-scan re-runs the whole backfill (idempotent) instead of silently
+        // skipping ops. Marking the epoch is the LAST step.
+        for org_id in advanced_orgs {
+            if let Some(epoch) = org_epochs.get(&org_id) {
+                repository::set_setting(
+                    &self.db,
+                    &backfill_epoch_marker_key(&org_id),
+                    &epoch.to_string(),
+                )
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            }
+        }
+        Ok(enqueued)
     }
 
     fn handle_push_payload(
@@ -4179,20 +4300,19 @@ mod tests {
 
     #[test]
     fn redacted_op_upgrades_to_full_when_permission_is_granted() {
-        // A receiver first holds a denied op only as a redacted placeholder (its
-        // frontier advances past it). After it gains permission, the authority
-        // re-delivers the FULL op for the SAME seq/op_id; admission must treat this
-        // as an upgrade — materialize the body — not as equivocation.
+        // End-to-end proof that the BLOCKER is closed in the production path: the
+        // receiver first holds the op only as a redacted placeholder (frontier moved
+        // past it). The grant goes through the REAL permission write (upsert_sync_policy,
+        // which bumps the permission epoch); the authority's scheduled backfill then
+        // re-enqueues the already-minted op on its own, and a normal push upgrades
+        // the placeholder to the full body and materializes it. No full op is handed
+        // to the receiver by the test.
         with_tmp_home(|| {
             let source = make_runtime(142);
             let receiver = make_runtime(143);
-            seed_core_authority_target_for_resource(
-                &source.runtime.db,
-                "core.flow",
-                "flow-x",
-                &receiver.runtime.local_node_id,
-            );
 
+            // Mint the flow with NO target for the receiver: the source serves it
+            // redacted, so the receiver advances its frontier past it without a body.
             let op = source
                 .runtime
                 .record_core_capture(complete_core_flow_capture("flow-x", "Granted Flow"))
@@ -4203,25 +4323,26 @@ mod tests {
                 .get_operation(op.op_id)
                 .expect("full operation");
 
-            // Phase 1: deliver it redacted (receiver not yet a target). Build the
-            // redacted wire by hand from the signed op — exactly what the serving
-            // path emits to a non-target.
-            let redacted_wire = operation_to_redacted_wire(&RedactedRecord {
-                op_id: full.op_id,
-                operation_hash: full.operation_hash,
-                actor_node_id: full.body.actor_node_id.clone(),
-                node_seq: full.body.node_seq,
-                prev_node_hash: full.body.prev_node_hash,
-                signature: full.signature.clone(),
-            });
-            let redacted_payload = MeshSyncPullResponsePayload {
-                from_node_id: source.runtime.local_node_id.clone(),
+            // Phase 1: a real pull from the source serves the op redacted (receiver
+            // is not yet a target), so the receiver holds only a placeholder.
+            let pull = MeshSyncPullPayload {
+                from_node_id: receiver.runtime.local_node_id.clone(),
                 target_node_id: source.runtime.local_node_id.clone(),
-                from_node_seq: full.body.node_seq,
-                operations: vec![redacted_wire],
-                serving_floor_node_seq: 1,
-                serving_tip_node_seq: full.body.node_seq,
+                from_node_seq: 1,
+                limit: 64,
             };
+            let MeshSyncPullResult::Operations(redacted_payload) = source
+                .runtime
+                .handle_pull_payload(&receiver.runtime.local_node_id, pull)
+                .expect("serve redacted")
+            else {
+                panic!("expected operations response");
+            };
+            assert_eq!(redacted_payload.operations.len(), 1);
+            assert!(
+                redacted_payload.operations[0].redacted.is_some(),
+                "served redacted while receiver is not a target"
+            );
             receiver
                 .runtime
                 .handle_pull_response_payload(&source.runtime.local_node_id, redacted_payload)
@@ -4239,26 +4360,48 @@ mod tests {
                 .expect("get flow")
                 .is_none());
 
-            // Phase 2: receiver gains permission; the authority re-delivers the
-            // full op for the same op_id. It must upgrade and materialize.
+            // Phase 2: grant via the real permission write. This bumps the source's
+            // permission epoch; the receiver gets the same policy so it may now
+            // materialize the body.
+            seed_core_authority_target_for_resource(
+                &source.runtime.db,
+                "core.flow",
+                "flow-x",
+                &receiver.runtime.local_node_id,
+            );
             seed_core_authority_target_for_resource(
                 &receiver.runtime.db,
                 "core.flow",
                 "flow-x",
                 &receiver.runtime.local_node_id,
             );
-            let full_payload = MeshSyncPullResponsePayload {
-                from_node_id: source.runtime.local_node_id.clone(),
-                target_node_id: source.runtime.local_node_id.clone(),
-                from_node_seq: full.body.node_seq,
-                operations: vec![operation_to_wire(&full).expect("wire full")],
-                serving_floor_node_seq: 1,
-                serving_tip_node_seq: full.body.node_seq,
-            };
-            receiver
+
+            // The authority's scheduled backfill re-enqueues the already-minted op
+            // for the freshly-permitted receiver — with NO manual payload.
+            let enqueued = source
                 .runtime
-                .handle_pull_response_payload(&source.runtime.local_node_id, full_payload)
-                .expect("apply full upgrade");
+                .backfill_outbox_for_permission_grants()
+                .expect("backfill");
+            assert!(enqueued >= 1, "grant must re-enqueue the minted op");
+
+            // A normal push now ships the full op; the receiver upgrades + materializes.
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("push")
+                .expect("pending push after backfill");
+            assert!(
+                push.operations.iter().all(|op| op.redacted.is_none()),
+                "authority ships the full body to a permitted target"
+            );
+            let ack = receiver
+                .runtime
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect("handle push");
+            source
+                .runtime
+                .handle_ack_payload(&receiver.runtime.local_node_id, ack)
+                .expect("ack");
 
             // The redacted placeholder is gone and the flow is materialized.
             assert!(
@@ -4274,6 +4417,129 @@ mod tests {
                 .expect("get flow")
                 .expect("flow materialized after upgrade");
             assert_eq!(flow.name, "Granted Flow");
+
+            // A second backfill is a no-op: the epoch marker is now current, so the
+            // grant is not re-applied and the outbox is not re-enqueued.
+            let again = source
+                .runtime
+                .backfill_outbox_for_permission_grants()
+                .expect("idempotent backfill");
+            assert_eq!(again, 0, "backfill is idempotent once the epoch is recorded");
+        });
+    }
+
+    #[test]
+    fn redacted_upgrade_does_not_regress_node_frontier() {
+        // CR-002: admitting a full body BELOW the frontier (the redacted→full
+        // upgrade) must not rewind the per-node frontier. Build a chain where the
+        // receiver advances its frontier to seq 2 holding seq 1 only as a redacted
+        // placeholder, then upgrade seq 1 to full and assert the frontier stays at 2.
+        with_tmp_home(|| {
+            let source = make_runtime(150);
+            let receiver = make_runtime(151);
+            // Receiver subscribes to flow-b (seq 2) but not flow-a (seq 1).
+            seed_core_authority_target_for_resource(
+                &source.runtime.db,
+                "core.flow",
+                "flow-b",
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target_for_resource(
+                &receiver.runtime.db,
+                "core.flow",
+                "flow-b",
+                &receiver.runtime.local_node_id,
+            );
+
+            let op_a = source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("flow-a", "Flow A"))
+                .expect("record a");
+            source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("flow-b", "Flow B"))
+                .expect("record b");
+
+            // Pull both: seq 1 redacted, seq 2 full. Frontier advances to 2.
+            let pull = MeshSyncPullPayload {
+                from_node_id: receiver.runtime.local_node_id.clone(),
+                target_node_id: source.runtime.local_node_id.clone(),
+                from_node_seq: 1,
+                limit: 64,
+            };
+            let MeshSyncPullResult::Operations(payload) = source
+                .runtime
+                .handle_pull_payload(&receiver.runtime.local_node_id, pull)
+                .expect("serve chain")
+            else {
+                panic!("expected operations response");
+            };
+            receiver
+                .runtime
+                .handle_pull_response_payload(&source.runtime.local_node_id, payload)
+                .expect("apply chain");
+            let frontier_before = receiver
+                .runtime
+                .ledger
+                .get_node_frontier(&source.runtime.local_node_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(frontier_before.last_seq, 2);
+
+            // Grant flow-a and upgrade seq 1 to full via the real backfill + push.
+            seed_core_authority_target_for_resource(
+                &source.runtime.db,
+                "core.flow",
+                "flow-a",
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target_for_resource(
+                &receiver.runtime.db,
+                "core.flow",
+                "flow-a",
+                &receiver.runtime.local_node_id,
+            );
+            source
+                .runtime
+                .backfill_outbox_for_permission_grants()
+                .expect("backfill");
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("push")
+                .expect("pending push");
+            let ack = receiver
+                .runtime
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect("handle push");
+            source
+                .runtime
+                .handle_ack_payload(&receiver.runtime.local_node_id, ack)
+                .expect("ack");
+
+            // flow-a materialized (the upgrade applied)…
+            assert!(
+                repository::get_flow(&receiver.runtime.db, "flow-a")
+                    .expect("get a")
+                    .is_some(),
+                "upgraded op materialized"
+            );
+            // …and the frontier did NOT regress to seq 1.
+            let frontier_after = receiver
+                .runtime
+                .ledger
+                .get_node_frontier(&source.runtime.local_node_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(
+                frontier_after.last_seq, 2,
+                "upgrade below the frontier must not rewind it"
+            );
+            assert_eq!(
+                frontier_after.last_hash, frontier_before.last_hash,
+                "frontier hash stays anchored to the real chain head"
+            );
+            let _ = op_a;
         });
     }
 

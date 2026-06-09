@@ -84,6 +84,23 @@ pub struct FjallSyncLedgerStore {
 }
 
 impl FjallSyncLedgerStore {
+    /// Picks the frontier entry to persist for `candidate` without ever regressing.
+    /// The redacted->full upgrade path admits a body at a position BELOW the current
+    /// frontier (we caught up past it holding only a placeholder), so it passes a
+    /// frontier carrying that lower `last_seq`. Writing it verbatim would rewind the
+    /// node frontier and make us re-pull (and possibly re-admit as a fork) every seq
+    /// between the upgraded position and the real head. Keep the higher head and its
+    /// hash; only adopt the candidate when it genuinely advances the chain.
+    fn frontier_to_persist(
+        &self,
+        candidate: NodeFrontierEntry,
+    ) -> LedgerResult<NodeFrontierEntry> {
+        match self.get_node_frontier(&candidate.node_id)? {
+            Some(existing) if existing.last_seq >= candidate.last_seq => Ok(existing),
+            _ => Ok(candidate),
+        }
+    }
+
     pub fn open(path: impl AsRef<Path>) -> LedgerResult<Self> {
         let path = path.as_ref();
         let mut store = Self::open_at(path)?;
@@ -259,6 +276,15 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             if query.limit.is_some_and(|limit| operations.len() >= limit) {
                 break;
             }
+        }
+        Ok(operations)
+    }
+
+    fn list_all_operations(&self) -> LedgerResult<Vec<SyncOperation>> {
+        let mut operations = Vec::new();
+        for item in self.operations.iter() {
+            let (_, value) = item.into_inner()?;
+            operations.push(decode(value.as_ref())?);
         }
         Ok(operations)
     }
@@ -519,10 +545,11 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
                         partition_index_key(&partition_id, op_id),
                         Vec::new(),
                     );
+                    let persisted = self.frontier_to_persist(frontier)?;
                     batch.insert(
                         &self.node_frontier,
-                        frontier.node_id.as_bytes().to_vec(),
-                        encode(&frontier)?,
+                        persisted.node_id.as_bytes().to_vec(),
+                        encode(&persisted)?,
                     );
                     batch.commit()?;
                     return Ok(());
@@ -558,10 +585,11 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             partition_index_key(&partition_id, op_id),
             Vec::new(),
         );
+        let persisted = self.frontier_to_persist(frontier)?;
         batch.insert(
             &self.node_frontier,
-            frontier.node_id.as_bytes().to_vec(),
-            encode(&frontier)?,
+            persisted.node_id.as_bytes().to_vec(),
+            encode(&persisted)?,
         );
         batch.commit()?;
         Ok(())
