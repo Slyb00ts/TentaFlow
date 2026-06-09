@@ -73,6 +73,8 @@ async fn make_manager() -> Arc<IrohMeshManager> {
         relay_url: None,
         enable_lan_discovery: false,
         enable_dht_discovery: false,
+        addr_filter: None,
+        disable_portmapper: false,
     };
     IrohMeshManager::new(cfg, security)
         .await

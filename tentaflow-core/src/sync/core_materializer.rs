@@ -27,6 +27,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::SyncPolicy
             | CoreSyncResourceKind::SyncResourceAcl
             | CoreSyncResourceKind::SyncUserOrgProfile
+            | CoreSyncResourceKind::SharedSettingSecret
             | CoreSyncResourceKind::AddonInstance
             | CoreSyncResourceKind::AddonConfig
     )
@@ -123,7 +124,11 @@ pub fn apply_core_operation(
 /// `(resource_type, resource_id)` in `core_resource_versions`. A missing row
 /// (never-seen resource) always wins. Comparison uses the total HLC order from
 /// phase A (wall, logical, node_id tie-break).
-fn incoming_hlc_wins(
+///
+/// Shared with the replicated `addon.kv` materializer (`runtime::apply_kv_operation`):
+/// that path is the same concurrent-edit class as LWW-tracked core resources, so it
+/// reuses this exact comparison instead of re-deriving HLC order.
+pub(crate) fn incoming_hlc_wins(
     tx: &rusqlite::Transaction<'_>,
     resource_type: &str,
     resource_id: &str,
@@ -151,7 +156,7 @@ fn incoming_hlc_wins(
     }
 }
 
-fn upsert_resource_version(
+pub(crate) fn upsert_resource_version(
     tx: &rusqlite::Transaction<'_>,
     resource_type: &str,
     resource_id: &str,

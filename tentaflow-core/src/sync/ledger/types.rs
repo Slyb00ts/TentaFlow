@@ -52,8 +52,33 @@ pub enum SyncLedgerError {
     InvalidSignature { actor_node_id: String },
     #[error("niepoprawny klucz publiczny dla {actor_node_id}")]
     InvalidPublicKey { actor_node_id: String },
-    #[error("hash-chain partycji nie zgadza sie: partition={partition}, sequence={sequence}")]
-    HashChainMismatch { partition: String, sequence: u64 },
+    #[error("hash-chain noda nie zgadza sie: node={node}, node_seq={node_seq}")]
+    HashChainMismatch { node: String, node_seq: u64 },
+    /// Two distinct operations carry the same `(actor_node_id, node_seq)` but
+    /// different `op_hash`. A node is single-writer over its own chain, so this
+    /// can only mean the author signed two conflicting histories (Byzantine
+    /// equivocation). The operation is rejected outright — never repaired.
+    #[error("equivocation noda: node={node}, node_seq={node_seq}, existing={existing}, incoming={incoming}")]
+    NodeEquivocation {
+        node: String,
+        node_seq: u64,
+        existing: OperationId,
+        incoming: OperationId,
+    },
+    /// `hlc_timestamp.node_id` must equal `actor_node_id`. A node mints HLC
+    /// timestamps only on its own behalf, so a divergence means a forged HLC
+    /// origin — an attempt to skew last-writer-wins resolution by pretending an
+    /// op came from a different (e.g. higher-priority) node. Rejected outright.
+    #[error("hlc.node_id nie zgadza sie z actor_node_id: actor={actor}, hlc={hlc}")]
+    HlcNodeMismatch { actor: String, hlc: String },
+    /// `node_seq` is 1-based and dense; seq 0 is never a valid chain position.
+    #[error("niepoprawny node_seq=0 dla noda {node}")]
+    InvalidNodeSeq { node: String },
+    /// The on-disk ledger schema does not match the version this build expects.
+    /// Triggers a wipe + reseed under a bumped epoch so a layout change (e.g.
+    /// per-partition → per-node chains) never silently restarts node_seq.
+    #[error("niezgodna wersja schematu ledgera: on_disk={on_disk}, expected={expected}")]
+    SchemaVersionMismatch { on_disk: u32, expected: u32 },
     #[error("operacja z innego epoch baseline: expected={expected:?}, actual={actual:?}")]
     EpochMismatch {
         expected: BaselineEpoch,
@@ -257,7 +282,10 @@ pub struct NewSyncOperation {
 pub struct SyncOperationBody {
     pub org_id: String,
     pub partition_id: PartitionId,
-    pub partition_sequence: u64,
+    // Per-node sequence: a strictly-monotonic counter in the `actor_node_id`
+    // space. A node is single-writer over its own chain, so this never forks the
+    // way a per-partition counter did once two nodes wrote one partition.
+    pub node_seq: u64,
     pub addon_id: String,
     pub resource_type: String,
     pub resource_id: String,
@@ -277,7 +305,8 @@ pub struct SyncOperationBody {
     // (EpochMismatch), instead of a hard CBOR `missing field` failure.
     #[serde(default)]
     pub epoch: BaselineEpoch,
-    pub prev_partition_hash: Option<[u8; 32]>,
+    // Hash of the previous operation in THIS node's chain (None = node genesis).
+    pub prev_node_hash: Option<[u8; 32]>,
     pub payload_hash: [u8; 32],
     pub acl_snapshot_hash: [u8; 32],
     pub policy_epoch: u64,
@@ -295,8 +324,8 @@ pub struct SyncOperation {
 impl SyncOperation {
     pub fn from_new(
         new_operation: NewSyncOperation,
-        partition_sequence: u64,
-        prev_partition_hash: Option<[u8; 32]>,
+        node_seq: u64,
+        prev_node_hash: Option<[u8; 32]>,
         signer: &dyn SyncOperationSigner,
     ) -> LedgerResult<Self> {
         if new_operation.actor_node_id != signer.node_id() {
@@ -308,7 +337,7 @@ impl SyncOperation {
         let body = SyncOperationBody {
             org_id: new_operation.org_id,
             partition_id: new_operation.partition_id,
-            partition_sequence,
+            node_seq,
             addon_id: new_operation.addon_id,
             resource_type: new_operation.resource_type,
             resource_id: new_operation.resource_id,
@@ -323,7 +352,7 @@ impl SyncOperation {
             actor_node_id: new_operation.actor_node_id,
             hlc_timestamp: new_operation.hlc_timestamp,
             epoch: new_operation.epoch,
-            prev_partition_hash,
+            prev_node_hash,
             payload_hash: new_operation.payload_hash,
             acl_snapshot_hash: new_operation.acl_snapshot_hash,
             policy_epoch: new_operation.policy_epoch,
@@ -360,6 +389,22 @@ impl SyncOperation {
                 actual: self.op_id,
             });
         }
+        // node_seq is the 1-based dense chain position; 0 is structurally invalid.
+        if self.body.node_seq == 0 {
+            return Err(SyncLedgerError::InvalidNodeSeq {
+                node: self.body.actor_node_id.clone(),
+            });
+        }
+        // The HLC origin must be the authoring node: a forged hlc.node_id would
+        // let an attacker steer last-writer-wins resolution without touching the
+        // signed chain. The hash above already binds hlc into the op identity, so
+        // this rejects the forgery before it can ever influence materialization.
+        if self.body.hlc_timestamp.node_id != self.body.actor_node_id {
+            return Err(SyncLedgerError::HlcNodeMismatch {
+                actor: self.body.actor_node_id.clone(),
+                hlc: self.body.hlc_timestamp.node_id.clone(),
+            });
+        }
         Ok(())
     }
 }
@@ -373,10 +418,12 @@ pub trait SyncOperationVerifier: Send + Sync {
     fn verify_operation_signature(&self, operation: &SyncOperation) -> LedgerResult<()>;
 }
 
+/// Head of a single node's hash chain. Keyed by `node_id`; a node is the only
+/// writer of its own chain, so this advances monotonically and never forks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PartitionHead {
-    pub partition_id: PartitionId,
-    pub last_sequence: u64,
+pub struct NodeHead {
+    pub node_id: String,
+    pub last_seq: u64,
     pub last_hash: [u8; 32],
 }
 
@@ -384,15 +431,26 @@ pub struct PartitionHead {
 pub struct AppendResult {
     pub op_id: OperationId,
     pub operation_hash: [u8; 32],
-    pub previous_partition_hash: Option<[u8; 32]>,
-    pub partition_sequence: u64,
+    pub previous_node_hash: Option<[u8; 32]>,
+    pub node_seq: u64,
 }
 
+/// Reads every operation routed to one partition (materialization index). The
+/// partition no longer carries a global sequence, so the caller orders the
+/// result by HLC. Snapshot/pull use `NodeLogQuery` for per-node chain reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationQuery {
     pub partition_id: PartitionId,
-    pub from_sequence: Option<u64>,
-    pub to_sequence: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+/// Reads a contiguous slice of one node's chain ordered by `node_seq`. This is
+/// the dense, monotonic axis pull/repair/snapshot-tail validate against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeLogQuery {
+    pub node_id: String,
+    pub from_node_seq: Option<u64>,
+    pub to_node_seq: Option<u64>,
     pub limit: Option<usize>,
 }
 
@@ -421,19 +479,26 @@ pub struct InboxEntry {
     pub deferred_count: u32,
 }
 
+/// What the local node has observed of one remote node's chain: the highest
+/// contiguous `node_seq` accepted and that operation's hash. Replaces the old
+/// per-(peer, partition) cursor — the node-frontier is keyed by the authoring
+/// node, not by partition, because admission is now per-node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerCursor {
-    pub peer: PeerId,
-    pub partition_id: PartitionId,
-    pub last_sequence: u64,
+pub struct NodeFrontierEntry {
+    pub node_id: String,
+    pub last_seq: u64,
     pub last_hash: [u8; 32],
 }
 
+/// A pending catch-up pull for a gap in one node's chain. `peer` is the mesh
+/// peer we ask; `target_node_id` is the authoring node whose chain we need from
+/// `from_node_seq` onward (peer and target may differ — any peer can relay
+/// another node's chain).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepairQueueEntry {
     pub peer: PeerId,
-    pub partition_id: PartitionId,
-    pub from_sequence: u64,
+    pub target_node_id: String,
+    pub from_node_seq: u64,
     pub next_attempt_ms: i64,
     pub retry_count: u32,
 }
@@ -450,6 +515,17 @@ pub struct SyncSnapshot {
     pub root_hash: [u8; 32],
     #[serde(default)]
     pub state_hash: [u8; 32],
+    /// Per-node coverage of this snapshot: `node_id -> (last_node_seq, last_hash)`
+    /// over every authoring node whose chain the snapshot prefix includes. This is
+    /// the AUTHORITATIVE coverage axis in the per-node model (`up_to_sequence` is
+    /// only a 1-based count watermark + storage key). A node that adopts this
+    /// snapshot sets its node-frontier to exactly this map, then pulls each
+    /// writer's chain forward from `last_node_seq` — so the catch-up tail is bounded
+    /// per writer with no fork. It is bound into the snapshot signature, so the
+    /// frontier a receiver commits to is attested by the author, not merely
+    /// reconstructed from the blob.
+    #[serde(default)]
+    pub node_frontier: std::collections::BTreeMap<String, (u64, [u8; 32])>,
     #[serde(default)]
     pub last_operation_hash: Option<[u8; 32]>,
     #[serde(default)]
@@ -486,8 +562,28 @@ pub trait SyncLedgerStore: Send + Sync {
         operation: NewSyncOperation,
         signer: &dyn SyncOperationSigner,
     ) -> LedgerResult<AppendResult>;
+    /// Every operation routed to a partition (materialization index), unordered
+    /// across node chains. Callers order by HLC.
     fn get_operations(&self, query: OperationQuery) -> LedgerResult<Vec<SyncOperation>>;
+    /// A contiguous slice of one node's chain ordered by `node_seq`. The dense
+    /// axis pull/repair/snapshot-tail validate against.
+    fn get_node_operations(&self, query: NodeLogQuery) -> LedgerResult<Vec<SyncOperation>>;
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation>;
+    /// The `op_id` we actually recorded at `(node_id, node_seq)` on the per-node
+    /// chain axis, or `None` if that position was compacted away or never seen.
+    /// Equivocation detection compares this against the incoming op's `op_id`:
+    /// because ops are content-addressed, an op forged at an already-known seq has
+    /// a DIFFERENT op_id, which a by-op_id lookup would miss entirely.
+    fn get_node_log_entry(
+        &self,
+        node_id: &str,
+        node_seq: u64,
+    ) -> LedgerResult<Option<OperationId>>;
+    /// The lowest `node_seq` for `node_id` whose operation row is still present
+    /// (not compacted away), i.e. the earliest position this node can RELAY to a
+    /// peer. `None` if we hold nothing live for that chain. A pull asking below
+    /// this floor cannot be served from the log and must escalate to a snapshot.
+    fn earliest_live_node_seq(&self, node_id: &str) -> LedgerResult<Option<u64>>;
     fn put_in_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn get_outbox_entry(&self, target: SyncTarget, op_id: OperationId)
         -> LedgerResult<OutboxEntry>;
@@ -501,6 +597,18 @@ pub trait SyncLedgerStore: Send + Sync {
         &self,
         source: PeerId,
         operation: SyncOperation,
+        verifier: &dyn SyncOperationVerifier,
+    ) -> LedgerResult<()>;
+    /// Atomically verifies + stores an accepted op in the inbox AND advances the
+    /// author's node-frontier in ONE durable batch. The two MUST be atomic: if a
+    /// crash advanced the frontier without persisting the inbox entry, that seq
+    /// would be skipped forever (the op is neither pulled again — frontier is past
+    /// it — nor applied — it never reached the inbox), silently losing data.
+    fn admit_verified_operation(
+        &self,
+        source: PeerId,
+        operation: SyncOperation,
+        frontier: NodeFrontierEntry,
         verifier: &dyn SyncOperationVerifier,
     ) -> LedgerResult<()>;
     fn get_inbox_entry(&self, source: PeerId, op_id: OperationId) -> LedgerResult<InboxEntry>;
@@ -527,12 +635,10 @@ pub trait SyncLedgerStore: Send + Sync {
     /// reap orphaned entries whose backing operation has been compacted away;
     /// removing an absent key is a no-op.
     fn remove_outbox_entry(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
-    fn get_peer_cursor(
-        &self,
-        peer: PeerId,
-        partition: PartitionId,
-    ) -> LedgerResult<Option<PeerCursor>>;
-    fn save_peer_cursor(&self, cursor: PeerCursor) -> LedgerResult<()>;
+    /// What the local node has observed of `node_id`'s chain (last contiguous
+    /// `node_seq` + hash). `None` until the first operation from that node lands.
+    fn get_node_frontier(&self, node_id: &str) -> LedgerResult<Option<NodeFrontierEntry>>;
+    fn save_node_frontier(&self, frontier: NodeFrontierEntry) -> LedgerResult<()>;
     fn upsert_repair_request(&self, entry: RepairQueueEntry) -> LedgerResult<()>;
     fn list_due_repair_requests(
         &self,
@@ -543,11 +649,11 @@ pub trait SyncLedgerStore: Send + Sync {
     fn mark_repair_attempted(
         &self,
         peer: PeerId,
-        partition: PartitionId,
+        target_node_id: &str,
         next_attempt_ms: i64,
         retry_count: u32,
     ) -> LedgerResult<()>;
-    fn remove_repair_request(&self, peer: PeerId, partition: PartitionId) -> LedgerResult<()>;
+    fn remove_repair_request(&self, peer: PeerId, target_node_id: &str) -> LedgerResult<()>;
     fn save_snapshot(&self, snapshot: SyncSnapshot) -> LedgerResult<()>;
     fn get_snapshot(
         &self,
@@ -560,7 +666,9 @@ pub trait SyncLedgerStore: Send + Sync {
         partition: PartitionId,
         up_to_sequence: Option<u64>,
     ) -> LedgerResult<Option<SyncSnapshot>>;
-    fn get_partition_head(&self, partition: PartitionId) -> LedgerResult<Option<PartitionHead>>;
+    /// Head of `node_id`'s LOCAL chain (only the local node ever appends to its
+    /// own head). Returns `None` before the node mints its first operation.
+    fn get_node_head(&self, node_id: &str) -> LedgerResult<Option<NodeHead>>;
     fn list_outbox_for_partition(
         &self,
         partition: PartitionId,
@@ -603,6 +711,31 @@ pub trait SyncLedgerStore: Send + Sync {
 
 /// Prefix shared by every core-owned partition_id (`core/org/<org>/<suffix>`).
 pub const CORE_PARTITION_PREFIX: &str = "core/";
+
+/// Canonical leaf order for operations within a partition. This is the single
+/// deterministic total order every structural reader (Merkle leaves, snapshot
+/// prefix/tail build, compaction) must agree on so two honest nodes that hold the
+/// same operation set compute the SAME root_hash / state_hash.
+///
+/// It deliberately does NOT use the HLC: HLC carries a wall-clock component, so
+/// under clock skew two nodes can disagree on the relative HLC order of ops from
+/// different authors, which would make the Merkle root un-reconcilable. Instead
+/// the order is `(actor_node_id, node_seq)` — each per-node chain is dense and
+/// strictly monotonic in `node_seq`, so this is a stable total order regardless
+/// of clock skew. `operation_hash` is a final tie-break that can only matter if
+/// the input set is already Byzantine (equivocation), which the chain validators
+/// reject upstream. The HLC is used ONLY for last-writer-wins value resolution in
+/// the materializer (`incoming_hlc_wins`), never for leaf ordering.
+pub fn partition_materialization_order(
+    a: &SyncOperation,
+    b: &SyncOperation,
+) -> std::cmp::Ordering {
+    a.body
+        .actor_node_id
+        .cmp(&b.body.actor_node_id)
+        .then_with(|| a.body.node_seq.cmp(&b.body.node_seq))
+        .then_with(|| a.operation_hash.cmp(&b.operation_hash))
+}
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> LedgerResult<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -667,7 +800,7 @@ mod tests {
         let body = SyncOperationBody {
             org_id: "org_1".to_string(),
             partition_id: PartitionId::new("core/org/org_1/flows").unwrap(),
-            partition_sequence: 7,
+            node_seq: 7,
             addon_id: "core".to_string(),
             resource_type: "core.flow".to_string(),
             resource_id: "flow-uuid".to_string(),
@@ -685,7 +818,7 @@ mod tests {
                 counter: 5,
                 origin_node: "node_a".to_string(),
             },
-            prev_partition_hash: Some([9; 32]),
+            prev_node_hash: Some([9; 32]),
             payload_hash: [1; 32],
             acl_snapshot_hash: [2; 32],
             policy_epoch: 2,
@@ -711,7 +844,7 @@ mod tests {
         struct LegacyOperationBody {
             org_id: String,
             partition_id: PartitionId,
-            partition_sequence: u64,
+            node_seq: u64,
             addon_id: String,
             resource_type: String,
             resource_id: String,
@@ -725,7 +858,7 @@ mod tests {
             actor_device_id: String,
             actor_node_id: String,
             hlc_timestamp: HybridLogicalTimestamp,
-            prev_partition_hash: Option<[u8; 32]>,
+            prev_node_hash: Option<[u8; 32]>,
             payload_hash: [u8; 32],
             acl_snapshot_hash: [u8; 32],
             policy_epoch: u64,
@@ -735,7 +868,7 @@ mod tests {
         let legacy = LegacyOperationBody {
             org_id: "org_1".to_string(),
             partition_id: PartitionId::new("core/org/org_1/flows").unwrap(),
-            partition_sequence: 7,
+            node_seq: 7,
             addon_id: "core".to_string(),
             resource_type: "core.flow".to_string(),
             resource_id: "flow-uuid".to_string(),
@@ -749,7 +882,7 @@ mod tests {
             actor_device_id: "node_a".to_string(),
             actor_node_id: "node_a".to_string(),
             hlc_timestamp: hlc(100, 1, "node_a"),
-            prev_partition_hash: Some([9; 32]),
+            prev_node_hash: Some([9; 32]),
             payload_hash: [1; 32],
             acl_snapshot_hash: [2; 32],
             policy_epoch: 2,
