@@ -354,8 +354,8 @@ fn process_four_node_central_only_clients_do_not_materialize_sql() {
 
     authority.command(&format!("ASSERT_NO_PAYLOAD {}", central_a.node_id));
     authority.command(&format!("ASSERT_NO_PAYLOAD {}", central_b.node_id));
-    authority.command(&format!("ASSERT_REPAIR_DENIED {}", central_a.node_id));
-    authority.command(&format!("ASSERT_REPAIR_DENIED {}", central_b.node_id));
+    authority.command(&format!("ASSERT_REPAIR_REDACTED {}", central_a.node_id));
+    authority.command(&format!("ASSERT_REPAIR_REDACTED {}", central_b.node_id));
     authority.command(&format!(
         "ASSERT_SNAPSHOT_DENIED {} {} {}",
         central_a.node_id, snapshot.0, snapshot.1
@@ -374,15 +374,14 @@ fn process_four_node_central_only_clients_do_not_materialize_sql() {
 
 // Authority-write through a central client labels the capture by its raw table
 // (`contacts/<hash>`), not the replicated logical resource (`person/person-1`).
-// Under per-node hash-chains the serving side rejects a chain pull on the first
-// op the requester is not a sync target for, so that unsubscribed `contacts` op
-// permanently blocks `replicated` from advancing past it to the later
-// `person/person-1` op on the same authority chain — the chain cannot be
-// repaired. Fixing this requires a production chain-skip/tombstone for ops a
-// subscriber is not permitted to receive (out of scope for this test); the
-// resource-scoped convergence path is covered by the other process tests.
+// Under per-node hash-chains that unsubscribed `contacts` op sits on the same
+// authority chain, BEFORE the `person/person-1` op `replicated` does subscribe
+// to. The serving side now answers a chain pull by REDACTING the op the requester
+// is not a sync target for (signed chain proof, no body) instead of aborting, so
+// `replicated` advances its node-frontier past the redacted position and still
+// materializes the later op it is permitted to receive. This is the regression
+// guard for the per-node chain serving deadlock.
 #[test]
-#[ignore = "per-node chain serving blocks on an unsubscribed op authored on the authority chain (needs chain-skip mechanism)"]
 fn process_four_node_central_only_clients_read_and_write_through_authority() {
     if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
         return;
@@ -430,7 +429,21 @@ fn process_four_node_central_only_clients_read_and_write_through_authority() {
     ));
 
     let sql_op = parse_record_flow_op_id(&authority.command("RECORD_SQL_INSERT replicated-copy"));
+    // The authority chain now holds, in node_seq order: the replicated person op
+    // (seq 1, replicated IS a target), the central client's raw `contacts` write
+    // (seq 2, replicated is NOT a target) and `replicated-copy` (seq 3, replicated
+    // IS a target). The push carries only seqs 1 and 3, so seq 3 GAPS on seq 2 at
+    // the receiver and queues a per-node repair. The repair pull is where the fix
+    // bites: the authority serves seq 2 REDACTED (signed chain proof, no body) so
+    // `replicated` advances past it and admits seq 3 — instead of the old hard
+    // reject that stalled the chain forever.
     authority.command(&format!("PUSH {}", replicated.node_id));
+    // The push carries only `replicated-copy`, which gaps on the unsubscribed
+    // `contacts` op ahead of it and queues a per-node repair. SEND_REPAIR drives
+    // that repair pull: the authority serves the unsubscribed op REDACTED so
+    // `replicated` advances past it and admits `replicated-copy`. `send_repair_pull`
+    // retries until the gap's repair request is queued, so there is no race.
+    replicated.command(&format!("SEND_REPAIR {}", authority.node_id));
     authority.command(&format!("WAIT_ACKS {} 1", sql_op));
     replicated.command("WAIT_SQL_NAME replicated-copy");
     central_a.command("ASSERT_NO_SQL");
@@ -534,7 +547,10 @@ fn process_four_node_snapshot_tail_respects_acl() {
     let snapshot = parse_snapshot_line(&snapshot_line);
     let update_op = parse_record_flow_op_id(&source.command("RECORD_SQL_UPDATE snap-tail"));
 
-    source.command(&format!("ASSERT_REPAIR_DENIED {}", receiver_denied.node_id));
+    // A non-target chain pull is served REDACTED (no body leak); a snapshot pull
+    // is still hard-denied because a SQL snapshot package cannot be partially
+    // redacted (all-or-nothing per partition).
+    source.command(&format!("ASSERT_REPAIR_REDACTED {}", receiver_denied.node_id));
     source.command(&format!(
         "ASSERT_SNAPSHOT_DENIED {} {} {}",
         receiver_denied.node_id, snapshot.0, snapshot.1
@@ -1179,9 +1195,9 @@ async fn handle_child_command(
             send_snapshot_pull(mesh, peer, sequence.parse()?, snapshot_id).await?;
             Ok("SEND_SNAPSHOT".to_string())
         }
-        ["ASSERT_REPAIR_DENIED", peer] => {
-            assert_repair_denied(peer)?;
-            Ok("ASSERT_REPAIR_DENIED".to_string())
+        ["ASSERT_REPAIR_REDACTED", peer] => {
+            assert_repair_redacted(peer)?;
+            Ok("ASSERT_REPAIR_REDACTED".to_string())
         }
         ["ASSERT_SNAPSHOT_DENIED", peer, sequence, snapshot_id] => {
             assert_snapshot_denied(peer, sequence.parse()?, snapshot_id)?;
@@ -1275,9 +1291,12 @@ async fn send_snapshot_pull(
     Ok(())
 }
 
-fn assert_repair_denied(peer: &str) -> anyhow::Result<()> {
-    // Pull the local node's own chain (it authored the snapshot partition): an
-    // unauthorized requester must be denied per served operation.
+fn assert_repair_redacted(peer: &str) -> anyhow::Result<()> {
+    // Pull the local node's own chain (it authored the snapshot partition) as an
+    // unauthorized requester. The pull is no longer hard-denied: the serving side
+    // REDACTS every op the requester is not a sync target for, so the chain stays
+    // dense (the requester can advance its frontier) but leaks no resource body.
+    // Assert the response carries operations and every one is redacted.
     let target_node_id = tentaflow_core::sync::runtime::local_node_id()
         .ok_or_else(|| anyhow::anyhow!("sync runtime not started"))?;
     let payload = tentaflow_protocol::mesh::MeshSyncPullPayload {
@@ -1286,14 +1305,25 @@ fn assert_repair_denied(peer: &str) -> anyhow::Result<()> {
         from_node_seq: 1,
         limit: 64,
     };
-    let error = match tentaflow_core::sync::runtime::handle_pull_payload(peer, payload) {
-        Ok(_) => anyhow::bail!("repair pull must be denied"),
-        Err(error) => error,
+    let result = tentaflow_core::sync::runtime::handle_pull_payload(peer, payload)?
+        .ok_or_else(|| anyhow::anyhow!("repair pull returned no result"))?;
+    let MeshSyncPullResult::Operations(response) = result else {
+        anyhow::bail!("repair pull must serve operations, not a snapshot");
     };
     anyhow::ensure!(
-        error.to_string().contains("is not a sync target"),
-        "unexpected repair denial: {error}"
+        !response.operations.is_empty(),
+        "repair pull served no operations to redact"
     );
+    for op in &response.operations {
+        anyhow::ensure!(
+            op.redacted.is_some(),
+            "unauthorized requester must receive only redacted ops"
+        );
+        anyhow::ensure!(
+            op.operation.is_empty() && op.partition_id.is_empty(),
+            "redacted op must withhold body and partition"
+        );
+    }
     Ok(())
 }
 

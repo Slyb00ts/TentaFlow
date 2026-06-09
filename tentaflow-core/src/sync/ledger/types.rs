@@ -416,6 +416,11 @@ pub trait SyncOperationSigner: Send + Sync {
 
 pub trait SyncOperationVerifier: Send + Sync {
     fn verify_operation_signature(&self, operation: &SyncOperation) -> LedgerResult<()>;
+    /// Verifies a redacted chain placeholder. We cannot recompute `operation_hash`
+    /// (the body is absent), so we trust the carried hash ONLY because the
+    /// signature is over it: a forged hash would need the author's key to produce
+    /// a matching signature. The caller still links `prev_node_hash` to the chain.
+    fn verify_redacted_signature(&self, record: &RedactedRecord) -> LedgerResult<()>;
 }
 
 /// Head of a single node's hash chain. Keyed by `node_id`; a node is the only
@@ -425,6 +430,50 @@ pub struct NodeHead {
     pub node_id: String,
     pub last_seq: u64,
     pub last_hash: [u8; 32],
+}
+
+/// One position on a node's chain as the local store holds it: either the full
+/// operation (we are a sync target for the resource) or a redacted placeholder
+/// (we are not). Pull-serving walks the chain in this form so a relay can pass on
+/// a position it itself only holds redacted, without forging a body.
+#[derive(Debug, Clone)]
+pub enum NodeChainEntry {
+    Full(SyncOperation),
+    Redacted(RedactedRecord),
+}
+
+impl NodeChainEntry {
+    pub fn node_seq(&self) -> u64 {
+        match self {
+            NodeChainEntry::Full(op) => op.body.node_seq,
+            NodeChainEntry::Redacted(record) => record.node_seq,
+        }
+    }
+
+    pub fn op_id(&self) -> OperationId {
+        match self {
+            NodeChainEntry::Full(op) => op.op_id,
+            NodeChainEntry::Redacted(record) => record.op_id,
+        }
+    }
+}
+
+/// A chain position the local node knows ONLY as a verified placeholder: the
+/// authoring node minted it, the signature checks out over `operation_hash`, and
+/// it links the per-node chain via `prev_node_hash` — but the body was withheld
+/// because the local node is not a sync target for the underlying resource. It
+/// lets the receiver advance its node-frontier and detect equivocation at this
+/// `(actor_node_id, node_seq)` without ever materializing the resource. If the
+/// receiver later gains permission, the full op (same `op_id`) replaces this
+/// record and is materialized — never a fork, always a completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactedRecord {
+    pub op_id: OperationId,
+    pub operation_hash: [u8; 32],
+    pub actor_node_id: String,
+    pub node_seq: u64,
+    pub prev_node_hash: Option<[u8; 32]>,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +617,14 @@ pub trait SyncLedgerStore: Send + Sync {
     /// A contiguous slice of one node's chain ordered by `node_seq`. The dense
     /// axis pull/repair/snapshot-tail validate against.
     fn get_node_operations(&self, query: NodeLogQuery) -> LedgerResult<Vec<SyncOperation>>;
+    /// Like `get_node_operations`, but each chain position is returned in the form
+    /// the store holds it: a full operation OR a redacted placeholder. Pull-serving
+    /// uses this so a relay can forward a position it itself holds only redacted,
+    /// preserving chain density instead of leaving a gap the requester loops on.
+    fn get_node_chain_entries(
+        &self,
+        query: NodeLogQuery,
+    ) -> LedgerResult<Vec<NodeChainEntry>>;
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation>;
     /// The `op_id` we actually recorded at `(node_id, node_seq)` on the per-node
     /// chain axis, or `None` if that position was compacted away or never seen.
@@ -611,6 +668,23 @@ pub trait SyncLedgerStore: Send + Sync {
         frontier: NodeFrontierEntry,
         verifier: &dyn SyncOperationVerifier,
     ) -> LedgerResult<()>;
+    /// Atomically verifies a redacted chain placeholder, records it on the per-node
+    /// axis (`node_log` + a `redacted_log` row) and advances the author's
+    /// node-frontier — all in ONE durable batch, for the same crash-safety reason
+    /// as `admit_verified_operation`. It deliberately writes NOTHING to the inbox
+    /// or the partition view: a redacted op carries no body, so there is nothing to
+    /// materialize or relay as full. `get_node_log_entry` still resolves this
+    /// position, so equivocation detection works against it.
+    fn admit_redacted_operation(
+        &self,
+        record: RedactedRecord,
+        frontier: NodeFrontierEntry,
+        verifier: &dyn SyncOperationVerifier,
+    ) -> LedgerResult<()>;
+    /// The redacted placeholder stored at `op_id`, if the local node holds this
+    /// position only in redacted form (no full body). `None` once the full op
+    /// lands (it is removed) or if the position was never seen as redacted.
+    fn get_redacted_record(&self, op_id: OperationId) -> LedgerResult<Option<RedactedRecord>>;
     fn get_inbox_entry(&self, source: PeerId, op_id: OperationId) -> LedgerResult<InboxEntry>;
     fn list_unapplied_inbox(&self, limit: usize) -> LedgerResult<Vec<InboxEntry>>;
     fn mark_inbox_applied(&self, source: PeerId, op_id: OperationId) -> LedgerResult<()>;

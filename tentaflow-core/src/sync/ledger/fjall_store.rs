@@ -5,8 +5,10 @@
 
 use super::types::{
     decode, encode, partition_materialization_order, AppendResult, BaselineEpoch, CompactionPolicy,
-    HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, NodeFrontierEntry, NodeHead,
-    NodeLogQuery, OperationId, OperationQuery, OutboxEntry, PartitionId, PeerId, RepairQueueEntry,
+    HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, NodeChainEntry,
+    NodeFrontierEntry, NodeHead,
+    NodeLogQuery, OperationId, OperationQuery, OutboxEntry, PartitionId, PeerId, RedactedRecord,
+    RepairQueueEntry,
     SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner,
     SyncOperationVerifier, SyncSnapshot, SyncTarget,
 };
@@ -19,6 +21,11 @@ use std::path::Path;
 // axis (actor_node_id || 0x00 || node_seq.be -> op_id); `partition_index` is the
 // materialization routing index (partition_id || 0x00 || op_id -> ()).
 const OPERATIONS: &str = "operations";
+// Per-node chain positions the local node holds ONLY as verified redacted
+// placeholders (op_id -> RedactedRecord): authored + signed, body withheld
+// because we are not a sync target for the resource. Keyed by op_id like
+// `operations`, but never materialized and never relayed as full.
+const REDACTED_LOG: &str = "redacted_log";
 const NODE_LOG: &str = "node_log";
 const PARTITION_INDEX: &str = "partition_index";
 const NODE_HEADS: &str = "node_heads";
@@ -53,6 +60,7 @@ pub const LEDGER_SCHEMA_VERSION: u32 = 2;
 pub struct FjallSyncLedgerStore {
     db: Database,
     operations: Keyspace,
+    redacted_log: Keyspace,
     node_log: Keyspace,
     partition_index: Keyspace,
     node_heads: Keyspace,
@@ -144,6 +152,7 @@ impl FjallSyncLedgerStore {
         let db = Database::builder(path).open()?;
         Ok(Self {
             operations: db.keyspace(OPERATIONS, KeyspaceCreateOptions::default)?,
+            redacted_log: db.keyspace(REDACTED_LOG, KeyspaceCreateOptions::default)?,
             node_log: db.keyspace(NODE_LOG, KeyspaceCreateOptions::default)?,
             partition_index: db.keyspace(PARTITION_INDEX, KeyspaceCreateOptions::default)?,
             node_heads: db.keyspace(NODE_HEADS, KeyspaceCreateOptions::default)?,
@@ -278,6 +287,40 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             }
         }
         Ok(operations)
+    }
+
+    fn get_node_chain_entries(
+        &self,
+        query: NodeLogQuery,
+    ) -> LedgerResult<Vec<NodeChainEntry>> {
+        let mut entries = Vec::new();
+        let prefix = node_prefix(&query.node_id);
+        for item in self.node_log.prefix(&prefix) {
+            let (key, value) = item.into_inner()?;
+            let Some(node_seq) = node_seq_from_node_log_key(key.as_ref()) else {
+                continue;
+            };
+            if query.from_node_seq.is_some_and(|from| node_seq < from) {
+                continue;
+            }
+            if query.to_node_seq.is_some_and(|to| node_seq > to) {
+                continue;
+            }
+            let op_id = operation_id_from_bytes(value.as_ref())?;
+            // Prefer the full op; fall back to the redacted placeholder. A node_log
+            // entry whose content row was compacted away AND has no redacted record
+            // is simply skipped — the caller's compaction-floor escalation handles
+            // a requester sitting below the floor.
+            if let Some(op_value) = self.operations.get(op_id.as_bytes())? {
+                entries.push(NodeChainEntry::Full(decode(op_value.as_ref())?));
+            } else if let Some(red_value) = self.redacted_log.get(op_id.as_bytes())? {
+                entries.push(NodeChainEntry::Redacted(decode(red_value.as_ref())?));
+            }
+            if query.limit.is_some_and(|limit| entries.len() >= limit) {
+                break;
+            }
+        }
+        Ok(entries)
     }
 
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation> {
@@ -462,6 +505,10 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
                     // still be durable (a re-delivery of an op we hold).
                     let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
                     batch.insert(&self.operations, op_id.as_bytes().to_vec(), operation_bytes);
+                    // Upgrade redacted→full: if we previously held this position
+                    // only as a redacted placeholder, the full body now supersedes
+                    // it. Same op_id, so this is a completion, not a fork.
+                    batch.remove(&self.redacted_log, op_id.as_bytes().to_vec());
                     batch.insert(
                         &self.node_log,
                         node_log_key(&actor_node_id, node_seq),
@@ -498,6 +545,9 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
         batch.insert(&self.inbox, inbox_key, encode(&entry)?);
         batch.insert(&self.operations, op_id.as_bytes().to_vec(), operation_bytes);
+        // Upgrade redacted→full: a placeholder previously held at this op_id is
+        // superseded by the full body. Same op_id, so a completion, not a fork.
+        batch.remove(&self.redacted_log, op_id.as_bytes().to_vec());
         batch.insert(
             &self.node_log,
             node_log_key(&actor_node_id, node_seq),
@@ -515,6 +565,46 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         );
         batch.commit()?;
         Ok(())
+    }
+
+    fn admit_redacted_operation(
+        &self,
+        record: RedactedRecord,
+        frontier: NodeFrontierEntry,
+        verifier: &dyn SyncOperationVerifier,
+    ) -> LedgerResult<()> {
+        verifier.verify_redacted_signature(&record)?;
+        // A redacted op only advances the per-node chain axis. It is recorded on
+        // `node_log` (so equivocation detection and chain continuity resolve at
+        // this seq) and in `redacted_log` (so a later full op can detect it must
+        // upgrade), and it advances `node_frontier`. It NEVER touches `inbox`
+        // (nothing to apply), `operations`/`partition_index` (no body to relay or
+        // materialize), or `node_heads` (the local mint's chain only).
+        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+        batch.insert(
+            &self.redacted_log,
+            record.op_id.as_bytes().to_vec(),
+            encode(&record)?,
+        );
+        batch.insert(
+            &self.node_log,
+            node_log_key(&record.actor_node_id, record.node_seq),
+            record.op_id.as_bytes().to_vec(),
+        );
+        batch.insert(
+            &self.node_frontier,
+            frontier.node_id.as_bytes().to_vec(),
+            encode(&frontier)?,
+        );
+        batch.commit()?;
+        Ok(())
+    }
+
+    fn get_redacted_record(&self, op_id: OperationId) -> LedgerResult<Option<RedactedRecord>> {
+        match self.redacted_log.get(op_id.as_bytes())? {
+            Some(value) => Ok(Some(decode(value.as_ref())?)),
+            None => Ok(None),
+        }
     }
 
     fn get_inbox_entry(&self, source: PeerId, op_id: OperationId) -> LedgerResult<InboxEntry> {
@@ -1123,6 +1213,104 @@ mod tests {
         assert_eq!(first.node_seq, 1);
         assert_eq!(second.node_seq, 2);
         assert_eq!(second.previous_node_hash, Some(first.operation_hash));
+    }
+
+    #[test]
+    fn admit_redacted_records_node_log_and_advances_frontier() {
+        // A redacted placeholder advances the per-node chain axis (node_log +
+        // node_frontier) and is content-addressable by op_id, but never lands in
+        // the inbox or the partition view — there is nothing to materialize.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let op = SyncOperation::from_new(sample_operation(&signer, "person_1"), 1, None, &signer)
+            .unwrap();
+        let record = RedactedRecord {
+            op_id: op.op_id,
+            operation_hash: op.operation_hash,
+            actor_node_id: op.body.actor_node_id.clone(),
+            node_seq: 1,
+            prev_node_hash: None,
+            signature: op.signature.clone(),
+        };
+
+        store
+            .admit_redacted_operation(
+                record.clone(),
+                NodeFrontierEntry {
+                    node_id: op.body.actor_node_id.clone(),
+                    last_seq: 1,
+                    last_hash: op.operation_hash,
+                },
+                &HexNodeIdOperationVerifier,
+            )
+            .unwrap();
+
+        // node_log resolves the position (so equivocation detection works) and the
+        // redacted record is retrievable, but the inbox stays empty.
+        assert_eq!(
+            store
+                .get_node_log_entry(signer.node_id(), 1)
+                .unwrap(),
+            Some(op.op_id)
+        );
+        assert!(store.get_redacted_record(op.op_id).unwrap().is_some());
+        assert!(store.list_unapplied_inbox(16).unwrap().is_empty());
+        assert!(store.get_operation(op.op_id).is_err());
+        assert_eq!(
+            store
+                .get_node_frontier(signer.node_id())
+                .unwrap()
+                .unwrap()
+                .last_seq,
+            1
+        );
+    }
+
+    #[test]
+    fn full_op_upgrade_removes_redacted_record() {
+        // A full op for the same op_id supersedes a redacted placeholder: the
+        // redacted row is removed and the body becomes materializable. Same op_id,
+        // so this is a completion, not a fork.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let op = SyncOperation::from_new(sample_operation(&signer, "person_1"), 1, None, &signer)
+            .unwrap();
+        let source = PeerId::new("peer-x").unwrap();
+        let frontier = NodeFrontierEntry {
+            node_id: op.body.actor_node_id.clone(),
+            last_seq: 1,
+            last_hash: op.operation_hash,
+        };
+        store
+            .admit_redacted_operation(
+                RedactedRecord {
+                    op_id: op.op_id,
+                    operation_hash: op.operation_hash,
+                    actor_node_id: op.body.actor_node_id.clone(),
+                    node_seq: 1,
+                    prev_node_hash: None,
+                    signature: op.signature.clone(),
+                },
+                frontier.clone(),
+                &HexNodeIdOperationVerifier,
+            )
+            .unwrap();
+        assert!(store.get_redacted_record(op.op_id).unwrap().is_some());
+
+        store
+            .admit_verified_operation(
+                source,
+                op.clone(),
+                frontier,
+                &HexNodeIdOperationVerifier,
+            )
+            .unwrap();
+
+        assert!(store.get_redacted_record(op.op_id).unwrap().is_none());
+        assert!(store.get_operation(op.op_id).is_ok());
+        assert_eq!(store.list_unapplied_inbox(16).unwrap().len(), 1);
     }
 
     #[test]

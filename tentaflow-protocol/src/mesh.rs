@@ -1015,9 +1015,34 @@ pub struct MeshSyncOperationWire {
     pub op_id: Vec<u8>,
     // Partition stays for routing/materialization; the chain axis is now the
     // authoring node's `node_seq`, carried inside the encoded operation body.
+    // Empty string for a redacted op: the requester is not permitted to learn
+    // which resource the op touches, so even the partition name is withheld.
     pub partition_id: String,
     pub node_seq: u64,
+    // Full operation body (CBOR) for an op the requester is permitted to receive.
+    // Empty when `redacted` is set — a redacted op carries no body at all.
     pub operation: Vec<u8>,
+    // Set when the serving peer holds this chain position but the requester is
+    // NOT a sync target for the underlying resource. It carries only the
+    // signed chain proof (signature over `op_id`, plus `prev_node_hash`), which
+    // lets the requester verify continuity and advance its node-frontier WITHOUT
+    // ever seeing the resource body. `None` for a normal, fully-served op.
+    #[serde(default)]
+    pub redacted: Option<RedactedOperationWire>,
+}
+
+/// The minimal, signature-verifiable proof of a single chain position served in
+/// place of a full operation the requester may not read. `op_id` (carried on the
+/// enclosing `MeshSyncOperationWire`) IS the operation hash, and the signature is
+/// over `op_id`, so the requester can verify authorship and link the chain via
+/// `prev_node_hash` without the body. Because `op_id = blake3(body)` is a one-way
+/// hash, nothing about the redacted resource leaks (no body, no partition, no
+/// resource id, no HLC wall-clock).
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct RedactedOperationWire {
+    pub actor_node_id: String,
+    pub prev_node_hash: Option<[u8; 32]>,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
@@ -2031,6 +2056,7 @@ mod tests {
             partition_id: "addon/contacts/persons/1".to_string(),
             node_seq: 4,
             operation: vec![1, 2, 3, 4],
+            redacted: None,
         };
         let push = MeshSyncPushPayload {
             from_node_id: "node-a".to_string(),
@@ -2102,6 +2128,7 @@ mod tests {
                 partition_id: "addon/contacts/persons/1".to_string(),
                 node_seq: 11,
                 operation: vec![7, 8],
+                redacted: None,
             }],
         };
         let bytes = crate::cbor::encode(&snapshot_response).expect("encode snapshot response");
