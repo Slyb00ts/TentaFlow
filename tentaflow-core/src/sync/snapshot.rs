@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sync::ledger::{
     build_merkle_summary, hash_canonical, node_frontier_for_operations,
-    partition_materialization_order, validate_hash_chain, HexNodeIdOperationVerifier, LedgerResult,
+    partition_materialization_order, validate_hash_chain, validate_hash_chain_anchored,
+    HexNodeIdOperationVerifier, LedgerResult,
     OperationQuery, PartitionId, SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation,
     SyncOperationSigner, SyncOperationVerifier, SyncSnapshot,
 };
@@ -474,9 +475,20 @@ impl<'a> SnapshotManager<'a> {
         verify_snapshot_signature(snapshot)?;
         validate_snapshot_blob_bytes(snapshot, blob_bytes)?;
         let blob = decode_snapshot_sql_blob(blob_bytes)?;
+        // `validate_snapshot_sql_blob` re-verifies every blob op's Ed25519
+        // signature (and the blob's hash chain / merkle root) against the
+        // attested snapshot, so the prefix needs no separate per-op check here.
         validate_snapshot_sql_blob(snapshot, &blob, blob_bytes)?;
-        // The tail spans several authoring nodes; validate each per-node chain.
-        validate_hash_chain(operations_after_snapshot)?;
+        // The tail comes from a possibly hostile/relaying peer: anchor each
+        // writer's chain onto the snapshot's author-attested `node_frontier`
+        // (bound into the verified snapshot signature). A writer absent from the
+        // frontier anchors at genesis. This rejects a stale/forked but validly
+        // signed segment whose first op does not continue the donor's chain.
+        validate_hash_chain_anchored(operations_after_snapshot, &snapshot.node_frontier)?;
+        // Unlike the blob, the tail ops are NOT covered by the snapshot
+        // signature, so each must be independently signature-verified before it
+        // touches SQLite or advances the frontier.
+        validate_operation_signatures(operations_after_snapshot)?;
 
         for operation in operations_after_snapshot {
             if operation.body.partition_id != snapshot.partition_id {
@@ -1746,5 +1758,165 @@ mod tests {
         );
         // The adopted frontier names the donor writer at its highest covered seq.
         assert_eq!(donor.snapshot.node_frontier[signer.node_id()].0, 1);
+    }
+
+    /// Builds a donor SQL package whose snapshot covers a single seq-1 op, plus a
+    /// validly signed seq-2 tail op chained onto the snapshot frontier. Returns the
+    /// store, partition, snapshot package and the legitimate tail op so individual
+    /// tests can swap the tail for a tampered/forked variant.
+    fn donor_with_tail(
+        addon_prefix: &str,
+    ) -> (
+        tempfile::TempDir,
+        FjallSyncLedgerStore,
+        PartitionId,
+        SyncSnapshot,
+        Vec<u8>,
+        SyncOperation,
+        Ed25519OperationSigner,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let addon_id = unique_addon_id(addon_prefix);
+        let partition = PartitionId::new(format!("addon/{addon_id}/contacts/1")).unwrap();
+        let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
+            .expect("open addon db");
+        {
+            let conn = pool.get().expect("conn");
+            conn.execute(
+                "CREATE TABLE contacts (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                [],
+            )
+            .expect("create table");
+        }
+        let first = store
+            .append_operation(
+                sql_operation(
+                    &signer,
+                    partition.clone(),
+                    &addon_id,
+                    ActionType::Insert,
+                    "INSERT INTO contacts (id, name) VALUES (?1, ?2)",
+                    vec![JsonValue::from(1), JsonValue::String("Ola".to_string())],
+                    "donor-capture-insert",
+                    1,
+                ),
+                &signer,
+            )
+            .unwrap();
+        let donor = SnapshotManager::new(&store)
+            .build_sql_package_and_store(
+                SnapshotBuildRequest {
+                    partition_id: partition.clone(),
+                    up_to_sequence: Some(1),
+                    created_at_ms: 1_765_000_000_010,
+                },
+                &signer,
+            )
+            .unwrap()
+            .expect("snapshot package");
+
+        // A real seq-2 op for the same writer, chained onto the seq-1 op's hash —
+        // exactly what the snapshot frontier attests, so the legitimate tail passes.
+        let tail = SyncOperation::from_new(
+            sql_operation(
+                &signer,
+                partition.clone(),
+                &addon_id,
+                ActionType::Update,
+                "UPDATE contacts SET name = ?2 WHERE id = ?1",
+                vec![JsonValue::from(1), JsonValue::String("Ala".to_string())],
+                "donor-capture-update",
+                2,
+            ),
+            2,
+            Some(first.operation_hash),
+            &signer,
+        )
+        .unwrap();
+
+        let snapshot = donor.snapshot.clone();
+        let blob_bytes = donor.blob_bytes.clone();
+        (dir, store, partition, snapshot, blob_bytes, tail, signer)
+    }
+
+    #[test]
+    fn remote_tail_with_forged_signature_is_rejected() {
+        // A relay swaps the tail op for one signed by an UNRELATED key (so its
+        // actor_node_id no longer matches the signing key). The wire adopt path
+        // must reject it on per-op signature verification before any SQLite write
+        // or frontier advance — the snapshot signature only covers the blob, never
+        // the tail (CR-B1).
+        let _home = pin_home();
+        let (_dir, store, _partition, snapshot, blob_bytes, tail, _signer) =
+            donor_with_tail("forged-tail");
+        let manager = SnapshotManager::new(&store);
+
+        // Re-sign the same op body with a foreign key while keeping the genuine
+        // actor_node_id: the signature no longer verifies against that node's key.
+        let foreign = signer();
+        let mut forged = tail.clone();
+        forged.signature = foreign
+            .sign_operation(&forged.signing_bytes())
+            .unwrap();
+
+        let result = manager.restore_sql_from_package_parts(&snapshot, &blob_bytes, &[forged]);
+        assert!(
+            matches!(result, Err(SyncLedgerError::InvalidSignature { .. })),
+            "forged tail signature must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn remote_tail_forked_off_frontier_is_rejected() {
+        // The tail op is genuinely signed by the donor writer but chains onto a
+        // bogus predecessor instead of the snapshot's attested frontier hash — a
+        // stale/forked segment a relay could splice. It must be rejected before
+        // touching SQLite or advancing the frontier (CR-W1).
+        let _home = pin_home();
+        let (_dir, store, partition, snapshot, blob_bytes, _tail, signer) =
+            donor_with_tail("forked-tail");
+        let manager = SnapshotManager::new(&store);
+        let addon_id = partition
+            .as_str()
+            .trim_start_matches("addon/")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // Same writer, correct seq-2, validly signed, but prev_node_hash points at
+        // a fork rather than the seq-1 hash the snapshot frontier attests.
+        let forked = SyncOperation::from_new(
+            sql_operation(
+                &signer,
+                partition.clone(),
+                &addon_id,
+                ActionType::Update,
+                "UPDATE contacts SET name = ?2 WHERE id = ?1",
+                vec![JsonValue::from(1), JsonValue::String("Eva".to_string())],
+                "forked-capture-update",
+                2,
+            ),
+            2,
+            Some([0xAB; 32]),
+            &signer,
+        )
+        .unwrap();
+
+        let result = manager.restore_sql_from_package_parts(&snapshot, &blob_bytes, &[forked]);
+        assert!(
+            matches!(result, Err(SyncLedgerError::HashChainMismatch { .. })),
+            "forked tail must be rejected against attested frontier, got {result:?}"
+        );
+
+        // The legitimate tail (chained onto the frontier) is still accepted, so the
+        // anchoring check did not over-reject.
+        let (_dir2, store2, _p2, snapshot2, blob2, good_tail, _signer2) =
+            donor_with_tail("forked-tail-ok");
+        SnapshotManager::new(&store2)
+            .restore_sql_from_package_parts(&snapshot2, &blob2, &[good_tail])
+            .expect("legitimate frontier-anchored tail must be accepted");
     }
 }
