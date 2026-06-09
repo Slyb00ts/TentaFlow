@@ -2317,6 +2317,11 @@ pub struct DeployVllmRecommendRequest {
     /// wiec metadane architektury czytamy z naglowka pliku zamiast config.json.
     #[serde(default)]
     pub gguf_file: Option<String>,
+    /// Silnik deploymentu (`vllm` lub `llama-cpp`). Decyduje, ktorym modelem
+    /// fizycznym liczony jest VRAM. Opcjonalne dla kompatybilnosci wire — None
+    /// (oraz wykryty GGUF) mapuje na domyslny vLLM/llama.cpp w handlerze.
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 #[derive(

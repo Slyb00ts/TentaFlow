@@ -656,6 +656,10 @@ async function fetchVllmRecommendation(overrides = {}) {
     gpus,
     ...overrides,
   };
+  // Jawne pole `engine` mowi backendowi ktorym modelem fizycznym liczyc VRAM.
+  // Bez niego GGUF wykrywa sie po nazwie pliku, ale jawne pole jest pewne i
+  // dziala tez dla nie-GGUF modeli llama.cpp.
+  if (isLlamaCppEngine()) body.engine = 'llama-cpp';
   // llama.cpp/GGUF: repo nie ma config.json, wiec backend liczy VRAM z metadanych
   // wybranego pliku .gguf. Bez sciezki pliku backend nie ma czego odczytac.
   // Wysylamy pole tylko gdy plik jest wybrany — pusty string oznaczalby dla
@@ -907,9 +911,13 @@ function tAdv(k, params) { return I18n.t(`catalog.deploy_wizard.advanced.${k}`, 
 function renderVramCard(rec, totalVramGb, gpuCount) {
   const v = rec.vram_estimate || {};
   const r = rec.recommended || {};
+  const isLcpp = isLlamaCppEngine();
   const perGpu = v.per_gpu_gb || 0;
   const tpPp = (r.tensor_parallel || 1) * (r.pipeline_parallel || 1);
-  const totalUsed = perGpu * tpPp;
+  // Backend liczy `total_gb` poprawnie dla obu silnikow (dla llama.cpp compute
+  // buffer liczony raz, nie ×N GPU). Mnozenie perGpu × tpPp client-side
+  // zawyzaloby total dla llama.cpp, wiec preferujemy autorytatywna wartosc.
+  const totalUsed = (typeof v.total_gb === 'number' && v.total_gb > 0) ? v.total_gb : perGpu * tpPp;
   const headroomGb = totalVramGb - totalUsed;
   const pctUsed = totalVramGb > 0 ? Math.min(200, Math.round((totalUsed / totalVramGb) * 100)) : 0;
   const fits = v.fits_per_gpu !== false && pctUsed <= 95;
@@ -970,7 +978,7 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
       <div class="adv-kpi-grid" id="edw-adv-kpi">
         <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
         <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(tAdv('kpi_kv_cache'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_kv_sub', { ctx: (r.max_model_len || 0).toLocaleString(), dtype: r.kv_cache_dtype || 'auto' }))}</div></div>
-        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_activations'))}</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_activations_sub'))}</div></div>
+        <div class="adv-kpi"><div class="k-label">${escapeHtml(isLcpp ? tAdv('kpi_compute_buffer') : tAdv('kpi_activations'))}</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(isLcpp ? tAdv('kpi_compute_buffer_sub') : tAdv('kpi_activations_sub'))}</div></div>
         <div class="adv-kpi ${leftCls}"><div class="k-label">${escapeHtml(tAdv('kpi_headroom'))}</div><div class="k-value">${headroomGb >= 0 ? headroomGb.toFixed(1) : '−' + Math.abs(headroomGb).toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_headroom_sub', { p: Math.max(0, 100 - pctUsed) }))}</div></div>
         <div class="adv-kpi ${totalCls}"><div class="k-label">${escapeHtml(tAdv('kpi_total_avail'))}</div><div class="k-value">${totalUsed.toFixed(1)} GB / ${totalVramGb.toFixed(0)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_total_sub', { p: pctUsed, n: gpuCount }))}</div></div>
       </div>
@@ -980,7 +988,7 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
         <div class="adv-vram-legend">
           <span class="lg-w">${escapeHtml(tAdv('legend_weights', { p: w(weightsGb).toFixed(0) }))}</span>
           <span class="lg-kv">${escapeHtml(tAdv('legend_kv', { p: w(kvGb).toFixed(0) }))}</span>
-          <span class="lg-act">${escapeHtml(tAdv('legend_activations', { p: w(actGb).toFixed(0) }))}</span>
+          <span class="lg-act">${escapeHtml(isLcpp ? tAdv('legend_compute', { p: w(actGb).toFixed(0) }) : tAdv('legend_activations', { p: w(actGb).toFixed(0) }))}</span>
           ${overflow
             ? `<span class="lg-free danger">${escapeHtml(tAdv('legend_short', { gb: Math.abs(headroomGb).toFixed(1) }))}</span>`
             : `<span class="lg-free">${escapeHtml(tAdv('legend_free', { p: w(freeGb).toFixed(0) }))}</span>`}
@@ -1060,6 +1068,7 @@ function renderAdvancedManualControls(adv, rec) {
   // jako fallback gdy backend nie zwraca jeszcze `applied` (graceful degradation).
   const applied = rec?.applied || rec?.recommended || {};
   const recCfg = rec?.recommended || {};
+  const isLcpp = isLlamaCppEngine();
   const autoAdjusted = new Set(Array.isArray(rec?.auto_adjusted) ? rec.auto_adjusted : []);
   const lockedParam = adv.lockedParam || null;
 
@@ -1173,13 +1182,13 @@ function renderAdvancedManualControls(adv, rec) {
 
     <div class="adv-row-2">
       <div class="adv-form-row">
-        <label><span>${escapeHtml(tAdv('tp_label'))} ${lockMark('tensor_parallel')}</span><span class="v">${tp}</span></label>
+        <label><span>${escapeHtml(isLcpp ? tAdv('tp_label_llamacpp') : tAdv('tp_label'))} ${lockMark('tensor_parallel')}</span><span class="v">${tp}</span></label>
         <tf-input type="number" id="edw-adv-tp" min="1" max="${totalGpus}" value="${tp}"></tf-input>
         <div class="adv-hint">${escapeHtml(tAdv('tp_hint', { n: totalGpus }))}</div>
         ${tpAdjust}
       </div>
       <div class="adv-form-row">
-        <label><span>${escapeHtml(tAdv('pp_label'))}</span><span class="v">${pp}</span></label>
+        <label><span>${escapeHtml(isLcpp ? tAdv('pp_label_llamacpp') : tAdv('pp_label'))}</span><span class="v">${pp}</span></label>
         <tf-input type="number" id="edw-adv-pp" min="1" max="${totalGpus}" value="${pp}"></tf-input>
         <div class="adv-hint">${escapeHtml(tAdv('pp_hint', { n: totalGpus }))}</div>
       </div>
@@ -1216,7 +1225,7 @@ function renderAdvancedManualControls(adv, rec) {
     </div>
 
     <div class="adv-hint" style="margin-top:10px;">
-      ${escapeHtml(tAdv('vllm_args_note'))}
+      ${escapeHtml(isLcpp ? tAdv('llamacpp_args_note') : tAdv('vllm_args_note'))}
     </div>
   `;
 }
