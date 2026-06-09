@@ -69,12 +69,14 @@ impl<'a> CompactionManager<'a> {
         };
         verify_snapshot_signature(&snapshot)?;
         package_store.get_sql_package(&snapshot)?;
-        let operations = self.ledger.get_operations(OperationQuery {
+        // The watermark is a 1-based count over the HLC-ordered partition op set:
+        // take that prefix for finality evaluation.
+        let mut operations = self.ledger.get_operations(OperationQuery {
             partition_id: request.partition_id.clone(),
-            from_sequence: Some(1),
-            to_sequence: Some(snapshot.up_to_sequence),
             limit: None,
         })?;
+        operations.sort_by(crate::sync::ledger::partition_materialization_order);
+        operations.truncate(snapshot.up_to_sequence as usize);
         let outbox = self
             .ledger
             .list_outbox_for_partition(request.partition_id.clone(), snapshot.up_to_sequence)?;
@@ -283,27 +285,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.compacted_up_to_sequence, 1);
-        assert!(store
+        // Compaction dropped the first HLC-ordered op (the snapshot prefix),
+        // leaving exactly one live operation in the partition.
+        let remaining = store
             .get_operations(OperationQuery {
-                partition_id: partition.clone(),
-                from_sequence: Some(1),
-                to_sequence: Some(1),
+                partition_id: partition,
                 limit: None,
             })
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            store
-                .get_operations(OperationQuery {
-                    partition_id: partition,
-                    from_sequence: Some(2),
-                    to_sequence: Some(2),
-                    limit: None,
-                })
-                .unwrap()
-                .len(),
-            1
-        );
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
     }
 
     #[test]

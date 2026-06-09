@@ -1103,10 +1103,14 @@ async fn send_snapshot_pull(
 }
 
 fn assert_repair_denied(peer: &str) -> anyhow::Result<()> {
+    // Pull the local node's own chain (it authored the snapshot partition): an
+    // unauthorized requester must be denied per served operation.
+    let target_node_id = tentaflow_core::sync::runtime::local_node_id()
+        .ok_or_else(|| anyhow::anyhow!("sync runtime not started"))?;
     let payload = tentaflow_protocol::mesh::MeshSyncPullPayload {
         from_node_id: peer.to_string(),
-        partition_id: SNAPSHOT_PARTITION.to_string(),
-        from_sequence: 1,
+        target_node_id,
+        from_node_seq: 1,
         limit: 64,
     };
     let error = match tentaflow_core::sync::runtime::handle_pull_payload(peer, payload) {

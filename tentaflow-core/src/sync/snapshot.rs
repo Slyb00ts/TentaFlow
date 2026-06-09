@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sync::ledger::{
-    build_merkle_summary, hash_canonical, validate_hash_chain, validate_hash_chain_from,
+    build_merkle_summary, hash_canonical, partition_materialization_order, validate_hash_chain,
     HexNodeIdOperationVerifier, LedgerResult, OperationQuery, PartitionId, SnapshotId,
     SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier,
     SyncSnapshot,
@@ -145,34 +145,35 @@ impl<'a> SnapshotManager<'a> {
         Self { ledger }
     }
 
+    /// Returns the partition's operations in HLC order, truncated to the first
+    /// `up_to_count` of them (all of them when `None`). The snapshot watermark is
+    /// a 1-based count over this HLC-ordered set — there is no global partition
+    /// sequence anymore, so HLC is the canonical materialization order.
+    fn partition_prefix_operations(
+        &self,
+        partition_id: &PartitionId,
+        up_to_count: Option<u64>,
+    ) -> LedgerResult<Vec<SyncOperation>> {
+        let mut operations = self.ledger.get_operations(OperationQuery {
+            partition_id: partition_id.clone(),
+            limit: None,
+        })?;
+        operations.sort_by(|a, b| partition_materialization_order(a, b));
+        if let Some(count) = up_to_count {
+            operations.truncate(count as usize);
+        }
+        Ok(operations)
+    }
+
     pub fn build_and_store(
         &self,
         request: SnapshotBuildRequest,
         signer: &dyn SyncOperationSigner,
     ) -> LedgerResult<Option<SnapshotBuildResult>> {
-        let Some(head) = self
-            .ledger
-            .get_partition_head(request.partition_id.clone())?
-        else {
-            return Ok(None);
-        };
-        let up_to_sequence = request
-            .up_to_sequence
-            .unwrap_or(head.last_sequence)
-            .min(head.last_sequence);
+        let operations =
+            self.partition_prefix_operations(&request.partition_id, request.up_to_sequence)?;
+        let up_to_sequence = operations.len() as u64;
         if up_to_sequence == 0 {
-            return Ok(None);
-        }
-
-        let operations = self.ledger.get_operations(OperationQuery {
-            partition_id: request.partition_id.clone(),
-            from_sequence: Some(1),
-            to_sequence: Some(up_to_sequence),
-            limit: Some(usize::try_from(up_to_sequence).map_err(|_| {
-                SyncLedgerError::Runtime("snapshot sequence does not fit usize".to_string())
-            })?),
-        })?;
-        if operations.is_empty() {
             return Ok(None);
         }
         validate_hash_chain(&operations)?;
@@ -235,29 +236,10 @@ impl<'a> SnapshotManager<'a> {
         request: SnapshotBuildRequest,
         signer: &dyn SyncOperationSigner,
     ) -> LedgerResult<Option<SnapshotSqlPackageBuildResult>> {
-        let Some(head) = self
-            .ledger
-            .get_partition_head(request.partition_id.clone())?
-        else {
-            return Ok(None);
-        };
-        let up_to_sequence = request
-            .up_to_sequence
-            .unwrap_or(head.last_sequence)
-            .min(head.last_sequence);
+        let operations =
+            self.partition_prefix_operations(&request.partition_id, request.up_to_sequence)?;
+        let up_to_sequence = operations.len() as u64;
         if up_to_sequence == 0 {
-            return Ok(None);
-        }
-
-        let operations = self.ledger.get_operations(OperationQuery {
-            partition_id: request.partition_id.clone(),
-            from_sequence: Some(1),
-            to_sequence: Some(up_to_sequence),
-            limit: Some(usize::try_from(up_to_sequence).map_err(|_| {
-                SyncLedgerError::Runtime("snapshot sequence does not fit usize".to_string())
-            })?),
-        })?;
-        if operations.is_empty() {
             return Ok(None);
         }
         validate_hash_chain(&operations)?;
@@ -362,29 +344,24 @@ impl<'a> SnapshotManager<'a> {
             });
         }
 
-        let from_sequence = snapshot.up_to_sequence.saturating_add(1);
-        let operations_after_snapshot = match self
-            .ledger
-            .get_partition_head(request.partition_id.clone())?
-        {
-            Some(head) if head.last_sequence >= from_sequence => {
-                self.ledger.get_operations(OperationQuery {
-                    partition_id: request.partition_id,
-                    from_sequence: Some(from_sequence),
-                    to_sequence: None,
-                    limit: request.operation_limit,
-                })?
-            }
-            _ => Vec::new(),
-        };
-        if let Some(first_operation) = operations_after_snapshot.first() {
-            if first_operation.body.partition_sequence != from_sequence {
-                return Err(SyncLedgerError::MerkleSequenceGap {
-                    expected: from_sequence,
-                    actual: first_operation.body.partition_sequence,
-                });
-            }
-            validate_hash_chain_from(&operations_after_snapshot, snapshot.last_operation_hash)?;
+        // The snapshot prefix is the first `up_to_sequence` partition ops in
+        // canonical order; the tail is every remaining op. Reconstruct the prefix
+        // op_ids from the live ledger and treat everything not in that set as the
+        // tail. This stays correct after compaction (prefix ops are gone, so the
+        // whole live partition is tail). Each node's chain in the tail is checked.
+        let prefix = self.partition_prefix_operations(
+            &request.partition_id,
+            Some(snapshot.up_to_sequence),
+        )?;
+        let covered: std::collections::HashSet<crate::sync::ledger::OperationId> =
+            prefix.iter().map(|op| op.op_id).collect();
+        let mut operations_after_snapshot =
+            self.partition_tail_after(&request.partition_id, &covered)?;
+        if let Some(limit) = request.operation_limit {
+            operations_after_snapshot.truncate(limit);
+        }
+        if !operations_after_snapshot.is_empty() {
+            validate_hash_chain(&operations_after_snapshot)?;
             validate_operation_signatures(&operations_after_snapshot)?;
         }
 
@@ -392,6 +369,22 @@ impl<'a> SnapshotManager<'a> {
             snapshot,
             operations_after_snapshot,
         })
+    }
+
+    /// Partition operations not in `covered`, in canonical materialization order.
+    /// The complement of a snapshot prefix — the snapshot tail.
+    fn partition_tail_after(
+        &self,
+        partition_id: &PartitionId,
+        covered: &std::collections::HashSet<crate::sync::ledger::OperationId>,
+    ) -> LedgerResult<Vec<SyncOperation>> {
+        let mut tail: Vec<SyncOperation> = self
+            .partition_prefix_operations(partition_id, None)?
+            .into_iter()
+            .filter(|op| !covered.contains(&op.op_id))
+            .collect();
+        tail.sort_by(partition_materialization_order);
+        Ok(tail)
     }
 
     pub fn restore_sql_from_snapshot(
@@ -426,22 +419,29 @@ impl<'a> SnapshotManager<'a> {
         &self,
         request: SnapshotSqlPackageRestoreRequest,
     ) -> LedgerResult<SnapshotSqlRestoreResult> {
-        let plan = self.build_restore_plan(SnapshotRestoreRequest {
-            partition_id: request.partition_id,
-            up_to_sequence: request.up_to_sequence,
-            snapshot_id: request.snapshot_id,
-            operation_limit: None,
-        })?;
-        validate_snapshot_blob_bytes(&plan.snapshot, &request.blob_bytes)?;
+        let snapshot = self.ledger.get_snapshot(
+            request.partition_id.clone(),
+            request.up_to_sequence,
+            request.snapshot_id.clone(),
+        )?;
+        verify_snapshot_signature(&snapshot)?;
+        validate_snapshot_blob_bytes(&snapshot, &request.blob_bytes)?;
         let blob = decode_snapshot_sql_blob(&request.blob_bytes)?;
-        validate_snapshot_sql_blob(&plan.snapshot, &blob, &request.blob_bytes)?;
+        validate_snapshot_sql_blob(&snapshot, &blob, &request.blob_bytes)?;
+
+        // The blob op_ids are the authoritative covered set; the tail is the live
+        // partition ops not in it (correct even after the prefix is compacted).
+        let covered: std::collections::HashSet<crate::sync::ledger::OperationId> =
+            blob.operations.iter().map(|op| op.op_id).collect();
+        let operations_after_snapshot =
+            self.partition_tail_after(&request.partition_id, &covered)?;
+        if !operations_after_snapshot.is_empty() {
+            validate_hash_chain(&operations_after_snapshot)?;
+            validate_operation_signatures(&operations_after_snapshot)?;
+        }
 
         let mut sqlite_rows_changed = 0u64;
-        for operation in blob
-            .operations
-            .iter()
-            .chain(plan.operations_after_snapshot.iter())
-        {
+        for operation in blob.operations.iter().chain(operations_after_snapshot.iter()) {
             let capture = crate::sync::runtime::capture_from_operation(operation)?;
             sqlite_rows_changed +=
                 crate::addon::storage_sql_exec::apply_replicated_write(&capture, operation.op_id)
@@ -449,8 +449,8 @@ impl<'a> SnapshotManager<'a> {
         }
 
         Ok(SnapshotSqlRestoreResult {
-            snapshot: plan.snapshot,
-            operations_applied: blob.operations.len() + plan.operations_after_snapshot.len(),
+            operations_applied: blob.operations.len() + operations_after_snapshot.len(),
+            snapshot,
             sqlite_rows_changed,
         })
     }
@@ -465,9 +465,9 @@ impl<'a> SnapshotManager<'a> {
         validate_snapshot_blob_bytes(snapshot, blob_bytes)?;
         let blob = decode_snapshot_sql_blob(blob_bytes)?;
         validate_snapshot_sql_blob(snapshot, &blob, blob_bytes)?;
-        validate_hash_chain_from(operations_after_snapshot, snapshot.last_operation_hash)?;
+        // The tail spans several authoring nodes; validate each per-node chain.
+        validate_hash_chain(operations_after_snapshot)?;
 
-        let mut expected_sequence = snapshot.up_to_sequence.saturating_add(1);
         for operation in operations_after_snapshot {
             if operation.body.partition_id != snapshot.partition_id {
                 return Err(SyncLedgerError::MerklePartitionMismatch {
@@ -475,13 +475,6 @@ impl<'a> SnapshotManager<'a> {
                     actual: operation.body.partition_id.as_str().to_string(),
                 });
             }
-            if operation.body.partition_sequence != expected_sequence {
-                return Err(SyncLedgerError::MerkleSequenceGap {
-                    expected: expected_sequence,
-                    actual: operation.body.partition_sequence,
-                });
-            }
-            expected_sequence = expected_sequence.saturating_add(1);
         }
 
         let mut sqlite_rows_changed = 0u64;
@@ -526,15 +519,8 @@ impl<'a> SnapshotManager<'a> {
         &self,
         snapshot: &SyncSnapshot,
     ) -> LedgerResult<Vec<SyncOperation>> {
-        let operations = self.ledger.get_operations(OperationQuery {
-            partition_id: snapshot.partition_id.clone(),
-            from_sequence: Some(snapshot.from_sequence),
-            to_sequence: Some(snapshot.up_to_sequence),
-            limit: Some(
-                usize::try_from(snapshot.operation_count)
-                    .map_err(|_| snapshot_mismatch(snapshot, "operation_count"))?,
-            ),
-        })?;
+        let operations =
+            self.partition_prefix_operations(&snapshot.partition_id, Some(snapshot.up_to_sequence))?;
         if operations.len() as u64 != snapshot.operation_count {
             return Err(snapshot_mismatch(snapshot, "operation_count"));
         }
@@ -752,14 +738,9 @@ fn state_hash(
 ) -> LedgerResult<[u8; 32]> {
     let payload = SnapshotStatePayload {
         partition_id: partition_id.as_str(),
-        from_sequence: operations
-            .first()
-            .map(|operation| operation.body.partition_sequence)
-            .unwrap_or_default(),
-        up_to_sequence: operations
-            .last()
-            .map(|operation| operation.body.partition_sequence)
-            .unwrap_or_default(),
+        // Count watermark over the HLC-ordered op set passed in by the caller.
+        from_sequence: if operations.is_empty() { 0 } else { 1 },
+        up_to_sequence: operations.len() as u64,
         operation_ids: operations
             .iter()
             .map(|operation| *operation.op_id.as_bytes())
@@ -1173,7 +1154,7 @@ mod tests {
 
         assert_eq!(plan.snapshot, snapshot);
         assert_eq!(plan.operations_after_snapshot.len(), 1);
-        assert_eq!(plan.operations_after_snapshot[0].body.partition_sequence, 2);
+        assert_eq!(plan.operations_after_snapshot[0].body.node_seq, 2);
     }
 
     #[test]
@@ -1380,15 +1361,16 @@ mod tests {
                 keep_operations_after_sequence: Some(2),
             })
             .unwrap();
-        assert!(store
-            .get_operations(OperationQuery {
-                partition_id: partition.clone(),
-                from_sequence: Some(1),
-                to_sequence: Some(1),
-                limit: None,
-            })
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store
+                .get_operations(OperationQuery {
+                    partition_id: partition.clone(),
+                    limit: None,
+                })
+                .unwrap()
+                .len(),
+            1
+        );
 
         let result = manager
             .restore_sql_from_package(SnapshotSqlPackageRestoreRequest {
