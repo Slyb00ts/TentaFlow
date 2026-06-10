@@ -7093,29 +7093,34 @@ pub async fn service_oauth_start(
         }
     };
 
-    let resp = |flow_id: String, authorize_url: String, error: Option<String>| {
+    let resp = |flow_id: String, authorize_url: String, user_code: String, error: Option<String>| {
         Ok(MessageBody::ServiceBody(
             tentaflow_protocol::ServicePayload::ResOauthStart(
                 tentaflow_protocol::ServiceOauthStartResponse {
                     flow_id,
                     authorize_url,
+                    user_code,
                     error,
                 },
             ),
         ))
     };
 
-    // The OAuth callback lands on this node's loopback (localhost:1455), so the
-    // browser must reach it — login only runs on the local node.
+    // Device-code login runs entirely on the node that serves this dashboard
+    // (it makes the HTTPS calls to OpenAI; the browser only opens a URL and
+    // types a code). Deploying to a different mesh peer with login is not yet
+    // supported, so reject a remote target.
     if forward_target_node(ctx, &payload.node_id).is_some() {
         return resp(
             String::new(),
             String::new(),
-            Some("subscription login must be performed on the local node".to_string()),
+            String::new(),
+            Some("subscription login must run on the node serving this dashboard".to_string()),
         );
     }
     if !payload.provider.eq_ignore_ascii_case("openai") {
         return resp(
+            String::new(),
             String::new(),
             String::new(),
             Some("subscription login is only available for OpenAI".to_string()),
@@ -7123,8 +7128,8 @@ pub async fn service_oauth_start(
     }
 
     match crate::services::backend::codex_oauth::start_login().await {
-        Ok((flow_id, authorize_url)) => resp(flow_id, authorize_url, None),
-        Err(e) => resp(String::new(), String::new(), Some(e)),
+        Ok((flow_id, authorize_url, user_code)) => resp(flow_id, authorize_url, user_code, None),
+        Err(e) => resp(String::new(), String::new(), String::new(), Some(e)),
     }
 }
 

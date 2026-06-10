@@ -419,7 +419,10 @@ pub struct ServiceOauthStartRequest {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceOauthStartResponse {
     pub flow_id: String,
+    /// Page the user opens in any browser to authorise the device-code login.
     pub authorize_url: String,
+    /// One-time code the user enters on `authorize_url`.
+    pub user_code: String,
     pub error: Option<String>,
 }
 

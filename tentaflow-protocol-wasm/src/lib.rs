@@ -2714,6 +2714,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             set(obj, "flow_id", r.flow_id.into());
             set(obj, "authorizeUrl", r.authorize_url.clone().into());
             set(obj, "authorize_url", r.authorize_url.into());
+            set(obj, "userCode", r.user_code.clone().into());
+            set(obj, "user_code", r.user_code.into());
             if let Some(e) = r.error {
                 set(obj, "error", e.into());
             }

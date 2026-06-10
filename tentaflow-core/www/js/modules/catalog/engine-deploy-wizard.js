@@ -2058,8 +2058,15 @@ async function startOauthLogin() {
     if (!res || res.error || !res.authorizeUrl) {
       throw new Error((res && res.error) || 'no authorize URL');
     }
-    window.open(res.authorizeUrl, '_blank', 'noopener');
-    if (statusEl) statusEl.textContent = I18n.t('external.oauth_waiting');
+    const url = res.authorizeUrl;
+    const code = res.userCode || '';
+    try { window.open(url, '_blank', 'noopener'); } catch (_e) { /* popup blocked — link shown below */ }
+    if (statusEl) {
+      statusEl.innerHTML = `${escapeHtml(I18n.t('external.oauth_enter_code'))}
+        <a href="${escapeAttr(url)}" target="_blank" rel="noopener">${escapeHtml(url)}</a>
+        → <strong style="font-size:1.15em;letter-spacing:2px">${escapeHtml(code)}</strong>
+        <br><span class="form-hint">${escapeHtml(I18n.t('external.oauth_waiting'))}</span>`;
+    }
     pollOauth(res.flowId);
   } catch (e) {
     if (statusEl) statusEl.textContent = I18n.t('external.oauth_failed', { error: e.message || String(e) });
