@@ -14,6 +14,7 @@ pub mod dispatchers;
 pub mod dispatchers_impl;
 pub mod envelope;
 pub mod executor;
+pub mod expr;
 pub mod node_adapter;
 pub mod node_adapters;
 pub mod resolver;
