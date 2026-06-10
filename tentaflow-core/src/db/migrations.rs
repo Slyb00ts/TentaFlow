@@ -739,7 +739,7 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
         t(
             "skills",
             "created_by",
-            "creator provenance marker born TEXT in v62 (post-flip, never held an \
+            "creator provenance marker born TEXT in v63 (post-flip, never held an \
              INTEGER id); nullable, no declared user_accounts FK — synced rows may \
              reference an account the receiving node has not materialized yet",
         ),
