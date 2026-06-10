@@ -1445,3 +1445,205 @@ fn import_max_length_base_collision_terminates_with_unique_value() {
         joiner_name.chars().count()
     );
 }
+
+// =============================================================================
+// Staleness-aware single-flight: abandoned adopt states free the slot via TTL
+// =============================================================================
+
+/// Rewrites `settings.updated_at` of the persisted adopt state with an SQLite
+/// datetime modifier (e.g. "-11 minutes") or a raw literal, to simulate an
+/// adopt state armed long ago by a counterpart that never came back.
+fn set_adopt_state_updated_at(pool: &DbPool, value_sql: &str) {
+    let conn = pool.lock().unwrap();
+    let changed = conn
+        .execute(
+            &format!("UPDATE settings SET updated_at = {value_sql} WHERE key = ?1"),
+            params![BASELINE_ADOPT_STATE_KEY],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "adopt state row must exist to backdate");
+}
+
+#[test]
+fn begin_adopt_atomic_evicts_stale_elected_state() {
+    let pool = new_pool();
+    // Armed-only state (Elected) from an old pairing whose joiner never pulled.
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Donor,
+            "ghost-peer",
+            &epoch(0, "g"),
+            BaselinePhase::Elected,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+    set_adopt_state_updated_at(&pool, "datetime('now','-11 minutes')");
+
+    // A different target may now take over the slot instead of being refused.
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "live-peer",
+            &epoch(3, "l"),
+            BaselinePhase::Elected,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+    let st = load_adopt_state(&pool).unwrap().unwrap();
+    assert_eq!(st.role, BaselineRole::Joiner);
+    assert_eq!(st.peer, "live-peer");
+    assert_eq!(st.epoch.counter, 3);
+}
+
+#[test]
+fn begin_adopt_atomic_fresh_elected_still_refuses_different_target() {
+    let pool = new_pool();
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Donor,
+            "peer-a",
+            &epoch(1, "a"),
+            BaselinePhase::Elected,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+    // Within the armed TTL the slot still refuses any different target.
+    set_adopt_state_updated_at(&pool, "datetime('now','-5 minutes')");
+    assert!(begin_adopt_atomic(
+        &pool,
+        BaselineRole::Joiner,
+        "peer-b",
+        &epoch(2, "b"),
+        BaselinePhase::Elected,
+    )
+    .is_err());
+    let st = load_adopt_state(&pool).unwrap().unwrap();
+    assert_eq!(st.peer, "peer-a", "fresh state must not be evicted");
+}
+
+#[test]
+fn begin_adopt_atomic_evicts_stale_active_phase() {
+    let pool = new_pool();
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "peer-a",
+            &epoch(1, "a"),
+            BaselinePhase::Receiving,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+    // An active phase gets the longer TTL: 61 minutes is past it.
+    set_adopt_state_updated_at(&pool, "datetime('now','-61 minutes')");
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Donor,
+            "peer-b",
+            &epoch(2, "b"),
+            BaselinePhase::Elected,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+    let st = load_adopt_state(&pool).unwrap().unwrap();
+    assert_eq!(st.peer, "peer-b");
+}
+
+#[test]
+fn begin_adopt_atomic_fresh_active_phase_still_refuses() {
+    let pool = new_pool();
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "peer-a",
+            &epoch(1, "a"),
+            BaselinePhase::Receiving,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+    // 30 minutes is stale for an armed slot but NOT for an active transfer.
+    set_adopt_state_updated_at(&pool, "datetime('now','-30 minutes')");
+    assert!(begin_adopt_atomic(
+        &pool,
+        BaselineRole::Donor,
+        "peer-b",
+        &epoch(2, "b"),
+        BaselinePhase::Elected,
+    )
+    .is_err());
+    let st = load_adopt_state(&pool).unwrap().unwrap();
+    assert_eq!(st.peer, "peer-a");
+    assert_eq!(st.phase, BaselinePhase::Receiving);
+}
+
+#[test]
+fn begin_adopt_atomic_same_target_resume_unaffected_by_age() {
+    let pool = new_pool();
+    store_adopt_state(
+        &pool,
+        &BaselineAdoptState {
+            role: BaselineRole::Joiner,
+            peer: "donor-node".into(),
+            epoch: epoch(4, "d"),
+            phase: BaselinePhase::Imported,
+        },
+    )
+    .unwrap();
+    // Even a very old same-target Imported state must resume, never restart:
+    // the DB is already merged, only post-commit work remains.
+    set_adopt_state_updated_at(&pool, "datetime('now','-2 hours')");
+    match begin_adopt_atomic(
+        &pool,
+        BaselineRole::Joiner,
+        "donor-node",
+        &epoch(4, "d"),
+        BaselinePhase::Receiving,
+    )
+    .unwrap()
+    {
+        BeginOutcome::Resume(st) => assert_eq!(st.phase, BaselinePhase::Imported),
+        BeginOutcome::Started => panic!("same-target Imported must resume, not restart"),
+    }
+}
+
+#[test]
+fn begin_adopt_atomic_garbage_updated_at_treated_as_stale() {
+    let pool = new_pool();
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Donor,
+            "peer-a",
+            &epoch(1, "a"),
+            BaselinePhase::Receiving,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+    // A corrupt timestamp must not wedge the slot forever -> treated as stale.
+    set_adopt_state_updated_at(&pool, "'not-a-datetime'");
+    assert!(matches!(
+        begin_adopt_atomic(
+            &pool,
+            BaselineRole::Joiner,
+            "peer-b",
+            &epoch(2, "b"),
+            BaselinePhase::Elected,
+        )
+        .unwrap(),
+        BeginOutcome::Started
+    ));
+    let st = load_adopt_state(&pool).unwrap().unwrap();
+    assert_eq!(st.peer, "peer-b");
+}
