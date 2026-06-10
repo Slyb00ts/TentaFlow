@@ -6,5 +6,6 @@
 // =============================================================================
 
 pub mod client;
+pub mod codex;
 
 pub use client::BackendClient;

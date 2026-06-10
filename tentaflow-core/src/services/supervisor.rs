@@ -806,24 +806,44 @@ impl Supervisor {
         .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
     }
 
-    /// Decrypted, node-local API key for a local external-provider service,
+    /// Decrypted, node-local credentials for a local external-provider service,
     /// read from its `services.config_json`. Returns `None` when the service is
     /// not an external provider, carries no key, or decryption fails. Used only
     /// to build this node's BackendClient handle — the key never leaves the node
-    /// (it is absent from the broadcast `ServiceInfo`).
-    fn external_provider_api_key(&self, service_id: i64) -> Option<String> {
-        let conn = self.db.lock().ok()?;
-        let row = crate::services_repo::services::get(&conn, service_id).ok()??;
-        drop(conn);
+    /// (it is absent from the broadcast `ServiceInfo`). For OpenAI subscription
+    /// auth (`auth_mode = "subscription"`) the key is the pasted Codex auth blob
+    /// and the handle is redirected to the ChatGPT Responses backend.
+    fn external_provider_creds(
+        &self,
+        service_id: i64,
+    ) -> Option<crate::services::handles_cache::ExternalProviderCreds> {
+        let row = {
+            let conn = self.db.lock().ok()?;
+            crate::services_repo::services::get(&conn, service_id).ok()??
+        };
         let parsed: serde_json::Value = serde_json::from_str(&row.config_json).ok()?;
         let raw = parsed.get("api_key").and_then(|v| v.as_str())?;
         let key = self.settings_cipher.decrypt(raw).ok()?;
         let key = key.trim().to_string();
         if key.is_empty() {
-            None
-        } else {
-            Some(key)
+            return None;
         }
+        let mut creds = crate::services::handles_cache::ExternalProviderCreds {
+            api_key: key,
+            request_format: None,
+            endpoint_override: None,
+        };
+        let subscription = parsed
+            .get("auth_mode")
+            .and_then(|v| v.as_str())
+            .map(|m| m.eq_ignore_ascii_case("subscription"))
+            .unwrap_or(false);
+        if subscription && row.engine_id.eq_ignore_ascii_case("openai") {
+            creds.request_format = Some("codex".to_string());
+            creds.endpoint_override =
+                Some(crate::services::backend::codex::CHATGPT_CODEX_RESPONSES_URL.to_string());
+        }
+        Some(creds)
     }
 
     // ---- Mesh registry + live handles reconcile ---------------------------
@@ -947,12 +967,12 @@ impl Supervisor {
             // the BackendClient can authenticate. Only for locally-owned external
             // services — remote ones are reached over the mesh and keep their key
             // on the owning node.
-            let api_key = if svc.node_id == self.local_node_id && svc.deploy_method == "external" {
-                self.external_provider_api_key(service_id)
+            let creds = if svc.node_id == self.local_node_id && svc.deploy_method == "external" {
+                self.external_provider_creds(service_id)
             } else {
                 None
             };
-            let handle = match build_handle(&svc, api_key) {
+            let handle = match build_handle(&svc, creds) {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::warn!(
