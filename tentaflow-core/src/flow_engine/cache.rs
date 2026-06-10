@@ -143,40 +143,48 @@ impl CompiledFlow {
             .unwrap_or(false)
     }
 
-    /// Pozycja w execution_order node'a LLM, którego krawędź wyjściowa ma
-    /// `from_port="stream"`. Walidacja streaming end-shape gwarantuje co
-    /// najwyżej jeden taki node; brak = `None`.
-    pub fn streaming_llm_run_idx(&self) -> Option<usize> {
+    /// §3.11 B — pozycja w execution_order node'a-producenta strumienia:
+    /// node, którego krawędź wyjściowa ma `from_port="stream"` ORAZ który ma
+    /// zarejestrowanego `StreamProducerAdapter` (LLM pozostaje jednym z nich).
+    /// Walidacja streaming end-shape gwarantuje co najwyżej jeden taki node;
+    /// brak = `None`. Generalizacja starego `llm`-only slotu — harness
+    /// `loop`/`subflow`/addon stream block też mogą tu trafić.
+    pub fn stream_producer_run_idx(&self, registry: &AdapterRegistry) -> Option<usize> {
         if !self.is_streaming {
             return None;
         }
         for edge in self.definition.edges.iter() {
-            if edge.from_port == "stream" {
-                if let Some(&pos) = self.run_idx_by_id.get(edge.from.as_str()) {
-                    return Some(pos);
-                }
+            if edge.from_port != "stream" {
+                continue;
+            }
+            let Some(&pos) = self.run_idx_by_id.get(edge.from.as_str()) else {
+                continue;
+            };
+            let node = &self.definition.nodes[self.execution_order[pos]];
+            if registry.is_stream_producer(&node.node_type) {
+                return Some(pos);
             }
         }
         None
     }
 
-    /// Stage 3d Krok 2c-2: chain stream nodes po LLM (intermediate
-    /// streaming-aware nody między LLM a output sink). Walks `from_port=
-    /// "stream"` edges starting from LLM, kolejność topologiczna
+    /// Stage 3d Krok 2c-2: chain stream nodes po producencie (intermediate
+    /// streaming-aware nody między producentem a output sink). Walks `from_port=
+    /// "stream"` edges starting from the stream producer, kolejność topologiczna
     /// (execution_order indices). Zatrzymuje się gdy konsument to
     /// `output` node (sink) — output nie jest w chain'ie.
     ///
     /// Przykład: `llm.stream → pii_filter.stream → tts_stream_bridge.full →
     /// output` zwraca `[run_idx(pii_filter), run_idx(tts_stream_bridge)]`.
-    pub fn streaming_chain_run_idxs(&self) -> Vec<usize> {
-        let Some(llm_idx) = self.streaming_llm_run_idx() else {
+    pub fn streaming_chain_run_idxs(&self, registry: &AdapterRegistry) -> Vec<usize> {
+        let Some(producer_idx) = self.stream_producer_run_idx(registry) else {
             return Vec::new();
         };
-        let llm_def_idx = self.execution_order[llm_idx];
-        let llm_node_id = self.definition.nodes[llm_def_idx].id.as_str();
+        let producer_def_idx = self.execution_order[producer_idx];
+        let producer_node_id = self.definition.nodes[producer_def_idx].id.as_str();
 
         let mut chain: Vec<usize> = Vec::new();
-        let mut current_id = llm_node_id.to_string();
+        let mut current_id = producer_node_id.to_string();
         loop {
             // Find edge `from_port="stream"` z current_id.
             let next_edge = self
@@ -460,12 +468,43 @@ mod tests {
             ]
         }"#;
         // R7 streaming end-shape: llm.stream → output(stream).
-        let cf = CompiledFlow::from_json("1", json, &registry()).unwrap();
+        let reg = registry();
+        let cf = CompiledFlow::from_json("1", json, &reg).unwrap();
         assert!(cf.is_streaming);
-        assert_eq!(cf.streaming_llm_run_idx(), Some(1));
+        assert_eq!(cf.stream_producer_run_idx(&reg), Some(1));
         // Stage 3d Krok 2c: chain pusty dla direct LLM → output (output
         // jest sink'iem, NIE w chain'ie).
-        assert!(cf.streaming_chain_run_idxs().is_empty());
+        assert!(cf.streaming_chain_run_idxs(&reg).is_empty());
+    }
+
+    /// §3.11 B — producent strumienia jest wykrywany przez slot
+    /// `StreamProducerAdapter`, nie po node_type=="llm". Non-LLM producent
+    /// (zarejestrowany przez `register_stream_producer`) terminujący w
+    /// `output(stream)` jest poprawnie wskazany.
+    #[test]
+    fn compile_detects_non_llm_stream_producer() {
+        use crate::flow_engine::node_adapter::test_support::TestStreamProducer;
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_stream_producer(Arc::new(TestStreamProducer::new("test_producer")));
+
+        let json = r#"{
+            "nodes": [
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"p","type":"test_producer","config":{}},
+                {"id":"o","type":"output","config":{"mode":"stream"}}
+            ],
+            "edges": [
+                {"from":"t","to":"p","from_port":"text","to_port":"in"},
+                {"from":"p","to":"o","from_port":"stream","to_port":"text"}
+            ]
+        }"#;
+        let cf = CompiledFlow::from_json("1", json, &r).unwrap();
+        assert!(cf.is_streaming);
+        let producer = cf.stream_producer_run_idx(&r).expect("producer detected");
+        let def_idx = cf.execution_order[producer];
+        assert_eq!(cf.definition.nodes[def_idx].node_type, "test_producer");
     }
 
     /// Stage 3d Krok 2c: streaming_chain_run_idxs walks intermediate
@@ -495,7 +534,7 @@ mod tests {
             ]
         }"#;
         let cf = CompiledFlow::from_json("1", json, &r).unwrap();
-        let chain = cf.streaming_chain_run_idxs();
+        let chain = cf.streaming_chain_run_idxs(&r);
         assert_eq!(chain.len(), 1);
         // Chain pos to run_idx pii_filter — czyli execution_order[chain[0]]
         // wskazuje na node z node_type=='pii_filter'.

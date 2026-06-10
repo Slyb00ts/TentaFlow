@@ -305,6 +305,15 @@ pub struct FlowEnvelope {
     pub provenance: HashMap<String, ArtifactProvenance>,
     #[serde(default)]
     pub context: ConversationContext,
+    /// Fourth data channel (§3.12): user-facing flow variables written by
+    /// `output_mapping` and read by CEL expressions / `input_mapping`. Travels
+    /// with the envelope (copy-on-write per fan-out branch — the envelope is
+    /// cloned per branch already), so there is no shared mutable map and no
+    /// races. `meta` is from now on engine plumbing only; user data lives here.
+    /// `BTreeMap` for deterministic serialization/diffing. Additive + defaulted,
+    /// so `schema_version` stays 1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variables: BTreeMap<String, FlowValue>,
     #[serde(default)]
     pub meta: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -321,6 +330,7 @@ impl FlowEnvelope {
             artifacts: HashMap::new(),
             provenance: HashMap::new(),
             context: ConversationContext::default(),
+            variables: BTreeMap::new(),
             meta: BTreeMap::new(),
             trace: Vec::new(),
         }
@@ -556,5 +566,35 @@ mod tests {
         assert_eq!(ChatMessage::system("x").role, ChatRole::System);
         assert_eq!(ChatMessage::user("x").role, ChatRole::User);
         assert_eq!(ChatMessage::assistant("x").role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn empty_variables_omitted_from_serialization() {
+        let env = FlowEnvelope::empty();
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(
+            !s.contains("variables"),
+            "empty variables must be skipped, got: {s}"
+        );
+        // schema_version stays 1 — variables is additive + defaulted.
+        assert_eq!(env.schema_version, 1);
+    }
+
+    #[test]
+    fn variables_round_trip_and_default_on_missing() {
+        let mut env = FlowEnvelope::empty();
+        env.variables
+            .insert("harness_done".into(), FlowValue::Json(serde_json::json!(true)));
+        env.variables
+            .insert("attempt".into(), FlowValue::Text("3".into()));
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(s.contains("variables"), "non-empty variables must serialize");
+        let back: FlowEnvelope = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.variables, env.variables);
+
+        // Legacy envelope without a variables key deserializes to an empty map.
+        let legacy = r#"{"schema_version":1,"payload":{"kind":"empty"}}"#;
+        let parsed: FlowEnvelope = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.variables.is_empty());
     }
 }

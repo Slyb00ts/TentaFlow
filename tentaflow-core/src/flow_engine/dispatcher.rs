@@ -22,8 +22,8 @@ use crate::flow_engine::cache::{CachedFlow, CompiledFlow, FlowCache};
 use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
-    MetricsSink, NoopMetrics, PiiRulesStore, PromptStore, SttDispatcher, TtsCleaningStore,
-    TtsDispatcher,
+    MetricsSink, NoopMetrics, NoopProgress, PiiRulesStore, ProgressSink, PromptStore,
+    SttDispatcher, TtsCleaningStore, TtsDispatcher,
 };
 use crate::flow_engine::dispatchers_impl::{
     AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
@@ -87,7 +87,7 @@ enum ResolvedFlow {
 
 /// Per-request metadata przekazywane przez callera. FlowDispatcher buduje z
 /// tego `ExecutionContext` (klonując Arc'i dispatcherów + clock + blobs).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FlowRequestMeta {
     pub request_id: String,
     pub session_id: Option<String>,
@@ -95,6 +95,11 @@ pub struct FlowRequestMeta {
     pub user_role: Option<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
+    /// §3.11 C — per-request progress fan-out. The caller (a handler holding
+    /// AppState's `ProgressBroker`) injects the production sink; `None` →
+    /// no-op (headless / tests). Scope = session_id, falling back to
+    /// request_id so a broadcast key always exists.
+    pub progress_sink: Option<Arc<dyn ProgressSink>>,
 }
 
 impl FlowRequestMeta {
@@ -106,7 +111,16 @@ impl FlowRequestMeta {
             user_role: None,
             deadline: None,
             cancel_token: CancellationToken::new(),
+            progress_sink: None,
         }
+    }
+
+    /// Effective broadcast scope for progress events — session id when present,
+    /// else the request id.
+    fn progress_scope(&self) -> String {
+        self.session_id
+            .clone()
+            .unwrap_or_else(|| self.request_id.clone())
     }
 }
 
@@ -164,6 +178,11 @@ impl ContextFactory {
             metrics: self.metrics.clone(),
             pii_rules: self.pii_rules.clone(),
             tts_cleaning: self.tts_cleaning.clone(),
+            progress: meta
+                .progress_sink
+                .clone()
+                .unwrap_or_else(|| Arc::new(NoopProgress) as Arc<dyn ProgressSink>),
+            progress_scope: meta.progress_scope(),
             usage_sink: Arc::new(UsageSink::new()),
         }
     }

@@ -10,14 +10,15 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
-    MetricsSink, PiiRulesStore, PromptStore, SttDispatcher, TtsCleaningStore, TtsDispatcher,
+    MetricsSink, PiiRulesStore, ProgressSink, PromptStore, SttDispatcher, TtsCleaningStore,
+    TtsDispatcher,
 };
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
 use super::types::{FlowDataType, FlowNode};
@@ -102,6 +103,15 @@ pub struct ExecutionContext {
     pub pii_rules: Arc<dyn PiiRulesStore>,
     pub tts_cleaning: Arc<dyn TtsCleaningStore>,
 
+    /// §3.11 C — ephemeral execution progress fan-out. The executor emits
+    /// NodeStarted/NodeFinished here; later phases (loop/map/router/child)
+    /// emit their own variants. `scope` for emission is `progress_scope`.
+    /// Defaults to a no-op when no broker is wired (headless / tests).
+    pub progress: Arc<dyn ProgressSink>,
+    /// Broadcast key for `progress` emissions — session id, falling back to
+    /// the request id so a scope always exists even without a session.
+    pub progress_scope: String,
+
     pub usage_sink: Arc<UsageSink>,
 }
 
@@ -182,6 +192,25 @@ pub trait NodeAdapter: Send + Sync {
     fn consumed_artifact_types(&self) -> &[(&'static str, FlowDataType)] {
         &[]
     }
+
+    /// Faza 4 §3.11 A — bramkowanie gałęzi (skip-semantyka). Po `execute`
+    /// executor pyta adapter, które output porty są AKTYWNE dla tego konkretnego
+    /// wyniku; następnik osiągalny WYŁĄCZNIE krawędziami z nieaktywnych portów
+    /// dostaje status `Skipped` i nie wykonuje się.
+    ///
+    /// `None` (default) = wszystkie porty aktywne — zero zmian dla istniejących
+    /// adapterów. Dodane jako metoda traitu z domyślną implementacją (NIE zmiana
+    /// sygnatury `execute`), żeby równolegle rozwijane adaptery dalej się
+    /// kompilowały bez dotykania ich kodu.
+    ///
+    /// `condition` nadpisuje to, zwracając dokładnie `{"true"}` albo `{"false"}`.
+    fn active_output_ports(
+        &self,
+        _node: &FlowNode,
+        _result: &FlowEnvelope,
+    ) -> Option<HashSet<String>> {
+        None
+    }
 }
 
 /// Marker trait dla LLM adaptera — executor potrzebuje typed accessor żeby
@@ -236,6 +265,37 @@ pub trait StreamingNodeAdapter: NodeAdapter {
     fn stream_output_kind(&self) -> crate::flow_engine::envelope::EnvelopeDeltaKind;
 }
 
+/// Faza 4 §3.11 B — uogólnienie producenta strumienia. Dziś tylko LLM potrafi
+/// produkować `EnvelopeDelta` (executor zakładał slot `registry.llm()`); ten
+/// trait pozwala KAŻDEMU node'owi być źródłem strumienia (harness loop /
+/// subflow forward, addon stream block itp.). Producent = node z wychodzącą
+/// krawędzią `from_port="stream"` który ma zarejestrowany `StreamProducerAdapter`.
+///
+/// Adapter implementujący ten trait MUSI też implementować `NodeAdapter`
+/// (blocking ścieżka dla non-streaming flow); `register_stream_producer<T>`
+/// rejestruje go w obu slotach. `LlmNodeAdapter` jest jednym z producentów —
+/// jego impl owija dotychczasową ścieżkę `prepare_llm_request` +
+/// `ctx.llm.stream_chat`, BEZ duplikacji budowania requestu.
+#[async_trait]
+pub trait StreamProducerAdapter: NodeAdapter {
+    /// Buduje strumień `EnvelopeDelta` dla tego node'a. Wołane przez
+    /// `execute_streaming` po wykonaniu wszystkich pre-producent nodów —
+    /// `inputs` to rozwiązane wejścia producenta (zwykle jedno). Strumień
+    /// jest `'static` (spawnowany do finalizera), więc adapter klonuje co
+    /// potrzebne z `ctx` przed zwróceniem.
+    async fn produce_stream(
+        &self,
+        node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            anyhow::Result<crate::flow_engine::envelope::EnvelopeDelta>,
+        >,
+    >;
+}
+
 /// Resolver dla dynamicznych typów node — adaptery rejestrowane runtime po
 /// instalacji addonu (np. block z `addon.{id}.{name}`). Zwraca `None` gdy nie
 /// znajduje match'a; registry zwraca wynik z `dynamic_resolver` jeśli builtin
@@ -254,6 +314,11 @@ pub struct AdapterRegistry {
     adapters: HashMap<String, Arc<dyn NodeAdapter>>,
     llm: Option<Arc<dyn LlmAdapter>>,
     streaming_adapters: HashMap<String, Arc<dyn StreamingNodeAdapter>>,
+    /// §3.11 B — node_type → stream producer. Generalizuje stary slot
+    /// `llm`-only: dowolny node_type może produkować `EnvelopeDelta`.
+    /// `LlmNodeAdapter` rejestruje się tu obok `llm` slotu (jeden node, oba
+    /// kontrakty).
+    stream_producers: HashMap<String, Arc<dyn StreamProducerAdapter>>,
     /// Resolver dla node_type'ów nie znalezionych w `adapters`. Cache wynikow
     /// (jeden lookup = jedno wywolanie) wewnatrz resolver-impl, registry nie
     /// memoize'uje — co compile flow to nowe pytanie. RwLock bo `set` jest
@@ -268,6 +333,7 @@ impl AdapterRegistry {
             adapters: HashMap::new(),
             llm: None,
             streaming_adapters: HashMap::new(),
+            stream_producers: HashMap::new(),
             dynamic_resolver: RwLock::new(None),
         }
     }
@@ -281,17 +347,49 @@ impl AdapterRegistry {
     }
 
     /// Rejestracja LLM adaptera — equivalent `register` plus zapamiętanie
-    /// typed referencji. Wymaga osobnej metody bo `Arc<dyn LlmAdapter>` nie
-    /// koerc'uje się do `Arc<dyn NodeAdapter>` automatycznie.
+    /// typed referencji ORAZ rejestracja w slocie producentów strumienia
+    /// (§3.11 B — LLM jest jednym z producentów). Wymaga osobnej metody bo
+    /// `Arc<dyn LlmAdapter>` nie koerc'uje się do `Arc<dyn NodeAdapter>`
+    /// automatycznie. Bound `StreamProducerAdapter` jest wymuszony — LLM
+    /// MUSI umieć produkować strumień, a wpis w `stream_producers` zastępuje
+    /// stary slot `llm`-only w detekcji producenta (cache/validation/executor).
     pub fn register_llm<A>(&mut self, adapter: Arc<A>)
     where
-        A: LlmAdapter + 'static,
+        A: LlmAdapter + StreamProducerAdapter + 'static,
     {
+        let key = adapter.node_type().to_string();
         let typed: Arc<dyn LlmAdapter> = adapter.clone();
+        let producer: Arc<dyn StreamProducerAdapter> = adapter.clone();
         let generic: Arc<dyn NodeAdapter> = adapter;
-        self.adapters
-            .insert(generic.node_type().to_string(), generic);
+        self.adapters.insert(key.clone(), generic);
+        self.stream_producers.insert(key, producer);
         self.llm = Some(typed);
+    }
+
+    /// §3.11 B — rejestracja non-LLM producenta strumienia (np. harness
+    /// `loop`/`subflow` forward, addon stream block). Generic bound + osobna
+    /// koercja per slot — trait-object upcasting nie wymagany.
+    pub fn register_stream_producer<T>(&mut self, adapter: Arc<T>)
+    where
+        T: NodeAdapter + StreamProducerAdapter + 'static,
+    {
+        let key = adapter.node_type().to_string();
+        let blocking: Arc<dyn NodeAdapter> = adapter.clone();
+        let producer: Arc<dyn StreamProducerAdapter> = adapter;
+        self.adapters.insert(key.clone(), blocking);
+        self.stream_producers.insert(key, producer);
+    }
+
+    /// §3.11 B — accessor producenta strumienia per node_type. Executor i
+    /// detekcja producenta (cache/validation) używają tego zamiast zakładać
+    /// LLM. `None` = node nie potrafi produkować strumienia.
+    pub fn stream_producer(&self, node_type: &str) -> Option<&Arc<dyn StreamProducerAdapter>> {
+        self.stream_producers.get(node_type)
+    }
+
+    /// §3.11 B — czy dany node_type ma zarejestrowanego producenta strumienia.
+    pub fn is_stream_producer(&self, node_type: &str) -> bool {
+        self.stream_producers.contains_key(node_type)
     }
 
     /// Ustawia dynamic resolver dla node_type'ów nie zarejestrowanych jako
@@ -378,6 +476,7 @@ pub mod test_support {
     };
     use crate::flow_engine::dispatchers::metrics::NoopMetrics;
     use crate::flow_engine::dispatchers::pii_rules::PiiRule;
+    use crate::flow_engine::dispatchers::progress::NoopProgress;
     use crate::flow_engine::dispatchers::stt::{SttRequest, SttResponse};
     use crate::flow_engine::dispatchers::tts::{TtsRequest, TtsResponse};
     use crate::flow_engine::envelope::{ChatMessage, FlowEnvelope, LlmStreamChunk};
@@ -513,6 +612,8 @@ pub mod test_support {
             metrics: Arc::new(NoopMetrics),
             pii_rules: Arc::new(StubPiiRules),
             tts_cleaning: Arc::new(StubTtsCleaning),
+            progress: Arc::new(NoopProgress),
+            progress_scope: "test".into(),
             usage_sink: Arc::new(UsageSink::new()),
         }
     }
@@ -523,6 +624,109 @@ pub mod test_support {
         let mut ctx = stub_ctx();
         ctx.initial_envelope = Arc::new(initial);
         ctx
+    }
+
+    /// Capturing `ProgressSink` — records every (scope, event) for assertions.
+    /// Used by executor / dispatcher tests to prove NodeStarted/NodeFinished
+    /// emission (§3.11 C).
+    #[derive(Default)]
+    pub struct CapturingProgress {
+        events: Mutex<Vec<(String, super::super::dispatchers::ProgressEvent)>>,
+    }
+
+    impl CapturingProgress {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Snapshot of all captured events in emission order.
+        pub fn events(&self) -> Vec<(String, super::super::dispatchers::ProgressEvent)> {
+            self.events.lock().map(|g| g.clone()).unwrap_or_default()
+        }
+    }
+
+    impl super::super::dispatchers::ProgressSink for CapturingProgress {
+        fn emit(&self, scope: &str, event: super::super::dispatchers::ProgressEvent) {
+            if let Ok(mut g) = self.events.lock() {
+                g.push((scope.to_string(), event));
+            }
+        }
+    }
+
+    /// Minimalny non-LLM `StreamProducerAdapter` dla testów (§3.11 B). Emituje
+    /// stały dwuchunkowy strumień `EnvelopeDelta::Llm` (text + terminal), żeby
+    /// dowieść że executor streamuje z dowolnego zarejestrowanego producenta,
+    /// nie tylko ze slotu LLM.
+    pub struct TestStreamProducer {
+        node_type: String,
+    }
+
+    impl TestStreamProducer {
+        pub fn new(node_type: impl Into<String>) -> Self {
+            Self {
+                node_type: node_type.into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NodeAdapter for TestStreamProducer {
+        fn node_type(&self) -> &str {
+            &self.node_type
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new(
+                "in",
+                crate::flow_engine::types::FlowDataType::Text,
+            )]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![
+                PortSpec::new("stream", crate::flow_engine::types::FlowDataType::Text),
+                PortSpec::new("full", crate::flow_engine::types::FlowDataType::Text),
+            ]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            _ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            let mut out = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(FlowEnvelope::empty);
+            out.payload = crate::flow_engine::envelope::FlowValue::Text("test-produced".into());
+            Ok(out)
+        }
+    }
+
+    #[async_trait]
+    impl StreamProducerAdapter for TestStreamProducer {
+        async fn produce_stream(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            _ctx: &ExecutionContext,
+        ) -> Result<
+            BoxStream<'static, Result<crate::flow_engine::envelope::EnvelopeDelta>>,
+        > {
+            use crate::flow_engine::envelope::{EnvelopeDelta, FinishReason};
+            use futures::StreamExt;
+            let first = LlmStreamChunk {
+                text_delta: "hello from test producer".into(),
+                ..Default::default()
+            };
+            let last = LlmStreamChunk {
+                finish_reason: Some(FinishReason::Stop),
+                ..Default::default()
+            };
+            let items = vec![
+                Ok(EnvelopeDelta::Llm(first)),
+                Ok(EnvelopeDelta::Llm(last)),
+            ];
+            Ok(futures::stream::iter(items).boxed())
+        }
     }
 }
 

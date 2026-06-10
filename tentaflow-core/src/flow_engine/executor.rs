@@ -22,9 +22,40 @@ use crate::flow_engine::envelope::{
     ChatMessage, EnvelopeDelta, FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue,
     NodeInput, TokenUsage, TraceStatus, TraceStep,
 };
-use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext};
+use crate::flow_engine::io_mapping;
+use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter};
+use crate::flow_engine::types::FlowNode;
 
 const MAX_NODES_PER_EXECUTION: usize = 256;
+
+/// §3.11 C — engine-level progress emission. Only NodeStarted/NodeFinished are
+/// emitted here; iteration/map/tool/child/router variants belong to the phases
+/// (5/6) that own those blocks. Mapping `TraceStatus` → wire label keeps the
+/// UI free of the full trace step.
+fn emit_node_started(ctx: &ExecutionContext, node_id: &str, node_type: &str) {
+    ctx.progress.emit(
+        &ctx.progress_scope,
+        crate::flow_engine::dispatchers::ProgressEvent::NodeStarted {
+            node_id: node_id.to_string(),
+            node_type: node_type.to_string(),
+        },
+    );
+}
+
+fn emit_node_finished(ctx: &ExecutionContext, node_id: &str, status: &TraceStatus) {
+    let label = match status {
+        TraceStatus::Ok => "ok",
+        TraceStatus::Error { .. } => "error",
+        TraceStatus::Skipped => "skipped",
+    };
+    ctx.progress.emit(
+        &ctx.progress_scope,
+        crate::flow_engine::dispatchers::ProgressEvent::NodeFinished {
+            node_id: node_id.to_string(),
+            status: label.to_string(),
+        },
+    );
+}
 
 pub struct StreamingExecution {
     pub stream: BoxStream<'static, Result<EnvelopeDelta>>,
@@ -62,9 +93,18 @@ pub async fn execute_blocking(
         ));
     }
 
-    let (mut pending_deps, succs) = build_dependency_graph(&compiled, n);
+    let DependencyGraph {
+        mut pending_deps,
+        succ_nodes,
+        out_edges,
+    } = build_dependency_graph(&compiled, n);
     let ctx = Arc::new(ctx);
     let mut outputs: Vec<Option<Arc<FlowEnvelope>>> = vec![None; n];
+    // `live_inputs[pos]` zlicza krawędzie wejściowe, które po rozwiązaniu
+    // poprzednika okazały się aktywne (port producenta aktywny). Gdy wszyscy
+    // poprzednicy są rozwiązani (`pending_deps==0`), node z ≥1 żywą krawędzią
+    // wykonuje się normalnie, a node z zerem — jest Skipped i propaguje skip.
+    let mut live_inputs: Vec<usize> = vec![0; n];
     let mut trace: Vec<TraceStep> = Vec::with_capacity(n);
     let mut error: Option<String> = None;
     let mut last_finish_reason: Option<FinishReason> = None;
@@ -79,32 +119,42 @@ pub async fn execute_blocking(
 
     while let Some(joined) = join_set.join_next().await {
         let run = joined.map_err(|e| anyhow!("flow node task failed to join: {e}"))?;
+        // Aktywne porty wyjściowe rozwiązanego node'a (None = wszystkie aktywne).
+        // Liczone po Ok/continue_on_error; przy fatalnym błędzie pętla i tak
+        // abortuje resztę, więc gałęzie nie startują.
+        let mut active_ports: Option<HashSet<String>> = None;
         match run.result {
             Ok(envelope) => {
                 trace.push(TraceStep {
-                    node_id: run.node_id,
-                    node_type: run.node_type,
+                    node_id: run.node_id.clone(),
+                    node_type: run.node_type.clone(),
                     started_at_ms: run.step_started_ms,
                     duration_ms: run.duration_ms,
                     status: TraceStatus::Ok,
                     usage: None,
                 });
+                emit_node_finished(&ctx, &run.node_id, &TraceStatus::Ok);
+                active_ports = compute_active_ports(&compiled, adapters.as_ref(), run.pos, &envelope);
                 outputs[run.pos] = Some(Arc::new(envelope));
             }
             Err(msg) => {
+                let status = TraceStatus::Error {
+                    message: msg.clone(),
+                };
+                emit_node_finished(&ctx, &run.node_id, &status);
                 trace.push(TraceStep {
-                    node_id: run.node_id,
-                    node_type: run.node_type,
+                    node_id: run.node_id.clone(),
+                    node_type: run.node_type.clone(),
                     started_at_ms: run.step_started_ms,
                     duration_ms: run.duration_ms,
-                    status: TraceStatus::Error {
-                        message: msg.clone(),
-                    },
+                    status,
                     usage: None,
                 });
                 if continue_on_error {
                     // Propaguj envelope sprzed błędu — następniki dostaną
                     // pierwsze dostępne wejście tego noda, fallback initial.
+                    // Błędny node nie bramkuje (wszystkie porty aktywne), żeby
+                    // continue_on_error zachowało dotychczasowe zachowanie.
                     let propagated = build_inputs(&compiled, run.pos, &outputs)
                         .into_iter()
                         .next()
@@ -137,12 +187,55 @@ pub async fn execute_blocking(
             }
         }
 
-        // Zwolnij następniki: każdy traci jedną zależność; ten który osiągnął
-        // zero (wszystkie poprzedniki gotowe) startuje teraz.
-        for &succ in &succs[run.pos] {
-            pending_deps[succ] -= 1;
-            if pending_deps[succ] == 0 {
-                spawn_node(&mut join_set, &compiled, &adapters, &ctx, &outputs, succ)?;
+        // Rozwiązanie node'a propaguje się do następników. `to_resolve` zbiera
+        // pozycje, których ostatni poprzednik właśnie się rozwiązał — node ze
+        // wszystkimi nieaktywnymi krawędziami wejściowymi staje się Skipped i
+        // jego skip propaguje dalej (BFS po następnikach, bez rekursji).
+        let mut to_resolve: Vec<(usize, Option<HashSet<String>>)> =
+            vec![(run.pos, active_ports.take())];
+        while let Some((from_pos, ports)) = to_resolve.pop() {
+            // Najpierw policz żywe krawędzie wychodzące z tego node'a. Node
+            // Skipped (`ports == Some(empty via skip)`) — patrz niżej — nie ma
+            // żywych portów; przekazujemy `Some(empty)` przez `skipped_marker`.
+            for (to_pos, from_port) in &out_edges[from_pos] {
+                let is_live = match &ports {
+                    // None = wszystkie porty aktywne (default adaptera).
+                    None => true,
+                    Some(set) => set.contains(from_port),
+                };
+                if is_live {
+                    live_inputs[*to_pos] += 1;
+                }
+            }
+            // Następnie zdejmij zależność per DISTINCT poprzednik (combine z
+            // dwiema krawędziami od tego samego node'a liczy 1).
+            for &succ in &succ_nodes[from_pos] {
+                pending_deps[succ] -= 1;
+                if pending_deps[succ] == 0 {
+                    if live_inputs[succ] > 0 {
+                        spawn_node(&mut join_set, &compiled, &adapters, &ctx, &outputs, succ)?;
+                    } else {
+                        // Wszystkie krawędzie wejściowe nieaktywne → Skipped.
+                        // Brak wykonania, brak usage; skip propaguje dalej
+                        // (puste porty aktywne).
+                        let def_idx = compiled.execution_order[succ];
+                        let node = &compiled.definition.nodes[def_idx];
+                        let now_ms = ctx.clock.now_ms();
+                        // §3.11 C — a skipped node still surfaces as reached:
+                        // started then finished with status `skipped`.
+                        emit_node_started(&ctx, &node.id, &node.node_type);
+                        emit_node_finished(&ctx, &node.id, &TraceStatus::Skipped);
+                        trace.push(TraceStep {
+                            node_id: node.id.clone(),
+                            node_type: node.node_type.clone(),
+                            started_at_ms: now_ms,
+                            duration_ms: 0,
+                            status: TraceStatus::Skipped,
+                            usage: None,
+                        });
+                        to_resolve.push((succ, Some(HashSet::new())));
+                    }
+                }
             }
         }
     }
@@ -187,30 +280,71 @@ struct NodeRun {
     result: std::result::Result<FlowEnvelope, String>,
 }
 
-/// Buduje (pending_deps, succs) z compiled flow. `pending_deps[pos]` = liczba
-/// odrębnych poprzedników node'a (in-degree liczone po node'ach, nie krawędziach
-/// — combine z dwiema krawędziami od tego samego noda liczy 1). `succs[from]` =
-/// pozycje zależne od `from`. Toposort w compile gwarantuje brak cykli, więc
-/// scheduler zawsze osusza JoinSet.
-fn build_dependency_graph(compiled: &CompiledFlow, n: usize) -> (Vec<usize>, Vec<Vec<usize>>) {
+/// Graf zależności sterujący schedulerem dataflow + bramkowaniem gałęzi.
+struct DependencyGraph {
+    /// `pending_deps[pos]` = liczba odrębnych poprzedników node'a (in-degree
+    /// po node'ach, nie krawędziach — combine z dwiema krawędziami od tego
+    /// samego noda liczy 1). Maleje gdy poprzednik się rozwiąże (wykona lub
+    /// zostanie Skipped).
+    pending_deps: Vec<usize>,
+    /// `succ_nodes[from]` = odrębne pozycje zależne od `from`; po jednym wpisie
+    /// na poprzednika (steruje dekrementem `pending_deps`).
+    succ_nodes: Vec<Vec<usize>>,
+    /// `out_edges[from]` = WSZYSTKIE krawędzie wychodzące jako `(to_pos,
+    /// from_port)`. Bez dedupu — liczność krawędzi (z portami) decyduje o
+    /// aktywności wejść następnika (`condition` ma dwie krawędzie różnych
+    /// portów do dwóch gałęzi; tylko aktywny port daje żywe wejście).
+    out_edges: Vec<Vec<(usize, String)>>,
+}
+
+/// Buduje graf zależności z compiled flow. Toposort w compile gwarantuje brak
+/// cykli, więc scheduler zawsze osusza JoinSet.
+fn build_dependency_graph(compiled: &CompiledFlow, n: usize) -> DependencyGraph {
     // Jeden globalny HashSet par (from,pos) zamiast N HashSetów per node —
     // dedupy podwójnych krawędzi tej samej pary (rzadkie, np. dwie krawędzie do
     // jednego combine z tego samego noda) bez alokacji setu na każdy węzeł.
     let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
     let mut pending_deps = vec![0usize; n];
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut succ_nodes: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut out_edges: Vec<Vec<(usize, String)>> = vec![Vec::new(); n];
     for pos in 0..n {
         for &edge_idx in &compiled.incoming_edges_per_pos[pos] {
             let edge = &compiled.definition.edges[edge_idx];
             if let Some(&from_pos) = compiled.run_idx_by_id.get(edge.from.as_str()) {
-                if from_pos != pos && seen_pairs.insert((from_pos, pos)) {
+                if from_pos == pos {
+                    continue;
+                }
+                // Krawędź per port — sterowanie bramkowaniem.
+                out_edges[from_pos].push((pos, edge.from_port.clone()));
+                // Zależność per odrębny poprzednik — sterowanie barierą.
+                if seen_pairs.insert((from_pos, pos)) {
                     pending_deps[pos] += 1;
-                    succs[from_pos].push(pos);
+                    succ_nodes[from_pos].push(pos);
                 }
             }
         }
     }
-    (pending_deps, succs)
+    DependencyGraph {
+        pending_deps,
+        succ_nodes,
+        out_edges,
+    }
+}
+
+/// Pyta adapter rozwiązanego node'a, które porty wyjściowe są aktywne dla danego
+/// wyniku (§3.11 A). `None` = wszystkie aktywne (default). Lookup adaptera nie
+/// może zawieść tu (spawn już go znalazł), ale defensywnie zwracamy `None`.
+fn compute_active_ports(
+    compiled: &CompiledFlow,
+    adapters: &AdapterRegistry,
+    pos: usize,
+    result: &FlowEnvelope,
+) -> Option<HashSet<String>> {
+    let def_idx = compiled.execution_order[pos];
+    let node = &compiled.definition.nodes[def_idx];
+    adapters
+        .get(&node.node_type)
+        .and_then(|a| a.active_output_ports(node, result))
 }
 
 /// Buduje inputs z ukończonych poprzedników i spawnuje adapter node'a jako task.
@@ -237,13 +371,28 @@ fn spawn_node(
         )
     })?;
     let inputs = build_inputs(compiled, pos, outputs);
+    // §3.11 C — NodeStarted emitted on the coordinator thread before the task
+    // spawns, so events keep the scheduler's resolution order (NodeFinished is
+    // emitted back in the join loop).
+    emit_node_started(ctx, &node.id, &node.node_type);
     let compiled = compiled.clone();
     let ctx = ctx.clone();
+    let initial = ctx.initial_envelope.clone();
     let step_started_ms = ctx.clock.now_ms();
     join_set.spawn(async move {
         let node = &compiled.definition.nodes[def_idx];
         let attempt = Instant::now();
-        let result = adapter.execute(node, &inputs, &ctx).await;
+        // io-mapping seam (§3.12): the inbound scope is the deterministically
+        // chosen first input (single-input is the common shape; for fan-in
+        // nodes like combine/output we pick the branch with the lowest
+        // `from_node_id`, matching combine's own merge ordering so the same
+        // flow reads the same branch across runs), falling back to the flow's
+        // initial envelope for the trigger. The adapter sees a config with
+        // input_mapping results overlaid and output_mapping writes its results
+        // into the result's variables.
+        let inbound: &FlowEnvelope =
+            io_mapping_inbound(&inputs).unwrap_or_else(|| initial.as_ref());
+        let result = run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, &ctx).await;
         let duration_ms = attempt.elapsed().as_millis() as u64;
         NodeRun {
             pos,
@@ -255,6 +404,34 @@ fn spawn_node(
         }
     });
     Ok(())
+}
+
+/// Generic io-mapping seam (§3.12) shared by the blocking and streaming paths.
+/// Evaluates `input_mapping` against `inbound`, runs the adapter on a config
+/// with the results overlaid, then evaluates `output_mapping` against the
+/// result and writes the variables. Nodes without either mapping key take the
+/// zero-cost fast path (no scope built, no node clone). io-mapping expression
+/// failures become node errors (with node name + expression + cause).
+async fn run_node_with_io_mapping(
+    adapter: &dyn NodeAdapter,
+    node: &FlowNode,
+    inbound: &FlowEnvelope,
+    inputs: &[NodeInput],
+    ctx: &ExecutionContext,
+) -> Result<FlowEnvelope> {
+    if !io_mapping::has_io_mapping(node) {
+        return adapter.execute(node, inputs, ctx).await;
+    }
+
+    let overlaid_config = io_mapping::apply_input_mapping(node, inbound).map_err(|e| anyhow!(e))?;
+    // Clone the node only when a mapping is present; swap in the overlaid config
+    // so the adapter (incl. addon.*) reads computed settings transparently.
+    let mut mapped_node = node.clone();
+    mapped_node.config = overlaid_config;
+
+    let mut result = adapter.execute(&mapped_node, inputs, ctx).await?;
+    io_mapping::apply_output_mapping(node, &mut result).map_err(|e| anyhow!(e))?;
+    Ok(result)
 }
 
 /// Abortuje i osusza pozostałe taski po fatalnym błędzie/cancel/deadline, żeby
@@ -303,20 +480,20 @@ pub async fn execute_streaming(
     let execution_id = create_execution_record(&db, &compiled.flow_id).await?;
     ctx.execution_id = execution_id;
 
-    let llm_run_idx = compiled
-        .streaming_llm_run_idx()
+    let producer_run_idx = compiled
+        .stream_producer_run_idx(adapters.as_ref())
         .ok_or_else(|| anyhow!("execute_streaming called on non-streaming flow"))?;
-    let llm_def_idx = compiled.execution_order[llm_run_idx];
-    let llm_node = &compiled.definition.nodes[llm_def_idx];
+    let producer_def_idx = compiled.execution_order[producer_run_idx];
+    let producer_node = &compiled.definition.nodes[producer_def_idx];
 
     let n = compiled.execution_order.len();
     let mut outputs: Vec<Option<Arc<FlowEnvelope>>> = vec![None; n];
     let mut trace: Vec<TraceStep> = Vec::with_capacity(n);
 
-    // Pre-LLM topo loop. Cancel/deadline checked between nodes — same
-    // contract as `execute_blocking`. LLM streaming dispatch ma własny
-    // wrapper (StreamBoundary) honorujący te flagi w trakcie streamu.
-    for run_idx in 0..llm_run_idx {
+    // Pre-producer topo loop. Cancel/deadline checked between nodes — same
+    // contract as `execute_blocking`. The producer's streaming dispatch has
+    // its own finalizer honouring these flags during the stream.
+    for run_idx in 0..producer_run_idx {
         if ctx.cancel_token.is_cancelled() {
             return Err(anyhow!("cancelled"));
         }
@@ -337,10 +514,26 @@ pub async fn execute_streaming(
         })?;
         let step_started = ctx.clock.now_ms();
         let attempt_started = Instant::now();
-        let envelope = adapter
-            .execute(node, &inputs, &ctx)
+        emit_node_started(&ctx, &node.id, &node.node_type);
+        // Same io-mapping seam as the blocking path: input_mapping overlay
+        // before execute, output_mapping write after. Variables computed by a
+        // pre-producer node are visible to the streaming producer downstream.
+        // Inbound scope chosen deterministically (see `io_mapping_inbound`).
+        let inbound: &FlowEnvelope =
+            io_mapping_inbound(&inputs).unwrap_or_else(|| ctx.initial_envelope.as_ref());
+        let envelope = run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, &ctx)
             .await
-            .map_err(|e| anyhow!("pre-LLM node '{}' failed: {e}", node.id))?;
+            .map_err(|e| {
+                emit_node_finished(
+                    &ctx,
+                    &node.id,
+                    &TraceStatus::Error {
+                        message: e.to_string(),
+                    },
+                );
+                anyhow!("pre-producer node '{}' failed: {e}", node.id)
+            })?;
+        emit_node_finished(&ctx, &node.id, &TraceStatus::Ok);
         let duration_ms = attempt_started.elapsed().as_millis() as u64;
         let usage = take_node_usage(&ctx, &node.id);
         trace.push(TraceStep {
@@ -354,35 +547,47 @@ pub async fn execute_streaming(
         outputs[run_idx] = Some(Arc::new(envelope));
     }
 
-    // Streaming LLM dispatch via typed accessor.
-    let llm_inputs = build_inputs(&compiled, llm_run_idx, &outputs);
-    let llm_adapter = adapters
-        .llm()
-        .ok_or_else(|| anyhow!("no LLM adapter registered for streaming flow"))?;
-    let request = llm_adapter.prepare_llm_request(llm_node, &llm_inputs, &ctx);
-    let llm_step_started = ctx.clock.now_ms();
-    let adapter_stream = ctx
-        .llm
-        .stream_chat(request)
+    // §3.11 B — streaming dispatch via the generalized stream producer slot
+    // (LLM is one such producer). The producer builds the EnvelopeDelta stream;
+    // the executor no longer assumes the LLM-only path. The producer config is
+    // passed raw (no io-mapping overlay): R7 rejects io-mapping on a stream
+    // producer at validation precisely because this path cannot apply it, so
+    // blocking and streaming dispatch never diverge on the same saved flow.
+    let producer_inputs = build_inputs(&compiled, producer_run_idx, &outputs);
+    let producer = adapters
+        .stream_producer(&producer_node.node_type)
+        .ok_or_else(|| {
+            anyhow!(
+                "no StreamProducerAdapter for node '{}' (type '{}')",
+                producer_node.id,
+                producer_node.node_type
+            )
+        })?;
+    let producer_step_started = ctx.clock.now_ms();
+    emit_node_started(&ctx, &producer_node.id, &producer_node.node_type);
+    let mut envelope_stream: BoxStream<'static, Result<EnvelopeDelta>> = producer
+        .produce_stream(producer_node, &producer_inputs, &ctx)
         .await
-        .map_err(|e| anyhow!("stream_chat failed: {e}"))?;
-
-    // Stage 3d Krok 2c-2: mapuj LlmStreamChunk → EnvelopeDelta::Llm
-    // (envelope-level stream pomiędzy nodami chain'a).
-    use futures::stream::StreamExt;
-    let mut envelope_stream: BoxStream<'static, Result<EnvelopeDelta>> = adapter_stream
-        .map(|res| res.map(EnvelopeDelta::Llm))
-        .boxed();
+        .map_err(|e| {
+            emit_node_finished(
+                &ctx,
+                &producer_node.id,
+                &TraceStatus::Error {
+                    message: e.to_string(),
+                },
+            );
+            anyhow!("stream producer '{}' failed: {e}", producer_node.id)
+        })?;
 
     // Stage 3d Krok 2c-2: fold streaming chain (intermediate streaming-aware
-    // nodes po LLM, np. pii_filter / tts_stream_bridge). Każdy node
+    // nodes po producencie, np. pii_filter / tts_stream_bridge). Każdy node
     // konsumuje upstream EnvelopeDelta i produkuje downstream — mogą zmienić
     // kind (LLM → Audio przez tts_stream_bridge).
-    let llm_input_envelope = llm_inputs
+    let producer_input_envelope = producer_inputs
         .first()
         .map(|i| i.envelope.clone())
         .unwrap_or_else(|| initial_arc.clone());
-    let chain_run_idxs = compiled.streaming_chain_run_idxs();
+    let chain_run_idxs = compiled.streaming_chain_run_idxs(adapters.as_ref());
     for chain_run_idx in chain_run_idxs {
         let chain_def_idx = compiled.execution_order[chain_run_idx];
         let chain_node = &compiled.definition.nodes[chain_def_idx];
@@ -400,7 +605,7 @@ pub async fn execute_streaming(
             .process_stream(
                 chain_node,
                 envelope_stream,
-                llm_input_envelope.clone(),
+                producer_input_envelope.clone(),
                 &ctx,
             )
             .await
@@ -411,9 +616,14 @@ pub async fn execute_streaming(
     let (outbound_tx, outbound_rx) = mpsc::channel::<Result<EnvelopeDelta>>(64);
     let (outcome_tx, outcome_rx) = oneshot::channel::<FlowExecutionOutcome>();
 
-    let llm_node_id = llm_node.id.clone();
-    let llm_node_type = llm_node.node_type.clone();
+    let producer_node_id = producer_node.id.clone();
+    let producer_node_type = producer_node.node_type.clone();
     let db_for_task = db.clone();
+    // §3.11 C — the streaming producer's NodeFinished is emitted by the
+    // finalizer once the stream settles (ok/cancel/error), carrying the
+    // producer identity captured here so the spawned task stays self-contained.
+    let progress = ctx.progress.clone();
+    let progress_scope = ctx.progress_scope.clone();
 
     tokio::spawn(finalize_streaming_flow(
         execution_id,
@@ -423,12 +633,14 @@ pub async fn execute_streaming(
         cancel,
         FinalizerInputs {
             started,
-            llm_step_started,
-            llm_node_id,
-            llm_node_type,
-            llm_input_envelope,
+            producer_step_started,
+            producer_node_id,
+            producer_node_type,
+            producer_input_envelope,
             trace,
             db: db_for_task,
+            progress,
+            progress_scope,
         },
     ));
 
@@ -444,12 +656,16 @@ pub async fn execute_streaming(
 
 struct FinalizerInputs {
     started: Instant,
-    llm_step_started: u64,
-    llm_node_id: String,
-    llm_node_type: String,
-    llm_input_envelope: Arc<FlowEnvelope>,
+    producer_step_started: u64,
+    producer_node_id: String,
+    producer_node_type: String,
+    producer_input_envelope: Arc<FlowEnvelope>,
     trace: Vec<TraceStep>,
     db: DbPool,
+    /// §3.11 C — NodeFinished for the streaming producer is emitted here once
+    /// the stream settles (the producer's start was emitted by the executor).
+    progress: Arc<dyn crate::flow_engine::dispatchers::ProgressSink>,
+    progress_scope: String,
 }
 
 async fn finalize_streaming_flow(
@@ -472,7 +688,7 @@ async fn finalize_streaming_flow(
     // dla wire trailers.
     let mut last_audio_finish: Option<FinishReason> = None;
     let mut audio_chunks_emitted: usize = 0;
-    let llm_attempt_started = Instant::now();
+    let producer_attempt_started = Instant::now();
 
     'main: loop {
         tokio::select! {
@@ -538,7 +754,7 @@ async fn finalize_streaming_flow(
     // skonsumowane przez klienta, nie ma sensu duplikować w outcome).
     // LLM path agreguje text/reasoning do final_envelope.
     let is_audio_path = audio_chunks_emitted > 0;
-    let mut final_envelope: FlowEnvelope = (*inputs.llm_input_envelope).clone();
+    let mut final_envelope: FlowEnvelope = (*inputs.producer_input_envelope).clone();
     if is_audio_path {
         final_envelope.payload = FlowValue::Empty;
         // Audio path nie dopisuje assistant message — głos czytał
@@ -553,24 +769,46 @@ async fn finalize_streaming_flow(
             .push(ChatMessage::assistant(text_buf));
     }
 
-    let llm_duration_ms = llm_attempt_started.elapsed().as_millis() as u64;
-    let llm_usage = last_usage.unwrap_or_default();
+    let producer_duration_ms = producer_attempt_started.elapsed().as_millis() as u64;
+    let producer_usage = last_usage.unwrap_or_default();
+    // The producer always ran (its stream was being consumed), so a cancel is
+    // an interrupted execution, not a gate-out. §3.11 A reserves `Skipped` for
+    // nodes that never executed because a branch was gated off; using it here
+    // would mislabel a producer that did work. Cancel/error both map to Error.
+    let producer_status = if cancelled {
+        TraceStatus::Error {
+            message: "cancelled".into(),
+        }
+    } else if let Some(e) = error.clone() {
+        TraceStatus::Error { message: e }
+    } else {
+        TraceStatus::Ok
+    };
+    // §3.11 C — producer NodeFinished once the stream settles.
+    {
+        let label = match &producer_status {
+            TraceStatus::Ok => "ok",
+            TraceStatus::Error { .. } => "error",
+            TraceStatus::Skipped => "skipped",
+        };
+        inputs.progress.emit(
+            &inputs.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::NodeFinished {
+                node_id: inputs.producer_node_id.clone(),
+                status: label.to_string(),
+            },
+        );
+    }
     inputs.trace.push(TraceStep {
-        node_id: inputs.llm_node_id.clone(),
-        node_type: inputs.llm_node_type.clone(),
-        started_at_ms: inputs.llm_step_started,
-        duration_ms: llm_duration_ms,
-        status: if cancelled {
-            TraceStatus::Skipped
-        } else if let Some(e) = error.clone() {
-            TraceStatus::Error { message: e }
-        } else {
-            TraceStatus::Ok
-        },
-        usage: if llm_usage == TokenUsage::default() {
+        node_id: inputs.producer_node_id.clone(),
+        node_type: inputs.producer_node_type.clone(),
+        started_at_ms: inputs.producer_step_started,
+        duration_ms: producer_duration_ms,
+        status: producer_status,
+        usage: if producer_usage == TokenUsage::default() {
             None
         } else {
-            Some(llm_usage)
+            Some(producer_usage)
         },
     });
 
@@ -603,6 +841,19 @@ async fn finalize_streaming_flow(
 
     persist_execution(&inputs.db, execution_id, &outcome).await;
     let _ = outcome_tx.send(outcome);
+}
+
+/// Deterministic inbound envelope for the io-mapping scope (§3.12). For a
+/// single-input node it is that input; for a fan-in node (combine/output) it is
+/// the input with the lowest `from_node_id`, mirroring combine's own merge
+/// ordering (`combine.rs` sorts by `from_node_id`) so the same flow always
+/// evaluates io-mapping against the same branch. Returns `None` for the trigger
+/// (no inputs), where the caller falls back to the flow's initial envelope.
+fn io_mapping_inbound(inputs: &[NodeInput]) -> Option<&FlowEnvelope> {
+    inputs
+        .iter()
+        .min_by(|a, b| a.from_node_id.cmp(&b.from_node_id))
+        .map(|i| i.envelope.as_ref())
 }
 
 fn build_inputs(
@@ -1014,6 +1265,201 @@ mod chain_integration_tests {
         let outcome = exec.outcome.await.expect("outcome");
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
     }
+
+    /// §3.11 B — execute_streaming drives ANY registered StreamProducerAdapter,
+    /// not just the LLM slot. A non-LLM `TestStreamProducer` terminating at
+    /// output(stream) streams its EnvelopeDelta chunks through to the client.
+    #[tokio::test]
+    async fn execute_streaming_with_non_llm_stream_producer() {
+        use crate::flow_engine::node_adapter::test_support::{CapturingProgress, TestStreamProducer};
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_stream_producer(Arc::new(TestStreamProducer::new("test_producer")));
+        let registry = Arc::new(r);
+
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"p1","type":"test_producer","config":{}},
+                {"id":"o1","type":"output","config":{"mode":"stream"}}
+            ],
+            "edges":[
+                {"from":"t1","to":"p1","from_port":"text","to_port":"in"},
+                {"from":"p1","to":"o1","from_port":"stream","to_port":"text"}
+            ]
+        }"#;
+        let compiled = Arc::new(
+            crate::flow_engine::cache::CompiledFlow::from_json("0", flow_json, &registry)
+                .expect("compile"),
+        );
+
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+
+        let exec = execute_streaming(fresh_db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+
+        let mut concat = String::new();
+        let mut saw_finish = false;
+        let mut stream = exec.stream;
+        while let Some(item) = stream.next().await {
+            let EnvelopeDelta::Llm(c) = item.expect("delta ok") else {
+                panic!("expected Llm delta");
+            };
+            concat.push_str(&c.text_delta);
+            if c.finish_reason == Some(FinishReason::Stop) {
+                saw_finish = true;
+            }
+        }
+        assert!(
+            concat.contains("hello from test producer"),
+            "non-LLM producer text not streamed: {concat:?}"
+        );
+        assert!(saw_finish, "client never saw finish_reason=Stop");
+
+        let outcome = exec.outcome.await.expect("outcome");
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+
+        // §3.11 C — the producer node surfaced started + finished(ok).
+        use crate::flow_engine::dispatchers::ProgressEvent;
+        let evs: Vec<ProgressEvent> = capture.events().into_iter().map(|(_, e)| e).collect();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ProgressEvent::NodeStarted { node_id, .. } if node_id == "p1"
+        )));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ProgressEvent::NodeFinished { node_id, status } if node_id == "p1" && status == "ok"
+        )));
+    }
+
+    /// §3.11 A — a stream producer cancelled MID-FLIGHT (after it already
+    /// emitted output) must be traced as Error("cancelled"), NOT Skipped.
+    /// `Skipped` is reserved for nodes gated off that never executed; a producer
+    /// whose stream was being consumed did run. The audio path is the exact
+    /// scenario from review (audio chunks emitted, then cancel).
+    #[tokio::test]
+    async fn cancelled_mid_audio_producer_traced_error_not_skipped() {
+        use crate::flow_engine::envelope::{AudioStreamChunk, EnvelopeDelta};
+        use crate::flow_engine::node_adapter::{NodeAdapter, PortSpec, StreamProducerAdapter};
+        use crate::flow_engine::types::{FlowDataType, FlowNode};
+
+        // Producer emits one audio chunk, then parks forever — so the finalizer
+        // is mid-stream (audio_chunks_emitted=1) when the cancel token fires.
+        struct AudioThenPark;
+        #[async_trait]
+        impl NodeAdapter for AudioThenPark {
+            fn node_type(&self) -> &str {
+                "audio_park"
+            }
+            fn input_ports(&self) -> Vec<PortSpec> {
+                vec![PortSpec::new("in", FlowDataType::Text)]
+            }
+            fn output_ports(&self) -> Vec<PortSpec> {
+                vec![
+                    PortSpec::new("stream", FlowDataType::Audio),
+                    PortSpec::new("full", FlowDataType::Audio),
+                ]
+            }
+            async fn execute(
+                &self,
+                _node: &FlowNode,
+                _inputs: &[NodeInput],
+                _ctx: &ExecutionContext,
+            ) -> Result<FlowEnvelope> {
+                Ok(FlowEnvelope::empty())
+            }
+        }
+        #[async_trait]
+        impl StreamProducerAdapter for AudioThenPark {
+            async fn produce_stream(
+                &self,
+                _node: &FlowNode,
+                _inputs: &[NodeInput],
+                _ctx: &ExecutionContext,
+            ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+                let chunk = AudioStreamChunk {
+                    choice_index: 0,
+                    bytes_delta: vec![0x01, 0x02],
+                    mime: "audio/wav".into(),
+                    sample_rate: Some(22_050),
+                    finish_reason: None,
+                };
+                let head = futures::stream::iter(vec![Ok(EnvelopeDelta::Audio(chunk))]);
+                // Park: a stream that never yields again, so the finalizer waits
+                // on next() until the cancel token wins the biased select.
+                let tail = futures::stream::pending::<Result<EnvelopeDelta>>();
+                Ok(head.chain(tail).boxed())
+            }
+        }
+
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_stream_producer(Arc::new(AudioThenPark));
+        let registry = Arc::new(r);
+
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"p1","type":"audio_park","config":{}},
+                {"id":"o1","type":"output","config":{"mode":"stream"}}
+            ],
+            "edges":[
+                {"from":"t1","to":"p1","from_port":"text","to_port":"in"},
+                {"from":"p1","to":"o1","from_port":"stream","to_port":"audio"}
+            ]
+        }"#;
+        let compiled = Arc::new(
+            crate::flow_engine::cache::CompiledFlow::from_json("0", flow_json, &registry)
+                .expect("compile"),
+        );
+
+        let cancel = CancellationToken::new();
+        let mut ctx = stub_ctx();
+        ctx.cancel_token = cancel.clone();
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+
+        let exec = execute_streaming(fresh_db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+
+        // Drain exactly the one emitted audio chunk, then cancel so the parked
+        // producer settles via the cancel branch (not stream end).
+        let mut stream = exec.stream;
+        let first = stream.next().await.expect("audio chunk").expect("delta ok");
+        assert!(
+            matches!(first, EnvelopeDelta::Audio(_)),
+            "expected the emitted audio chunk first"
+        );
+        cancel.cancel();
+
+        let outcome = exec.outcome.await.expect("outcome");
+        assert_eq!(outcome.finish_reason, FinishReason::Cancelled);
+        let producer = outcome
+            .trace
+            .iter()
+            .find(|s| s.node_id == "p1")
+            .expect("producer trace step");
+        assert!(
+            matches!(producer.status, TraceStatus::Error { ref message } if message == "cancelled"),
+            "cancelled-after-run producer must be Error(cancelled), not Skipped: {:?}",
+            producer.status
+        );
+        assert_ne!(
+            producer.status,
+            TraceStatus::Skipped,
+            "Skipped is reserved for gated-out nodes that never ran"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1030,9 +1476,10 @@ mod concurrent_executor_tests {
         test_support::stub_ctx, AdapterRegistry, ExecutionContext, NodeAdapter, PortSpec,
     };
     use crate::flow_engine::node_adapters::{
-        CombineNodeAdapter, OutputNodeAdapter, TriggerNodeAdapter,
+        CombineNodeAdapter, ConditionNodeAdapter, OutputNodeAdapter, TriggerNodeAdapter,
     };
     use crate::flow_engine::types::{FlowDataType, FlowNode};
+    use crate::flow_engine::envelope::TraceStatus;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use std::path::Path;
@@ -1058,7 +1505,7 @@ mod concurrent_executor_tests {
         async fn execute(
             &self,
             node: &FlowNode,
-            _inputs: &[NodeInput],
+            inputs: &[NodeInput],
             _ctx: &ExecutionContext,
         ) -> Result<FlowEnvelope> {
             if node
@@ -1075,7 +1522,15 @@ mod concurrent_executor_tests {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             tokio::time::sleep(Duration::from_millis(ms)).await;
-            Ok(FlowEnvelope::with_payload(FlowValue::Text(node.id.clone())))
+            // Passthrough envelope (preserves variables travelling with it),
+            // payload overwritten with the node id — like real adapters that
+            // clone their input rather than discarding the data channel.
+            let mut out = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(FlowEnvelope::empty);
+            out.payload = FlowValue::Text(node.id.clone());
+            Ok(out)
         }
     }
 
@@ -1084,8 +1539,22 @@ mod concurrent_executor_tests {
         r.register(Arc::new(TriggerNodeAdapter::new()));
         r.register(Arc::new(OutputNodeAdapter::new()));
         r.register(Arc::new(CombineNodeAdapter::new()));
+        r.register(Arc::new(ConditionNodeAdapter::new()));
         r.register(Arc::new(SleepAdapter));
         Arc::new(r)
+    }
+
+    /// Zwraca status node'a z trace wyniku (None gdy node nie pojawił się w
+    /// trace — np. nie został spawnowany ani oznaczony Skipped).
+    fn node_status<'a>(
+        outcome: &'a FlowExecutionOutcome,
+        node_id: &str,
+    ) -> Option<&'a TraceStatus> {
+        outcome
+            .trace
+            .iter()
+            .find(|s| s.node_id == node_id)
+            .map(|s| &s.status)
     }
 
     fn db() -> DbPool {
@@ -1217,6 +1686,291 @@ mod concurrent_executor_tests {
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
     }
 
+    /// Wykonuje `json` z initial payloadem Text(`input_text`) — pozwala
+    /// condition (`field:"input"`) zdecydować gałąź deterministycznie.
+    async fn run_with_input(json: &str, input_text: &str) -> FlowExecutionOutcome {
+        let reg = registry();
+        let compiled = Arc::new(CompiledFlow::from_json("0", json, &reg).expect("compile"));
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text(input_text.into());
+        execute_blocking(db(), compiled, initial, stub_ctx(), reg)
+            .await
+            .expect("exec")
+    }
+
+    /// condition → tylko aktywna gałąź się wykonuje; nieaktywna jest Skipped,
+    /// a node poniżej nieaktywnej gałęzi też jest Skipped (propagacja).
+    #[tokio::test]
+    async fn condition_runs_only_active_branch_and_skips_the_other() {
+        // trigger → cond. cond.true → t_branch → t_tail; cond.false → f_branch.
+        // input="go" ⇒ true aktywne: t_branch + t_tail wykonane, f_branch
+        // Skipped.
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"cond","type":"condition","config":{"field":"input","operator":"equals","value":"go"}},
+                {"id":"t_branch","type":"sleep","config":{}},
+                {"id":"t_tail","type":"sleep","config":{}},
+                {"id":"f_branch","type":"sleep","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"cond","from_port":"text","to_port":"in"},
+                {"from":"cond","to":"t_branch","from_port":"true","to_port":"in"},
+                {"from":"t_branch","to":"t_tail","from_port":"full","to_port":"in"},
+                {"from":"cond","to":"f_branch","from_port":"false","to_port":"in"},
+                {"from":"t_tail","to":"o","from_port":"full","to_port":"text"},
+                {"from":"f_branch","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run_with_input(json, "go").await;
+        assert_eq!(node_status(&outcome, "t_branch"), Some(&TraceStatus::Ok));
+        assert_eq!(node_status(&outcome, "t_tail"), Some(&TraceStatus::Ok));
+        assert_eq!(
+            node_status(&outcome, "f_branch"),
+            Some(&TraceStatus::Skipped),
+            "false branch must be skipped: {:?}",
+            outcome.trace
+        );
+        // Output dostaje wejście tylko z żywej gałęzi (t_tail), drugie wejście
+        // pochodzi od Skipped f_branch (brak output) — bariera spełniona.
+        assert_eq!(node_status(&outcome, "o"), Some(&TraceStatus::Ok));
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("t_tail"));
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    /// Odwrotny wybór: input nie pasuje ⇒ false aktywne, true Skipped wraz z
+    /// całym łańcuchem za nim.
+    #[tokio::test]
+    async fn condition_false_branch_active_skips_true_chain() {
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"cond","type":"condition","config":{"field":"input","operator":"equals","value":"go"}},
+                {"id":"t_branch","type":"sleep","config":{}},
+                {"id":"t_tail","type":"sleep","config":{}},
+                {"id":"f_branch","type":"sleep","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"cond","from_port":"text","to_port":"in"},
+                {"from":"cond","to":"t_branch","from_port":"true","to_port":"in"},
+                {"from":"t_branch","to":"t_tail","from_port":"full","to_port":"in"},
+                {"from":"cond","to":"f_branch","from_port":"false","to_port":"in"},
+                {"from":"t_tail","to":"o","from_port":"full","to_port":"text"},
+                {"from":"f_branch","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run_with_input(json, "nope").await;
+        assert_eq!(node_status(&outcome, "f_branch"), Some(&TraceStatus::Ok));
+        assert_eq!(
+            node_status(&outcome, "t_branch"),
+            Some(&TraceStatus::Skipped)
+        );
+        assert_eq!(
+            node_status(&outcome, "t_tail"),
+            Some(&TraceStatus::Skipped),
+            "node below skipped branch must be skipped too: {:?}",
+            outcome.trace
+        );
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("f_branch"));
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    /// Node zasilany jednocześnie przez gałąź Skipped i gałąź żywą NADAL się
+    /// wykonuje (≥1 żywa krawędź wejściowa). combine traktuje Skipped jako
+    /// nieobecne wejście.
+    #[tokio::test]
+    async fn node_fed_by_skipped_and_live_branch_still_runs() {
+        // trigger → live(sleep) + cond. cond.true → dead_in (Skipped, bo input
+        // != "go"). combine zbiera live + dead_in: dead_in Skipped, live żywy
+        // ⇒ combine wykonuje się z samym live.
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"live","type":"sleep","config":{}},
+                {"id":"cond","type":"condition","config":{"field":"input","operator":"equals","value":"go"}},
+                {"id":"dead_in","type":"sleep","config":{}},
+                {"id":"c","type":"combine","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"live","from_port":"text","to_port":"in"},
+                {"from":"t","to":"cond","from_port":"text","to_port":"in"},
+                {"from":"cond","to":"dead_in","from_port":"true","to_port":"in"},
+                {"from":"live","to":"c","from_port":"full","to_port":"in"},
+                {"from":"dead_in","to":"c","from_port":"full","to_port":"in"},
+                {"from":"c","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run_with_input(json, "nope").await;
+        assert_eq!(node_status(&outcome, "live"), Some(&TraceStatus::Ok));
+        assert_eq!(node_status(&outcome, "dead_in"), Some(&TraceStatus::Skipped));
+        assert_eq!(
+            node_status(&outcome, "c"),
+            Some(&TraceStatus::Ok),
+            "combine must run with the single live input: {:?}",
+            outcome.trace
+        );
+        // combine widzi tylko żywe wejście (Skipped nie ma output).
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("live"));
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    /// Gdy WSZYSTKIE wejścia barriery są Skipped, sama bariera jest Skipped.
+    #[tokio::test]
+    async fn barrier_with_all_skipped_inputs_is_skipped() {
+        // cond.true → a → c; cond.false → b → c. Tylko jedna gałąź żyje, więc
+        // c (combine) ma jedno żywe + jedno Skipped wejście → c żyje. Żeby
+        // sprawdzić all-skipped, kierujemy OBA wejścia combine z tej samej
+        // (nieaktywnej) gałęzi: cond.true → a → c; a → mid → c (oba za 'a').
+        // input != "go" ⇒ true Skipped ⇒ a, mid, c wszystkie Skipped.
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"cond","type":"condition","config":{"field":"input","operator":"equals","value":"go"}},
+                {"id":"a","type":"sleep","config":{}},
+                {"id":"mid","type":"sleep","config":{}},
+                {"id":"c","type":"combine","config":{}},
+                {"id":"f_branch","type":"sleep","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"cond","from_port":"text","to_port":"in"},
+                {"from":"cond","to":"a","from_port":"true","to_port":"in"},
+                {"from":"a","to":"mid","from_port":"full","to_port":"in"},
+                {"from":"a","to":"c","from_port":"full","to_port":"in"},
+                {"from":"mid","to":"c","from_port":"full","to_port":"in"},
+                {"from":"cond","to":"f_branch","from_port":"false","to_port":"in"},
+                {"from":"c","to":"o","from_port":"full","to_port":"text"},
+                {"from":"f_branch","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run_with_input(json, "nope").await;
+        assert_eq!(node_status(&outcome, "f_branch"), Some(&TraceStatus::Ok));
+        assert_eq!(node_status(&outcome, "a"), Some(&TraceStatus::Skipped));
+        assert_eq!(node_status(&outcome, "mid"), Some(&TraceStatus::Skipped));
+        assert_eq!(
+            node_status(&outcome, "c"),
+            Some(&TraceStatus::Skipped),
+            "barrier with all-skipped inputs must be skipped: {:?}",
+            outcome.trace
+        );
+        // Output zasilane przez żywą f_branch i Skipped combine ⇒ żyje.
+        assert_eq!(node_status(&outcome, "o"), Some(&TraceStatus::Ok));
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("f_branch"));
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    /// condition.expression (CEL) drives the stage-A gating end-to-end: a bool
+    /// expression over the envelope selects which branch runs, the other is
+    /// Skipped (§3.11 A + §3.12).
+    #[tokio::test]
+    async fn condition_expression_cel_drives_gating_end_to_end() {
+        // input="go" ⇒ expression `payload == "go"` is true ⇒ true branch runs,
+        // false branch Skipped.
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"cond","type":"condition","config":{"expression":"payload == \"go\""}},
+                {"id":"t_branch","type":"sleep","config":{}},
+                {"id":"f_branch","type":"sleep","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"cond","from_port":"text","to_port":"in"},
+                {"from":"cond","to":"t_branch","from_port":"true","to_port":"in"},
+                {"from":"cond","to":"f_branch","from_port":"false","to_port":"in"},
+                {"from":"t_branch","to":"o","from_port":"full","to_port":"text"},
+                {"from":"f_branch","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run_with_input(json, "go").await;
+        assert_eq!(node_status(&outcome, "t_branch"), Some(&TraceStatus::Ok));
+        assert_eq!(node_status(&outcome, "f_branch"), Some(&TraceStatus::Skipped));
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("t_branch"));
+
+        // input="stop" ⇒ false branch runs, true branch Skipped.
+        let outcome = run_with_input(json, "stop").await;
+        assert_eq!(node_status(&outcome, "f_branch"), Some(&TraceStatus::Ok));
+        assert_eq!(node_status(&outcome, "t_branch"), Some(&TraceStatus::Skipped));
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("f_branch"));
+    }
+
+    /// input_mapping computes a node's config from variables; output_mapping
+    /// writes the node's result into a flow variable. End-to-end over the
+    /// blocking executor seam (§3.12).
+    #[tokio::test]
+    async fn io_mapping_overlay_and_variable_write_end_to_end() {
+        // The sleep node's `sleep_ms` is computed from a variable seeded via the
+        // trigger's output_mapping; the combine writes a variable read back from
+        // the final envelope.
+        let json = r#"{
+            "variables":[{"name":"greeting","type":"text"}],
+            "nodes":[
+                {"id":"t","type":"trigger","config":{"output_mapping":{"greeting":"payload"}}},
+                {"id":"a","type":"sleep","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"a","from_port":"text","to_port":"in"},
+                {"from":"a","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run_with_input(json, "hello").await;
+        // The variable written by the trigger's output_mapping rides the
+        // envelope downstream (sleep clones its input envelope).
+        assert_eq!(
+            outcome.final_envelope.variables.get("greeting"),
+            Some(&FlowValue::Text("hello".into()))
+        );
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    /// §3.12 fan-in io-mapping determinism: a `combine` carrying `input_mapping`
+    /// must evaluate it against the branch with the lowest `from_node_id`,
+    /// matching combine's own merge ordering — never an arbitrary first input.
+    /// Each branch tags the envelope with its own id via output_mapping; the
+    /// combine's input_mapping reads `vars.branch_tag` into its `separator`
+    /// config so the joined payload reveals which branch the scope used. The
+    /// SleepAdapter emits `Text(node.id)`, so branches "a" and "z" yield
+    /// payloads "a" and "z"; combine joins them sorted ("a" then "z") with the
+    /// chosen separator. Inbound scope = lowest id "a" ⇒ separator "a" ⇒ "aaz".
+    #[tokio::test]
+    async fn fan_in_io_mapping_reads_lowest_from_node_id_branch() {
+        let json = r#"{
+            "variables":[{"name":"branch_tag","type":"text"}],
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"a","type":"sleep","config":{"output_mapping":{"branch_tag":"\"a\""}}},
+                {"id":"z","type":"sleep","config":{"output_mapping":{"branch_tag":"\"z\""}}},
+                {"id":"c","type":"combine","config":{
+                    "variable_merge_policy":{"branch_tag":"last_wins"},
+                    "input_mapping":{"separator":"vars.branch_tag"}
+                }},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"a","from_port":"text","to_port":"in"},
+                {"from":"t","to":"z","from_port":"text","to_port":"in"},
+                {"from":"a","to":"c","from_port":"full","to_port":"in"},
+                {"from":"z","to":"c","from_port":"full","to_port":"in"},
+                {"from":"c","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let outcome = run(json).await;
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        // Separator "a" (lowest-id branch's tag) ⇒ "a" + "a" + "z" = "aaz".
+        // An arbitrary "z" scope would instead give "azz" — the assertion
+        // pins the deterministic choice.
+        assert_eq!(
+            outcome.final_envelope.payload.as_text(),
+            Some("aaz"),
+            "combine io-mapping must read the lowest-id branch deterministically: {:?}",
+            outcome.final_envelope.payload
+        );
+    }
+
     #[tokio::test]
     async fn branch_error_fails_fast() {
         // Gałąź b zwraca błąd; continue_on_error=false (default) → flow error,
@@ -1243,6 +1997,108 @@ mod concurrent_executor_tests {
             outcome.error.as_deref().unwrap_or("").contains("boom"),
             "expected boom error, got {:?}",
             outcome.error
+        );
+    }
+
+    /// §3.11 C — the executor emits NodeStarted/NodeFinished for every node,
+    /// captured via a test ProgressSink injected on the ExecutionContext.
+    #[tokio::test]
+    async fn progress_sink_receives_node_started_and_finished() {
+        use crate::flow_engine::dispatchers::ProgressEvent;
+        use crate::flow_engine::node_adapter::test_support::CapturingProgress;
+        let reg = registry();
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"a","type":"sleep","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"a","from_port":"text","to_port":"in"},
+                {"from":"a","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let compiled = Arc::new(CompiledFlow::from_json("0", json, &reg).expect("compile"));
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+        ctx.progress_scope = "session-x".into();
+
+        let outcome = execute_blocking(db(), compiled, initial, ctx, reg)
+            .await
+            .expect("exec");
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+
+        let events = capture.events();
+        // Every event carries the configured scope.
+        assert!(events.iter().all(|(s, _)| s == "session-x"));
+        let only = |events: &[(String, ProgressEvent)]| {
+            events.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>()
+        };
+        let evs = only(&events);
+        for id in ["t", "a", "o"] {
+            assert!(
+                evs.iter().any(|e| matches!(
+                    e,
+                    ProgressEvent::NodeStarted { node_id, .. } if node_id == id
+                )),
+                "missing NodeStarted for {id}: {evs:?}"
+            );
+            assert!(
+                evs.iter().any(|e| matches!(
+                    e,
+                    ProgressEvent::NodeFinished { node_id, status } if node_id == id && status == "ok"
+                )),
+                "missing NodeFinished(ok) for {id}: {evs:?}"
+            );
+        }
+    }
+
+    /// §3.11 C — a skipped node still surfaces as NodeStarted + NodeFinished
+    /// with status `skipped`, so the UI shows it was reached.
+    #[tokio::test]
+    async fn progress_sink_marks_skipped_branch() {
+        use crate::flow_engine::dispatchers::ProgressEvent;
+        use crate::flow_engine::node_adapter::test_support::CapturingProgress;
+        let reg = registry();
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"cond","type":"condition","config":{"field":"input","operator":"equals","value":"go"}},
+                {"id":"t_branch","type":"sleep","config":{}},
+                {"id":"f_branch","type":"sleep","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"cond","from_port":"text","to_port":"in"},
+                {"from":"cond","to":"t_branch","from_port":"true","to_port":"in"},
+                {"from":"cond","to":"f_branch","from_port":"false","to_port":"in"},
+                {"from":"t_branch","to":"o","from_port":"full","to_port":"text"},
+                {"from":"f_branch","to":"o","from_port":"full","to_port":"text"}
+            ]
+        }"#;
+        let compiled = Arc::new(CompiledFlow::from_json("0", json, &reg).expect("compile"));
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("nope".into());
+
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+
+        execute_blocking(db(), compiled, initial, ctx, reg)
+            .await
+            .expect("exec");
+
+        let evs: Vec<ProgressEvent> = capture.events().into_iter().map(|(_, e)| e).collect();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ProgressEvent::NodeFinished { node_id, status } if node_id == "t_branch" && status == "skipped"
+            )),
+            "true branch must be reported skipped: {evs:?}"
         );
     }
 }
