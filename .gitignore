@@ -42,6 +42,17 @@ tentaflow-client/native/include/
 tentaflow-mobile/ios/Frameworks/GStreamer.xcframework/
 tentaflow-mobile/ios/Frameworks/pkgconfig/
 
+# Android / Gradle build outputs
+tentaflow-mobile/android/.gradle/
+tentaflow-mobile/android/.kotlin/
+tentaflow-mobile/android/build/
+tentaflow-mobile/android/app/build/
+tentaflow-mobile/android/app/.cxx/
+tentaflow-mobile/android/.cxx/
+tentaflow-mobile/android/local.properties
+tentaflow-mobile/android/captures/
+tentaflow-mobile/android/app/src/main/jniLibs/
+
 # =============================================================================
 # Bazy danych
 # =============================================================================

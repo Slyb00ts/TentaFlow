@@ -55,12 +55,11 @@ fn ios_data_dir() -> PathBuf {
 
 #[cfg(target_os = "android")]
 fn android_data_dir() -> PathBuf {
-    // Wewnetrzna pamiec aplikacji Android
-    // ndk-glue udostepnia context z getFilesDir()
-    let base = std::env::var("ANDROID_DATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/data/data/ai.tentaflow.mobile/files"));
-    base.join("tentaflow-ai")
+    if let Ok(home) = std::env::var("TENTAFLOW_HOME") {
+        return PathBuf::from(home);
+    }
+
+    PathBuf::from("/data/user/0/ai.tentaflow.mobile/files")
 }
 
 // =============================================================================

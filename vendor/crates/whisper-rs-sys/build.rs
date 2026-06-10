@@ -63,6 +63,9 @@ fn platform_name(target: &str) -> &'static str {
         "x86_64-unknown-linux-gnu" => "linux-x86_64",
         "aarch64-unknown-linux-gnu" => "linux-aarch64",
         "aarch64-apple-darwin" => "macos-arm64",
+        "aarch64-linux-android" => "android-arm64",
+        "armv7-linux-androideabi" => "android-armv7",
+        "x86_64-linux-android" => "android-x86_64",
         "x86_64-pc-windows-msvc" => "windows-x86_64",
         other => panic!("whisper-rs-sys: brak native-libs dla targetu {other}"),
     }
@@ -101,4 +104,3 @@ fn generate_bindings(include_dir: &Path) {
         .write_to_file(out.join("bindings.rs"))
         .expect("whisper-rs-sys: nie mozna zapisac bindings.rs");
 }
-

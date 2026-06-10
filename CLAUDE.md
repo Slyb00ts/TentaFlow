@@ -203,6 +203,26 @@ access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write
 
 - `scripts/native-libs/build-all.sh` (Linux/macOS) i `scripts/native-libs/build-all.ps1`
   (Windows) wykrywają platformę i budują natywne zależności do `native-libs/<platform>/`.
+- Android ma osobny cross-build producer: `scripts/native-libs/build-all-android.sh`.
+  Buduje `zvec`, `llama.cpp` i izolowane `whisper.cpp` przez Android NDK do
+  `native-libs/android-arm64`, `native-libs/android-armv7` i `native-libs/android-x86_64`.
+  Domyślny wariant llama/whisper to `multi` CPU, zgodny z `LLAMA_CPP_NATIVE_VARIANT`
+  i `WHISPER_CPP_NATIVE_VARIANT` w sys-crate'ach. Androidowe buildy GGML mają
+  `GGML_OPENMP=OFF`, żeby nie wymagać dodatkowego runtime `libomp.so`. Skrypt kopiuje też `libc++_shared.so`;
+  `tentaflow-mobile/android/scripts/build-rust.sh` kopiuje `libwhisper_tf.so` i
+  `libc++_shared.so` do `app/src/main/jniLibs/<abi>/`.
+- `tentaflow-mobile/android/scripts/build-rust.sh` jest samowystarczalnym wejściem dla
+  Androida: wykrywa NDK w standardowych lokalizacjach, wybiera ABI z podłączonego
+  telefonu przez `adb` (`ANDROID_ABIS=auto`, domyślnie), pobiera GStreamer Android SDK
+  do `TENTAFLOW_NATIVE_CACHE` gdy go brakuje, i wywołuje `build-all-android.sh` dla
+  brakujących native-libs. `ANDROID_ABIS=all` buduje wszystkie ABI.
+- `tentaflow-mobile/android/gradlew` jest repo-local bootstrapem Gradle: pobiera Gradle
+  8.2.1 i, gdy system ma zbyt nową Javę, Temurin JDK 17 do `TENTAFLOW_NATIVE_CACHE`.
+  `scripts/setup.sh` wywołuje ten bootstrap, więc Android APK nie wymaga ręcznej
+  instalacji systemowego Gradle/JDK.
+- `tentaflow-mobile/core/build.rs` dopina na Androidzie statyczne archiwa GStreamer SDK
+  (`ffi`, `pcre2-8`, `gmodule-2.0`, `iconv`, `intl`), żeby `libtentaflow_mobile.so`
+  nie zostawiał niezwiązanych symboli typu `ffi_type_void` przy `dlopen` na telefonie.
 - Źródła pobierane przez skrypty trafiają poza repo do `TENTAFLOW_NATIVE_CACHE`
   (domyślnie `${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs` — trwały cache na
   dysku, NIE `/tmp`: tmpfs w RAM urywa rozpakowanie na małym RAM-ie → CMake „Parse

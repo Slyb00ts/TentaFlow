@@ -181,103 +181,94 @@ impl ModelManager {
             filename, repo_id
         );
 
-        // hf-hub API jest synchroniczne — uruchamiamy w osobnym watku
-        let downloaded_path = tokio::task::spawn_blocking({
-            let repo_id = repo_id.clone();
-            let filename = filename.clone();
-            let progress_tx = progress_tx.clone();
+        let downloaded_path = {
+            let start = Instant::now();
 
-            move || -> anyhow::Result<PathBuf> {
-                let start = Instant::now();
+            // Wyslij status pobierania
+            let _ = progress_tx.send(DownloadProgress {
+                model_id: repo_id.clone(),
+                filename: filename.clone(),
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                percent: 0.0,
+                speed_bps: 0,
+                status: DownloadStatus::Downloading,
+            });
 
-                // Wyslij status pobierania
-                let _ = progress_tx.send(DownloadProgress {
-                    model_id: repo_id.clone(),
-                    filename: filename.clone(),
-                    downloaded_bytes: 0,
-                    total_bytes: 0,
-                    percent: 0.0,
-                    speed_bps: 0,
-                    status: DownloadStatus::Downloading,
-                });
+            let api = hf_hub::api::tokio::Api::new()
+                .context("Nie udalo sie utworzyc klienta HuggingFace Hub")?;
 
-                let api = hf_hub::api::sync::Api::new()
-                    .context("Nie udalo sie utworzyc klienta HuggingFace Hub")?;
+            let repo = api.model(repo_id.clone());
 
-                let repo = api.model(repo_id.clone());
+            // hf-hub pobiera plik do wlasnego cache i zwraca sciezke
+            let hf_path = repo.get(&filename).await.with_context(|| {
+                format!(
+                    "Nie udalo sie pobrac pliku '{}' z repozytorium '{}'",
+                    filename, repo_id
+                )
+            })?;
 
-                // hf-hub pobiera plik do wlasnego cache i zwraca sciezke
-                let hf_path = repo.get(&filename).with_context(|| {
-                    format!(
-                        "Nie udalo sie pobrac pliku '{}' z repozytorium '{}'",
-                        filename, repo_id
-                    )
-                })?;
+            let elapsed = start.elapsed();
+            let file_size = std::fs::metadata(&hf_path).map(|m| m.len()).unwrap_or(0);
 
-                let elapsed = start.elapsed();
-                let file_size = std::fs::metadata(&hf_path).map(|m| m.len()).unwrap_or(0);
+            let speed_bps = if elapsed.as_secs() > 0 {
+                file_size / elapsed.as_secs()
+            } else {
+                file_size
+            };
 
-                let speed_bps = if elapsed.as_secs() > 0 {
-                    file_size / elapsed.as_secs()
-                } else {
+            // Wyslij status weryfikacji
+            let _ = progress_tx.send(DownloadProgress {
+                model_id: repo_id.clone(),
+                filename: filename.clone(),
+                downloaded_bytes: file_size,
+                total_bytes: file_size,
+                percent: 100.0,
+                speed_bps,
+                status: DownloadStatus::Verifying,
+            });
+
+            // Skopiuj z cache hf-hub do naszego katalogu modeli
+            let target = models_dir.join(&filename);
+            std::fs::copy(&hf_path, &target).with_context(|| {
+                format!(
+                    "Nie udalo sie skopiowac modelu z {:?} do {:?}",
+                    hf_path, target
+                )
+            })?;
+
+            // Weryfikacja rozmiaru po skopiowaniu
+            let copied_size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+
+            if copied_size != file_size {
+                std::fs::remove_file(&target).ok();
+                anyhow::bail!(
+                    "Rozmiar pliku po skopiowaniu ({}) nie zgadza sie z oryginatem ({})",
+                    copied_size,
                     file_size
-                };
-
-                // Wyslij status weryfikacji
-                let _ = progress_tx.send(DownloadProgress {
-                    model_id: repo_id.clone(),
-                    filename: filename.clone(),
-                    downloaded_bytes: file_size,
-                    total_bytes: file_size,
-                    percent: 100.0,
-                    speed_bps,
-                    status: DownloadStatus::Verifying,
-                });
-
-                // Skopiuj z cache hf-hub do naszego katalogu modeli
-                let target = models_dir.join(&filename);
-                std::fs::copy(&hf_path, &target).with_context(|| {
-                    format!(
-                        "Nie udalo sie skopiowac modelu z {:?} do {:?}",
-                        hf_path, target
-                    )
-                })?;
-
-                // Weryfikacja rozmiaru po skopiowaniu
-                let copied_size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
-
-                if copied_size != file_size {
-                    std::fs::remove_file(&target).ok();
-                    anyhow::bail!(
-                        "Rozmiar pliku po skopiowaniu ({}) nie zgadza sie z oryginatem ({})",
-                        copied_size,
-                        file_size
-                    );
-                }
-
-                // Wyslij status zakonczenia
-                let _ = progress_tx.send(DownloadProgress {
-                    model_id: repo_id.clone(),
-                    filename: filename.clone(),
-                    downloaded_bytes: file_size,
-                    total_bytes: file_size,
-                    percent: 100.0,
-                    speed_bps,
-                    status: DownloadStatus::Complete,
-                });
-
-                info!(
-                    "Model '{}' pobrany ({:.1} MB, {:.1} s)",
-                    filename,
-                    file_size as f64 / 1_048_576.0,
-                    elapsed.as_secs_f64()
                 );
-
-                Ok(target)
             }
-        })
-        .await
-        .context("Watek pobierania zakonczyl sie nieoczekiwanie")??;
+
+            // Wyslij status zakonczenia
+            let _ = progress_tx.send(DownloadProgress {
+                model_id: repo_id.clone(),
+                filename: filename.clone(),
+                downloaded_bytes: file_size,
+                total_bytes: file_size,
+                percent: 100.0,
+                speed_bps,
+                status: DownloadStatus::Complete,
+            });
+
+            info!(
+                "Model '{}' pobrany ({:.1} MB, {:.1} s)",
+                filename,
+                file_size as f64 / 1_048_576.0,
+                elapsed.as_secs_f64()
+            );
+
+            target
+        };
 
         Ok(downloaded_path)
     }

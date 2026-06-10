@@ -36,6 +36,7 @@ pub mod org;
 pub mod pickup_tokens;
 pub mod policy;
 pub mod ports;
+pub mod providers;
 pub mod rbac;
 pub mod recording;
 pub mod registry;

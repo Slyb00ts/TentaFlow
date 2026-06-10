@@ -1,0 +1,30 @@
+[engine]
+id = "gemini"
+category = "llm"
+resource_kind = "ai"
+provider = "external"
+name = "Google Gemini"
+description_pl = "Modele Google Gemini przez punkt końcowy zgodny z OpenAI."
+description_en = "Google Gemini models via the OpenAI-compatible endpoint."
+homepage = "https://ai.google.dev"
+license = "Proprietary"
+default_port = 443
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
+detection_health_path = "/models"
+requires_api_key = true
+
+[[model_preset]]
+id = "gemini-2.5-pro"
+display_name = "Gemini 2.5 Pro"
+repo = "gemini-2.5-pro"
+recommended = true
+
+[[model_preset]]
+id = "gemini-2.5-flash"
+display_name = "Gemini 2.5 Flash"
+repo = "gemini-2.5-flash"

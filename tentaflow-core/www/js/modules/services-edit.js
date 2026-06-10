@@ -21,6 +21,11 @@ let recommendDebounceHandle = null;
 
 export async function openEditModal(svc, opts = {}) {
   closeModal();
+  // External cloud providers don't expose a model/VRAM config — editing them
+  // means picking which of the provider's live models become available.
+  if ((svc.deploy_method || '') === 'external') {
+    return openExternalModelPicker(svc, opts);
+  }
   const onSaved = opts.onSaved || (() => {});
   const engineId = opts.engineId || svc.engine_id;
   const cfg = parseConfig(svc.config_json);
@@ -135,6 +140,111 @@ export async function openEditModal(svc, opts = {}) {
   startVramPoll(overlay, svc.id);
   // Pierwszy estimate VRAM (HF config.json + estimate_vllm_vram).
   if (isVllm) scheduleRecommendRefresh(overlay, svc, engineId);
+}
+
+// External provider model picker: lists the provider's live models with a
+// checkbox per model (pre-checked = already added to model_registry). "Add to
+// models" persists the selection so chosen models appear in Modele dostępne.
+async function openExternalModelPicker(svc, opts = {}) {
+  const onSaved = opts.onSaved || (() => {});
+  const nodeId = opts.nodeId || svc.node_id || undefined;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-shell">
+      <div class="modal-head">
+        <h2>${escapeHtml(svc.display_name || svc.engine_id)} — ${escapeHtml(I18n.t('external.select_models'))}</h2>
+        <button class="modal-x" data-close aria-label="close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="form-hint">${escapeHtml(I18n.t('external.select_models_hint'))}</p>
+        <div data-status class="form-hint">${escapeHtml(I18n.t('external.loading_models'))}</div>
+        <div data-model-list class="external-model-list"></div>
+      </div>
+      <div class="modal-foot" style="display:flex;gap:8px;align-items:center;">
+        <tf-button variant="secondary" icon="refresh" data-refresh>${escapeHtml(I18n.t('external.refresh_models'))}</tf-button>
+        <span style="flex:1"></span>
+        <tf-button variant="ghost" data-cancel>${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+        <tf-button variant="primary" icon="check" data-save>${escapeHtml(I18n.t('external.add_to_models'))}</tf-button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  currentModalEl = overlay;
+
+  overlay.querySelector('[data-close]').addEventListener('click', closeModal);
+  overlay.querySelector('[data-cancel]').addEventListener('click', closeModal);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) closeModal();
+  });
+
+  const listEl = overlay.querySelector('[data-model-list]');
+  const statusEl = overlay.querySelector('[data-status]');
+
+  async function load() {
+    statusEl.style.display = '';
+    statusEl.textContent = I18n.t('external.loading_models');
+    listEl.innerHTML = '';
+    try {
+      const res = await ApiBinary.action('serviceModelCatalogRequest', { serviceId: svc.id, nodeId });
+      if (res && res.error) {
+        statusEl.textContent = I18n.t('external.load_failed', { error: res.error });
+        return;
+      }
+      const models = (res && res.models) || [];
+      if (models.length === 0) {
+        statusEl.textContent = I18n.t('external.no_models');
+        return;
+      }
+      statusEl.style.display = 'none';
+      listEl.innerHTML = models.map((m) => {
+        const id = m.id || m.model_name || '';
+        const ctxLen = m.contextLength || m.context_length;
+        const ctxTxt = ctxLen ? ` · ${ctxLen}` : '';
+        const name = m.displayName || m.display_name || id;
+        return `
+          <label class="external-model-row" style="display:flex;align-items:center;gap:10px;padding:6px 0;">
+            <tf-checkbox ${m.selected ? 'checked' : ''} data-model-id="${escapeHtml(id)}"></tf-checkbox>
+            <span style="flex:1">${escapeHtml(name)}${escapeHtml(ctxTxt)}</span>
+            <tf-chip>${escapeHtml(m.modality || 'chat')}</tf-chip>
+          </label>`;
+      }).join('');
+    } catch (e) {
+      statusEl.style.display = '';
+      statusEl.textContent = I18n.t('external.load_failed', { error: e.message || String(e) });
+    }
+  }
+
+  overlay.querySelector('[data-refresh]').addEventListener('click', load);
+  overlay.querySelector('[data-save]').addEventListener('click', async () => {
+    const saveBtn = overlay.querySelector('[data-save]');
+    saveBtn.setAttribute('disabled', '');
+    const ids = Array.from(listEl.querySelectorAll('tf-checkbox'))
+      .filter((c) => c.checked)
+      .map((c) => c.getAttribute('data-model-id'))
+      .filter(Boolean);
+    try {
+      const res = await ApiBinary.action('serviceModelSelectionRequest', {
+        serviceId: svc.id,
+        nodeId,
+        selectedModelIds: ids,
+      });
+      if (res && res.success === false) {
+        statusEl.style.display = '';
+        statusEl.textContent = I18n.t('external.save_failed', { error: res.error || '' });
+        saveBtn.removeAttribute('disabled');
+        return;
+      }
+      closeModal();
+      onSaved();
+    } catch (e) {
+      statusEl.style.display = '';
+      statusEl.textContent = I18n.t('external.save_failed', { error: e.message || String(e) });
+      saveBtn.removeAttribute('disabled');
+    }
+  });
+
+  await load();
 }
 
 function closeModal() {

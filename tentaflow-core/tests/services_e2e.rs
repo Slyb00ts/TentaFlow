@@ -60,6 +60,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             license: String::new(),
             icon: None,
             resource_kind: None,
+            provider: None,
             requires_model: None,
             gpu_supported: None,
             // dgx_spark: brak ograniczen Spark dla testowego silnika

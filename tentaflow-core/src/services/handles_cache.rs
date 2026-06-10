@@ -123,7 +123,10 @@ impl LiveHandlesCache {
     }
 
     pub fn upsert_service_info(&self, svc: &ServiceInfo) -> Result<()> {
-        let handle = build_handle(svc)?;
+        // Snapshot-driven insert (mesh sync / non-supervisor paths) carries no
+        // local secrets; external-provider keys are injected only on the owning
+        // node by the supervisor's handle reconcile.
+        let handle = build_handle(svc, None)?;
         let quic_inner = match &handle {
             BackendHandle::Quic(h) => Some(h.clone()),
             _ => None,
@@ -185,7 +188,26 @@ impl LiveHandlesCache {
 /// Buduje `BackendHandle` dla `ServiceInfo`. **Nie spawnuje reconnect loop'u**
 /// dla QUIC — supervisor robi to osobnym taskiem w kroku N7.2 zaraz po
 /// `insert`. Embedded nie wymaga zadnej infrastruktury sieciowej.
-pub fn build_handle(svc: &ServiceInfo) -> Result<BackendHandle> {
+/// Node-local materialisation extras for an external cloud provider, resolved by
+/// the supervisor from the local `services.config_json`. They never travel on the
+/// broadcast `ServiceInfo`, so only the owning node holds them. `api_key` is the
+/// DECRYPTED key (or the pasted subscription auth blob); `request_format` +
+/// `endpoint_override` redirect subscription providers (e.g. OpenAI ChatGPT plan
+/// → Codex Responses backend) to their non-standard endpoint.
+#[derive(Debug, Clone, Default)]
+pub struct ExternalProviderCreds {
+    pub api_key: String,
+    pub request_format: Option<String>,
+    pub endpoint_override: Option<String>,
+}
+
+/// Buduje `BackendHandle` dla `ServiceInfo`. **Nie spawnuje reconnect loop'u**
+/// dla QUIC — supervisor robi to osobnym taskiem w kroku N7.2 zaraz po
+/// `insert`. Embedded nie wymaga zadnej infrastruktury sieciowej.
+/// `creds` carries the decrypted key / subscription routing for external cloud
+/// providers; `None` for local engines that need no key (vllm/ollama) and for
+/// remote services reached over the mesh.
+pub fn build_handle(svc: &ServiceInfo, creds: Option<ExternalProviderCreds>) -> Result<BackendHandle> {
     let transport = Transport::from_db_tag(&svc.transport)?;
     match transport {
         Transport::Embedded => {
@@ -201,23 +223,30 @@ pub fn build_handle(svc: &ServiceInfo) -> Result<BackendHandle> {
             })
         }
         Transport::HttpDirect | Transport::ExternalHttp => {
-            let url = svc
+            let endpoint = svc
                 .endpoint_url
                 .clone()
                 .ok_or_else(|| anyhow!("endpoint_url missing for HTTP transport"))?;
-            // HTTP backend bez wymaganego api_key — wkladamy pusty `api_key`
-            // zeby `BackendClient::new` nie wybuchnal na lokalnym serwisie
-            // (ollama / vllm dostepne anonymously). Realne sekrety dla
-            // hosted endpointow przyjda z `extra_config` w pelnym scieprze
-            // (krok N7.2 supervisor passowac bedzie te pola).
+            // Local engines (ollama / vllm) are anonymous, so an empty key is
+            // fine and keeps `BackendClient::new` from erroring. External cloud
+            // providers get their DECRYPTED key (and, for subscription auth, the
+            // request format + endpoint override) injected here by the supervisor.
+            let (api_key, request_format, url) = match creds {
+                Some(c) => (
+                    c.api_key,
+                    c.request_format,
+                    c.endpoint_override.unwrap_or(endpoint),
+                ),
+                None => (String::new(), None, endpoint),
+            };
             let backend = crate::config::ServiceBackend {
                 connection: ConnectionType::OpenAIApi {
                     url,
-                    api_key: Some(String::new()),
+                    api_key: Some(api_key),
                     api_key_env: None,
                     extra_headers: Vec::new(),
                     custom_endpoint: None,
-                    request_format: None,
+                    request_format,
                     tts_config: None,
                 },
                 max_concurrent: 8,
@@ -530,7 +559,7 @@ mod tests {
     #[test]
     fn build_handle_embedded_uses_first_model_name() {
         let svc = embedded_svc(1, "n", "qwen-tiny");
-        let h = build_handle(&svc).expect("build embedded");
+        let h = build_handle(&svc, None).expect("build embedded");
         match h {
             BackendHandle::Embedded {
                 model_name,

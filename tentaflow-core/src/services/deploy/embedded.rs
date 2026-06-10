@@ -613,6 +613,7 @@ mod tests {
                 icon: None,
                 provider: None,
                 resource_kind: None,
+                provider: None,
                 requires_model: None,
                 gpu_supported: None,
                 default_port: 0,

@@ -1,0 +1,27 @@
+diff --git a/src/db/index/column/fts_column/posting/bitpacked_posting_list.cc b/src/db/index/column/fts_column/posting/bitpacked_posting_list.cc
+index 8ca8e26..1ba4f57 100644
+--- a/src/db/index/column/fts_column/posting/bitpacked_posting_list.cc
++++ b/src/db/index/column/fts_column/posting/bitpacked_posting_list.cc
+@@ -19,6 +19,7 @@
+ #include <cstdlib>
+ #include <memory>
+ #include <zvec/ailego/logger/logger.h>
++#include <new>
+ #include "bitpacked_simd_dispatch.h"
+ 
+ #ifdef _MSC_VER
+@@ -50,8 +51,13 @@ inline auto make_aligned_uint32_array(size_t count) {
+   auto *ptr = static_cast<uint32_t *>(_aligned_malloc(num_bytes, 16));
+   return std::unique_ptr<uint32_t[], decltype(&_aligned_free)>(ptr,
+                                                                _aligned_free);
+-#else
++#elif !defined(__ANDROID__)
+   auto *ptr = static_cast<uint32_t *>(std::aligned_alloc(16, num_bytes));
+   return std::unique_ptr<uint32_t[], decltype(&std::free)>(ptr, std::free);
++#else
++  void *raw = nullptr;
++  if (posix_memalign(&raw, 16, num_bytes) != 0) throw std::bad_alloc();
++  auto *ptr = static_cast<uint32_t *>(raw);
++  return std::unique_ptr<uint32_t[], decltype(&std::free)>(ptr, std::free);
+ #endif
+ }

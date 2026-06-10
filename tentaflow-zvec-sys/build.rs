@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 fn require(path: &Path, platform: &str) {
     if !path.exists() {
-        let hint = if platform == "windows-x86_64" {
+        let hint = if platform.starts_with("android-") {
+            "scripts/native-libs/build-all-android.sh --only zvec".to_string()
+        } else if platform == "windows-x86_64" {
             "scripts\\native-libs\\build-all.ps1 --Only zvec".to_string()
         } else {
             "./scripts/native-libs/build-all.sh --only zvec".to_string()
@@ -33,6 +35,8 @@ fn main() {
         "aarch64-apple-ios" => "ios-arm64",
         "aarch64-apple-ios-sim" => "ios-sim-arm64",
         "aarch64-linux-android" => "android-arm64",
+        "armv7-linux-androideabi" => "android-armv7",
+        "x86_64-linux-android" => "android-x86_64",
         "x86_64-pc-windows-msvc" => "windows-x86_64",
         other => panic!("tentaflow-zvec-sys: no vendored zvec archive for target `{other}`"),
     };
@@ -55,6 +59,21 @@ fn main() {
         require(&static_dir.join("zvec_c_api.lib"), platform);
         println!("cargo:rustc-link-search=native={}", static_dir.display());
         println!("cargo:rustc-link-lib=dylib=zvec_c_api");
+    } else if target.contains("android") || target.contains("apple-ios") {
+        require(&static_dir.join("libzvec_c_api.a"), platform);
+        require(&static_dir.join("libzvec_deps.a"), platform);
+        println!("cargo:rustc-link-search=native={}", static_dir.display());
+        println!("cargo:rustc-link-lib=static:+whole-archive=zvec_c_api");
+        println!("cargo:rustc-link-lib=static=zvec_deps");
+        if target.contains("apple") {
+            println!("cargo:rustc-link-lib=c++");
+        } else if target.contains("android") {
+            println!("cargo:rustc-link-lib=c++_shared");
+            println!("cargo:rustc-link-lib=log");
+            println!("cargo:rustc-link-lib=android");
+            println!("cargo:rustc-link-lib=dl");
+            println!("cargo:rustc-link-lib=z");
+        }
     } else if target.contains("linux") || target.contains("apple-darwin") {
         let shared = if target.contains("apple") {
             "libzvec_c_api.dylib"
@@ -65,17 +84,6 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dynamic_dir.display());
         println!("cargo:rustc-link-lib=dylib=zvec_c_api");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dynamic_dir.display());
-    } else {
-        require(&static_dir.join("libzvec_c_api.a"), platform);
-        require(&static_dir.join("libzvec_deps.a"), platform);
-        println!("cargo:rustc-link-search=native={}", static_dir.display());
-        println!("cargo:rustc-link-lib=static:+whole-archive=zvec_c_api");
-        println!("cargo:rustc-link-lib=static=zvec_deps");
-        if target.contains("apple") {
-            println!("cargo:rustc-link-lib=c++");
-        } else if target.contains("android") {
-            println!("cargo:rustc-link-lib=c++_shared");
-        }
     }
 
     let header = include.join("zvec/c_api.h");

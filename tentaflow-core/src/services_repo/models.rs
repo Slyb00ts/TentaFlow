@@ -131,6 +131,85 @@ pub fn delete_for_service(conn: &Connection, service_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// One model the admin chose to expose for an external provider service.
+/// `modality` (chat/embedding/tts/stt/...) becomes the single capability tag.
+#[derive(Debug, Clone)]
+pub struct SelectedModel {
+    pub model_name: String,
+    pub display_name: Option<String>,
+    pub modality: String,
+    pub context_length: Option<i64>,
+}
+
+/// Reconcile `model_registry` for `service_id` to EXACTLY the given selection:
+/// deselected models are removed, newly-selected ones inserted, and rows that
+/// stay selected are left untouched (preserving their `is_default`). When the
+/// resulting set has no default, the first row becomes the default so the
+/// service still resolves a model. Used by the external-provider model picker.
+pub fn replace_selection(
+    conn: &Connection,
+    service_id: i64,
+    selected: &[SelectedModel],
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    let existing = list_for_service(conn, service_id)?;
+    let existing_names: HashSet<&str> = existing.iter().map(|m| m.model_name.as_str()).collect();
+    let selected_names: HashSet<&str> = selected.iter().map(|m| m.model_name.as_str()).collect();
+
+    // Remove rows no longer selected.
+    for row in &existing {
+        if !selected_names.contains(row.model_name.as_str()) {
+            conn.execute(
+                "DELETE FROM model_registry WHERE id = ?1",
+                params![row.id],
+            )
+            .context("delete deselected model_registry row")?;
+        }
+    }
+
+    // Insert newly-selected rows (UNIQUE(service_id, model_name) protects against
+    // races; ignore the conflict if a concurrent insert won).
+    for m in selected {
+        if existing_names.contains(m.model_name.as_str()) {
+            continue;
+        }
+        let capabilities = format!("[\"{}\"]", m.modality);
+        conn.execute(
+            "INSERT OR IGNORE INTO model_registry (service_id, model_name, display_name, \
+                capabilities, context_length, quantization, is_default) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0)",
+            params![
+                service_id,
+                m.model_name,
+                m.display_name,
+                capabilities,
+                m.context_length,
+            ],
+        )
+        .context("insert selected model_registry row")?;
+    }
+
+    // Guarantee a default so the service can resolve a model.
+    let has_default: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_registry WHERE service_id = ?1 AND is_default = 1)",
+            params![service_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("check default model")?
+        != 0;
+    if !has_default {
+        conn.execute(
+            "UPDATE model_registry SET is_default = 1 \
+             WHERE id = (SELECT id FROM model_registry WHERE service_id = ?1 ORDER BY id ASC LIMIT 1)",
+            params![service_id],
+        )
+        .context("set default model")?;
+    }
+    Ok(())
+}
+
 /// Aggregate row joining `model_registry` with the parent `services`.
 /// Used by the dashboard `GET /api/models` to surface which engine each
 /// model is served by + the runtime transport / status.

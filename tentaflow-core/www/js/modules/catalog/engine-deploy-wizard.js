@@ -104,6 +104,18 @@ export async function openDeployWizard(engineId, opts = {}) {
     containerName: null,
     gpuSelectMode: 'all',
     gpuIds: [],
+    // External cloud provider credentials (deploy.external.requires_api_key).
+    // Stored encrypted server-side; base_url/api_version only used by
+    // openai-compatible/azure-openai engines that need an endpoint override.
+    apiKey: '',
+    baseUrl: '',
+    apiVersion: '',
+    // 'api' = pay-per-token API key; 'subscription' = OAuth/ChatGPT-or-Google
+    // subscription token (OpenAI Codex / Gemini Code Assist). Only OpenAI+Gemini.
+    externalAuthMode: 'api',
+    // Subscription OAuth: set once the browser login completes on the node.
+    oauthFlowId: null,
+    oauthAccount: null,
     // Advanced (vLLM Auto-tuned) - wartosci uzywane do build vllm_args.
     // `lockedParam` = ostatnio dotkniety przez usera slider/chip — backend
     // dostaje `lock_<param>: true` tylko dla niego, reszte parametrow
@@ -400,6 +412,34 @@ function renderFooter() {
 
 // ---- Step 1: deploy method ------------------------------------------------
 
+// OpenAI (ChatGPT plan via Codex OAuth) and Google Gemini (Google AI via the
+// Gemini CLI / Code Assist OAuth) can be driven by a personal subscription, not
+// only a pay-per-token API key. Anthropic deliberately blocks this for third
+// parties, so Claude is API-key only.
+function subscriptionSupportedEngine() {
+  // OpenAI subscription (ChatGPT plan via the Codex Responses backend) is wired
+  // end-to-end. Gemini's Code Assist subscription API needs its own adapter and
+  // is API-key only until that lands.
+  return ['openai'].includes(String(engineEntry?.engine?.id || '').toLowerCase());
+}
+
+function renderMethodCard(m, auth) {
+  const splitExternal = m === 'external' && auth;
+  const active = splitExternal
+    ? (selection.deployMethod === 'external' && selection.externalAuthMode === auth)
+    : (selection.deployMethod === m);
+  const sel = active ? ' selected' : '';
+  const key = splitExternal ? `external_${auth}` : m;
+  const authAttr = auth ? ` data-auth="${escapeAttr(auth)}"` : '';
+  return `
+    <button type="button" class="deploy-method-card${sel}" data-method="${escapeAttr(m)}"${authAttr}>
+      <div class="dm-ico">${deployIcon(m, 32)}</div>
+      <div class="dm-name">${escapeHtml(I18n.t(`wizard.method.${key}`))}</div>
+      <div class="dm-desc">${escapeHtml(I18n.t(`wizard.method.${key}Desc`))}</div>
+    </button>
+  `;
+}
+
 function renderStepMethod() {
   if (availableMethods.length === 0) {
     const msg = I18n.t('wizard.noMethodsAvailable').replace('{os}', escapeHtml(hostOs));
@@ -409,17 +449,14 @@ function renderStepMethod() {
     `;
   }
 
-  const cards = availableMethods.map((m) => {
-    const sel = selection.deployMethod === m ? ' selected' : '';
-    const name = I18n.t(`wizard.method.${m}`);
-    const desc = I18n.t(`wizard.method.${m}Desc`);
-    return `
-      <button type="button" class="deploy-method-card${sel}" data-method="${escapeAttr(m)}">
-        <div class="dm-ico">${deployIcon(m, 32)}</div>
-        <div class="dm-name">${escapeHtml(name)}</div>
-        <div class="dm-desc">${escapeHtml(desc)}</div>
-      </button>
-    `;
+  // OpenAI / Gemini support BOTH a pay-per-token API key and an OAuth
+  // subscription (ChatGPT plan / Google AI), so their single "external" method
+  // splits into two tiles — like Docker/Native are separate tiles.
+  const cards = availableMethods.flatMap((m) => {
+    if (m === 'external' && subscriptionSupportedEngine()) {
+      return [renderMethodCard('external', 'api'), renderMethodCard('external', 'subscription')];
+    }
+    return [renderMethodCard(m, null)];
   }).join('');
 
   // Node selector (jeśli są inne node'y)
@@ -1523,8 +1560,12 @@ function renderStepRuntime() {
   // zmiany. Dla native (python-bundle / binary / embedded) backend zawsze sam
   // alokuje port z puli i ignoruje wartosc z formularza, wiec tam pokazujemy
   // tylko informacyjny opis.
+  // Cloud API providers have no local port — the endpoint is the provider URL.
+  const isCloudExternal = externalCredsConfig().requiresApiKey;
   const isDocker = selection.deployMethod === 'docker';
-  const portField = isDocker
+  const portField = isCloudExternal
+    ? ''
+    : isDocker
     ? `
       <div class="form-group">
         <tf-input type="number" id="edw-port"
@@ -1543,9 +1584,104 @@ function renderStepRuntime() {
   return `
     <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.configureRuntime'))}</h4>
     ${summary}
+    ${renderExternalCredsFields()}
     ${portField}
     ${extra}
   `;
+}
+
+/// Credential metadata for the selected external engine. `requiresApiKey` gates
+/// the API-key field; `showBaseUrl`/`showApiVersion` add an endpoint override
+/// for engines that need one (generic openai-compatible, Azure).
+function externalCredsConfig() {
+  const eng = engineEntry?.engine || {};
+  const ext = engineEntry?.deploy?.external || null;
+  const requiresApiKey = selection.deployMethod === 'external' && !!ext?.requires_api_key;
+  const api = String(eng.api || '').toLowerCase();
+  const isGeneric = String(eng.id || '').toLowerCase() === 'openai-compatible';
+  // Subscription mode (OpenAI/Gemini) takes an OAuth token, not an API key —
+  // base URL / api-version overrides don't apply there.
+  const subscription = requiresApiKey
+    && subscriptionSupportedEngine()
+    && selection.externalAuthMode === 'subscription';
+  return {
+    requiresApiKey,
+    subscription,
+    showBaseUrl: requiresApiKey && !subscription && (api === 'azure-openai' || isGeneric),
+    showApiVersion: requiresApiKey && !subscription && api === 'azure-openai',
+    defaultBaseUrl: ext?.detection_endpoint || '',
+    defaultApiVersion: '2024-10-21',
+  };
+}
+
+function renderExternalCredsFields() {
+  const c = externalCredsConfig();
+  if (!c.requiresApiKey) return '';
+  const baseUrl = c.showBaseUrl
+    ? `
+      <div class="form-group">
+        <tf-input type="text" id="edw-base-url"
+          label="${escapeAttr(I18n.t('external.base_url'))}"
+          placeholder="${escapeAttr(c.defaultBaseUrl)}"
+          value="${escapeAttr(selection.baseUrl || '')}"></tf-input>
+        <span class="form-hint">${escapeHtml(I18n.t('external.base_url_hint'))}</span>
+      </div>`
+    : '';
+  const apiVersion = c.showApiVersion
+    ? `
+      <div class="form-group">
+        <tf-input type="text" id="edw-api-version"
+          label="${escapeAttr(I18n.t('external.api_version'))}"
+          placeholder="${escapeAttr(c.defaultApiVersion)}"
+          value="${escapeAttr(selection.apiVersion || '')}"></tf-input>
+      </div>`
+    : '';
+  const engId = String(engineEntry?.engine?.id || '').toLowerCase();
+  const keyLabel = c.subscription ? I18n.t('external.subscription_token') : I18n.t('external.api_key');
+  const keyPlaceholder = c.subscription
+    ? I18n.t('external.subscription_token_placeholder')
+    : I18n.t('external.api_key_placeholder');
+  const subHintKey = engId === 'gemini' ? 'external.subscription_hint_gemini' : 'external.subscription_hint_openai';
+  const keyHint = c.subscription ? I18n.t(subHintKey) : I18n.t('external.api_key_hint');
+  // Subscription = browser OAuth login (no key pasting). API mode = a key field.
+  if (c.subscription) {
+    return `
+      <div class="form-group">
+        <label>${escapeHtml(keyLabel)}</label>
+        ${renderSubscriptionLogin()}
+        <span class="form-hint">${escapeHtml(keyHint)}</span>
+      </div>
+    `;
+  }
+  return `
+    <div class="form-group">
+      <tf-input type="password" id="edw-api-key"
+        label="${escapeAttr(keyLabel)}"
+        placeholder="${escapeAttr(keyPlaceholder)}"
+        value="${escapeAttr(selection.apiKey || '')}"></tf-input>
+      <span class="form-hint">${escapeHtml(keyHint)}</span>
+    </div>
+    ${baseUrl}
+    ${apiVersion}
+  `;
+}
+
+function renderSubscriptionLogin() {
+  if (selection.oauthFlowId) {
+    const who = selection.oauthAccount
+      ? I18n.t('external.oauth_signed_in_as', { account: selection.oauthAccount })
+      : I18n.t('external.oauth_signed_in');
+    return `
+      <div style="display:flex;align-items:center;gap:10px;">
+        <tf-chip status="ok">${escapeHtml(who)}</tf-chip>
+        <tf-button variant="ghost" id="edw-oauth-login">${escapeHtml(I18n.t('external.oauth_relogin'))}</tf-button>
+      </div>`;
+  }
+  return `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <tf-button variant="primary" icon="key" id="edw-oauth-login">${escapeHtml(I18n.t('external.oauth_login'))}</tf-button>
+      <span data-oauth-status class="form-hint"></span>
+    </div>`;
 }
 
 // ---- Step 3: GPUs ---------------------------------------------------------
@@ -1558,6 +1694,9 @@ function renderStepRuntime() {
 function shouldSkipModelStep() {
   const eng = engineEntry?.engine;
   if (!eng) return false;
+  // Cloud API providers don't pick a model at deploy time — the model picker in
+  // the service edit view selects from the provider's live catalog instead.
+  if (externalCredsConfig().requiresApiKey) return true;
   if (eng.requires_model === false) return true;
   if (eng.requires_model === true) return false;
   const category = String(eng.category || '').toLowerCase();
@@ -1571,6 +1710,8 @@ function shouldSkipModelStep() {
 // engine manifest may opt out via `engine.gpu_supported === false`; by default
 // (field absent) we assume the engine can use GPUs if the node has any.
 function shouldSkipGpuStep() {
+  // Cloud API providers run remotely — there is no local GPU to allocate.
+  if (externalCredsConfig().requiresApiKey) return true;
   const gpus = nodeGpus(selection.nodeId);
   if (gpus.length === 0) return true;
   if (usesDockerCompose()) return true;
@@ -1744,9 +1885,8 @@ function bindStepInputs() {
 function bindStepMethodInputs() {
   document.querySelectorAll('.deploy-method-card[data-method]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      console.log('[wizard][method-click] dataset.method=', btn.dataset.method, 'before:', selection.deployMethod);
       selection.deployMethod = btn.dataset.method;
-      console.log('[wizard][method-click] after:', selection.deployMethod);
+      if (btn.dataset.auth) selection.externalAuthMode = btn.dataset.auth;
       refreshModal();
     });
   });
@@ -1882,6 +2022,84 @@ function bindStepRuntimeInputs() {
       selection.containerName = String(raw).trim();
     });
   }
+  const apiKeyInput = document.getElementById('edw-api-key');
+  if (apiKeyInput) {
+    apiKeyInput.addEventListener('input', (e) => {
+      selection.apiKey = String(e.detail?.value ?? apiKeyInput.value);
+    });
+  }
+  const baseUrlInput = document.getElementById('edw-base-url');
+  if (baseUrlInput) {
+    baseUrlInput.addEventListener('input', (e) => {
+      selection.baseUrl = String(e.detail?.value ?? baseUrlInput.value).trim();
+    });
+  }
+  const apiVersionInput = document.getElementById('edw-api-version');
+  if (apiVersionInput) {
+    apiVersionInput.addEventListener('input', (e) => {
+      selection.apiVersion = String(e.detail?.value ?? apiVersionInput.value).trim();
+    });
+  }
+  document.getElementById('edw-oauth-login')?.addEventListener('click', startOauthLogin);
+}
+
+// Subscription browser-OAuth: ask the node to start a login, open the provider's
+// authorize page, then poll until the node captures the tokens.
+async function startOauthLogin() {
+  const btn = document.getElementById('edw-oauth-login');
+  const statusEl = document.querySelector('[data-oauth-status]');
+  if (btn) btn.setAttribute('disabled', '');
+  if (statusEl) statusEl.textContent = I18n.t('external.oauth_opening');
+  try {
+    const res = await ApiBinary.action('serviceOauthStartRequest', {
+      provider: engineEntry?.engine?.id || '',
+      nodeId: selection.nodeId,
+    });
+    if (!res || res.error || !res.authorizeUrl) {
+      throw new Error((res && res.error) || 'no authorize URL');
+    }
+    const url = res.authorizeUrl;
+    const code = res.userCode || '';
+    try { window.open(url, '_blank', 'noopener'); } catch (_e) { /* popup blocked — link shown below */ }
+    if (statusEl) {
+      statusEl.innerHTML = `${escapeHtml(I18n.t('external.oauth_enter_code'))}
+        <a href="${escapeAttr(url)}" target="_blank" rel="noopener">${escapeHtml(url)}</a>
+        → <strong style="font-size:1.15em;letter-spacing:2px">${escapeHtml(code)}</strong>
+        <br><span class="form-hint">${escapeHtml(I18n.t('external.oauth_waiting'))}</span>`;
+    }
+    pollOauth(res.flowId);
+  } catch (e) {
+    if (statusEl) statusEl.textContent = I18n.t('external.oauth_failed', { error: e.message || String(e) });
+    if (btn) btn.removeAttribute('disabled');
+  }
+}
+
+function pollOauth(flowId) {
+  const tick = async () => {
+    // Abort if the wizard moved on / closed.
+    if (!document.getElementById('engine-deploy-wizard')) return;
+    try {
+      const res = await ApiBinary.action('serviceOauthPollRequest', { flowId, nodeId: selection.nodeId });
+      if (res && res.status === 'done') {
+        selection.oauthFlowId = flowId;
+        selection.oauthAccount = res.accountLabel || '';
+        refreshModal();
+        return;
+      }
+      if (res && res.status === 'error') {
+        const statusEl = document.querySelector('[data-oauth-status]');
+        if (statusEl) statusEl.textContent = I18n.t('external.oauth_failed', { error: res.error || '' });
+        document.getElementById('edw-oauth-login')?.removeAttribute('disabled');
+        return;
+      }
+      setTimeout(tick, 2000);
+    } catch (e) {
+      const statusEl = document.querySelector('[data-oauth-status]');
+      if (statusEl) statusEl.textContent = I18n.t('external.oauth_failed', { error: e.message || String(e) });
+      document.getElementById('edw-oauth-login')?.removeAttribute('disabled');
+    }
+  };
+  setTimeout(tick, 2000);
 }
 
 function bindFooter() {
@@ -2014,6 +2232,21 @@ function updateHfGgufFiles() {
 
 async function startDeploy() {
   const btn = document.getElementById('edw-deploy');
+
+  // External cloud providers: subscription needs a completed OAuth login; API
+  // mode needs a key. Neither may deploy empty (the provider would reject calls).
+  const creds = externalCredsConfig();
+  if (creds.requiresApiKey) {
+    if (creds.subscription && !selection.oauthFlowId) {
+      toast(I18n.t('external.oauth_required'), 'error');
+      return;
+    }
+    if (!creds.subscription && !selection.apiKey.trim()) {
+      toast(I18n.t('external.api_key_required'), 'error');
+      return;
+    }
+  }
+
   if (btn) btn.setAttribute('disabled', '');
 
   const eng = engineEntry.engine || {};
@@ -2115,6 +2348,15 @@ async function startDeploy() {
       ? selection.advanced.gpu_memory_utilization
       : null,
     vllm_args: vllmArgs,
+    // External cloud provider credentials. `api_key` is encrypted server-side
+    // (never persisted in clear). `base_url`/`api_version` override the
+    // manifest endpoint for generic openai-compatible / Azure engines.
+    api_key: (creds.requiresApiKey && !creds.subscription) ? selection.apiKey.trim() : undefined,
+    // Subscription: the node swaps this flow id for the captured OAuth tokens.
+    oauth_flow_id: (creds.requiresApiKey && creds.subscription) ? selection.oauthFlowId : undefined,
+    base_url: (creds.showBaseUrl && selection.baseUrl) ? selection.baseUrl : undefined,
+    api_version: (creds.showApiVersion && selection.apiVersion) ? selection.apiVersion : undefined,
+    auth_mode: creds.requiresApiKey ? (creds.subscription ? 'subscription' : 'api') : undefined,
   });
 
   console.log('[wizard][startDeploy] payload:', {

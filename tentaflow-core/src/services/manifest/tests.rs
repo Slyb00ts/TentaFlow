@@ -31,6 +31,7 @@ fn make_engine(id: &str, category: Category) -> Engine {
         api: ApiKind::OpenaiCompatible,
         version: "1.0.0".to_string(),
         resource_kind: None,
+        provider: None,
         requires_model: None,
         gpu_supported: None,
         dgx_spark: None,
@@ -106,6 +107,7 @@ fn external_deploy(platforms: Vec<TargetOs>) -> ExternalDeploy {
         detection_binary: "ollama".to_string(),
         detection_endpoint: "http://localhost:11434".to_string(),
         detection_health_path: "/api/tags".to_string(),
+        requires_api_key: false,
     }
 }
 
@@ -947,6 +949,7 @@ mod capability_axes {
                 detection_binary: "test".into(),
                 detection_endpoint: "http://localhost".into(),
                 detection_health_path: "/health".into(),
+                requires_api_key: false,
             }),
         }
     }
