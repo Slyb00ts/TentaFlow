@@ -6205,6 +6205,29 @@ async fn forward_service_action(
     }
 }
 
+/// Forward a mesh command and return the FULL response (so callers can read the
+/// typed payload, not just ok/error). Trust + transport errors become `Err`.
+async fn forward_command(
+    ctx: &HandlerContext,
+    target_node_id: &str,
+    cmd: tentaflow_protocol::mesh::MeshCommandType,
+) -> Result<crate::mesh::iroh_manager::CommandWaitResponse, String> {
+    let iroh = ctx
+        .state
+        .quic_mesh
+        .as_ref()
+        .ok_or("mesh transport not available on this node")?
+        .clone();
+    if let Some(security) = ctx.state.mesh_security.as_ref() {
+        if !security.is_trusted(target_node_id) {
+            return Err(format!("peer {} is not trusted", target_node_id));
+        }
+    }
+    iroh.send_command_and_wait(target_node_id, cmd, 15)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Resolves a service row by id, returning a NotFound protocol error when the
 /// row is gone. Caller drops the lock before doing async work.
 fn fetch_service_row(
@@ -7106,17 +7129,30 @@ pub async fn service_oauth_start(
         ))
     };
 
-    // Device-code login runs entirely on the node that serves this dashboard
-    // (it makes the HTTPS calls to OpenAI; the browser only opens a URL and
-    // types a code). Deploying to a different mesh peer with login is not yet
-    // supported, so reject a remote target.
-    if forward_target_node(ctx, &payload.node_id).is_some() {
-        return resp(
-            String::new(),
-            String::new(),
-            String::new(),
-            Some("subscription login must run on the node serving this dashboard".to_string()),
-        );
+    // The OAuth flow must run on the node that will own the service + tokens.
+    // When deploying to a mesh peer, forward the login there (the peer holds the
+    // device-code flow and later resolves the tokens at deploy time).
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::OauthStart {
+            provider: payload.provider.clone(),
+        };
+        return match forward_command(ctx, target, cmd).await {
+            Ok(r) => match r.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::OauthStartResult {
+                    flow_id,
+                    authorize_url,
+                    user_code,
+                    error,
+                } => resp(flow_id, authorize_url, user_code, error),
+                _ => resp(
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    Some("unexpected mesh response".to_string()),
+                ),
+            },
+            Err(e) => resp(String::new(), String::new(), String::new(), Some(e)),
+        };
     }
     if !payload.provider.eq_ignore_ascii_case("openai") {
         return resp(
@@ -7138,7 +7174,7 @@ pub async fn service_oauth_start(
 #[observed]
 pub async fn service_oauth_poll(
     req: &MessageBody,
-    _ctx: &HandlerContext,
+    ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqOauthPoll(p)) => p.clone(),
@@ -7148,17 +7184,40 @@ pub async fn service_oauth_poll(
             ));
         }
     };
+
+    let poll_resp = |status: String, account_label: Option<String>, error: Option<String>| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResOauthPoll(
+                tentaflow_protocol::ServiceOauthPollResponse {
+                    status,
+                    account_label,
+                    error,
+                },
+            ),
+        ))
+    };
+
+    // The flow lives on the node that started it — poll the same node.
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::OauthPoll {
+            flow_id: payload.flow_id.clone(),
+        };
+        return match forward_command(ctx, target, cmd).await {
+            Ok(r) => match r.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::OauthPollResult {
+                    status,
+                    account_label,
+                    error,
+                } => poll_resp(status, account_label, error),
+                _ => poll_resp("error".to_string(), None, Some("unexpected mesh response".to_string())),
+            },
+            Err(e) => poll_resp("error".to_string(), None, Some(e)),
+        };
+    }
+
     let (status, account_label, error) =
         crate::services::backend::codex_oauth::poll(&payload.flow_id);
-    Ok(MessageBody::ServiceBody(
-        tentaflow_protocol::ServicePayload::ResOauthPoll(
-            tentaflow_protocol::ServiceOauthPollResponse {
-                status,
-                account_label,
-                error,
-            },
-        ),
-    ))
+    poll_resp(status, account_label, error)
 }
 
 #[handler(variant = "ServiceVramHintRequest", since = (1, 0))]
