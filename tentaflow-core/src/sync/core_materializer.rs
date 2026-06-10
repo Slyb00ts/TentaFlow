@@ -20,6 +20,8 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
     matches!(
         kind,
         CoreSyncResourceKind::Flow
+            | CoreSyncResourceKind::Skill
+            | CoreSyncResourceKind::SkillFile
             | CoreSyncResourceKind::UserAccount
             | CoreSyncResourceKind::Organization
             | CoreSyncResourceKind::Role
@@ -96,6 +98,8 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::SyncUserOrgProfile => apply_sync_user_org_profile(&tx, operation)?,
         CoreSyncResourceKind::Flow => apply_flow(&tx, operation)?,
         CoreSyncResourceKind::FlowModelBinding => apply_flow_model_binding(&tx, operation)?,
+        CoreSyncResourceKind::Skill => apply_skill(&tx, operation)?,
+        CoreSyncResourceKind::SkillFile => apply_skill_file(&tx, operation)?,
         CoreSyncResourceKind::SyncPolicy => apply_sync_policy(&tx, operation)?,
         CoreSyncResourceKind::SyncResourceAcl => apply_sync_resource_acl(&tx, operation)?,
         CoreSyncResourceKind::SyncExplicitShare => apply_sync_explicit_share(&tx, operation)?,
@@ -302,6 +306,15 @@ fn apply_addon_instance(
                 )
                 .ok();
             }
+            // The addon's materialized skill goes too (mirrors the local
+            // uninstall cleanup). The origin also emits a core.skill Delete op,
+            // which then applies as a harmless no-op here. FK cascade drops the
+            // skill's reference files.
+            tx.execute(
+                "DELETE FROM skills WHERE source = 'addon' AND source_ref = ?1",
+                rusqlite::params![addon_id],
+            )
+            .ok();
             tx.execute(
                 "DELETE FROM addons WHERE addon_id = ?1",
                 rusqlite::params![addon_id],
@@ -892,6 +905,163 @@ fn apply_flow_model_binding(
             .execute(
                 "DELETE FROM flow_model_bindings WHERE id = ?1",
                 rusqlite::params![id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Remote skill fields are untrusted peer input: an out-of-set `status`
+/// degrades to 'active' instead of tripping the SQL CHECK (which would turn
+/// the inbox entry into a terminal conflict with a raw SQL message).
+fn skill_status_or_active(status: String) -> String {
+    match status.as_str() {
+        "active" | "disabled" | "quarantine" | "archived" => status,
+        _ => "active".to_string(),
+    }
+}
+
+/// A `source` outside the CHECK set cannot be guessed — reject the operation
+/// with our own message so the conflict reason is readable, not raw SQL.
+fn check_skill_source(source: &str) -> LedgerResult<()> {
+    if matches!(source, "user" | "addon" | "hub") {
+        Ok(())
+    } else {
+        Err(SyncLedgerError::Runtime(format!(
+            "replicated skill has invalid source: '{source}'"
+        )))
+    }
+}
+
+/// Mirrors the size cap every local write path enforces
+/// (`repository::validate_skill_params`) so sync cannot smuggle oversized rows.
+fn check_skill_content(content: &str) -> LedgerResult<()> {
+    if content.chars().count() > crate::db::repository::SKILL_CONTENT_MAX_CHARS {
+        Err(SyncLedgerError::Runtime(format!(
+            "replicated skill content exceeds {} chars",
+            crate::db::repository::SKILL_CONTENT_MAX_CHARS
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Apply a replicated skill row. Inserts are full-row upserts (the origin emits
+/// every upsert as Insert with the complete synced field set). `use_count` /
+/// `last_used_at` / `created_by` / `created_at` are node-local and never touched
+/// here, so a synced edit cannot reset local usage stats. Source/status/content
+/// are validated against the local write rules before touching the table.
+fn apply_skill(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert => {
+            let source = field_string(operation, "source")?;
+            check_skill_source(&source)?;
+            let content = field_string(operation, "content")?;
+            check_skill_content(&content)?;
+            let status = skill_status_or_active(field_string_or(operation, "status", "active")?);
+            tx.execute(
+                "INSERT INTO skills \
+                 (id, name, display_name, description, content, tags_json, category, source, source_ref, status, created_by) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 name = excluded.name, display_name = excluded.display_name, \
+                 description = excluded.description, content = excluded.content, \
+                 tags_json = excluded.tags_json, category = excluded.category, \
+                 source = excluded.source, source_ref = excluded.source_ref, \
+                 status = excluded.status, updated_at = datetime('now')",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "name")?,
+                    field_optional_string(operation, "display_name")?,
+                    field_string(operation, "description")?,
+                    content,
+                    field_string_or(operation, "tags_json", "[]")?,
+                    field_optional_string(operation, "category")?,
+                    source,
+                    field_optional_string(operation, "source_ref")?,
+                    status,
+                    field_optional_string(operation, "created_by")?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Update => {
+            let content = optional_present_string(operation, "content")?;
+            if let Some(content) = content.as_deref() {
+                check_skill_content(content)?;
+            }
+            let status = optional_present_string(operation, "status")?.map(skill_status_or_active);
+            let display_name = nullable_update_string(operation, "display_name")?;
+            let category = nullable_update_string(operation, "category")?;
+            tx.execute(
+                "UPDATE skills SET \
+                 name = COALESCE(?2, name), \
+                 display_name = CASE WHEN ?3 THEN ?4 ELSE display_name END, \
+                 description = COALESCE(?5, description), content = COALESCE(?6, content), \
+                 tags_json = COALESCE(?7, tags_json), \
+                 category = CASE WHEN ?8 THEN ?9 ELSE category END, \
+                 status = COALESCE(?10, status), updated_at = datetime('now') \
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    optional_present_string(operation, "name")?,
+                    display_name.0,
+                    display_name.1,
+                    optional_present_string(operation, "description")?,
+                    content,
+                    optional_present_string(operation, "tags_json")?,
+                    category.0,
+                    category.1,
+                    status,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation))
+        }
+        ActionType::Delete => tx
+            .execute("DELETE FROM skills WHERE id = ?1", rusqlite::params![id])
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated skill reference file. Components travel in the fields
+/// (`skill_id`, `path`, `content`); the resource id is the composite
+/// (skill_id, path) for per-file LWW. `skill_files` carries an FK to `skills`,
+/// so a file landing before its skill is a causal-ordering gap — surfaced as
+/// DeferredOrdering to keep the inbox entry retryable until the skill arrives.
+fn apply_skill_file(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let skill_id = field_string(operation, "skill_id")?;
+    let path = field_string(operation, "path")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let skill_exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM skills WHERE id = ?1",
+                    rusqlite::params![skill_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .unwrap_or(false);
+            if !skill_exists {
+                return Err(SyncLedgerError::DeferredOrdering(format!(
+                    "skill_files target skill not found: {skill_id}"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO skill_files (skill_id, path, content) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(skill_id, path) DO UPDATE SET content = excluded.content",
+                rusqlite::params![skill_id, path, field_string(operation, "content")?],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM skill_files WHERE skill_id = ?1 AND path = ?2",
+                rusqlite::params![skill_id, path],
             )
             .map_err(sql_error),
     }

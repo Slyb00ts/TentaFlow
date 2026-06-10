@@ -578,7 +578,239 @@ pub(crate) fn materialize_addon_derived_state(
     for flow in compiled_flows {
         registry.register(&manifest.addon_id, flow);
     }
+    materialize_addon_skill(db, manifest, package_dir);
     Ok(())
+}
+
+/// Deterministic skill id for an addon's materialized SKILL.md: UUIDv5 of the
+/// addon_id under the OID namespace with a project-scoped prefix. Every fleet
+/// node derives the identical id from the replicated `addons` row, so the
+/// skills sync apply stays idempotent (a random id per node would leave
+/// permanent duplicates).
+pub(crate) fn addon_skill_id(addon_id: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("tentaflow:addon-skill:{addon_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+/// Optional frontmatter of a SKILL.md file (the three keys the Harness plan
+/// defines) plus the markdown body with the frontmatter block stripped.
+struct SkillFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    tags: Vec<String>,
+    body: String,
+}
+
+/// Strips surrounding single or double quotes from a scalar value.
+fn unquote(value: &str) -> &str {
+    let v = value.trim();
+    if v.len() >= 2
+        && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')))
+    {
+        &v[1..v.len() - 1]
+    } else {
+        v
+    }
+}
+
+/// Tolerant frontmatter parser for SKILL.md. Hand-rolled on purpose:
+/// serde_yaml is not a dependency of this crate and the format is limited to
+/// three known keys (`name`, `description`, `tags`), so a full YAML engine
+/// would be dead weight. Supported tag shapes: inline `[a, b]`, a plain
+/// comma list, and a `- item` block list. A document without an opening
+/// `---` line (or with an unterminated block) is returned verbatim as body.
+fn parse_skill_frontmatter(raw: &str) -> SkillFrontmatter {
+    let mut fm = SkillFrontmatter {
+        name: None,
+        description: None,
+        tags: Vec::new(),
+        body: raw.to_string(),
+    };
+    let after_open = if let Some(rest) = raw.strip_prefix("---\r\n") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("---\n") {
+        rest
+    } else {
+        return fm;
+    };
+    let mut close: Option<(usize, usize)> = None;
+    let mut offset = 0usize;
+    for line in after_open.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            close = Some((offset, offset + line.len()));
+            break;
+        }
+        offset += line.len();
+    }
+    let Some((block_end, body_start)) = close else {
+        return fm;
+    };
+    fm.body = after_open[body_start..]
+        .trim_start_matches(['\r', '\n'])
+        .to_string();
+
+    let mut in_tags_list = false;
+    for line in after_open[..block_end].lines() {
+        let trimmed = line.trim();
+        if in_tags_list {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let item = unquote(item);
+                if !item.is_empty() {
+                    fm.tags.push(item.to_string());
+                }
+                continue;
+            }
+            in_tags_list = false;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "name" => {
+                let v = unquote(value);
+                if !v.is_empty() {
+                    fm.name = Some(v.to_string());
+                }
+            }
+            "description" => {
+                let v = unquote(value);
+                if !v.is_empty() {
+                    fm.description = Some(v.to_string());
+                }
+            }
+            "tags" => {
+                if value.is_empty() {
+                    in_tags_list = true;
+                } else {
+                    let inner = value
+                        .strip_prefix('[')
+                        .and_then(|v| v.strip_suffix(']'))
+                        .unwrap_or(value);
+                    fm.tags = inner
+                        .split(',')
+                        .map(|tag| unquote(tag).to_string())
+                        .filter(|tag| !tag.is_empty())
+                        .collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    fm
+}
+
+/// Derives a registry-valid fallback skill name from an addon id. Addon ids
+/// allow uppercase, '.', '_' and Unicode alphanumerics (`validate_manifest`),
+/// but skill names are strict ASCII kebab-case — lowercase the ASCII
+/// alphanumerics, fold every other run into a single hyphen, cut at the limit.
+fn fallback_skill_name(addon_id: &str) -> String {
+    let mut name = String::with_capacity(addon_id.len());
+    for ch in addon_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_lowercase());
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    // Only ASCII was pushed, so the byte cut is char-boundary safe.
+    name.truncate(crate::db::repository::SKILL_NAME_MAX_CHARS);
+    while name.ends_with('-') {
+        name.pop();
+    }
+    name
+}
+
+/// Materializes the addon's SKILL.md into the `skills` registry (Harness §3.2):
+/// deterministic UUIDv5 id, source='addon', source_ref=addon_id. Optional
+/// frontmatter overrides name/description/tags; fallbacks are the addon id and
+/// the manifest description. A package WITHOUT a SKILL.md removes a previously
+/// materialized row (the update dropped its skill). Best-effort by design: a
+/// malformed or oversized skill must not fail an otherwise valid install, so
+/// failures are logged and the skill is skipped.
+pub(crate) fn materialize_addon_skill(db: &DbPool, manifest: &AddonManifest, package_dir: &Path) {
+    use crate::db::repository::{
+        delete_addon_skills, get_skill, is_kebab_case, upsert_skill, SKILL_DESCRIPTION_MAX_CHARS,
+        SKILL_NAME_MAX_CHARS,
+    };
+    let addon_id = &manifest.addon_id;
+    let skill_md = std::fs::read_to_string(package_dir.join("SKILL.md")).unwrap_or_default();
+    if skill_md.trim().is_empty() {
+        match delete_addon_skills(db, addon_id) {
+            Ok(0) => {}
+            Ok(removed) => info!(
+                "Addon '{addon_id}': removed {removed} materialized skill(s) — package has no SKILL.md"
+            ),
+            Err(e) => warn!("Addon '{addon_id}': failed to remove materialized skill: {e}"),
+        }
+        return;
+    }
+
+    let fm = parse_skill_frontmatter(&skill_md);
+    let skill_id = addon_skill_id(addon_id);
+    let name = match fm.name.as_deref() {
+        Some(n) if is_kebab_case(n) && n.chars().count() <= SKILL_NAME_MAX_CHARS => n.to_string(),
+        Some(other) => {
+            warn!(
+                "Addon '{addon_id}': SKILL.md frontmatter name '{other}' is not valid kebab-case — deriving from the addon id"
+            );
+            fallback_skill_name(addon_id)
+        }
+        None => fallback_skill_name(addon_id),
+    };
+    let manifest_description = manifest.description.clone().unwrap_or_default();
+    let description = match fm.description.as_deref() {
+        Some(d) if d.chars().count() <= SKILL_DESCRIPTION_MAX_CHARS => d.to_string(),
+        _ if !manifest_description.is_empty() => manifest_description,
+        _ => manifest.display_name.clone(),
+    };
+    // Admin-editable fields (status, tags — only edits the upsert handler allows
+    // on addon skills) survive package updates and mesh reconciles; frontmatter
+    // tags only seed the first materialization.
+    let existing = get_skill(db, &skill_id).ok().flatten();
+    let (status, tags_json) = match &existing {
+        Some(row) => (row.status.clone(), row.tags_json.clone()),
+        None => (
+            "active".to_string(),
+            serde_json::to_string(&fm.tags).unwrap_or_else(|_| "[]".to_string()),
+        ),
+    };
+    let category = manifest.category.as_deref().filter(|c| !c.is_empty());
+    // Reconcile runs on every addon event on every node, and each upsert records
+    // a sync capture — a no-op write would re-emit the row mesh-wide (op
+    // amplification) and widen the LWW race against concurrent admin edits.
+    if let Some(row) = &existing {
+        let unchanged = row.source == "addon"
+            && row.source_ref.as_deref() == Some(addon_id.as_str())
+            && row.name == name
+            && row.display_name.as_deref() == Some(manifest.display_name.as_str())
+            && row.description == description
+            && row.content == fm.body
+            && row.category.as_deref() == category;
+        if unchanged {
+            return;
+        }
+    }
+    let params = crate::db::models::SkillParams {
+        id: &skill_id,
+        name: &name,
+        display_name: Some(&manifest.display_name),
+        description: &description,
+        content: &fm.body,
+        tags_json: &tags_json,
+        category,
+        source: "addon",
+        source_ref: Some(addon_id),
+        status: &status,
+        created_by: None,
+        actor_user_id: None,
+    };
+    if let Err(e) = upsert_skill(db, &params) {
+        warn!("Addon '{addon_id}': SKILL.md not materialized into the skills registry: {e}");
+    }
 }
 
 /// Cap on a synced addon-package archive (compressed). Bounds disk/bandwidth a
@@ -965,6 +1197,14 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("Nie udalo sie usunac addonu z DB: {e}"))?;
 
     conn.execute("COMMIT", [])?;
+    drop(conn);
+
+    // The materialized skill row follows its addon out of the registry; the
+    // delete also emits a core.skill sync capture so peers drop it. Best-effort:
+    // the addon itself is already gone, so a failure here only logs.
+    if let Err(e) = crate::db::repository::delete_addon_skills(db, addon_id) {
+        warn!("Addon '{addon_id}': failed to remove materialized skill: {e}");
+    }
 
     // F1a §6.5 M1.W4: zamknij per-addon SQLite pool. Plik data.db pozostaje
     // na dysku (user moze chciec backup) — czyszczenie tylko manualne.
@@ -1220,6 +1460,11 @@ fn upgrade_core(
     let license = new_manifest.license.as_deref().unwrap_or("");
     let show_in_catalog = new_manifest.show_in_catalog.unwrap_or(true) as i64;
 
+    // The new package version owns the skill: refresh `addons.skill_md` so the
+    // row mirrors the package (install does the same) and the skills-registry
+    // materialization below sees the updated content.
+    let new_skill_md = std::fs::read_to_string(new_dir.join("SKILL.md")).ok();
+
     let old_version: String = {
         let conn = db.lock().unwrap();
         conn.query_row(
@@ -1247,8 +1492,8 @@ fn upgrade_core(
         "UPDATE addons SET version = ?1, name = ?2, description = ?3, author = ?4, \
          manifest_json = ?5, platforms = ?6, category = ?7, icon = ?8, runtime = ?9, \
          wasm_size_bytes = ?10, license = ?11, show_in_catalog = ?12, \
-         package_version = ?13, updated_at = datetime('now') \
-         WHERE addon_id = ?14",
+         package_version = ?13, skill_md = ?14, updated_at = datetime('now') \
+         WHERE addon_id = ?15",
         rusqlite::params![
             &new_manifest.version,
             &new_manifest.display_name,
@@ -1263,6 +1508,7 @@ fn upgrade_core(
             license,
             show_in_catalog,
             package_version,
+            &new_skill_md,
             addon_id,
         ],
     )?;
@@ -1305,6 +1551,10 @@ fn upgrade_core(
 
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &new_manifest)?;
+
+    // The skills-registry row tracks the package: re-materialize from the new
+    // SKILL.md (or drop the row when the new version removed the file).
+    materialize_addon_skill(db, &new_manifest, new_dir);
 
     // Reconcile vector-namespace metadata schemas against the new manifest:
     // add/drop typed columns on collections that already exist so a declared
@@ -3203,5 +3453,249 @@ slot = "sidebar"
         let err = migrate_addon_dirs_to_org_default(home).expect_err("must err");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(format!("{err}").contains("dup"));
+    }
+
+    #[test]
+    fn addon_skill_id_is_deterministic_per_addon() {
+        let first = addon_skill_id("memory");
+        let second = addon_skill_id("memory");
+        assert_eq!(first, second, "same addon id must yield the same UUIDv5");
+        assert_ne!(
+            first,
+            addon_skill_id("embeddings-chunker"),
+            "different addons must yield different ids"
+        );
+        let parsed = uuid::Uuid::parse_str(&first).expect("valid uuid");
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Sha1));
+    }
+
+    #[test]
+    fn frontmatter_absent_returns_body_verbatim() {
+        let fm = parse_skill_frontmatter("# Title\n\nBody text.\n");
+        assert!(fm.name.is_none());
+        assert!(fm.description.is_none());
+        assert!(fm.tags.is_empty());
+        assert_eq!(fm.body, "# Title\n\nBody text.\n");
+    }
+
+    #[test]
+    fn frontmatter_parses_known_keys_and_strips_block() {
+        let raw = "---\nname: web-research\ndescription: \"How to research\"\ntags: [research, web]\nunknown: ignored\n---\n\n# Body\n";
+        let fm = parse_skill_frontmatter(raw);
+        assert_eq!(fm.name.as_deref(), Some("web-research"));
+        assert_eq!(fm.description.as_deref(), Some("How to research"));
+        assert_eq!(fm.tags, vec!["research".to_string(), "web".to_string()]);
+        assert_eq!(fm.body, "# Body\n");
+    }
+
+    #[test]
+    fn frontmatter_parses_block_list_tags_and_quotes() {
+        let raw =
+            "---\nname: 'quoted-name'\ntags:\n  - alpha\n  - \"beta\"\ndescription: plain\n---\nBody";
+        let fm = parse_skill_frontmatter(raw);
+        assert_eq!(fm.name.as_deref(), Some("quoted-name"));
+        assert_eq!(fm.description.as_deref(), Some("plain"));
+        assert_eq!(fm.tags, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(fm.body, "Body");
+    }
+
+    #[test]
+    fn frontmatter_unterminated_block_is_treated_as_body() {
+        let raw = "---\nname: broken\nno closing fence";
+        let fm = parse_skill_frontmatter(raw);
+        assert!(fm.name.is_none());
+        assert_eq!(fm.body, raw);
+    }
+
+    #[test]
+    fn frontmatter_handles_crlf_and_comma_tags() {
+        let raw = "---\r\nname: crlf-skill\r\ntags: a, b\r\n---\r\nBody\r\n";
+        let fm = parse_skill_frontmatter(raw);
+        assert_eq!(fm.name.as_deref(), Some("crlf-skill"));
+        assert_eq!(fm.tags, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(fm.body, "Body\r\n");
+    }
+
+    fn skill_test_manifest(addon_id: &str) -> AddonManifest {
+        let toml = format!(
+            "[addon]\nid = \"{addon_id}\"\nname = \"Skill Test\"\nversion = \"0.1.0\"\nwasm_file = \"addon.wasm\"\ndescription = \"Manifest description\"\n"
+        );
+        parse_manifest_toml(&toml).expect("manifest")
+    }
+
+    #[test]
+    fn materialize_addon_skill_upserts_deterministic_readonly_row() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("SKILL.md"),
+            "---\nname: memory-usage\ntags: [memory]\n---\n# Using memory\n",
+        )
+        .unwrap();
+        let manifest = skill_test_manifest("skill-test-addon");
+
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        let expected_id = addon_skill_id("skill-test-addon");
+        let skill = crate::db::repository::get_skill(&db, &expected_id)
+            .expect("get")
+            .expect("materialized");
+        assert_eq!(skill.name, "memory-usage");
+        assert_eq!(skill.source, "addon");
+        assert_eq!(skill.source_ref.as_deref(), Some("skill-test-addon"));
+        assert_eq!(skill.description, "Manifest description");
+        assert_eq!(skill.content, "# Using memory\n");
+        assert_eq!(skill.tags_json, r#"["memory"]"#);
+
+        // Re-materialization (addon update) converges on the SAME row.
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        let all =
+            crate::db::repository::list_skills(&db, &crate::db::models::SkillListFilter::default())
+                .expect("list");
+        assert_eq!(all.len(), 1, "deterministic id must prevent duplicates");
+
+        // An admin-disabled addon skill stays disabled across package updates.
+        let params = crate::db::models::SkillParams {
+            id: &expected_id,
+            name: &skill.name,
+            display_name: skill.display_name.as_deref(),
+            description: &skill.description,
+            content: &skill.content,
+            tags_json: &skill.tags_json,
+            category: skill.category.as_deref(),
+            source: "addon",
+            source_ref: Some("skill-test-addon"),
+            status: "disabled",
+            created_by: None,
+            actor_user_id: None,
+        };
+        crate::db::repository::upsert_skill(&db, &params).expect("disable");
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        let skill = crate::db::repository::get_skill(&db, &expected_id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(skill.status, "disabled");
+
+        // A package without SKILL.md removes the materialized row.
+        std::fs::remove_file(tmp.path().join("SKILL.md")).unwrap();
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        assert!(crate::db::repository::get_skill(&db, &expected_id)
+            .expect("get")
+            .is_none());
+    }
+
+    #[test]
+    fn materialize_addon_skill_falls_back_to_addon_id_on_bad_frontmatter_name() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("SKILL.md"),
+            "---\nname: Not Valid Name\n---\nBody\n",
+        )
+        .unwrap();
+        let manifest = skill_test_manifest("fallback-addon");
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        let skill = crate::db::repository::get_skill(&db, &addon_skill_id("fallback-addon"))
+            .expect("get")
+            .expect("materialized");
+        assert_eq!(skill.name, "fallback-addon");
+        assert_eq!(skill.content, "Body\n");
+    }
+
+    #[test]
+    fn fallback_skill_name_sanitizes_valid_addon_ids() {
+        assert_eq!(fallback_skill_name("company_lookup"), "company-lookup");
+        assert_eq!(fallback_skill_name("My.Addon"), "my-addon");
+        assert_eq!(fallback_skill_name("_.-Edge--Case-_."), "edge-case");
+        assert_eq!(fallback_skill_name("already-kebab"), "already-kebab");
+        let long = "a".repeat(63) + "_tail";
+        let derived = fallback_skill_name(&long);
+        assert!(derived.len() <= crate::db::repository::SKILL_NAME_MAX_CHARS);
+        assert!(!derived.ends_with('-'));
+    }
+
+    #[test]
+    fn materialize_addon_skill_sanitizes_fallback_name_from_addon_id() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("SKILL.md"), "Body only\n").unwrap();
+        let manifest = skill_test_manifest("Company_Lookup.v2");
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        let skill = crate::db::repository::get_skill(&db, &addon_skill_id("Company_Lookup.v2"))
+            .expect("get")
+            .expect("materialized");
+        assert_eq!(skill.name, "company-lookup-v2");
+    }
+
+    #[test]
+    fn materialize_addon_skill_preserves_admin_tags_and_skips_noop_upserts() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("SKILL.md"),
+            "---\nname: tagged-skill\ntags: [from-package]\n---\nBody\n",
+        )
+        .unwrap();
+        let manifest = skill_test_manifest("tag-test-addon");
+        let skill_id = addon_skill_id("tag-test-addon");
+
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        let skill = crate::db::repository::get_skill(&db, &skill_id)
+            .expect("get")
+            .expect("materialized");
+        assert_eq!(skill.tags_json, r#"["from-package"]"#);
+
+        let count_skill_captures = || -> i64 {
+            let conn = db.lock().expect("db lock");
+            conn.query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures WHERE resource_type = 'core.skill'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count captures")
+        };
+        let after_first = count_skill_captures();
+
+        // Admin edits the tags (the only frontmatter-seeded field the upsert
+        // handler lets admins change on addon skills, next to status).
+        let params = crate::db::models::SkillParams {
+            id: &skill_id,
+            name: &skill.name,
+            display_name: skill.display_name.as_deref(),
+            description: &skill.description,
+            content: &skill.content,
+            tags_json: r#"["admin-tag"]"#,
+            category: skill.category.as_deref(),
+            source: "addon",
+            source_ref: Some("tag-test-addon"),
+            status: &skill.status,
+            created_by: None,
+            actor_user_id: None,
+        };
+        crate::db::repository::upsert_skill(&db, &params).expect("admin tag edit");
+        let after_edit = count_skill_captures();
+
+        // A reconcile with an unchanged package keeps the admin tags AND emits
+        // no new sync capture (no-op detection).
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        let skill = crate::db::repository::get_skill(&db, &skill_id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(skill.tags_json, r#"["admin-tag"]"#);
+        assert_eq!(count_skill_captures(), after_edit);
+        assert!(after_edit > after_first);
+
+        // A real package change still rematerializes — and keeps the tags.
+        std::fs::write(
+            tmp.path().join("SKILL.md"),
+            "---\nname: tagged-skill\ntags: [from-package]\n---\nNew body\n",
+        )
+        .unwrap();
+        materialize_addon_skill(&db, &manifest, tmp.path());
+        let skill = crate::db::repository::get_skill(&db, &skill_id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(skill.content, "New body\n");
+        assert_eq!(skill.tags_json, r#"["admin-tag"]"#);
+        assert!(count_skill_captures() > after_edit);
     }
 }

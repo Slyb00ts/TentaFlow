@@ -668,6 +668,7 @@ mod tests {
                 homepage: "".into(),
                 license: "".into(),
                 icon: None,
+                provider: None,
                 resource_kind: None,
                 provider: None,
                 requires_model: None,

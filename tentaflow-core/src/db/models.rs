@@ -273,6 +273,61 @@ pub struct FlowParams<'a> {
     pub actor_user_id: Option<&'a str>,
 }
 
+/// Skill — markdown instruction for the LLM from the Skills registry (Harness §3.2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbSkill {
+    pub id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: String,
+    pub content: String,
+    pub tags_json: String,
+    pub category: Option<String>,
+    pub source: String,
+    pub source_ref: Option<String>,
+    pub status: String,
+    pub use_count: i64,
+    pub last_used_at: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Skill reference file (markdown/text under references/ or templates/)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbSkillFile {
+    pub skill_id: String,
+    pub path: String,
+    pub content: String,
+}
+
+/// Skill upsert parameters. `id` is caller-supplied: a random UUIDv4 for
+/// user/hub skills, a deterministic UUIDv5 of the addon_id for addon skill
+/// materialization (fleet-wide idempotent sync apply).
+#[derive(Debug, Clone)]
+pub struct SkillParams<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub display_name: Option<&'a str>,
+    pub description: &'a str,
+    pub content: &'a str,
+    pub tags_json: &'a str,
+    pub category: Option<&'a str>,
+    pub source: &'a str,
+    pub source_ref: Option<&'a str>,
+    pub status: &'a str,
+    pub created_by: Option<&'a str>,
+    pub actor_user_id: Option<&'a str>,
+}
+
+/// Skill list filters (all optional, combined with AND)
+#[derive(Debug, Clone, Default)]
+pub struct SkillListFilter<'a> {
+    pub source: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub tag: Option<&'a str>,
+}
+
 /// Parametry tworzenia/aktualizacji szablonu wezla flow
 #[derive(Debug, Clone)]
 pub struct FlowNodeTemplateParams<'a> {

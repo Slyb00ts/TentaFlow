@@ -965,6 +965,76 @@ pub enum SchedulerPayload {
     JobRunNowResponse(SchedulerJobRunNowResponse),
 }
 
+// ----- Skills registry (Harness plan §3.2) -----
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsListRequest {
+    pub tag: Option<String>,
+    pub source: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsListResponse {
+    pub skills_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsDetailRequest {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsDetailResponse {
+    pub skill_json: String,
+    pub files_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsUpsertRequest {
+    pub skill_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsUpsertResponse {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsDeleteRequest {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsDeleteResponse {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsForkRequest {
+    pub skill_id: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsForkResponse {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum SkillsPayload {
+    ListRequest(SkillsListRequest),
+    ListResponse(SkillsListResponse),
+    DetailRequest(SkillsDetailRequest),
+    DetailResponse(SkillsDetailResponse),
+    UpsertRequest(SkillsUpsertRequest),
+    UpsertResponse(SkillsUpsertResponse),
+    DeleteRequest(SkillsDeleteRequest),
+    DeleteResponse(SkillsDeleteResponse),
+    ForkRequest(SkillsForkRequest),
+    ForkResponse(SkillsForkResponse),
+}
+
 // =============================================================================
 // Sync conflict manager — admin-only conflict review and resolution.
 // =============================================================================
@@ -4355,6 +4425,9 @@ pub enum MessageBody {
     // ----- Scheduler -----
     SchedulerBody(SchedulerPayload),
 
+    // ----- Skills registry -----
+    SkillsBody(SkillsPayload),
+
     // ----- Sync conflict manager -----
     SyncConflictBody(SyncConflictPayload),
 
@@ -5078,6 +5151,49 @@ mod tests {
             }],
         });
         assert_eq!(round_trip(update.clone()), update);
+    }
+
+    #[test]
+    fn skills_payload_round_trip() {
+        let bodies = [
+            MessageBody::SkillsBody(SkillsPayload::ListRequest(SkillsListRequest {
+                tag: Some("crm".to_string()),
+                source: None,
+                status: Some("active".to_string()),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::ListResponse(SkillsListResponse {
+                skills_json: "[{\"id\":\"s1\"}]".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::DetailRequest(SkillsDetailRequest {
+                skill_id: "s1".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::DetailResponse(SkillsDetailResponse {
+                skill_json: "{\"id\":\"s1\"}".to_string(),
+                files_json: "[{\"path\":\"references/api.md\"}]".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::UpsertRequest(SkillsUpsertRequest {
+                skill_json: "{\"name\":\"my-skill\"}".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::UpsertResponse(SkillsUpsertResponse {
+                skill_id: "s1".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::DeleteRequest(SkillsDeleteRequest {
+                skill_id: "s1".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::DeleteResponse(SkillsDeleteResponse {
+                deleted: true,
+            })),
+            MessageBody::SkillsBody(SkillsPayload::ForkRequest(SkillsForkRequest {
+                skill_id: "s1".to_string(),
+                new_name: "my-skill-copy".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::ForkResponse(SkillsForkResponse {
+                skill_id: "s2".to_string(),
+            })),
+        ];
+        for body in bodies {
+            assert_eq!(round_trip(body.clone()), body);
+        }
     }
 
     #[test]
