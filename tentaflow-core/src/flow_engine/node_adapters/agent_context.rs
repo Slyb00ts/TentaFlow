@@ -178,10 +178,13 @@ impl NodeAdapter for AgentContextNodeAdapter {
             .system_prompts
             .push(ANTI_INJECTION_NOTE.to_string());
 
-        // Harness signals. NOTE: these belong in envelope.variables, but phase 4
-        // adds that field concurrently — it is NOT in main on this branch yet.
-        // To stay compilable we write them into envelope.meta for now; the
-        // phase-4 merge fixup migrates meta -> variables (§3.12).
+        // Harness signals live in envelope.meta: they are engine plumbing
+        // exchanged between harness blocks (agent_context → llm → tool_exec →
+        // loop), not user-facing declared flow variables. Keeping them out of
+        // envelope.variables avoids forcing every harness flow to declare them
+        // (R10) and subjecting internal control state to the variable-merge
+        // policy. Variable promotion, if ever wanted, is revisited in phase 5
+        // where the loop block and seeded harness flows own these keys.
         out.meta
             .insert("agent_id".into(), serde_json::json!(agent.id));
         out.meta
