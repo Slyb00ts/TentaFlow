@@ -104,6 +104,12 @@ export async function openDeployWizard(engineId, opts = {}) {
     containerName: null,
     gpuSelectMode: 'all',
     gpuIds: [],
+    // External cloud provider credentials (deploy.external.requires_api_key).
+    // Stored encrypted server-side; base_url/api_version only used by
+    // openai-compatible/azure-openai engines that need an endpoint override.
+    apiKey: '',
+    baseUrl: '',
+    apiVersion: '',
     // Advanced (vLLM Auto-tuned) - wartosci uzywane do build vllm_args.
     // `lockedParam` = ostatnio dotkniety przez usera slider/chip — backend
     // dostaje `lock_<param>: true` tylko dla niego, reszte parametrow
@@ -1543,8 +1549,62 @@ function renderStepRuntime() {
   return `
     <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.configureRuntime'))}</h4>
     ${summary}
+    ${renderExternalCredsFields()}
     ${portField}
     ${extra}
+  `;
+}
+
+/// Credential metadata for the selected external engine. `requiresApiKey` gates
+/// the API-key field; `showBaseUrl`/`showApiVersion` add an endpoint override
+/// for engines that need one (generic openai-compatible, Azure).
+function externalCredsConfig() {
+  const eng = engineEntry?.engine || {};
+  const ext = engineEntry?.deploy?.external || null;
+  const requiresApiKey = selection.deployMethod === 'external' && !!ext?.requires_api_key;
+  const api = String(eng.api || '').toLowerCase();
+  const isGeneric = String(eng.id || '').toLowerCase() === 'openai-compatible';
+  return {
+    requiresApiKey,
+    showBaseUrl: requiresApiKey && (api === 'azure-openai' || isGeneric),
+    showApiVersion: requiresApiKey && api === 'azure-openai',
+    defaultBaseUrl: ext?.detection_endpoint || '',
+    defaultApiVersion: '2024-10-21',
+  };
+}
+
+function renderExternalCredsFields() {
+  const c = externalCredsConfig();
+  if (!c.requiresApiKey) return '';
+  const baseUrl = c.showBaseUrl
+    ? `
+      <div class="form-group">
+        <tf-input type="text" id="edw-base-url"
+          label="${escapeAttr(I18n.t('external.base_url'))}"
+          placeholder="${escapeAttr(c.defaultBaseUrl)}"
+          value="${escapeAttr(selection.baseUrl || '')}"></tf-input>
+        <span class="form-hint">${escapeHtml(I18n.t('external.base_url_hint'))}</span>
+      </div>`
+    : '';
+  const apiVersion = c.showApiVersion
+    ? `
+      <div class="form-group">
+        <tf-input type="text" id="edw-api-version"
+          label="${escapeAttr(I18n.t('external.api_version'))}"
+          placeholder="${escapeAttr(c.defaultApiVersion)}"
+          value="${escapeAttr(selection.apiVersion || '')}"></tf-input>
+      </div>`
+    : '';
+  return `
+    <div class="form-group">
+      <tf-input type="password" id="edw-api-key"
+        label="${escapeAttr(I18n.t('external.api_key'))}"
+        placeholder="${escapeAttr(I18n.t('external.api_key_placeholder'))}"
+        value="${escapeAttr(selection.apiKey || '')}"></tf-input>
+      <span class="form-hint">${escapeHtml(I18n.t('external.api_key_hint'))}</span>
+    </div>
+    ${baseUrl}
+    ${apiVersion}
   `;
 }
 
@@ -1882,6 +1942,24 @@ function bindStepRuntimeInputs() {
       selection.containerName = String(raw).trim();
     });
   }
+  const apiKeyInput = document.getElementById('edw-api-key');
+  if (apiKeyInput) {
+    apiKeyInput.addEventListener('input', (e) => {
+      selection.apiKey = String(e.detail?.value ?? apiKeyInput.value);
+    });
+  }
+  const baseUrlInput = document.getElementById('edw-base-url');
+  if (baseUrlInput) {
+    baseUrlInput.addEventListener('input', (e) => {
+      selection.baseUrl = String(e.detail?.value ?? baseUrlInput.value).trim();
+    });
+  }
+  const apiVersionInput = document.getElementById('edw-api-version');
+  if (apiVersionInput) {
+    apiVersionInput.addEventListener('input', (e) => {
+      selection.apiVersion = String(e.detail?.value ?? apiVersionInput.value).trim();
+    });
+  }
 }
 
 function bindFooter() {
@@ -2014,6 +2092,15 @@ function updateHfGgufFiles() {
 
 async function startDeploy() {
   const btn = document.getElementById('edw-deploy');
+
+  // External cloud providers: the API key is mandatory and must not be deployed
+  // empty (the provider would reject every request). Validate before disabling.
+  const creds = externalCredsConfig();
+  if (creds.requiresApiKey && !selection.apiKey.trim()) {
+    toast(I18n.t('external.api_key_required'), 'error');
+    return;
+  }
+
   if (btn) btn.setAttribute('disabled', '');
 
   const eng = engineEntry.engine || {};
@@ -2115,6 +2202,12 @@ async function startDeploy() {
       ? selection.advanced.gpu_memory_utilization
       : null,
     vllm_args: vllmArgs,
+    // External cloud provider credentials. `api_key` is encrypted server-side
+    // (never persisted in clear). `base_url`/`api_version` override the
+    // manifest endpoint for generic openai-compatible / Azure engines.
+    api_key: creds.requiresApiKey ? selection.apiKey.trim() : undefined,
+    base_url: (creds.showBaseUrl && selection.baseUrl) ? selection.baseUrl : undefined,
+    api_version: (creds.showApiVersion && selection.apiVersion) ? selection.apiVersion : undefined,
   });
 
   console.log('[wizard][startDeploy] payload:', {

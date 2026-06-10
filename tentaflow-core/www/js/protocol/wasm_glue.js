@@ -3897,6 +3897,42 @@ export function encodeServiceManifestDeployRequest(engine_id, deploy_method, nod
 }
 
 /**
+ * MessageBody::ServiceBody(ServicePayload::ReqModelCatalog) — live model
+ * catalog of a deployed external provider service (fetched from provider API).
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeServiceModelCatalogRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceModelCatalogRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ServiceBody(ServicePayload::ReqModelSelection) — persist the
+ * admin's model selection (model_registry upserted to exactly this set).
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeServiceModelSelectionRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceModelSelectionRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::ServiceBody(ServicePayload::ReqPause) — supervisor leaves a
  * paused service untouched.
  * @param {number} service_id

@@ -105,6 +105,7 @@ function renderRoot() {
       <tf-tab id="tentaflow" icon="catalog" count="0">${escapeHtml(I18n.t('catalog.tab_tentaflow'))}</tf-tab>
       <tf-tab id="nim" icon="zap">${escapeHtml(I18n.t('catalog.tab_nim'))}</tf-tab>
       <tf-tab id="ibm" icon="cpu">${escapeHtml(I18n.t('catalog.tab_ibm'))}</tf-tab>
+      <tf-tab id="external" icon="cloud">${escapeHtml(I18n.t('catalog.tab_external'))}</tf-tab>
     </tf-tabs>
 
     <div id="catalog-content">
@@ -297,6 +298,9 @@ function renderActiveTab() {
   } else if (activeTab === 'ibm') {
     host.innerHTML = renderProviderTab('ibm');
     bindCards(host);
+  } else if (activeTab === 'external') {
+    host.innerHTML = renderProviderTab('external');
+    bindCards(host);
   } else {
     host.innerHTML = renderProviderTab('tentaflow');
     bindCards(host);
@@ -317,6 +321,12 @@ function updateCount() {
   ).length;
   const ibmTab = document.querySelector('#catalog-tabs tf-tab#ibm');
   if (ibmTab) ibmTab.setAttribute('count', String(ibmTotal));
+
+  const externalTotal = Manifest.all().filter((s) =>
+    Manifest.providerOf(s) === 'external' && Manifest.isEngineCompatible(s, targetOs, target)
+  ).length;
+  const externalTab = document.querySelector('#catalog-tabs tf-tab#external');
+  if (externalTab) externalTab.setAttribute('count', String(externalTotal));
 }
 
 // ---- Provider tab (TentaFlow Catalog / IBM) -------------------------------

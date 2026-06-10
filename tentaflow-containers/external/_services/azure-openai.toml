@@ -1,0 +1,19 @@
+[engine]
+id = "azure-openai"
+category = "llm"
+resource_kind = "ai"
+provider = "external"
+name = "Azure OpenAI"
+description_pl = "Modele OpenAI hostowane w Azure; nazwy wdrożeń podaje administrator."
+description_en = "OpenAI models hosted on Azure; deployment names are provided by the admin."
+homepage = "https://azure.microsoft.com/products/ai-services/openai-service"
+license = "Proprietary"
+default_port = 443
+api = "azure-openai"
+version = "1.0.0"
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_endpoint = "https://YOUR-RESOURCE.openai.azure.com"
+detection_health_path = "/openai/models?api-version=2024-10-21"
+requires_api_key = true

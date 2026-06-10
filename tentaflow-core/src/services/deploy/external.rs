@@ -57,11 +57,21 @@ impl DeployStrategy for ExternalDeploy {
         }
 
         // Resolve daemon URL: explicit override from user_config wins so ops can
-        // point at a non-default port; fall back to the manifest's declared endpoint.
+        // point at a non-default port. `base_url` is the cloud-provider override
+        // (generic openai-compatible / Azure resource endpoint); `detected_url`
+        // is the local-daemon auto-detect result. Fall back to the manifest's
+        // declared endpoint.
         let endpoint_url = self
             .user_config
-            .get("detected_url")
+            .get("base_url")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                self.user_config
+                    .get("detected_url")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .map(str::to_string)
             .unwrap_or_else(|| external.detection_endpoint.clone());
 
@@ -83,12 +93,17 @@ impl DeployStrategy for ExternalDeploy {
             .build()
             .map_err(|e| DeployError::Other(format!("reqwest builder: {}", e)))?;
 
-        // Three quick attempts with a short backoff — covers daemons that are
-        // mid-restart but already up in PATH.
+        // Cloud API providers (requires_api_key) authenticate every request, so
+        // an unauthenticated health probe legitimately returns 401/403/404. We
+        // can't decrypt the per-service key here, so we only assert the base URL
+        // is REACHABLE (any HTTP response counts); the key is validated later by
+        // the model-catalog/inference paths that own the cipher. User-managed
+        // daemons (Ollama) keep the strict 2xx contract.
+        let lenient = external.requires_api_key;
         let mut last_err: Option<String> = None;
         for attempt in 1..=3u8 {
             match client.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
+                Ok(resp) if lenient || resp.status().is_success() => {
                     last_err = None;
                     break;
                 }
@@ -200,6 +215,7 @@ mod tests {
                     detection_binary: id.into(),
                     detection_endpoint: endpoint.into(),
                     detection_health_path: health.into(),
+                    requires_api_key: false,
                 }),
             },
             model_presets: vec![ModelPreset {

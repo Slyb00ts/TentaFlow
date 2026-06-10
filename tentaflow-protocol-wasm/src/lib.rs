@@ -1895,6 +1895,32 @@ pub fn encode_service_engine_presets_request(engine_id: String) -> Result<Vec<u8
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::ServiceBody(ServicePayload::ReqModelCatalog) — live model
+/// catalog of a deployed external provider service (fetched from provider API).
+#[wasm_bindgen(js_name = encodeServiceModelCatalogRequest)]
+pub fn encode_service_model_catalog_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceModelCatalogRequest, ServicePayload};
+    let payload: ServiceModelCatalogRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("ServiceModelCatalogRequest JSON: {e}")))?;
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqModelCatalog(
+        payload,
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceBody(ServicePayload::ReqModelSelection) — persist the
+/// admin's model selection (model_registry upserted to exactly this set).
+#[wasm_bindgen(js_name = encodeServiceModelSelectionRequest)]
+pub fn encode_service_model_selection_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceModelSelectionRequest, ServicePayload};
+    let payload: ServiceModelSelectionRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("ServiceModelSelectionRequest JSON: {e}")))?;
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqModelSelection(
+        payload,
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
 // --- Prompts --------------------------------------------------------------
 
 /// MessageBody::PromptListRequest (unit).
@@ -2607,6 +2633,50 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 arr.push(&item);
             }
             set(obj, "presets", arr.into());
+        }
+        SP::ReqModelCatalog(r) => {
+            set(obj, "variant", "ServiceModelCatalogRequest".into());
+            set(obj, "serviceId", r.service_id.into());
+            set(obj, "service_id", r.service_id.into());
+            if let Some(n) = r.node_id {
+                set(obj, "nodeId", n.clone().into());
+                set(obj, "node_id", n.into());
+            }
+        }
+        SP::ResModelCatalog(r) => {
+            set(obj, "variant", "ServiceModelCatalogResponse".into());
+            let arr = js_sys::Array::new();
+            for m in r.models {
+                let item = js_sys::Object::new();
+                set(&item, "id", m.id.into());
+                if let Some(d) = m.display_name {
+                    set(&item, "displayName", d.clone().into());
+                    set(&item, "display_name", d.into());
+                }
+                set(&item, "modality", m.modality.into());
+                if let Some(c) = m.context_length {
+                    set(&item, "contextLength", c.into());
+                    set(&item, "context_length", c.into());
+                }
+                set(&item, "selected", m.selected.into());
+                arr.push(&item);
+            }
+            set(obj, "models", arr.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqModelSelection(r) => {
+            set(obj, "variant", "ServiceModelSelectionRequest".into());
+            set(obj, "serviceId", r.service_id.into());
+            set(obj, "service_id", r.service_id.into());
+        }
+        SP::ResModelSelection(r) => {
+            set(obj, "variant", "ServiceModelSelectionResponse".into());
+            set(obj, "success", r.success.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
         }
     }
 }

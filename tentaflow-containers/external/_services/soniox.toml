@@ -1,0 +1,25 @@
+[engine]
+id = "soniox"
+category = "stt"
+resource_kind = "ai"
+provider = "external"
+name = "Soniox"
+description_pl = "Chmurowe rozpoznawanie mowy Soniox z transkrypcją w czasie rzeczywistym."
+description_en = "Soniox cloud speech-to-text with real-time transcription."
+homepage = "https://soniox.com"
+license = "Proprietary"
+default_port = 443
+api = "soniox"
+version = "1.0.0"
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_endpoint = "https://api.soniox.com/v1"
+detection_health_path = "/models"
+requires_api_key = true
+
+[[model_preset]]
+id = "stt-rt-v4"
+display_name = "Soniox STT v4"
+repo = "stt-rt-v4"
+recommended = true

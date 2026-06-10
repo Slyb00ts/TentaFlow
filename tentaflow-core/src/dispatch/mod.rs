@@ -595,6 +595,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResEnginePresets(_) => {
                 "ServiceEnginePresetsResponse"
             }
+            tentaflow_protocol::ServicePayload::ReqModelCatalog(_) => "ServiceModelCatalogRequest",
+            tentaflow_protocol::ServicePayload::ResModelCatalog(_) => "ServiceModelCatalogResponse",
+            tentaflow_protocol::ServicePayload::ReqModelSelection(_) => "ServiceModelSelectionRequest",
+            tentaflow_protocol::ServicePayload::ResModelSelection(_) => {
+                "ServiceModelSelectionResponse"
+            }
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {

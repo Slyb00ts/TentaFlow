@@ -1150,6 +1150,24 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ServiceBody(ServicePayload::ReqModelCatalog) */
+  serviceModelCatalogRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceModelCatalogRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqModelSelection) */
+  serviceModelSelectionRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceModelSelectionRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
   /** MessageBody::ServiceQuicStatusRequest (unit) */
   serviceQuicStatusRequest(correlationId, sequence = 1) {
     assertReady();

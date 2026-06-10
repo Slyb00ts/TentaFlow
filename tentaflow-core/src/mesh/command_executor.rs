@@ -914,6 +914,13 @@ impl MeshCommandExecutor {
                 Err(e) => return CommandResponse::fail(format!("invalid config_json: {}", e)),
             }
         };
+        // Cloud external provider keys arrive plaintext over the encrypted mesh;
+        // re-encrypt with THIS node's settings cipher so the key is node-local
+        // and never persisted in the clear.
+        let user_config = crate::services::deploy::encrypt_api_key_in_config(
+            &user_config,
+            self.security.settings_cipher(),
+        );
 
         let job = match crate::services::deploy::create_deploy_job(
             resolved,
