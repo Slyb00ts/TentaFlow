@@ -1,0 +1,35 @@
+[engine]
+id = "qwen"
+category = "llm"
+resource_kind = "ai"
+provider = "external"
+name = "Qwen (Alibaba)"
+description_pl = "Chmurowe API Qwen (Alibaba Model Studio) w trybie zgodnym z OpenAI."
+description_en = "Qwen cloud API (Alibaba Model Studio) over the OpenAI-compatible mode."
+homepage = "https://www.alibabacloud.com/help/en/model-studio"
+license = "Proprietary"
+default_port = 443
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_endpoint = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+detection_health_path = "/models"
+requires_api_key = true
+
+[[model_preset]]
+id = "qwen-max"
+display_name = "Qwen Max"
+repo = "qwen-max"
+recommended = true
+
+[[model_preset]]
+id = "qwen-plus"
+display_name = "Qwen Plus"
+repo = "qwen-plus"
+
+[[model_preset]]
+id = "qwen-turbo"
+display_name = "Qwen Turbo"
+repo = "qwen-turbo"
