@@ -22,6 +22,8 @@ pub enum CoreSyncResourceKind {
     SyncUserOrgProfile,
     Flow,
     FlowModelBinding,
+    Skill,
+    SkillFile,
     SyncPolicy,
     SyncResourceAcl,
     SyncExplicitShare,
@@ -183,6 +185,30 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "flows",
     },
+    // Skills registry (Harness §3.2) — replicates like flows. Node-local usage
+    // stats (use_count, last_used_at) are intentionally NOT part of the synced
+    // field set; see the capture builders in db/repository.rs.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::Skill,
+        table_name: "skills",
+        resource_type: "core.skill",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "skills",
+    },
+    // Markdown/text reference files of a skill. Composite key (skill_id, path)
+    // travels as a length-prefixed composite resource_id (per-file LWW), the
+    // same scheme addon_config uses for (addon_id, key).
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::SkillFile,
+        table_name: "skill_files",
+        resource_type: "core.skill_file",
+        primary_key_column: "skill_id,path",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "skills",
+    },
     CoreSyncDescriptor {
         kind: CoreSyncResourceKind::SyncPolicy,
         table_name: "sync_policies",
@@ -288,6 +314,23 @@ mod tests {
         // flow_versions are a local-only snapshot history now; they must NOT be
         // a core sync resource after the UUID identity redesign.
         assert!(descriptor_for_table("flow_versions").is_none());
+    }
+
+    #[test]
+    fn registry_contains_skills_tables() {
+        assert_eq!(
+            descriptor_for_table("skills").map(|descriptor| descriptor.resource_type),
+            Some("core.skill")
+        );
+        assert_eq!(
+            descriptor_for_table("skill_files").map(|descriptor| descriptor.resource_type),
+            Some("core.skill_file")
+        );
+        let skill = descriptor_for_kind(CoreSyncResourceKind::Skill);
+        assert_eq!(
+            skill.partition_id("org-default", None).unwrap().as_str(),
+            "core/org/org-default/skills"
+        );
     }
 
     #[test]

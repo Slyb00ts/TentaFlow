@@ -2139,6 +2139,75 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::SkillsBody(ListRequest) — UserSession. Skills registry list
+   * with optional tag/source/status filters.
+   * payload: { tag?, source?, status? }
+   */
+  skillsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsListRequest(
+      payload.tag ?? null,
+      payload.source ?? null,
+      payload.status ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  skillsDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsDetailRequest(String(payload.skillId ?? payload.skill_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  skillsUpsertRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsUpsertRequest(
+      typeof payload.skillJson === 'string' ? payload.skillJson : JSON.stringify(payload.skill ?? payload),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  skillsDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsDeleteRequest(String(payload.skillId ?? payload.skill_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  skillsForkRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsForkRequest(
+      String(payload.skillId ?? payload.skill_id ?? ''),
+      String(payload.newName ?? payload.new_name ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   syncConflictsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeSyncConflictsListRequest(

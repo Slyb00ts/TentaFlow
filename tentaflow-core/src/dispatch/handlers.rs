@@ -4809,6 +4809,386 @@ pub async fn scheduler_job_run_now(
     ))
 }
 
+// =============================================================================
+// Skills registry (Harness plan §3.2) — CRUD over the binary protocol.
+// List/Detail are UserSession (Flow Builder reads skills too); writes are
+// Admin-only. Hub import and curator payloads arrive in phase 7.
+// =============================================================================
+
+/// Handler-side shape of `SkillsUpsertRequest.skill_json`. `id` absent =
+/// create (a fresh UUIDv4 is assigned, source is forced to 'user'); `files`
+/// absent = keep the current reference files, present = full replacement
+/// (an empty list clears them).
+#[derive(serde::Deserialize)]
+struct SkillUpsertInput {
+    id: Option<String>,
+    name: String,
+    display_name: Option<String>,
+    description: String,
+    content: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    category: Option<String>,
+    status: Option<String>,
+    files: Option<Vec<SkillFileInput>>,
+}
+
+#[derive(serde::Deserialize)]
+struct SkillFileInput {
+    path: String,
+    content: String,
+}
+
+/// List projection of `DbSkill` — every index field except `content`, which
+/// can be 100k chars per row; the editor fetches it via `SkillsDetailRequest`.
+#[derive(serde::Serialize)]
+struct SkillSummary<'a> {
+    id: &'a str,
+    name: &'a str,
+    display_name: Option<&'a str>,
+    description: &'a str,
+    tags_json: &'a str,
+    category: Option<&'a str>,
+    source: &'a str,
+    source_ref: Option<&'a str>,
+    status: &'a str,
+    use_count: i64,
+    last_used_at: Option<&'a str>,
+    created_by: Option<&'a str>,
+    created_at: &'a str,
+    updated_at: &'a str,
+}
+
+#[handler(variant = "SkillsListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn skills_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::ListRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request("expected SkillsListRequestBody"));
+        }
+    };
+    let filter = db::models::SkillListFilter {
+        source: payload.source.as_deref().filter(|s| !s.is_empty()),
+        status: payload.status.as_deref().filter(|s| !s.is_empty()),
+        tag: payload.tag.as_deref().filter(|s| !s.is_empty()),
+    };
+    let skills = repository::list_skills(&ctx.state.db, &filter).map_err(db_err)?;
+    let summaries: Vec<SkillSummary<'_>> = skills
+        .iter()
+        .map(|s| SkillSummary {
+            id: &s.id,
+            name: &s.name,
+            display_name: s.display_name.as_deref(),
+            description: &s.description,
+            tags_json: &s.tags_json,
+            category: s.category.as_deref(),
+            source: &s.source,
+            source_ref: s.source_ref.as_deref(),
+            status: &s.status,
+            use_count: s.use_count,
+            last_used_at: s.last_used_at.as_deref(),
+            created_by: s.created_by.as_deref(),
+            created_at: &s.created_at,
+            updated_at: &s.updated_at,
+        })
+        .collect();
+    let skills_json = serde_json::to_string(&summaries)
+        .map_err(|e| ProtocolError::internal(format!("skills encode failed: {}", e)))?;
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::ListResponse(tentaflow_protocol::SkillsListResponse {
+            skills_json,
+        }),
+    ))
+}
+
+#[handler(variant = "SkillsDetailRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn skills_detail(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::DetailRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SkillsDetailRequestBody",
+            ));
+        }
+    };
+    let skill = repository::get_skill(&ctx.state.db, &payload.skill_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("skill not found: {}", payload.skill_id))
+        })?;
+    let files = repository::list_skill_files(&ctx.state.db, &payload.skill_id).map_err(db_err)?;
+    let skill_json = serde_json::to_string(&skill)
+        .map_err(|e| ProtocolError::internal(format!("skill encode failed: {}", e)))?;
+    let files_json = serde_json::to_string(&files)
+        .map_err(|e| ProtocolError::internal(format!("skill files encode failed: {}", e)))?;
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::DetailResponse(
+            tentaflow_protocol::SkillsDetailResponse {
+                skill_json,
+                files_json,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "SkillsUpsertRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn skills_upsert(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::UpsertRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SkillsUpsertRequestBody",
+            ));
+        }
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let input: SkillUpsertInput = serde_json::from_str(&payload.skill_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid skill json: {}", e)))?;
+
+    let existing = match &input.id {
+        Some(id) => Some(
+            repository::get_skill(&ctx.state.db, id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found(format!("skill not found: {}", id)))?,
+        ),
+        None => None,
+    };
+
+    // Addon-sourced skills are owned by the addon package (upgrades overwrite
+    // them, uninstall removes them) — only tags and status are admin-editable.
+    if let Some(existing) = &existing {
+        if existing.source == "addon" {
+            let immutable_changed = input.name != existing.name
+                || input.content != existing.content
+                || input.description != existing.description
+                || input.display_name.as_deref() != existing.display_name.as_deref()
+                || input.category.as_deref() != existing.category.as_deref();
+            if immutable_changed || input.files.is_some() {
+                return Err(ProtocolError::bad_request(
+                    "addon-sourced skills only allow tag/status edits — fork the skill \
+                     (SkillsForkRequest) to get an editable user copy",
+                ));
+            }
+        }
+    }
+
+    // The schema deliberately has no UNIQUE on name (sync apply across nodes),
+    // so soft-uniqueness is enforced here on create and rename only.
+    let name_changed = existing
+        .as_ref()
+        .map(|e| e.name != input.name)
+        .unwrap_or(true);
+    if name_changed
+        && repository::get_skill_by_name(&ctx.state.db, &input.name)
+            .map_err(db_err)?
+            .is_some()
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "skill name already in use: '{}'",
+            input.name
+        )));
+    }
+
+    if let Some(files) = &input.files {
+        let mut seen = std::collections::HashSet::new();
+        for f in files {
+            repository::validate_skill_file(&f.path, &f.content)
+                .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+            if !seen.insert(f.path.as_str()) {
+                return Err(ProtocolError::bad_request(format!(
+                    "duplicate skill file path: '{}'",
+                    f.path
+                )));
+            }
+        }
+    }
+
+    let (skill_id, source, source_ref, created_by) = match &existing {
+        Some(e) => (
+            e.id.clone(),
+            e.source.clone(),
+            e.source_ref.clone(),
+            e.created_by.clone(),
+        ),
+        None => (
+            uuid::Uuid::new_v4().to_string(),
+            "user".to_string(),
+            None,
+            Some(user_id.clone()),
+        ),
+    };
+    let status = input
+        .status
+        .clone()
+        .or_else(|| existing.as_ref().map(|e| e.status.clone()))
+        .unwrap_or_else(|| "active".to_string());
+    let tags_json = serde_json::to_string(&input.tags)
+        .map_err(|e| ProtocolError::internal(format!("skill tags encode failed: {}", e)))?;
+    let params = db::models::SkillParams {
+        id: &skill_id,
+        name: &input.name,
+        display_name: input.display_name.as_deref(),
+        description: &input.description,
+        content: &input.content,
+        tags_json: &tags_json,
+        category: input.category.as_deref(),
+        source: &source,
+        source_ref: source_ref.as_deref(),
+        status: &status,
+        created_by: created_by.as_deref(),
+        actor_user_id: Some(&user_id),
+    };
+    repository::validate_skill_params(&params)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    repository::upsert_skill(&ctx.state.db, &params).map_err(db_err)?;
+    if let Some(files) = input.files {
+        let files: Vec<(String, String)> = files.into_iter().map(|f| (f.path, f.content)).collect();
+        repository::replace_skill_files(&ctx.state.db, &skill_id, &files, Some(&user_id))
+            .map_err(db_err)?;
+    }
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "skill.upsert",
+        Some(&format!("skill:{}", skill_id)),
+        Some(&input.name),
+    );
+
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::UpsertResponse(
+            tentaflow_protocol::SkillsUpsertResponse { skill_id },
+        ),
+    ))
+}
+
+#[handler(variant = "SkillsDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn skills_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::DeleteRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SkillsDeleteRequestBody",
+            ));
+        }
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let skill = repository::get_skill(&ctx.state.db, &payload.skill_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("skill not found: {}", payload.skill_id))
+        })?;
+    if skill.source == "addon" {
+        return Err(ProtocolError::bad_request(
+            "addon-sourced skills cannot be deleted — uninstall the addon to remove its skill",
+        ));
+    }
+    let deleted = repository::delete_skill(&ctx.state.db, &payload.skill_id).map_err(db_err)?;
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "skill.delete",
+        Some(&format!("skill:{}", payload.skill_id)),
+        Some(&skill.name),
+    );
+
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::DeleteResponse(
+            tentaflow_protocol::SkillsDeleteResponse { deleted },
+        ),
+    ))
+}
+
+#[handler(variant = "SkillsForkRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn skills_fork(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::ForkRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request("expected SkillsForkRequestBody"));
+        }
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let origin = repository::get_skill(&ctx.state.db, &payload.skill_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("skill not found: {}", payload.skill_id))
+        })?;
+    if repository::get_skill_by_name(&ctx.state.db, &payload.new_name)
+        .map_err(db_err)?
+        .is_some()
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "skill name already in use: '{}'",
+            payload.new_name
+        )));
+    }
+
+    // The copy keeps the origin's status so forking a quarantined hub skill
+    // cannot bypass the quarantine review; source becomes 'user' and the copy
+    // is fully independent (no source_ref back-link, per plan §3.2).
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let params = db::models::SkillParams {
+        id: &new_id,
+        name: &payload.new_name,
+        display_name: origin.display_name.as_deref(),
+        description: &origin.description,
+        content: &origin.content,
+        tags_json: &origin.tags_json,
+        category: origin.category.as_deref(),
+        source: "user",
+        source_ref: None,
+        status: &origin.status,
+        created_by: Some(&user_id),
+        actor_user_id: Some(&user_id),
+    };
+    repository::validate_skill_params(&params)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    repository::upsert_skill(&ctx.state.db, &params).map_err(db_err)?;
+    let files = repository::list_skill_files(&ctx.state.db, &payload.skill_id).map_err(db_err)?;
+    if !files.is_empty() {
+        let files: Vec<(String, String)> = files.into_iter().map(|f| (f.path, f.content)).collect();
+        repository::replace_skill_files(&ctx.state.db, &new_id, &files, Some(&user_id))
+            .map_err(db_err)?;
+    }
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "skill.fork",
+        Some(&format!("skill:{}", new_id)),
+        Some(&format!(
+            "forked from skill:{} as '{}'",
+            payload.skill_id, payload.new_name
+        )),
+    );
+
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::ForkResponse(tentaflow_protocol::SkillsForkResponse {
+            skill_id: new_id,
+        }),
+    ))
+}
+
 #[handler(variant = "AuditLogListRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
