@@ -1085,6 +1085,28 @@
     "edge_dangling": "Kante verweist auf einen nicht existierenden Knoten",
     "cycle_detected": "Zyklus im Flow-Graph erkannt"
   },
+  "flows_vars": {
+    "title": "Flow-Variablen",
+    "button": "Variablen",
+    "button_title": "Flow-Variablen deklarieren",
+    "hint": "Deklarieren Sie Flow-Variablen. Bloecke koennen nur dann ueber output_mapping darauf schreiben, wenn sie hier aufgefuehrt sind.",
+    "add": "Variable hinzufuegen",
+    "remove": "Entfernen",
+    "save": "Speichern",
+    "cancel": "Abbrechen",
+    "empty": "Keine Variablen deklariert.",
+    "col_name": "Name",
+    "col_type": "Typ",
+    "col_default": "Standard",
+    "col_description": "Beschreibung",
+    "name_placeholder": "z. B. chosen_model",
+    "default_placeholder": "optional (JSON oder Text)",
+    "description_placeholder": "optional",
+    "saved": "Variablen gespeichert ({count})",
+    "err_empty_name": "Der Variablenname darf nicht leer sein.",
+    "err_bad_name": "Ungueltiger Name '{name}' — Kleinbuchstaben, Ziffern und Unterstriche verwenden (mit Buchstaben beginnen).",
+    "err_duplicate": "Doppelter Variablenname '{name}'."
+  },
   "flows_palette": {
     "title": "Palette",
     "search_placeholder": "Node suchen...",
@@ -1177,7 +1199,13 @@
       "router": "Router",
       "output": "Ausgang",
       "agent_context": "Agentenkontext",
-      "tool_exec": "Werkzeugausführung"
+      "tool_exec": "Werkzeugausführung",
+      "subflow": "Sub-Flow",
+      "loop": "Schleife",
+      "map": "Map",
+      "agent": "Agent",
+      "agent_router": "Agenten-Router",
+      "compact_context": "Kontext verdichten"
     },
     "node_descriptions": {
       "trigger": "Flow-Einstiegspunkt (HTTP, QUIC, Webhook)",
@@ -1199,7 +1227,13 @@
       "router": "Pass-through Node",
       "output": "Flow-Ausgang — gibt Ergebnis zurück",
       "agent_context": "Lädt den Agenten: System-Prompt, Skill-Index, Werkzeuge und Schleifensignale; eröffnet den Lauf",
-      "tool_exec": "Führt die Werkzeugaufrufe des Modells aus; keine Aufrufe beenden die Agentenschleife"
+      "tool_exec": "Führt die Werkzeugaufrufe des Modells aus; keine Aufrufe beenden die Agentenschleife",
+      "subflow": "Führt einen anderen Flow als Körper dieses Flows aus; gibt das Kind-Ergebnis zurück",
+      "loop": "Wiederholt den Körper-Flow, bis die Bedingung wahr ist oder das Iterationsbudget erschöpft ist",
+      "map": "Führt den Körper-Flow parallel für jedes Array-Element aus; Ergebnisse in Eingabereihenfolge",
+      "agent": "Führt einen Agenten als Block aus und gibt nur die Zusammenfassung (finale Antwort) zurück",
+      "agent_router": "Wählt mit einem LLM-Aufruf den besten Agenten für die Aufgabe; führt ihn nicht aus",
+      "compact_context": "Fasst die Mitte des Gesprächs zusammen, wenn der Kontext den Schwellenwert überschreitet, und schützt System-Prompt und neueste Nachrichten"
     },
     "fields": {
       "model": "Modell",

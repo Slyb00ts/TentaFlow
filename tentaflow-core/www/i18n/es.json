@@ -1085,6 +1085,28 @@
     "edge_dangling": "La arista apunta a un nodo inexistente",
     "cycle_detected": "Ciclo detectado en el grafo de flujo"
   },
+  "flows_vars": {
+    "title": "Variables del flujo",
+    "button": "Variables",
+    "button_title": "Declarar variables del flujo",
+    "hint": "Declara las variables del flujo. Los bloques solo pueden escribir en ellas mediante output_mapping si estan listadas aqui.",
+    "add": "Anadir variable",
+    "remove": "Eliminar",
+    "save": "Guardar",
+    "cancel": "Cancelar",
+    "empty": "No hay variables declaradas.",
+    "col_name": "Nombre",
+    "col_type": "Tipo",
+    "col_default": "Predeterminado",
+    "col_description": "Descripcion",
+    "name_placeholder": "p. ej. chosen_model",
+    "default_placeholder": "opcional (JSON o texto)",
+    "description_placeholder": "opcional",
+    "saved": "Variables guardadas ({count})",
+    "err_empty_name": "El nombre de la variable no puede estar vacio.",
+    "err_bad_name": "Nombre invalido '{name}' — usa minusculas, digitos y guiones bajos (empezar con una letra).",
+    "err_duplicate": "Nombre de variable duplicado '{name}'."
+  },
   "flows_palette": {
     "title": "Paleta",
     "search_placeholder": "Buscar nodo...",
@@ -1177,7 +1199,13 @@
       "router": "Router",
       "output": "Salida",
       "agent_context": "Contexto del agente",
-      "tool_exec": "Ejecución de herramientas"
+      "tool_exec": "Ejecución de herramientas",
+      "subflow": "Sub-flow",
+      "loop": "Bucle",
+      "map": "Map",
+      "agent": "Agente",
+      "agent_router": "Enrutador de agentes",
+      "compact_context": "Compactar contexto"
     },
     "node_descriptions": {
       "trigger": "Punto de entrada del flow (HTTP, QUIC, webhook)",
@@ -1199,7 +1227,13 @@
       "router": "Nodo pasarela",
       "output": "Salida del flow - devuelve el resultado",
       "agent_context": "Carga el agente: prompt de sistema, índice de skills, herramientas y señales del bucle; abre la ejecución",
-      "tool_exec": "Ejecuta las llamadas a herramientas del modelo; sin llamadas finaliza el bucle del agente"
+      "tool_exec": "Ejecuta las llamadas a herramientas del modelo; sin llamadas finaliza el bucle del agente",
+      "subflow": "Ejecuta otro flow como cuerpo de este flow; devuelve el resultado del hijo",
+      "loop": "Repite el flow-cuerpo hasta que la condición sea verdadera o se agote el presupuesto de iteraciones",
+      "map": "Ejecuta el flow-cuerpo en paralelo para cada elemento del array; resultados en orden de entrada",
+      "agent": "Ejecuta un agente como bloque y devuelve solo el resumen (respuesta final)",
+      "agent_router": "Elige el mejor agente para la tarea con una llamada LLM; no lo ejecuta",
+      "compact_context": "Resume la parte central de la conversación cuando el contexto supera el umbral, protegiendo el system prompt y los mensajes más recientes"
     },
     "fields": {
       "model": "Modelo",

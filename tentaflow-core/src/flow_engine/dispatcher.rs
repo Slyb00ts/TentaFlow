@@ -36,13 +36,15 @@ use crate::flow_engine::envelope::{
 use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
-    AgentContextNodeAdapter, CombineNodeAdapter, ConditionNodeAdapter,
-    ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, LlmNodeAdapter, MemoryNodeAdapter,
+    AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, CombineNodeAdapter,
+    CompactContextNodeAdapter, ConditionNodeAdapter, ConversationHistoryNodeAdapter,
+    EmbeddingsNodeAdapter, LlmNodeAdapter, LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter,
     OutputNodeAdapter, PiiFilterNodeAdapter, SessionContextNodeAdapter, SpeakerContextNodeAdapter,
-    SttNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter,
-    VisionNodeAdapter,
+    SttNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter,
+    TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
 };
 use crate::flow_engine::resolver;
+use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
 use crate::flow_engine::synthetic;
 use crate::services::runtime::quic_handle::ServiceManager;
 
@@ -142,6 +144,12 @@ pub struct FlowDispatcher {
     /// dispatchera naraz. Pusty slot = błąd node'a (sloty wypełniane na starcie,
     /// przed obsługą ruchu).
     agent_service: crate::agents::AgentServiceSlot,
+    /// Harness §3.5.0: SubflowRunnerSlot — w przeciwieństwie do `agent_service`
+    /// wypełniany JUŻ w `FlowDispatcher::new` (dispatcher ma DbPool i registry).
+    /// `subflow`/`loop`/`map`/`agent` trzymają klon tego slotu (wpięty w
+    /// `build_registry`); runner trzyma `Weak<AdapterRegistry>`, więc cykl
+    /// registry→adapter→slot→runner→registry jest przerwany.
+    subflow_runner: SubflowRunnerSlot,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -167,11 +175,15 @@ impl ContextFactory {
         ExecutionContext {
             request_id: meta.request_id.clone(),
             execution_id: 0,
+            parent_execution_id: None,
+            light: false,
             session_id: meta.session_id.clone(),
             user_id: meta.user_id.clone(),
             user_role: meta.user_role.clone(),
             deadline: meta.deadline,
             cancel_token: meta.cancel_token.clone(),
+            subflow_depth: 0,
+            subflow_visited: Arc::new(Vec::new()),
             initial_envelope: Arc::new(FlowEnvelope::empty()),
             clock: self.clock.clone(),
             blobs: self.blobs.clone(),
@@ -255,14 +267,27 @@ impl FlowDispatcher {
 
         let agent_service: crate::agents::AgentServiceSlot =
             Arc::new(parking_lot::RwLock::new(None));
-        let registry = build_registry(agent_service.clone());
+        // SubflowRunnerSlot is filled here (not from main.rs): the runner needs
+        // only the DbPool and the registry, both available now. The adapters
+        // registered below carry a clone of this still-empty slot; we fill it
+        // once the registry Arc exists so the runner's Weak resolves.
+        let subflow_runner: SubflowRunnerSlot = Arc::new(parking_lot::RwLock::new(None));
+        let registry = Arc::new(build_registry(
+            agent_service.clone(),
+            subflow_runner.clone(),
+        ));
+        *subflow_runner.write() = Some(Arc::new(SubflowRunner::new(
+            db.clone(),
+            Arc::downgrade(&registry),
+        )));
         Self {
             db,
             cache: FlowCache::new(60),
-            registry: Arc::new(registry),
+            registry,
             ctx_factory,
             addon_flow_blocks: parking_lot::RwLock::new(None),
             agent_service,
+            subflow_runner,
         }
     }
 
@@ -316,6 +341,14 @@ impl FlowDispatcher {
     /// `build_registry`); ten accessor służy callerom dispatchera.
     pub fn agent_service(&self) -> Option<Arc<crate::agents::AgentService>> {
         self.agent_service.read().clone()
+    }
+
+    /// Zwraca `SubflowRunner` (wypełniony w `FlowDispatcher::new`). Bloki
+    /// `subflow`/`loop`/`map`/`agent` czytają ten sam slot przez swój klon
+    /// (wpięty w `build_registry`); accessor służy callerom dispatchera, którzy
+    /// chcą uruchomić flow jako pod-flow poza grafem.
+    pub fn subflow_runner(&self) -> Option<Arc<SubflowRunner>> {
+        self.subflow_runner.read().clone()
     }
 
     /// Etap 2: BlobStore handle — używane przez TTS-as-flow path w
@@ -770,7 +803,10 @@ fn wrap_blocking_as_stream(
 /// rejestrowane przez `register_streaming<T>` — landują w obu slotach
 /// (blocking + streaming). Czysta NodeAdapter rejestracja przez
 /// `register` dla nodów które nie mają stream variant'a.
-fn build_registry(agent_service: crate::agents::AgentServiceSlot) -> AdapterRegistry {
+fn build_registry(
+    agent_service: crate::agents::AgentServiceSlot,
+    subflow_runner: SubflowRunnerSlot,
+) -> AdapterRegistry {
     use crate::flow_engine::node_adapters::SentenceBufferNodeAdapter;
 
     let mut r = AdapterRegistry::new();
@@ -790,10 +826,22 @@ fn build_registry(agent_service: crate::agents::AgentServiceSlot) -> AdapterRegi
     for a in arcs {
         r.register(a);
     }
-    // Harness §3.5: agent_context + tool_exec share the late-bound
-    // AgentServiceSlot (filled by main.rs after the AddonManager exists).
+    // Harness §3.5: agent_context + tool_exec + agent_router + compact_context
+    // share the late-bound AgentServiceSlot (filled by main.rs after the
+    // AddonManager exists). agent_router/compact_context also issue audited LLM
+    // calls via ctx.llm; they need only the registry/service.
     r.register(Arc::new(AgentContextNodeAdapter::new(agent_service.clone())));
-    r.register(Arc::new(ToolExecNodeAdapter::new(agent_service)));
+    r.register(Arc::new(ToolExecNodeAdapter::new(agent_service.clone())));
+    r.register(Arc::new(AgentRouterNodeAdapter::new(agent_service.clone())));
+    r.register(Arc::new(CompactContextNodeAdapter::new()));
+    // Harness §3.5 blocks 1/2/6/8: subflow + loop + map + agent all share the
+    // SubflowRunnerSlot (filled by FlowDispatcher::new) — each runs another flow
+    // as its body. `agent` additionally needs the AgentServiceSlot to resolve
+    // the agent's harness flow id.
+    r.register(Arc::new(SubflowNodeAdapter::new(subflow_runner.clone())));
+    r.register(Arc::new(LoopNodeAdapter::new(subflow_runner.clone())));
+    r.register(Arc::new(MapNodeAdapter::new(subflow_runner.clone())));
+    r.register(Arc::new(AgentNodeAdapter::new(agent_service, subflow_runner)));
     r.register_llm(Arc::new(LlmNodeAdapter::new()));
     // Streaming-aware adaptery (dual-trait NodeAdapter + StreamingNodeAdapter)
     // trafiają do obu slotów. `tts` jest dual: blocking (całość) + streaming
@@ -805,13 +853,28 @@ fn build_registry(agent_service: crate::agents::AgentServiceSlot) -> AdapterRegi
     r
 }
 
+/// Builds an AdapterRegistry with empty dependency slots — for tests that need
+/// the full builtin adapter set (e.g. compiling a flow body for the
+/// SubflowRunner) without a live AgentService or SubflowRunner. The subflow
+/// adapter's own slot is filled by the caller after the registry Arc exists.
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_registry_for_test() -> AdapterRegistry {
+    build_registry(
+        Arc::new(parking_lot::RwLock::new(None)),
+        Arc::new(parking_lot::RwLock::new(None)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn registry_includes_all_node_types() {
-        let r = build_registry(Arc::new(parking_lot::RwLock::new(None)));
+        let r = build_registry(
+            Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
+        );
         let types: std::collections::BTreeSet<&str> = r.registered_types().into_iter().collect();
         for expected in [
             "trigger",
@@ -830,6 +893,12 @@ mod tests {
             "sentence_buffer",
             "agent_context",
             "tool_exec",
+            "agent_router",
+            "compact_context",
+            "subflow",
+            "loop",
+            "map",
+            "agent",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }

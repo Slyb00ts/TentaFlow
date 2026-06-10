@@ -73,14 +73,47 @@ impl UsageSink {
 
 /// Pełny zestaw zależności dostępny adapterom podczas execute(). Wszystkie pola
 /// to Arc<dyn Trait> z dispatchers/ — zero ServiceManager, zero god-objectu.
+///
+/// `Clone` jest tani — każde pole to `Arc`/`Option`/`Copy`. Klonowanie jest
+/// wymagane przez `SubflowRunner` (§3.5): blok `subflow`/`loop`/`map` wykonuje
+/// flow-ciało na KLONIE kontekstu rodzica ze świeżym `execution_id` i świeżym
+/// `usage_sink`, zachowując współdzielone dispatchery i guard rekurencji.
+#[derive(Clone)]
 pub struct ExecutionContext {
     pub request_id: String,
     pub execution_id: i64,
+    /// §3.5 — id of the run that spawned this one, recorded as
+    /// `flow_executions.parent_execution_id` so the execution tree (parent →
+    /// subflow / loop body / map element) is reconstructable. `SubflowRunner`
+    /// sets it for real nested runs; top-level and light-mode runs leave it
+    /// `None`. Kept separate from `execution_id` (the child's OWN id, assigned
+    /// by `execute_blocking`) so the two never collide.
+    pub parent_execution_id: Option<i64>,
+    /// §3.5 blocks 1/2 — light run mode for `loop` iterations and `map`
+    /// elements: `execute_blocking` neither creates nor persists a
+    /// `flow_executions` row, so a 25-iteration agent loop (or a 50-element map)
+    /// never spams the audit table. The iteration accounting lives in the agent
+    /// run log and the parent's single `TraceStep` instead. `subflow`/`agent`
+    /// leave this false — they DO get their own audit row.
+    pub light: bool,
     pub session_id: Option<String>,
     pub user_id: Option<String>,
     pub user_role: Option<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
+
+    /// §3.5 / §3.10 — guard rekurencji sub-flow, trzymany TU (nie w
+    /// `envelope.meta`), bo meta jest zapisywalne przez każdy node, w tym blok
+    /// addonu WASM deserializujący cały envelope z odpowiedzi gościa
+    /// (`addon.rs:173`) — guard w meta dałby się wyzerować i otworzyć
+    /// nieograniczoną rekurencję. `subflow_depth` to liczba zagnieżdżeń
+    /// sub-flow nad bieżącym wykonaniem (0 = top-level).
+    pub subflow_depth: u8,
+    /// §3.5 — zbiór flow_id'ów na ścieżce stosu sub-flow (do detekcji cyklu:
+    /// flow A → subflow B → subflow A jest błędem). `Arc` żeby klon kontekstu
+    /// dzielił tę samą listę bez kopiowania; `SubflowRunner` rozszerza ją o
+    /// flow dziecka przed zejściem w głąb.
+    pub subflow_visited: Arc<Vec<String>>,
 
     /// Seed envelope dostarczony przez routing (request_id, model, payload,
     /// initial messages). Plan v4.2 D2: używa go TYLKO trigger.execute().
@@ -593,11 +626,15 @@ pub mod test_support {
         ExecutionContext {
             request_id: "test".into(),
             execution_id: 0,
+            parent_execution_id: None,
+            light: false,
             session_id: None,
             user_id: None,
             user_role: None,
             deadline: None,
             cancel_token: CancellationToken::new(),
+            subflow_depth: 0,
+            subflow_visited: Arc::new(Vec::new()),
             initial_envelope: Arc::new(FlowEnvelope::empty()),
             clock: Arc::new(SystemClock),
             blobs: Arc::new(InMemoryBlobStore::new()) as Arc<dyn BlobStore>,

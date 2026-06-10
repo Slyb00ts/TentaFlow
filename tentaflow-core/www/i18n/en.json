@@ -1233,6 +1233,28 @@
     "edge_dangling": "Edge points to a non-existent node",
     "cycle_detected": "Cycle detected in flow graph"
   },
+  "flows_vars": {
+    "title": "Flow variables",
+    "button": "Variables",
+    "button_title": "Declare flow variables",
+    "hint": "Declare flow variables. Blocks can write to them via output_mapping only if listed here.",
+    "add": "Add variable",
+    "remove": "Remove",
+    "save": "Save",
+    "cancel": "Cancel",
+    "empty": "No variables declared.",
+    "col_name": "Name",
+    "col_type": "Type",
+    "col_default": "Default",
+    "col_description": "Description",
+    "name_placeholder": "e.g. chosen_model",
+    "default_placeholder": "optional (JSON or text)",
+    "description_placeholder": "optional",
+    "saved": "Saved variables ({count})",
+    "err_empty_name": "Variable name cannot be empty.",
+    "err_bad_name": "Invalid name '{name}' — use lowercase letters, digits and underscores (start with a letter).",
+    "err_duplicate": "Duplicate variable name '{name}'."
+  },
   "flows_palette": {
     "title": "Palette",
     "search_placeholder": "Search node...",
@@ -1325,7 +1347,13 @@
       "router": "Router",
       "output": "Output",
       "agent_context": "Agent Context",
-      "tool_exec": "Tool Execution"
+      "tool_exec": "Tool Execution",
+      "subflow": "Sub Flow",
+      "loop": "Loop",
+      "map": "Map",
+      "agent": "Agent",
+      "agent_router": "Agent Router",
+      "compact_context": "Compact Context"
     },
     "node_descriptions": {
       "trigger": "Flow entry point (HTTP, QUIC, webhook)",
@@ -1347,7 +1375,13 @@
       "router": "Pass-through node",
       "output": "Flow output - returns result",
       "agent_context": "Loads the agent: system prompt, skills index, tools and loop signals; opens the run",
-      "tool_exec": "Runs the model's tool calls; no calls ends the agent loop"
+      "tool_exec": "Runs the model's tool calls; no calls ends the agent loop",
+      "subflow": "Runs another flow as this flow's body; returns the child result",
+      "loop": "Repeats the body flow until the condition is true or the iteration budget runs out",
+      "map": "Runs the body flow in parallel for each array element; results in input order",
+      "agent": "Runs an agent as a block and returns only the summary (final answer)",
+      "agent_router": "Picks the best agent for the task with one LLM call; does not run it",
+      "compact_context": "Summarizes the middle of the conversation when context exceeds the threshold, protecting the system prompt and newest messages"
     },
     "fields": {
       "model": "Model",

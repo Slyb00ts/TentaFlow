@@ -1253,6 +1253,28 @@
     "edge_dangling": "Krawędź prowadzi do nieistniejącego węzła",
     "cycle_detected": "Wykryto cykl w grafie przepływu"
   },
+  "flows_vars": {
+    "title": "Zmienne flow",
+    "button": "Zmienne",
+    "button_title": "Zadeklaruj zmienne flow",
+    "hint": "Zadeklaruj zmienne flow. Bloki moga zapisywac do nich przez output_mapping tylko gdy sa tu wymienione.",
+    "add": "Dodaj zmienna",
+    "remove": "Usun",
+    "save": "Zapisz",
+    "cancel": "Anuluj",
+    "empty": "Brak zadeklarowanych zmiennych.",
+    "col_name": "Nazwa",
+    "col_type": "Typ",
+    "col_default": "Wartosc domyslna",
+    "col_description": "Opis",
+    "name_placeholder": "np. chosen_model",
+    "default_placeholder": "opcjonalnie (JSON lub tekst)",
+    "description_placeholder": "opcjonalnie",
+    "saved": "Zapisano zmienne ({count})",
+    "err_empty_name": "Nazwa zmiennej nie moze byc pusta.",
+    "err_bad_name": "Niepoprawna nazwa '{name}' — uzyj malych liter, cyfr i podkreslen (start od litery).",
+    "err_duplicate": "Zduplikowana nazwa zmiennej '{name}'."
+  },
   "flows_palette": {
     "title": "Paleta",
     "search_placeholder": "Szukaj node...",
@@ -1346,7 +1368,13 @@
       "router": "Router",
       "output": "Wyjście",
       "agent_context": "Kontekst agenta",
-      "tool_exec": "Wykonanie narzędzi"
+      "tool_exec": "Wykonanie narzędzi",
+      "subflow": "Pod-flow",
+      "loop": "Pętla",
+      "map": "Mapowanie",
+      "agent": "Agent",
+      "agent_router": "Router agentów",
+      "compact_context": "Kompakcja kontekstu"
     },
     "node_descriptions": {
       "trigger": "Punkt wejścia flow (HTTP, QUIC, webhook)",
@@ -1369,7 +1397,13 @@
       "router": "Przekazanie danych dalej",
       "output": "Wyjście flow - zwraca wynik",
       "agent_context": "Ładuje agenta: system prompt, indeks skilli, narzędzia i sygnały pętli; tworzy przebieg",
-      "tool_exec": "Wykonuje wywołania narzędzi z odpowiedzi modelu; brak wywołań kończy pętlę agenta"
+      "tool_exec": "Wykonuje wywołania narzędzi z odpowiedzi modelu; brak wywołań kończy pętlę agenta",
+      "subflow": "Wykonuje inny flow jako ciało tego flow; zwraca wynik dziecka",
+      "loop": "Powtarza flow-ciało aż warunek będzie prawdziwy albo skończy się budżet iteracji",
+      "map": "Wykonuje flow-ciało równolegle dla każdego elementu tablicy; wyniki w kolejności wejściowej",
+      "agent": "Uruchamia agenta jako blok i zwraca tylko podsumowanie (finalną odpowiedź)",
+      "agent_router": "Wybiera najlepszego agenta dla zadania jednym wywołaniem LLM; nie uruchamia go",
+      "compact_context": "Streszcza środek rozmowy gdy kontekst przekroczy próg, chroniąc system prompt i najnowsze wiadomości"
     },
     "fields": {
       "model": "Model",

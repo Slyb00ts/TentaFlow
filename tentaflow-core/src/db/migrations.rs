@@ -372,8 +372,23 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "compliance_ai_events_agent_context",
             MigrationStep::RustSelfManaged(add_ai_events_agent_context),
         ),
+        (
+            67,
+            "flow_executions_parent_execution_id",
+            MigrationStep::Sql(FLOW_EXECUTIONS_PARENT_EXECUTION_ID),
+        ),
     ]
 }
+
+// Sub Flow (Harness §3.5 block 8): a nested flow run gets its own
+// `flow_executions` row whose `parent_execution_id` points at the parent run,
+// so the execution tree (parent → subflow / loop body / map element) is
+// reconstructable from the audit table. NULL = top-level run. No FK on self
+// because synthetic/light runs use id 0 and never insert a row.
+const FLOW_EXECUTIONS_PARENT_EXECUTION_ID: &str = "
+ALTER TABLE flow_executions ADD COLUMN parent_execution_id INTEGER;
+CREATE INDEX idx_flow_executions_parent ON flow_executions(parent_execution_id);
+";
 
 // Skills registry (Harness plan §3.2): instruction-only skills (markdown +
 // text references, never scripts). `name` is deliberately NOT UNIQUE — the

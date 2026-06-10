@@ -5391,6 +5391,12 @@ mod agents_repository_tests {
     #[test]
     fn upsert_get_list_roundtrip_and_filters() {
         let db = setup_db();
+        // Seed materializes a system `general` agent (§3.8); this test asserts
+        // exact list counts over agents IT creates, so start from a clean table.
+        db.lock()
+            .unwrap()
+            .execute("DELETE FROM agents", [])
+            .expect("clear seeded agents");
         let a = uuid::Uuid::new_v4().to_string();
         let b = uuid::Uuid::new_v4().to_string();
         upsert_agent(&db, &agent_params(&a, "research-agent")).expect("upsert a");
@@ -6107,11 +6113,12 @@ pub fn create_flow_execution(
     request_id: Option<&str>,
     model: Option<&str>,
     status: &str,
+    parent_execution_id: Option<i64>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     conn.execute(
-        "INSERT INTO flow_executions (flow_id, request_id, model, started_at, status) VALUES (?1, ?2, ?3, datetime('now'), ?4)",
-        rusqlite::params![flow_id, request_id, model, status],
+        "INSERT INTO flow_executions (flow_id, request_id, model, started_at, status, parent_execution_id) VALUES (?1, ?2, ?3, datetime('now'), ?4, ?5)",
+        rusqlite::params![flow_id, request_id, model, status, parent_execution_id],
     )?;
     Ok(conn.last_insert_rowid())
 }

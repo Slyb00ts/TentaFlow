@@ -13,14 +13,12 @@
 //       scalane per-key polityka z configu (§3.12).
 // =============================================================================
 
-use std::collections::BTreeMap;
-
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use serde_json::Value;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use crate::flow_engine::node_adapters::variable_merge::{merge_ordered, MergeSource};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct CombineNodeAdapter;
@@ -101,125 +99,19 @@ impl NodeAdapter for CombineNodeAdapter {
         // Variables z wszystkich live branchy scalane per-key polityka (§3.12).
         // Skipped poprzednicy nie maja outputu, wiec build_inputs ich pomija —
         // tu sa tylko zywe wejscia. Bez wejsc lub w liniowym flow (1 wejscie)
-        // to passthrough variables pierwszego brancha.
-        out.variables = merge_variables(node, &sorted)?;
+        // to passthrough variables pierwszego brancha. Deterministyczna
+        // kolejnosc po from_node_id zachowana przez `sorted`.
+        let sources: Vec<MergeSource<'_>> = sorted
+            .iter()
+            .map(|inp| MergeSource {
+                port: Some(inp.from_port.as_str()),
+                variables: &inp.envelope.variables,
+            })
+            .collect();
+        out.variables =
+            merge_ordered(node, &format!("combine node '{}'", node.id), &sources)?;
         Ok(out)
     }
-}
-
-/// Per-key conflict policy parsed from `node.config.variable_merge_policy`.
-/// Default (no entry) = a different value for the same key on two branches is
-/// a node error (§3.12) — deterministic and debuggable.
-enum MergePolicy {
-    /// Last branch (deterministic `from_node_id` order) wins on conflict.
-    LastWins,
-    /// The branch whose `from_port` equals the configured port wins.
-    PreferPort(String),
-    /// Collect all branch values into a JSON array (input order).
-    Collect,
-}
-
-/// Merges `variables` from every live branch using the per-key policy. Branches
-/// are pre-sorted by `from_node_id` so `last_wins`/`collect` are deterministic.
-fn merge_variables(
-    node: &FlowNode,
-    sorted: &[&NodeInput],
-) -> Result<BTreeMap<String, FlowValue>> {
-    let policies = parse_policies(node)?;
-    let mut merged: BTreeMap<String, FlowValue> = BTreeMap::new();
-    // For `collect` we accumulate arrays; for `prefer_port` we track whether the
-    // winning port already supplied a value so a later branch cannot override it.
-    let mut collected: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    let mut prefer_locked: BTreeMap<String, bool> = BTreeMap::new();
-
-    for input in sorted {
-        for (key, value) in &input.envelope.variables {
-            match policies.get(key) {
-                Some(MergePolicy::Collect) => {
-                    collected
-                        .entry(key.clone())
-                        .or_default()
-                        .push(crate::flow_engine::expr::flow_value_to_json(value));
-                }
-                Some(MergePolicy::PreferPort(port)) => {
-                    let locked = prefer_locked.entry(key.clone()).or_insert(false);
-                    if input.from_port == *port {
-                        merged.insert(key.clone(), value.clone());
-                        *locked = true;
-                    } else if !*locked && !merged.contains_key(key) {
-                        // Hold a non-preferred value only until the preferred
-                        // port supplies one; the preferred port always wins.
-                        merged.insert(key.clone(), value.clone());
-                    }
-                }
-                Some(MergePolicy::LastWins) => {
-                    merged.insert(key.clone(), value.clone());
-                }
-                None => match merged.get(key) {
-                    Some(existing) if existing != value => {
-                        return Err(anyhow!(
-                            "combine node '{}': conflicting values for variable '{key}' \
-                             across branches and no merge policy configured \
-                             (set variable_merge_policy['{key}'] to last_wins, \
-                             prefer_port:<port> or collect)",
-                            node.id
-                        ));
-                    }
-                    Some(_) => {}
-                    None => {
-                        merged.insert(key.clone(), value.clone());
-                    }
-                },
-            }
-        }
-    }
-
-    for (key, values) in collected {
-        merged.insert(key, FlowValue::Json(Value::Array(values)));
-    }
-    Ok(merged)
-}
-
-/// Parses `node.config.variable_merge_policy` ({key: policy-string}) into the
-/// per-key policy map. `"last_wins"` | `"collect"` | `"prefer_port:<port>"`.
-fn parse_policies(node: &FlowNode) -> Result<BTreeMap<String, MergePolicy>> {
-    let Some(obj) = node
-        .config
-        .get("variable_merge_policy")
-        .and_then(|v| v.as_object())
-    else {
-        return Ok(BTreeMap::new());
-    };
-    let mut policies = BTreeMap::new();
-    for (key, spec) in obj {
-        let spec = spec.as_str().ok_or_else(|| {
-            anyhow!(
-                "combine node '{}': variable_merge_policy['{key}'] must be a string",
-                node.id
-            )
-        })?;
-        let policy = if spec == "last_wins" {
-            MergePolicy::LastWins
-        } else if spec == "collect" {
-            MergePolicy::Collect
-        } else if let Some(port) = spec.strip_prefix("prefer_port:") {
-            if port.is_empty() {
-                return Err(anyhow!(
-                    "combine node '{}': prefer_port policy for '{key}' needs a port name",
-                    node.id
-                ));
-            }
-            MergePolicy::PreferPort(port.to_string())
-        } else {
-            return Err(anyhow!(
-                "combine node '{}': unknown merge policy '{spec}' for variable '{key}' \
-                 (expected last_wins, collect or prefer_port:<port>)",
-                node.id
-            ));
-        };
-        policies.insert(key.clone(), policy);
-    }
-    Ok(policies)
 }
 
 /// Mapuje dowolny `FlowValue` na string. Dla typow blob-owych zwraca krotki

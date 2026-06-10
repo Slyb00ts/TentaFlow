@@ -242,4 +242,48 @@ mod tests {
         assert!(!s.contains("from_port"), "got: {s}");
         assert!(!s.contains("to_port"), "got: {s}");
     }
+
+    /// Sekcja `variables` w ksztalcie emitowanym przez edytor zmiennych
+    /// (variables.js) parsuje sie do FlowDefinition: type jako FlowDataType
+    /// snake_case, default jako dowolny JSON, description opcjonalne. To kontrakt
+    /// UI <-> backend (R10 czyta te deklaracje).
+    #[test]
+    fn variables_section_from_ui_parses() {
+        let json = r#"{
+            "nodes":[{"id":"t1","type":"trigger","config":{}}],
+            "edges":[],
+            "variables":[
+                {"name":"chosen_model","type":"text","default":"qwen3.6:27b","description":"router pick"},
+                {"name":"attempts","type":"json","default":0},
+                {"name":"flag","type":"any"}
+            ]
+        }"#;
+        let def: FlowDefinition = serde_json::from_str(json).expect("parses");
+        assert_eq!(def.variables.len(), 3);
+        assert_eq!(def.variables[0].name, "chosen_model");
+        assert_eq!(def.variables[0].var_type, FlowDataType::Text);
+        assert_eq!(
+            def.variables[0].default.as_ref().unwrap().as_str(),
+            Some("qwen3.6:27b")
+        );
+        assert_eq!(def.variables[1].var_type, FlowDataType::Json);
+        assert_eq!(def.variables[1].default.as_ref().unwrap().as_i64(), Some(0));
+        // Brak default/description => None (skip_serializing_if w round-trip).
+        assert!(def.variables[2].default.is_none());
+        assert!(def.variables[2].description.is_none());
+        assert_eq!(def.variables[2].var_type, FlowDataType::Any);
+    }
+
+    /// Legacy flow_json bez sekcji `variables` round-trippuje byte-identycznie
+    /// (pusta lista nie jest serializowana — zachowawczy default).
+    #[test]
+    fn empty_variables_omitted_in_serialization() {
+        let def = FlowDefinition {
+            nodes: vec![],
+            edges: vec![],
+            variables: vec![],
+        };
+        let s = serde_json::to_string(&def).unwrap();
+        assert!(!s.contains("variables"), "got: {s}");
+    }
 }
