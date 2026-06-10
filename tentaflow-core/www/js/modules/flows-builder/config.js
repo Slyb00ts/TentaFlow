@@ -65,6 +65,38 @@ async function loadDynamicEnumOptions(source, category) {
         label: p.name || p.id || '',
       }));
     }
+    if (source === 'flows') {
+      // Sub Flow picker (Harness §3.5 block 8): only active flows. The current
+      // flow id is not available to this loader yet, so self-reference is not
+      // filtered here — the subflow runtime guard rejects a self/cycle
+      // reference (UI gap noted in the adapter).
+      const list = await ApiBinary.list('flowListRequest').catch(() => []);
+      return (Array.isArray(list) ? list : [])
+        .filter((f) => (f.status || (f.enabled ? 'active' : 'draft')) === 'active')
+        .map((f) => ({
+          value: f.id || f.flowId || '',
+          label: f.name || f.id || '',
+        }));
+    }
+    if (source === 'agents') {
+      // Agent picker (Harness §3.5 blocks 3/6/7): only enabled agents. Used by
+      // agent_context, agent and agent_router config. The agents list response
+      // carries a JSON string (agentsJson), not a structured array, so parse it
+      // here. The value is the agent id; the label prefers display_name.
+      const resp = await ApiBinary.one('agentsListRequest', {}).catch(() => null);
+      let rows = [];
+      try {
+        rows = JSON.parse(resp?.agentsJson ?? resp?.agents_json ?? '[]');
+      } catch (_e) {
+        rows = [];
+      }
+      return (Array.isArray(rows) ? rows : [])
+        .filter((a) => a.is_enabled !== false && a.isEnabled !== false)
+        .map((a) => ({
+          value: a.id || a.agentId || '',
+          label: a.display_name || a.displayName || a.name || a.id || '',
+        }));
+    }
     return [];
   })();
   _dynamicEnumCache.set(key, promise);

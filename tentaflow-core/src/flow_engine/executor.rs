@@ -80,7 +80,12 @@ pub async fn execute_blocking(
     let initial_arc = Arc::new(initial);
     ctx.initial_envelope = initial_arc.clone();
 
-    let execution_id = create_execution_record(&db, &compiled.flow_id).await?;
+    // SubflowRunner (§3.5) sets `parent_execution_id` so this child links back
+    // to the run that spawned it; top-level runs leave it `None`. Light-mode
+    // runs (loop iterations / map elements) skip the audit row entirely so a
+    // 25-iteration loop never spams `flow_executions`.
+    let execution_id =
+        create_execution_record(&db, &compiled.flow_id, ctx.parent_execution_id, ctx.light).await?;
     ctx.execution_id = execution_id;
 
     let continue_on_error = compiled.continue_on_error();
@@ -477,7 +482,8 @@ pub async fn execute_streaming(
     let initial_arc = Arc::new(initial);
     ctx.initial_envelope = initial_arc.clone();
 
-    let execution_id = create_execution_record(&db, &compiled.flow_id).await?;
+    let execution_id =
+        create_execution_record(&db, &compiled.flow_id, ctx.parent_execution_id, ctx.light).await?;
     ctx.execution_id = execution_id;
 
     let producer_run_idx = compiled
@@ -921,27 +927,35 @@ fn aggregate_usage(trace: &[TraceStep]) -> TokenUsage {
     total
 }
 
-/// Synthetic flows (Universal Flow Gateway, flow_id=0) są ephemeral —
-/// nie istnieją w tabeli `flows`, więc insert do `flow_executions` z FK
-/// na `flows(id)` failuje przy `PRAGMA foreign_keys=ON`. Skipujemy audit
-/// row i zwracamy execution_id=0 jako sentinel; persist_execution też
-/// to honoruje.
-async fn create_execution_record(db: &DbPool, flow_id: &str) -> Result<i64> {
-    if flow_id.is_empty() {
+/// Returns the freshly created `flow_executions` id, or `0` as a sentinel for
+/// runs that intentionally skip the audit row:
+///   - synthetic flows (Universal Flow Gateway, `flow_id` empty) are ephemeral
+///     and not present in `flows`, so an FK-bound insert would fail;
+///   - light-mode runs (loop iterations / map elements, §3.5 blocks 1/2) carry
+///     a real `flow_id` but must NOT insert a row per iteration/element — their
+///     accounting lives in the agent run log and the parent's `TraceStep`.
+/// `persist_execution` honours the same `0` sentinel and skips the update.
+async fn create_execution_record(
+    db: &DbPool,
+    flow_id: &str,
+    parent_execution_id: Option<i64>,
+    light: bool,
+) -> Result<i64> {
+    if flow_id.is_empty() || light {
         return Ok(0);
     }
     let pool = db.clone();
     let flow_id = flow_id.to_string();
     let id = tokio::task::spawn_blocking(move || {
-        repository::create_flow_execution(&pool, &flow_id, None, None, "running")
+        repository::create_flow_execution(&pool, &flow_id, None, None, "running", parent_execution_id)
     })
     .await??;
     Ok(id)
 }
 
 async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecutionOutcome) {
-    // execution_id == 0 = synthetic flow (no audit row created — see
-    // create_execution_record skip). Skip persist too.
+    // execution_id == 0 = no audit row was created (synthetic or light run —
+    // see create_execution_record). Nothing to update.
     if execution_id == 0 {
         return;
     }

@@ -1068,6 +1068,47 @@ pub fn flow_node_templates_list(
         }
     }
 
+    // Per-agent palette entries (Harness §3.5 block 6): one `agent` block per
+    // enabled agent, with `agent_id` prefilled in default_config — mirrors the
+    // per-addon-block append above. Zero new adapters; the UX is "an agent is a
+    // block". Ports/category/icon/params_schema are copied from the generic
+    // `agent` template (already in `templates`) so the prefilled entries stay in
+    // lockstep with it. Skipped silently when the generic template or the
+    // dispatcher's AgentService is absent (headless / pre-seed).
+    if let Some(generic) = templates.iter().find(|t| t.node_type == "agent").cloned() {
+        let agents = repository::list_agents(
+            &ctx.state.db,
+            &db::models::AgentListFilter {
+                is_enabled: Some(true),
+                routable: None,
+            },
+        )
+        .unwrap_or_default();
+        for a in agents {
+            let default_config =
+                serde_json::json!({ "agent_id": a.id }).to_string();
+            let label = a.display_name.clone().unwrap_or_else(|| a.name.clone());
+            templates.push(tentaflow_protocol::FlowNodeTemplate {
+                id: 0,
+                node_type: "agent".to_string(),
+                category: generic.category.clone(),
+                label,
+                description: if a.description.is_empty() {
+                    generic.description.clone()
+                } else {
+                    Some(a.description.clone())
+                },
+                default_config,
+                icon: generic.icon.clone(),
+                input_ports: generic.input_ports.clone(),
+                output_ports: generic.output_ports.clone(),
+                input_port_types: generic.input_port_types.clone(),
+                output_port_types: generic.output_port_types.clone(),
+                params_schema: generic.params_schema.clone(),
+            });
+        }
+    }
+
     Ok(MessageBody::FlowNodeTemplatesListResponseBody(
         tentaflow_protocol::FlowNodeTemplatesListResponse { templates },
     ))

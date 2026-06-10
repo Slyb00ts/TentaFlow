@@ -11,6 +11,7 @@ import { Router } from '/js/router.js';
 import { FlowCanvas } from '/js/modules/flows-builder/canvas.js';
 import { FlowPalette } from '/js/modules/flows-builder/palette.js';
 import { FlowConfig } from '/js/modules/flows-builder/config.js';
+import { openVariablesEditor } from '/js/modules/flows-builder/variables.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
@@ -54,6 +55,7 @@ const FlowBuilderScreen = {
             <tf-button variant="ghost" size="sm" icon="max" data-role="zoom-fit" title="${escapeAttr(I18n.t('flows_builder.zoom_fit'))}"></tf-button>
           </div>
           <div class="fb-topbar-separator"></div>
+          <tf-button variant="ghost" size="sm" icon="code" data-role="variables" title="${escapeAttr(I18n.t('flows_vars.button_title'))}">${escapeHtml(I18n.t('flows_vars.button'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="play" data-role="test" title="${escapeAttr(I18n.t('flows_builder.test_title'))}">${escapeHtml(I18n.t('flows_builder.test'))}</tf-button>
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>
@@ -115,6 +117,9 @@ const FlowBuilderScreen = {
       autosaveTimer: null,
       saving: false,
       templatesMap: new Map(),
+      // Deklaracje zmiennych flow (§3.12 / R10). Wczytane z flow_json i
+      // dopisywane z powrotem przy zapisie — bez tego save gubilby sekcje.
+      flowVariables: [],
       cleanupFns: [],
     };
     this._state = state;
@@ -139,6 +144,7 @@ const FlowBuilderScreen = {
     try {
       parsed = JSON.parse(state.flow.flow_json || state.flow.flowJson || '{"nodes":[],"edges":[]}');
     } catch (_) { parsed = { nodes: [], edges: [] }; }
+    state.flowVariables = Array.isArray(parsed.variables) ? parsed.variables : [];
 
     // Paleta
     state.palette = new FlowPalette(root.querySelector('[data-role="palette"]'), {
@@ -230,6 +236,7 @@ const FlowBuilderScreen = {
     root.querySelector('[data-role="zoom-out"]').addEventListener('click', () => state.canvas.zoomBy(1 / 1.2));
     root.querySelector('[data-role="zoom-fit"]').addEventListener('click', () => state.canvas.fitToContent());
     root.querySelector('[data-role="save"]').addEventListener('click', () => this._save());
+    root.querySelector('[data-role="variables"]').addEventListener('click', () => this._openVariables());
     root.querySelector('[data-role="test"]').addEventListener('click', () => {
       toast(I18n.t('flows_builder.test_soon'), 'info');
     });
@@ -326,18 +333,25 @@ const FlowBuilderScreen = {
       const name = (nameEl.value || '').trim() || I18n.t('flows_builder.default_name');
       const status = statusEl.value || 'draft';
       const data = s.canvas.getData();
+      // `variables` dopisujemy tylko gdy niepuste — pusty flow round-trippuje
+      // byte-identycznie z legacy flow_json (serde skip_serializing_if).
+      const graph = { nodes: data.nodes, edges: data.edges };
+      if (Array.isArray(s.flowVariables) && s.flowVariables.length > 0) {
+        graph.variables = s.flowVariables;
+      }
+      const graphJson = JSON.stringify(graph);
       await ApiBinary.action('flowUpdateRequest', {
         flowId: String(s.flowId),
         name,
         description: s.flow.description ?? null,
-        flowJson: JSON.stringify({ nodes: data.nodes, edges: data.edges }),
+        flowJson: graphJson,
         status,
       });
       s.flow = {
         ...s.flow,
         name,
         status,
-        flow_json: JSON.stringify({ nodes: data.nodes, edges: data.edges }),
+        flow_json: graphJson,
       };
       s.dirty = false;
       this._setAutosave('ok', I18n.t('flows_builder.autosave_saved'));
@@ -348,6 +362,16 @@ const FlowBuilderScreen = {
     } finally {
       s.saving = false;
     }
+  },
+
+  async _openVariables() {
+    const s = this._state;
+    if (!s) return;
+    const result = await openVariablesEditor(s.flowVariables || []);
+    if (result === null) return; // anulowano — bez zmian
+    s.flowVariables = result;
+    this._markDirty();
+    toast(I18n.t('flows_vars.saved', { count: result.length }), 'success');
   },
 
   _onKey(ev) {

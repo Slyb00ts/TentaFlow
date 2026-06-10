@@ -1085,6 +1085,28 @@
     "edge_dangling": "L'arête pointe vers un nœud inexistant",
     "cycle_detected": "Cycle détecté dans le graphe de flux"
   },
+  "flows_vars": {
+    "title": "Variables du flux",
+    "button": "Variables",
+    "button_title": "Declarer les variables du flux",
+    "hint": "Declarez les variables du flux. Les blocs peuvent y ecrire via output_mapping uniquement si elles sont listees ici.",
+    "add": "Ajouter une variable",
+    "remove": "Supprimer",
+    "save": "Enregistrer",
+    "cancel": "Annuler",
+    "empty": "Aucune variable declaree.",
+    "col_name": "Nom",
+    "col_type": "Type",
+    "col_default": "Par defaut",
+    "col_description": "Description",
+    "name_placeholder": "ex. chosen_model",
+    "default_placeholder": "optionnel (JSON ou texte)",
+    "description_placeholder": "optionnel",
+    "saved": "Variables enregistrees ({count})",
+    "err_empty_name": "Le nom de la variable ne peut pas etre vide.",
+    "err_bad_name": "Nom invalide '{name}' — utilisez des minuscules, des chiffres et des underscores (commencer par une lettre).",
+    "err_duplicate": "Nom de variable en double '{name}'."
+  },
   "flows_palette": {
     "title": "Palette",
     "search_placeholder": "Rechercher un nœud...",
@@ -1177,7 +1199,13 @@
       "router": "Router",
       "output": "Sortie",
       "agent_context": "Contexte de l'agent",
-      "tool_exec": "Exécution des outils"
+      "tool_exec": "Exécution des outils",
+      "subflow": "Sous-flow",
+      "loop": "Boucle",
+      "map": "Map",
+      "agent": "Agent",
+      "agent_router": "Routeur d'agents",
+      "compact_context": "Compactage du contexte"
     },
     "node_descriptions": {
       "trigger": "Point d'entrée du flow (HTTP, QUIC, webhook)",
@@ -1199,7 +1227,13 @@
       "router": "Nœud de passage",
       "output": "Sortie du flow — renvoie le résultat",
       "agent_context": "Charge l'agent : prompt système, index des compétences, outils et signaux de boucle ; ouvre l'exécution",
-      "tool_exec": "Exécute les appels d'outils du modèle ; aucun appel termine la boucle de l'agent"
+      "tool_exec": "Exécute les appels d'outils du modèle ; aucun appel termine la boucle de l'agent",
+      "subflow": "Exécute un autre flow comme corps de ce flow ; renvoie le résultat de l'enfant",
+      "loop": "Répète le flow-corps jusqu'à ce que la condition soit vraie ou que le budget d'itérations soit épuisé",
+      "map": "Exécute le flow-corps en parallèle pour chaque élément du tableau ; résultats dans l'ordre d'entrée",
+      "agent": "Exécute un agent comme bloc et ne renvoie que le résumé (réponse finale)",
+      "agent_router": "Choisit le meilleur agent pour la tâche avec un appel LLM ; ne l'exécute pas",
+      "compact_context": "Résume le milieu de la conversation quand le contexte dépasse le seuil, en protégeant le system prompt et les messages les plus récents"
     },
     "fields": {
       "model": "Modèle",

@@ -20,6 +20,7 @@ pub mod node_adapter;
 pub mod node_adapters;
 pub mod progress_broker;
 pub mod resolver;
+pub mod subflow_runner;
 pub mod synthetic;
 pub mod types;
 pub mod validation;
