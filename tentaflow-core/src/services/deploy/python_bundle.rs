@@ -669,6 +669,7 @@ mod tests {
                 license: "".into(),
                 icon: None,
                 resource_kind: None,
+                provider: None,
                 requires_model: None,
                 gpu_supported: None,
                 default_port: 0,
