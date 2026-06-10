@@ -14,6 +14,7 @@ pub mod llm;
 pub mod memory;
 pub mod metrics;
 pub mod pii_rules;
+pub mod progress;
 pub mod prompts;
 pub mod stt;
 pub mod tts;
@@ -29,6 +30,7 @@ pub use memory::{
 };
 pub use metrics::{MetricsSink, NoopMetrics};
 pub use pii_rules::{PiiRule, PiiRulesStore};
+pub use progress::{NoopProgress, ProgressEvent, ProgressSink};
 pub use prompts::PromptStore;
 pub use stt::{SttDispatcher, SttRequest, SttResponse};
 pub use tts::{TtsDispatcher, TtsRequest, TtsResponse, TtsStreamChunk};

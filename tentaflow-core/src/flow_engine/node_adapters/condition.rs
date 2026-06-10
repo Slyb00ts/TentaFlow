@@ -2,16 +2,20 @@
 // Plik: flow_engine/node_adapters/condition.rs
 // Opis: ConditionNodeAdapter — eval warunku na polu envelope. Plan v4.2 D1:
 //       czyta wyłącznie z inputs[0] (single-input hard rule). Bez cross-node
-//       lookupu. Wynik trafia do envelope.meta["condition_result"]; executor
-//       routuje krawędzie po `from_port == "true" | "false"`.
+//       lookupu. Decyzja: `config.expression` (CEL bool nad envelope, §3.12)
+//       albo legacy field/operator/value. Wynik trafia do
+//       envelope.meta["condition_result"]; executor routuje krawędzie po
+//       `from_port == "true" | "false"` (skip-semantyka §3.11 A).
 // =============================================================================
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashSet;
 use tracing::warn;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
+use crate::flow_engine::expr::{evaluate_bool, ExprScope};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -56,33 +60,76 @@ impl NodeAdapter for ConditionNodeAdapter {
             .first()
             .ok_or_else(|| anyhow!("condition node requires exactly 1 input edge"))?;
 
-        let field = node
+        // Two decision sources, expression preferred (§3.12). A CEL bool over
+        // the envelope is the general path; the legacy field/operator/value
+        // triple stays for flows that predate CEL. The chosen source writes the
+        // bool into `decision.result`, which `active_output_ports` reads back
+        // for gating — the standalone bool is not needed past that point.
+        let decision = if let Some(expr) = node
             .config
-            .get("field")
+            .get("expression")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let operator = node
-            .config
-            .get("operator")
-            .and_then(|v| v.as_str())
-            .unwrap_or("equals");
-        let expected = node.config.get("value").cloned().unwrap_or(Value::Null);
-
-        let actual = resolve_field_value(field, &input.envelope);
-        let result = evaluate_condition(&actual, operator, &expected);
-
-        // Passthrough envelope, ale dopisujemy decision do meta. Executor
-        // używa wyniku do routowania (port "true" vs "false").
-        let mut out = (*input.envelope).clone();
-        out.meta.insert(
-            "condition_result".into(),
+            .filter(|s| !s.trim().is_empty())
+        {
+            let extras: [(&str, Value); 0] = [];
+            let scope = ExprScope {
+                vars: &input.envelope.variables,
+                payload: &input.envelope.payload,
+                artifacts: &input.envelope.artifacts,
+                meta: &input.envelope.meta,
+                extras: &extras,
+            };
+            let result = evaluate_bool(expr, &scope, None)
+                .map_err(|e| anyhow!("condition node '{}': {e}", node.id))?;
+            serde_json::json!({ "expression": expr, "result": result })
+        } else {
+            let field = node
+                .config
+                .get("field")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let operator = node
+                .config
+                .get("operator")
+                .and_then(|v| v.as_str())
+                .unwrap_or("equals");
+            let expected = node.config.get("value").cloned().unwrap_or(Value::Null);
+            let actual = resolve_field_value(field, &input.envelope);
+            let result = evaluate_condition(&actual, operator, &expected);
             serde_json::json!({
                 "field": field,
                 "operator": operator,
                 "result": result,
-            }),
-        );
+            })
+        };
+
+        // Passthrough envelope, ale dopisujemy decision do meta. `condition_result`
+        // zostaje dla downstream odczytów (back-compat), ale faktyczne bramkowanie
+        // robi teraz `active_output_ports` — executor pomija gałąź nieaktywnego
+        // portu zamiast wykonywać obie.
+        let mut out = (*input.envelope).clone();
+        out.meta.insert("condition_result".into(), decision);
         Ok(out)
+    }
+
+    /// Bramkowanie (§3.11 A): aktywuje dokładnie jeden port wyjściowy. Wynik
+    /// czytamy z `meta.condition_result.result` zapisanego w `execute` — jedno
+    /// źródło prawdy, brak ponownej ewaluacji warunku. Brak wpisu (np. wynik
+    /// przepuszczony przez inny adapter) traktujemy jako `false`, więc gałąź
+    /// `true` jest bramkowana zachowawczo.
+    fn active_output_ports(
+        &self,
+        _node: &FlowNode,
+        result: &FlowEnvelope,
+    ) -> Option<HashSet<String>> {
+        let decided = result
+            .meta
+            .get("condition_result")
+            .and_then(|v| v.get("result"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let port = if decided { "true" } else { "false" };
+        Some(HashSet::from([port.to_string()]))
     }
 }
 
@@ -340,6 +387,122 @@ mod tests {
                 .and_then(|v| v.get("result"))
                 .and_then(|v| v.as_bool()),
             Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_output_ports_gates_true_when_condition_true() {
+        let env = FlowEnvelope::with_payload(FlowValue::Text("hello".into()));
+        let inputs = vec![make_input(env)];
+        let node = condition_node("input", "equals", serde_json::json!("hello"));
+        let out = ConditionNodeAdapter
+            .execute(&node, &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        let active = ConditionNodeAdapter.active_output_ports(&node, &out).unwrap();
+        assert_eq!(active, HashSet::from(["true".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn active_output_ports_gates_false_when_condition_false() {
+        let env = FlowEnvelope::with_payload(FlowValue::Text("hello".into()));
+        let inputs = vec![make_input(env)];
+        let node = condition_node("input", "equals", serde_json::json!("other"));
+        let out = ConditionNodeAdapter
+            .execute(&node, &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        let active = ConditionNodeAdapter.active_output_ports(&node, &out).unwrap();
+        assert_eq!(active, HashSet::from(["false".to_string()]));
+    }
+
+    fn expression_node(expr: &str) -> FlowNode {
+        FlowNode {
+            id: "cond-expr".into(),
+            node_type: "condition".into(),
+            config: serde_json::json!({ "expression": expr }),
+            position: None,
+            label: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn expression_true_activates_true_port() {
+        let mut env = FlowEnvelope::with_payload(FlowValue::Text("hi".into()));
+        env.variables
+            .insert("attempt".into(), FlowValue::Json(serde_json::json!(3)));
+        let inputs = vec![make_input(env)];
+        let node = expression_node("vars.attempt > 2 && payload == \"hi\"");
+        let out = ConditionNodeAdapter
+            .execute(&node, &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            out.meta
+                .get("condition_result")
+                .and_then(|v| v.get("result"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let active = ConditionNodeAdapter.active_output_ports(&node, &out).unwrap();
+        assert_eq!(active, HashSet::from(["true".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn expression_false_activates_false_port() {
+        let mut env = FlowEnvelope::empty();
+        env.variables
+            .insert("attempt".into(), FlowValue::Json(serde_json::json!(1)));
+        let inputs = vec![make_input(env)];
+        let node = expression_node("vars.attempt > 2");
+        let out = ConditionNodeAdapter
+            .execute(&node, &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        let active = ConditionNodeAdapter.active_output_ports(&node, &out).unwrap();
+        assert_eq!(active, HashSet::from(["false".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn non_bool_expression_is_node_error() {
+        let env = FlowEnvelope::with_payload(FlowValue::Text("hi".into()));
+        let inputs = vec![make_input(env)];
+        let node = expression_node("payload");
+        let err = ConditionNodeAdapter
+            .execute(&node, &inputs, &stub_ctx())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cond-expr"), "{err}");
+        assert!(err.to_string().contains("expected bool"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn empty_expression_falls_back_to_legacy_field_logic() {
+        // Blank expression must not hijack the decision — legacy path runs.
+        let env = FlowEnvelope::with_payload(FlowValue::Text("go".into()));
+        let inputs = vec![make_input(env)];
+        let node = FlowNode {
+            id: "c".into(),
+            node_type: "condition".into(),
+            config: serde_json::json!({
+                "expression": "  ",
+                "field": "input",
+                "operator": "equals",
+                "value": "go"
+            }),
+            position: None,
+            label: None,
+        };
+        let out = ConditionNodeAdapter
+            .execute(&node, &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            out.meta
+                .get("condition_result")
+                .and_then(|v| v.get("result"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
         );
     }
 

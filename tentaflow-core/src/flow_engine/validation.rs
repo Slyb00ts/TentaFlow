@@ -13,8 +13,12 @@
 //         R6. condition edges (from_port "true"/"false") tylko z node'a
 //             "condition"
 //         R7. streaming end-shape — edge `from_port="stream"` musi prowadzić
-//             do node'a "output" z config.mode="stream", bez nodów po LLM
-//             na ścieżce do output. Co najwyżej jedna gałąź streaming na flow.
+//             do node'a "output" z config.mode="stream". Head łańcucha musi być
+//             zarejestrowanym `StreamProducerAdapter` (§3.11 B — nie zakładamy
+//             już LLM). Co najwyżej jedna gałąź streaming na node (poza output).
+//         R10. każda zmienna docelowa `output_mapping` node'a musi być
+//             zadeklarowana w sekcji `variables` flow (§3.12). Brak sekcji =
+//             zero dozwolonych zmiennych → output_mapping do czegokolwiek błąd.
 // =============================================================================
 
 use std::collections::{HashMap, HashSet};
@@ -84,6 +88,34 @@ pub enum FlowValidationError {
         to_node: String,
         to_port: String,
         to_type: FlowDataType,
+    },
+    /// R10: `output_mapping` zapisuje do zmiennej spoza sekcji `variables`.
+    UndeclaredVariableTarget {
+        node_id: String,
+        variable: String,
+    },
+    /// R10: deklaracja `input_mapping`/`output_mapping` nie jest obiektem
+    /// {klucz: "<CEL>"} albo wartość nie jest stringiem.
+    MalformedMapping {
+        node_id: String,
+        mapping: &'static str,
+        detail: String,
+    },
+    /// R7 (§3.11 B): head of a stream chain (`from_port="stream"` producer)
+    /// has no registered `StreamProducerAdapter`.
+    StreamProducerNotRegistered {
+        node_id: String,
+        node_type: String,
+    },
+    /// R7 (§3.12): a stream-producing node declares io-mapping. The streaming
+    /// dispatch path drives the producer directly (no executor overlay), so
+    /// `input_mapping`/`output_mapping` would silently no-op while the same
+    /// flow's blocking path applies them — rejected to keep the two paths
+    /// from diverging.
+    StreamProducerWithIoMapping {
+        node_id: String,
+        node_type: String,
+        mapping: &'static str,
     },
 }
 
@@ -166,6 +198,30 @@ impl fmt::Display for FlowValidationError {
             } => write!(
                 f,
                 "edge {from_node}.{from_port} (type {from_type:?}) -> {to_node}.{to_port} (type {to_type:?}): incompatible types"
+            ),
+            Self::UndeclaredVariableTarget { node_id, variable } => write!(
+                f,
+                "node '{node_id}' output_mapping writes undeclared variable '{variable}'; \
+                 declare it in the flow's variables section"
+            ),
+            Self::MalformedMapping {
+                node_id,
+                mapping,
+                detail,
+            } => write!(f, "node '{node_id}' {mapping} is malformed: {detail}"),
+            Self::StreamProducerNotRegistered { node_id, node_type } => write!(
+                f,
+                "node '{node_id}' (type '{node_type}') produces a stream edge but has no \
+                 registered StreamProducerAdapter"
+            ),
+            Self::StreamProducerWithIoMapping {
+                node_id,
+                node_type,
+                mapping,
+            } => write!(
+                f,
+                "node '{node_id}' (type '{node_type}') is a stream producer and cannot declare \
+                 {mapping}; the streaming path does not apply io-mapping to the producer"
             ),
         }
     }
@@ -402,6 +458,34 @@ pub fn validate(
         .filter(|node_id| !stream_in_count.contains_key(*node_id))
         .collect();
     for producer in producers {
+        // §3.11 B — the head of a stream chain must be a registered
+        // `StreamProducerAdapter` (LLM is one such producer). R7 no longer
+        // assumes node_type=="llm" — any registered producer is accepted.
+        let producer_node = nodes_by_id[producer];
+        if !registry.is_stream_producer(&producer_node.node_type) {
+            return Err(FlowValidationError::StreamProducerNotRegistered {
+                node_id: producer_node.id.clone(),
+                node_type: producer_node.node_type.clone(),
+            });
+        }
+        // §3.12: the streaming dispatch path drives the producer via
+        // `produce_stream(node, ...)` with the raw config — io-mapping never
+        // overlays there. Forbid it so a savable flow cannot behave one way in
+        // blocking dispatch and silently no-op the mapping in streaming.
+        if producer_node.config.get("input_mapping").is_some() {
+            return Err(FlowValidationError::StreamProducerWithIoMapping {
+                node_id: producer_node.id.clone(),
+                node_type: producer_node.node_type.clone(),
+                mapping: "input_mapping",
+            });
+        }
+        if producer_node.config.get("output_mapping").is_some() {
+            return Err(FlowValidationError::StreamProducerWithIoMapping {
+                node_id: producer_node.id.clone(),
+                node_type: producer_node.node_type.clone(),
+                mapping: "output_mapping",
+            });
+        }
         let mut seen: HashSet<&str> = HashSet::new();
         let mut current_id = producer;
         seen.insert(current_id);
@@ -445,6 +529,68 @@ pub fn validate(
         }
     }
 
+    // R10: output_mapping targets must be declared variables (§3.12). Absent
+    // `variables` section = empty allow-set, so any output_mapping is rejected.
+    let declared: HashSet<&str> = def.variables.iter().map(|v| v.name.as_str()).collect();
+    for node in &def.nodes {
+        validate_mapping_shape(node, "input_mapping")?;
+        let Some(mapping) = node.config.get("output_mapping") else {
+            continue;
+        };
+        let obj = mapping
+            .as_object()
+            .ok_or_else(|| FlowValidationError::MalformedMapping {
+                node_id: node.id.clone(),
+                mapping: "output_mapping",
+                detail: "must be an object {variable: \"<CEL>\"}".to_string(),
+            })?;
+        for (variable, expr) in obj {
+            if !expr.is_string() {
+                return Err(FlowValidationError::MalformedMapping {
+                    node_id: node.id.clone(),
+                    mapping: "output_mapping",
+                    detail: format!("value for '{variable}' must be a CEL string"),
+                });
+            }
+            if !declared.contains(variable.as_str()) {
+                return Err(FlowValidationError::UndeclaredVariableTarget {
+                    node_id: node.id.clone(),
+                    variable: variable.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Shared shape check for io-mapping declarations: the key must hold an object
+/// of `{name: "<CEL string>"}`. Reused for `input_mapping` (R10 does not gate
+/// its keys — they target node config, not variables — but the shape must be
+/// well-formed so the executor's overlay cannot misfire silently).
+fn validate_mapping_shape(
+    node: &crate::flow_engine::types::FlowNode,
+    mapping: &'static str,
+) -> Result<(), FlowValidationError> {
+    let Some(value) = node.config.get(mapping) else {
+        return Ok(());
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| FlowValidationError::MalformedMapping {
+            node_id: node.id.clone(),
+            mapping,
+            detail: "must be an object {key: \"<CEL>\"}".to_string(),
+        })?;
+    for (key, expr) in obj {
+        if !expr.is_string() {
+            return Err(FlowValidationError::MalformedMapping {
+                node_id: node.id.clone(),
+                mapping,
+                detail: format!("value for '{key}' must be a CEL string"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -550,6 +696,150 @@ mod tests {
             }"#,
         );
         validate(&def, &registry()).unwrap();
+    }
+
+    /// §3.12 — R7 rejects a stream producer carrying `input_mapping`: the
+    /// streaming dispatch path drives the producer with the raw config and
+    /// never overlays io-mapping, so allowing it would silently diverge from
+    /// the blocking path on the same saved flow.
+    #[test]
+    fn rejects_stream_producer_with_input_mapping() {
+        let def = parse(
+            r#"{
+                "variables":[{"name":"chosen","type":"text"}],
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m","input_mapping":{"model":"vars.chosen"}}},
+                    {"id":"o","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l","from_port":"text"},
+                    {"from":"l","to":"o","from_port":"stream","to_port":"text"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlowValidationError::StreamProducerWithIoMapping {
+                    mapping: "input_mapping",
+                    ..
+                }
+            ),
+            "expected StreamProducerWithIoMapping(input_mapping), got {err:?}"
+        );
+    }
+
+    /// §3.12 — same rejection for `output_mapping` on a stream producer (the
+    /// finalizer never applies output_mapping to the producer either).
+    #[test]
+    fn rejects_stream_producer_with_output_mapping() {
+        let def = parse(
+            r#"{
+                "variables":[{"name":"answer","type":"text"}],
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m","output_mapping":{"answer":"payload"}}},
+                    {"id":"o","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l","from_port":"text"},
+                    {"from":"l","to":"o","from_port":"stream","to_port":"text"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlowValidationError::StreamProducerWithIoMapping {
+                    mapping: "output_mapping",
+                    ..
+                }
+            ),
+            "expected StreamProducerWithIoMapping(output_mapping), got {err:?}"
+        );
+    }
+
+    /// A non-producer node carrying io-mapping in a streaming flow is still
+    /// fine — only the producer is restricted. The pre-producer `llm`-less
+    /// path applies io-mapping normally.
+    #[test]
+    fn accepts_io_mapping_on_pre_producer_node_in_streaming_flow() {
+        let def = parse(
+            r#"{
+                "variables":[{"name":"seen","type":"text"}],
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{"output_mapping":{"seen":"payload"}}},
+                    {"id":"l","type":"llm","config":{"model":"m"}},
+                    {"id":"o","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l","from_port":"text"},
+                    {"from":"l","to":"o","from_port":"stream","to_port":"text"}
+                ]
+            }"#,
+        );
+        validate(&def, &registry()).unwrap();
+    }
+
+    /// §3.11 B — R7 accepts a non-LLM `StreamProducerAdapter` as the head of a
+    /// stream chain terminating at output(stream).
+    #[test]
+    fn ok_streaming_shape_non_llm_producer() {
+        use crate::flow_engine::node_adapter::test_support::TestStreamProducer;
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_stream_producer(Arc::new(TestStreamProducer::new("test_producer")));
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"p","type":"test_producer","config":{}},
+                    {"id":"o","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"p","from_port":"text","to_port":"in"},
+                    {"from":"p","to":"o","from_port":"stream","to_port":"text"}
+                ]
+            }"#,
+        );
+        validate(&def, &r).unwrap();
+    }
+
+    /// §3.11 B — R7 rejects a stream edge whose producer node has a `stream`
+    /// output port (so R3 passes) but is NOT registered in the stream-producer
+    /// slot. Here the test adapter is registered via plain `register` instead
+    /// of `register_stream_producer`.
+    #[test]
+    fn rejects_stream_from_non_producer() {
+        use crate::flow_engine::node_adapter::test_support::TestStreamProducer;
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        // Plain register: the adapter exposes a `stream` port (R3 ok) but is
+        // absent from the producer slot (R7 must reject).
+        r.register(Arc::new(TestStreamProducer::new("fake_stream")));
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"p","type":"fake_stream","config":{}},
+                    {"id":"o","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"p","from_port":"text","to_port":"in"},
+                    {"from":"p","to":"o","from_port":"stream","to_port":"text"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &r).unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::StreamProducerNotRegistered { .. }),
+            "expected StreamProducerNotRegistered, got {err:?}"
+        );
     }
 
     #[test]
@@ -832,6 +1122,105 @@ mod tests {
             err,
             FlowValidationError::StreamingNotToOutput { .. }
         ));
+    }
+
+    #[test]
+    fn r10_rejects_output_mapping_to_undeclared_variable() {
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"o","type":"output","config":{"output_mapping":{"answer":"payload"}}}
+                ],
+                "edges":[
+                    {"from":"t","to":"o","from_port":"text","to_port":"text"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlowValidationError::UndeclaredVariableTarget { ref variable, .. } if variable == "answer"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn r10_accepts_output_mapping_to_declared_variable() {
+        let def = parse(
+            r#"{
+                "variables":[{"name":"answer","type":"text"}],
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"o","type":"output","config":{"output_mapping":{"answer":"payload"}}}
+                ],
+                "edges":[
+                    {"from":"t","to":"o","from_port":"text","to_port":"text"}
+                ]
+            }"#,
+        );
+        validate(&def, &registry()).expect("declared variable target must pass R10");
+    }
+
+    #[test]
+    fn r10_absent_variables_section_rejects_any_output_mapping() {
+        // No `variables` key at all = empty allow-set.
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"o","type":"output","config":{"output_mapping":{"x":"1"}}}
+                ],
+                "edges":[
+                    {"from":"t","to":"o","from_port":"text","to_port":"text"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::UndeclaredVariableTarget { .. }
+        ));
+    }
+
+    #[test]
+    fn r10_input_mapping_keys_are_not_gated_by_declarations() {
+        // input_mapping targets node config, not variables — must pass even
+        // without a variables section, as long as it is well-formed.
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"input_mapping":{"model":"vars.m"}}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l","from_port":"text"},
+                    {"from":"l","to":"o","to_port":"text"}
+                ]
+            }"#,
+        );
+        validate(&def, &registry()).expect("input_mapping must not be gated by R10");
+    }
+
+    #[test]
+    fn r10_rejects_malformed_output_mapping() {
+        let def = parse(
+            r#"{
+                "variables":[{"name":"x","type":"any"}],
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"o","type":"output","config":{"output_mapping":{"x":42}}}
+                ],
+                "edges":[
+                    {"from":"t","to":"o","from_port":"text","to_port":"text"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(err, FlowValidationError::MalformedMapping { .. }));
     }
 
     #[test]

@@ -846,6 +846,7 @@ pub async fn handle_request(
             mesh_services_registry: mesh_services_registry.clone(),
             live_handles: service_manager.live_handles.clone(),
             ui_sessions: shared_sessions.clone(),
+            progress_broker: crate::flow_engine::progress_broker::global_broker(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);

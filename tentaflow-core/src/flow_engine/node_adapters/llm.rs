@@ -10,9 +10,14 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::LlmRequest;
-use crate::flow_engine::envelope::{ChatMessage, ChatRole, FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, LlmAdapter, NodeAdapter, PortSpec};
+use crate::flow_engine::envelope::{
+    ChatMessage, ChatRole, EnvelopeDelta, FlowEnvelope, FlowValue, NodeInput,
+};
+use crate::flow_engine::node_adapter::{
+    ExecutionContext, LlmAdapter, NodeAdapter, PortSpec, StreamProducerAdapter,
+};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
+use futures::stream::{BoxStream, StreamExt};
 
 const NODE_TYPE: &str = "llm";
 
@@ -249,6 +254,29 @@ impl LlmAdapter for LlmNodeAdapter {
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
         })
+    }
+}
+
+/// §3.11 B — LLM jest jednym z producentów strumienia. Ten impl owija
+/// dotychczasową ścieżkę streamingu (`prepare_llm_request` + `ctx.llm.
+/// stream_chat`) bez duplikacji budowania requestu — executor woła
+/// `produce_stream` zamiast inline'owego `ctx.llm.stream_chat`, a slot
+/// producenta jest teraz uniwersalny (`AdapterRegistry::stream_producer`).
+#[async_trait]
+impl StreamProducerAdapter for LlmNodeAdapter {
+    async fn produce_stream(
+        &self,
+        node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+        let request = self.prepare_llm_request(node, inputs, ctx);
+        let adapter_stream = ctx
+            .llm
+            .stream_chat(request)
+            .await
+            .map_err(|e| anyhow!("stream_chat failed: {e}"))?;
+        Ok(adapter_stream.map(|res| res.map(EnvelopeDelta::Llm)).boxed())
     }
 }
 

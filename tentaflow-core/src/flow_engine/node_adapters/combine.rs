@@ -9,11 +9,15 @@
 //       history, system_prompts) bierze z pierwszego inputu — wszystkie
 //       branche zaczynaja od tego samego triggera, wiec metadane sa zwykle
 //       identyczne. Payload nadpisany na zlepiony tekst, artifacts z
-//       pierwszego inputu zachowane.
+//       pierwszego inputu zachowane. Variables z wszystkich live branchy
+//       scalane per-key polityka z configu (§3.12).
 // =============================================================================
+
+use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use serde_json::Value;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
@@ -94,8 +98,128 @@ impl NodeAdapter for CombineNodeAdapter {
         // meta nie laczymy zeby uniknac konfliktu duplikatow.
         let mut out = (*sorted[0].envelope).clone();
         out.payload = FlowValue::Text(joined);
+        // Variables z wszystkich live branchy scalane per-key polityka (§3.12).
+        // Skipped poprzednicy nie maja outputu, wiec build_inputs ich pomija —
+        // tu sa tylko zywe wejscia. Bez wejsc lub w liniowym flow (1 wejscie)
+        // to passthrough variables pierwszego brancha.
+        out.variables = merge_variables(node, &sorted)?;
         Ok(out)
     }
+}
+
+/// Per-key conflict policy parsed from `node.config.variable_merge_policy`.
+/// Default (no entry) = a different value for the same key on two branches is
+/// a node error (§3.12) — deterministic and debuggable.
+enum MergePolicy {
+    /// Last branch (deterministic `from_node_id` order) wins on conflict.
+    LastWins,
+    /// The branch whose `from_port` equals the configured port wins.
+    PreferPort(String),
+    /// Collect all branch values into a JSON array (input order).
+    Collect,
+}
+
+/// Merges `variables` from every live branch using the per-key policy. Branches
+/// are pre-sorted by `from_node_id` so `last_wins`/`collect` are deterministic.
+fn merge_variables(
+    node: &FlowNode,
+    sorted: &[&NodeInput],
+) -> Result<BTreeMap<String, FlowValue>> {
+    let policies = parse_policies(node)?;
+    let mut merged: BTreeMap<String, FlowValue> = BTreeMap::new();
+    // For `collect` we accumulate arrays; for `prefer_port` we track whether the
+    // winning port already supplied a value so a later branch cannot override it.
+    let mut collected: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut prefer_locked: BTreeMap<String, bool> = BTreeMap::new();
+
+    for input in sorted {
+        for (key, value) in &input.envelope.variables {
+            match policies.get(key) {
+                Some(MergePolicy::Collect) => {
+                    collected
+                        .entry(key.clone())
+                        .or_default()
+                        .push(crate::flow_engine::expr::flow_value_to_json(value));
+                }
+                Some(MergePolicy::PreferPort(port)) => {
+                    let locked = prefer_locked.entry(key.clone()).or_insert(false);
+                    if input.from_port == *port {
+                        merged.insert(key.clone(), value.clone());
+                        *locked = true;
+                    } else if !*locked && !merged.contains_key(key) {
+                        // Hold a non-preferred value only until the preferred
+                        // port supplies one; the preferred port always wins.
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
+                Some(MergePolicy::LastWins) => {
+                    merged.insert(key.clone(), value.clone());
+                }
+                None => match merged.get(key) {
+                    Some(existing) if existing != value => {
+                        return Err(anyhow!(
+                            "combine node '{}': conflicting values for variable '{key}' \
+                             across branches and no merge policy configured \
+                             (set variable_merge_policy['{key}'] to last_wins, \
+                             prefer_port:<port> or collect)",
+                            node.id
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                },
+            }
+        }
+    }
+
+    for (key, values) in collected {
+        merged.insert(key, FlowValue::Json(Value::Array(values)));
+    }
+    Ok(merged)
+}
+
+/// Parses `node.config.variable_merge_policy` ({key: policy-string}) into the
+/// per-key policy map. `"last_wins"` | `"collect"` | `"prefer_port:<port>"`.
+fn parse_policies(node: &FlowNode) -> Result<BTreeMap<String, MergePolicy>> {
+    let Some(obj) = node
+        .config
+        .get("variable_merge_policy")
+        .and_then(|v| v.as_object())
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut policies = BTreeMap::new();
+    for (key, spec) in obj {
+        let spec = spec.as_str().ok_or_else(|| {
+            anyhow!(
+                "combine node '{}': variable_merge_policy['{key}'] must be a string",
+                node.id
+            )
+        })?;
+        let policy = if spec == "last_wins" {
+            MergePolicy::LastWins
+        } else if spec == "collect" {
+            MergePolicy::Collect
+        } else if let Some(port) = spec.strip_prefix("prefer_port:") {
+            if port.is_empty() {
+                return Err(anyhow!(
+                    "combine node '{}': prefer_port policy for '{key}' needs a port name",
+                    node.id
+                ));
+            }
+            MergePolicy::PreferPort(port.to_string())
+        } else {
+            return Err(anyhow!(
+                "combine node '{}': unknown merge policy '{spec}' for variable '{key}' \
+                 (expected last_wins, collect or prefer_port:<port>)",
+                node.id
+            ));
+        };
+        policies.insert(key.clone(), policy);
+    }
+    Ok(policies)
 }
 
 /// Mapuje dowolny `FlowValue` na string. Dla typow blob-owych zwraca krotki
@@ -148,6 +272,32 @@ mod tests {
             from_node_id: from_node_id.into(),
             from_port: "full".into(),
             envelope: Arc::new(env),
+        }
+    }
+
+    fn input_with_vars(
+        from_node_id: &str,
+        from_port: &str,
+        vars: &[(&str, FlowValue)],
+    ) -> NodeInput {
+        let mut env = FlowEnvelope::with_payload(FlowValue::Text(from_node_id.into()));
+        for (k, v) in vars {
+            env.variables.insert((*k).to_string(), v.clone());
+        }
+        NodeInput {
+            from_node_id: from_node_id.into(),
+            from_port: from_port.into(),
+            envelope: Arc::new(env),
+        }
+    }
+
+    fn combine_node_with_policy(policy: serde_json::Value) -> FlowNode {
+        FlowNode {
+            id: "c1".into(),
+            node_type: "combine".into(),
+            config: serde_json::json!({ "variable_merge_policy": policy }),
+            position: None,
+            label: None,
         }
     }
 
@@ -256,6 +406,126 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no incoming edges"));
+    }
+
+    #[tokio::test]
+    async fn combine_passthrough_variables_from_single_branch() {
+        let adapter = CombineNodeAdapter::new();
+        let inputs = vec![input_with_vars(
+            "a",
+            "full",
+            &[("done", FlowValue::Json(serde_json::json!(true)))],
+        )];
+        let out = adapter
+            .execute(&combine_node(None), &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            out.variables.get("done"),
+            Some(&FlowValue::Json(serde_json::json!(true)))
+        );
+    }
+
+    #[tokio::test]
+    async fn combine_merges_disjoint_variables_without_policy() {
+        let adapter = CombineNodeAdapter::new();
+        let inputs = vec![
+            input_with_vars("a", "full", &[("x", FlowValue::Text("1".into()))]),
+            input_with_vars("b", "full", &[("y", FlowValue::Text("2".into()))]),
+        ];
+        let out = adapter
+            .execute(&combine_node(None), &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out.variables.get("x"), Some(&FlowValue::Text("1".into())));
+        assert_eq!(out.variables.get("y"), Some(&FlowValue::Text("2".into())));
+    }
+
+    #[tokio::test]
+    async fn combine_same_value_same_key_is_not_a_conflict() {
+        let adapter = CombineNodeAdapter::new();
+        let inputs = vec![
+            input_with_vars("a", "full", &[("k", FlowValue::Text("same".into()))]),
+            input_with_vars("b", "full", &[("k", FlowValue::Text("same".into()))]),
+        ];
+        let out = adapter
+            .execute(&combine_node(None), &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out.variables.get("k"), Some(&FlowValue::Text("same".into())));
+    }
+
+    #[tokio::test]
+    async fn combine_conflicting_values_without_policy_is_error() {
+        let adapter = CombineNodeAdapter::new();
+        let inputs = vec![
+            input_with_vars("a", "full", &[("k", FlowValue::Text("one".into()))]),
+            input_with_vars("b", "full", &[("k", FlowValue::Text("two".into()))]),
+        ];
+        let err = adapter
+            .execute(&combine_node(None), &inputs, &stub_ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("conflicting values for variable 'k'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn combine_last_wins_policy_resolves_conflict() {
+        let adapter = CombineNodeAdapter::new();
+        // Sorted by from_node_id: a then b — b wins.
+        let inputs = vec![
+            input_with_vars("a", "full", &[("k", FlowValue::Text("one".into()))]),
+            input_with_vars("b", "full", &[("k", FlowValue::Text("two".into()))]),
+        ];
+        let node = combine_node_with_policy(serde_json::json!({"k": "last_wins"}));
+        let out = adapter.execute(&node, &inputs, &stub_ctx()).await.unwrap();
+        assert_eq!(out.variables.get("k"), Some(&FlowValue::Text("two".into())));
+    }
+
+    #[tokio::test]
+    async fn combine_prefer_port_policy_picks_winning_port() {
+        let adapter = CombineNodeAdapter::new();
+        let inputs = vec![
+            input_with_vars("a", "draft", &[("k", FlowValue::Text("draft".into()))]),
+            input_with_vars("b", "final", &[("k", FlowValue::Text("final".into()))]),
+        ];
+        let node = combine_node_with_policy(serde_json::json!({"k": "prefer_port:final"}));
+        let out = adapter.execute(&node, &inputs, &stub_ctx()).await.unwrap();
+        assert_eq!(
+            out.variables.get("k"),
+            Some(&FlowValue::Text("final".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn combine_collect_policy_builds_array_in_input_order() {
+        let adapter = CombineNodeAdapter::new();
+        let inputs = vec![
+            input_with_vars("a", "full", &[("k", FlowValue::Text("a".into()))]),
+            input_with_vars("b", "full", &[("k", FlowValue::Text("b".into()))]),
+        ];
+        let node = combine_node_with_policy(serde_json::json!({"k": "collect"}));
+        let out = adapter.execute(&node, &inputs, &stub_ctx()).await.unwrap();
+        assert_eq!(
+            out.variables.get("k"),
+            Some(&FlowValue::Json(serde_json::json!(["a", "b"])))
+        );
+    }
+
+    #[tokio::test]
+    async fn combine_unknown_merge_policy_is_error() {
+        let adapter = CombineNodeAdapter::new();
+        let inputs = vec![input_with_vars(
+            "a",
+            "full",
+            &[("k", FlowValue::Text("v".into()))],
+        )];
+        let node = combine_node_with_policy(serde_json::json!({"k": "merge_somehow"}));
+        let err = adapter.execute(&node, &inputs, &stub_ctx()).await.unwrap_err();
+        assert!(err.to_string().contains("unknown merge policy"), "{err}");
     }
 
     #[test]

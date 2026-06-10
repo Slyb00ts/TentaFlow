@@ -32,6 +32,7 @@ pub fn synthetic_chat(model: &str) -> FlowDefinition {
             // /other) — pii_filter zwraca Text wiec idziemy do `text`.
             edge("p1", "o1", "full", "text"),
         ],
+        variables: Vec::new(),
     }
 }
 
@@ -54,6 +55,7 @@ pub fn synthetic_chat_stream(model: &str) -> FlowDefinition {
             edge("l1", "p1", "stream", "in"),
             edge("p1", "o1", "stream", "text"),
         ],
+        variables: Vec::new(),
     }
 }
 
@@ -70,6 +72,7 @@ pub fn synthetic_tts(model: &str) -> FlowDefinition {
             // TTS produkuje Audio → output.audio.
             edge("t2", "o1", "full", "audio"),
         ],
+        variables: Vec::new(),
     }
 }
 
@@ -87,6 +90,7 @@ pub fn synthetic_stt(model: &str) -> FlowDefinition {
             // STT zwraca tekst transkrypcji → output.text.
             edge("s1", "o1", "full", "text"),
         ],
+        variables: Vec::new(),
     }
 }
 
@@ -103,6 +107,7 @@ pub fn synthetic_embeddings(model: &str) -> FlowDefinition {
             // Embeddings produkuje Embedding → output.embedding.
             edge("e1", "o1", "full", "embedding"),
         ],
+        variables: Vec::new(),
     }
 }
 

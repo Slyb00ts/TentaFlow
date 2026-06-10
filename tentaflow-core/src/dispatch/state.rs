@@ -65,6 +65,12 @@ pub struct AppState {
     pub live_handles: Arc<LiveHandlesCache>,
     /// Per-WS-connection UI panel session state (Faza 6 Krok 4).
     pub ui_sessions: Arc<SessionRegistry>,
+    /// §3.11 C — ephemeral execution progress fan-out. Per-scope tokio
+    /// broadcast (session / run id). The flow executor publishes via a
+    /// `BrokerProgressSink` (injected per request on `FlowRequestMeta`);
+    /// phase-3 wire handlers (`AgentsPayload::RunEventsSubscribe`) subscribe.
+    /// Events are ephemeral — durable record stays in `run_log`.
+    pub progress_broker: Arc<crate::flow_engine::progress_broker::ProgressBroker>,
 }
 
 impl AppState {
@@ -119,6 +125,7 @@ impl AppState {
                 crate::addon::ui_session::init_global_registry(reg.clone());
                 reg
             },
+            progress_broker: crate::flow_engine::progress_broker::global_broker(),
         })
     }
 }

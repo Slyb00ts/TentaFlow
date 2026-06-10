@@ -178,11 +178,31 @@ fn is_default_port_in(s: &str) -> bool {
     s == "in"
 }
 
+/// Deklaracja zmiennej flow (§3.12). Flow Builder pokazuje je w panelu flow;
+/// R10 wymaga, by kazdy `output_mapping` zapisywal wylacznie do zadeklarowanej
+/// zmiennej. Pole opcjonalne w flow_json — brak sekcji = zero dozwolonych
+/// zmiennych (output_mapping do czegokolwiek = blad walidacji).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariableDeclaration {
+    pub name: String,
+    #[serde(rename = "type", default)]
+    pub var_type: FlowDataType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Pelna definicja flow (parsowana z flow_json w DB)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowDefinition {
     pub nodes: Vec<FlowNode>,
     pub edges: Vec<FlowEdge>,
+    /// Zadeklarowane zmienne flow (§3.12 / R10). Default puste — legacy
+    /// flow_json bez tej sekcji round-trippuje byte-identycznie i nie pozwala
+    /// na zaden output_mapping (zachowawczo).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<VariableDeclaration>,
 }
 
 #[cfg(test)]
