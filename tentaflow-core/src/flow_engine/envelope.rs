@@ -101,6 +101,11 @@ pub struct ChatMessage {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Tool invocations requested by an assistant message. `None` for every
+    /// other role and for assistant turns without tool calls — the tool loop
+    /// resends these verbatim so the backend sees a valid call/result pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<LlmToolCall>>,
 }
 
 /// Etap 3b: content multimodal. Pre-3b każdy adapter trzymał `String` —
@@ -146,6 +151,7 @@ impl ChatMessage {
             content: ChatMessageContent::Text(content.into()),
             name: None,
             tool_call_id: None,
+            tool_calls: None,
         }
     }
 
@@ -155,6 +161,7 @@ impl ChatMessage {
             content: ChatMessageContent::Text(content.into()),
             name: None,
             tool_call_id: None,
+            tool_calls: None,
         }
     }
 
@@ -164,6 +171,7 @@ impl ChatMessage {
             content: ChatMessageContent::Text(content.into()),
             name: None,
             tool_call_id: None,
+            tool_calls: None,
         }
     }
 
@@ -174,6 +182,7 @@ impl ChatMessage {
             content: ChatMessageContent::Parts(parts),
             name: None,
             tool_call_id: None,
+            tool_calls: None,
         }
     }
 
@@ -386,6 +395,16 @@ pub struct LlmStreamChunk {
     /// Engine-level error embedded w streamie (np. backend rate limit). Adapter
     /// może zdecydować — przerwać flow albo skonsumować i kontynuować.
     pub error: Option<String>,
+}
+
+/// Completed tool invocation requested by the model. `arguments` is a
+/// JSON-encoded string (OpenAI wire compatibility) — consumers parse it
+/// against the tool parameter schema before dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 /// Streamingowy delta wywołań narzędzi. Indeks identyfikuje slot toola w

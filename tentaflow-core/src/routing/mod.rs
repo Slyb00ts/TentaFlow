@@ -317,6 +317,18 @@ fn message_to_chat_message(m: &Message) -> Option<ChatMessage> {
         content,
         name: m.name.clone(),
         tool_call_id: m.tool_call_id.clone(),
+        // Inbound history replay: an external tool loop resends the assistant
+        // message that requested the calls — dropping them here would break
+        // the call/result pairing the backend validates.
+        tool_calls: m.tool_calls.as_ref().map(|tcs| {
+            tcs.iter()
+                .map(|tc| crate::flow_engine::envelope::LlmToolCall {
+                    id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                })
+                .collect()
+        }),
     })
 }
 

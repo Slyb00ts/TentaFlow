@@ -382,7 +382,9 @@ impl InferenceEngine for LlamaCppEngine {
         // prefillu/TTFT nie zaniża tempa dekodowania. Bez pierwszego tokena (0 lub 1
         // wygenerowany) tempo nie ma sensu → 0.0.
         let decode_secs = match ttft {
-            Some(t) => elapsed.saturating_sub(t.duration_since(start)).as_secs_f64(),
+            Some(t) => elapsed
+                .saturating_sub(t.duration_since(start))
+                .as_secs_f64(),
             None => 0.0,
         };
         let tokens_per_second = if decode_secs > 0.0 && generated_tokens > 1 {

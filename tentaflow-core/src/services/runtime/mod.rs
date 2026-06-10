@@ -12,6 +12,7 @@ pub mod quic_handle;
 pub mod resolver;
 pub mod strategy;
 pub mod target;
+pub mod tool_calling;
 pub mod transport_client;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};

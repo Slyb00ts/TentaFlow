@@ -42,6 +42,27 @@ pub struct AiEventHandle {
     event_id: String,
 }
 
+/// One EXECUTED tool call (HARNESS_PLAN §3.1) — the real outcome of running
+/// a tool, as opposed to the model's request rows written at finish. Payloads
+/// are hashed by the repository; only hashes reach the table.
+#[derive(Debug, Clone)]
+pub struct ToolExecution<'a> {
+    /// Model-issued call id (`LlmToolCall.id`).
+    pub tool_call_id: &'a str,
+    /// Owning addon; `None` for core built-in tools.
+    pub addon_id: Option<&'a str>,
+    /// Public tool name (`"addon_id.tool_name"`).
+    pub tool_name: &'a str,
+    /// Arguments JSON as handed to the tool.
+    pub arguments: &'a str,
+    /// Tool output JSON (or error payload returned to the model).
+    pub output: &'a str,
+    pub success: bool,
+    pub error_message: Option<&'a str>,
+    /// Execution start; the finish instant is the recording time.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl AiGateway {
     pub fn new(db: DbPool, node_id: impl Into<String>) -> Self {
         Self {
@@ -99,6 +120,36 @@ impl AiEventHandle {
         &self.event_id
     }
 
+    /// Records the result of one executed tool call into
+    /// `compliance_ai_tool_calls`. Called by the tool loop right after the
+    /// tool returns — pairs the model-issued call id with the real status,
+    /// output hash and timing. Returns the row's UUID `tool_call_id`.
+    pub fn record_tool_execution(&self, execution: &ToolExecution<'_>) -> Result<String> {
+        let conn = self.db.lock().map_err(|_| anyhow!("DB lock poisoned"))?;
+        let started_at = execution
+            .started_at
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        add_ai_tool_call(
+            &conn,
+            &NewAiToolCall {
+                event_id: &self.event_id,
+                llm_tool_call_id: Some(execution.tool_call_id),
+                addon_id: execution.addon_id,
+                tool_name: execution.tool_name,
+                input_text: execution.arguments,
+                output_text: execution.output,
+                status: if execution.success {
+                    ToolCallStatus::Success
+                } else {
+                    ToolCallStatus::Failed
+                },
+                error_message: execution.error_message,
+                started_at: Some(&started_at),
+            },
+        )
+    }
+
     pub fn finish_success(&self, response: &ChatCompletionResponse) -> Result<()> {
         let conn = self.db.lock().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let response_text = chat_response_text(response);
@@ -120,12 +171,17 @@ impl AiEventHandle {
                 &conn,
                 &NewAiToolCall {
                     event_id: &self.event_id,
+                    llm_tool_call_id: Some(&call.id),
                     addon_id: None,
                     tool_name: &call.function.name,
                     input_text: &call.function.arguments,
                     output_text: "",
-                    status: ToolCallStatus::Success,
+                    // The model only REQUESTED this call here; the execution
+                    // outcome lands via `record_tool_execution`. A row marked
+                    // Success for a never-run tool would be a false record.
+                    status: ToolCallStatus::Running,
                     error_message: None,
+                    started_at: None,
                 },
             )?;
         }
@@ -174,12 +230,16 @@ impl AiEventHandle {
                 &conn,
                 &NewAiToolCall {
                     event_id: &self.event_id,
+                    llm_tool_call_id: Some(&call.id),
                     addon_id: None,
                     tool_name: &call.function.name,
                     input_text: &call.function.arguments,
                     output_text: "",
-                    status: ToolCallStatus::Success,
+                    // Request-only row — see `finish_success`: execution
+                    // outcome is recorded separately, never assumed here.
+                    status: ToolCallStatus::Running,
                     error_message: None,
+                    started_at: None,
                 },
             )?;
         }
@@ -477,5 +537,125 @@ mod tests {
 
         assert_eq!(response_payload, "odpowiedź ze streamu");
         assert_eq!(token_count, 5);
+    }
+
+    fn sha256_hex(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn record_tool_execution_persists_real_results() {
+        let db = db();
+        let gateway = AiGateway::new(db.clone(), "node-test");
+        let request = ChatCompletionRequest {
+            model: "bielik".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Zapamiętaj coś".to_string())),
+                ..Default::default()
+            }],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            user: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            memory_options: None,
+            audio_input: None,
+        };
+        let handle = gateway
+            .start_chat_event(&request, None, None)
+            .expect("start event");
+
+        let started_at = chrono::Utc::now() - chrono::Duration::seconds(2);
+        let arguments = r#"{"fact":"favorite color is blue","layer":"user"}"#;
+        let output = r#"{"stored":true,"memory_id":"mem-1"}"#;
+        let row_id = handle
+            .record_tool_execution(&ToolExecution {
+                tool_call_id: "call_0_aabbccdd",
+                addon_id: Some("memory"),
+                tool_name: "memory.memory_store",
+                arguments,
+                output,
+                success: true,
+                error_message: None,
+                started_at,
+            })
+            .expect("record success execution");
+        handle
+            .record_tool_execution(&ToolExecution {
+                tool_call_id: "call_1_11223344",
+                addon_id: Some("memory"),
+                tool_name: "memory.memory_recall",
+                arguments: r#"{"query":"color"}"#,
+                output: r#"{"error":"permission denied"}"#,
+                success: false,
+                error_message: Some("permission denied"),
+                started_at,
+            })
+            .expect("record failed execution");
+
+        let conn = db.lock().expect("db lock");
+        let (llm_id, addon_id, input_hash, output_hash, status, row_started_at, finished_at): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT llm_tool_call_id, addon_id, input_hash, output_hash, status, started_at, finished_at \
+                 FROM compliance_ai_tool_calls WHERE tool_call_id = ?1",
+                params![row_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("success row");
+        assert_eq!(llm_id, "call_0_aabbccdd");
+        assert_eq!(addon_id, "memory");
+        assert_eq!(input_hash, sha256_hex(arguments));
+        assert_eq!(output_hash, sha256_hex(output));
+        assert_eq!(status, "success");
+        assert_eq!(
+            row_started_at,
+            started_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        );
+        let finished_at = finished_at.expect("executed call must have finished_at");
+        assert!(
+            finished_at.as_str() >= row_started_at.as_str(),
+            "finished_at {finished_at} precedes started_at {row_started_at}"
+        );
+
+        let (failed_status, error_message): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, error_message FROM compliance_ai_tool_calls \
+                 WHERE event_id = ?1 AND llm_tool_call_id = 'call_1_11223344'",
+                params![handle.event_id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("failed row");
+        assert_eq!(failed_status, "failed");
+        assert_eq!(error_message.as_deref(), Some("permission denied"));
     }
 }

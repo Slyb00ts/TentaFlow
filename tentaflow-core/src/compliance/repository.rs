@@ -654,6 +654,7 @@ pub fn add_ai_tool_call(conn: &Connection, tool_call: &NewAiToolCall<'_>) -> Res
     let input_hash = hash_text(tool_call.input_text);
     let output_hash = hash_text(tool_call.output_text);
     let now = now_utc();
+    let started_at = tool_call.started_at.unwrap_or(now.as_str());
     let finished_at = if tool_call.status == ToolCallStatus::Running {
         None
     } else {
@@ -661,17 +662,18 @@ pub fn add_ai_tool_call(conn: &Connection, tool_call: &NewAiToolCall<'_>) -> Res
     };
     let affected = conn.execute(
         "INSERT INTO compliance_ai_tool_calls \
-            (tool_call_id, event_id, addon_id, tool_name, input_hash, output_hash, status, started_at, finished_at, error_message) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (tool_call_id, event_id, llm_tool_call_id, addon_id, tool_name, input_hash, output_hash, status, started_at, finished_at, error_message) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             tool_call_id,
             tool_call.event_id,
+            tool_call.llm_tool_call_id,
             tool_call.addon_id,
             tool_call.tool_name,
             input_hash,
             output_hash,
             tool_call.status.as_str(),
-            now,
+            started_at,
             finished_at,
             tool_call.error_message,
         ],

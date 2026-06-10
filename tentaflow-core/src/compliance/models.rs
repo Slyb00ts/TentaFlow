@@ -269,10 +269,16 @@ pub struct NewAiSource<'a> {
 #[derive(Debug, Clone)]
 pub struct NewAiToolCall<'a> {
     pub event_id: &'a str,
+    /// Model-issued call id (`LlmToolCall.id`). `None` for rows that only
+    /// record the model's request without an execution to pair it with.
+    pub llm_tool_call_id: Option<&'a str>,
     pub addon_id: Option<&'a str>,
     pub tool_name: &'a str,
     pub input_text: &'a str,
     pub output_text: &'a str,
     pub status: ToolCallStatus,
     pub error_message: Option<&'a str>,
+    /// Real execution start (UTC, `%Y-%m-%dT%H:%M:%SZ`). `None` falls back
+    /// to the insert timestamp — correct for request-only rows.
+    pub started_at: Option<&'a str>,
 }

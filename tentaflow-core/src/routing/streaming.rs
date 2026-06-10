@@ -5,7 +5,9 @@
 //       buffering.
 // =============================================================================
 
-use crate::api::openai::types::{ChatCompletionChunk, ChatCompletionRequest, ToolCall};
+use crate::api::openai::types::{
+    ChatCompletionChunk, ChatCompletionRequest, FunctionCall, ToolCall,
+};
 use crate::compliance::ai_gateway::{AiEventHandle, AiGateway, AiGatewayContext};
 use crate::error::Result;
 use crate::routing::router::Router;
@@ -224,7 +226,9 @@ impl Stream for ComplianceAuditStream {
                         self.response_text.push_str(content);
                     }
                     if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
-                        self.tool_calls.extend(tool_calls.iter().cloned());
+                        for delta in tool_calls {
+                            absorb_tool_call_delta(&mut self.tool_calls, delta);
+                        }
                     }
                 }
                 if let Some(usage) = chunk.usage.as_ref() {
@@ -254,13 +258,59 @@ impl Drop for ComplianceAuditStream {
     }
 }
 
+/// Hard cap on tool-call slots reassembled from one stream. `delta.index`
+/// comes from an untrusted backend (or a remote mesh node) — without a cap
+/// a single forged chunk with a huge index would allocate slots until OOM.
+const MAX_TOOL_CALL_SLOTS: usize = 256;
+
+/// Reassembles streamed tool-call fragments into full `ToolCall`s for the
+/// AI audit record: id/name arrive on the fragment that opens a slot,
+/// argument text accumulates across fragments of the same `index`.
+fn absorb_tool_call_delta(
+    acc: &mut Vec<ToolCall>,
+    delta: &crate::api::openai::types::ToolCallDelta,
+) {
+    let idx = delta.index as usize;
+    if idx >= MAX_TOOL_CALL_SLOTS {
+        tracing::warn!(
+            index = idx,
+            "tool-call delta index exceeds slot cap; fragment dropped from audit record"
+        );
+        return;
+    }
+    while acc.len() <= idx {
+        acc.push(ToolCall {
+            id: String::new(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: String::new(),
+                arguments: String::new(),
+            },
+        });
+    }
+    let slot = &mut acc[idx];
+    if let Some(id) = &delta.id {
+        slot.id = id.clone();
+    }
+    if let Some(function) = &delta.function {
+        if let Some(name) = &function.name {
+            slot.function.name.push_str(name);
+        }
+        if let Some(arguments) = &function.arguments {
+            slot.function.arguments.push_str(arguments);
+        }
+    }
+}
+
 fn make_chunk(
     id: &str,
     created: u64,
     model: &str,
     c: crate::flow_engine::envelope::LlmStreamChunk,
 ) -> crate::api::openai::types::ChatCompletionChunk {
-    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta};
+    use crate::api::openai::types::{
+        ChatCompletionChunk, ChunkChoice, Delta, FunctionCallDelta, ToolCallDelta,
+    };
     ChatCompletionChunk {
         id: id.to_string(),
         object: "chat.completion.chunk".to_string(),
@@ -279,7 +329,33 @@ fn make_chunk(
                     Some(c.text_delta)
                 },
                 reasoning_content: c.reasoning_delta,
-                tool_calls: None,
+                tool_calls: if c.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(
+                        c.tool_calls
+                            .into_iter()
+                            .map(|tc| ToolCallDelta {
+                                index: tc.index,
+                                // "function" is stamped on the slot-opening
+                                // fragment (the one carrying the id),
+                                // mirroring OpenAI wire behaviour.
+                                tool_type: tc.id.is_some().then(|| "function".to_string()),
+                                id: tc.id,
+                                function: if tc.function_name.is_none()
+                                    && tc.arguments_delta.is_none()
+                                {
+                                    None
+                                } else {
+                                    Some(FunctionCallDelta {
+                                        name: tc.function_name,
+                                        arguments: tc.arguments_delta,
+                                    })
+                                },
+                            })
+                            .collect(),
+                    )
+                },
             },
             finish_reason: c
                 .finish_reason

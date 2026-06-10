@@ -23,7 +23,7 @@ pub use audit::{AuditEvent, AuditSink};
 pub use clock::Clock;
 pub use conversation::ConversationHistoryStore;
 pub use embeddings::{EmbeddingsDispatcher, EmbeddingsRequest, EmbeddingsResponse};
-pub use llm::{LlmDispatcher, LlmRequest, LlmResponse};
+pub use llm::{LlmDispatcher, LlmRequest, LlmResponse, LlmToolSpec};
 pub use memory::{
     MemoryHit, MemoryQuery, MemoryRecall, MemoryRecord, MemoryStore, MemoryStoreReceipt,
 };

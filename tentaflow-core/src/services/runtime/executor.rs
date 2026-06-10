@@ -32,6 +32,7 @@ use crate::services::runtime::context::ExecutionContext;
 use crate::services::runtime::resolver::{AliasResolver, ResolveError, ResolveRequest};
 use crate::services::runtime::strategy::{rank, StrategyState};
 use crate::services::runtime::target::ResolvedExecutionTarget;
+use crate::services::runtime::tool_calling::{self, ToolCallMode};
 
 /// Strumien chunkow zwracany przez `stream_chat`. Boxed `Pin<Box<dyn Stream>>`
 /// zeby caller mog go zapakowac w SSE bez wiedzy o konkretnym typie strumienia
@@ -96,6 +97,16 @@ impl ExecutorError {
             Self::FlowDispatcherUnavailable | Self::SttRuntimeUnavailable | Self::SttBackend(_)
         )
     }
+}
+
+/// Outcome of the `tool_call_mode` deployment-config lookup. `Failed` stays
+/// distinct from `NoOverride` so a transient DB failure never silently flips
+/// an explicitly-prompt HTTP service to native tool delivery.
+#[derive(Debug, Clone, Copy)]
+enum ToolCallModeLookup {
+    Mode(ToolCallMode),
+    NoOverride,
+    Failed,
 }
 
 /// Top-level orchestrator. Holds Arc references to every collaborator;
@@ -356,6 +367,11 @@ impl ModelRuntimeExecutor {
             }
         }
         request.stream = true;
+        // Prompt-mode tool calling is intentionally NOT applied on the
+        // streaming path: intercepting `<tool_call>` tags mid-stream ships
+        // with the agent-loop phases, and today's tool-sending callers use
+        // the blocking path. Native (HTTP) candidates serialize `tools` in
+        // the request body and their tool-call deltas pass through untouched.
 
         match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
@@ -466,6 +482,35 @@ impl ModelRuntimeExecutor {
                                                     content: None,
                                                     reasoning_content: Some(reasoning),
                                                     tool_calls: None,
+                                                },
+                                                finish_reason: None,
+                                                logprobs: None,
+                                            }],
+                                            system_fingerprint: None,
+                                            audio: None,
+                                            detected_intent: None,
+                                            detected_tools: None,
+                                            transcribed_text: None,
+                                            speaker_id: None,
+                                            speaker_name: None,
+                                            usage: None,
+                                        }))
+                                    }
+                                    StreamChunkType::ToolCallDelta(tc) => {
+                                        Some(Ok(ChatCompletionChunk {
+                                            id: chat_id,
+                                            object: "chat.completion.chunk".to_string(),
+                                            created,
+                                            model,
+                                            choices: vec![ChunkChoice {
+                                                index: 0,
+                                                delta: Delta {
+                                                    role: None,
+                                                    content: None,
+                                                    reasoning_content: None,
+                                                    tool_calls: Some(vec![
+                                                        crate::routing::stream_helpers::protocol_tool_call_delta_to_openai(tc),
+                                                    ]),
                                                 },
                                                 finish_reason: None,
                                                 logprobs: None,
@@ -658,6 +703,86 @@ impl ModelRuntimeExecutor {
             .clone()
     }
 
+    /// HARNESS_PLAN §3.1: native/prompt tool-calling decision, per candidate.
+    /// An explicit `tool_call_mode` from the service deployment config wins
+    /// where the transport supports it; otherwise OpenAI-compatible HTTP
+    /// backends default to native and everything else uses prompt mode,
+    /// because the embedded engine and the QUIC/mesh `CompletionPayload`
+    /// wire cannot carry `tools`. A FAILED config lookup (not "no override")
+    /// falls back to prompt mode even on HTTP: prompt works on every chat
+    /// backend, while defaulting to native would leak `tools` natively past
+    /// a service the operator explicitly pinned to prompt.
+    async fn tool_call_mode_for(&self, target: &ResolvedExecutionTarget) -> ToolCallMode {
+        let lookup = self.explicit_tool_call_mode(target).await;
+        let is_http = matches!(
+            target,
+            ResolvedExecutionTarget::Local {
+                handle: BackendHandle::Http(_),
+                ..
+            }
+        );
+        if is_http {
+            match lookup {
+                ToolCallModeLookup::Mode(mode) => mode,
+                ToolCallModeLookup::NoOverride => ToolCallMode::Native,
+                ToolCallModeLookup::Failed => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        "tool_call_mode config lookup failed; using prompt mode for this request"
+                    );
+                    ToolCallMode::Prompt
+                }
+            }
+        } else {
+            if matches!(lookup, ToolCallModeLookup::Mode(ToolCallMode::Native)) {
+                tracing::warn!(
+                    target_kind = target.telemetry_tag(),
+                    "tool_call_mode=native is unsupported on this transport; using prompt mode"
+                );
+            }
+            ToolCallMode::Prompt
+        }
+    }
+
+    /// Reads the optional top-level `tool_call_mode` key from the candidate
+    /// service's `services.config_json` (same store the deploy wizard writes
+    /// — mirror of how `request_time_parameters` is persisted). Only Local
+    /// candidates have a local service row; mesh forwards resolve the mode
+    /// on the owning node and flows never consult this.
+    async fn explicit_tool_call_mode(
+        &self,
+        target: &ResolvedExecutionTarget,
+    ) -> ToolCallModeLookup {
+        let Some(service_id) = target.local_service_id() else {
+            return ToolCallModeLookup::NoOverride;
+        };
+        // DB-less router: no config store exists, so no override can exist.
+        let Some(db) = self.db.clone() else {
+            return ToolCallModeLookup::NoOverride;
+        };
+        tokio::task::spawn_blocking(move || {
+            let Ok(conn) = db.lock() else {
+                return ToolCallModeLookup::Failed;
+            };
+            let svc = match crate::services_repo::services::get(&conn, service_id) {
+                Ok(Some(svc)) => svc,
+                // Service row deleted mid-flight: no config row, no override.
+                Ok(None) => return ToolCallModeLookup::NoOverride,
+                Err(_) => return ToolCallModeLookup::Failed,
+            };
+            let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&svc.config_json) else {
+                return ToolCallModeLookup::Failed;
+            };
+            match cfg.get("tool_call_mode").and_then(|v| v.as_str()) {
+                Some(s) => ToolCallMode::from_config_str(s)
+                    .map_or(ToolCallModeLookup::NoOverride, ToolCallModeLookup::Mode),
+                None => ToolCallModeLookup::NoOverride,
+            }
+        })
+        .await
+        .unwrap_or(ToolCallModeLookup::Failed)
+    }
+
     /// Branches per `ResolvedExecutionTarget`. Local handles dispatch
     /// in-process; flow goes through the dispatcher; mesh forward and
     /// QUIC sidecar return `TransportPendingCutover` because their
@@ -689,7 +814,21 @@ impl ModelRuntimeExecutor {
                 request.model = model_name.clone();
             }
         }
-        match target {
+        // HARNESS_PLAN §3.1: prompt-mode candidates get the tool section moved
+        // into the system prompt BEFORE transport-specific dispatch (so the
+        // section also crosses the QUIC/mesh message wire) and the completion
+        // parsed for `<tool_call>` blocks afterwards. Flow targets keep the
+        // request untouched — flows compose their own tool wiring (phase 3).
+        let prompt_tools = if matches!(target, ResolvedExecutionTarget::Flow { .. }) {
+            None
+        } else if request.tools.as_ref().is_some_and(|t| !t.is_empty())
+            && self.tool_call_mode_for(target).await == ToolCallMode::Prompt
+        {
+            tool_calling::apply_prompt_mode_request(&mut request)
+        } else {
+            None
+        };
+        let mut response = match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
                 BackendHandle::Embedded { .. } => self
                     .local_inference
@@ -829,7 +968,11 @@ impl ModelRuntimeExecutor {
                     &request.model,
                 ))
             }
+        }?;
+        if let Some(tools) = &prompt_tools {
+            tool_calling::apply_prompt_mode_response(&mut response, tools);
         }
+        Ok(response)
     }
 
     /// R3b.7 — shared mesh forwarding for chat / embeddings / TTS / STT.

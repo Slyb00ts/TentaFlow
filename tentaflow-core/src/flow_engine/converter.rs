@@ -13,7 +13,8 @@ use crate::api::openai::types::{
     MessageContent, Usage,
 };
 use crate::error::{CoreError, Result as CoreResult};
-use crate::flow_engine::envelope::{FlowExecutionOutcome, FlowValue};
+use crate::flow_engine::dispatchers_impl::llm_impl::envelope_tool_call_to_openai;
+use crate::flow_engine::envelope::{ChatRole, FlowExecutionOutcome, FlowValue};
 
 pub fn flow_outcome_to_chat_response(
     outcome: &FlowExecutionOutcome,
@@ -25,6 +26,18 @@ pub fn flow_outcome_to_chat_response(
         other => Cow::Owned(serde_json::to_string(&payload_to_json(other)).unwrap_or_default()),
     };
     let finish_reason = outcome.finish_reason.as_openai_str().map(|s| s.to_string());
+    // The LLM adapter records tool calls on the assistant message it appends
+    // to conversation context — the last assistant message is the response
+    // this outcome represents.
+    let tool_calls = outcome
+        .final_envelope
+        .context
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == ChatRole::Assistant)
+        .and_then(|m| m.tool_calls.as_ref())
+        .map(|tcs| tcs.iter().map(envelope_tool_call_to_openai).collect());
 
     ChatCompletionResponse {
         id: generate_response_id(),
@@ -38,7 +51,7 @@ pub fn flow_outcome_to_chat_response(
                 content: Some(MessageContent::Text(content.into_owned())),
                 reasoning_content: None,
                 name: None,
-                tool_calls: None,
+                tool_calls,
                 tool_call_id: None,
             },
             finish_reason,
@@ -211,6 +224,40 @@ mod tests {
         }
         assert_eq!(r.choices[0].finish_reason.as_deref(), Some("stop"));
         assert_eq!(r.usage.as_ref().unwrap().total_tokens, 15);
+    }
+
+    #[test]
+    fn chat_response_maps_tool_calls_from_last_assistant_message() {
+        use crate::flow_engine::envelope::{ChatMessage, LlmToolCall};
+        let mut o = outcome(FlowValue::Text("".into()), FinishReason::ToolCalls);
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![LlmToolCall {
+            id: "call_0_ab".into(),
+            name: "memory.memory_store".into(),
+            arguments: "{\"fact\":\"x\"}".into(),
+        }]);
+        o.final_envelope.context.messages = vec![ChatMessage::user("hi"), assistant];
+        let r = flow_outcome_to_chat_response(&o, "m");
+        let tcs = r.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls should be mapped");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].id, "call_0_ab");
+        assert_eq!(tcs[0].tool_type, "function");
+        assert_eq!(tcs[0].function.name, "memory.memory_store");
+        assert_eq!(tcs[0].function.arguments, "{\"fact\":\"x\"}");
+        assert_eq!(r.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn chat_response_without_tool_calls_keeps_none() {
+        let r = flow_outcome_to_chat_response(
+            &outcome(FlowValue::Text("hi".into()), FinishReason::Stop),
+            "m",
+        );
+        assert!(r.choices[0].message.tool_calls.is_none());
     }
 
     #[test]

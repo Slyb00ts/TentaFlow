@@ -138,6 +138,8 @@ impl LlmNodeAdapter {
             frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
             presence_penalty: Self::pick_optional_f32(node, envelope, "presence_penalty"),
             stop: Self::pick_stop(node),
+            tools: Vec::new(),
+            tool_choice: None,
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),
             user_id: ctx.user_id.clone(),
@@ -200,9 +202,13 @@ impl NodeAdapter for LlmNodeAdapter {
         // jego pochodzenie wynika z trace (executor produkuje TraceStep).
         let mut out: FlowEnvelope = (**envelope).clone();
         out.payload = FlowValue::Text(response.content.clone());
-        out.context
-            .messages
-            .push(ChatMessage::assistant(response.content));
+        let mut assistant = ChatMessage::assistant(response.content);
+        if !response.tool_calls.is_empty() {
+            // Tool calls ride on the assistant message so downstream nodes
+            // (tool executor, converter) see them in conversation context.
+            assistant.tool_calls = Some(response.tool_calls);
+        }
+        out.context.messages.push(assistant);
         Ok(out)
     }
 }
@@ -236,6 +242,8 @@ impl LlmAdapter for LlmNodeAdapter {
             frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
             presence_penalty: Self::pick_optional_f32(node, envelope, "presence_penalty"),
             stop: Self::pick_stop(node),
+            tools: Vec::new(),
+            tool_choice: None,
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),
             user_id: ctx.user_id.clone(),

@@ -17,13 +17,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::{build_user_context, ModelRuntimeSlot};
 use crate::api::openai::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent,
+    ChatCompletionChunk, ChatCompletionRequest, ContentPart, FunctionCall, FunctionDefinition,
+    ImageUrl, Message, MessageContent, Tool, ToolCall, ToolChoice,
 };
 use crate::flow_engine::blob_store::BlobStore;
-use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse};
+use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse, LlmToolSpec};
 use crate::flow_engine::envelope::{
-    ChatMessage, ChatMessageContent, ChatRole, FinishReason, LlmStreamChunk, MessagePart,
-    TokenUsage,
+    ChatMessage, ChatMessageContent, ChatRole, FinishReason, LlmStreamChunk, LlmToolCall,
+    MessagePart, TokenUsage, ToolCallDelta,
 };
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 use base64::Engine;
@@ -80,6 +81,14 @@ impl LlmDispatcher for LlmDispatcherImpl {
             .next()
             .ok_or_else(|| anyhow!("LlmDispatcher: backend returned 0 choices"))?;
 
+        let tool_calls: Vec<LlmToolCall> = choice
+            .message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(openai_tool_call_to_envelope)
+            .collect();
+
         let content = match choice.message.content {
             Some(MessageContent::Text(t)) => t,
             Some(MessageContent::Parts(parts)) => parts
@@ -108,6 +117,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
             content,
             usage,
             finish_reason,
+            tool_calls,
         })
     }
 
@@ -252,12 +262,49 @@ async fn build_chat_request(
         stream_options: None,
         user: None,
         response_format: None,
-        tools: None,
-        tool_choice: None,
+        tools: if req.tools.is_empty() {
+            None
+        } else {
+            Some(req.tools.iter().map(tool_spec_to_openai).collect())
+        },
+        tool_choice: req.tool_choice.clone().map(ToolChoice::String),
         n: None,
         memory_options: None,
         audio_input: None,
     })
+}
+
+fn tool_spec_to_openai(spec: &LlmToolSpec) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: FunctionDefinition {
+            name: spec.name.clone(),
+            description: Some(spec.description.clone()),
+            parameters: Some(spec.parameters.clone()),
+        },
+    }
+}
+
+fn openai_tool_call_to_envelope(tc: ToolCall) -> LlmToolCall {
+    LlmToolCall {
+        id: tc.id,
+        name: tc.function.name,
+        arguments: tc.function.arguments,
+    }
+}
+
+/// Reverse mapping used when resending conversation history (a tool loop
+/// replays the assistant message that requested the calls) and when the
+/// converter rebuilds an OpenAI response from a flow outcome.
+pub(crate) fn envelope_tool_call_to_openai(tc: &LlmToolCall) -> ToolCall {
+    ToolCall {
+        id: tc.id.clone(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: tc.name.clone(),
+            arguments: tc.arguments.clone(),
+        },
+    }
 }
 
 /// Etap 3b: async — rozwija `MessagePart::Image.blob_ref` przez BlobStore
@@ -293,7 +340,10 @@ async fn chat_msg_to_openai(m: &ChatMessage, blobs: &dyn BlobStore) -> Result<Me
         content,
         reasoning_content: None,
         name: m.name.clone(),
-        tool_calls: None,
+        tool_calls: m
+            .tool_calls
+            .as_ref()
+            .map(|tcs| tcs.iter().map(envelope_tool_call_to_openai).collect()),
         tool_call_id: m.tool_call_id.clone(),
     })
 }
@@ -332,6 +382,7 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
     let mut choice_index: u32 = 0;
     let mut text_delta = String::new();
     let mut reasoning_delta: Option<String> = None;
+    let mut tool_calls: Vec<ToolCallDelta> = Vec::new();
     let mut finish_reason: Option<FinishReason> = None;
 
     if let Some(choice) = chunk.choices.into_iter().next() {
@@ -342,6 +393,27 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
         if let Some(r) = choice.delta.reasoning_content {
             reasoning_delta = Some(r);
         }
+        if let Some(tcs) = choice.delta.tool_calls {
+            // Empty strings mean "no delta for this field in this chunk" → None.
+            tool_calls = tcs
+                .into_iter()
+                .map(|tc| {
+                    let (function_name, arguments_delta) = match tc.function {
+                        Some(f) => (
+                            f.name.filter(|s| !s.is_empty()),
+                            f.arguments.filter(|s| !s.is_empty()),
+                        ),
+                        None => (None, None),
+                    };
+                    ToolCallDelta {
+                        index: tc.index,
+                        id: tc.id.filter(|s| !s.is_empty()),
+                        function_name,
+                        arguments_delta,
+                    }
+                })
+                .collect();
+        }
         if let Some(fr) = choice.finish_reason {
             finish_reason = Some(openai_finish_to_envelope(Some(&fr)));
         }
@@ -351,7 +423,7 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
         choice_index,
         text_delta,
         reasoning_delta,
-        tool_calls: Vec::new(),
+        tool_calls,
         usage: None,
         finish_reason,
         error: None,
@@ -393,6 +465,133 @@ mod tests {
             Some(MessageContent::Text(t)) => assert_eq!(t, "hello"),
             _ => panic!("expected text content"),
         }
+    }
+
+    #[tokio::test]
+    async fn build_chat_request_maps_tools_and_tool_choice() {
+        use crate::flow_engine::blob_store::InMemoryBlobStore;
+        let blobs = InMemoryBlobStore::new();
+        let mut req = LlmRequest::new("m");
+        req.messages = vec![ChatMessage::user("hi")];
+        req.tools = vec![LlmToolSpec {
+            name: "memory.memory_store".into(),
+            description: "Store a fact".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        req.tool_choice = Some("auto".into());
+        let api = build_chat_request(&req, false, &blobs).await.unwrap();
+        let tools = api.tools.expect("tools should be set");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_type, "function");
+        assert_eq!(tools[0].function.name, "memory.memory_store");
+        assert_eq!(
+            tools[0].function.description.as_deref(),
+            Some("Store a fact")
+        );
+        assert_eq!(
+            tools[0].function.parameters,
+            Some(serde_json::json!({"type":"object"}))
+        );
+        match api.tool_choice {
+            Some(ToolChoice::String(ref s)) => assert_eq!(s, "auto"),
+            other => panic!("expected string tool_choice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_chat_request_omits_tools_when_empty() {
+        use crate::flow_engine::blob_store::InMemoryBlobStore;
+        let blobs = InMemoryBlobStore::new();
+        let mut req = LlmRequest::new("m");
+        req.messages = vec![ChatMessage::user("hi")];
+        let api = build_chat_request(&req, false, &blobs).await.unwrap();
+        assert!(api.tools.is_none());
+        assert!(api.tool_choice.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_msg_carries_assistant_tool_calls_to_openai() {
+        use crate::flow_engine::blob_store::InMemoryBlobStore;
+        let blobs = InMemoryBlobStore::new();
+        let mut m = ChatMessage::assistant("");
+        m.tool_calls = Some(vec![LlmToolCall {
+            id: "call_0_aa".into(),
+            name: "t".into(),
+            arguments: "{\"a\":1}".into(),
+        }]);
+        let api = chat_msg_to_openai(&m, &blobs).await.unwrap();
+        let tcs = api.tool_calls.expect("tool_calls should round trip");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].id, "call_0_aa");
+        assert_eq!(tcs[0].tool_type, "function");
+        assert_eq!(tcs[0].function.name, "t");
+        assert_eq!(tcs[0].function.arguments, "{\"a\":1}");
+    }
+
+    #[test]
+    fn chat_chunk_maps_delta_tool_calls() {
+        use crate::api::openai::types::{
+            ChunkChoice, Delta, FunctionCallDelta, ToolCallDelta as WireToolCallDelta,
+        };
+        let chunk = ChatCompletionChunk {
+            id: "c".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![
+                        WireToolCallDelta {
+                            index: 1,
+                            id: Some("call_1".into()),
+                            tool_type: Some("function".into()),
+                            function: Some(FunctionCallDelta {
+                                name: Some("t".into()),
+                                arguments: Some("{\"a\"".into()),
+                            }),
+                        },
+                        // Continuation fragment: only index + arguments, the
+                        // shape OpenAI sends after the slot-opening fragment.
+                        WireToolCallDelta {
+                            index: 1,
+                            id: None,
+                            tool_type: None,
+                            function: Some(FunctionCallDelta {
+                                name: None,
+                                arguments: Some(":1}".into()),
+                            }),
+                        },
+                    ]),
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            system_fingerprint: None,
+            audio: None,
+            detected_intent: None,
+            detected_tools: None,
+            transcribed_text: None,
+            speaker_id: None,
+            speaker_name: None,
+            usage: None,
+        };
+        let mapped = chat_chunk_to_llm_chunk(chunk);
+        assert_eq!(mapped.tool_calls.len(), 2);
+        assert_eq!(mapped.tool_calls[0].index, 1);
+        assert_eq!(mapped.tool_calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(mapped.tool_calls[0].function_name.as_deref(), Some("t"));
+        assert_eq!(
+            mapped.tool_calls[0].arguments_delta.as_deref(),
+            Some("{\"a\"")
+        );
+        assert_eq!(mapped.tool_calls[1].index, 1);
+        assert!(mapped.tool_calls[1].id.is_none());
+        assert!(mapped.tool_calls[1].function_name.is_none());
+        assert_eq!(mapped.tool_calls[1].arguments_delta.as_deref(), Some(":1}"));
     }
 
     /// Etap 3b: multimodal Parts → OpenAI Parts z base64 data URL.
