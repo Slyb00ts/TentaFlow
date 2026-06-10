@@ -99,11 +99,27 @@ fn jwt_payload(jwt: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn account_id_from_jwt(jwt: &str) -> Option<String> {
+pub(crate) fn account_id_from_jwt(jwt: &str) -> Option<String> {
     jwt_payload(jwt)?
         .get("https://api.openai.com/auth")?
         .get("chatgpt_account_id")?
         .as_str()
+        .map(String::from)
+}
+
+/// Best-effort human label (email) decoded from an OpenAI id token, for showing
+/// which account just logged in.
+pub(crate) fn email_from_jwt(jwt: &str) -> Option<String> {
+    let payload = jwt_payload(jwt)?;
+    payload
+        .get("email")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("https://api.openai.com/profile")
+                .and_then(|p| p.get("email"))
+                .and_then(Value::as_str)
+        })
         .map(String::from)
 }
 

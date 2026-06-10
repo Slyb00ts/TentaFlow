@@ -3579,6 +3579,26 @@ pub async fn service_manifest_deploy(
         serde_json::from_str(&payload.config_json)
             .map_err(|e| ProtocolError::bad_request(format!("invalid config_json: {}", e)))?
     };
+    // Subscription login: the wizard sends an `oauth_flow_id` instead of a key.
+    // Swap it for the tokens captured by the completed OAuth flow on this node
+    // (the credential blob then follows the normal encrypted `api_key` path).
+    let user_config = {
+        let mut cfg = user_config;
+        if let Some(obj) = cfg.as_object_mut() {
+            if let Some(flow_id) = obj
+                .get("oauth_flow_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                if let Some(blob) = crate::services::backend::codex_oauth::take_tokens(&flow_id) {
+                    obj.insert("api_key".to_string(), serde_json::Value::String(blob));
+                }
+                obj.remove("oauth_flow_id");
+            }
+        }
+        cfg
+    };
+
     // Cloud external providers carry an `api_key` — encrypt it with this node's
     // settings cipher before it flows into the placeholder/deployment/service
     // config_json. The key stays node-local; remote deploys are forwarded with
@@ -7055,6 +7075,85 @@ pub async fn service_model_selection(
     );
 
     resp(true, None)
+}
+
+#[handler(variant = "ServiceOauthStartRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_oauth_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqOauthStart(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqOauthStart",
+            ));
+        }
+    };
+
+    let resp = |flow_id: String, authorize_url: String, error: Option<String>| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResOauthStart(
+                tentaflow_protocol::ServiceOauthStartResponse {
+                    flow_id,
+                    authorize_url,
+                    error,
+                },
+            ),
+        ))
+    };
+
+    // The OAuth callback lands on this node's loopback (localhost:1455), so the
+    // browser must reach it — login only runs on the local node.
+    if forward_target_node(ctx, &payload.node_id).is_some() {
+        return resp(
+            String::new(),
+            String::new(),
+            Some("subscription login must be performed on the local node".to_string()),
+        );
+    }
+    if !payload.provider.eq_ignore_ascii_case("openai") {
+        return resp(
+            String::new(),
+            String::new(),
+            Some("subscription login is only available for OpenAI".to_string()),
+        );
+    }
+
+    match crate::services::backend::codex_oauth::start_login().await {
+        Ok((flow_id, authorize_url)) => resp(flow_id, authorize_url, None),
+        Err(e) => resp(String::new(), String::new(), Some(e)),
+    }
+}
+
+#[handler(variant = "ServiceOauthPollRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_oauth_poll(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqOauthPoll(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqOauthPoll",
+            ));
+        }
+    };
+    let (status, account_label, error) =
+        crate::services::backend::codex_oauth::poll(&payload.flow_id);
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResOauthPoll(
+            tentaflow_protocol::ServiceOauthPollResponse {
+                status,
+                account_label,
+                error,
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "ServiceVramHintRequest", since = (1, 0))]

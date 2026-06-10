@@ -408,6 +408,36 @@ pub struct ServiceModelSelectionResponse {
     pub error: Option<String>,
 }
 
+/// Request: begin a subscription OAuth login (browser PKCE) on the named node.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceOauthStartRequest {
+    pub provider: String,
+    pub node_id: Option<String>,
+}
+
+/// Response: the URL to open in the browser plus a flow id to poll.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceOauthStartResponse {
+    pub flow_id: String,
+    pub authorize_url: String,
+    pub error: Option<String>,
+}
+
+/// Request: poll a login flow's status.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceOauthPollRequest {
+    pub flow_id: String,
+    pub node_id: Option<String>,
+}
+
+/// Response: `status` is "pending" | "done" | "error".
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceOauthPollResponse {
+    pub status: String,
+    pub account_label: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -432,6 +462,10 @@ pub enum ServicePayload {
     ResModelCatalog(ServiceModelCatalogResponse),
     ReqModelSelection(ServiceModelSelectionRequest),
     ResModelSelection(ServiceModelSelectionResponse),
+    ReqOauthStart(ServiceOauthStartRequest),
+    ResOauthStart(ServiceOauthStartResponse),
+    ReqOauthPoll(ServiceOauthPollRequest),
+    ResOauthPoll(ServiceOauthPollResponse),
 }
 
 // =============================================================================
