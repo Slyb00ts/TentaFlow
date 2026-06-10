@@ -1555,6 +1555,86 @@ pub fn encode_skills_fork_request(skill_id: String, new_name: String) -> Result<
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeAgentsListRequest)]
+pub fn encode_agents_list_request(
+    enabled: Option<bool>,
+    routable: Option<bool>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::ListRequest(tentaflow_protocol::AgentsListRequest {
+            enabled,
+            routable,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentsDetailRequest)]
+pub fn encode_agents_detail_request(agent_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::DetailRequest(tentaflow_protocol::AgentsDetailRequest {
+            agent_id,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentsUpsertRequest)]
+pub fn encode_agents_upsert_request(agent_json: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::UpsertRequest(tentaflow_protocol::AgentsUpsertRequest {
+            agent_json,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentsDeleteRequest)]
+pub fn encode_agents_delete_request(agent_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::DeleteRequest(tentaflow_protocol::AgentsDeleteRequest {
+            agent_id,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentRunsListRequest)]
+pub fn encode_agent_runs_list_request(
+    agent_id: Option<String>,
+    status: Option<String>,
+    parent_run_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunsListRequest(tentaflow_protocol::AgentRunsListRequest {
+            agent_id,
+            status,
+            parent_run_id,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentRunDetailRequest)]
+pub fn encode_agent_run_detail_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunDetailRequest(
+            tentaflow_protocol::AgentRunDetailRequest { run_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeToolsCatalogRequest)]
+pub fn encode_tools_catalog_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::ToolsCatalogRequest(
+            tentaflow_protocol::ToolsCatalogRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 fn parse_sync_conflict_resolution(
     resolution: &str,
 ) -> Result<tentaflow_protocol::SyncConflictResolution, JsError> {
@@ -3982,6 +4062,86 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "SkillsForkResponse".into());
                 set(&obj, "skillId", resp.skill_id.clone().into());
                 set(&obj, "skill_id", resp.skill_id.into());
+            }
+        },
+        MessageBody::AgentsBody(payload) => match payload {
+            tentaflow_protocol::AgentsPayload::ListRequest(req) => {
+                set(&obj, "variant", "AgentsListRequest".into());
+                set(
+                    &obj,
+                    "enabled",
+                    req.enabled.map(JsValue::from).unwrap_or(JsValue::NULL),
+                );
+                set(
+                    &obj,
+                    "routable",
+                    req.routable.map(JsValue::from).unwrap_or(JsValue::NULL),
+                );
+            }
+            tentaflow_protocol::AgentsPayload::ListResponse(resp) => {
+                set(&obj, "variant", "AgentsListResponse".into());
+                set(&obj, "agentsJson", resp.agents_json.clone().into());
+                set(&obj, "agents_json", resp.agents_json.into());
+            }
+            tentaflow_protocol::AgentsPayload::DetailRequest(req) => {
+                set(&obj, "variant", "AgentsDetailRequest".into());
+                set(&obj, "agentId", req.agent_id.clone().into());
+                set(&obj, "agent_id", req.agent_id.into());
+            }
+            tentaflow_protocol::AgentsPayload::DetailResponse(resp) => {
+                set(&obj, "variant", "AgentsDetailResponse".into());
+                set(&obj, "agentJson", resp.agent_json.clone().into());
+                set(&obj, "agent_json", resp.agent_json.into());
+            }
+            tentaflow_protocol::AgentsPayload::UpsertRequest(req) => {
+                set(&obj, "variant", "AgentsUpsertRequest".into());
+                set(&obj, "agentJson", req.agent_json.clone().into());
+                set(&obj, "agent_json", req.agent_json.into());
+            }
+            tentaflow_protocol::AgentsPayload::UpsertResponse(resp) => {
+                set(&obj, "variant", "AgentsUpsertResponse".into());
+                set(&obj, "agentId", resp.agent_id.clone().into());
+                set(&obj, "agent_id", resp.agent_id.into());
+            }
+            tentaflow_protocol::AgentsPayload::DeleteRequest(req) => {
+                set(&obj, "variant", "AgentsDeleteRequest".into());
+                set(&obj, "agentId", req.agent_id.clone().into());
+                set(&obj, "agent_id", req.agent_id.into());
+            }
+            tentaflow_protocol::AgentsPayload::DeleteResponse(resp) => {
+                set(&obj, "variant", "AgentsDeleteResponse".into());
+                set(&obj, "deleted", resp.deleted.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunsListRequest(req) => {
+                set(&obj, "variant", "AgentRunsListRequest".into());
+                set_optional_string(&obj, "agentId", req.agent_id.clone());
+                set_optional_string(&obj, "agent_id", req.agent_id);
+                set_optional_string(&obj, "status", req.status);
+                set_optional_string(&obj, "parentRunId", req.parent_run_id.clone());
+                set_optional_string(&obj, "parent_run_id", req.parent_run_id);
+            }
+            tentaflow_protocol::AgentsPayload::RunsListResponse(resp) => {
+                set(&obj, "variant", "AgentRunsListResponse".into());
+                set(&obj, "runsJson", resp.runs_json.clone().into());
+                set(&obj, "runs_json", resp.runs_json.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunDetailRequest(req) => {
+                set(&obj, "variant", "AgentRunDetailRequest".into());
+                set(&obj, "runId", req.run_id.clone().into());
+                set(&obj, "run_id", req.run_id.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunDetailResponse(resp) => {
+                set(&obj, "variant", "AgentRunDetailResponse".into());
+                set(&obj, "runJson", resp.run_json.clone().into());
+                set(&obj, "run_json", resp.run_json.into());
+            }
+            tentaflow_protocol::AgentsPayload::ToolsCatalogRequest(_) => {
+                set(&obj, "variant", "ToolsCatalogRequest".into());
+            }
+            tentaflow_protocol::AgentsPayload::ToolsCatalogResponse(resp) => {
+                set(&obj, "variant", "ToolsCatalogResponse".into());
+                set(&obj, "toolsJson", resp.tools_json.clone().into());
+                set(&obj, "tools_json", resp.tools_json.into());
             }
         },
         MessageBody::SyncConflictBody(payload) => match payload {

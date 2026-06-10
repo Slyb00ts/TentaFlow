@@ -49,6 +49,19 @@ pub struct LlmRequest {
     /// widziały `user=None` mimo że request przyszedł od zalogowanego usera.
     pub user_id: Option<String>,
     pub user_role: Option<String>,
+    /// Harness §3.4: audit correlation set by `LlmNodeAdapter` from the node id
+    /// and envelope meta. The gateway-aware dispatcher opens one
+    /// `compliance_ai_events` row per `execute_chat` carrying these, so every
+    /// `llm` node in every flow is audited per call (not just the harness).
+    pub flow_id: Option<String>,
+    pub flow_node_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub agent_run_id: Option<String>,
+    /// Turn-level correlation key (§3.4). Set by `LlmNodeAdapter` from
+    /// `envelope.meta["correlation_id"]` (routing seeds it with the session
+    /// event's `request_id`). The gateway-aware dispatcher copies it onto the
+    /// per-call `compliance_ai_events` row so all rows of one user turn link.
+    pub correlation_id: Option<String>,
 }
 
 impl LlmRequest {
@@ -68,6 +81,11 @@ impl LlmRequest {
             cancel_token: CancellationToken::new(),
             user_id: None,
             user_role: None,
+            flow_id: None,
+            flow_node_id: None,
+            agent_id: None,
+            agent_run_id: None,
+            correlation_id: None,
         }
     }
 }

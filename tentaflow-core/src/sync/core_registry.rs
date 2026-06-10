@@ -24,6 +24,7 @@ pub enum CoreSyncResourceKind {
     FlowModelBinding,
     Skill,
     SkillFile,
+    Agent,
     SyncPolicy,
     SyncResourceAcl,
     SyncExplicitShare,
@@ -209,6 +210,18 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "skills",
     },
+    // Agents registry (Harness §3.3) — replicates like flows/skills. Runtime
+    // `agent_runs` are deliberately absent: like `flow_executions`, they are
+    // node-local execution state and never travel through sync.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::Agent,
+        table_name: "agents",
+        resource_type: "core.agent",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "agents",
+    },
     CoreSyncDescriptor {
         kind: CoreSyncResourceKind::SyncPolicy,
         table_name: "sync_policies",
@@ -334,6 +347,21 @@ mod tests {
     }
 
     #[test]
+    fn registry_contains_agents_table() {
+        assert_eq!(
+            descriptor_for_table("agents").map(|descriptor| descriptor.resource_type),
+            Some("core.agent")
+        );
+        let agent = descriptor_for_kind(CoreSyncResourceKind::Agent);
+        assert_eq!(
+            agent.partition_id("org-default", None).unwrap().as_str(),
+            "core/org/org-default/agents"
+        );
+        // agent_runs is runtime state and must never become a sync resource.
+        assert!(descriptor_for_table("agent_runs").is_none());
+    }
+
+    #[test]
     fn registry_contains_identity_and_rbac_tables() {
         for table in [
             "organizations",
@@ -351,7 +379,12 @@ mod tests {
 
     #[test]
     fn runtime_tables_are_not_core_synced() {
-        for table in ["flow_executions", "flow_invocations", "audit_log"] {
+        for table in [
+            "flow_executions",
+            "flow_invocations",
+            "audit_log",
+            "agent_runs",
+        ] {
             assert!(
                 !is_core_sync_table(table),
                 "{table} must stay out of core sync"
