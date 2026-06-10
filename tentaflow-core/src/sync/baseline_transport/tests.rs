@@ -396,6 +396,86 @@ async fn reroll_happy_path() {
     }
 }
 
+/// Regression: a mandated donor (epoch-reconcile / admin-forced adopt) must win
+/// the election even when the JOINER's node_id is lexicographically lower. Before
+/// the explicit-proposal fix the joiner aborted pre-flight with "local election
+/// disagrees" and the mesh could never converge.
+#[tokio::test]
+async fn joiner_with_lower_node_id_completes_full_session() {
+    let donor_pool = new_pool();
+    seed_donor_org(&donor_pool);
+    // Probe security only to learn the donor's random ed25519 node_id; the key is
+    // persisted in the pool, so `donor_security` below yields the same id.
+    let probe = MeshSecurity::new(donor_pool.clone(), test_cipher()).expect("security probe");
+    let donor_node_id = probe.ed25519_public_key_hex();
+    drop(probe);
+
+    // Force the failing ordering: joiner id strictly LOWER than the donor's.
+    let (joiner_node_id, joiner_pubkey) = loop {
+        let (id, pk) = gen_identity();
+        if id < donor_node_id {
+            break (id, pk);
+        }
+    };
+
+    let (security, donor_node_id) = donor_security(donor_pool, &joiner_node_id, &joiner_pubkey);
+    assert!(joiner_node_id < donor_node_id);
+
+    let joiner_pool = new_pool();
+    seed_joiner_org(&joiner_pool);
+
+    let (mut joiner_stream, mut donor_stream) = DuplexFrameStream::pair();
+    let cipher = test_cipher();
+
+    let donor_task = {
+        let security = Arc::clone(&security);
+        let donor_node_id = donor_node_id.clone();
+        let joiner_node_id = joiner_node_id.clone();
+        tokio::spawn(async move {
+            run_donor_session(
+                &mut donor_stream,
+                &security,
+                &donor_node_id,
+                &joiner_node_id,
+            )
+            .await
+        })
+    };
+
+    let joiner_pool_for_task = joiner_pool.clone();
+    let donor_node_id_for_joiner = donor_node_id.clone();
+    let joiner_task = tokio::spawn(async move {
+        run_joiner_session(
+            &mut joiner_stream,
+            &joiner_pool_for_task,
+            &joiner_node_id,
+            &donor_node_id_for_joiner,
+            &cipher,
+            0,
+        )
+        .await
+    });
+
+    donor_task.await.unwrap().expect("donor session ok");
+    let report = joiner_task
+        .await
+        .unwrap()
+        .expect("joiner with lower node_id must complete the session");
+    assert_eq!(report.donor_org_id, "org-donor");
+
+    let donor_state = load_adopt_state(&security.db)
+        .unwrap()
+        .expect("donor state");
+    assert_eq!(donor_state.role, BaselineRole::Donor);
+    assert_eq!(donor_state.phase, BaselinePhase::Completed);
+
+    let joiner_state = load_adopt_state(&joiner_pool)
+        .unwrap()
+        .expect("joiner state");
+    assert_eq!(joiner_state.role, BaselineRole::Joiner);
+    assert_eq!(joiner_state.phase, BaselinePhase::Completed);
+}
+
 #[tokio::test]
 async fn joiner_aborts_on_ack_role_mismatch() {
     let (joiner_node_id, _) = gen_identity();

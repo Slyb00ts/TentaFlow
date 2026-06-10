@@ -126,8 +126,14 @@ pub async fn run_joiner_session<S: FrameStream>(
     cipher: &SettingsCipher,
     epoch_seen: u64,
 ) -> LedgerResult<BaselineImportReport> {
-    // Elekcja musi miec ten sam wynik po obu stronach — donor liczy ja tez.
-    let (donor, joiner) = decide_roles(local_node_id, donor_node_id, None);
+    // The caller mandates the donor (pairing confirm already elected it;
+    // epoch-reconcile picked the winning-epoch carrier; admin ops name it
+    // explicitly), so the joiner proposes it — the lowest-id election is only a
+    // FALLBACK for proposal-less elects. Proposing keeps both sides converging on
+    // the same (donor, joiner) pair regardless of node_id ordering; the guard
+    // below is defense-in-depth and only fires if decide_roles rejects the
+    // proposal.
+    let (donor, joiner) = decide_roles(local_node_id, donor_node_id, Some(donor_node_id));
     if donor != donor_node_id {
         return Err(transport_err(
             "elect",
