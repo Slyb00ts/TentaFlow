@@ -9,7 +9,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NATIVE_ROOT="$ROOT/native-libs"
-NATIVE_CACHE="${TENTAFLOW_NATIVE_CACHE:-/tmp/tentaflow-native-libs}"
+# Scratch (klony git + rozpakowane FetchContent _deps + obiekty buildu) potrafi
+# urosnac do wielu GB. NIE trzymamy go w /tmp: na Linuksie to czesto tmpfs w RAM,
+# wiec na maszynie z malym RAM-em rozpakowanie urywa pliki do zer i CMake pada na
+# "Parse error ... bad character". Domyslnie celujemy w trwaly cache na dysku.
+NATIVE_CACHE="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
 
 detect_platform() {
   local os arch
@@ -78,8 +82,29 @@ ensure_owned_dir() {
   fi
 }
 
+# Cache buildu rozpakowuje wiele GB zrodel. Jesli laduje na tmpfs (np. /tmp w RAM)
+# albo zostalo <8 GB wolnego, ostrzegamy GLOSNO — bo brak miejsca objawia sie nie
+# jako "No space left", lecz jako urwane/wyzerowane pliki i pozniejszy "Parse error
+# ... bad character" w CMake, co jest mylace i trudne do zdiagnozowania.
+check_cache_space() {
+  mkdir -p "$NATIVE_CACHE"
+  local fstype avail_kb
+  fstype="$(df -PT "$NATIVE_CACHE" 2>/dev/null | awk 'NR==2 {print $2}')"
+  avail_kb="$(df -Pk "$NATIVE_CACHE" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [ "$fstype" = "tmpfs" ] || [ "$fstype" = "ramfs" ]; then
+    echo ">>> UWAGA: cache buildu ($NATIVE_CACHE) jest na $fstype (RAM)." >&2
+    echo "    Przy malym RAM-ie rozpakowanie zrodel sie urwie i CMake padnie na" >&2
+    echo "    'Parse error ... bad character'. Ustaw cache na dysk:" >&2
+    echo "      export TENTAFLOW_NATIVE_CACHE=\"\$HOME/.cache/tentaflow-native-libs\"" >&2
+  fi
+  if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 8388608 ]; then
+    echo ">>> UWAGA: tylko $((avail_kb / 1024 / 1024)) GB wolnego w $NATIVE_CACHE (zalecane >=8 GB)." >&2
+  fi
+}
+
 prepare_layout() {
   local platform="$1"
+  check_cache_space
   ensure_owned_dir "$NATIVE_ROOT/$platform/include"
   ensure_owned_dir "$NATIVE_ROOT/$platform/lib-static"
   ensure_owned_dir "$NATIVE_ROOT/$platform/lib-dynamic"
