@@ -72,6 +72,11 @@ pub struct BackendClient {
     ///     `request_override = true`; konsumowane przez embedded loader, nie
     ///     przez BackendClient (dla HTTP/QUIC trafia przez python_request).
     request_overrides: tentaflow_protocol::RequestTimeParameters,
+
+    /// Lazily-initialised ChatGPT subscription (Codex) credential cache. Only
+    /// populated when `request_format == "codex"`; holds the refreshed
+    /// access/refresh tokens parsed from the pasted `~/.codex/auth.json`.
+    codex_creds: super::codex::CodexCredsCache,
 }
 
 impl BackendClient {
@@ -197,6 +202,7 @@ impl BackendClient {
             audio_transcriptions_url,
             audio_speech_url,
             request_overrides,
+            codex_creds: tokio::sync::RwLock::new(None),
         })
     }
 
@@ -283,6 +289,19 @@ impl BackendClient {
     ) -> Result<ChatCompletionResponse> {
         self.check_circuit_breaker()?;
         self.apply_model_override(&mut request.model);
+
+        // ChatGPT subscription (Codex) speaks the Responses API at a different
+        // endpoint with OAuth-token auth — handled by a dedicated adapter.
+        if self.request_format.as_deref() == Some("codex") {
+            return super::codex::chat_completion(
+                &self.client,
+                &self.url,
+                &self.codex_creds,
+                &self.api_key,
+                &request,
+            )
+            .await;
+        }
 
         let url = &self.chat_completions_url;
         debug!("Wysylanie chat completion do: {}", url);
@@ -377,6 +396,17 @@ impl BackendClient {
         request.stream = true;
 
         self.apply_model_override(&mut request.model);
+
+        if self.request_format.as_deref() == Some("codex") {
+            return super::codex::chat_completion_stream(
+                &self.client,
+                &self.url,
+                &self.codex_creds,
+                &self.api_key,
+                &request,
+            )
+            .await;
+        }
 
         let url = &self.chat_completions_url;
         debug!("Wysylanie streaming chat completion do: {}", url);

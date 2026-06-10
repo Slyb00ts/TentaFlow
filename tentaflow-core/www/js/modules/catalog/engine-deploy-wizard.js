@@ -414,7 +414,10 @@ function renderFooter() {
 // only a pay-per-token API key. Anthropic deliberately blocks this for third
 // parties, so Claude is API-key only.
 function subscriptionSupportedEngine() {
-  return ['openai', 'gemini'].includes(String(engineEntry?.engine?.id || '').toLowerCase());
+  // OpenAI subscription (ChatGPT plan via the Codex Responses backend) is wired
+  // end-to-end. Gemini's Code Assist subscription API needs its own adapter and
+  // is API-key only until that lands.
+  return ['openai'].includes(String(engineEntry?.engine?.id || '').toLowerCase());
 }
 
 function renderMethodCard(m, auth) {
@@ -1637,12 +1640,20 @@ function renderExternalCredsFields() {
     : I18n.t('external.api_key_placeholder');
   const subHintKey = engId === 'gemini' ? 'external.subscription_hint_gemini' : 'external.subscription_hint_openai';
   const keyHint = c.subscription ? I18n.t(subHintKey) : I18n.t('external.api_key_hint');
-  return `
-    <div class="form-group">
-      <tf-input type="password" id="edw-api-key"
+  // Subscription credentials are the multi-line ~/.codex/auth.json paste, so use
+  // a textarea; a pay-per-token API key uses a single-line password field.
+  const keyControl = c.subscription
+    ? `<tf-textarea id="edw-api-key" rows="5"
         label="${escapeAttr(keyLabel)}"
         placeholder="${escapeAttr(keyPlaceholder)}"
-        value="${escapeAttr(selection.apiKey || '')}"></tf-input>
+        value="${escapeAttr(selection.apiKey || '')}"></tf-textarea>`
+    : `<tf-input type="password" id="edw-api-key"
+        label="${escapeAttr(keyLabel)}"
+        placeholder="${escapeAttr(keyPlaceholder)}"
+        value="${escapeAttr(selection.apiKey || '')}"></tf-input>`;
+  return `
+    <div class="form-group">
+      ${keyControl}
       <span class="form-hint">${escapeHtml(keyHint)}</span>
     </div>
     ${baseUrl}
