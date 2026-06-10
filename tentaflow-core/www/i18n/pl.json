@@ -111,6 +111,24 @@
     "connected": "Połączony",
     "disconnected": "Rozłączony"
   },
+  "external": {
+    "api_key": "Klucz API",
+    "api_key_placeholder": "Wklej klucz API dostawcy",
+    "api_key_hint": "Przechowywany zaszyfrowany na tym węźle, nigdy nie jest udostępniany w meshu.",
+    "api_key_required": "Ten dostawca wymaga klucza API.",
+    "base_url": "Adres bazowy (opcjonalnie)",
+    "base_url_hint": "Nadpisz endpoint dostawcy (self-hosted lub adres zasobu Azure).",
+    "api_version": "Wersja API",
+    "select_models": "Dostępne modele",
+    "select_models_hint": "Wybierz, które modele dostawcy mają być dostępne w TentaFlow.",
+    "add_to_models": "Dodaj do modeli",
+    "refresh_models": "Odśwież modele",
+    "no_models": "Dostawca nie zwrócił żadnych modeli.",
+    "models_added": "Zapisano wybór modeli.",
+    "load_failed": "Nie udało się pobrać modeli: {error}",
+    "save_failed": "Nie udało się zapisać wyboru: {error}",
+    "loading_models": "Ładowanie modeli…"
+  },
   "common": {
     "save": "Zapisz",
     "cancel": "Anuluj",
@@ -625,6 +643,7 @@
     "tab_tentaflow": "TentaFlow Catalog",
     "tab_nim": "NVIDIA NIM",
     "tab_ibm": "IBM",
+    "tab_external": "Zewnętrzne usługi",
     "nim_soon": "Integracja NVIDIA NIM wkrótce",
     "noCompatible": "Brak silników kompatybilnych z tym systemem",
     "group_ai": "Serwisy AI",

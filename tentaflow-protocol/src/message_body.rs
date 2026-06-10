@@ -367,6 +367,47 @@ pub struct ServicePresetInfo {
     pub recommended: bool,
 }
 
+/// Request: list the LIVE model catalog of a deployed external provider service
+/// (fetched from the provider API). `node_id` None/local = run here, otherwise
+/// the dispatcher forwards to the owning peer.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceModelCatalogRequest {
+    pub service_id: i64,
+    pub node_id: Option<String>,
+}
+
+/// One model offered by the provider, with whether it is already selected
+/// (present in this service's model_registry).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceModelCatalogEntry {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub modality: String,
+    pub context_length: Option<u32>,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceModelCatalogResponse {
+    pub models: Vec<ServiceModelCatalogEntry>,
+    pub error: Option<String>,
+}
+
+/// Request: persist the admin's model selection for a service — model_registry
+/// is upserted to exactly this set (rows inserted/removed to match).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceModelSelectionRequest {
+    pub service_id: i64,
+    pub node_id: Option<String>,
+    pub selected_model_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceModelSelectionResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -387,6 +428,10 @@ pub enum ServicePayload {
     ResVramHint(ServiceVramHintResponse),
     ReqEnginePresets(ServiceEnginePresetsRequest),
     ResEnginePresets(ServiceEnginePresetsResponse),
+    ReqModelCatalog(ServiceModelCatalogRequest),
+    ResModelCatalog(ServiceModelCatalogResponse),
+    ReqModelSelection(ServiceModelSelectionRequest),
+    ResModelSelection(ServiceModelSelectionResponse),
 }
 
 // =============================================================================

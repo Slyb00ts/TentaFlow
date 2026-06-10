@@ -806,6 +806,26 @@ impl Supervisor {
         .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
     }
 
+    /// Decrypted, node-local API key for a local external-provider service,
+    /// read from its `services.config_json`. Returns `None` when the service is
+    /// not an external provider, carries no key, or decryption fails. Used only
+    /// to build this node's BackendClient handle — the key never leaves the node
+    /// (it is absent from the broadcast `ServiceInfo`).
+    fn external_provider_api_key(&self, service_id: i64) -> Option<String> {
+        let conn = self.db.lock().ok()?;
+        let row = crate::services_repo::services::get(&conn, service_id).ok()??;
+        drop(conn);
+        let parsed: serde_json::Value = serde_json::from_str(&row.config_json).ok()?;
+        let raw = parsed.get("api_key").and_then(|v| v.as_str())?;
+        let key = self.settings_cipher.decrypt(raw).ok()?;
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            None
+        } else {
+            Some(key)
+        }
+    }
+
     // ---- Mesh registry + live handles reconcile ---------------------------
 
     /// Refresh the local entry of the mesh services registry from SQLite, then
@@ -923,7 +943,16 @@ impl Supervisor {
                     svc.engine_id
                 );
             }
-            let handle = match build_handle(&svc) {
+            // External cloud providers: resolve this node's decrypted API key so
+            // the BackendClient can authenticate. Only for locally-owned external
+            // services — remote ones are reached over the mesh and keep their key
+            // on the owning node.
+            let api_key = if svc.node_id == self.local_node_id && svc.deploy_method == "external" {
+                self.external_provider_api_key(service_id)
+            } else {
+                None
+            };
+            let handle = match build_handle(&svc, api_key) {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::warn!(

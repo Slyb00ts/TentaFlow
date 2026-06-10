@@ -1,0 +1,19 @@
+[engine]
+id = "openai-compatible"
+category = "llm"
+resource_kind = "ai"
+provider = "external"
+name = "OpenAI-compatible (custom)"
+description_pl = "Generyczny adapter dla dowolnego punktu końcowego zgodnego z OpenAI (podaj base_url + klucz)."
+description_en = "Generic adapter for any OpenAI-compatible endpoint (provide base_url + key)."
+homepage = "https://github.com/openai/openai-openapi"
+license = "Proprietary"
+default_port = 443
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_endpoint = "http://localhost:8000/v1"
+detection_health_path = "/models"
+requires_api_key = true

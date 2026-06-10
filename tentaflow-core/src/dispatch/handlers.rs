@@ -3579,6 +3579,12 @@ pub async fn service_manifest_deploy(
         serde_json::from_str(&payload.config_json)
             .map_err(|e| ProtocolError::bad_request(format!("invalid config_json: {}", e)))?
     };
+    // Cloud external providers carry an `api_key` — encrypt it with this node's
+    // settings cipher before it flows into the placeholder/deployment/service
+    // config_json. The key stays node-local; remote deploys are forwarded with
+    // the plaintext key over the encrypted mesh and re-encrypted by the receiver.
+    let user_config =
+        crate::services::deploy::encrypt_api_key_in_config(&user_config, &ctx.state.settings_cipher);
 
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
         ProtocolError::internal("port allocator not initialized (supervisor disabled)")
@@ -6851,6 +6857,204 @@ pub async fn service_update(
             restarted,
         }),
     ))
+}
+
+/// Resolve the request context for calling an external provider's API from a
+/// service row: its `ApiKind` (from the manifest), base URL (`endpoint_url`),
+/// DECRYPTED api key and optional api version (Azure). The key is decrypted
+/// here on the owning node and never returned to the client.
+fn resolve_external_request_ctx(
+    ctx: &HandlerContext,
+    row: &crate::services_repo::services::ServiceRow,
+) -> Result<(crate::services::manifest::ApiKind, String, String, Option<String>), String> {
+    if row.deploy_method != crate::services_repo::services::DeployMethod::External {
+        return Err("service is not an external provider".to_string());
+    }
+    let manifest = crate::services::manifest::registry()
+        .by_id(&row.engine_id)
+        .ok_or_else(|| format!("engine '{}' not found in manifest", row.engine_id))?;
+    let api = manifest.engine.api;
+    let base_url = row
+        .endpoint_url
+        .clone()
+        .ok_or_else(|| "service has no endpoint_url".to_string())?;
+    let cfg: serde_json::Value =
+        serde_json::from_str(&row.config_json).unwrap_or(serde_json::Value::Null);
+    let api_version = cfg
+        .get("api_version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let api_key = cfg
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .map(|raw| ctx.state.settings_cipher.decrypt(raw).unwrap_or_default())
+        .unwrap_or_default();
+    Ok((api, base_url, api_key, api_version))
+}
+
+/// Classify a selected model's modality without an extra API round-trip:
+/// ElevenLabs = tts, Soniox = stt, Anthropic = chat, everything else by id.
+fn modality_for(api: crate::services::manifest::ApiKind, id: &str) -> String {
+    use crate::services::manifest::ApiKind;
+    match api {
+        ApiKind::Elevenlabs => "tts".to_string(),
+        ApiKind::Soniox => "stt".to_string(),
+        ApiKind::Anthropic => "chat".to_string(),
+        _ => crate::services::providers::classify_openai_model_id(id).to_string(),
+    }
+}
+
+#[handler(variant = "ServiceModelCatalogRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_model_catalog(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqModelCatalog(p)) => {
+            p.clone()
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqModelCatalog",
+            ));
+        }
+    };
+
+    let resp = |models, error| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResModelCatalog(
+                tentaflow_protocol::ServiceModelCatalogResponse { models, error },
+            ),
+        ))
+    };
+
+    // Provider keys are node-local; listing must run on the owning node.
+    if forward_target_node(ctx, &payload.node_id).is_some() {
+        return resp(
+            Vec::new(),
+            Some("model listing must be performed on the node that owns the provider".to_string()),
+        );
+    }
+
+    let row = fetch_service_row(ctx, payload.service_id)?;
+    let (api, base_url, api_key, api_version) = match resolve_external_request_ctx(ctx, &row) {
+        Ok(v) => v,
+        Err(e) => return resp(Vec::new(), Some(e)),
+    };
+
+    let fetched = match crate::services::providers::list_models(
+        api,
+        &base_url,
+        &api_key,
+        api_version.as_deref(),
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => return resp(Vec::new(), Some(e.to_string())),
+    };
+
+    let selected: std::collections::HashSet<String> = {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::models::list_for_service(&conn, payload.service_id)
+            .map_err(db_err)?
+            .into_iter()
+            .map(|m| m.model_name)
+            .collect()
+    };
+
+    let models = fetched
+        .into_iter()
+        .map(|m| tentaflow_protocol::ServiceModelCatalogEntry {
+            selected: selected.contains(&m.id),
+            id: m.id,
+            display_name: m.display_name,
+            modality: m.modality,
+            context_length: m.context_length,
+        })
+        .collect();
+
+    resp(models, None)
+}
+
+#[handler(variant = "ServiceModelSelectionRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_model_selection(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqModelSelection(p)) => {
+            p.clone()
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqModelSelection",
+            ));
+        }
+    };
+
+    let resp = |success, error| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResModelSelection(
+                tentaflow_protocol::ServiceModelSelectionResponse { success, error },
+            ),
+        ))
+    };
+
+    if forward_target_node(ctx, &payload.node_id).is_some() {
+        return resp(
+            false,
+            Some("model selection must be performed on the node that owns the provider".to_string()),
+        );
+    }
+
+    let row = fetch_service_row(ctx, payload.service_id)?;
+    let api = match resolve_external_request_ctx(ctx, &row) {
+        Ok((api, _, _, _)) => api,
+        Err(e) => return resp(false, Some(e)),
+    };
+
+    let selected: Vec<crate::services_repo::models::SelectedModel> = payload
+        .selected_model_ids
+        .iter()
+        .map(|id| crate::services_repo::models::SelectedModel {
+            model_name: id.clone(),
+            display_name: None,
+            modality: modality_for(api, id),
+            context_length: None,
+        })
+        .collect();
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        if let Err(e) =
+            crate::services_repo::models::replace_selection(&conn, payload.service_id, &selected)
+        {
+            return resp(false, Some(e.to_string()));
+        }
+    }
+
+    audit(
+        ctx,
+        require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b)).as_deref(),
+        "service.model.selection",
+        Some(&row.engine_id),
+        Some(&format!("{} models", selected.len())),
+    );
+
+    resp(true, None)
 }
 
 #[handler(variant = "ServiceVramHintRequest", since = (1, 0))]

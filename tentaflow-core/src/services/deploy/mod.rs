@@ -251,6 +251,37 @@ pub(crate) fn strip_hf_token(user_config: &serde_json::Value) -> serde_json::Val
     sanitized
 }
 
+/// Config key holding a cloud external provider's API key (OpenAI, Anthropic, …).
+pub const API_KEY_CONFIG_KEY: &str = "api_key";
+
+/// Returns a copy of `user_config` with a plaintext `api_key` encrypted in place
+/// (`enc:…`). Unlike `hf_token` (which is stripped and resolved per-node from a
+/// secure setting), an external provider's key has no global setting to fall
+/// back on — it must be persisted with the service. We keep it encrypted at rest
+/// so it never lands in `config_json` (services + deployments rows, sync) in the
+/// clear. No-op when the key is absent, blank, or already encrypted. Called at
+/// the deploy ingestion boundary so the owning node encrypts with ITS cipher.
+pub fn encrypt_api_key_in_config(
+    user_config: &serde_json::Value,
+    settings_cipher: &crate::crypto::SettingsCipher,
+) -> serde_json::Value {
+    let mut out = user_config.clone();
+    if let Some(map) = out.as_object_mut() {
+        if let Some(serde_json::Value::String(key)) = map.get(API_KEY_CONFIG_KEY) {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with("enc:") {
+                if let Ok(encrypted) = settings_cipher.encrypt(trimmed) {
+                    map.insert(
+                        API_KEY_CONFIG_KEY.to_string(),
+                        serde_json::Value::String(encrypted),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn create_deploy_job(
     method: DeployMethod,
     manifest: &ServiceManifest,
@@ -1339,10 +1370,17 @@ pub(crate) fn build_endpoint_url(host: &str, port: u16, api: ApiKind) -> String 
     let base = format!("http://{}:{}", host, port);
     match api {
         ApiKind::OpenaiCompatible => format!("{}/v1", base),
+        // Cloud API families (Anthropic/Azure/ElevenLabs/Soniox) are reached via
+        // the manifest's explicit `detection_endpoint`, never through this
+        // host:port builder; they keep the bare base for completeness.
         ApiKind::OllamaNative
         | ApiKind::SherpaTts
         | ApiKind::SherpaStt
         | ApiKind::Comfyui
+        | ApiKind::Anthropic
+        | ApiKind::AzureOpenai
+        | ApiKind::Elevenlabs
+        | ApiKind::Soniox
         | ApiKind::Custom => base,
     }
 }
@@ -1644,6 +1682,7 @@ mod apply_parameters_deploy_tests {
             detection_binary: "ollama".into(),
             detection_endpoint: "http://localhost:11434".into(),
             detection_health_path: "/api/tags".into(),
+            requires_api_key: false,
         });
 
         let user_config = json!({ "parameters": { "context_size": 16384 } });

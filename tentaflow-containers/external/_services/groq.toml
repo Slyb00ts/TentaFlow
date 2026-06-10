@@ -1,0 +1,25 @@
+[engine]
+id = "groq"
+category = "llm"
+resource_kind = "ai"
+provider = "external"
+name = "Groq"
+description_pl = "Niskolatencyjne API Groq dla modeli open-weight zgodne z OpenAI."
+description_en = "Groq low-latency OpenAI-compatible API for open-weight models."
+homepage = "https://groq.com"
+license = "Proprietary"
+default_port = 443
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_endpoint = "https://api.groq.com/openai/v1"
+detection_health_path = "/models"
+requires_api_key = true
+
+[[model_preset]]
+id = "llama-3.3-70b-versatile"
+display_name = "Llama 3.3 70B Versatile"
+repo = "llama-3.3-70b-versatile"
+recommended = true

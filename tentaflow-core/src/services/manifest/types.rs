@@ -333,6 +333,14 @@ pub enum ApiKind {
     SherpaTts,
     SherpaStt,
     Comfyui,
+    /// Anthropic Messages API (`POST /v1/messages`, `x-api-key` + `anthropic-version`).
+    Anthropic,
+    /// Azure OpenAI (deployment-in-path + `?api-version=`, `api-key` header).
+    AzureOpenai,
+    /// ElevenLabs (TTS/STT, `xi-api-key` header).
+    Elevenlabs,
+    /// Soniox speech-to-text (`Authorization: Bearer`).
+    Soniox,
     Custom,
 }
 
@@ -439,10 +447,19 @@ impl NativeRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalDeploy {
     pub platforms: Vec<TargetOs>,
+    /// Local binary that signals a user-managed daemon is installed (e.g.
+    /// `ollama`). Cloud API providers have no local binary — left empty, which
+    /// also tells the deploy path to skip binary auto-detection.
+    #[serde(default)]
     pub detection_binary: String,
     pub detection_endpoint: String,
     #[serde(default = "default_health_path")]
     pub detection_health_path: String,
+    /// Cloud API provider: requires an admin-supplied API key. When true the
+    /// deploy path stores the key encrypted in the service `config_json`, skips
+    /// binary detection, and the health probe sends the provider auth header.
+    #[serde(default)]
+    pub requires_api_key: bool,
 }
 
 fn default_health_path() -> String {
