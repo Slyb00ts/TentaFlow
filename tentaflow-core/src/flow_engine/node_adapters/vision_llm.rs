@@ -188,6 +188,8 @@ impl NodeAdapter for VisionNodeAdapter {
             frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
             presence_penalty: Self::pick_optional_f32(node, envelope, "presence_penalty"),
             stop: Self::pick_stop(node),
+            tools: Vec::new(),
+            tool_choice: None,
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),
             user_id: ctx.user_id.clone(),

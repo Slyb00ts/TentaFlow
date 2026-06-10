@@ -64,6 +64,9 @@ impl ConversationHistoryStore for ConversationHistoryImpl {
                 content: crate::flow_engine::envelope::ChatMessageContent::Text(m.content),
                 name: None,
                 tool_call_id: None,
+                // Cache persists role + text only — tool-call structure is
+                // not stored, so replayed history never carries tool_calls.
+                tool_calls: None,
             })
             .collect())
     }

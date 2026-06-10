@@ -355,6 +355,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "repair_default_flow_random_id",
             MigrationStep::RustSelfManaged(repair_default_flow_random_id),
         ),
+        (
+            62,
+            "compliance_ai_tool_calls_llm_call_id",
+            MigrationStep::Sql(COMPLIANCE_AI_TOOL_CALLS_LLM_CALL_ID),
+        ),
     ]
 }
 
@@ -4715,6 +4720,14 @@ BEGIN
     SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
     WHERE processor_id = NEW.processor_id;
 END;
+"#;
+
+// v62 — `compliance_ai_tool_calls.llm_tool_call_id`: model-issued call id
+// (`LlmToolCall.id`) recorded next to the execution result. Kept apart from
+// the UUID primary key because prompt-mode ids are deterministic content
+// hashes and may repeat across events.
+const COMPLIANCE_AI_TOOL_CALLS_LLM_CALL_ID: &str = r#"
+ALTER TABLE compliance_ai_tool_calls ADD COLUMN llm_tool_call_id TEXT NULL;
 "#;
 
 // v40 — `platform_locales`: katalog jezykow interfejsu per organizacja.

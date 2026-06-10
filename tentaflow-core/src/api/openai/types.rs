@@ -279,6 +279,40 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// Tool call fragment in a streaming chunk. OpenAI splits one call across
+/// chunks: the first fragment of a slot carries `index`+`id`+`type`+
+/// `function.name`, continuations carry only `index`+`function.arguments` —
+/// every field except `index` must be optional or the SSE parse would
+/// reject continuation chunks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    /// Slot index of the call within the message's tool_calls list
+    #[serde(default)]
+    pub index: u32,
+
+    /// Call id (only on the fragment that opens a slot)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<String>,
+
+    /// Type: "function" (only on the fragment that opens a slot)
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none", default)]
+    pub tool_type: Option<String>,
+
+    /// Function name / incremental arguments fragment
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub function: Option<FunctionCallDelta>,
+}
+
+/// Incremental function payload inside `ToolCallDelta`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub arguments: Option<String>,
+}
+
 /// Response z /v1/chat/completions (non-streaming)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
@@ -500,7 +534,7 @@ pub struct Delta {
 
     /// Tool calls (przyrostowe)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 // =============================================================================

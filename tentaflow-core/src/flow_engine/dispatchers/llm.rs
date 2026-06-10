@@ -11,7 +11,18 @@ use futures::stream::BoxStream;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::flow_engine::envelope::{ChatMessage, LlmStreamChunk, TokenUsage};
+use crate::flow_engine::envelope::{ChatMessage, LlmStreamChunk, LlmToolCall, TokenUsage};
+
+/// Tool advertised to the model — backend-agnostic shape mapped per
+/// candidate to either native OpenAI `tools` or the prompt-mode section
+/// (`services/runtime/tool_calling.rs`). `parameters` is a JSON Schema
+/// object describing the arguments.
+#[derive(Debug, Clone)]
+pub struct LlmToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
 
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
@@ -25,6 +36,12 @@ pub struct LlmRequest {
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub stop: Vec<String>,
+    /// Tools offered for this request. Empty = no tool calling — the
+    /// outgoing request carries no `tools` field at all.
+    pub tools: Vec<LlmToolSpec>,
+    /// OpenAI-style tool_choice ("auto" / "none" / "required"). `None`
+    /// leaves the backend default.
+    pub tool_choice: Option<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
     /// User context propagated z `ExecutionContext.user_id` / `user_role`.
@@ -45,6 +62,8 @@ impl LlmRequest {
             frequency_penalty: None,
             presence_penalty: None,
             stop: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
             deadline: None,
             cancel_token: CancellationToken::new(),
             user_id: None,
@@ -58,6 +77,9 @@ pub struct LlmResponse {
     pub content: String,
     pub usage: TokenUsage,
     pub finish_reason: super::super::envelope::FinishReason,
+    /// Tool invocations requested by the model. Empty when the backend
+    /// answered with plain content only.
+    pub tool_calls: Vec<LlmToolCall>,
 }
 
 #[async_trait]

@@ -12,9 +12,11 @@ use std::sync::Arc;
 use futures::stream::StreamExt;
 use futures::Stream;
 
-use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta};
+use crate::api::openai::types::{
+    ChatCompletionChunk, ChunkChoice, Delta, FunctionCallDelta, ToolCallDelta,
+};
 use crate::error::Result;
-use tentaflow_protocol::{ModelStreamChunk, StreamChunkType};
+use tentaflow_protocol::{ModelStreamChunk, StreamChunkType, ToolCallDeltaChunk};
 
 /// Konwertuje strumien QUIC ModelStreamChunk na strumien ChatCompletionChunk
 /// zgodny z OpenAI SSE. Pierwszy chunk dostaje role=assistant; dalsze delta-only.
@@ -50,6 +52,7 @@ where
                             Some(text),
                             None,
                             None,
+                            None,
                         )))
                     }
                     StreamChunkType::ReasoningDelta(reasoning) => {
@@ -62,6 +65,20 @@ where
                             None,
                             Some(reasoning),
                             None,
+                            None,
+                        )))
+                    }
+                    StreamChunkType::ToolCallDelta(tc) => {
+                        let first = is_first.swap(false, Ordering::SeqCst);
+                        Some(Ok(make_chunk(
+                            chat_id,
+                            created,
+                            model_name,
+                            first,
+                            None,
+                            None,
+                            Some(vec![protocol_tool_call_delta_to_openai(tc)]),
+                            None,
                         )))
                     }
                     StreamChunkType::Done { final_metrics: _ } => Some(Ok(make_chunk(
@@ -69,6 +86,7 @@ where
                         created,
                         model_name,
                         false,
+                        None,
                         None,
                         None,
                         Some("stop".to_string()),
@@ -88,6 +106,27 @@ where
     Box::pin(converted)
 }
 
+/// Maps the protocol-level tool-call fragment onto the OpenAI chunk shape.
+/// `type` is only stamped on the fragment that opens a slot (carries the
+/// id), mirroring OpenAI's wire behaviour.
+pub fn protocol_tool_call_delta_to_openai(tc: ToolCallDeltaChunk) -> ToolCallDelta {
+    let function = if tc.function_name.is_none() && tc.arguments_delta.is_none() {
+        None
+    } else {
+        Some(FunctionCallDelta {
+            name: tc.function_name,
+            arguments: tc.arguments_delta,
+        })
+    };
+    ToolCallDelta {
+        index: tc.index,
+        tool_type: tc.id.is_some().then(|| "function".to_string()),
+        id: tc.id,
+        function,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn make_chunk(
     id: String,
     created: u64,
@@ -95,6 +134,7 @@ fn make_chunk(
     first: bool,
     content: Option<String>,
     reasoning: Option<String>,
+    tool_calls: Option<Vec<ToolCallDelta>>,
     finish_reason: Option<String>,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
@@ -112,7 +152,7 @@ fn make_chunk(
                 },
                 content,
                 reasoning_content: reasoning,
-                tool_calls: None,
+                tool_calls,
             },
             finish_reason,
             logprobs: None,
