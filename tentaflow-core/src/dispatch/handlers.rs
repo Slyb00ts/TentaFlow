@@ -6987,14 +6987,24 @@ pub async fn service_model_catalog(
         Err(e) => return resp(Vec::new(), Some(e)),
     };
 
-    let fetched = match crate::services::providers::list_models(
-        api,
-        &base_url,
-        &api_key,
-        api_version.as_deref(),
-    )
-    .await
-    {
+    // Subscription (ChatGPT plan) tokens are rejected by the standard
+    // `/v1/models`, so list from the Codex backend instead.
+    let subscription = serde_json::from_str::<serde_json::Value>(&row.config_json)
+        .ok()
+        .and_then(|c| {
+            c.get("auth_mode")
+                .and_then(|v| v.as_str())
+                .map(|m| m.eq_ignore_ascii_case("subscription"))
+        })
+        .unwrap_or(false);
+
+    let fetch = if subscription && row.engine_id.eq_ignore_ascii_case("openai") {
+        crate::services::backend::codex::list_models(&api_key).await
+    } else {
+        crate::services::providers::list_models(api, &base_url, &api_key, api_version.as_deref())
+            .await
+    };
+    let fetched = match fetch {
         Ok(m) => m,
         Err(e) => return resp(Vec::new(), Some(e.to_string())),
     };
