@@ -61,6 +61,80 @@ backend_enabled() {
   return 1
 }
 
+# Linkuje whisper + JEGO ggml w jeden wspoldzielony obiekt z UKRYTYMI symbolami
+# ggml_* (eksportowane tylko whisper_*). To pozwala glownej binarce linkowac
+# rownoczesnie STATYCZNY ggml z llama.cpp (inna wersja: master vs whisper v1.8.3)
+# bez kolizji symboli — whisper uzywa swojego prywatnego ggml zamknietego w .so,
+# zamiast dzielic jeden zestaw `ggml_*` z llama (co konczylo sie SIGABRT przy
+# `--allow-multiple-definition`). Rust (whisper-rs-sys) woła wylacznie `whisper_*`.
+build_isolated_dylib() {
+  local backend="$1" static_dir="$2" out_dir="$3" build="$4"
+  shift 4
+  local enabled=("$@")
+  local cxx="${CXX:-c++}"
+
+  local archives=(
+    "$static_dir/libwhisper.a"
+    "$static_dir/libggml.a"
+    "$static_dir/libggml-base.a"
+    "$static_dir/libggml-cpu.a"
+  )
+  backend_enabled cuda "${enabled[@]}"   && archives+=("$static_dir/libggml-cuda.a")
+  backend_enabled vulkan "${enabled[@]}" && archives+=("$static_dir/libggml-vulkan.a")
+  backend_enabled rocm "${enabled[@]}"   && archives+=("$static_dir/libggml-hip.a")
+  backend_enabled metal "${enabled[@]}"  && archives+=("$static_dir/libggml-metal.a")
+
+  case "$PLATFORM" in
+    macos-*)
+      # macOS: two-level namespace sam w sobie blokuje interpozycje, ale i tak
+      # eksportujemy tylko `_whisper_*` lista symboli. `-all_load` wciaga calosc
+      # archiwow (odpowiednik --whole-archive).
+      local list="$build/whisper_exports.list"
+      printf '_whisper_*\n' > "$list"
+      local frameworks=(-framework Accelerate -framework Foundation)
+      backend_enabled metal "${enabled[@]}" && frameworks+=(-framework Metal -framework MetalKit)
+      "$cxx" -dynamiclib -fPIC \
+        -install_name "@rpath/libwhisper_tf.dylib" \
+        -o "$out_dir/libwhisper_tf.dylib" \
+        -Wl,-exported_symbols_list,"$list" \
+        -Wl,-all_load "${archives[@]}" \
+        "${frameworks[@]}"
+      ;;
+    windows-*)
+      echo "[whisper.cpp] izolowany dylib na Windows: uzyj build-all.ps1 (.def/__declspec)" >&2
+      return 0
+      ;;
+    *)
+      # Linux: version-script localizuje WSZYSTKO poza whisper_* — prywatny ggml
+      # nie trafia do dynamicznej tablicy symboli, wiec nie koliduje z ggml llamy
+      # w glownej binarce. --whole-archive wciaga wszystkie obiekty (rejestracje
+      # backendow ggml przez static-init dzieja sie wewnatrz .so). --no-undefined
+      # wymusza, by brakujacy backend-lib byl jasnym bledem linku, a nie cichym
+      # crashem w runtime.
+      local map="$build/whisper_exports.map"
+      printf '{ global: whisper_*; local: *; };\n' > "$map"
+      local syslibs=(-fopenmp -lm -ldl -lpthread -lrt)
+      if backend_enabled cuda "${enabled[@]}"; then
+        syslibs+=(-L/usr/local/cuda/lib64 -L/usr/local/cuda/lib64/stubs -L/opt/cuda/lib64 -L/opt/cuda/lib64/stubs)
+        syslibs+=(-lcudart -lcublas -lcublasLt -lcuda -lculibos)
+      fi
+      backend_enabled vulkan "${enabled[@]}" && syslibs+=(-lvulkan)
+      if backend_enabled rocm "${enabled[@]}"; then
+        local hip="${HIP_PATH:-/opt/rocm}"
+        syslibs+=(-L"$hip/lib" -lhipblas -lrocblas -lamdhip64)
+      fi
+      "$cxx" -shared -fPIC \
+        -o "$out_dir/libwhisper_tf.so" \
+        -Wl,--version-script="$map" \
+        -Wl,--whole-archive "${archives[@]}" -Wl,--no-whole-archive \
+        -Wl,--no-undefined \
+        "${syslibs[@]}"
+      ;;
+  esac
+
+  append_manifest_library "$PLATFORM" "whisper-tf-isolated-$backend" "isolated-dylib" "$WHISPER_CPP_REF" "Whisper + prywatny ggml; eksport tylko whisper_*."
+}
+
 build_backend() {
   local backend="$1"
   local build="$NATIVE_CACHE/build/whisper.cpp-$PLATFORM-$backend"
@@ -136,9 +210,12 @@ build_backend() {
   cmake --build "$build" --target "${targets[@]}" -j"$jobs"
 
   copy_matching "$build" "$static_dir" -name '*.a' -o -name '*.lib'
-  copy_matching "$build" "$dynamic_dir" -name '*.so*' -o -name '*.dylib' -o -name '*.dll'
 
-  append_manifest_library "$PLATFORM" "whisper-cpp-$backend" "static-preferred" "$WHISPER_CPP_REF" "Backend: ${enabled_backends[*]:-cpu}."
+  # Z tych .a budujemy JEDEN izolowany dylib (prywatny ggml) — patrz
+  # build_isolated_dylib. Glowna binarka linkuje go dynamicznie, a llama.cpp
+  # zostaje statycznie ze swoim ggml. To eliminuje kolizje symboli ggml_*.
+  append_manifest_library "$PLATFORM" "whisper-cpp-$backend" "static-input-for-dylib" "$WHISPER_CPP_REF" "Backend: ${enabled_backends[*]:-cpu}. Wejscie do izolowanego dylib."
+  build_isolated_dylib "$backend" "$static_dir" "$dynamic_dir" "$build" "${enabled_backends[@]}"
 }
 
 for backend in "${BACKEND_LIST[@]}"; do

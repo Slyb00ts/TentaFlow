@@ -9,8 +9,9 @@ name = "tentaflow_mobile"
 crate-type = ["staticlib"]
 
 [dependencies]
-# default-features = false wycina `inference-whisper` (whisper-rs) z builda
-# mobilnego. Whisper na iOS leci natywnym Swift (TentaFlowAI/Whisper/*).
+# Wspolna baza mobilna (iOS + Android). default-features = false; whisper.cpp
+# dokladany TYLKO na Android (blok nizej) — na iOS STT leci MLX-whisper / natywny
+# Swift (TentaFlowAI/Whisper/*), wiec whisper.cpp sie tam nie linkuje.
 # `camera` (GStreamer) zostawiamy — apka mobilna uczestniczy w pipeline video
 # i wymaga GStreamer iOS SDK podpietego w Xcode.
 tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "dashboard-api"] }
@@ -39,5 +40,11 @@ tentaflow-core = { path = "../../tentaflow-core", default-features = false, feat
 [target.'cfg(all(target_os = "ios", not(target_abi = "sim")))'.dependencies]
 tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["inference-sherpa"] }
 
+# Android: whisper.cpp (STT) ZAWSZE wbudowany — engine `whisper` musi byc
+# dostepny w runtime. UWAGA: ten target linkuje statycznie llama.cpp
+# (inference-llamacpp z bazy) ORAZ whisper.cpp; oba wnosza symbole ggml. Na
+# Androidzie nie ma backendu CUDA, wiec kolizja ggml-cuda nie zachodzi, ale
+# pilnuj zeby nie wlaczac tu gpu-cuda na obu silnikach jednoczesnie.
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15.1"
+tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["inference-whisper"] }

@@ -13,12 +13,10 @@ gpu-cuda = ["tentaflow-core/gpu-cuda"]
 gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
 gpu-rocm = ["tentaflow-core/gpu-rocm"]
 gpu-metal = ["tentaflow-core/gpu-metal"]
-inference-whisper = ["tentaflow-core/inference-whisper"]
 
 [dependencies]
-# default-features = false nie linkuje whisper.cpp do tej samej binarki co llama.cpp.
-# Statyczne ggml/ggml-cuda z tych projektów kolidują symbolami; whisper trzeba
-# wlaczyc jawnie przez feature `inference-whisper` albo uruchamiac jako osobny serwis.
+# Wspolna baza dla WSZYSTKICH platform (Apple tez). default-features = false,
+# whisper.cpp dokladany per-target ponizej (zawsze na nie-Apple, nigdy na Apple).
 # `camera` re-dodane jawnie.
 tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa", "inference-supertonic", "camera", "vector-milvus"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
@@ -34,6 +32,14 @@ parking_lot = "0.12"
 # i podmienia biezaca binarke (external updater process — Windows nie blokuje
 # pliku w trakcie kopiowania).
 axoupdater = { version = "0.10.0", features = ["blocking"] }
+
+# Whisper.cpp (STT) ZAWSZE wbudowany na nie-Apple (Linux/Windows). To NIE jest
+# feature opt-in — engine `whisper` musi byc dostepny w runtime na tych
+# platformach. Apple (macOS/iOS) STT idzie wylacznie przez MLX-whisper (blok
+# nizej), wiec tam whisper.cpp sie nie linkuje. Ten binary nie zaciaga
+# inference-llamacpp, wiec nie ma kolizji symboli ggml whisper.cpp <-> llama.cpp.
+[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
+tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["inference-whisper"] }
 
 # MLX inference — tylko na macOS. Implementacja przez Swift bridge
 # (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i

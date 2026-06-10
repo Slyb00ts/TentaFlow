@@ -14,6 +14,7 @@ use std::process::Command;
 fn main() {
     set_linux_rpath();
     copy_native_dynamic_libs();
+    copy_isolated_whisper_dylib();
     copy_versioned_shared_libs_linux();
     build_mlx_bridge();
     build_kokoro_bridge();
@@ -21,23 +22,22 @@ fn main() {
 }
 
 // ----- Linux linker flags ----------------------------------------------------
-// 1. Rpath $ORIGIN: sherpa-rs kopiuje libsherpa-onnx-c-api.so +
-//    libonnxruntime.so do target/<profile>/ przy pierwszym buildzie. Bez
-//    ustawionego rpath binarka szuka tych libsow tylko w systemowych sciezkach
-//    (/usr/lib, LD_LIBRARY_PATH) i pada z "error while loading shared
-//    libraries". Rpath $ORIGIN mowi linkerowi: szukaj obok exe. macOS uzywa
-//    @loader_path (ustawione w build_mlx_bridge).
-// 2. --allow-multiple-definition: whisper.cpp i llama.cpp moga statycznie
-//    linkowac wlasna kopie ggml-quants.c. Linker GNU ld widzi wtedy te same
-//    symbole `quantize_*`, `ggml_validate_row_data` itd. w obu rlibach.
-//    Funkcje pochodza z tego samego runtime'u ggml, wiec linker moze wybrac
-//    pierwsza definicje i ignorowac kolejne.
+// Rpath $ORIGIN: sherpa-rs (libsherpa-onnx-c-api.so + libonnxruntime.so) oraz
+// izolowany whisper (libwhisper_tf.so) sa kopiowane do target/<profile>/ przy
+// buildzie. Bez rpath binarka szukalaby ich tylko w systemowych sciezkach
+// (/usr/lib, LD_LIBRARY_PATH) i padla z "error while loading shared libraries".
+// $ORIGIN = szukaj obok exe. macOS uzywa @loader_path (build_mlx_bridge).
+//
+// whisper.cpp i llama.cpp NIE dziela juz statycznego ggml: whisper jest
+// izolowanym dylibem z prywatnym (ukrytym) ggml (patrz build-whisper-cpp.sh +
+// whisper-rs-sys/build.rs), wiec znikla potrzeba `--allow-multiple-definition`
+// (Linux) / `/FORCE:MULTIPLE` (MSVC) — symbole ggml_* whispera nie trafiaja juz
+// do glownego linku binarki.
 fn set_linux_rpath() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "linux" => {
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
-            println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
             add_native_dynamic_rpath();
         }
         "macos" => {
@@ -46,17 +46,6 @@ fn set_linux_rpath() {
             // (analogicznie jak Linux). Rpath @loader_path/target_dir ustawia
             // build_mlx_bridge — tu chodzi tylko o vendor zvec.
             add_native_dynamic_rpath();
-        }
-        "windows" => {
-            // MSVC odpowiednik --allow-multiple-definition. whisper.cpp i
-            // llama.cpp moga linkowac wlasna kopie ggml-quants.c, na
-            // Windowsie link.exe pada z LNK2005 dla kazdego quantize_row_*.
-            // /FORCE:MULTIPLE kaze wybrac pierwsza definicje i ignorowac
-            // kolejne (identyczne bo to ten sam ggml).
-            println!("cargo:rustc-link-arg=/FORCE:MULTIPLE");
-            // /NODEFAULTLIB:library — niepotrzebne, ale bez tego LNK4098
-            // wala na konsoli o konflikcie msvcrt z innymi libs (warning,
-            // nie blocker, zostaje).
         }
         _ => {}
     }
@@ -123,6 +112,52 @@ fn copy_native_dynamic_libs() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" {
         println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
+    }
+}
+
+// Kopiuje IZOLOWANY dylib whispera (libwhisper_tf.so / .dll) PLASKO obok
+// binarki. whisper-rs-sys linkuje go dynamicznie i liczy na $ORIGIN w runtime,
+// a `copy_native_dynamic_libs` odtwarza tylko strukture katalogow lib-dynamic
+// (whisper-cpp/<variant>/...), wiec sam .so nie laduje plasko tam gdzie szuka
+// loader. Apple pomijamy — tam STT idzie przez MLX, whisper.cpp sie nie linkuje.
+fn copy_isolated_whisper_dylib() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" || target_os == "ios" {
+        return;
+    }
+    let platform = match native_platform() {
+        Some(v) => v,
+        None => return,
+    };
+    let variant =
+        std::env::var("WHISPER_CPP_NATIVE_VARIANT").unwrap_or_else(|_| "multi".to_string());
+    let fname = match target_os.as_str() {
+        "windows" => "whisper_tf.dll",
+        _ => "libwhisper_tf.so",
+    };
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let src = manifest
+        .join("../native-libs")
+        .join(&platform)
+        .join("lib-dynamic")
+        .join("whisper-cpp")
+        .join(&variant)
+        .join(fname);
+    println!("cargo:rerun-if-changed={}", src.display());
+    if !src.exists() {
+        return;
+    }
+    let dest = cargo_target_dir().join(fname);
+    let _ = std::fs::remove_file(&dest);
+    if std::fs::hard_link(&src, &dest).is_err() {
+        if let Err(e) = std::fs::copy(&src, &dest) {
+            println!(
+                "cargo:warning=tentaflow: copy isolated whisper {} -> {} nieudane: {}",
+                src.display(),
+                dest.display(),
+                e
+            );
+        }
     }
 }
 
