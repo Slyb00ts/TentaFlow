@@ -80,7 +80,9 @@ case "$PLATFORM" in
     # linkuje uniwersalnych archiwów ("Unsupported archive identifier") — wycinamy
     # czysty arm64. Slice device jest już single-arch, więc cp wystarcza.
     ORT_DST="$NATIVE_ROOT/$PLATFORM/lib-static/libonnxruntime.a"
-    if lipo -info "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" 2>/dev/null | grep -q 'fat file'; then
+    # Uwaga: dla cienkiego archiwum lipo wypisuje "Non-fat file: ...", co zawiera
+    # podłańcuch "fat file" — dlatego dopasowujemy dokładną frazę pliku uniwersalnego.
+    if lipo -info "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" 2>/dev/null | grep -q 'Architectures in the fat file'; then
       lipo "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" -thin arm64 -output "$ORT_DST"
     else
       cp "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" "$ORT_DST"
