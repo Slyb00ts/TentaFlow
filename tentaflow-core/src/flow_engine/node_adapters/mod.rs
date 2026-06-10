@@ -7,6 +7,7 @@
 // =============================================================================
 
 pub mod addon;
+pub mod agent_context;
 pub mod combine;
 pub mod condition;
 pub mod conversation_history;
@@ -19,12 +20,14 @@ pub mod sentence_buffer;
 pub mod session_context;
 pub mod speaker_context;
 pub mod stt;
+pub mod tool_exec;
 pub mod trigger;
 pub mod tts;
 pub mod tts_clean;
 pub mod vision_llm;
 
 pub use addon::AddonNodeAdapter;
+pub use agent_context::AgentContextNodeAdapter;
 pub use combine::CombineNodeAdapter;
 pub use condition::ConditionNodeAdapter;
 pub use conversation_history::ConversationHistoryNodeAdapter;
@@ -37,6 +40,7 @@ pub use sentence_buffer::SentenceBufferNodeAdapter;
 pub use session_context::SessionContextNodeAdapter;
 pub use speaker_context::SpeakerContextNodeAdapter;
 pub use stt::SttNodeAdapter;
+pub use tool_exec::ToolExecNodeAdapter;
 pub use trigger::TriggerNodeAdapter;
 pub use tts::TtsNodeAdapter;
 pub use tts_clean::TtsCleanNodeAdapter;

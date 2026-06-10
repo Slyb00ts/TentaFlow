@@ -1090,6 +1090,107 @@ export function encodeAddonsListRequest() {
 }
 
 /**
+ * @param {string} run_id
+ * @returns {Uint8Array}
+ */
+export function encodeAgentRunDetailRequest(run_id) {
+    const ptr0 = passStringToWasm0(run_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAgentRunDetailRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string | null} [agent_id]
+ * @param {string | null} [status]
+ * @param {string | null} [parent_run_id]
+ * @returns {Uint8Array}
+ */
+export function encodeAgentRunsListRequest(agent_id, status, parent_run_id) {
+    var ptr0 = isLikeNone(agent_id) ? 0 : passStringToWasm0(agent_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    var ptr1 = isLikeNone(status) ? 0 : passStringToWasm0(status, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    var ptr2 = isLikeNone(parent_run_id) ? 0 : passStringToWasm0(parent_run_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAgentRunsListRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @param {string} agent_id
+ * @returns {Uint8Array}
+ */
+export function encodeAgentsDeleteRequest(agent_id) {
+    const ptr0 = passStringToWasm0(agent_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAgentsDeleteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} agent_id
+ * @returns {Uint8Array}
+ */
+export function encodeAgentsDetailRequest(agent_id) {
+    const ptr0 = passStringToWasm0(agent_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAgentsDetailRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {boolean | null} [enabled]
+ * @param {boolean | null} [routable]
+ * @returns {Uint8Array}
+ */
+export function encodeAgentsListRequest(enabled, routable) {
+    const ret = wasm.encodeAgentsListRequest(isLikeNone(enabled) ? 0xFFFFFF : enabled ? 1 : 0, isLikeNone(routable) ? 0xFFFFFF : routable ? 1 : 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} agent_json
+ * @returns {Uint8Array}
+ */
+export function encodeAgentsUpsertRequest(agent_json) {
+    const ptr0 = passStringToWasm0(agent_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAgentsUpsertRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::ApiKeyCreateRequest { name, scopes }.
  * @param {string} name
  * @param {string[]} scopes
@@ -4327,6 +4428,19 @@ export function encodeSyncStorageReportRequest() {
  */
 export function encodeTlsStatusRequest() {
     const ret = wasm.encodeTlsStatusRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeToolsCatalogRequest() {
+    const ret = wasm.encodeToolsCatalogRequest();
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

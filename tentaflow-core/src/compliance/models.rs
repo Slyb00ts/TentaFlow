@@ -43,6 +43,7 @@ pub enum RetentionScopeKind {
     Dsar,
     Breach,
     General,
+    AgentRuns,
 }
 
 impl RetentionScopeKind {
@@ -55,6 +56,7 @@ impl RetentionScopeKind {
             Self::Dsar => "dsar",
             Self::Breach => "breach",
             Self::General => "general",
+            Self::AgentRuns => "agent_runs",
         }
     }
 
@@ -67,6 +69,7 @@ impl RetentionScopeKind {
             "dsar" => Some(Self::Dsar),
             "breach" => Some(Self::Breach),
             "general" => Some(Self::General),
+            "agent_runs" => Some(Self::AgentRuns),
             _ => None,
         }
     }
@@ -204,7 +207,13 @@ pub struct NewAiEvent<'a> {
     pub instance_id: Option<&'a str>,
     pub flow_id: Option<&'a str>,
     pub flow_node_id: Option<&'a str>,
+    pub agent_id: Option<&'a str>,
+    pub agent_run_id: Option<&'a str>,
     pub request_id: &'a str,
+    /// Cross-event correlation key (§3.4). The session/root event seeds it with
+    /// its own `request_id`; per-call events of the same user turn copy that
+    /// value, so one turn's rows link despite distinct `request_id`s.
+    pub correlation_id: Option<&'a str>,
     pub model_id: &'a str,
     pub backend: &'a str,
     pub risk_class: ComplianceRiskClass,
@@ -221,6 +230,8 @@ pub struct ComplianceAiEvent {
     pub instance_id: Option<String>,
     pub flow_id: Option<String>,
     pub flow_node_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub agent_run_id: Option<String>,
     pub request_id: String,
     pub model_id: String,
     pub backend: String,

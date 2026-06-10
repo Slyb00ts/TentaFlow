@@ -2208,6 +2208,99 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::AgentsBody(ListRequest) — UserSession. Agents registry list
+   * with optional enabled/routable filters (booleans or null = no filter).
+   * payload: { enabled?, routable? }
+   */
+  agentsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentsListRequest(
+      typeof payload.enabled === 'boolean' ? payload.enabled : null,
+      typeof payload.routable === 'boolean' ? payload.routable : null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  agentsDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentsDetailRequest(String(payload.agentId ?? payload.agent_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  agentsUpsertRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentsUpsertRequest(
+      typeof payload.agentJson === 'string' ? payload.agentJson : JSON.stringify(payload.agent ?? payload),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  agentsDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentsDeleteRequest(String(payload.agentId ?? payload.agent_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  agentRunsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const agentId = payload.agentId ?? payload.agent_id;
+    const parentRunId = payload.parentRunId ?? payload.parent_run_id;
+    const body = _wasm.encodeAgentRunsListRequest(
+      agentId ? String(agentId) : null,
+      payload.status ? String(payload.status) : null,
+      parentRunId ? String(parentRunId) : null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  agentRunDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentRunDetailRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  toolsCatalogRequest(correlationId, _payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeToolsCatalogRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   syncConflictsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeSyncConflictsListRequest(

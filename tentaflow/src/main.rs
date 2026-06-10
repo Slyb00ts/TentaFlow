@@ -521,6 +521,17 @@ async fn run_server(args: Args) -> Result<()> {
     if let Some(dispatcher) = router.flow_dispatcher() {
         dispatcher.set_addon_resolver(addon_manager.clone());
         tracing::info!("FlowDispatcher: addon block resolver wpiety");
+
+        // Harness §3.5.0: build AgentService (registry + tool catalog + core.*
+        // builtins) with its own deps and pin it into the AgentServiceSlot so
+        // the phase-3 blocks read it. AddonManager backs the ToolDispatcher and
+        // the per-principal tool permission checks.
+        let agent_service = Arc::new(tentaflow_core::agents::AgentService::new(
+            db.clone(),
+            addon_manager.clone(),
+        ));
+        dispatcher.set_agent_service(agent_service);
+        tracing::info!("FlowDispatcher: AgentService wpiety do slotu");
     }
 
     // Auto-start wszystkich service-mode addonow ktore byly enabled przed
