@@ -606,13 +606,22 @@ impl Supervisor {
                 // deployem → dwie instancje walcza o ten sam port. Failed /
                 // Interrupted / Stopped obsluguje auto-start pinned, a nie
                 // health probe.
-                if !matches!(
-                    svc.status,
-                    ServiceStatus::Running | ServiceStatus::Degraded
-                ) {
+                // External cloud providers have no local process; a previously
+                // `Failed` one must keep being re-probed so it can recover to
+                // Running once it is reachable (the user did not stop it).
+                let is_external = matches!(svc.transport, Transport::ExternalHttp);
+                let recover_external = is_external && svc.status == ServiceStatus::Failed;
+                if !recover_external
+                    && !matches!(svc.status, ServiceStatus::Running | ServiceStatus::Degraded)
+                {
                     continue;
                 }
-                if Self::service_requires_registered_model(svc)
+                // Local engines with no registered model can never serve, so they
+                // are marked Failed. External providers manage their model set via
+                // the editor's picker — an empty set is "needs configuration", not
+                // a failure, and must not get stuck Failed.
+                if !is_external
+                    && Self::service_requires_registered_model(svc)
                     && self.model_count(svc.id).await.unwrap_or(0) == 0
                 {
                     self.mark_status(
