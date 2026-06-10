@@ -337,6 +337,24 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "user",
             r#"{"properties":{"high_threshold":{"type":"number","title":"Próg wysokiej pewności","minimum":0,"maximum":1,"step":0.05,"default":0.85},"medium_threshold":{"type":"number","title":"Próg średniej pewności","minimum":0,"maximum":1,"step":0.05,"default":0.6}},"order":["high_threshold","medium_threshold"]}"#,
         ),
+        (
+            "agent_context",
+            "service",
+            "Kontekst agenta",
+            "Ładuje definicję agenta: system prompt, indeks skilli, allowlistę narzędzi i sygnały pętli harnessa; tworzy przebieg agenta",
+            r#"{"agent_id":"","from_vars":false}"#,
+            "bot",
+            r#"{"properties":{"agent_id":{"type":"string","title":"Agent","description":"Wybierz agenta (puste = z vars przy from_vars)","dynamic_enum":{"source":"agents"}},"from_vars":{"type":"boolean","title":"Z vars (router)","description":"Bierz agenta ze zmiennej ustawionej przez agent_router","default":false},"model":{"type":"string","title":"Model (override)","description":"Nadpisuje model agenta dla tej pętli","dynamic_enum":{"source":"models","category":"llm"}},"max_iterations":{"type":"integer","title":"Maks. iteracji (override)","minimum":1,"maximum":100}},"order":["agent_id","from_vars","model","max_iterations"]}"#,
+        ),
+        (
+            "tool_exec",
+            "service",
+            "Wykonanie narzędzi",
+            "Wykonuje wywołania narzędzi z ostatniej odpowiedzi modelu (core.* + narzędzia addonów); brak wywołań kończy pętlę agenta",
+            r#"{"max_result_chars":16000,"max_tool_calls_per_iteration":16}"#,
+            "wrench",
+            r#"{"properties":{"max_result_chars":{"type":"integer","title":"Maks. znaków wyniku","minimum":256,"maximum":131072,"default":16000,"description":"Przycinanie środka (middle-out) zbyt długich wyników narzędzi"},"max_tool_calls_per_iteration":{"type":"integer","title":"Maks. wywołań na iterację","minimum":1,"maximum":64,"default":16}},"order":["max_result_chars","max_tool_calls_per_iteration"]}"#,
+        ),
     ];
 
     // INSERT OR REPLACE — przy unique node_type aktualizujemy istniejace

@@ -1035,6 +1035,104 @@ pub enum SkillsPayload {
     ForkResponse(SkillsForkResponse),
 }
 
+// ----- Agents registry (Harness plan §3.3) -----
+//
+// CRUD over the `agents` table plus read-only views over runtime `agent_runs`
+// and a pickable tool catalog. All collection payloads carry pre-serialized
+// JSON (`*_json`) just like SkillsBody — the DB rows are too wide and too
+// evolution-prone to mirror field-by-field on the wire, and the dashboard
+// parses them straight into its editor model. Run control (spawn/wait/cancel)
+// and the RunEvents push channel are phase 6 and deliberately absent here.
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentsListRequest {
+    pub enabled: Option<bool>,
+    pub routable: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentsListResponse {
+    pub agents_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentsDetailRequest {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentsDetailResponse {
+    pub agent_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentsUpsertRequest {
+    pub agent_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentsUpsertResponse {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentsDeleteRequest {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentsDeleteResponse {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunsListRequest {
+    pub agent_id: Option<String>,
+    pub status: Option<String>,
+    pub parent_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunsListResponse {
+    pub runs_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunDetailRequest {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunDetailResponse {
+    pub run_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ToolsCatalogRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ToolsCatalogResponse {
+    pub tools_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum AgentsPayload {
+    ListRequest(AgentsListRequest),
+    ListResponse(AgentsListResponse),
+    DetailRequest(AgentsDetailRequest),
+    DetailResponse(AgentsDetailResponse),
+    UpsertRequest(AgentsUpsertRequest),
+    UpsertResponse(AgentsUpsertResponse),
+    DeleteRequest(AgentsDeleteRequest),
+    DeleteResponse(AgentsDeleteResponse),
+    RunsListRequest(AgentRunsListRequest),
+    RunsListResponse(AgentRunsListResponse),
+    RunDetailRequest(AgentRunDetailRequest),
+    RunDetailResponse(AgentRunDetailResponse),
+    ToolsCatalogRequest(ToolsCatalogRequest),
+    ToolsCatalogResponse(ToolsCatalogResponse),
+}
+
 // =============================================================================
 // Sync conflict manager — admin-only conflict review and resolution.
 // =============================================================================
@@ -4428,6 +4526,9 @@ pub enum MessageBody {
     // ----- Skills registry -----
     SkillsBody(SkillsPayload),
 
+    // ----- Agents registry -----
+    AgentsBody(AgentsPayload),
+
     // ----- Sync conflict manager -----
     SyncConflictBody(SyncConflictPayload),
 
@@ -5189,6 +5290,58 @@ mod tests {
             })),
             MessageBody::SkillsBody(SkillsPayload::ForkResponse(SkillsForkResponse {
                 skill_id: "s2".to_string(),
+            })),
+        ];
+        for body in bodies {
+            assert_eq!(round_trip(body.clone()), body);
+        }
+    }
+
+    #[test]
+    fn agents_payload_round_trip() {
+        let bodies = [
+            MessageBody::AgentsBody(AgentsPayload::ListRequest(AgentsListRequest {
+                enabled: Some(true),
+                routable: None,
+            })),
+            MessageBody::AgentsBody(AgentsPayload::ListResponse(AgentsListResponse {
+                agents_json: "[{\"id\":\"a1\"}]".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::DetailRequest(AgentsDetailRequest {
+                agent_id: "a1".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::DetailResponse(AgentsDetailResponse {
+                agent_json: "{\"id\":\"a1\"}".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::UpsertRequest(AgentsUpsertRequest {
+                agent_json: "{\"name\":\"my-agent\"}".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::UpsertResponse(AgentsUpsertResponse {
+                agent_id: "a1".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::DeleteRequest(AgentsDeleteRequest {
+                agent_id: "a1".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::DeleteResponse(AgentsDeleteResponse {
+                deleted: true,
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunsListRequest(AgentRunsListRequest {
+                agent_id: Some("a1".to_string()),
+                status: Some("running".to_string()),
+                parent_run_id: None,
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunsListResponse(AgentRunsListResponse {
+                runs_json: "[{\"id\":\"r1\"}]".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunDetailRequest(AgentRunDetailRequest {
+                run_id: "r1".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunDetailResponse(AgentRunDetailResponse {
+                run_json: "{\"id\":\"r1\"}".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {})),
+            MessageBody::AgentsBody(AgentsPayload::ToolsCatalogResponse(ToolsCatalogResponse {
+                tools_json: "{\"addons\":[],\"core\":[]}".to_string(),
             })),
         ];
         for body in bodies {

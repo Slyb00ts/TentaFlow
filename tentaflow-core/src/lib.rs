@@ -57,6 +57,7 @@ pub mod dispatch;
 pub mod util;
 
 pub mod addon;
+pub mod agents;
 pub mod deploy;
 pub mod license;
 pub mod lifecycle_signal;

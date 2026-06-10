@@ -529,6 +529,22 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::SkillsPayload::ForkRequest(_) => "SkillsForkRequest",
             tentaflow_protocol::SkillsPayload::ForkResponse(_) => "SkillsForkResponse",
         },
+        MessageBody::AgentsBody(p) => match p {
+            tentaflow_protocol::AgentsPayload::ListRequest(_) => "AgentsListRequest",
+            tentaflow_protocol::AgentsPayload::ListResponse(_) => "AgentsListResponse",
+            tentaflow_protocol::AgentsPayload::DetailRequest(_) => "AgentsDetailRequest",
+            tentaflow_protocol::AgentsPayload::DetailResponse(_) => "AgentsDetailResponse",
+            tentaflow_protocol::AgentsPayload::UpsertRequest(_) => "AgentsUpsertRequest",
+            tentaflow_protocol::AgentsPayload::UpsertResponse(_) => "AgentsUpsertResponse",
+            tentaflow_protocol::AgentsPayload::DeleteRequest(_) => "AgentsDeleteRequest",
+            tentaflow_protocol::AgentsPayload::DeleteResponse(_) => "AgentsDeleteResponse",
+            tentaflow_protocol::AgentsPayload::RunsListRequest(_) => "AgentRunsListRequest",
+            tentaflow_protocol::AgentsPayload::RunsListResponse(_) => "AgentRunsListResponse",
+            tentaflow_protocol::AgentsPayload::RunDetailRequest(_) => "AgentRunDetailRequest",
+            tentaflow_protocol::AgentsPayload::RunDetailResponse(_) => "AgentRunDetailResponse",
+            tentaflow_protocol::AgentsPayload::ToolsCatalogRequest(_) => "ToolsCatalogRequest",
+            tentaflow_protocol::AgentsPayload::ToolsCatalogResponse(_) => "ToolsCatalogResponse",
+        },
         MessageBody::SyncConflictBody(p) => match p {
             tentaflow_protocol::SyncConflictPayload::ListRequest(_) => "SyncConflictsListRequest",
             tentaflow_protocol::SyncConflictPayload::ListResponse(_) => "SyncConflictsListResponse",
@@ -1643,6 +1659,256 @@ mod tests {
         let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx).await;
         assert!(!is_err);
         assert!(matches!(resp, MessageBody::ModelListResponse { .. }));
+    }
+
+    fn agents_ctx(role: &str, user_id: [u8; 16], state: std::sync::Arc<state::AppState>) -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id,
+                role: Some(role.to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            org_context: None,
+        }
+    }
+
+    // The seeded admin (`db::init` -> `seed_defaults`) is the only `user_accounts`
+    // row in a fresh test DB; a write's sync-capture stamps the actor and an FK on
+    // a random UUID would fail. Admin-write tests must act as this real user.
+    fn seeded_admin_bytes() -> [u8; 16] {
+        *uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002")
+            .unwrap()
+            .as_bytes()
+    }
+
+    #[tokio::test]
+    async fn agents_upsert_then_list_and_detail_round_trip() {
+        use tentaflow_protocol::{AgentsDetailRequest, AgentsListRequest, AgentsPayload, AgentsUpsertRequest};
+        let state = state::AppState::for_test();
+        let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
+
+        let upsert = MessageBody::AgentsBody(AgentsPayload::UpsertRequest(AgentsUpsertRequest {
+            agent_json: r#"{"name":"researcher","description":"Finds things","tools":["memory.memory_store","core.skill_view"]}"#.to_string(),
+        }));
+        let (resp, is_err) = dispatch(&upsert, &admin).await;
+        assert!(!is_err, "upsert failed: {:?}", resp);
+        let agent_id = match resp {
+            MessageBody::AgentsBody(AgentsPayload::UpsertResponse(r)) => r.agent_id,
+            other => panic!("expected UpsertResponse, got {:?}", other),
+        };
+        assert!(!agent_id.is_empty());
+
+        let list = MessageBody::AgentsBody(AgentsPayload::ListRequest(AgentsListRequest {
+            enabled: None,
+            routable: None,
+        }));
+        let (resp, is_err) = dispatch(&list, &admin).await;
+        assert!(!is_err);
+        let agents_json = match resp {
+            MessageBody::AgentsBody(AgentsPayload::ListResponse(r)) => r.agents_json,
+            other => panic!("expected ListResponse, got {:?}", other),
+        };
+        let rows: serde_json::Value = serde_json::from_str(&agents_json).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["name"], "researcher");
+        // The list summary preloads the tools_json the editor needs.
+        assert!(rows[0]["tools_json"].as_str().unwrap().contains("memory.memory_store"));
+
+        let detail = MessageBody::AgentsBody(AgentsPayload::DetailRequest(AgentsDetailRequest {
+            agent_id: agent_id.clone(),
+        }));
+        let (resp, is_err) = dispatch(&detail, &admin).await;
+        assert!(!is_err);
+        match resp {
+            MessageBody::AgentsBody(AgentsPayload::DetailResponse(r)) => {
+                let agent: serde_json::Value = serde_json::from_str(&r.agent_json).unwrap();
+                assert_eq!(agent["id"], agent_id);
+                assert_eq!(agent["description"], "Finds things");
+            }
+            other => panic!("expected DetailResponse, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_upsert_denied_for_non_admin() {
+        use tentaflow_protocol::{AgentsPayload, AgentsUpsertRequest};
+        let state = state::AppState::for_test();
+        let user = agents_ctx("user", [3u8; 16], state.clone());
+        let upsert = MessageBody::AgentsBody(AgentsPayload::UpsertRequest(AgentsUpsertRequest {
+            agent_json: r#"{"name":"x","description":"d"}"#.to_string(),
+        }));
+        let (resp, is_err) = dispatch(&upsert, &user).await;
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
+            other => panic!("expected PolicyDenied, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_runs_list_filters_to_own_principal_for_non_admin() {
+        use tentaflow_protocol::{AgentsPayload, AgentRunsListRequest};
+        let state = state::AppState::for_test();
+        // Seed an agent + two runs owned by two different principals.
+        let owner = uuid::Uuid::from_bytes([7u8; 16]).to_string();
+        let other = uuid::Uuid::from_bytes([8u8; 16]).to_string();
+        let params = crate::db::models::AgentParams {
+            id: "agent-1",
+            name: "runner",
+            display_name: None,
+            description: "runs",
+            system_prompt: None,
+            model: None,
+            tools_json: "[]",
+            skills_json: "{}",
+            params_json: "{}",
+            max_iterations: 25,
+            timeout_secs: 600,
+            max_subagents: 0,
+            max_spawn_depth: 1,
+            flow_id: None,
+            routable: true,
+            is_enabled: true,
+            actor_user_id: None,
+        };
+        crate::db::repository::upsert_agent(&state.db, &params).unwrap();
+        for (id, uid) in [("run-own", &owner), ("run-other", &other)] {
+            crate::db::repository::create_agent_run(
+                &state.db,
+                &crate::db::models::NewAgentRun {
+                    id,
+                    agent_id: "agent-1",
+                    parent_run_id: None,
+                    flow_execution_id: None,
+                    user_id: Some(uid),
+                    org_id: None,
+                    prompt: "do it",
+                },
+            )
+            .unwrap();
+        }
+
+        let req = MessageBody::AgentsBody(AgentsPayload::RunsListRequest(AgentRunsListRequest {
+            agent_id: Some("agent-1".to_string()),
+            status: None,
+            parent_run_id: None,
+        }));
+
+        // Non-admin owner sees only their own run.
+        let owner_ctx = agents_ctx("user", [7u8; 16], state.clone());
+        let (resp, is_err) = dispatch(&req, &owner_ctx).await;
+        assert!(!is_err);
+        let runs: serde_json::Value = match resp {
+            MessageBody::AgentsBody(AgentsPayload::RunsListResponse(r)) => {
+                serde_json::from_str(&r.runs_json).unwrap()
+            }
+            other => panic!("expected RunsListResponse, got {:?}", other),
+        };
+        let arr = runs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "run-own");
+
+        // Admin sees both runs.
+        let admin_ctx = agents_ctx("admin", [1u8; 16], state.clone());
+        let (resp, is_err) = dispatch(&req, &admin_ctx).await;
+        assert!(!is_err);
+        let runs: serde_json::Value = match resp {
+            MessageBody::AgentsBody(AgentsPayload::RunsListResponse(r)) => {
+                serde_json::from_str(&r.runs_json).unwrap()
+            }
+            other => panic!("expected RunsListResponse, got {:?}", other),
+        };
+        assert_eq!(runs.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn agent_run_detail_hidden_from_other_principal() {
+        use tentaflow_protocol::{AgentsPayload, AgentRunDetailRequest};
+        let state = state::AppState::for_test();
+        let owner = uuid::Uuid::from_bytes([7u8; 16]).to_string();
+        let params = crate::db::models::AgentParams {
+            id: "agent-2",
+            name: "runner-two",
+            display_name: None,
+            description: "runs",
+            system_prompt: None,
+            model: None,
+            tools_json: "[]",
+            skills_json: "{}",
+            params_json: "{}",
+            max_iterations: 25,
+            timeout_secs: 600,
+            max_subagents: 0,
+            max_spawn_depth: 1,
+            flow_id: None,
+            routable: true,
+            is_enabled: true,
+            actor_user_id: None,
+        };
+        crate::db::repository::upsert_agent(&state.db, &params).unwrap();
+        crate::db::repository::create_agent_run(
+            &state.db,
+            &crate::db::models::NewAgentRun {
+                id: "run-private",
+                agent_id: "agent-2",
+                parent_run_id: None,
+                flow_execution_id: None,
+                user_id: Some(&owner),
+                org_id: None,
+                prompt: "secret",
+            },
+        )
+        .unwrap();
+
+        let req = MessageBody::AgentsBody(AgentsPayload::RunDetailRequest(AgentRunDetailRequest {
+            run_id: "run-private".to_string(),
+        }));
+        // A different non-admin principal gets NotFound (not the run body).
+        let stranger = agents_ctx("user", [99u8; 16], state.clone());
+        let (resp, is_err) = dispatch(&req, &stranger).await;
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotFound),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_catalog_includes_core_builtins() {
+        use tentaflow_protocol::{AgentsPayload, ToolsCatalogRequest};
+        let state = state::AppState::for_test();
+        // Admin-only: the catalog discloses every addon's tool surface and its
+        // sole consumer is the admin-gated agent editor (handler #[policy(Admin)]).
+        let admin = agents_ctx("admin", [5u8; 16], state.clone());
+        let req = MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {}));
+        let (resp, is_err) = dispatch(&req, &admin).await;
+        assert!(!is_err);
+        let catalog: serde_json::Value = match resp {
+            MessageBody::AgentsBody(AgentsPayload::ToolsCatalogResponse(r)) => {
+                serde_json::from_str(&r.tools_json).unwrap()
+            }
+            other => panic!("expected ToolsCatalogResponse, got {:?}", other),
+        };
+        // No addon manager in for_test() → addons empty, but core builtins always present.
+        let core = catalog["core"].as_array().unwrap();
+        assert!(core.iter().any(|t| t["name"] == "core.skill_view"));
+    }
+
+    #[tokio::test]
+    async fn tools_catalog_denied_for_non_admin() {
+        use tentaflow_protocol::{AgentsPayload, ToolsCatalogRequest};
+        let state = state::AppState::for_test();
+        let user = agents_ctx("user", [6u8; 16], state.clone());
+        let req = MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {}));
+        let (resp, is_err) = dispatch(&req, &user).await;
+        assert!(is_err, "non-admin must be denied the tools catalog");
+        match resp {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
+            other => panic!("expected PolicyDenied, got {:?}", other),
+        }
     }
 }
 

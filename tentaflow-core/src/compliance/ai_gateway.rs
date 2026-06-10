@@ -28,6 +28,17 @@ pub struct AiGatewayContext {
     pub instance_id: Option<String>,
     pub flow_id: Option<String>,
     pub flow_node_id: Option<String>,
+    /// Agent definition driving this call (Harness §3.1). Set by the
+    /// gateway-aware LlmDispatcherImpl from flow variables the harness writes.
+    pub agent_id: Option<String>,
+    /// Agent run this call belongs to — the correlation key that stitches every
+    /// `compliance_ai_events` row of one harness run together (§3.4).
+    pub agent_run_id: Option<String>,
+    /// Cross-event correlation key for a single user turn (§3.4). The routing
+    /// layer seeds it with the session event's `request_id`; the flow's per-call
+    /// `llm` events copy that value here so all rows of one turn share it. When
+    /// `None`, a started event becomes its own anchor (its `request_id`).
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +51,10 @@ pub struct AiGateway {
 pub struct AiEventHandle {
     db: DbPool,
     event_id: String,
+    /// The minted `request_id` of this event. Routing uses the session event's
+    /// value as the turn's correlation key so the flow's per-call events copy it
+    /// (§3.4).
+    request_id: String,
 }
 
 /// One EXECUTED tool call (HARNESS_PLAN §3.1) — the real outcome of running
@@ -80,6 +95,12 @@ impl AiGateway {
         let conn = self.db.lock().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let org_id = resolve_org_id(&conn, user, context)?;
         let request_id = uuid::Uuid::new_v4().to_string();
+        // A session/root event with no inbound correlation key anchors the turn:
+        // it correlates to its own request_id, which routing then propagates so
+        // the flow's per-call events copy it (§3.4).
+        let correlation_id = context
+            .and_then(|c| c.correlation_id.as_deref())
+            .unwrap_or(request_id.as_str());
         let legal_basis_id = default_ai_legal_basis_id(&org_id);
         let event_id = start_ai_event(
             &conn,
@@ -91,7 +112,10 @@ impl AiGateway {
                 instance_id: context.and_then(|c| c.instance_id.as_deref()),
                 flow_id: context.and_then(|c| c.flow_id.as_deref()),
                 flow_node_id: context.and_then(|c| c.flow_node_id.as_deref()),
+                agent_id: context.and_then(|c| c.agent_id.as_deref()),
+                agent_run_id: context.and_then(|c| c.agent_run_id.as_deref()),
                 request_id: &request_id,
+                correlation_id: Some(correlation_id),
                 model_id: &request.model,
                 backend: "chat",
                 risk_class: ComplianceRiskClass::High,
@@ -111,13 +135,62 @@ impl AiGateway {
         Ok(AiEventHandle {
             db: self.db.clone(),
             event_id,
+            request_id,
         })
+    }
+
+    /// Records one EXECUTED tool call against the latest `compliance_ai_events`
+    /// row of an agent run (the LLM call that requested it — same
+    /// `agent_run_id`). The tool_exec block calls this after running each tool;
+    /// it pairs the model-issued call id with the real execution status, output
+    /// hash and timing (§3.10). Returns `Ok(None)` when the run has no event yet
+    /// (audit then no-ops — never blocks the tool loop).
+    pub fn record_run_tool_execution(
+        &self,
+        agent_run_id: &str,
+        execution: &ToolExecution<'_>,
+    ) -> Result<Option<String>> {
+        let conn = self.db.lock().map_err(|_| anyhow!("blokada DB zatruta"))?;
+        let Some(event_id) =
+            super::repository::latest_ai_event_id_for_run(&conn, agent_run_id)?
+        else {
+            return Ok(None);
+        };
+        let started_at = execution
+            .started_at
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let tool_call_id = add_ai_tool_call(
+            &conn,
+            &NewAiToolCall {
+                event_id: &event_id,
+                llm_tool_call_id: Some(execution.tool_call_id),
+                addon_id: execution.addon_id,
+                tool_name: execution.tool_name,
+                input_text: execution.arguments,
+                output_text: execution.output,
+                status: if execution.success {
+                    ToolCallStatus::Success
+                } else {
+                    ToolCallStatus::Failed
+                },
+                error_message: execution.error_message,
+                started_at: Some(&started_at),
+            },
+        )?;
+        Ok(Some(tool_call_id))
     }
 }
 
 impl AiEventHandle {
     pub fn event_id(&self) -> &str {
         &self.event_id
+    }
+
+    /// This event's `request_id`. Routing seeds the turn's `correlation_id` with
+    /// the session event's value (§3.4).
+    pub fn request_id(&self) -> &str {
+        &self.request_id
     }
 
     /// Records the result of one executed tool call into
@@ -657,5 +730,170 @@ mod tests {
             .expect("failed row");
         assert_eq!(failed_status, "failed");
         assert_eq!(error_message.as_deref(), Some("permission denied"));
+    }
+
+    #[test]
+    fn record_run_tool_execution_attaches_to_latest_run_event() {
+        let db = db();
+        let gateway = AiGateway::new(db.clone(), "node-test");
+        let request = ChatCompletionRequest {
+            model: "bielik".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("do work".to_string())),
+                ..Default::default()
+            }],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            user: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            memory_options: None,
+            audio_input: None,
+        };
+        // Two events for the same run; the recording must land on the second
+        // (latest), which is the call the tool result answers.
+        let run_ctx = AiGatewayContext {
+            agent_run_id: Some("run-77".to_string()),
+            ..Default::default()
+        };
+        let _first = gateway
+            .start_chat_event(&request, None, Some(&run_ctx))
+            .expect("first event");
+        let second = gateway
+            .start_chat_event(&request, None, Some(&run_ctx))
+            .expect("second event");
+
+        let row = gateway
+            .record_run_tool_execution(
+                "run-77",
+                &ToolExecution {
+                    tool_call_id: "call-x",
+                    addon_id: None,
+                    tool_name: "core.skill_view",
+                    arguments: r#"{"name":"x"}"#,
+                    output: r#"{"skill":"x"}"#,
+                    success: true,
+                    error_message: None,
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .expect("record ok");
+        assert!(row.is_some(), "a run with events must record");
+
+        // Scope the read lock so it is released before the next gateway call —
+        // record_run_tool_execution re-acquires the same Mutex.
+        {
+            let conn = db.lock().expect("db lock");
+            let event_id: String = conn
+                .query_row(
+                    "SELECT event_id FROM compliance_ai_tool_calls WHERE llm_tool_call_id = 'call-x'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("tool call row");
+            assert_eq!(event_id, second.event_id(), "must attach to latest event");
+        }
+
+        // A run with no events records nothing (audit no-op).
+        let none = gateway
+            .record_run_tool_execution(
+                "run-unknown",
+                &ToolExecution {
+                    tool_call_id: "c",
+                    addon_id: None,
+                    tool_name: "core.skill_view",
+                    arguments: "{}",
+                    output: "{}",
+                    success: true,
+                    error_message: None,
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .expect("record ok");
+        assert!(none.is_none(), "no event for run → no row");
+    }
+
+    #[test]
+    fn session_and_per_call_events_share_correlation_id() {
+        let db = db();
+        let gateway = AiGateway::new(db.clone(), "node-test");
+        let request = ChatCompletionRequest {
+            model: "bielik".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Hi".to_string())),
+                ..Default::default()
+            }],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            user: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            memory_options: None,
+            audio_input: None,
+        };
+
+        // Session/root event with no inbound correlation anchors the turn to its
+        // own request_id.
+        let session = gateway
+            .start_chat_event(&request, None, None)
+            .expect("session event");
+        let correlation = session.request_id().to_string();
+
+        // A flow per-call event carrying that correlation key links to the same
+        // turn, even though it mints a distinct request_id.
+        let per_call_ctx = AiGatewayContext {
+            correlation_id: Some(correlation.clone()),
+            ..Default::default()
+        };
+        let per_call = gateway
+            .start_chat_event(&request, None, Some(&per_call_ctx))
+            .expect("per-call event");
+        assert_ne!(
+            session.event_id(),
+            per_call.event_id(),
+            "two distinct events"
+        );
+
+        let conn = db.lock().expect("db lock");
+        let session_corr: String = conn
+            .query_row(
+                "SELECT correlation_id FROM compliance_ai_events WHERE event_id = ?1",
+                params![session.event_id()],
+                |r| r.get(0),
+            )
+            .expect("session correlation");
+        let per_call_corr: String = conn
+            .query_row(
+                "SELECT correlation_id FROM compliance_ai_events WHERE event_id = ?1",
+                params![per_call.event_id()],
+                |r| r.get(0),
+            )
+            .expect("per-call correlation");
+        assert_eq!(
+            session_corr, correlation,
+            "session event anchors to its own request_id"
+        );
+        assert_eq!(
+            per_call_corr, correlation,
+            "per-call event copies the session correlation key"
+        );
     }
 }

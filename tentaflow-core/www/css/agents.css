@@ -1,0 +1,254 @@
+/* ===== File: agents.css — Agents registry screen + editor window styles ===== */
+
+.agents-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.agents-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.agents-toolbar tf-searchbox {
+  flex: 1 1 220px;
+  max-width: 340px;
+}
+
+.agents-filter {
+  min-width: 170px;
+}
+
+.agents-table-host {
+  padding: 6px 14px 14px;
+}
+
+/* --- Editor window --- */
+
+.agents-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.agents-tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.agents-editor-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.agents-limits {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.agents-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agents-field-hint {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.agents-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+}
+
+.agents-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+/* --- Tool picker tree --- */
+
+.agents-tool-tree,
+.agents-skill-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+}
+
+.agents-tool-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agents-tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 2px;
+}
+
+.agents-tool-row,
+.agents-skill-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0 2px 14px;
+  font-size: 12.5px;
+}
+
+.agents-tool-wildcard {
+  padding-left: 0;
+  flex: 1;
+}
+
+.agents-tool-name,
+.agents-skill-name {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-1);
+  white-space: nowrap;
+}
+
+.agents-tool-desc,
+.agents-skill-desc {
+  color: var(--text-3);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.agents-skill-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agents-tree-empty {
+  color: var(--text-3);
+  font-size: 12.5px;
+  padding: 8px 4px;
+}
+
+/* --- Runs tab --- */
+
+.agents-runs-host {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.agents-run-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.agents-run-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.agents-run-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agents-run-block pre {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.agents-run-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agents-run-step {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--border);
+  font-size: 12.5px;
+}
+
+.agents-run-step-kind {
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+}
+
+.agents-run-step-detail {
+  color: var(--text-2);
+  flex: 1;
+  word-break: break-word;
+}
+
+.agents-run-step-ts {
+  color: var(--text-3);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.agents-form-error {
+  color: #ef4444;
+  font-size: 12.5px;
+}
+
+.agents-editor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+}
+
+.agents-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+@media (max-width: 720px) {
+  .agents-editor-grid,
+  .agents-limits {
+    grid-template-columns: 1fr;
+  }
+}

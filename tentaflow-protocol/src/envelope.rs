@@ -131,7 +131,12 @@ mod serde_array64 {
 // v15 changes: added `MessageBody::SkillsBody(SkillsPayload)` (Skills
 // registry, Harness plan §3.2: List/Detail/Upsert/Delete/Fork pairs).
 // New enum variant shifts CBOR tag values — handshake bump required.
-pub const SCHEMA_VERSION: u16 = 15;
+// v16 changes: added `MessageBody::AgentsBody(AgentsPayload)` (Agents
+// registry, Harness plan §3.3: agent CRUD + agent_runs read views +
+// tool catalog). The variant is inserted after SkillsBody, shifting every
+// later variant's CBOR tag value — by the convention above this mandates a
+// handshake bump so old/new node mixes are rejected at handshake.
+pub const SCHEMA_VERSION: u16 = 16;
 
 // =============================================================================
 // Message kind discriminants

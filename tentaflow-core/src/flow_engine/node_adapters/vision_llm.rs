@@ -194,6 +194,33 @@ impl NodeAdapter for VisionNodeAdapter {
             cancel_token: ctx.cancel_token.clone(),
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
+            // Per-call audit correlation (§3.4) — flow_node_id from the node id,
+            // the rest from envelope meta when the harness set it.
+            flow_id: envelope
+                .meta
+                .get("flow_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            flow_node_id: Some(node.id.clone()),
+            agent_id: envelope
+                .meta
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            agent_run_id: envelope
+                .meta
+                .get("agent_run_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            correlation_id: envelope
+                .meta
+                .get("correlation_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
         };
 
         let response = ctx

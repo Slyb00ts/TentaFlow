@@ -22,6 +22,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
         CoreSyncResourceKind::Flow
             | CoreSyncResourceKind::Skill
             | CoreSyncResourceKind::SkillFile
+            | CoreSyncResourceKind::Agent
             | CoreSyncResourceKind::UserAccount
             | CoreSyncResourceKind::Organization
             | CoreSyncResourceKind::Role
@@ -100,6 +101,7 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::FlowModelBinding => apply_flow_model_binding(&tx, operation)?,
         CoreSyncResourceKind::Skill => apply_skill(&tx, operation)?,
         CoreSyncResourceKind::SkillFile => apply_skill_file(&tx, operation)?,
+        CoreSyncResourceKind::Agent => apply_agent(&tx, operation)?,
         CoreSyncResourceKind::SyncPolicy => apply_sync_policy(&tx, operation)?,
         CoreSyncResourceKind::SyncResourceAcl => apply_sync_resource_acl(&tx, operation)?,
         CoreSyncResourceKind::SyncExplicitShare => apply_sync_explicit_share(&tx, operation)?,
@@ -1063,6 +1065,105 @@ fn apply_skill_file(
                 "DELETE FROM skill_files WHERE skill_id = ?1 AND path = ?2",
                 rusqlite::params![skill_id, path],
             )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated agent row (Harness §3.3). Like skills, every local upsert
+/// is emitted as a full-row Insert, so the Insert arm is the primary path; the
+/// Update arm covers partial captures for completeness. `agent_runs` are runtime
+/// state and never reach this materializer.
+fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO agents \
+                 (id, name, display_name, description, system_prompt, model, tools_json, \
+                  skills_json, params_json, max_iterations, timeout_secs, max_subagents, \
+                  max_spawn_depth, flow_id, routable, is_enabled) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 name = excluded.name, display_name = excluded.display_name, \
+                 description = excluded.description, system_prompt = excluded.system_prompt, \
+                 model = excluded.model, tools_json = excluded.tools_json, \
+                 skills_json = excluded.skills_json, params_json = excluded.params_json, \
+                 max_iterations = excluded.max_iterations, timeout_secs = excluded.timeout_secs, \
+                 max_subagents = excluded.max_subagents, max_spawn_depth = excluded.max_spawn_depth, \
+                 flow_id = excluded.flow_id, routable = excluded.routable, \
+                 is_enabled = excluded.is_enabled, updated_at = datetime('now')",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "name")?,
+                    field_optional_string(operation, "display_name")?,
+                    field_string(operation, "description")?,
+                    field_optional_string(operation, "system_prompt")?,
+                    field_optional_string(operation, "model")?,
+                    field_string_or(operation, "tools_json", "[]")?,
+                    field_string_or(operation, "skills_json", "{}")?,
+                    field_string_or(operation, "params_json", "{}")?,
+                    field_i64_or(operation, "max_iterations", 25)?,
+                    field_i64_or(operation, "timeout_secs", 600)?,
+                    field_i64_or(operation, "max_subagents", 0)?,
+                    field_i64_or(operation, "max_spawn_depth", 1)?,
+                    field_optional_string(operation, "flow_id")?,
+                    field_bool_or(operation, "routable", true)?,
+                    field_bool_or(operation, "is_enabled", true)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => {
+            let display_name = nullable_update_string(operation, "display_name")?;
+            let system_prompt = nullable_update_string(operation, "system_prompt")?;
+            let model = nullable_update_string(operation, "model")?;
+            let flow_id = nullable_update_string(operation, "flow_id")?;
+            tx.execute(
+                "UPDATE agents SET \
+                 name = COALESCE(?2, name), \
+                 display_name = CASE WHEN ?3 THEN ?4 ELSE display_name END, \
+                 description = COALESCE(?5, description), \
+                 system_prompt = CASE WHEN ?6 THEN ?7 ELSE system_prompt END, \
+                 model = CASE WHEN ?8 THEN ?9 ELSE model END, \
+                 tools_json = COALESCE(?10, tools_json), \
+                 skills_json = COALESCE(?11, skills_json), \
+                 params_json = COALESCE(?12, params_json), \
+                 max_iterations = COALESCE(?13, max_iterations), \
+                 timeout_secs = COALESCE(?14, timeout_secs), \
+                 max_subagents = COALESCE(?15, max_subagents), \
+                 max_spawn_depth = COALESCE(?16, max_spawn_depth), \
+                 flow_id = CASE WHEN ?17 THEN ?18 ELSE flow_id END, \
+                 routable = COALESCE(?19, routable), \
+                 is_enabled = COALESCE(?20, is_enabled), \
+                 updated_at = datetime('now') \
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    optional_present_string(operation, "name")?,
+                    display_name.0,
+                    display_name.1,
+                    optional_present_string(operation, "description")?,
+                    system_prompt.0,
+                    system_prompt.1,
+                    model.0,
+                    model.1,
+                    optional_present_string(operation, "tools_json")?,
+                    optional_present_string(operation, "skills_json")?,
+                    optional_present_string(operation, "params_json")?,
+                    optional_present_i64(operation, "max_iterations")?,
+                    optional_present_i64(operation, "timeout_secs")?,
+                    optional_present_i64(operation, "max_subagents")?,
+                    optional_present_i64(operation, "max_spawn_depth")?,
+                    flow_id.0,
+                    flow_id.1,
+                    optional_present_bool(operation, "routable")?,
+                    optional_present_bool(operation, "is_enabled")?,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation))
+        }
+        ActionType::Delete => tx
+            .execute("DELETE FROM agents WHERE id = ?1", rusqlite::params![id])
             .map_err(sql_error),
     }
 }

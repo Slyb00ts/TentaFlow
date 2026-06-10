@@ -9,7 +9,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::flow_engine::dispatchers::LlmRequest;
+use crate::flow_engine::dispatchers::{LlmRequest, LlmToolSpec};
 use crate::flow_engine::envelope::{ChatMessage, ChatRole, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, LlmAdapter, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
@@ -86,6 +86,68 @@ impl LlmNodeAdapter {
             .map(|s| s.to_string())
     }
 
+    /// Tools offered for this request. The harness writes `harness_tools` into
+    /// `envelope.meta` (a JSON array of `{name, description, parameters}`); when
+    /// present and the node is not on the final pass, the LLM request carries
+    /// them so the model can call tools (§3.1, §3.4). Empty/absent = plain chat.
+    /// The grace-summary iteration (`loop_final_pass`) drops tools so the model
+    /// produces a final answer (§1.1).
+    fn pick_tools(envelope: &FlowEnvelope) -> (Vec<LlmToolSpec>, Option<String>) {
+        let final_pass = envelope
+            .meta
+            .get("loop_final_pass")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if final_pass {
+            return (Vec::new(), None);
+        }
+        let tools = envelope
+            .meta
+            .get("harness_tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        let name = t.get("name").and_then(|v| v.as_str())?;
+                        Some(LlmToolSpec {
+                            name: name.to_string(),
+                            description: t
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            parameters: t
+                                .get("parameters")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let tool_choice = if tools.is_empty() {
+            None
+        } else {
+            envelope
+                .meta
+                .get("tool_choice")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        (tools, tool_choice)
+    }
+
+    /// Reads a string audit-correlation key from `envelope.meta` (set by the
+    /// harness / trigger). Empty strings collapse to `None`.
+    fn meta_string(envelope: &FlowEnvelope, key: &str) -> Option<String> {
+        envelope
+            .meta
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
     /// Zbieranie messages z envelope.context. Plan v4.2:
     /// 1. system_prompts → osobne System messages (nie sklejać).
     /// 2. inline `system_prompt` z node config → osobny System message
@@ -129,6 +191,7 @@ impl LlmNodeAdapter {
     ) -> Result<LlmRequest> {
         let model = Self::pick_model(node, envelope)?;
         let messages = Self::build_messages(node, envelope);
+        let (tools, tool_choice) = Self::pick_tools(envelope);
         Ok(LlmRequest {
             model,
             messages,
@@ -138,12 +201,17 @@ impl LlmNodeAdapter {
             frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
             presence_penalty: Self::pick_optional_f32(node, envelope, "presence_penalty"),
             stop: Self::pick_stop(node),
-            tools: Vec::new(),
-            tool_choice: None,
+            tools,
+            tool_choice,
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
+            flow_id: Self::meta_string(envelope, "flow_id"),
+            flow_node_id: Some(node.id.clone()),
+            agent_id: Self::meta_string(envelope, "agent_id"),
+            agent_run_id: Self::meta_string(envelope, "agent_run_id"),
+            correlation_id: Self::meta_string(envelope, "correlation_id"),
         })
     }
 }
@@ -233,21 +301,29 @@ impl LlmAdapter for LlmNodeAdapter {
                 &envelope_owned
             }
         };
-        Self::build_llm_request(node, envelope, ctx).unwrap_or_else(|_| LlmRequest {
-            model: String::new(),
-            messages: Self::build_messages(node, envelope),
-            temperature: Self::pick_optional_f32(node, envelope, "temperature"),
-            max_tokens: Self::pick_optional_u32(node, envelope, "max_tokens"),
-            top_p: Self::pick_optional_f32(node, envelope, "top_p"),
-            frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
-            presence_penalty: Self::pick_optional_f32(node, envelope, "presence_penalty"),
-            stop: Self::pick_stop(node),
-            tools: Vec::new(),
-            tool_choice: None,
-            deadline: ctx.deadline,
-            cancel_token: ctx.cancel_token.clone(),
-            user_id: ctx.user_id.clone(),
-            user_role: ctx.user_role.clone(),
+        Self::build_llm_request(node, envelope, ctx).unwrap_or_else(|_| {
+            let (tools, tool_choice) = Self::pick_tools(envelope);
+            LlmRequest {
+                model: String::new(),
+                messages: Self::build_messages(node, envelope),
+                temperature: Self::pick_optional_f32(node, envelope, "temperature"),
+                max_tokens: Self::pick_optional_u32(node, envelope, "max_tokens"),
+                top_p: Self::pick_optional_f32(node, envelope, "top_p"),
+                frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
+                presence_penalty: Self::pick_optional_f32(node, envelope, "presence_penalty"),
+                stop: Self::pick_stop(node),
+                tools,
+                tool_choice,
+                deadline: ctx.deadline,
+                cancel_token: ctx.cancel_token.clone(),
+                user_id: ctx.user_id.clone(),
+                user_role: ctx.user_role.clone(),
+                flow_id: Self::meta_string(envelope, "flow_id"),
+                flow_node_id: Some(node.id.clone()),
+                agent_id: Self::meta_string(envelope, "agent_id"),
+                agent_run_id: Self::meta_string(envelope, "agent_run_id"),
+                correlation_id: Self::meta_string(envelope, "correlation_id"),
+            }
         })
     }
 }
@@ -334,6 +410,39 @@ mod tests {
         let env = FlowEnvelope::empty();
         let n = node(json!({}));
         assert!(LlmNodeAdapter::pick_model(&n, &env).is_err());
+    }
+
+    #[test]
+    fn harness_tools_pass_through_to_request() {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("model".into(), json!("m"));
+        env.meta.insert(
+            "harness_tools".into(),
+            json!([
+                {"name": "core.skill_view", "description": "load a skill", "parameters": {"type": "object"}},
+                {"name": "memory.memory_store", "description": "store", "parameters": {"type": "object"}}
+            ]),
+        );
+        env.meta.insert("tool_choice".into(), json!("auto"));
+        let req = LlmNodeAdapter::build_llm_request(&node(json!({})), &env, &stub_ctx()).unwrap();
+        assert_eq!(req.tools.len(), 2);
+        assert_eq!(req.tools[0].name, "core.skill_view");
+        assert_eq!(req.tools[1].name, "memory.memory_store");
+        assert_eq!(req.tool_choice.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn final_pass_drops_tools() {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("model".into(), json!("m"));
+        env.meta.insert(
+            "harness_tools".into(),
+            json!([{"name": "core.skill_view", "description": "x", "parameters": {}}]),
+        );
+        env.meta.insert("loop_final_pass".into(), json!(true));
+        let req = LlmNodeAdapter::build_llm_request(&node(json!({})), &env, &stub_ctx()).unwrap();
+        assert!(req.tools.is_empty(), "final pass must drop tools (grace summary)");
+        assert!(req.tool_choice.is_none());
     }
 
     #[test]

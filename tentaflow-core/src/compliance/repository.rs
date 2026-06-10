@@ -284,6 +284,19 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
             0,
             "archive",
         ),
+        // Agent run logs (Harness §3.3): tool outputs in `run_log` may be PII
+        // (CRM/memory), so the row's text columns are purged after the term while
+        // the statistical row stays. 30-day default; the purge job lands in phase 6/7.
+        (
+            "ret-core-agent-runs-default",
+            "agent_runs_default",
+            "Przebiegi agentów",
+            "Agent runs",
+            RetentionScopeKind::AgentRuns,
+            30,
+            0,
+            "delete",
+        ),
     ] {
         conn.execute(
             "INSERT OR IGNORE INTO compliance_retention_policies \
@@ -428,10 +441,10 @@ pub fn start_ai_event(conn: &Connection, event: &NewAiEvent<'_>) -> Result<Strin
     let affected = conn.execute(
         "INSERT INTO compliance_ai_events \
             (event_id, org_id, user_id, node_id, addon_id, instance_id, flow_id, flow_node_id, \
-             request_id, model_id, backend, started_at, finished_at, status, risk_class, \
-             legal_basis_id, retention_policy_id, prompt_hash, response_hash, audit_log_id, error_message) \
+             agent_id, agent_run_id, request_id, correlation_id, model_id, backend, started_at, finished_at, status, \
+             risk_class, legal_basis_id, retention_policy_id, prompt_hash, response_hash, audit_log_id, error_message) \
          VALUES \
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, 'running', ?13, ?14, ?15, '', '', NULL, NULL)",
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, 'running', ?16, ?17, ?18, '', '', NULL, NULL)",
         params![
             event_id,
             event.org_id,
@@ -441,7 +454,10 @@ pub fn start_ai_event(conn: &Connection, event: &NewAiEvent<'_>) -> Result<Strin
             event.instance_id,
             event.flow_id,
             event.flow_node_id,
+            event.agent_id,
+            event.agent_run_id,
             event.request_id,
+            event.correlation_id,
             event.model_id,
             event.backend,
             started_at,
@@ -461,8 +477,9 @@ pub fn start_ai_event(conn: &Connection, event: &NewAiEvent<'_>) -> Result<Strin
 pub fn get_ai_event(conn: &Connection, event_id: &str) -> Result<Option<ComplianceAiEvent>> {
     conn.query_row(
         "SELECT event_id, org_id, user_id, node_id, addon_id, instance_id, flow_id, flow_node_id, \
-                request_id, model_id, backend, started_at, finished_at, status, risk_class, \
-                legal_basis_id, retention_policy_id, prompt_hash, response_hash, audit_log_id, error_message \
+                agent_id, agent_run_id, request_id, model_id, backend, started_at, finished_at, \
+                status, risk_class, legal_basis_id, retention_policy_id, prompt_hash, response_hash, \
+                audit_log_id, error_message \
          FROM compliance_ai_events \
          WHERE event_id = ?1",
         params![event_id],
@@ -476,21 +493,39 @@ pub fn get_ai_event(conn: &Connection, event_id: &str) -> Result<Option<Complian
                 instance_id: row.get(5)?,
                 flow_id: row.get(6)?,
                 flow_node_id: row.get(7)?,
-                request_id: row.get(8)?,
-                model_id: row.get(9)?,
-                backend: row.get(10)?,
-                started_at: row.get(11)?,
-                finished_at: row.get(12)?,
-                status: row_ai_status(row, 13)?,
-                risk_class: row_risk_class(row, 14)?,
-                legal_basis_id: row.get(15)?,
-                retention_policy_id: row.get(16)?,
-                prompt_hash: row.get(17)?,
-                response_hash: row.get(18)?,
-                audit_log_id: row.get(19)?,
-                error_message: row.get(20)?,
+                agent_id: row.get(8)?,
+                agent_run_id: row.get(9)?,
+                request_id: row.get(10)?,
+                model_id: row.get(11)?,
+                backend: row.get(12)?,
+                started_at: row.get(13)?,
+                finished_at: row.get(14)?,
+                status: row_ai_status(row, 15)?,
+                risk_class: row_risk_class(row, 16)?,
+                legal_basis_id: row.get(17)?,
+                retention_policy_id: row.get(18)?,
+                prompt_hash: row.get(19)?,
+                response_hash: row.get(20)?,
+                audit_log_id: row.get(21)?,
+                error_message: row.get(22)?,
             })
         },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Returns the `event_id` of the most recent `compliance_ai_events` row for one
+/// agent run. The harness records a tool execution against the LLM call that
+/// requested it; that call's event carries the same `agent_run_id`, so the
+/// tool_exec block attaches executions to the latest such event (the call it is
+/// answering). `None` when the run has no events yet (audit then no-ops).
+pub fn latest_ai_event_id_for_run(conn: &Connection, agent_run_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT event_id FROM compliance_ai_events \
+         WHERE agent_run_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+        params![agent_run_id],
+        |row| row.get::<_, String>(0),
     )
     .optional()
     .map_err(Into::into)
@@ -506,19 +541,21 @@ fn ai_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComplianceAiEv
         instance_id: row.get(5)?,
         flow_id: row.get(6)?,
         flow_node_id: row.get(7)?,
-        request_id: row.get(8)?,
-        model_id: row.get(9)?,
-        backend: row.get(10)?,
-        started_at: row.get(11)?,
-        finished_at: row.get(12)?,
-        status: row_ai_status(row, 13)?,
-        risk_class: row_risk_class(row, 14)?,
-        legal_basis_id: row.get(15)?,
-        retention_policy_id: row.get(16)?,
-        prompt_hash: row.get(17)?,
-        response_hash: row.get(18)?,
-        audit_log_id: row.get(19)?,
-        error_message: row.get(20)?,
+        agent_id: row.get(8)?,
+        agent_run_id: row.get(9)?,
+        request_id: row.get(10)?,
+        model_id: row.get(11)?,
+        backend: row.get(12)?,
+        started_at: row.get(13)?,
+        finished_at: row.get(14)?,
+        status: row_ai_status(row, 15)?,
+        risk_class: row_risk_class(row, 16)?,
+        legal_basis_id: row.get(17)?,
+        retention_policy_id: row.get(18)?,
+        prompt_hash: row.get(19)?,
+        response_hash: row.get(20)?,
+        audit_log_id: row.get(21)?,
+        error_message: row.get(22)?,
     })
 }
 
@@ -530,8 +567,9 @@ pub fn list_ai_events(
     let limit = i64::from(filter.limit.clamp(1, 500));
     let offset = i64::from(filter.offset);
     let mut sql = "SELECT event_id, org_id, user_id, node_id, addon_id, instance_id, flow_id, flow_node_id, \
-                          request_id, model_id, backend, started_at, finished_at, status, risk_class, \
-                          legal_basis_id, retention_policy_id, prompt_hash, response_hash, audit_log_id, error_message \
+                          agent_id, agent_run_id, request_id, model_id, backend, started_at, finished_at, \
+                          status, risk_class, legal_basis_id, retention_policy_id, prompt_hash, response_hash, \
+                          audit_log_id, error_message \
                    FROM compliance_ai_events \
                    WHERE org_id = ?1"
         .to_string();
@@ -753,6 +791,22 @@ mod tests {
     }
 
     #[test]
+    fn retencja_agent_runs_domyslnie_trzydziesci_dni() {
+        let conn = db();
+        let policy = resolve_retention_policy(
+            &conn,
+            crate::services::org::DEFAULT_ORG_ID,
+            RetentionScopeKind::AgentRuns,
+            None,
+        )
+        .expect("polityka retencji agent_runs");
+
+        assert_eq!(policy.scope_kind, RetentionScopeKind::AgentRuns);
+        assert_eq!(policy.retention_days, 30);
+        assert_eq!(policy.action_after_retention, "delete");
+    }
+
+    #[test]
     fn nowa_organizacja_dostaje_domyslne_polityki_compliance() {
         let pool = std::sync::Arc::new(std::sync::Mutex::new(db()));
         let org = crate::services::org::repo::create_organization(
@@ -791,7 +845,10 @@ mod tests {
                 instance_id: Some("instance-a"),
                 flow_id: None,
                 flow_node_id: None,
+                agent_id: None,
+                agent_run_id: None,
                 request_id: "request-a",
+                correlation_id: None,
                 model_id: "model-a",
                 backend: "test",
                 risk_class: ComplianceRiskClass::High,
