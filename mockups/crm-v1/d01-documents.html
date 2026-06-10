@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>Documents (D1)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css"></head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05 12.25 20.24"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 13.5"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20l3-2 3 2 3-2 3 2 3-2 1 2V2l-3 2-3-2-3 2-3-2-3 2-1-2z"/><path d="M16 8H8"/><path d="M16 12H8"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9 14a2 2 0 0 0 2 2h2a2 2 0 0 0 0-4h-2a2 2 0 0 1 0-4h2a2 2 0 0 1 2 2"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/><rect x="10" y="4" width="4" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>Documents (D1)</h1>
+  <p class="lead">
+    Pliki + metadane. <strong>Bez logiki finansowej</strong> (to billing). Bez treści e-dokumentów księgowych (to też billing). Tu są: oferty PDF, karty akceptacji, harmonogramy, umowy, NDA, transkrypcje spotkań, attachmenty z maili.
+    AI ekstrakcja (OCR + LLM) dorzuca metadane: kogo dotyczy, jaki deal, typ dokumentu, daty kluczowe.
+  </p>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">D1</span><h2>Documents — wszystkie pliki</h2><div class="desc">3 248 plików · 142 GB · sortowane wg ostatniej aktywności.</div></div>
+<div class="screen-frame">
+<div class="tf-shell">
+
+<aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-deal"/></svg>CRM</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av indigo">AK</div><div><div class="nm">Anna Kowalska</div><div class="rl">Handlowiec · Wschód</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+
+<main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>Documents</strong></div>
+  <div class="pill-tabs">
+    <button class="pill-tab active"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-file"/></svg>Oferty</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-file-text"/></svg>Umowy</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-shield-check"/></svg>Karty akceptacji</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-lock"/></svg>NDA</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy</button>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+<div class="page-head">
+<div class="title">Wszystkie dokumenty<div class="sub">3 248 plików · ostatni przesłany 4 min temu</div></div>
+<div class="actions">
+  <div class="segmented"><button class="active"><svg class="icon"><use href="#i-list"/></svg>Lista</button><button><svg class="icon"><use href="#i-grid"/></svg>Karty</button></div>
+  <button class="btn btn-primary"><svg class="icon"><use href="#i-upload"/></svg>Wgraj</button>
+</div>
+</div>
+
+<table class="tf-table">
+<thead><tr><th></th><th>Nazwa</th><th>Typ</th><th>Powiązany z</th><th>Rozmiar</th><th>Ostatnia akt.</th><th>Tagi</th></tr></thead>
+<tbody>
+<tr><td><svg class="icon text-3"><use href="#i-file"/></svg></td><td><strong>Oferta_VW_ERP_v3.pdf</strong></td><td>oferta</td><td><a>VW Poznań · ERP fleet</a> <span class="contrib-tag crm">deal</span></td><td>2.1 MB</td><td>4 dni</td><td><span class="chip success">tracked · 4 otwarcia</span></td></tr>
+<tr><td><svg class="icon text-3"><use href="#i-file"/></svg></td><td><strong>acceptance_card_OrlenCRO_v1.pdf</strong></td><td>karta akceptacji</td><td><a>Orlen · Cyfryzacja CRO</a> <span class="contrib-tag crm">deal</span></td><td>240 KB</td><td>dziś 8:42</td><td><span class="chip success">zaakceptowana</span></td></tr>
+<tr><td><svg class="icon text-3"><use href="#i-file"/></svg></td><td><strong>NDA_VW_signed.pdf</strong></td><td>NDA</td><td><a>Volkswagen Poznań</a> <span class="contrib-tag contacts">firma</span></td><td>180 KB</td><td>3 tyg.</td><td><span class="chip">signed</span></td></tr>
+<tr><td><svg class="icon text-3"><use href="#i-file"/></svg></td><td><strong>Harmonogram_wdrozenia.xlsx</strong></td><td>harmonogram</td><td><a>VW Poznań · ERP fleet</a></td><td>340 KB</td><td>4 dni</td><td>—</td></tr>
+<tr><td><svg class="icon text-3"><use href="#i-file"/></svg></td><td><strong>transcript_VW_demo_18.05.txt</strong></td><td>transkrypcja</td><td><a>Spotkanie demo VW</a> <span class="contrib-tag calendar">event</span></td><td>48 KB</td><td>17 godz.</td><td><span class="chip accent">52 min</span></td></tr>
+<tr><td><svg class="icon text-3"><use href="#i-file"/></svg></td><td><strong>Umowa_ramowa_mBank.pdf</strong></td><td>umowa</td><td><a>mBank S.A.</a> <span class="contrib-tag contacts">firma</span></td><td>620 KB</td><td>11 mc.</td><td><span class="chip">signed</span></td></tr>
+<tr><td><svg class="icon text-3"><use href="#i-file"/></svg></td><td><strong>Oferta_PKO_BP_v2.pdf</strong></td><td>oferta</td><td><a>PKO BP · platforma wniosk.</a></td><td>1.8 MB</td><td>14 dni</td><td><span class="chip warning">0 otwarć</span></td></tr>
+<tr><td><svg class="icon text-3"><use href="#i-file"/></svg></td><td><strong>Case_study_Santander.pdf</strong></td><td>case study</td><td><span class="contrib-tag crm">marketing</span></td><td>980 KB</td><td>1 mc</td><td><span class="chip">marketing</span></td></tr>
+</tbody>
+</table>
+
+<!-- AI -->
+<div class="section-card mt-md" style="background:linear-gradient(135deg,rgba(167,139,250,0.06),rgba(99,102,241,0.04));border-color:rgba(167,139,250,0.25);">
+  <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-sparkles"/></svg>AI · auto-organizacja</div></div>
+  <div class="text-sm text-2">
+    Wykryto <strong>38 plików</strong> bez metadanych. Mogę zaproponować dla każdego: typ, powiązany deal/firmę, datę, tagi — w jednym confirm dialogu.
+  </div>
+  <button class="btn btn-primary btn-sm mt-sm">Pokaż propozycje</button>
+</div>
+
+</main>
+</div></div>
+</section>
+
+</body>
+</html>

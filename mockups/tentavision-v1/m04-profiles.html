@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Profile analityczne (M4 v2)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.col-2 { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
+.slider-row { display: grid; grid-template-columns: 1fr auto 60px; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px dashed var(--border); }
+.slider-row:last-child { border-bottom: 0; }
+.slider-row .label { font-size: 12.5px; font-weight: 700; }
+.slider-row .label .desc { font-size: 11px; color: var(--text-3); font-weight: 400; margin-top: 2px; display: block; }
+.slider-row input[type=range] { width: 220px; }
+.slider-row .val { font-family: ui-monospace,monospace; font-weight: 700; color: var(--accent-2); text-align: right; }
+.flow-card { background: var(--bg); border: 1px solid var(--border-hover); border-radius: var(--radius); padding: 14px;
+  display: grid; grid-template-columns: 40px 1fr auto; gap: 12px; align-items: center; margin-bottom: 8px; }
+.flow-card .ico { width: 40px; height: 40px; border-radius: var(--radius-sm); background: var(--accent-glow);
+  color: var(--accent-2); display: flex; align-items: center; justify-content: center; }
+.flow-card .name { font-weight: 700; font-size: 13.5px; }
+.flow-card .meta { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+.flow-card .meta span { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/></symbol>
+  <symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5 11 16.5"/><path d="M16.5 7.5 13 16.5"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M4</span><h2>Profile analityczne — wybór Flow + quick params</h2>
+    <div class="desc">Profil to: cel + Flow (z FlowBuilder) + kamery + harmonogram + parametry. Pełna edycja DAG = otwarcie FlowBuilder.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flow"/></svg>FlowBuilder</div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Analyst</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Profile analityczne</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">ADR-brama</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Profil: ADR-brama <span class="risk A">A</span></div>
+            <div class="d-sub">Profil dla kontroli wjazdu cystern · klasa ryzyka A (bezosobowe) · 3 kamery przypisane</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-flow"/></svg>Flow: tv-realtime-adr</span>
+              <span class="chip"><svg class="icon"><use href="#i-camera"/></svg>3 kamery</span>
+              <span class="chip">24/7</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-play"/></svg>Test na nagraniu</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg>Zapisz</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab active"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Bindings</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+        </div>
+
+        <div class="col-2">
+          <!-- LEFT: Flow + quick params -->
+          <section>
+            <section class="section-card">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-flow"/></svg>Flow przypisany do profilu</div>
+                <span class="text-xs text-3">Definicja pipeline'u: FlowBuilder</span>
+              </div>
+              <div class="flow-card">
+                <div class="ico"><svg class="icon icon-lg" style="width:22px;height:22px"><use href="#i-flow"/></svg></div>
+                <div>
+                  <div class="name">tv-realtime-adr</div>
+                  <div class="meta">
+                    <span><svg class="icon"><use href="#i-cpu"/></svg>6 bloków</span>
+                    <span>capabilities: vision.detect, vision.ocr</span>
+                    <span>v3 · ostatnia edycja Aleksandra · 2 dni temu</span>
+                  </div>
+                </div>
+                <button class="btn btn-secondary"><svg class="icon"><use href="#i-external"/></svg>Otwórz w FlowBuilder</button>
+              </div>
+              <div class="form-row mt-md">
+                <label>Zmień Flow<div class="label-desc">Lista Flow z FlowBuilder które używają capabilities z TentaVision</div></label>
+                <select class="select">
+                  <option>tv-realtime-adr (v3) — aktywny</option>
+                  <option>tv-realtime-adr (v2) — poprzednia wersja</option>
+                  <option>tv-realtime-adr-strict (eksperyment)</option>
+                  <option>tv-realtime-adr-night-only</option>
+                </select>
+              </div>
+              <p class="text-xs text-3 flex align-center gap-sm" style="margin-top:6px">
+                <svg class="icon"><use href="#i-info"/></svg>
+                Lista filtrowana do Flow które używają tylko capabilities wymagane przez TentaVision (vision.detect, vision.ocr, video.recording). Inne Flow nie pasują do tego profilu.
+              </p>
+            </section>
+
+            <section class="section-card">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-brain"/></svg>Quick params <span class="text-xs text-3" style="font-weight:400;letter-spacing:0">— overrides do Flow inputs</span></div>
+                <span class="chip accent">3 zmienione vs domyślne</span>
+              </div>
+              <div>
+                <div class="slider-row">
+                  <div><div class="label">Próg czytelności tablicy ADR</div><div class="desc">Poniżej → alarm "tablica nieczytelna"</div></div>
+                  <input type="range" min="0" max="1" step="0.05" value="0.65">
+                  <div class="val">0.65</div>
+                </div>
+                <div class="slider-row">
+                  <div><div class="label">FPS sampling kamery</div><div class="desc">Częstotliwość analizy</div></div>
+                  <input type="range" min="1" max="15" step="1" value="5">
+                  <div class="val">5 fps</div>
+                </div>
+                <div class="slider-row">
+                  <div><div class="label">Latency budget p95</div><div class="desc">Twardy limit, powyżej → degradacja FPS</div></div>
+                  <input type="range" min="500" max="5000" step="100" value="3000">
+                  <div class="val">3000 ms</div>
+                </div>
+                <div class="slider-row">
+                  <div><div class="label">Min. wielkość pojazdu (bbox)</div><div class="desc">Filtruje małe obiekty</div></div>
+                  <input type="range" min="0" max="0.5" step="0.05" value="0.20">
+                  <div class="val">0.20</div>
+                </div>
+                <div class="slider-row">
+                  <div><div class="label">Klasy pojazdów</div><div class="desc">Z listy COCO + custom</div></div>
+                  <div class="flex gap-sm wrap"><span class="chip accent">truck</span><span class="chip accent">tanker</span><span class="chip">van</span><span class="chip">car</span></div>
+                  <div></div>
+                </div>
+              </div>
+              <p class="text-xs text-3 mt-md flex align-center gap-sm">
+                <svg class="icon"><use href="#i-info"/></svg>
+                Quick params zapisują się jako overrides do inputs Flow. Aby zmienić strukturę grafu (dodać blok, zmienić routing) — otwórz w FlowBuilder.
+              </p>
+            </section>
+          </section>
+
+          <!-- RIGHT: profile config + camera assignment -->
+          <section>
+            <section class="section-card">
+              <div class="section-card-head"><div class="title">Konfiguracja profilu</div></div>
+              <div class="field"><label>Nazwa</label><input class="input" value="ADR-brama"></div>
+              <div class="field"><label>Cel</label><select class="select"><option>Real-time (ciągła analiza)</option><option>Alarm enrichment</option><option>Forensic indexing</option></select></div>
+              <div class="field">
+                <label>Harmonogram</label>
+                <div class="flex gap-sm"><span class="chip success">24/7</span><button class="btn btn-secondary btn-sm">Edytuj harmonogram</button></div>
+              </div>
+              <div class="field"><label>Retencja klipów</label><select class="select"><option>Klasa A · 30 dni (domyślne)</option></select></div>
+              <div class="field"><label>Tier QoS</label><select class="select"><option>Tier 1 — degraduj FPS przy saturacji</option></select></div>
+            </section>
+
+            <section class="section-card">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-camera"/></svg>Kamery w profilu</div>
+                <button class="btn btn-sm btn-secondary"><svg class="icon"><use href="#i-plus"/></svg>Dodaj</button>
+              </div>
+              <table class="tf-table" style="border:0;background:transparent">
+                <tbody>
+                  <tr><td class="fw-700">C-01 brama wjazdowa</td><td><span class="status-pill ok">online</span></td></tr>
+                  <tr><td class="fw-700">C-18 dok</td><td><span class="status-pill ok">online</span></td></tr>
+                  <tr><td class="fw-700">C-22 wjazd ADR</td><td><span class="status-pill warn">degraded</span></td></tr>
+                </tbody>
+              </table>
+            </section>
+
+            <section class="section-card" style="background:rgba(167,139,250,0.05);border-color:rgba(167,139,250,0.25);padding:14px">
+              <div class="text-xs fw-700 flex align-center gap-sm" style="color:var(--accent-2)"><svg class="icon"><use href="#i-link"/></svg>Capabilities tego Flow</div>
+              <div class="flex col gap-sm mt-md">
+                <div class="flex justify-between align-center text-sm">
+                  <span class="mono">vision.detect</span>
+                  <span class="chip success">bound: yolo11m@node-A</span>
+                </div>
+                <div class="flex justify-between align-center text-sm">
+                  <span class="mono">vision.ocr</span>
+                  <span class="chip success">bound: ppocrv5@node-A</span>
+                </div>
+                <div class="flex justify-between align-center text-sm">
+                  <span class="mono">video.recording</span>
+                  <span class="chip success">bound: tv-recording@node-A</span>
+                </div>
+              </div>
+              <p class="text-xs text-3 mt-md">Zmiana mapowania capability → service: <a href="m14-bindings.html">Bindings tab</a></p>
+            </section>
+          </section>
+        </div>
+
+        <!-- Profile library -->
+        <section class="section-card mt-md">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-brain"/></svg>Profile w deployment</div>
+            <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy profil</button>
+          </div>
+          <table class="tf-table" style="border:0">
+            <thead><tr><th>Nazwa</th><th>Flow</th><th>Klasa</th><th>Kamery</th><th>Harmonogram</th><th>Aktywny</th></tr></thead>
+            <tbody>
+              <tr><td class="fw-700">ADR-brama</td><td class="mono text-xs">tv-realtime-adr (v3)</td><td><span class="risk A">A</span></td><td>3</td><td>24/7</td><td><span class="toggle on"></span></td></tr>
+              <tr><td class="fw-700">ADR-dok</td><td class="mono text-xs">tv-realtime-adr (v3)</td><td><span class="risk A">A</span></td><td>2</td><td>06:00–22:00</td><td><span class="toggle on"></span></td></tr>
+              <tr><td class="fw-700">Peron-publiczny</td><td class="mono text-xs">tv-realtime-public (v2)</td><td><span class="risk B">B</span></td><td>4</td><td>04:30–24:00</td><td><span class="toggle on"></span></td></tr>
+              <tr><td class="fw-700">Bezpieczeństwo-noc</td><td class="mono text-xs">tv-security-night (v1)</td><td><span class="risk B">B</span></td><td>8</td><td>22:00–06:00</td><td><span class="toggle on"></span></td></tr>
+              <tr><td class="fw-700">ANPR-parking</td><td class="mono text-xs">tv-anpr (v4)</td><td><span class="risk B">B</span></td><td>2</td><td>24/7</td><td><span class="toggle on"></span></td></tr>
+              <tr style="opacity:0.55"><td class="fw-700">Re-ID strzeżony (D4)</td><td class="mono text-xs">tv-reid-historical (template)</td><td><span class="risk C">C</span></td><td>0 <span class="chip danger" style="font-size:10px">brak claims</span></td><td>—</td><td><span class="toggle"></span></td></tr>
+            </tbody>
+          </table>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — tf-pin-input (Mesh pairing)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.25);
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+  --shadow-lg: 0 16px 48px rgba(0,0,0,0.7);
+  --glow-indigo: 0 0 30px rgba(99, 102, 241, 0.3);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+.intro {
+  max-width: 1200px; margin: 36px auto 0; padding: 0 24px;
+}
+.intro h1 {
+  font-size: 26px; font-weight: 800; margin-bottom: 6px;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.intro .lead { color: var(--text-2); max-width: 860px; font-size: 14px; line-height: 1.7; }
+
+.grid {
+  max-width: 1200px; margin: 32px auto 80px; padding: 0 24px;
+  display: grid; gap: 32px;
+}
+
+/* Modal shell (fake tf-window) */
+.modal {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  width: 100%;
+  max-width: 520px;
+  margin: 0 auto;
+}
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.modal-head .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
+.modal-head h3 { font-size: 15px; font-weight: 700; color: var(--text); }
+.modal-body { padding: 28px 24px; }
+.modal-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+}
+
+/* Buttons */
+.btn {
+  padding: 9px 18px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--border-hover); background: var(--bg-3); }
+.btn.primary {
+  background: var(--gradient-accent);
+  border-color: transparent;
+  color: white;
+  box-shadow: var(--glow-indigo);
+}
+.btn.primary:hover { filter: brightness(1.1); }
+
+/* Intro hint */
+.pin-intro {
+  text-align: center;
+  color: var(--text-2);
+  font-size: 13px;
+  margin-bottom: 24px;
+  line-height: 1.6;
+}
+.pin-intro .node-id {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--accent-2);
+  background: rgba(167, 139, 250, 0.08);
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(167, 139, 250, 0.2);
+}
+
+/* ======================================================
+   tf-pin-input — OTP-style 6-digit input
+   ====================================================== */
+.tf-pin-input {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin: 8px 0 20px;
+}
+.tf-pin-input .group {
+  display: flex;
+  gap: 10px;
+}
+.tf-pin-input .sep {
+  display: flex; align-items: center;
+  color: var(--text-3);
+  font-size: 22px;
+  font-weight: 300;
+  user-select: none;
+  padding: 0 2px;
+}
+.tf-pin-cell {
+  width: 52px;
+  height: 64px;
+  background: var(--bg-input);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text);
+  text-align: center;
+  transition: all 0.15s ease;
+  outline: none;
+  caret-color: var(--accent-1);
+}
+.tf-pin-cell:hover { border-color: var(--border-hover); }
+.tf-pin-cell:focus {
+  border-color: var(--accent-1);
+  background: rgba(99, 102, 241, 0.06);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.tf-pin-cell.filled {
+  border-color: rgba(99, 102, 241, 0.5);
+  color: var(--accent-2);
+}
+.tf-pin-cell.error {
+  border-color: var(--danger);
+  background: rgba(239, 68, 68, 0.08);
+  animation: shake 0.3s ease;
+}
+.tf-pin-cell.success {
+  border-color: var(--success);
+  background: rgba(34, 197, 94, 0.08);
+  color: var(--success);
+}
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-4px); }
+  75% { transform: translateX(4px); }
+}
+
+/* Caret blink — only focused, empty cell */
+.tf-pin-cell:focus:placeholder-shown {
+  animation: caret-pulse 1.1s ease-in-out infinite;
+}
+@keyframes caret-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px var(--accent-glow); }
+  50% { box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1); }
+}
+
+/* Status / helper */
+.pin-status {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-3);
+  margin-top: 12px;
+  min-height: 18px;
+}
+.pin-status.error { color: var(--danger); }
+.pin-status.success { color: var(--success); }
+
+/* Variants section */
+.variant-label {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-3);
+  margin-bottom: 16px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed var(--border);
+}
+
+/* Spec section */
+.spec {
+  max-width: 1200px;
+  margin: 0 auto 80px;
+  padding: 0 24px;
+}
+.spec h2 {
+  font-size: 18px;
+  font-weight: 700;
+  margin-bottom: 16px;
+  color: var(--text);
+}
+.spec-table {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.spec-row {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.spec-row:last-child { border-bottom: none; }
+.spec-row .k {
+  font-weight: 600;
+  color: var(--text-2);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+.spec-row .v { color: var(--text); font-size: 13px; line-height: 1.7; }
+.spec-row code {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--bg-input);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--accent-2);
+}
+
+/* Display side (initiator) */
+.display-side {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px;
+  background: var(--bg-input);
+  border: 1.5px dashed var(--border);
+  border-radius: var(--radius-lg);
+  margin: 12px 0 20px;
+}
+.display-pin {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 42px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  background: var(--gradient-accent);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  padding: 8px 16px;
+}
+.display-timer {
+  font-size: 13px;
+  color: var(--warning);
+  margin-top: 8px;
+  font-weight: 600;
+}
+.display-steps {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-top: 14px;
+  text-align: center;
+  line-height: 1.8;
+}
+
+/* Side by side comparison */
+.pair-demo {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  max-width: 1200px;
+  margin: 0 auto 60px;
+  padding: 0 24px;
+}
+.pair-demo .side-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-3);
+  margin-bottom: 12px;
+  text-align: center;
+}
+.pair-demo .modal { max-width: none; }
+
+@media (max-width: 900px) {
+  .pair-demo { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>tf-pin-input — OTP-style PIN dla mesh pairing</h1>
+  <p class="lead">
+    Komponent 6-cyfrowego inputu PIN w stylu 2FA/bluetooth. Auto-advance między polami, paste rozrzuca cyfry po boxach, strzałki + backspace nawigują wstecz. Monospace JetBrains Mono, akcent indigo→violet spójny z resztą systemu. Zastępuje zwykły tf-input w `openConfirmPinModal`.
+  </p>
+</div>
+
+<!-- PAIR DEMO: side-by-side -->
+<div class="pair-demo">
+  <div>
+    <div class="side-label">Node inicjator — wyświetla PIN</div>
+    <div class="modal">
+      <div class="modal-head">
+        <span class="dot" style="background: var(--warning);"></span>
+        <h3>Przekaż PIN na drugi node</h3>
+      </div>
+      <div class="modal-body">
+        <div class="pin-intro">
+          Wpisz ten PIN na nodzie <span class="node-id">spark-002</span> żeby dokończyć parowanie.
+        </div>
+        <div class="display-side">
+          <div class="display-pin">454 568</div>
+          <div class="display-timer">48s</div>
+          <div class="display-steps">
+            1. Otwórz Mesh na drugim nodzie<br>
+            2. Kliknij "Potwierdź" przy oczekującym parowaniu<br>
+            3. Wpisz ten PIN
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn">Zamknij</button>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="side-label">Node docelowy — wpisuje PIN</div>
+    <div class="modal">
+      <div class="modal-head">
+        <span class="dot"></span>
+        <h3>Potwierdź parowanie</h3>
+      </div>
+      <div class="modal-body">
+        <div class="pin-intro">
+          Wpisz PIN z noda <span class="node-id">e2400535...</span> żeby nawiązać zaufanie.
+        </div>
+        <div class="tf-pin-input">
+          <div class="group">
+            <input class="tf-pin-cell filled" value="4" maxlength="1" inputmode="numeric" readonly>
+            <input class="tf-pin-cell filled" value="5" maxlength="1" inputmode="numeric" readonly>
+            <input class="tf-pin-cell filled" value="4" maxlength="1" inputmode="numeric" readonly>
+          </div>
+          <div class="sep">·</div>
+          <div class="group">
+            <input class="tf-pin-cell filled" value="5" maxlength="1" inputmode="numeric" readonly>
+            <input class="tf-pin-cell" value="" maxlength="1" inputmode="numeric" placeholder="" autofocus>
+            <input class="tf-pin-cell" value="" maxlength="1" inputmode="numeric" placeholder="">
+          </div>
+        </div>
+        <div class="pin-status">Wpisuję PIN, auto-advance między polami</div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn">Anuluj</button>
+        <button class="btn primary">Potwierdź parowanie</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- STATES: empty, partial, filled, error, success -->
+<div class="grid">
+  <div class="modal">
+    <div class="modal-head"><span class="dot"></span><h3>Stany komponentu</h3></div>
+    <div class="modal-body">
+
+      <div class="variant-label">1. Pusty, focus na pierwszym polu</div>
+      <div class="tf-pin-input">
+        <div class="group">
+          <input class="tf-pin-cell" value="" maxlength="1" placeholder="">
+          <input class="tf-pin-cell" value="" maxlength="1" placeholder="">
+          <input class="tf-pin-cell" value="" maxlength="1" placeholder="">
+        </div>
+        <div class="sep">·</div>
+        <div class="group">
+          <input class="tf-pin-cell" value="" maxlength="1" placeholder="">
+          <input class="tf-pin-cell" value="" maxlength="1" placeholder="">
+          <input class="tf-pin-cell" value="" maxlength="1" placeholder="">
+        </div>
+      </div>
+      <div class="pin-status">Wprowadź 6-cyfrowy PIN</div>
+
+      <div class="variant-label" style="margin-top: 32px;">2. Częściowo wypełniony</div>
+      <div class="tf-pin-input">
+        <div class="group">
+          <input class="tf-pin-cell filled" value="4" maxlength="1" readonly>
+          <input class="tf-pin-cell filled" value="5" maxlength="1" readonly>
+          <input class="tf-pin-cell filled" value="4" maxlength="1" readonly>
+        </div>
+        <div class="sep">·</div>
+        <div class="group">
+          <input class="tf-pin-cell" value="" maxlength="1">
+          <input class="tf-pin-cell" value="" maxlength="1">
+          <input class="tf-pin-cell" value="" maxlength="1">
+        </div>
+      </div>
+      <div class="pin-status">3 / 6 cyfr</div>
+
+      <div class="variant-label" style="margin-top: 32px;">3. Wypełniony, gotowy do submit</div>
+      <div class="tf-pin-input">
+        <div class="group">
+          <input class="tf-pin-cell filled" value="4" maxlength="1" readonly>
+          <input class="tf-pin-cell filled" value="5" maxlength="1" readonly>
+          <input class="tf-pin-cell filled" value="4" maxlength="1" readonly>
+        </div>
+        <div class="sep">·</div>
+        <div class="group">
+          <input class="tf-pin-cell filled" value="5" maxlength="1" readonly>
+          <input class="tf-pin-cell filled" value="6" maxlength="1" readonly>
+          <input class="tf-pin-cell filled" value="8" maxlength="1" readonly>
+        </div>
+      </div>
+      <div class="pin-status">PIN kompletny — kliknij "Potwierdź parowanie"</div>
+
+      <div class="variant-label" style="margin-top: 32px;">4. Błąd — nieprawidłowy PIN (shake animation)</div>
+      <div class="tf-pin-input">
+        <div class="group">
+          <input class="tf-pin-cell error" value="1" maxlength="1" readonly>
+          <input class="tf-pin-cell error" value="2" maxlength="1" readonly>
+          <input class="tf-pin-cell error" value="3" maxlength="1" readonly>
+        </div>
+        <div class="sep">·</div>
+        <div class="group">
+          <input class="tf-pin-cell error" value="4" maxlength="1" readonly>
+          <input class="tf-pin-cell error" value="5" maxlength="1" readonly>
+          <input class="tf-pin-cell error" value="6" maxlength="1" readonly>
+        </div>
+      </div>
+      <div class="pin-status error">Nieprawidłowy PIN — spróbuj ponownie (2/3 prób)</div>
+
+      <div class="variant-label" style="margin-top: 32px;">5. Sukces — parowanie zaakceptowane</div>
+      <div class="tf-pin-input">
+        <div class="group">
+          <input class="tf-pin-cell success" value="4" maxlength="1" readonly>
+          <input class="tf-pin-cell success" value="5" maxlength="1" readonly>
+          <input class="tf-pin-cell success" value="4" maxlength="1" readonly>
+        </div>
+        <div class="sep">·</div>
+        <div class="group">
+          <input class="tf-pin-cell success" value="5" maxlength="1" readonly>
+          <input class="tf-pin-cell success" value="6" maxlength="1" readonly>
+          <input class="tf-pin-cell success" value="8" maxlength="1" readonly>
+        </div>
+      </div>
+      <div class="pin-status success">✓ Nody wzajemnie zaufane — parowanie zakończone</div>
+
+    </div>
+  </div>
+</div>
+
+<!-- SPEC -->
+<div class="spec">
+  <h2>Specyfikacja komponentu</h2>
+  <div class="spec-table">
+    <div class="spec-row">
+      <div class="k">tag</div>
+      <div class="v"><code>&lt;tf-pin-input&gt;</code></div>
+    </div>
+    <div class="spec-row">
+      <div class="k">attrs</div>
+      <div class="v">
+        <code>length="6"</code> (default 6)<br>
+        <code>group-size="3"</code> (split 3+3, separator `·`)<br>
+        <code>disabled</code><br>
+        <code>error</code> (bool — shake + red border)<br>
+        <code>success</code> (bool — green border)<br>
+        <code>autofocus</code>
+      </div>
+    </div>
+    <div class="spec-row">
+      <div class="k">properties</div>
+      <div class="v">
+        <code>.value</code> — getter/setter (string "454568", bez spacji)<br>
+        <code>.complete</code> — readonly bool
+      </div>
+    </div>
+    <div class="spec-row">
+      <div class="k">events</div>
+      <div class="v">
+        <code>input</code> — każda zmiana (event.detail = { value, complete })<br>
+        <code>complete</code> — odpalony gdy wpisanych 6/6 cyfr<br>
+        <code>change</code> — jak <code>complete</code> ale kompatybilny z form
+      </div>
+    </div>
+    <div class="spec-row">
+      <div class="k">keyboard</div>
+      <div class="v">
+        <b>0-9</b> wpisuje + auto-advance do następnego pola<br>
+        <b>Backspace</b> czyści aktualne, jeśli puste → cofa focus i czyści poprzednie<br>
+        <b>←/→</b> nawigacja między polami<br>
+        <b>Ctrl+V / paste</b> rozrzuca cyfry (strip non-digits, bierze pierwszych <code>length</code>)<br>
+        <b>Enter</b> emituje <code>submit</code> gdy complete
+      </div>
+    </div>
+    <div class="spec-row">
+      <div class="k">accessibility</div>
+      <div class="v">
+        każde pole <code>aria-label="PIN cyfra N z 6"</code>,<br>
+        container <code>role="group" aria-labelledby="…"</code>,<br>
+        <code>inputmode="numeric"</code> + <code>autocomplete="one-time-code"</code> (natywny OTP autofill na iOS/Android)
+      </div>
+    </div>
+    <div class="spec-row">
+      <div class="k">rozmiary</div>
+      <div class="v">cell 52×64px, font 28px bold mono, gap 10px, separator 22px</div>
+    </div>
+    <div class="spec-row">
+      <div class="k">użycie w mesh.js</div>
+      <div class="v">
+        Zastępuje <code>tf-input</code> w <code>openConfirmPinModal</code>. Walidacja: <code>input.value.length === 6</code>. Bez regex, bez strip — komponent już pilnuje że są to tylko cyfry.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Live demo — drugie pole w "node docelowy" typealnie pokazuje caret blink
+// Auto-advance między polami (tylko dla inputów bez readonly)
+document.querySelectorAll('.tf-pin-cell:not([readonly])').forEach((input, idx, all) => {
+  input.addEventListener('input', (e) => {
+    if (e.target.value && !/^\d$/.test(e.target.value)) {
+      e.target.value = '';
+      return;
+    }
+    if (e.target.value) {
+      e.target.classList.add('filled');
+      const next = all[idx + 1];
+      if (next) next.focus();
+    } else {
+      e.target.classList.remove('filled');
+    }
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Backspace' && !e.target.value) {
+      const prev = all[idx - 1];
+      if (prev) {
+        prev.focus();
+        prev.value = '';
+        prev.classList.remove('filled');
+      }
+    }
+  });
+  input.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const digits = (e.clipboardData.getData('text') || '').replace(/\D/g, '').slice(0, all.length);
+    digits.split('').forEach((d, i) => {
+      if (all[i]) {
+        all[i].value = d;
+        all[i].classList.add('filled');
+      }
+    });
+    const focusIdx = Math.min(digits.length, all.length - 1);
+    if (all[focusIdx]) all[focusIdx].focus();
+  });
+});
+</script>
+
+</body>
+</html>

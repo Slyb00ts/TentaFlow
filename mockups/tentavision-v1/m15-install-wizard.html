@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Install TentaVision (M15)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.install-wrap { max-width: 900px; margin: 0 auto; padding: 16px 0; }
+.install-header {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 18px 22px; margin-bottom: 18px; display: flex; gap: 16px; align-items: center;
+}
+.install-header .big-ico {
+  width: 56px; height: 56px; border-radius: var(--radius); background: var(--gradient-accent);
+  display: flex; align-items: center; justify-content: center; color: white; flex-shrink: 0;
+}
+.install-header .big-ico svg { width: 28px; height: 28px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+.install-header h1 { font-size: 20px; font-weight: 800; }
+.install-header .sub { font-size: 12.5px; color: var(--text-2); margin-top: 3px; }
+
+.install-progress { display: flex; gap: 4px; margin-bottom: 20px; }
+.install-step {
+  flex: 1; padding: 9px 10px; border-radius: var(--radius-sm);
+  background: var(--bg-3); border: 1px solid var(--border); font-size: 11px; color: var(--text-3);
+  display: flex; align-items: center; gap: 6px;
+}
+.install-step .num { font-weight: 800; background: var(--bg); padding: 1px 6px; border-radius: 10px; }
+.install-step.active { background: var(--accent-glow); border-color: var(--accent-1); color: var(--text); }
+.install-step.active .num { background: var(--accent-1); color: white; }
+.install-step.done { color: var(--success); border-color: rgba(34,197,94,0.3); }
+.install-step.done .num { background: var(--success); color: white; }
+
+.alias-mapping {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 14px;
+}
+.alias-mapping-row {
+  display: grid; grid-template-columns: 220px 1fr 100px; gap: 14px; padding: 12px 0;
+  border-bottom: 1px solid var(--border); align-items: center;
+}
+.alias-mapping-row:last-child { border-bottom: 0; }
+.alias-mapping-row .alias-info .name { font-family: ui-monospace,monospace; font-size: 12.5px; font-weight: 700; color: var(--accent-2); }
+.alias-mapping-row .alias-info .desc { font-size: 11px; color: var(--text-3); margin-top: 3px; }
+.alias-mapping-row .alias-info .meta { font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-warning" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7" cy="14" r="4"/><path d="m10 11 10-5"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M15</span><h2>Wizard instalacji addona TentaVision</h2>
+    <div class="desc">6 kroków: permissions → storage → aliasy AI → Flow templates → profil prawny → pierwsza kamera.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Registry</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Instalacja: TentaVision</span>
+        </div>
+
+        <div class="install-wrap">
+
+          <!-- Header -->
+          <div class="install-header">
+            <div class="big-ico"><svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div>
+            <div style="flex:1">
+              <h1>TentaVision <span class="chip">v0.1.0</span></h1>
+              <div class="sub">Analiza obrazu z kamer — ADR, anomalie zachowań, bagaż, atrybuty, re-id (D4 pod gate)</div>
+              <div class="flex gap-sm mt-sm">
+                <span class="chip accent">application</span>
+                <span class="chip accent">service tick</span>
+                <span class="chip accent">5 tools (LLM)</span>
+                <span class="chip accent">4 flow blocks</span>
+                <span class="chip warning"><svg class="icon"><use href="#i-shield"/></svg>wymaga: HSM, GPU</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Progress -->
+          <div class="install-progress">
+            <div class="install-step done"><span class="num">1</span>Permissions <svg class="icon" style="width:11px;height:11px"><use href="#i-check"/></svg></div>
+            <div class="install-step done"><span class="num">2</span>Storage <svg class="icon" style="width:11px;height:11px"><use href="#i-check"/></svg></div>
+            <div class="install-step active"><span class="num">3</span>Aliasy AI</div>
+            <div class="install-step"><span class="num">4</span>Flow templates</div>
+            <div class="install-step"><span class="num">5</span>Profil prawny</div>
+            <div class="install-step"><span class="num">6</span>Pierwsza kamera</div>
+          </div>
+
+          <!-- Krok 3: Deklaracja aliasów AI -->
+          <section class="section-card">
+            <h3 style="font-size:16px;text-transform:none;color:var(--text);letter-spacing:0;margin-bottom:6px">Krok 3 — Deklaracja aliasów AI</h3>
+            <p class="section-sub">
+              TentaVision <strong>utworzy 6 wpisów</strong> w globalnej tabeli aliasów TentaFlow (<code class="mono">model_aliases</code>). Każdy alias ma sugerowany domyślny target z manifestu — możesz go zostawić lub wyczyścić. <strong>Konkretne przypisanie modeli, fallbacki i strategy konfigurujesz po instalacji</strong> w <strong>Serwisy → Aliasy</strong> (globalne UI TentaFlow). Tu tylko deklarujemy że aliasy mają zostać utworzone.
+            </p>
+
+            <div class="alias-mapping">
+              <div class="alias-mapping-row" style="font-size:10.5px;text-transform:uppercase;color:var(--text-3);font-weight:700;letter-spacing:0.06em;padding:6px 0">
+                <div>Alias (z manifestu)</div><div>Suggested default + status</div><div>Akcja</div>
+              </div>
+
+              <div class="alias-mapping-row">
+                <div class="alias-info">
+                  <div class="name">tentavision-yolo</div>
+                  <div class="desc">Detektor obiektów · methods: detect, track</div>
+                  <div class="meta">manifest suggested_default: <code class="mono">yolo11m-detector</code></div>
+                </div>
+                <div>
+                  <span class="chip success" style="margin-right:4px"><svg class="icon"><use href="#i-check"/></svg>will be created</span>
+                  <span class="text-xs text-3">target: yolo11m-detector (sugerowany)</span>
+                </div>
+                <div><span class="toggle on" title="utwórz z sugerowanym target"></span></div>
+              </div>
+
+              <div class="alias-mapping-row">
+                <div class="alias-info">
+                  <div class="name">tentavision-ocr</div>
+                  <div class="desc">OCR ADR / tablic · methods: recognize, recognize_cropped</div>
+                  <div class="meta">manifest suggested_default: <code class="mono">ppocrv5-ocr</code></div>
+                </div>
+                <div>
+                  <span class="chip success" style="margin-right:4px"><svg class="icon"><use href="#i-check"/></svg>will be created</span>
+                  <span class="text-xs text-3">target: ppocrv5-ocr (sugerowany)</span>
+                </div>
+                <div><span class="toggle on"></span></div>
+              </div>
+
+              <div class="alias-mapping-row">
+                <div class="alias-info">
+                  <div class="name">tentavision-action</div>
+                  <div class="desc">Klasyfikator akcji (D2) · methods: classify_window</div>
+                  <div class="meta">manifest suggested_default: <em>(pusty — auto_bind po deployu silnika)</em></div>
+                </div>
+                <div>
+                  <span class="chip warning" style="margin-right:4px"><svg class="icon"><use href="#i-warning"/></svg>created with empty target</span>
+                  <span class="text-xs text-3">admin uzupełni w Serwisy → Aliasy</span>
+                </div>
+                <div><span class="toggle on"></span></div>
+              </div>
+
+              <div class="alias-mapping-row">
+                <div class="alias-info">
+                  <div class="name">tentavision-vlm</div>
+                  <div class="desc">VLM atrybuty (D5) · methods: embed, caption</div>
+                  <div class="meta">manifest suggested_default: <code class="mono">siglip2-vit-l14</code></div>
+                </div>
+                <div>
+                  <span class="chip success" style="margin-right:4px"><svg class="icon"><use href="#i-check"/></svg>will be created</span>
+                  <span class="text-xs text-3">target: siglip2-vit-l14 (sugerowany)</span>
+                </div>
+                <div><span class="toggle on"></span></div>
+              </div>
+
+              <div class="alias-mapping-row">
+                <div class="alias-info">
+                  <div class="name">tentavision-face-embed</div>
+                  <div class="desc">Face embed (D4) · <span class="risk C">C</span> · gate: d4-historical</div>
+                  <div class="meta">manifest suggested_default: <em>(pusty)</em> · alias będzie nieaktywny dopóki claims niezaspokojony</div>
+                </div>
+                <div>
+                  <span class="chip warning" style="margin-right:4px"><svg class="icon"><use href="#i-lock"/></svg>created inactive (gated)</span>
+                  <span class="text-xs text-3">is_active = 0 do czasu LegalGrant</span>
+                </div>
+                <div><span class="toggle on"></span></div>
+              </div>
+
+              <div class="alias-mapping-row">
+                <div class="alias-info">
+                  <div class="name">tentavision-reid</div>
+                  <div class="desc">Person re-id (D4) · <span class="risk C">C</span> · gate: d4-historical</div>
+                  <div class="meta">manifest suggested_default: <em>(pusty)</em></div>
+                </div>
+                <div>
+                  <span class="chip warning" style="margin-right:4px"><svg class="icon"><use href="#i-lock"/></svg>created inactive (gated)</span>
+                  <span class="text-xs text-3">is_active = 0 do czasu LegalGrant</span>
+                </div>
+                <div><span class="toggle on"></span></div>
+              </div>
+            </div>
+
+            <div class="section-card" style="background:rgba(96,165,250,0.06);border-color:rgba(96,165,250,0.25);padding:12px;margin:16px 0 0">
+              <div class="text-xs fw-700 flex align-center gap-sm" style="color:var(--info)"><svg class="icon"><use href="#i-info"/></svg>Co się stanie po finalizacji</div>
+              <p class="text-xs text-2 mt-sm">
+                TentaFlow wykona <code class="mono">create_or_reactivate_model_alias()</code> dla każdego z 6 aliasów w globalnej tabeli <code class="mono">model_aliases</code>. Sugerowane domyślne targety zostaną zapisane jako <code class="mono">target_model</code>, ale <strong>nie weryfikujemy</strong> czy taki model jest faktycznie zarejestrowany. <strong>Po instalacji</strong> przejdź do <a href="m16-global-aliases.html"><strong>Serwisy → Aliasy</strong></a> i:
+              </p>
+              <ul class="text-xs text-2 mt-sm" style="padding-left:22px;list-style:disc">
+                <li>Przypisz konkretne <code class="mono">target_model</code> (jeśli sugerowany default nie istnieje w deployment)</li>
+                <li>Dodaj <code class="mono">fallback_targets</code> (chain failoverowy)</li>
+                <li>Wybierz <code class="mono">strategy</code> (first_available · round_robin · weighted)</li>
+                <li>Aktywuj gated aliasy gdy claims D4 zostaną spełnione</li>
+              </ul>
+            </div>
+
+            <div class="flex justify-between mt-lg">
+              <button class="btn btn-ghost"><svg class="icon" style="transform:rotate(180deg)"><use href="#i-chevron"/></svg>Wstecz: Storage</button>
+              <button class="btn btn-primary btn-lg">Dalej: Flow templates <svg class="icon"><use href="#i-chevron"/></svg></button>
+            </div>
+          </section>
+
+          <!-- Podgląd poprzednich kroków -->
+          <details style="margin-top:18px">
+            <summary class="text-sm fw-700" style="cursor:pointer;color:var(--text-2);padding:10px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius-sm)">Podgląd ukończonych kroków (Permissions + Storage)</summary>
+
+            <section class="section-card mt-md">
+              <h3><svg class="icon"><use href="#i-shield"/></svg>Krok 1 — Permissions (ukończone)</h3>
+              <p class="section-sub">Addon zażądał 14 uprawnień. Zaakceptowano wszystkie.</p>
+              <div class="flex gap-sm wrap">
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>service.call <em>(medium)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>camera.manage <em>(medium)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>camera.read <em>(low)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>stream.subscribe <em>(medium)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sql.read <em>(low)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sql.write <em>(low)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>vector.read <em>(low)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>vector.write <em>(low)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>recording.save <em>(medium)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>recording.read <em>(medium)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>evidence.sign <em>(high)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>events.publish <em>(low)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>flow.invoke <em>(medium)</em></span>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>secrets.read <em>(high)</em></span>
+              </div>
+            </section>
+
+            <section class="section-card">
+              <h3><svg class="icon"><use href="#i-database"/></svg>Krok 2 — Storage (ukończone)</h3>
+              <p class="section-sub">Manifest deklaruje: KV + SQL (dwa backendy obsługiwane: SQLite, PostgreSQL). Wybrano:</p>
+              <table class="tf-table" style="background:transparent;border:0">
+                <tbody>
+                  <tr><td class="text-2 text-sm">KV store</td><td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>aktywny</span> — wspólna baza TentaFlow (limit 10k kluczy)</td></tr>
+                  <tr><td class="text-2 text-sm">SQL backend</td><td><span class="chip accent">SQLite</span> — per-addon plik <code class="mono text-xs">~/.tentaflow/addons/tentavision/data.db</code></td></tr>
+                  <tr><td class="text-2 text-sm">Dialect</td><td><span class="chip">ANSI</span> — przenośność, można migrować na PostgreSQL później</td></tr>
+                  <tr><td class="text-2 text-sm">Migrations</td><td>6 plików w <code class="mono text-xs">migrations/</code> · zostaną uruchomione po finalizacji</td></tr>
+                  <tr><td class="text-2 text-sm">Vector namespaces</td><td>4 namespaces: attributes, plates (B), faces, persons (C — locked)</td></tr>
+                  <tr><td class="text-2 text-sm">Encryption</td><td><span class="chip success">at-rest</span> (SQLCipher włączony)</td></tr>
+                </tbody>
+              </table>
+            </section>
+          </details>
+
+          <!-- Podgląd kolejnych kroków -->
+          <div class="section-card mt-md" style="background:var(--bg);border-color:var(--border)">
+            <div class="text-xs fw-700 text-3 mb-sm" style="text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px">Kolejne kroki</div>
+            <div class="flex col gap-sm">
+              <div class="flex align-center gap-sm text-sm">
+                <span class="install-step" style="flex:0;padding:4px 8px;font-size:10px"><span class="num">4</span></span>
+                <strong>Flow templates</strong> — addon dostarcza 3 szablony (tv-realtime-adr, tv-alarm-enrich, tv-evidence-export). Świadomy import opt-in.
+              </div>
+              <div class="flex align-center gap-sm text-sm">
+                <span class="install-step" style="flex:0;padding:4px 8px;font-size:10px"><span class="num">5</span></span>
+                <strong>Profil prawny</strong> — wybór deployment context (Komercja prywatna / Transport publiczny / Lotnisko / Służby uprawnione). Determinuje dostępność gate D4.
+              </div>
+              <div class="flex align-center gap-sm text-sm">
+                <span class="install-step" style="flex:0;padding:4px 8px;font-size:10px"><span class="num">6</span></span>
+                <strong>Pierwsza kamera</strong> — opcjonalne · można dodać teraz lub później przez M3 wizard.
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

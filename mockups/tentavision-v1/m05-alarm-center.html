@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Alarmy (M5)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.split { display: grid; grid-template-columns: 380px 1fr; gap: 16px; }
+.alarm-feed { display: flex; flex-direction: column; gap: 8px; max-height: 720px; overflow-y: auto; padding-right: 4px; }
+.alarm-feed .alarm-card { grid-template-columns: 80px 1fr; padding: 8px; }
+.alarm-feed .alarm-card .thumb { width: 80px; }
+.alarm-feed .alarm-card .title { font-size: 12.5px; }
+.alarm-feed .alarm-card .meta { font-size: 11px; gap: 6px; }
+.alarm-feed .alarm-card.selected { outline: 2px solid var(--accent-1); }
+.detail-clip { aspect-ratio: 16/9; background: linear-gradient(135deg,#2f3668,#050818); border-radius: var(--radius); position: relative;
+  display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.detail-clip .play-overlay {
+  width: 56px; height: 56px; background: rgba(99,102,241,0.85); border-radius: 50%;
+  display: flex; align-items: center; justify-content: center; color: white;
+}
+.timeline { display: flex; gap: 4px; margin-top: 12px; }
+.frame-thumb {
+  flex: 1; aspect-ratio: 16/9; background: linear-gradient(135deg,#1a1f45,#050818);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  display: flex; align-items: flex-end; padding: 4px; font-size: 9px; color: var(--text-2);
+}
+.frame-thumb.active { border-color: var(--accent-1); box-shadow: 0 0 0 2px var(--accent-glow); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-luggage" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="14" rx="2"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M5</span><h2>Centrum alarmów</h2>
+    <div class="desc">Feed real-time z filtrami + karta alarmu (klip 30s, klatki, akcje, workflow potwierdzania).</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Analyst</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Centrum alarmów</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico" style="background:var(--gradient-danger,linear-gradient(135deg,#ef4444,#f59e0b))"><svg viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Alarmy <span class="chip danger"><span class="dot"></span>3 critical</span> <span class="chip warning">12 warning</span></div>
+            <div class="d-sub">Feed real-time · 147 alarmów ostatnie 24h · 23 niepotwierdzone · operator I linii: Piotr</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-filter"/></svg>Filtry</button>
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-bell"/></svg>Wycisz dźwięk (10 min)</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab active"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+        </div>
+
+        <div class="split">
+          <!-- LEFT — alarm feed -->
+          <section>
+            <div class="tabs-bar" style="margin-bottom:10px">
+              <button class="tab active">Niepotwierdzone<span class="count">23</span></button>
+              <button class="tab">Wszystkie<span class="count">147</span></button>
+              <button class="tab">Zamknięte</button>
+            </div>
+            <div class="alarm-feed">
+              <div class="alarm-card critical selected">
+                <div class="thumb"><svg class="icon"><use href="#i-video"/></svg></div>
+                <div>
+                  <div class="title fw-700">D2 · podejrzenie agresji</div>
+                  <div class="meta"><span><svg class="icon"><use href="#i-camera"/></svg>C-04</span><span><svg class="icon"><use href="#i-clock"/></svg>12:43:21</span><span class="chip danger" style="font-size:10px">crit</span></div>
+                </div>
+              </div>
+              <div class="alarm-card warning">
+                <div class="thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+                <div>
+                  <div class="title fw-700">D1 · nieczytelna tablica ADR</div>
+                  <div class="meta"><span><svg class="icon"><use href="#i-camera"/></svg>C-01</span><span><svg class="icon"><use href="#i-clock"/></svg>12:38:04</span><span class="chip warning" style="font-size:10px">warn</span></div>
+                </div>
+              </div>
+              <div class="alarm-card warning">
+                <div class="thumb"><svg class="icon"><use href="#i-luggage"/></svg></div>
+                <div>
+                  <div class="title fw-700">D3 · bagaż &gt; 90s bez właściciela</div>
+                  <div class="meta"><span><svg class="icon"><use href="#i-camera"/></svg>C-07</span><span><svg class="icon"><use href="#i-clock"/></svg>12:31:55</span><span class="chip" style="font-size:10px">102s</span></div>
+                </div>
+              </div>
+              <div class="alarm-card critical">
+                <div class="thumb"><svg class="icon"><use href="#i-alert"/></svg></div>
+                <div>
+                  <div class="title fw-700">D2 · detekcja broni (low conf)</div>
+                  <div class="meta"><span><svg class="icon"><use href="#i-camera"/></svg>C-09</span><span><svg class="icon"><use href="#i-clock"/></svg>12:28:11</span><span class="chip danger" style="font-size:10px">0.61</span></div>
+                </div>
+              </div>
+              <div class="alarm-card info">
+                <div class="thumb"><svg class="icon"><use href="#i-camera"/></svg></div>
+                <div>
+                  <div class="title fw-700">D6 · pojazd w strefie zakazu</div>
+                  <div class="meta"><span><svg class="icon"><use href="#i-camera"/></svg>C-15</span><span><svg class="icon"><use href="#i-clock"/></svg>12:22:09</span></div>
+                </div>
+              </div>
+              <div class="alarm-card warning">
+                <div class="thumb"><svg class="icon"><use href="#i-luggage"/></svg></div>
+                <div>
+                  <div class="title fw-700">D3 · bagaż &gt; 90s</div>
+                  <div class="meta"><span><svg class="icon"><use href="#i-camera"/></svg>C-07</span><span><svg class="icon"><use href="#i-clock"/></svg>11:58:22</span></div>
+                </div>
+              </div>
+              <div class="alarm-card info">
+                <div class="thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+                <div>
+                  <div class="title fw-700">D1 · cysterna UN 1789</div>
+                  <div class="meta"><span><svg class="icon"><use href="#i-camera"/></svg>C-22</span><span><svg class="icon"><use href="#i-clock"/></svg>11:42:04</span></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- RIGHT — alarm detail -->
+          <section>
+            <section class="section-card">
+              <div class="section-card-head">
+                <div class="title">
+                  <span class="chip danger"><span class="dot"></span>D2 · agresja</span>
+                  <span class="text-sm text-2">conf 0.87 · C-04 wjazd · 12:43:21</span>
+                </div>
+                <div class="flex gap-sm">
+                  <span class="chip">alarm #14782</span>
+                  <span class="chip accent">profil: Bezpieczeństwo-noc</span>
+                </div>
+              </div>
+              <div class="detail-clip">
+                <div class="play-overlay"><svg class="icon icon-lg" style="width:24px;height:24px"><use href="#i-play"/></svg></div>
+                <div style="position:absolute;top:10px;left:12px;color:white;font-size:11px">30 s klip · 0:00 / 0:30</div>
+              </div>
+
+              <div class="timeline">
+                <div class="frame-thumb">−2s</div>
+                <div class="frame-thumb">−1s</div>
+                <div class="frame-thumb active">EVT</div>
+                <div class="frame-thumb">+1s</div>
+                <div class="frame-thumb">+2s</div>
+                <div class="frame-thumb">+3s</div>
+                <div class="frame-thumb">+4s</div>
+                <div class="frame-thumb">+5s</div>
+                <div class="frame-thumb">+6s</div>
+                <div class="frame-thumb">+7s</div>
+              </div>
+
+              <div class="grid-2 mt-md">
+                <div>
+                  <h3 style="font-size:11px;text-transform:uppercase;color:var(--accent-2);letter-spacing:0.08em;margin-bottom:8px">Metadane</h3>
+                  <table class="tf-table" style="background:transparent;border:0;font-size:11.5px">
+                    <tbody>
+                      <tr><td class="text-2">Detektor</td><td class="fw-700">D2 / agresja (VideoMAE V2)</td></tr>
+                      <tr><td class="text-2">Confidence</td><td class="fw-700">0.87</td></tr>
+                      <tr><td class="text-2">Strefa</td><td class="fw-700">Wjazd główny</td></tr>
+                      <tr><td class="text-2">Track ID</td><td class="mono">person-7842, person-7843</td></tr>
+                      <tr><td class="text-2">Maskowanie</td><td><span class="chip success">ON (operator I linii)</span></td></tr>
+                      <tr><td class="text-2">Model version</td><td class="mono">videomae-v2-rwf2k-2026.03</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div>
+                  <h3 style="font-size:11px;text-transform:uppercase;color:var(--accent-2);letter-spacing:0.08em;margin-bottom:8px">Workflow</h3>
+                  <div class="field">
+                    <label>Decyzja</label>
+                    <div class="flex gap-sm wrap">
+                      <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-check"/></svg>Potwierdź</button>
+                      <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-x"/></svg>Fałszywy</button>
+                      <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-flag"/></svg>Eskaluj</button>
+                    </div>
+                  </div>
+                  <div class="field"><label>Notatka operatora</label><textarea class="textarea" placeholder="np. dwie osoby, kłótnia w pobliżu wjazdu — wysłano patrol..."></textarea></div>
+                  <div class="field"><label>Akcje powiązane</label>
+                    <div class="flex col gap-sm">
+                      <div class="toggle-row"><span class="toggle on"></span>Wyślij SMS do dyspozytora</div>
+                      <div class="toggle-row"><span class="toggle on"></span>Zachowaj klip 30s</div>
+                      <div class="toggle-row"><span class="toggle"></span>Eksportuj jako paczkę dowodową</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </section>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

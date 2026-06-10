@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Live view (M2)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.live-grid-9 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-maximize" viewBox="0 0 24 24"><path d="M3 9V5a2 2 0 0 1 2-2h4"/><path d="M21 9V5a2 2 0 0 0-2-2h-4"/><path d="M3 15v4a2 2 0 0 0 2 2h4"/><path d="M21 15v4a2 2 0 0 1-2 2h-4"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M2</span>
+    <h2>Live view — grid kamer</h2>
+    <div class="desc">Grid 1/4/9/16 z overlay bbox per typ detektora. Maskowanie twarzy ON dla operatora I linii.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip">
+            <div class="avatar">PJ</div>
+            <div><div class="name-t">Piotr Jarocki</div><div class="role">Analyst</div></div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Live view</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">TentaVision <span class="chip success"><span class="dot"></span>9 / 22 kamer</span></div>
+            <div class="d-sub">Live view · maskowanie twarzy ON · overlay analizy ON · pora dnia: profil dzienny</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-list"/></svg>Wybierz kamery</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-maximize"/></svg>Fullscreen</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab active"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          <div class="tabs-right">
+            <div class="segmented">
+              <button><svg class="icon"><use href="#i-camera"/></svg>1</button>
+              <button>4</button>
+              <button class="active">9</button>
+              <button>16</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Detector overlay controls -->
+        <section class="section-card" style="padding:12px 16px">
+          <div class="flex align-center gap-md wrap">
+            <div class="text-xs text-3 fw-700" style="letter-spacing:0.1em;text-transform:uppercase">Overlay</div>
+            <div class="toggle-row"><span class="toggle on"></span>Bounding boxes</div>
+            <div class="toggle-row"><span class="toggle on"></span>Etykiety klas</div>
+            <div class="toggle-row"><span class="toggle"></span>Pose skeletons (D2)</div>
+            <div class="toggle-row"><span class="toggle on"></span>Strefy</div>
+            <div class="toggle-row"><span class="toggle on"></span>Maskuj twarze</div>
+            <div class="ml-auto flex gap-sm">
+              <span class="chip accent">D1 ADR</span>
+              <span class="chip accent">D2 zachowania</span>
+              <span class="chip accent">D3 bagaż</span>
+              <span class="chip">D5 atrybuty</span>
+              <span class="chip">D6 generic</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- 9-grid -->
+        <div class="live-grid-9">
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder"><svg class="icon"><use href="#i-camera"/></svg>C-01 brama wjazdowa</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title"><svg class="icon" style="width:12px;height:12px"><use href="#i-camera"/></svg>C-01 · brama</span>
+              <span class="video-tile-rec">REC</span>
+            </div>
+            <div class="video-tile-bbox success" data-label="cysterna · UN 1203" style="left:18%;top:30%;width:50%;height:45%"></div>
+            <div class="video-tile-overlay-bottom">
+              <span class="flex gap-sm"><span class="chip success" style="font-size:10px">D1 OK</span><span class="chip" style="font-size:10px">5 fps</span></span>
+              <span>12:43:55</span>
+            </div>
+          </div>
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder"><svg class="icon"><use href="#i-camera"/></svg>C-04 wjazd-2</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title"><svg class="icon" style="width:12px;height:12px"><use href="#i-camera"/></svg>C-04 · wjazd-2</span>
+              <span class="video-tile-rec">REC</span>
+            </div>
+            <div class="video-tile-bbox danger" data-label="osoba · agresja 0.87" style="left:35%;top:25%;width:25%;height:55%"></div>
+            <div class="video-tile-bbox" data-label="osoba" style="left:62%;top:30%;width:18%;height:50%"></div>
+            <div class="video-tile-overlay-bottom">
+              <span class="flex gap-sm"><span class="chip danger" style="font-size:10px">D2 ALARM</span><span class="chip" style="font-size:10px">12 fps</span></span>
+              <span>12:43:55</span>
+            </div>
+          </div>
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder"><svg class="icon"><use href="#i-camera"/></svg>C-07 peron</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title"><svg class="icon" style="width:12px;height:12px"><use href="#i-camera"/></svg>C-07 · peron</span>
+              <span class="video-tile-rec">REC</span>
+            </div>
+            <div class="video-tile-bbox warning" data-label="walizka · 102s no-owner" style="left:45%;top:55%;width:14%;height:25%"></div>
+            <div class="video-tile-overlay-bottom">
+              <span class="flex gap-sm"><span class="chip warning" style="font-size:10px">D3 watch</span><span class="chip" style="font-size:10px">10 fps</span></span>
+              <span>12:43:55</span>
+            </div>
+          </div>
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder"><svg class="icon"><use href="#i-camera"/></svg>C-09 hala</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title"><svg class="icon" style="width:12px;height:12px"><use href="#i-camera"/></svg>C-09 · hala</span>
+              <span class="video-tile-rec">REC</span>
+            </div>
+            <div class="video-tile-overlay-bottom">
+              <span class="flex gap-sm"><span class="chip success" style="font-size:10px">D6 OK</span><span class="chip" style="font-size:10px">8 fps</span></span>
+              <span>12:43:55</span>
+            </div>
+          </div>
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder" style="background:linear-gradient(135deg,#3a1a1a 0%,#050818 100%);color:var(--danger)"><svg class="icon"><use href="#i-alert"/></svg>C-12 magazyn — OFFLINE</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title" style="color:var(--danger)"><svg class="icon" style="width:12px;height:12px"><use href="#i-alert"/></svg>C-12 · magazyn</span>
+              <span class="chip danger" style="font-size:10px">offline 04:21</span>
+            </div>
+          </div>
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder"><svg class="icon"><use href="#i-camera"/></svg>C-15 parking</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title"><svg class="icon" style="width:12px;height:12px"><use href="#i-camera"/></svg>C-15 · parking</span>
+              <span class="video-tile-rec">REC</span>
+            </div>
+            <div class="video-tile-bbox" data-label="WX 12345" style="left:25%;top:55%;width:30%;height:18%"></div>
+            <div class="video-tile-overlay-bottom">
+              <span class="flex gap-sm"><span class="chip" style="font-size:10px">D5 plate</span><span class="chip" style="font-size:10px">5 fps</span></span>
+              <span>12:43:55</span>
+            </div>
+          </div>
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder"><svg class="icon"><use href="#i-camera"/></svg>C-18 dok</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title"><svg class="icon" style="width:12px;height:12px"><use href="#i-camera"/></svg>C-18 · dok</span>
+              <span class="video-tile-rec">REC</span>
+            </div>
+            <div class="video-tile-bbox success" data-label="cysterna · UN 1830" style="left:10%;top:25%;width:60%;height:55%"></div>
+            <div class="video-tile-overlay-bottom">
+              <span class="flex gap-sm"><span class="chip success" style="font-size:10px">D1 OK</span><span class="chip" style="font-size:10px">5 fps</span></span>
+              <span>12:43:55</span>
+            </div>
+          </div>
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder" style="background:linear-gradient(135deg,#3a1a1a 0%,#050818 100%);color:var(--danger)"><svg class="icon"><use href="#i-alert"/></svg>C-19 — OFFLINE 28h</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title" style="color:var(--danger)"><svg class="icon" style="width:12px;height:12px"><use href="#i-alert"/></svg>C-19 · boczne</span>
+              <span class="chip danger" style="font-size:10px">offline 28h</span>
+            </div>
+          </div>
+
+          <div class="video-tile">
+            <div class="video-tile-placeholder"><svg class="icon"><use href="#i-camera"/></svg>C-22 wjazd ADR</div>
+            <div class="video-tile-overlay-top">
+              <span class="video-tile-title"><svg class="icon" style="width:12px;height:12px"><use href="#i-camera"/></svg>C-22 · wjazd ADR</span>
+              <span class="video-tile-rec">REC</span>
+            </div>
+            <div class="video-tile-bbox warning" data-label="tablica · czytelność 0.42" style="left:38%;top:38%;width:18%;height:14%"></div>
+            <div class="video-tile-overlay-bottom">
+              <span class="flex gap-sm"><span class="chip warning" style="font-size:10px">D1 watch</span><span class="chip" style="font-size:10px">5 fps</span></span>
+              <span>12:43:55</span>
+            </div>
+          </div>
+
+        </div>
+
+        <p class="text-xs text-3 mt-md">Kliknij kafelek → fullscreen z timeline'em eventów ostatnich 60 minut. Shift+klik = porównanie dwóch kamer side-by-side.</p>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

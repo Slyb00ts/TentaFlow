@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Mesh &amp; Network settings (mockup)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+/* =============================================================================
+   Zrzut z tentaflow-core/www/css/style.css (sekcje :root, tf-screen, tf-breadcrumb,
+   tf-detail-header, tf-section-card, tf-accounts-table, status-pill, role-pill,
+   group-tag, users-toolbar, row-actions). Dodatki specyficzne dla ekranu sieci:
+   .net-bind-radio, .net-advertise-row, .net-filter-row.
+   ============================================================================= */
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.22);
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --radius-lg: 14px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--bg); color: var(--text); font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; min-height: 100vh; }
+
+/* ========= tf-screen shell ========= */
+.tf-screen { display: flex; flex-direction: column; flex: 1; min-height: 100vh; background: var(--bg); }
+.tf-screen-head { flex-shrink: 0; padding: 22px 26px 0; }
+.tf-screen-head__crumbs { margin-bottom: 12px; }
+.tf-screen-head__header { margin-bottom: 16px; }
+.tf-screen-body { flex: 1; padding: 20px 26px 26px; }
+
+/* ========= Breadcrumb ========= */
+.tf-breadcrumb { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-3); }
+.tf-breadcrumb .crumb { color: var(--text-2); cursor: pointer; transition: color 0.12s; }
+.tf-breadcrumb .crumb:hover { color: var(--accent-2); }
+.tf-breadcrumb .crumb.current { color: var(--text); font-weight: 600; cursor: default; }
+.tf-breadcrumb .sep { opacity: 0.5; display: inline-flex; align-items: center; }
+.tf-breadcrumb .sep svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+/* ========= tf-detail-header ========= */
+.tf-detail-header {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 20px; display: flex; align-items: center; gap: 18px;
+}
+.tf-detail-header .big-ico {
+  width: 60px; height: 60px; border-radius: var(--radius);
+  background: var(--gradient-accent); color: white;
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+  font-weight: 800; font-size: 22px;
+}
+.tf-detail-header .big-ico svg { width: 26px; height: 26px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tf-detail-header .d-meta { flex: 1; min-width: 0; }
+.tf-detail-header .d-name { font-size: 20px; font-weight: 800; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.tf-detail-header .d-sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+.tf-detail-header .d-badges { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.tf-detail-header .d-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+/* ========= tf-tabs (underline) ========= */
+.tf-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-top: 16px; }
+.tf-tab {
+  padding: 10px 16px; background: transparent; border: 0;
+  color: var(--text-3); font-size: 13px; font-weight: 600;
+  cursor: pointer; position: relative; font-family: inherit;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.tf-tab svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tf-tab:hover { color: var(--text-2); }
+.tf-tab.active { color: var(--accent-2); }
+.tf-tab.active::after {
+  content: ''; position: absolute; bottom: -1px; left: 0; right: 0; height: 2px;
+  background: var(--gradient-accent); border-radius: 2px 2px 0 0;
+}
+.tf-tab .count { background: var(--bg-3); padding: 1px 7px; border-radius: 999px; font-size: 11px; color: var(--text-3); margin-left: 2px; }
+.tf-tab.active .count { background: var(--accent-glow); color: var(--accent-2); }
+
+/* ========= tf-section-card ========= */
+.tf-section-card {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 20px; margin-bottom: 14px;
+}
+.tf-section-card h3 {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--accent-2); margin: 0 0 12px;
+}
+.tf-section-card h3 svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-section-card .section-sub { font-size: 12px; color: var(--text-3); margin: -4px 0 14px; line-height: 1.5; }
+.tf-section-card .section-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+.tf-section-card.flush { padding: 0; overflow: hidden; }
+.tf-section-card.flush > h3 { padding: 16px 20px 0; margin-bottom: 4px; }
+.tf-section-card.flush > .section-sub { padding: 0 20px; margin: 0 0 12px; }
+
+/* ========= Toolbar ========= */
+.users-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+.tf-searchbox {
+  flex: 1; max-width: 360px; position: relative;
+  display: flex; align-items: center;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 0 12px 0 34px; height: 34px;
+}
+.tf-searchbox svg { position: absolute; left: 11px; width: 14px; height: 14px; stroke: var(--text-3); fill: none; stroke-width: 2; }
+.tf-searchbox input { flex: 1; background: transparent; border: 0; outline: none; color: var(--text); font-family: inherit; font-size: 12.5px; }
+.tf-searchbox input::placeholder { color: var(--text-3); }
+
+.tf-filter-group { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.filter-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px; height: 26px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 999px;
+  color: var(--text-2); font-size: 11.5px; font-weight: 600;
+  cursor: pointer; transition: all 0.12s;
+}
+.filter-chip:hover { background: var(--bg-card-hover); color: var(--text); }
+.filter-chip[active] { background: var(--accent-glow); border-color: rgba(167, 139, 250, 0.3); color: var(--accent-2); }
+
+/* ========= tf-accounts-table ========= */
+.tf-accounts-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.tf-accounts-table th, .tf-accounts-table td {
+  padding: 10px 12px; font-size: 12px; text-align: left;
+  border-bottom: 1px solid var(--border); vertical-align: middle;
+}
+.tf-accounts-table th {
+  background: var(--bg-3); color: var(--text-2);
+  font-weight: 700; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+}
+.tf-accounts-table th.actions-col, .tf-accounts-table td.actions-col { text-align: right; white-space: nowrap; }
+.tf-accounts-table tbody tr { cursor: pointer; transition: background 0.12s; }
+.tf-accounts-table tbody tr:hover td { background: var(--bg-3); }
+.tf-accounts-table tbody tr:last-child td { border-bottom: 0; }
+.tf-accounts-table tbody tr.selected td { background: rgba(99, 102, 241, 0.08); }
+.tf-accounts-table tbody tr.disabled td { opacity: .45; cursor: default; }
+
+/* ========= tf-account-cell / avatar ========= */
+.tf-account-cell { display: flex; align-items: center; gap: 10px; }
+.tf-account-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-3);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; color: var(--accent-2); flex-shrink: 0;
+}
+.tf-account-avatar svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tf-account-name { font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.tf-account-sub { font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
+
+.ip-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; color: var(--text); }
+.ip-mono-sub { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
+
+/* ========= role-pill / status-pill / group-tag ========= */
+.role-pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+.role-pill.role-lan { background: rgba(34, 197, 94, 0.14); color: var(--success); }
+.role-pill.role-wifi { background: rgba(96, 165, 250, 0.14); color: var(--info); }
+.role-pill.role-vpn { background: rgba(167, 139, 250, 0.14); color: var(--accent-2); }
+.role-pill.role-virt { background: rgba(245, 158, 11, 0.14); color: var(--warning); }
+.role-pill.role-loop { color: var(--text-3); background: transparent; padding-left: 0; padding-right: 0; }
+
+.status-pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+.status-pill.ok { background: rgba(34, 197, 94, 0.14); color: var(--success); }
+.status-pill.off { background: var(--bg-3); color: var(--text-3); }
+.status-pill.sso { background: rgba(96, 165, 250, 0.14); color: var(--info); }
+.status-pill.local { background: rgba(167, 139, 250, 0.14); color: var(--accent-2); }
+
+.group-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 9px; border-radius: 8px;
+  background: rgba(99, 102, 241, 0.10); border: 1px solid rgba(99, 102, 241, 0.25);
+  color: var(--accent-2); font-size: 11px; font-weight: 600; white-space: nowrap;
+}
+.tf-accounts-table .group-tag-list { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* ========= row-actions / tf-button ghost sm ========= */
+.row-actions { display: inline-flex; gap: 4px; opacity: 0; transition: opacity 0.15s; }
+.tf-accounts-table tbody tr:hover .row-actions { opacity: 1; }
+.tf-btn-sm-ghost {
+  width: 26px; height: 26px; border-radius: var(--radius-sm);
+  background: transparent; border: 1px solid transparent; color: var(--text-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all 0.12s;
+}
+.tf-btn-sm-ghost:hover { background: var(--bg-3); border-color: var(--border); color: var(--text); }
+.tf-btn-sm-ghost svg { width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+/* ========= tf-button ========= */
+.tf-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 12px; height: 34px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent; background: transparent; color: var(--text);
+  font-family: inherit; font-size: 12.5px; font-weight: 600;
+  cursor: pointer; transition: all 0.12s; white-space: nowrap;
+}
+.tf-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-btn.primary { background: var(--gradient-accent); color: white; border-color: transparent; }
+.tf-btn.primary:hover { filter: brightness(1.08); }
+.tf-btn.ghost { color: var(--text-2); }
+.tf-btn.ghost:hover { background: var(--bg-3); color: var(--text); }
+.tf-btn.outline { border-color: var(--border); color: var(--text-2); }
+.tf-btn.outline:hover { background: var(--bg-3); border-color: var(--border-hover); color: var(--text); }
+
+/* ========= Radio / toggle ========= */
+.bind-radio {
+  width: 16px; height: 16px; border: 2px solid var(--border-hover);
+  border-radius: 50%; position: relative; cursor: pointer; flex-shrink: 0; transition: all 0.12s;
+}
+.bind-radio:hover { border-color: var(--accent-2); }
+.bind-radio.on { border-color: var(--accent-1); }
+.bind-radio.on::after { content: ""; position: absolute; inset: 2px; background: var(--gradient-accent); border-radius: 50%; }
+
+.tf-toggle {
+  width: 32px; height: 18px; background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: 999px; position: relative; cursor: pointer; transition: all 0.15s; flex-shrink: 0;
+}
+.tf-toggle::after {
+  content: ""; position: absolute; top: 1px; left: 1px;
+  width: 14px; height: 14px; background: var(--text-2);
+  border-radius: 50%; transition: all 0.15s;
+}
+.tf-toggle.on { background: var(--gradient-accent); border-color: transparent; }
+.tf-toggle.on::after { transform: translateX(14px); background: white; }
+
+/* ========= Radio cards (bind mode) ========= */
+.bind-mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.bind-mode-card {
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px; cursor: pointer; display: flex; gap: 12px; align-items: flex-start;
+  transition: all 0.12s;
+}
+.bind-mode-card:hover { border-color: var(--border-hover); }
+.bind-mode-card.active { border-color: var(--accent-1); background: rgba(99, 102, 241, 0.06); }
+.bind-mode-card .bind-radio { margin-top: 2px; }
+.bind-mode-card .t { font-weight: 700; font-size: 13px; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.bind-mode-card .d { font-size: 12px; color: var(--text-3); line-height: 1.55; }
+.bind-mode-card code { background: var(--bg-input); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; font-family: 'JetBrains Mono', monospace; color: var(--accent-2); }
+
+/* ========= Advertise preview ========= */
+.adv-list { display: flex; flex-direction: column; }
+.adv-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px dashed rgba(99, 102, 241, 0.12); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.adv-row:last-child { border-bottom: 0; }
+.adv-row.filtered { color: var(--text-3); }
+.adv-row.filtered .addr { text-decoration: line-through; }
+.adv-row.included { color: var(--success); }
+.adv-row .label { font-family: 'Manrope'; font-size: 10px; color: var(--text-3); min-width: 140px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+
+/* ========= Filter rows ========= */
+.net-filter-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px dashed rgba(99, 102, 241, 0.12); }
+.net-filter-row:last-child { border-bottom: 0; }
+.net-filter-row .t { font-size: 13px; font-weight: 600; color: var(--text); }
+.net-filter-row .d { font-size: 11px; color: var(--text-3); font-family: 'JetBrains Mono', monospace; margin-top: 2px; }
+
+/* ========= Form field ========= */
+.field { display: flex; flex-direction: column; gap: 6px; max-width: 560px; }
+.field label { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-2); }
+.field input {
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 9px 12px;
+  color: var(--text); font-family: inherit; font-size: 13px;
+}
+.field input:focus { outline: none; border-color: var(--accent-1); box-shadow: 0 0 0 3px var(--accent-glow); }
+.field .hint { font-size: 11.5px; color: var(--text-3); }
+
+/* ========= Banner ========= */
+.net-banner {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 12px 14px; border-radius: var(--radius); margin-bottom: 14px;
+  background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.22);
+  font-size: 12.5px; color: var(--text-2);
+}
+.net-banner svg { width: 16px; height: 16px; stroke: var(--warning); fill: none; stroke-width: 2; flex-shrink: 0; margin-top: 2px; }
+.net-banner strong { color: var(--text); }
+.net-banner code { background: var(--bg-input); padding: 1px 5px; border-radius: 4px; font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--text-2); }
+
+code { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; }
+</style>
+</head>
+<body>
+
+<main class="tf-screen">
+
+  <!-- ===== HEAD ===== -->
+  <header class="tf-screen-head">
+
+    <!-- breadcrumb -->
+    <nav class="tf-screen-head__crumbs">
+      <div class="tf-breadcrumb">
+        <span class="crumb">Ustawienia</span>
+        <span class="sep"><svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></span>
+        <span class="crumb current">Mesh &amp; Sieć</span>
+      </div>
+    </nav>
+
+    <!-- detail header -->
+    <div class="tf-screen-head__header">
+      <div class="tf-detail-header">
+        <div class="big-ico">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="1.5"/><circle cx="20" cy="4" r="1.5"/><circle cx="4" cy="20" r="1.5"/><circle cx="20" cy="20" r="1.5"/><path d="M12 9V6M12 15v3M9 12H6M15 12h3M6.5 6.5l3 3M17.5 6.5l-3 3M6.5 17.5l3-3M17.5 17.5l-3-3"/></svg>
+        </div>
+        <div class="d-meta">
+          <div class="d-name">Mesh &amp; Sieć</div>
+          <div class="d-sub">Interfejsy sieciowe, adresy IP i bind QUIC dla komunikacji mesh</div>
+          <div class="d-badges">
+            <span class="status-pill sso">iroh 0.98</span>
+            <span class="status-pill local">6 interfejsów · 8 IP</span>
+            <span class="status-pill ok">relay: self-hosted</span>
+          </div>
+        </div>
+        <div class="d-actions">
+          <button class="tf-btn outline">
+            <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+            Wykryj ponownie
+          </button>
+          <button class="tf-btn primary">
+            <svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>
+            Zapisz i zrestartuj mesh
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- tabs (tf-tabs underline) -->
+    <div class="tf-screen-head__tabs">
+      <div class="tf-tabs">
+        <button class="tf-tab">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+          Ogólne
+        </button>
+        <button class="tf-tab">
+          <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+          SSO
+        </button>
+        <button class="tf-tab">
+          <svg viewBox="0 0 24 24"><path d="M17 3H7a2 2 0 0 0-2 2v14l7-3 7 3V5a2 2 0 0 0-2-2z"/></svg>
+          OAuth
+        </button>
+        <button class="tf-tab">
+          <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          TLS
+        </button>
+        <button class="tf-tab active">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="1.5"/><circle cx="20" cy="4" r="1.5"/><circle cx="4" cy="20" r="1.5"/><circle cx="20" cy="20" r="1.5"/></svg>
+          Mesh &amp; Sieć <span class="count">6</span>
+        </button>
+        <button class="tf-tab">
+          <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+          NGC
+        </button>
+        <button class="tf-tab">
+          <svg viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.8 7.8 5.5 5.5 0 0 1 7.8-7.8zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3"/></svg>
+          API Keys
+        </button>
+        <button class="tf-tab">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+          Registries
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===== BODY ===== -->
+  <div class="tf-screen-body">
+
+    <!-- banner ostrzegawczy -->
+    <div class="net-banner">
+      <svg viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+      <div>
+        <strong>Host wielo-interfejsowy.</strong> Obecny bind <code>0.0.0.0</code> advertise'uje wszystkie wykryte adresy (również <code>docker0</code> i link-local). Zalecane: przypnij bind do <code>enp4s0</code> + aktywuj filtry Docker / link-local poniżej. Efekt: brak 10-16 s stalli na nieosiągalnych ścieżkach.
+      </div>
+    </div>
+
+    <!-- SECTION: Tryb bind -->
+    <div class="tf-section-card">
+      <h3>
+        <svg viewBox="0 0 24 24"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M8 8V5a4 4 0 0 1 8 0v3"/></svg>
+        Tryb bind QUIC
+      </h3>
+      <div class="section-sub">Gdzie iroh otwiera gniazdo UDP nasłuchujące na połączenia mesh.</div>
+      <div class="bind-mode-grid">
+        <div class="bind-mode-card">
+          <div class="bind-radio"></div>
+          <div>
+            <div class="t">Auto <span class="status-pill off">domyślne</span></div>
+            <div class="d">Bind <code>0.0.0.0:0</code>. iroh nasłuchuje na wszystkich interfejsach i advertise'uje wszystkie adresy. Działa na hostach 1-NIC; na multi-NIC powoduje wolne połączenia.</div>
+          </div>
+        </div>
+        <div class="bind-mode-card active">
+          <div class="bind-radio on"></div>
+          <div>
+            <div class="t">Custom — wybrany interfejs <span class="status-pill local">zalecane</span></div>
+            <div class="d">Przypnij bind do IP wybranego w tabeli poniżej. iroh nasłuchuje tylko na tym jednym gnieździe i <em>nie</em> advertise'uje adresów z innych interfejsów.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SECTION: Interfejsy -->
+    <div class="tf-section-card flush">
+      <h3>
+        <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4"/></svg>
+        Interfejsy sieciowe
+      </h3>
+      <div class="section-sub">Wybierz główny interfejs (radio) i zdecyduj które adresy advertise'ować peerom.</div>
+
+      <div style="padding: 0 20px 14px;">
+        <div class="users-toolbar">
+          <div class="tf-searchbox">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+            <input type="text" placeholder="Szukaj interfejsu lub adresu IP…"/>
+          </div>
+          <div class="tf-filter-group">
+            <button class="filter-chip" active>Wszystkie</button>
+            <button class="filter-chip">LAN</button>
+            <button class="filter-chip">VPN</button>
+            <button class="filter-chip">Virtual</button>
+            <button class="filter-chip">Down</button>
+          </div>
+          <div style="margin-left:auto; font-size: 11.5px; color: var(--text-3);">
+            Ostatnie wykrycie: <strong style="color: var(--text-2);">12 s temu</strong>
+          </div>
+        </div>
+      </div>
+
+      <table class="tf-accounts-table">
+        <thead>
+          <tr>
+            <th style="width: 60px; padding-left: 20px;">Bind</th>
+            <th>Interfejs</th>
+            <th>Adres IP</th>
+            <th>Rodzaj</th>
+            <th>Status</th>
+            <th style="width: 100px;">Advertise</th>
+            <th class="actions-col" style="padding-right: 20px;">Akcje</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="selected">
+            <td style="padding-left: 20px;"><div class="bind-radio on"></div></td>
+            <td>
+              <div class="tf-account-cell">
+                <div class="tf-account-avatar">
+                  <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4M9 19v2M15 19v2"/></svg>
+                </div>
+                <div>
+                  <div class="tf-account-name">enp4s0 <span class="group-tag">bind target</span></div>
+                  <div class="tf-account-sub">Realtek RTL8125 · 2.5 GbE</div>
+                </div>
+              </div>
+            </td>
+            <td>
+              <div class="ip-mono">192.168.1.42</div>
+              <div class="ip-mono-sub">fe80::a236:9fff:fe12:3d7a</div>
+            </td>
+            <td><span class="role-pill role-lan">LAN</span></td>
+            <td><span class="status-pill ok">UP</span></td>
+            <td><div class="tf-toggle on"></div></td>
+            <td class="actions-col" style="padding-right: 20px;">
+              <div class="row-actions">
+                <button class="tf-btn-sm-ghost" title="Szczegóły"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg></button>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-left: 20px;"><div class="bind-radio"></div></td>
+            <td>
+              <div class="tf-account-cell">
+                <div class="tf-account-avatar">
+                  <svg viewBox="0 0 24 24"><path d="M5 13a10 10 0 0 1 14 0M8.5 16.5a5 5 0 0 1 7 0M12 20h.01M2 8.82a15 15 0 0 1 20 0"/></svg>
+                </div>
+                <div>
+                  <div class="tf-account-name">wlp0s20f3</div>
+                  <div class="tf-account-sub">Intel Wi-Fi 6 AX201 · 5 GHz · -52 dBm</div>
+                </div>
+              </div>
+            </td>
+            <td>
+              <div class="ip-mono">192.168.1.87</div>
+              <div class="ip-mono-sub">fe80::42aa:8bff:fe01:9e33</div>
+            </td>
+            <td><span class="role-pill role-wifi">Wi-Fi</span></td>
+            <td><span class="status-pill ok">UP</span></td>
+            <td><div class="tf-toggle on"></div></td>
+            <td class="actions-col" style="padding-right: 20px;">
+              <div class="row-actions">
+                <button class="tf-btn-sm-ghost" title="Szczegóły"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg></button>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-left: 20px;"><div class="bind-radio"></div></td>
+            <td>
+              <div class="tf-account-cell">
+                <div class="tf-account-avatar">
+                  <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                </div>
+                <div>
+                  <div class="tf-account-name">tailscale0</div>
+                  <div class="tf-account-sub">Tailscale Wireguard tunnel</div>
+                </div>
+              </div>
+            </td>
+            <td>
+              <div class="ip-mono">100.86.42.17</div>
+              <div class="ip-mono-sub">fd7a:115c:a1e0::1:2a11</div>
+            </td>
+            <td><span class="role-pill role-vpn">VPN</span></td>
+            <td><span class="status-pill ok">UP</span></td>
+            <td><div class="tf-toggle on"></div></td>
+            <td class="actions-col" style="padding-right: 20px;">
+              <div class="row-actions">
+                <button class="tf-btn-sm-ghost" title="Szczegóły"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg></button>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-left: 20px;"><div class="bind-radio"></div></td>
+            <td>
+              <div class="tf-account-cell">
+                <div class="tf-account-avatar">
+                  <svg viewBox="0 0 24 24"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg>
+                </div>
+                <div>
+                  <div class="tf-account-name">docker0</div>
+                  <div class="tf-account-sub">Docker bridge · 3 kontenery</div>
+                </div>
+              </div>
+            </td>
+            <td><div class="ip-mono">172.17.0.1</div></td>
+            <td><span class="role-pill role-virt">Virtual</span></td>
+            <td><span class="status-pill ok">UP</span></td>
+            <td><div class="tf-toggle"></div></td>
+            <td class="actions-col" style="padding-right: 20px;">
+              <div class="row-actions">
+                <button class="tf-btn-sm-ghost" title="Ukryj ze spisu"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-left: 20px;"><div class="bind-radio"></div></td>
+            <td>
+              <div class="tf-account-cell">
+                <div class="tf-account-avatar">
+                  <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                </div>
+                <div>
+                  <div class="tf-account-name">virbr0</div>
+                  <div class="tf-account-sub">libvirt NAT bridge</div>
+                </div>
+              </div>
+            </td>
+            <td><div class="ip-mono">192.168.122.1</div></td>
+            <td><span class="role-pill role-virt">Virtual</span></td>
+            <td><span class="status-pill off">DOWN</span></td>
+            <td><div class="tf-toggle"></div></td>
+            <td class="actions-col" style="padding-right: 20px;">
+              <div class="row-actions">
+                <button class="tf-btn-sm-ghost" title="Ukryj ze spisu"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+              </div>
+            </td>
+          </tr>
+          <tr class="disabled">
+            <td style="padding-left: 20px;"><div class="bind-radio"></div></td>
+            <td>
+              <div class="tf-account-cell">
+                <div class="tf-account-avatar">
+                  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/></svg>
+                </div>
+                <div>
+                  <div class="tf-account-name">lo</div>
+                  <div class="tf-account-sub">Loopback</div>
+                </div>
+              </div>
+            </td>
+            <td>
+              <div class="ip-mono">127.0.0.1</div>
+              <div class="ip-mono-sub">::1</div>
+            </td>
+            <td><span class="role-pill role-loop">Loopback</span></td>
+            <td><span class="status-pill off">— bind zablokowany</span></td>
+            <td><div class="tf-toggle"></div></td>
+            <td class="actions-col" style="padding-right: 20px;"></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- SECTION: Advertise preview -->
+    <div class="tf-section-card">
+      <h3>
+        <svg viewBox="0 0 24 24"><path d="M2 12a10 10 0 0 1 20 0"/><path d="M5 12a7 7 0 0 1 14 0"/><path d="M8 12a4 4 0 0 1 8 0"/></svg>
+        Adresy wysyłane do peerów
+        <span class="status-pill ok" style="margin-left: 4px;">3 aktywne</span>
+      </h3>
+      <div class="section-sub">Podgląd listy <code>direct_addrs</code> propagowanej przez relay i zapisywanej w <code>trusted_contact:*</code>.</div>
+      <div class="adv-list">
+        <div class="adv-row included">
+          <span class="label">enp4s0 · LAN</span>
+          <span class="addr">192.168.1.42:52443</span>
+          <span class="status-pill ok" style="margin-left:auto;">wysyłane</span>
+        </div>
+        <div class="adv-row included">
+          <span class="label">wlp0s20f3 · Wi-Fi</span>
+          <span class="addr">192.168.1.87:52443</span>
+          <span class="status-pill ok" style="margin-left:auto;">wysyłane</span>
+        </div>
+        <div class="adv-row included">
+          <span class="label">tailscale0 · VPN</span>
+          <span class="addr">100.86.42.17:52443</span>
+          <span class="status-pill ok" style="margin-left:auto;">wysyłane</span>
+        </div>
+        <div class="adv-row filtered">
+          <span class="label">docker0</span>
+          <span class="addr">172.17.0.1:52443</span>
+          <span class="status-pill off" style="margin-left:auto;">filtr: Docker</span>
+        </div>
+        <div class="adv-row filtered">
+          <span class="label">virbr0</span>
+          <span class="addr">192.168.122.1:52443</span>
+          <span class="status-pill off" style="margin-left:auto;">DOWN</span>
+        </div>
+        <div class="adv-row filtered">
+          <span class="label">link-local IPv6</span>
+          <span class="addr">fe80::a236:9fff:fe12:3d7a</span>
+          <span class="status-pill off" style="margin-left:auto;">filtr: link-local</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- SECTION: Filtry -->
+    <div class="tf-section-card">
+      <h3>
+        <svg viewBox="0 0 24 24"><path d="M3 6h18M6 12h12M10 18h4"/></svg>
+        Filtry globalne
+      </h3>
+      <div class="section-sub">Automatyczne wykluczenia obowiązujące mimo ustawień tabeli wyżej.</div>
+      <div class="net-filter-row">
+        <div>
+          <div class="t">Ukryj Docker bridges</div>
+          <div class="d">172.17.0.0/16 — 172.31.0.0/16</div>
+        </div>
+        <div class="tf-toggle on"></div>
+      </div>
+      <div class="net-filter-row">
+        <div>
+          <div class="t">Ukryj link-local IPv6</div>
+          <div class="d">fe80::/10 — widoczne tylko w lokalnym segmencie</div>
+        </div>
+        <div class="tf-toggle on"></div>
+      </div>
+      <div class="net-filter-row">
+        <div>
+          <div class="t">Ukryj link-local IPv4</div>
+          <div class="d">169.254.0.0/16 — APIPA</div>
+        </div>
+        <div class="tf-toggle on"></div>
+      </div>
+      <div class="net-filter-row">
+        <div>
+          <div class="t">Ukryj loopback</div>
+          <div class="d">127.0.0.0/8, ::1</div>
+        </div>
+        <div class="tf-toggle on"></div>
+      </div>
+      <div class="net-filter-row">
+        <div>
+          <div class="t">Ukryj CGNAT poza Tailscale</div>
+          <div class="d">100.64.0.0/10 z wyjątkiem wykrytego tunelu Tailscale</div>
+        </div>
+        <div class="tf-toggle"></div>
+      </div>
+      <div class="net-filter-row">
+        <div>
+          <div class="t">Preferuj ścieżkę z tej samej podsieci</div>
+          <div class="d">Reorder direct_addrs — pierwsze IP z subnetu peera</div>
+        </div>
+        <div class="tf-toggle on"></div>
+      </div>
+    </div>
+
+    <!-- SECTION: Relay URL -->
+    <div class="tf-section-card">
+      <h3>
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h4M18 12h4M12 2v4M12 18v4"/></svg>
+        Relay
+        <span class="status-pill sso" style="margin-left: 4px;">self-hosted</span>
+      </h3>
+      <div class="section-sub">Serwer pośredniczący gdy direct p2p zawiedzie (NAT traversal). Klucz DB: <code>settings.mesh.iroh_relay_url</code>.</div>
+      <div class="field">
+        <label>Relay URL</label>
+        <input type="text" value="https://euw1-1.relay.iroh.network." placeholder="https://… (puste = N0 preset)"/>
+        <div class="hint">Domyślnie <code>https://euw1-1.relay.iroh.network.</code> (produkcyjny relay N0, region EU-West). Inne N0: <code>use1-1</code> (US-East), <code>use2-1</code> (US-West), <code>aps1-1</code> (Asia-Pacific). Puste pole = automatyczny dobór z N0 presetu. Dla self-hosted podaj własne URL.</div>
+      </div>
+      <div class="section-footer">
+        <button class="tf-btn ghost">Przywróć domyślne</button>
+        <button class="tf-btn outline">Sprawdź osiągalność</button>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+</body>
+</html>

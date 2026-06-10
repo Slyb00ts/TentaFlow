@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>CRM — Smart inbox „Wymaga uwagi” (C12)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css"></head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-fire" viewBox="0 0 24 24"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 17c1.7 0 3-1.3 3-3 0-1.4-.7-2.1-1.5-3-1.6-1.6-3-3-3-5 0-2.8 2.2-5 5-5 .5 6 5 8 5 12a8 8 0 1 1-16 0c0-2.2 1.1-4.2 2.7-5.5"/></symbol>
+<symbol id="i-warning" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18L4.92 10l5.17 1.82L12 17l1.91-5.18L19.08 10l-5.17-1.82L12 3z"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/></symbol>
+<symbol id="i-phone" viewBox="0 0 24 24"><path d="M22 16.92v3"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20l3-2"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 13.5"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>CRM — Smart inbox „Wymaga uwagi” (C12)</h1>
+  <p class="lead">
+    Dedykowana zakładka — zbiera sygnały z reguł deterministycznych + propozycji AI. To <strong>silnik adaptacyjnej sekcji</strong>, która karmi też Daily Inbox (C1) i dashboardy ról.
+    Każdy sygnał ma: typ, źródło (reguła lub AI), confidence, akcję domyślną, opcję odłożenia. Można dostroić reguły jak filtry mailowe.
+  </p>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">C12</span><h2>Smart inbox — 14 sygnałów</h2><div class="desc">Grupowane po typie. Można rozwinąć każdy żeby zobaczyć logikę reguły.</div></div>
+<div class="screen-frame">
+<div class="tf-shell">
+
+<aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-deal"/></svg>CRM<span class="badge danger">7</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av indigo">AK</div><div><div class="nm">Anna Kowalska</div><div class="rl">Handlowiec · Wschód</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+
+<main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>CRM</strong><span class="sep">›</span><span>Wymaga uwagi</span></div>
+  <div class="pill-tabs">
+    <button class="pill-tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+    <button class="pill-tab active"><svg class="icon"><use href="#i-inbox"/></svg>Inbox</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-pipeline"/></svg>Pipeline</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-trend"/></svg>Forecast</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-shield-check"/></svg>Akceptacje</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy</button>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+<div class="page-head">
+<div class="title"><svg class="icon" style="color:var(--danger);width:22px;height:22px;"><use href="#i-fire"/></svg> Wymaga uwagi<div class="sub">14 sygnałów · 4 reguły · 5 AI hygiene · 5 AI ekstrakcja</div></div>
+<div class="actions"><button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Dostrój reguły</button></div>
+</div>
+
+<div class="flex gap-sm mb-md">
+  <div class="filter-chip active">Wszystkie<span class="count">14</span></div>
+  <div class="filter-chip">Krytyczne<span class="count">3</span></div>
+  <div class="filter-chip">Reguły<span class="count">4</span></div>
+  <div class="filter-chip"><svg class="icon"><use href="#i-sparkles"/></svg>AI<span class="count">10</span></div>
+  <div class="filter-chip">Odłożone<span class="count">2</span></div>
+</div>
+
+<!-- GROUP 1: STALE COMMITS -->
+<div class="section-card" style="border-left:3px solid var(--danger);">
+  <div class="section-card-head">
+    <div class="title"><svg class="icon" style="color:var(--danger)"><use href="#i-fire"/></svg>Commit'y bez aktywności &gt; 7 dni — 3</div>
+    <div class="flex gap-sm">
+      <span class="contrib-tag crm">reguła</span>
+      <button class="btn btn-ghost btn-sm">Edytuj regułę</button>
+    </div>
+  </div>
+  <div class="text-xs text-3 mb-md" style="font-style:italic;">
+    Reguła: <code>deal.commit = true AND deal.last_activity_at &lt; now() - 7d</code>. Wpada do Daily Inbox z priorytetem KRYTYCZNYM, oraz do dashboardu dyrektora.
+  </div>
+  <div class="flex col">
+    <div class="inbox-row danger" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-fire"/></svg></div><div class="ix-body"><div class="ix-title">mBank · CBA migracja <span class="chip accent"><span class="dot"></span>commit</span></div><div class="ix-sub">120 000 PLN · 9 dni bez aktywności · Magda Wiśniewska</div></div><div class="ix-actions"><button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-phone"/></svg>Zadzwoń</button><button class="btn btn-sm">Zdejmij commit</button></div></div>
+    <div class="inbox-row danger" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-fire"/></svg></div><div class="ix-body"><div class="ix-title">Polskie LNG · katalog <span class="chip accent"><span class="dot"></span>commit</span></div><div class="ix-sub">680 000 PLN · 17 dni cisza · J. Niedzielski</div></div><div class="ix-actions"><button class="btn btn-danger btn-sm">Eskaluj</button></div></div>
+    <div class="inbox-row warning" style="margin-bottom:0"><div class="ix-ico"><svg class="icon"><use href="#i-warning"/></svg></div><div class="ix-body"><div class="ix-title">BNP · refresh oferty <span class="chip accent"><span class="dot"></span>commit</span></div><div class="ix-sub">95 000 PLN · 8 dni cisza · R. Trzaska</div></div><div class="ix-actions"><button class="btn btn-sm">Sprawdź</button></div></div>
+  </div>
+</div>
+
+<!-- GROUP 2: AI HYGIENE -->
+<div class="section-card" style="border-left:3px solid var(--accent-2);">
+  <div class="section-card-head">
+    <div class="title"><svg class="icon"><use href="#i-sparkles"/></svg>AI hygiene — niezgodności w danych — 5</div>
+    <span class="contrib-tag crm">ai · hygiene</span>
+  </div>
+  <div class="text-xs text-3 mb-md" style="font-style:italic;">
+    AI codziennie skanuje deale pod kątem niespójności (zmieniona wartość bez marży, brak następnej aktywności, oferta wysłana ale brak czytania itd.).
+  </div>
+  <div class="flex col">
+    <div class="inbox-row warning" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-sparkles"/></svg></div><div class="ix-body"><div class="ix-title">Marża spadła z 22% → 18% — <strong>VW Poznań · ERP fleet</strong></div><div class="ix-sub">Po dodaniu modułu warsztatów. Możliwe że warto zaktualizować plan kosztów.</div></div><div class="ix-actions"><button class="btn btn-sm">Pokaż diff</button></div></div>
+    <div class="inbox-row warning" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-sparkles"/></svg></div><div class="ix-body"><div class="ix-title">Commit bez następnej aktywności — <strong>Polsat · CRM call</strong></div><div class="ix-sub">Deal w commit od 3 dni, brak zaplanowanego next-step.</div></div><div class="ix-actions"><button class="btn btn-sm">Zaplanuj next-step</button></div></div>
+    <div class="inbox-row" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-sparkles"/></svg></div><div class="ix-body"><div class="ix-title">Brak otwarcia oferty 9 dni — <strong>Comp · cyfryzacja HR</strong></div><div class="ix-sub">Email tracking: oferta wysłana 12 dni temu, 0 otwarć.</div></div><div class="ix-actions"><button class="btn btn-sm">Nudge AI</button></div></div>
+    <div class="inbox-row" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-sparkles"/></svg></div><div class="ix-body"><div class="ix-title">Wartość się zmieniła, marża pusta — <strong>Empik · audyt</strong></div><div class="ix-sub">Wartość z 18k → 28k bez aktualizacji marży/kosztów.</div></div><div class="ix-actions"><button class="btn btn-sm">Otwórz deal</button></div></div>
+    <div class="inbox-row" style="margin-bottom:0"><div class="ix-ico"><svg class="icon"><use href="#i-sparkles"/></svg></div><div class="ix-body"><div class="ix-title">Konkurencja wzmiankowana 2× — <strong>VW Poznań</strong></div><div class="ix-sub">W transkrypcji wczoraj — „Comarch” pojawia się 2 razy. Może warto zapisać jako risk.</div></div><div class="ix-actions"><button class="btn btn-sm">Zapisz risk</button></div></div>
+  </div>
+</div>
+
+<!-- GROUP 3: AI EXTRACTION -->
+<div class="section-card" style="border-left:3px solid var(--info);">
+  <div class="section-card-head">
+    <div class="title"><svg class="icon"><use href="#i-sparkles"/></svg>AI ekstrakcja z maili/spotkań — 5</div>
+    <span class="contrib-tag crm">ai · extract</span>
+  </div>
+  <div class="text-xs text-3 mb-md" style="font-style:italic;">
+    AI proponuje aktualizacje danych z ostatnich konwersacji. Każda propozycja wymaga 1 kliknięcia.
+  </div>
+  <div class="flex col">
+    <div class="inbox-row" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-mail"/></svg></div><div class="ix-body"><div class="ix-title">Z maila Magdy (wczoraj 18:42): nowy decydent <strong>Adam Kowal</strong></div><div class="ix-sub">„Proszę kierować dalsze pytania do Adama (CTO).” → Propozycja: dodać Adama jako decydenta na deal VW Poznań.</div></div><div class="ix-actions"><button class="btn btn-primary btn-sm">Dodaj kontakt</button><button class="btn btn-ghost btn-sm">Pomiń</button></div></div>
+    <div class="inbox-row" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-calendar"/></svg></div><div class="ix-body"><div class="ix-title">Z transkrypcji spotkania (Volkswagen): nowy wymóg — <strong>integracja z SAP</strong></div><div class="ix-sub">Propozycja: dopisać do scope deala VW Poznań.</div></div><div class="ix-actions"><button class="btn btn-sm">Pokaż diff</button></div></div>
+    <div class="inbox-row" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-phone"/></svg></div><div class="ix-body"><div class="ix-title">Z rozmowy z Tauron (10.05): zmiana terminu na koniec lipca</div><div class="ix-sub">Propozycja: zaktualizować <code>est_close_date</code> z 30.06 → 31.07.</div></div><div class="ix-actions"><button class="btn btn-sm">Zaktualizuj</button></div></div>
+    <div class="inbox-row" style="margin-bottom:8px"><div class="ix-ico"><svg class="icon"><use href="#i-mail"/></svg></div><div class="ix-body"><div class="ix-title">Z maila PKO BP: prośba o referencje branży finansowej (3)</div><div class="ix-sub">Propozycja: utworzyć task „Wysłać case study mBank, ING, Santander”.</div></div><div class="ix-actions"><button class="btn btn-sm">Utwórz task</button></div></div>
+    <div class="inbox-row" style="margin-bottom:0"><div class="ix-ico"><svg class="icon"><use href="#i-mail"/></svg></div><div class="ix-body"><div class="ix-title">Nowy lead z LinkedIn (z konwersacji 2 dni temu): <strong>Patrycja Mazur, CIO Żabka</strong></div><div class="ix-sub">Propozycja: dodać kontakt + utworzyć deal w fazie Lead.</div></div><div class="ix-actions"><button class="btn btn-primary btn-sm">Utwórz deal</button></div></div>
+  </div>
+</div>
+
+<!-- GROUP 4: BILLING -->
+<div class="section-card" style="border-left:3px solid var(--warning);">
+  <div class="section-card-head">
+    <div class="title"><svg class="icon" style="color:var(--warning)"><use href="#i-receipt"/></svg>Koszty do refakturowania — 1</div>
+    <span class="contrib-tag billing">reguła · billing</span>
+  </div>
+  <div class="flex col">
+    <div class="inbox-row warning" style="margin-bottom:0"><div class="ix-ico"><svg class="icon"><use href="#i-receipt"/></svg></div><div class="ix-body"><div class="ix-title">FV/2026/05/00187 · Allegro API · 12 480 PLN — nieprzypisana</div><div class="ix-sub">Sugerowany deal: Allegro · Marketplace integration.</div></div><div class="ix-actions"><button class="btn btn-sm">Refakturuj</button></div></div>
+  </div>
+</div>
+
+</main>
+</div></div>
+</section>
+
+</body>
+</html>

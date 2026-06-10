@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>Platform — App switcher (P1)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.app-tile { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; transition: all 0.15s; cursor: pointer; min-height: 130px; display: flex; flex-direction: column; gap: 10px; }
+.app-tile:hover { border-color: var(--accent-1); background: var(--bg-card-hover); transform: translateY(-2px); }
+.app-tile.current { border-color: var(--accent-1); box-shadow: 0 0 0 2px rgba(99,102,241,0.3); }
+.app-tile .ic { width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: white; font-weight: 800; font-size: 14px; }
+.app-tile .nm { font-size: 14px; font-weight: 700; }
+.app-tile .ds { font-size: 11px; color: var(--text-3); }
+.app-tile .pulse { font-size: 10.5px; color: var(--text-2); padding-top: 8px; border-top: 1px dashed var(--border); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 13.5"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20l3-2 3 2 3-2 3 2 3-2 1 2V2l-3 2-3-2-3 2-3-2-3 2-1-2z"/><path d="M16 8H8"/><path d="M16 12H8"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9 14a2 2 0 0 0 2 2h2a2 2 0 0 0 0-4h-2a2 2 0 0 1 0-4h2a2 2 0 0 1 2 2"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/><rect x="10" y="4" width="4" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18L4.92 10l5.17 1.82L12 17l1.91-5.18L19.08 10l-5.17-1.82L12 3z"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>Platform — App switcher (P1)</h1>
+  <p class="lead">
+    Globalny przełącznik addonów. Otwierany kliknięciem na app-switcher w sidebar (lub <code>⌘⇧A</code>).
+    Każdy kafelek to <strong>addon-as-app</strong> z własnym menu, ikoną, kolorem. Pokazuje też puls — co się działo niedawno (np. „3 nowe sygnały w CRM”, „5 dokumentów do akceptacji w Billing”).
+  </p>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">P1</span><h2>App switcher — overlay nad bieżącym addonem</h2><div class="desc">Modal z kafelkami. Highlight = aktualnie otwarta aplikacja.</div></div>
+
+<div class="screen-frame">
+<div class="tf-shell">
+
+<aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-deal"/></svg>CRM</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av amber">TW</div><div><div class="nm">Tomasz Wójcik</div><div class="rl">Admin</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+<main class="addon-main" style="opacity:0.45;filter:blur(2px);pointer-events:none;padding:40px">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>Platform Settings</strong></div>
+  <div class="pill-tabs">
+    <button class="pill-tab active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-shield"/></svg>Permissions</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-sparkles"/></svg>AI Tools</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-history"/></svg>Audit log</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+  <div style="color:var(--text-3)">Tło: Daily Sales Inbox</div>
+</main>
+
+<div class="window-backdrop">
+<div class="palette-window" style="width:min(820px,94%);">
+  <div class="palette-input">
+    <svg class="icon"><use href="#i-search"/></svg>
+    <input type="text" placeholder="Szukaj addona…">
+    <span class="kbd">esc</span>
+  </div>
+
+  <div style="padding:18px;">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-3);font-weight:800;margin-bottom:10px;">Aplikacje aktywne (6)</div>
+    <div class="grid-3" style="margin-bottom:20px;">
+
+      <div class="app-tile current">
+        <div class="ic" style="background:var(--gradient-accent)">tf</div>
+        <div class="nm">CRM</div>
+        <div class="ds">Deale, pipeline, forecast, karty akceptacji.</div>
+        <div class="pulse"><span class="chip danger" style="font-size:9px"><span class="dot"></span>7</span> · 3 sygnały AI</div>
+      </div>
+
+      <div class="app-tile">
+        <div class="ic" style="background:var(--gradient-contacts)">@</div>
+        <div class="nm">Contacts</div>
+        <div class="ds">Firmy, osoby, relacje, grupy kapitałowe.</div>
+        <div class="pulse">+ 2 nowe leady dziś</div>
+      </div>
+
+      <div class="app-tile">
+        <div class="ic" style="background:var(--gradient-activity)">⚡</div>
+        <div class="nm">Activity</div>
+        <div class="ds">Timeline + tasks + reminders.</div>
+        <div class="pulse">7 otwartych zadań</div>
+      </div>
+
+      <div class="app-tile">
+        <div class="ic" style="background:linear-gradient(135deg,#60a5fa,#14b8a6)">📅</div>
+        <div class="nm">Calendar</div>
+        <div class="ds">Spotkania + meeting briefs AI.</div>
+        <div class="pulse">Dziś 3 eventy · najbliższy 10:00</div>
+      </div>
+
+      <div class="app-tile">
+        <div class="ic" style="background:linear-gradient(135deg,#4b5374,#2f3668)">📄</div>
+        <div class="nm">Documents</div>
+        <div class="ds">Pliki, OCR, podpisy elektroniczne.</div>
+        <div class="pulse">38 do auto-tagowania</div>
+      </div>
+
+      <div class="app-tile">
+        <div class="ic" style="background:var(--gradient-activity)">€</div>
+        <div class="nm">Billing</div>
+        <div class="ds">Faktury, koszty, refaktury, KSeF.</div>
+        <div class="pulse"><span class="chip warning" style="font-size:9px"><span class="dot"></span>8</span> · do rozksięgowania</div>
+      </div>
+
+    </div>
+
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-3);font-weight:800;margin-bottom:10px;">Dostępne (zainstalowane, nieotwarte)</div>
+    <div class="grid-3" style="margin-bottom:20px;">
+      <div class="app-tile">
+        <div class="ic" style="background:linear-gradient(135deg,#a78bfa,#60a5fa)">✉</div>
+        <div class="nm">Email</div>
+        <div class="ds">Wątki + threading + IMAP sync.</div>
+        <div class="pulse">2 nieprzeczytane</div>
+      </div>
+      <div class="app-tile">
+        <div class="ic" style="background:linear-gradient(135deg,#22c55e,#14b8a6)">🛡</div>
+        <div class="nm">Eureka MF</div>
+        <div class="ds">Sprawdzanie firm w Eureka.</div>
+        <div class="pulse">— ostatnio użyte 2 dni temu</div>
+      </div>
+      <div class="app-tile" style="border-style:dashed;">
+        <div class="ic" style="background:var(--bg-3);color:var(--text-3)"><svg class="icon"><use href="#i-plus"/></svg></div>
+        <div class="nm">Dodaj addon</div>
+        <div class="ds">Marketplace addonów TentaFlow.</div>
+        <div class="pulse">42 dostępnych w katalogu</div>
+      </div>
+    </div>
+
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:11.5px;color:var(--text-3);">
+      <strong style="color:var(--text-2)">Skróty:</strong>
+      <span style="margin-left:8px"><code style="background:var(--bg-3);padding:1px 5px;border-radius:3px">⌘⇧A</code> — ten switcher</span>
+      <span style="margin-left:8px"><code style="background:var(--bg-3);padding:1px 5px;border-radius:3px">⌘1-9</code> — szybkie przełączenie</span>
+      <span style="margin-left:8px"><code style="background:var(--bg-3);padding:1px 5px;border-radius:3px">⌘K</code> — command palette (działa w każdym addonie)</span>
+    </div>
+  </div>
+</div>
+</div>
+
+</div>
+</div>
+</section>
+
+</body>
+</html>

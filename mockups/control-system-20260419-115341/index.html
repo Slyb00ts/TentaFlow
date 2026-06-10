@@ -1,0 +1,1451 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no,viewport-fit=cover">
+<title>TentaFlow Control System — Mockup</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818;
+  --bg-2: #0a0e22;
+  --bg-3: #131736;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #f5f6ff;
+  --text-2: #c1c5e0;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #818cf8;
+  --accent-glow: rgba(99,102,241,0.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-accent-hover: linear-gradient(135deg, #7277f3 0%, #b69cfb 100%);
+  --gradient-danger: linear-gradient(135deg, #ef4444 0%, #f97316 100%);
+  --gradient-success: linear-gradient(135deg, #22c55e 0%, #10b981 100%);
+  --gradient-logo: linear-gradient(135deg,#a78bfa,#22d3ee,#f472b6);
+  --shadow-sm: 0 2px 6px rgba(0,0,0,0.4);
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+  --shadow-lg: 0 24px 64px rgba(0,0,0,0.7),0 8px 24px rgba(99,102,241,0.15);
+  /* Real glow — halo fade-out. Pure blur, no sharp ring. */
+  --glow-accent:
+    0 0 14px rgba(99,102,241,0.55),
+    0 0 28px rgba(99,102,241,0.35),
+    0 0 52px rgba(99,102,241,0.18),
+    0 0 84px rgba(99,102,241,0.08);
+  --glow-danger:
+    0 0 14px rgba(239,68,68,0.55),
+    0 0 28px rgba(239,68,68,0.35),
+    0 0 52px rgba(239,68,68,0.18);
+  --glow-success:
+    0 0 12px rgba(34,197,94,0.35),
+    0 0 28px rgba(34,197,94,0.18);
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --spring-snappy: cubic-bezier(0.34,1.56,0.64,1);
+  --spring-smooth: cubic-bezier(0.32,0.72,0,1);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  background-image: radial-gradient(ellipse 80% 50% at 50% 0%, rgba(99,102,241,0.08) 0%, transparent 60%);
+  min-height: 100vh;
+}
+
+.shell { max-width: 1400px; margin: 0 auto; padding: 40px 32px 120px; }
+.intro { margin-bottom: 48px; }
+.intro h1 {
+  font-size: 32px; font-weight: 800; letter-spacing: -0.02em;
+  background: var(--gradient-logo);
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: 8px;
+}
+.intro .sub { color: var(--text-2); font-size: 14px; max-width: 680px; }
+
+.section { margin-bottom: 56px; }
+.section-head {
+  display: flex; align-items: baseline; gap: 12px;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.section-head h2 { font-size: 18px; font-weight: 700; color: var(--text); }
+.section-head .desc { font-size: 12px; color: var(--text-3); }
+
+.demo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 18px;
+}
+.demo-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.demo-card.wide { grid-column: 1 / -1; }
+.demo-card .label {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--accent-2);
+}
+.demo-card .api {
+  font-family: 'SF Mono', Menlo, monospace; font-size: 11px;
+  color: var(--text-3);
+  background: var(--bg-input); border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-top: auto;
+  border: 1px solid var(--border);
+  white-space: pre;
+  overflow: auto;
+}
+
+/* =============================================================================
+ * tf-button — gradient primary, translucent accents
+ * ============================================================================= */
+
+.tf-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 16px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.15s var(--spring-smooth),
+              box-shadow 0.2s ease,
+              filter 0.15s ease,
+              background 0.15s ease,
+              border-color 0.15s ease,
+              color 0.15s ease;
+  text-decoration: none;
+  min-height: 38px;
+  user-select: none;
+  white-space: nowrap;
+  position: relative;
+}
+.tf-btn:active { transform: scale(0.97); }
+
+/* primary — gradient + glow halo on hover */
+.tf-btn.tf-btn-primary {
+  background: var(--gradient-accent);
+  color: white;
+  box-shadow:
+    0 4px 14px rgba(99,102,241,0.35),
+    inset 0 1px 0 rgba(255,255,255,0.18);
+}
+.tf-btn.tf-btn-primary:hover {
+  background: var(--gradient-accent-hover);
+  filter: brightness(1.08);
+  box-shadow:
+    0 6px 22px rgba(99,102,241,0.55),
+    0 0 32px rgba(99,102,241,0.3),
+    inset 0 1px 0 rgba(255,255,255,0.25);
+  transform: translateY(-1px);
+}
+
+.tf-btn.tf-btn-secondary {
+  background: var(--bg-3); color: var(--text); border-color: var(--border);
+}
+.tf-btn.tf-btn-secondary:hover {
+  background: var(--bg-card-hover); border-color: var(--border-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+}
+
+.tf-btn.tf-btn-ghost { background: transparent; color: var(--text-2); }
+.tf-btn.tf-btn-ghost:hover { background: var(--bg-3); color: var(--text); }
+
+.tf-btn.tf-btn-danger {
+  background: transparent; color: var(--danger);
+  border-color: rgba(239,68,68,0.3);
+}
+.tf-btn.tf-btn-danger:hover {
+  background: rgba(239,68,68,0.1);
+  border-color: var(--danger);
+  transform: translateY(-1px);
+  box-shadow: 0 0 20px rgba(239,68,68,0.3);
+}
+.tf-btn.tf-btn-danger-solid {
+  background: var(--gradient-danger); color: white;
+  box-shadow: 0 4px 14px rgba(239,68,68,0.35), inset 0 1px 0 rgba(255,255,255,0.15);
+}
+.tf-btn.tf-btn-danger-solid:hover {
+  filter: brightness(1.08); transform: translateY(-1px);
+  box-shadow: 0 6px 22px rgba(239,68,68,0.55), 0 0 32px rgba(239,68,68,0.3),
+    inset 0 1px 0 rgba(255,255,255,0.2);
+}
+.tf-btn.tf-btn-success {
+  background: var(--gradient-success); color: white;
+  box-shadow: 0 4px 14px rgba(34,197,94,0.35), inset 0 1px 0 rgba(255,255,255,0.15);
+}
+.tf-btn.tf-btn-success:hover {
+  filter: brightness(1.08); transform: translateY(-1px);
+  box-shadow: 0 6px 22px rgba(34,197,94,0.5), 0 0 28px rgba(34,197,94,0.25);
+}
+
+.tf-btn.tf-btn-sm { padding: 6px 12px; font-size: 11px; min-height: 30px; }
+.tf-btn.tf-btn-icon { width: 38px; padding: 0; justify-content: center; }
+.tf-btn.tf-btn-icon.tf-btn-sm { width: 30px; }
+.tf-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none !important; filter: none !important; }
+.tf-btn:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
+
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+/* =============================================================================
+ * tf-input — real glow halo on focus
+ * ============================================================================= */
+
+.tf-input-group { display: flex; flex-direction: column; gap: 6px; }
+.tf-input-group .tf-label {
+  font-size: 11px; font-weight: 600;
+  color: var(--text-2);
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.tf-input {
+  width: 100%;
+  padding: 10px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.25s ease;
+  min-height: 40px;
+  outline: none;
+}
+.tf-input::placeholder { color: var(--text-3); }
+.tf-input:hover { border-color: var(--border-hover); }
+.tf-input:focus {
+  border-color: var(--accent-1);
+  background: var(--bg-card);
+  box-shadow: var(--glow-accent);
+}
+.tf-input.tf-input-error { border-color: var(--danger); }
+.tf-input.tf-input-error:focus { box-shadow: var(--glow-danger); }
+.tf-input-group .tf-hint { font-size: 11px; color: var(--text-3); }
+.tf-input-group .tf-error-text { font-size: 11px; color: var(--danger); }
+
+.tf-input-wrap { position: relative; display: flex; align-items: center; }
+.tf-input-wrap .tf-input { padding-left: 40px; padding-right: 12px; }
+.tf-input-wrap .tf-input-icon {
+  position: absolute; left: 12px;
+  width: 16px; height: 16px;
+  color: var(--text-3);
+  pointer-events: none;
+  transition: color 0.15s;
+}
+.tf-input-wrap:focus-within .tf-input-icon { color: var(--accent-1); }
+
+/* =============================================================================
+ * tf-searchbox — pill with halo glow
+ * ============================================================================= */
+
+.tf-searchbox {
+  position: relative;
+  display: flex; align-items: center;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 44px 0 40px;
+  height: 40px;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.25s ease;
+}
+.tf-searchbox:hover { border-color: var(--border-hover); }
+.tf-searchbox:focus-within {
+  border-color: var(--accent-1);
+  background: var(--bg-card);
+  box-shadow: var(--glow-accent);
+}
+.tf-searchbox .tf-searchbox-icon {
+  position: absolute; left: 12px;
+  width: 16px; height: 16px;
+  color: var(--text-3);
+  pointer-events: none;
+  transition: color 0.15s;
+}
+.tf-searchbox:focus-within .tf-searchbox-icon { color: var(--accent-1); }
+.tf-searchbox input {
+  flex: 1;
+  background: transparent; border: 0; outline: none;
+  color: var(--text); font-size: 13px; font-weight: 500;
+  font-family: inherit;
+}
+.tf-searchbox input::placeholder { color: var(--text-3); }
+.tf-searchbox input::-webkit-search-cancel-button { display: none; }
+.tf-searchbox .tf-searchbox-clear {
+  position: absolute; right: 8px;
+  width: 24px; height: 24px;
+  background: var(--bg-3); color: var(--text-3);
+  border: 0; border-radius: 50%;
+  display: none; align-items: center; justify-content: center;
+  cursor: pointer;
+  font-size: 13px; line-height: 1;
+  transition: all 0.15s;
+}
+.tf-searchbox.has-value .tf-searchbox-clear { display: flex; }
+.tf-searchbox .tf-searchbox-clear:hover { background: var(--bg-card-hover); color: var(--text); transform: scale(1.05); }
+
+/* =============================================================================
+ * tf-select
+ * ============================================================================= */
+
+.tf-select-wrap { position: relative; display: inline-block; width: 100%; }
+.tf-select {
+  width: 100%;
+  appearance: none; -webkit-appearance: none;
+  padding: 10px 38px 10px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  outline: none;
+  min-height: 40px;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.25s ease;
+}
+.tf-select:hover { border-color: var(--border-hover); }
+.tf-select:focus {
+  border-color: var(--accent-1);
+  background: var(--bg-card);
+  box-shadow: var(--glow-accent);
+}
+.tf-select-wrap::after {
+  content: '';
+  position: absolute; right: 14px; top: 50%;
+  width: 8px; height: 8px;
+  border-right: 2px solid var(--text-3);
+  border-bottom: 2px solid var(--text-3);
+  transform: translateY(-70%) rotate(45deg);
+  pointer-events: none;
+  transition: border-color 0.15s;
+}
+.tf-select-wrap:focus-within::after { border-color: var(--accent-1); }
+.tf-select option { background: var(--bg-card); color: var(--text); }
+
+/* =============================================================================
+ * tf-toggle
+ * ============================================================================= */
+
+.tf-toggle {
+  position: relative;
+  display: inline-flex;
+  width: 44px; height: 24px;
+  background: var(--bg-3);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: all 0.2s var(--spring-smooth);
+  padding: 2px;
+  flex-shrink: 0;
+}
+.tf-toggle::after {
+  content: '';
+  width: 18px; height: 18px;
+  background: var(--text);
+  border-radius: 50%;
+  transition: all 0.25s var(--spring-snappy);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+}
+.tf-toggle.on {
+  background: var(--gradient-accent);
+  border-color: var(--accent-1);
+  box-shadow: 0 0 18px rgba(99,102,241,0.35);
+}
+.tf-toggle.on::after { transform: translateX(20px); background: white; }
+
+/* =============================================================================
+ * tf-tabs — 3 warianty:
+ *   .tf-tabs           → solid pill (current active = gradient fill)
+ *   .tf-tabs-soft      → translucent accent (wireframe-style)
+ *   .tf-tabs-underline → text + animated underline bar
+ * ============================================================================= */
+
+/* variant 1 — solid pill with gradient on active (primary look) */
+.tf-tabs {
+  display: inline-flex; gap: 4px;
+  padding: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.tf-tab {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 7px 14px;
+  border: 0; background: transparent;
+  color: var(--text-3);
+  border-radius: var(--radius-sm);
+  font-size: 12px; font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: all 0.18s var(--spring-smooth);
+  white-space: nowrap;
+}
+.tf-tab .tf-tab-count {
+  font-size: 10px; font-weight: 700;
+  background: var(--bg-3); color: var(--text-3);
+  padding: 1px 6px; border-radius: 10px;
+  transition: all 0.18s;
+}
+.tf-tab:hover { color: var(--text); background: var(--bg-3); }
+.tf-tab.active {
+  background: var(--gradient-accent); color: white;
+  box-shadow: 0 2px 10px rgba(99,102,241,0.4), inset 0 1px 0 rgba(255,255,255,0.18);
+}
+.tf-tab.active .tf-tab-count { background: rgba(255,255,255,0.2); color: white; }
+
+/* variant 2 — soft translucent accent (jak w wireframe) */
+.tf-tabs-soft {
+  display: inline-flex; gap: 4px;
+  padding: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.tf-tabs-soft .tf-tab.active {
+  background: var(--accent-glow);
+  color: var(--accent-2);
+  box-shadow: 0 0 0 1px var(--accent-1) inset, 0 0 14px rgba(99,102,241,0.2);
+}
+.tf-tabs-soft .tf-tab.active .tf-tab-count {
+  background: rgba(129,140,248,0.2); color: var(--accent-2);
+}
+
+/* variant 3 — underline bar tabs (text + animated sliding bar) */
+.tf-tabs-underline {
+  position: relative;
+  display: flex; gap: 4px;
+  border-bottom: 1px solid var(--border);
+  padding: 0 4px;
+}
+.tf-tabs-underline .tf-tab {
+  border-radius: 0;
+  padding: 12px 14px 14px;
+  background: transparent;
+  position: relative;
+  font-size: 13px; font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.tf-tabs-underline .tf-tab::after {
+  content: '';
+  position: absolute; left: 10px; right: 10px; bottom: -1px;
+  height: 2px;
+  background: var(--gradient-accent);
+  border-radius: 2px 2px 0 0;
+  transform: scaleX(0);
+  transform-origin: center;
+  transition: transform 0.25s var(--spring-snappy);
+  box-shadow: 0 0 10px rgba(99,102,241,0.6);
+}
+.tf-tabs-underline .tf-tab:hover { color: var(--text); background: transparent; }
+.tf-tabs-underline .tf-tab.active {
+  color: var(--text); background: transparent;
+  box-shadow: none;
+}
+.tf-tabs-underline .tf-tab.active::after { transform: scaleX(1); }
+.tf-tabs-underline .tf-tab.active .tf-tab-count {
+  background: var(--accent-glow); color: var(--accent-2);
+}
+
+/* =============================================================================
+ * tf-table — card-bordered z hover stripes
+ * ============================================================================= */
+
+.tf-table-wrap {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.tf-table {
+  width: 100%;
+  border-collapse: separate; border-spacing: 0;
+  font-size: 12px;
+}
+.tf-table th, .tf-table td {
+  padding: 12px 14px; text-align: left;
+  vertical-align: middle;
+}
+.tf-table thead th {
+  background: var(--bg-2); color: var(--text-2);
+  font-weight: 700; text-transform: uppercase;
+  font-size: 10px; letter-spacing: 0.08em;
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0;
+}
+.tf-table thead th.sortable { cursor: pointer; user-select: none; }
+.tf-table thead th.sortable:hover { color: var(--text); background: var(--bg-3); }
+.tf-table thead th.sortable::after {
+  content: '↕'; margin-left: 6px; opacity: 0.35; font-size: 10px;
+}
+.tf-table thead th.sorted-asc::after { content: '↑'; opacity: 1; color: var(--accent-2); }
+.tf-table thead th.sorted-desc::after { content: '↓'; opacity: 1; color: var(--accent-2); }
+.tf-table tbody tr { transition: background 0.12s; }
+.tf-table tbody tr:hover { background: var(--bg-card-hover); }
+.tf-table tbody tr + tr td { border-top: 1px solid var(--border); }
+.tf-table tbody tr.selected { background: var(--accent-glow); }
+.tf-table tbody tr.selected td { color: var(--text); }
+.tf-table td.actions { text-align: right; white-space: nowrap; }
+.tf-table td.num { font-family: 'SF Mono', monospace; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* mobile table → card list */
+@media (max-width: 720px) {
+  .tf-table thead { display: none; }
+  .tf-table, .tf-table tbody, .tf-table tr, .tf-table td { display: block; width: 100%; }
+  .tf-table tr {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tf-table tr + tr td { border-top: 0; }
+  .tf-table td {
+    padding: 4px 0;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 12px;
+  }
+  .tf-table td::before {
+    content: attr(data-label);
+    font-size: 10px; font-weight: 700; color: var(--text-3);
+    letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .tf-table td.actions { justify-content: flex-end; margin-top: 4px; }
+  .tf-table td.actions::before { display: none; }
+}
+
+/* status chips inside tables */
+.tf-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 10px; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  white-space: nowrap;
+}
+.tf-chip.ok { background: rgba(34,197,94,0.15); color: #22c55e; }
+.tf-chip.warn { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.tf-chip.err { background: rgba(239,68,68,0.15); color: #ef4444; }
+.tf-chip.info { background: rgba(96,165,250,0.15); color: #60a5fa; }
+.tf-chip.accent { background: var(--accent-glow); color: var(--accent-2); }
+.tf-chip .tf-chip-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+
+/* =============================================================================
+ * tf-dropdown-menu
+ * ============================================================================= */
+
+.tf-menu {
+  position: absolute;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 6px;
+  min-width: 180px;
+  opacity: 0; transform: translateY(-4px) scale(0.97);
+  pointer-events: none;
+  transition: all 0.18s var(--spring-snappy);
+  z-index: 100;
+}
+.tf-menu.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+.tf-menu-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  font-size: 13px; color: var(--text-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.1s;
+}
+.tf-menu-item:hover { background: var(--bg-3); color: var(--text); }
+.tf-menu-item.danger:hover { background: rgba(239,68,68,0.15); color: var(--danger); }
+.tf-menu-divider { height: 1px; background: var(--border); margin: 4px 0; }
+
+/* =============================================================================
+ * tf-window — flagship
+ * ============================================================================= */
+
+.tf-window {
+  position: fixed;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  display: flex; flex-direction: column;
+  min-width: 320px; min-height: 200px;
+  z-index: 1000;
+  animation: tf-window-open 0.32s var(--spring-snappy);
+  will-change: transform, width, height;
+  overflow: hidden;
+}
+@keyframes tf-window-open {
+  from { opacity: 0; transform: scale(0.92) translateY(20px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes tf-window-close {
+  to { opacity: 0; transform: scale(0.95) translateY(8px); }
+}
+.tf-window[data-transparent="true"] {
+  background: rgba(20, 24, 54, 0.55);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  border-color: rgba(255,255,255,0.08);
+}
+
+.tf-window-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  cursor: grab;
+  user-select: none;
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), transparent);
+  flex-shrink: 0;
+}
+.tf-window-header:active { cursor: grabbing; }
+.tf-window[data-transparent="true"] .tf-window-header {
+  border-bottom-color: rgba(255,255,255,0.08);
+}
+
+.tf-window-controls { display: flex; gap: 6px; margin-right: 4px; }
+.tf-window-control {
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  border: 0;
+  cursor: pointer;
+  transition: transform 0.15s, filter 0.15s, box-shadow 0.2s;
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+}
+.tf-window-control:hover { transform: scale(1.18); filter: brightness(1.15); }
+.tf-window-control:active { transform: scale(0.9); }
+.tf-window-control[data-action="close"] { background: #ff5f57; }
+.tf-window-control[data-action="close"]:hover { box-shadow: 0 0 10px rgba(255,95,87,0.6); }
+.tf-window-control[data-action="minimize"] { background: #febc2e; }
+.tf-window-control[data-action="minimize"]:hover { box-shadow: 0 0 10px rgba(254,188,46,0.6); }
+.tf-window-control[data-action="maximize"] { background: #28c840; }
+.tf-window-control[data-action="maximize"]:hover { box-shadow: 0 0 10px rgba(40,200,64,0.6); }
+.tf-window-control[data-action="collapse"] { background: var(--accent-1); }
+.tf-window-control[data-action="collapse"]:hover { box-shadow: 0 0 10px rgba(99,102,241,0.8); }
+.tf-window-control svg {
+  width: 9px; height: 9px;
+  color: rgba(0,0,0,0.6);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.tf-window-controls:hover .tf-window-control svg { opacity: 1; }
+
+.tf-window-title {
+  flex: 1;
+  font-size: 13px; font-weight: 700; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: center; gap: 8px;
+}
+.tf-window-title .tf-window-icon { width: 16px; height: 16px; color: var(--accent-2); }
+
+.tf-window-actions { display: flex; gap: 4px; }
+
+.tf-window-body {
+  flex: 1;
+  padding: 18px 20px;
+  overflow: auto;
+  display: flex; flex-direction: column; gap: 14px;
+}
+
+.tf-window-footer {
+  padding: 12px 16px;
+  background: var(--bg-2);
+  border-top: 1px solid var(--border);
+  display: flex; gap: 8px; justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.tf-window.collapsed .tf-window-body,
+.tf-window.collapsed .tf-window-footer { display: none; }
+.tf-window.collapsed { height: auto !important; min-height: auto; }
+
+.tf-window.maximized {
+  top: 12px !important; left: 12px !important;
+  width: calc(100vw - 24px) !important; height: calc(100vh - 24px) !important;
+  border-radius: var(--radius);
+}
+
+/* NICE resize handle — triangular dot pattern, soft and elegant */
+.tf-window-resize-handle {
+  position: absolute;
+  bottom: 4px; right: 4px;
+  width: 16px; height: 16px;
+  cursor: nwse-resize;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+  -webkit-mask: linear-gradient(135deg, transparent 0 48%, #000 48%);
+          mask: linear-gradient(135deg, transparent 0 48%, #000 48%);
+}
+.tf-window-resize-handle::before {
+  content: '';
+  position: absolute; inset: 0;
+  background-image: radial-gradient(circle, var(--text-2) 1.1px, transparent 1.6px);
+  background-size: 4px 4px;
+  background-position: right bottom;
+}
+.tf-window-resize-handle:hover {
+  opacity: 1;
+}
+.tf-window-resize-handle:hover::before {
+  background-image: radial-gradient(circle, var(--accent-2) 1.3px, transparent 1.8px);
+  filter: drop-shadow(0 0 4px rgba(129,140,248,0.6));
+}
+.tf-window.maximized .tf-window-resize-handle,
+.tf-window:not([data-resizable]) .tf-window-resize-handle { display: none; }
+
+/* =============================================================================
+ * Minimized window — elegant dock pill with status dot + hover hint
+ * ============================================================================= */
+.tf-window.minimized {
+  position: fixed; bottom: 16px; left: 16px;
+  width: auto !important;
+  height: 44px !important;
+  min-height: 44px; min-width: 0;
+  max-width: 280px;
+  cursor: pointer;
+  border-radius: 999px;
+  padding: 0 14px 0 8px;
+  box-shadow: 0 10px 32px rgba(0,0,0,0.55), 0 0 20px rgba(99,102,241,0.18);
+  background: linear-gradient(135deg, var(--bg-card) 0%, var(--bg-3) 100%);
+  border-color: var(--border-hover);
+  overflow: hidden;
+  animation: tf-win-minimize-in 0.35s var(--spring-snappy);
+}
+@keyframes tf-win-minimize-in {
+  from { transform: scale(0.85) translateY(40px); opacity: 0; }
+  to { transform: scale(1) translateY(0); opacity: 1; }
+}
+.tf-window.minimized::before {
+  content: '';
+  position: absolute; left: -20%; top: -50%;
+  width: 140%; height: 200%;
+  background: radial-gradient(circle at 30% 50%, rgba(99,102,241,0.18), transparent 60%);
+  pointer-events: none;
+  animation: tf-min-pulse 3s ease-in-out infinite;
+}
+@keyframes tf-min-pulse {
+  0%,100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+.tf-window.minimized .tf-window-header {
+  padding: 0; border: 0; gap: 10px; background: transparent;
+  height: 100%;
+  cursor: pointer;
+}
+.tf-window.minimized .tf-window-controls {
+  display: flex; gap: 4px; margin-right: 2px;
+}
+.tf-window.minimized .tf-window-control {
+  width: 10px; height: 10px;
+}
+.tf-window.minimized .tf-window-control[data-action="maximize"],
+.tf-window.minimized .tf-window-control[data-action="collapse"] { display: none; }
+.tf-window.minimized .tf-window-title {
+  font-size: 12px;
+  gap: 8px;
+  position: relative; z-index: 1;
+}
+.tf-window.minimized .tf-window-title .tf-window-icon { width: 14px; height: 14px; }
+.tf-window.minimized .tf-window-actions,
+.tf-window.minimized .tf-window-body,
+.tf-window.minimized .tf-window-footer,
+.tf-window.minimized .tf-window-resize-handle { display: none; }
+
+/* hover on minimized — gentle lift with glow */
+.tf-window.minimized:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 40px rgba(0,0,0,0.6), 0 0 28px rgba(99,102,241,0.35);
+  border-color: var(--accent-1);
+  transition: transform 0.2s var(--spring-smooth), box-shadow 0.2s ease, border-color 0.2s;
+}
+
+.tf-window-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(5,8,24,0.6);
+  backdrop-filter: blur(8px);
+  z-index: 999;
+  animation: tf-backdrop-in 0.2s ease-out;
+}
+@keyframes tf-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* =============================================================================
+ * Form helpers
+ * ============================================================================= */
+.form-row { display: flex; flex-direction: column; gap: 6px; }
+.form-row .label {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--text-2);
+}
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 600px) {
+  .form-grid { grid-template-columns: 1fr; }
+  .tf-window { width: 95vw !important; left: 2.5vw !important; max-width: 95vw; }
+}
+
+@media (hover: none) {
+  .tf-btn:hover, .tf-window-control:hover, .tf-tab:hover, .tf-menu-item:hover {
+    transform: none !important;
+  }
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><line x1="21" y1="21" x2="16.65" y2="16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></symbol>
+    <symbol id="i-min" viewBox="0 0 24 24"><line x1="6" y1="12" x2="18" y2="12" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></symbol>
+    <symbol id="i-max" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></symbol>
+    <symbol id="i-collapse" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M19.4 15a1.65 1.65 0 0 0 .3 1.8l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.8-.3 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.8.3l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .3-1.8 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.3-1.8l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.8.3h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.8-.3l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.3 1.8v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="6" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="18" cy="19" r="3" fill="none" stroke="currentColor" stroke-width="2"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49" stroke="currentColor" stroke-width="2"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49" stroke="currentColor" stroke-width="2"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6" fill="none" stroke="currentColor" stroke-width="2"/><path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="3"/><line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="3"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  </defs>
+</svg>
+
+<div class="shell">
+
+  <div class="intro">
+    <h1>TentaFlow Control System</h1>
+    <p class="sub">Spójny zestaw kontrolek dla całej aplikacji. Design tokens w <code>:root</code>, spring animacje, real focus glow, dotykowo-przyjazne. Kliknij wszystko żeby zobaczyć stany.</p>
+  </div>
+
+  <!-- ========================================================================
+       TF-WINDOW
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-window</h2>
+      <span class="desc">Uniwersalne okno: close / min / max / collapse · drag · resize · opcjonalnie transparent. Minimized = elegant dock pill.</span>
+    </div>
+
+    <div class="btn-row" style="margin-bottom: 24px;">
+      <button class="tf-btn tf-btn-primary" onclick="openWin('w-edit')"><svg width="14" height="14"><use href="#i-edit"/></svg>Otwórz: Edytuj alias</button>
+      <button class="tf-btn tf-btn-secondary" onclick="openWin('w-deploy')"><svg width="14" height="14"><use href="#i-share"/></svg>Deploy progress (transparent)</button>
+      <button class="tf-btn tf-btn-secondary" onclick="openWin('w-confirm')"><svg width="14" height="14"><use href="#i-trash"/></svg>Confirm dialog</button>
+      <button class="tf-btn tf-btn-ghost" onclick="resetWindows()">Reset positions</button>
+    </div>
+
+    <!-- Window 1: Edit alias (full features) -->
+    <div class="tf-window" id="w-edit" data-resizable data-draggable
+         style="top: 100px; left: 60px; width: 480px; height: 480px; display:none;">
+      <div class="tf-window-header" data-drag-handle>
+        <div class="tf-window-controls">
+          <button class="tf-window-control" data-action="close" onclick="closeWin('w-edit')" title="Zamknij"><svg><use href="#i-x"/></svg></button>
+          <button class="tf-window-control" data-action="minimize" onclick="minWin('w-edit')" title="Minimalizuj"><svg><use href="#i-min"/></svg></button>
+          <button class="tf-window-control" data-action="maximize" onclick="maxWin('w-edit')" title="Maksymalizuj"><svg><use href="#i-max"/></svg></button>
+          <button class="tf-window-control" data-action="collapse" onclick="collapseWin('w-edit')" title="Zwiń"><svg><use href="#i-collapse"/></svg></button>
+        </div>
+        <div class="tf-window-title">
+          <svg class="tf-window-icon"><use href="#i-edit"/></svg>
+          Edytuj alias: rag-embeddings
+        </div>
+        <div class="tf-window-actions">
+          <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" title="Ustawienia"><svg width="14" height="14"><use href="#i-settings"/></svg></button>
+        </div>
+      </div>
+      <div class="tf-window-body">
+        <div class="form-row">
+          <span class="label">Alias</span>
+          <input class="tf-input" value="rag-embeddings">
+        </div>
+        <div class="form-row">
+          <span class="label">Primary target</span>
+          <input class="tf-input" value="embeddings-gemma">
+        </div>
+        <div class="form-grid">
+          <div class="form-row">
+            <span class="label">Strategia</span>
+            <div class="tf-select-wrap">
+              <select class="tf-select">
+                <option>FirstAvailable</option>
+                <option>RoundRobin</option>
+                <option>LeastLoaded</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <span class="label">Aktywny</span>
+            <div style="padding-top: 10px;">
+              <div class="tf-toggle on" onclick="this.classList.toggle('on')"></div>
+            </div>
+          </div>
+        </div>
+        <div class="form-row">
+          <span class="label">Fallback chain</span>
+          <input class="tf-input" placeholder="llm-big, llm-chat (przez przecinek)">
+          <span style="font-size:11px;color:var(--text-3);">Lista rozdzielona przecinkami, priorytet od lewej</span>
+        </div>
+      </div>
+      <div class="tf-window-footer">
+        <button class="tf-btn tf-btn-ghost" onclick="closeWin('w-edit')">Anuluj</button>
+        <button class="tf-btn tf-btn-primary"><svg width="14" height="14"><use href="#i-check"/></svg>Zapisz</button>
+      </div>
+      <div class="tf-window-resize-handle" data-resize-handle></div>
+    </div>
+
+    <!-- Window 2: Deploy progress (transparent) -->
+    <div class="tf-window" id="w-deploy" data-transparent="true" data-draggable data-resizable
+         style="top: 140px; left: 580px; width: 420px; height: 360px; display:none;">
+      <div class="tf-window-header" data-drag-handle>
+        <div class="tf-window-controls">
+          <button class="tf-window-control" data-action="close" onclick="closeWin('w-deploy')"><svg><use href="#i-x"/></svg></button>
+          <button class="tf-window-control" data-action="minimize" onclick="minWin('w-deploy')"><svg><use href="#i-min"/></svg></button>
+        </div>
+        <div class="tf-window-title">
+          <svg class="tf-window-icon" style="color: var(--success);"><use href="#i-share"/></svg>
+          Deploy: vllm/qwen3.5-0.8b
+        </div>
+      </div>
+      <div class="tf-window-body" style="font-family: 'SF Mono', monospace; font-size: 11px; gap: 4px;">
+        <div style="color: var(--text-3);">[14:22:01] Pulling image vllm/vllm-openai:latest...</div>
+        <div style="color: var(--text-3);">[14:22:18] Layer 1/12 pulled (256 MB)</div>
+        <div style="color: var(--text-3);">[14:22:34] Layer 5/12 pulled (1.2 GB)</div>
+        <div style="color: var(--text-2);">[14:22:48] Image pulled successfully</div>
+        <div style="color: var(--accent-2);">[14:22:50] Starting container...</div>
+        <div style="color: var(--success);">[14:22:55] ✓ Container started on port 8000</div>
+        <div style="color: var(--accent-2);">[14:22:56] Waiting for health check...</div>
+        <div style="color: var(--warning);">[14:22:58] ⏳ Loading model weights (Qwen3.5-0.8B)...</div>
+      </div>
+      <div class="tf-window-resize-handle" data-resize-handle></div>
+    </div>
+
+    <!-- Window 3: Confirm -->
+    <div class="tf-window" id="w-confirm"
+         style="top: 200px; left: 320px; width: 420px; height: auto; display:none;">
+      <div class="tf-window-header" data-drag-handle>
+        <div class="tf-window-controls">
+          <button class="tf-window-control" data-action="close" onclick="closeWin('w-confirm')"><svg><use href="#i-x"/></svg></button>
+        </div>
+        <div class="tf-window-title">
+          <svg class="tf-window-icon" style="color: var(--danger);"><use href="#i-trash"/></svg>
+          Potwierdź usunięcie
+        </div>
+      </div>
+      <div class="tf-window-body">
+        <p style="color: var(--text-2); font-size: 13px;">Czy na pewno chcesz usunąć alias <strong style="color: var(--text);">rag-embeddings</strong>?</p>
+        <p style="color: var(--text-3); font-size: 12px;">Klienci używający tej nazwy zaczną otrzymywać błąd 404 dopóki nie utworzysz nowego aliasa o tej samej nazwie.</p>
+      </div>
+      <div class="tf-window-footer">
+        <button class="tf-btn tf-btn-ghost" onclick="closeWin('w-confirm')">Anuluj</button>
+        <button class="tf-btn tf-btn-danger-solid" onclick="closeWin('w-confirm')"><svg width="14" height="14"><use href="#i-trash"/></svg>Usuń alias</button>
+      </div>
+    </div>
+
+    <div class="demo-card wide">
+      <div class="label">API (Web Component)</div>
+      <pre class="api">&lt;tf-window
+  title="Edytuj alias"
+  buttons="close,minimize,maximize,collapse"
+  draggable resizable
+  transparent="false"
+  initial-x="center" initial-y="center"
+  min-width="400" min-height="300"&gt;
+  &lt;tf-input slot="body" label="Alias" value="rag-embeddings"&gt;&lt;/tf-input&gt;
+  &lt;tf-button slot="footer" variant="ghost" data-action="cancel"&gt;Anuluj&lt;/tf-button&gt;
+  &lt;tf-button slot="footer" variant="primary" data-action="save"&gt;Zapisz&lt;/tf-button&gt;
+&lt;/tf-window&gt;</pre>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-BUTTON
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-button</h2>
+      <span class="desc">primary (gradient) / secondary / ghost / danger / success · sm/md · icon-only · disabled</span>
+    </div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <div class="label">Variants</div>
+        <div class="btn-row">
+          <button class="tf-btn tf-btn-primary">Primary</button>
+          <button class="tf-btn tf-btn-secondary">Secondary</button>
+          <button class="tf-btn tf-btn-ghost">Ghost</button>
+          <button class="tf-btn tf-btn-danger">Danger</button>
+          <button class="tf-btn tf-btn-danger-solid">Danger solid</button>
+          <button class="tf-btn tf-btn-success">Success</button>
+        </div>
+        <div class="btn-row">
+          <button class="tf-btn tf-btn-primary tf-btn-sm">Primary sm</button>
+          <button class="tf-btn tf-btn-secondary tf-btn-sm">Sec sm</button>
+          <button class="tf-btn tf-btn-primary" disabled>Disabled</button>
+        </div>
+        <div class="btn-row">
+          <button class="tf-btn tf-btn-primary tf-btn-icon"><svg width="16" height="16"><use href="#i-plus"/></svg></button>
+          <button class="tf-btn tf-btn-secondary tf-btn-icon"><svg width="16" height="16"><use href="#i-edit"/></svg></button>
+          <button class="tf-btn tf-btn-danger tf-btn-icon"><svg width="16" height="16"><use href="#i-trash"/></svg></button>
+          <button class="tf-btn tf-btn-ghost tf-btn-icon"><svg width="16" height="16"><use href="#i-settings"/></svg></button>
+        </div>
+        <div class="btn-row">
+          <button class="tf-btn tf-btn-primary"><svg width="14" height="14"><use href="#i-plus"/></svg>Nowy serwis</button>
+          <button class="tf-btn tf-btn-secondary"><svg width="14" height="14"><use href="#i-share"/></svg>Aliasy</button>
+          <button class="tf-btn tf-btn-success"><svg width="14" height="14"><use href="#i-check"/></svg>Zatwierdź</button>
+        </div>
+        <div class="api">&lt;tf-button variant="primary" size="md" icon="plus"&gt;Nowy&lt;/tf-button&gt;</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-INPUT
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-input</h2>
+      <span class="desc">Default / focused (real glow halo) / error / hint / leading icon — kliknij input żeby zobaczyć glow</span>
+    </div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <div class="label">States</div>
+        <div class="tf-input-group">
+          <span class="tf-label">Email</span>
+          <input class="tf-input" placeholder="ty@firma.com">
+        </div>
+        <div class="tf-input-group">
+          <span class="tf-label">Z hint'em</span>
+          <input class="tf-input" value="rag-embeddings">
+          <span class="tf-hint">Nazwa rozpoznawana przez routing layer</span>
+        </div>
+        <div class="tf-input-group">
+          <span class="tf-label">Błąd walidacji</span>
+          <input class="tf-input tf-input-error" value="--invalid--">
+          <span class="tf-error-text">Nazwa może zawierać tylko a-z, 0-9, myślniki</span>
+        </div>
+        <div class="tf-input-group">
+          <span class="tf-label">Disabled</span>
+          <input class="tf-input" value="immutable" disabled>
+        </div>
+        <div class="tf-input-group">
+          <span class="tf-label">Z ikoną</span>
+          <div class="tf-input-wrap">
+            <input class="tf-input" placeholder="Wyszukaj...">
+            <svg class="tf-input-icon"><use href="#i-search"/></svg>
+          </div>
+        </div>
+        <div class="api">&lt;tf-input label="Email" placeholder="ty@firma.com" hint="..." error="..."&gt;&lt;/tf-input&gt;</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-SEARCHBOX
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-searchbox</h2>
+      <span class="desc">Search input z lupką + clear button + real focus glow halo</span>
+    </div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <div class="label">Empty</div>
+        <label class="tf-searchbox">
+          <svg class="tf-searchbox-icon"><use href="#i-search"/></svg>
+          <input type="search" placeholder="Szukaj kontenerów NIM...">
+          <button class="tf-searchbox-clear" type="button">×</button>
+        </label>
+        <div class="api">&lt;tf-searchbox placeholder="..." debounce="200"&gt;&lt;/tf-searchbox&gt;</div>
+      </div>
+      <div class="demo-card">
+        <div class="label">With value (clear visible)</div>
+        <label class="tf-searchbox has-value">
+          <svg class="tf-searchbox-icon"><use href="#i-search"/></svg>
+          <input type="search" value="qwen3.5">
+          <button class="tf-searchbox-clear" type="button">×</button>
+        </label>
+        <span style="font-size:11px;color:var(--text-3);">Klik × albo ESC = clear</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-SELECT
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-select</h2>
+      <span class="desc">Native select + custom chevron + focus glow · dark theme</span>
+    </div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <div class="label">Default</div>
+        <div class="tf-select-wrap">
+          <select class="tf-select">
+            <option>FirstAvailable</option>
+            <option>RoundRobin — round-robin między targetami</option>
+            <option>LeastLoaded — wybierz najmniej obciążony</option>
+          </select>
+        </div>
+        <div class="tf-select-wrap">
+          <select class="tf-select" disabled><option>Disabled select</option></select>
+        </div>
+        <div class="api">&lt;tf-select&gt;<br>  &lt;option value="fa"&gt;FirstAvailable&lt;/option&gt;<br>&lt;/tf-select&gt;</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-TOGGLE
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-toggle</h2>
+      <span class="desc">Switch on/off · spring animacja · gradient + glow gdy on · klik żeby przełączyć</span>
+    </div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <div class="label">States</div>
+        <div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap;">
+          <label style="display:flex;gap:10px;align-items:center;cursor:pointer;">
+            <div class="tf-toggle on" onclick="this.classList.toggle('on')"></div>
+            <span>Aktywny</span>
+          </label>
+          <label style="display:flex;gap:10px;align-items:center;cursor:pointer;">
+            <div class="tf-toggle" onclick="this.classList.toggle('on')"></div>
+            <span>Wyłączony</span>
+          </label>
+        </div>
+        <div class="api">&lt;tf-toggle checked&gt;&lt;/tf-toggle&gt;</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-TABS
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-tabs</h2>
+      <span class="desc">3 warianty: solid (gradient pill) · soft (translucent accent) · underline (animowany bar)</span>
+    </div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <div class="label">Variant: solid pill (gradient active)</div>
+        <div class="tf-tabs" data-tabset>
+          <button class="tf-tab active" data-tab>Lista <span class="tf-tab-count">24</span></button>
+          <button class="tf-tab" data-tab>Aliasy <span class="tf-tab-count">7</span></button>
+          <button class="tf-tab" data-tab>Modele <span class="tf-tab-count">12</span></button>
+          <button class="tf-tab" data-tab>NIM <span class="tf-tab-count">3</span></button>
+        </div>
+        <div class="api">&lt;tf-tabs variant="solid"&gt;...&lt;/tf-tabs&gt;</div>
+      </div>
+
+      <div class="demo-card">
+        <div class="label">Variant: soft (translucent accent — wireframe style)</div>
+        <div class="tf-tabs tf-tabs-soft" data-tabset>
+          <button class="tf-tab active" data-tab><svg width="12" height="12"><use href="#i-share"/></svg>Lista</button>
+          <button class="tf-tab" data-tab><svg width="12" height="12"><use href="#i-edit"/></svg>Aliasy</button>
+          <button class="tf-tab" data-tab><svg width="12" height="12"><use href="#i-settings"/></svg>Modele</button>
+        </div>
+        <div class="api">&lt;tf-tabs variant="soft"&gt;...&lt;/tf-tabs&gt;</div>
+      </div>
+
+      <div class="demo-card wide">
+        <div class="label">Variant: underline (animated bar)</div>
+        <div class="tf-tabs-underline" data-tabset>
+          <button class="tf-tab active" data-tab>Overview <span class="tf-tab-count">—</span></button>
+          <button class="tf-tab" data-tab>Nody <span class="tf-tab-count">12</span></button>
+          <button class="tf-tab" data-tab>Serwisy <span class="tf-tab-count">34</span></button>
+          <button class="tf-tab" data-tab>Aliasy <span class="tf-tab-count">7</span></button>
+          <button class="tf-tab" data-tab>Diagram</button>
+          <button class="tf-tab" data-tab>Logi</button>
+          <button class="tf-tab" data-tab>Settings</button>
+        </div>
+        <div class="api">&lt;tf-tabs variant="underline"&gt;...&lt;/tf-tabs&gt;</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-TABLE
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-table</h2>
+      <span class="desc">Sortable · selectable rows · status chips · mobile → card list (pod 720px)</span>
+    </div>
+    <div class="demo-card wide">
+      <div class="label">Services table</div>
+      <div class="tf-table-wrap">
+        <table class="tf-table">
+          <thead>
+            <tr>
+              <th class="sortable sorted-asc">Nazwa</th>
+              <th class="sortable">Engine</th>
+              <th class="sortable">Node</th>
+              <th class="sortable">Status</th>
+              <th class="num sortable">RPM</th>
+              <th class="num sortable">Latency</th>
+              <th class="actions">Akcje</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td data-label="Nazwa"><strong>llm-big</strong></td>
+              <td data-label="Engine">vLLM · Qwen 3.5 0.8B</td>
+              <td data-label="Node">node-alpha</td>
+              <td data-label="Status"><span class="tf-chip ok"><span class="tf-chip-dot"></span>Healthy</span></td>
+              <td class="num" data-label="RPM">128</td>
+              <td class="num" data-label="Latency">42 ms</td>
+              <td class="actions" data-label="Akcje">
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-edit"/></svg></button>
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-settings"/></svg></button>
+              </td>
+            </tr>
+            <tr class="selected">
+              <td data-label="Nazwa"><strong>rag-embeddings</strong></td>
+              <td data-label="Engine">sherpa-onnx · bge-large</td>
+              <td data-label="Node">node-beta</td>
+              <td data-label="Status"><span class="tf-chip warn"><span class="tf-chip-dot"></span>Degraded</span></td>
+              <td class="num" data-label="RPM">54</td>
+              <td class="num" data-label="Latency">118 ms</td>
+              <td class="actions" data-label="Akcje">
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-edit"/></svg></button>
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-settings"/></svg></button>
+              </td>
+            </tr>
+            <tr>
+              <td data-label="Nazwa"><strong>tts-voxcpm</strong></td>
+              <td data-label="Engine">voxcpm · 8B</td>
+              <td data-label="Node">node-gpu-01</td>
+              <td data-label="Status"><span class="tf-chip err"><span class="tf-chip-dot"></span>Down</span></td>
+              <td class="num" data-label="RPM">0</td>
+              <td class="num" data-label="Latency">—</td>
+              <td class="actions" data-label="Akcje">
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-edit"/></svg></button>
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-settings"/></svg></button>
+              </td>
+            </tr>
+            <tr>
+              <td data-label="Nazwa"><strong>stt-whisper</strong></td>
+              <td data-label="Engine">whisper · large-v3</td>
+              <td data-label="Node">node-alpha</td>
+              <td data-label="Status"><span class="tf-chip info"><span class="tf-chip-dot"></span>Starting</span></td>
+              <td class="num" data-label="RPM">—</td>
+              <td class="num" data-label="Latency">—</td>
+              <td class="actions" data-label="Akcje">
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-edit"/></svg></button>
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-settings"/></svg></button>
+              </td>
+            </tr>
+            <tr>
+              <td data-label="Nazwa"><strong>img-sdxl</strong></td>
+              <td data-label="Engine">ComfyUI · SDXL</td>
+              <td data-label="Node">node-gpu-01</td>
+              <td data-label="Status"><span class="tf-chip accent"><span class="tf-chip-dot"></span>Idle</span></td>
+              <td class="num" data-label="RPM">3</td>
+              <td class="num" data-label="Latency">1.2 s</td>
+              <td class="actions" data-label="Akcje">
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-edit"/></svg></button>
+                <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg width="14" height="14"><use href="#i-settings"/></svg></button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="api">&lt;tf-table sortable selectable&gt;<br>  &lt;tf-column key="name" label="Nazwa" sortable&gt;&lt;/tf-column&gt;<br>  &lt;tf-column key="status" label="Status" renderer="chip"&gt;&lt;/tf-column&gt;<br>&lt;/tf-table&gt;</div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-CHIP
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-chip</h2>
+      <span class="desc">Status pills z pulsującą kropką · ok / warn / err / info / accent</span>
+    </div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <div class="label">Warianty</div>
+        <div class="btn-row">
+          <span class="tf-chip ok"><span class="tf-chip-dot"></span>Healthy</span>
+          <span class="tf-chip warn"><span class="tf-chip-dot"></span>Degraded</span>
+          <span class="tf-chip err"><span class="tf-chip-dot"></span>Down</span>
+          <span class="tf-chip info"><span class="tf-chip-dot"></span>Starting</span>
+          <span class="tf-chip accent"><span class="tf-chip-dot"></span>Idle</span>
+        </div>
+        <div class="api">&lt;tf-chip status="ok"&gt;Healthy&lt;/tf-chip&gt;</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       TF-DROPDOWN-MENU
+       ======================================================================== -->
+  <div class="section">
+    <div class="section-head">
+      <h2>tf-dropdown-menu</h2>
+      <span class="desc">Context menu · scale + fade animation · click-outside zamyka</span>
+    </div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <div class="label">Demo</div>
+        <div style="position:relative;display:inline-block;">
+          <button class="tf-btn tf-btn-secondary" onclick="document.getElementById('menu1').classList.toggle('open')">Otwórz menu ▾</button>
+          <div class="tf-menu" id="menu1" style="top: 100%; left: 0; margin-top: 6px;">
+            <div class="tf-menu-item"><svg width="14" height="14"><use href="#i-edit"/></svg>Edytuj</div>
+            <div class="tf-menu-item"><svg width="14" height="14"><use href="#i-share"/></svg>Skopiuj link</div>
+            <div class="tf-menu-item"><svg width="14" height="14"><use href="#i-settings"/></svg>Ustawienia</div>
+            <div class="tf-menu-divider"></div>
+            <div class="tf-menu-item danger"><svg width="14" height="14"><use href="#i-trash"/></svg>Usuń</div>
+          </div>
+        </div>
+        <div class="api">&lt;tf-dropdown-menu trigger="click" placement="bottom-start"&gt;<br>  &lt;tf-menu-item action="edit"&gt;Edytuj&lt;/tf-menu-item&gt;<br>&lt;/tf-dropdown-menu&gt;</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ===== Demo only =====
+
+function openWin(id) {
+  const w = document.getElementById(id);
+  w.style.display = 'flex';
+  w.classList.remove('collapsed', 'minimized');
+  w.style.animation = 'none';
+  void w.offsetWidth;
+  w.style.animation = 'tf-window-open 0.32s var(--spring-snappy)';
+  bringToFront(w);
+}
+function closeWin(id) {
+  const w = document.getElementById(id);
+  w.style.animation = 'tf-window-close 0.2s ease-in forwards';
+  setTimeout(() => { w.style.display = 'none'; w.style.animation = ''; }, 200);
+}
+function minWin(id) {
+  const w = document.getElementById(id);
+  w.classList.toggle('minimized');
+  w.classList.remove('collapsed');
+}
+function maxWin(id) {
+  const w = document.getElementById(id);
+  w.classList.toggle('maximized');
+  w.classList.remove('collapsed','minimized');
+}
+function collapseWin(id) {
+  const w = document.getElementById(id);
+  w.classList.toggle('collapsed');
+}
+function resetWindows() {
+  ['w-edit','w-deploy','w-confirm'].forEach(id => {
+    const w = document.getElementById(id);
+    w.style.display = 'none';
+    w.classList.remove('collapsed','maximized','minimized');
+    w.style.transform = '';
+  });
+}
+let z = 1000;
+function bringToFront(w) { z += 1; w.style.zIndex = z; }
+
+// Drag
+document.querySelectorAll('.tf-window[data-draggable]').forEach(win => {
+  const handle = win.querySelector('[data-drag-handle]');
+  if (!handle) return;
+  let dx=0,dy=0,ox=0,oy=0,dragging=false;
+  handle.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.tf-window-control, .tf-btn')) return;
+    if (win.classList.contains('maximized') || win.classList.contains('minimized')) return;
+    dragging = true; bringToFront(win);
+    const r = win.getBoundingClientRect();
+    ox = r.left; oy = r.top; dx = e.clientX; dy = e.clientY;
+    handle.setPointerCapture(e.pointerId);
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    win.style.left = (ox + e.clientX - dx) + 'px';
+    win.style.top = (oy + e.clientY - dy) + 'px';
+  });
+  handle.addEventListener('pointerup', () => { dragging = false; });
+});
+
+// Resize
+document.querySelectorAll('.tf-window[data-resizable]').forEach(win => {
+  const handle = win.querySelector('[data-resize-handle]');
+  if (!handle) return;
+  let sx=0,sy=0,sw=0,sh=0,resizing=false;
+  handle.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+    resizing = true;
+    sx = e.clientX; sy = e.clientY;
+    sw = win.offsetWidth; sh = win.offsetHeight;
+    handle.setPointerCapture(e.pointerId);
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (!resizing) return;
+    win.style.width = Math.max(320, sw + e.clientX - sx) + 'px';
+    win.style.height = Math.max(200, sh + e.clientY - sy) + 'px';
+  });
+  handle.addEventListener('pointerup', () => { resizing = false; });
+});
+
+// Click minimized window → restore
+document.querySelectorAll('.tf-window').forEach(win => {
+  win.addEventListener('click', (e) => {
+    if (!win.classList.contains('minimized')) return;
+    if (e.target.closest('.tf-window-control')) return;
+    win.classList.remove('minimized');
+  });
+});
+
+// Searchbox clear
+document.querySelectorAll('.tf-searchbox').forEach(sb => {
+  const input = sb.querySelector('input');
+  const clear = sb.querySelector('.tf-searchbox-clear');
+  if (!input || !clear) return;
+  const sync = () => sb.classList.toggle('has-value', input.value.length > 0);
+  input.addEventListener('input', sync);
+  clear.addEventListener('click', () => { input.value=''; input.focus(); sync(); });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') { input.value=''; input.focus(); sync(); } });
+});
+
+// Tabs click
+document.querySelectorAll('[data-tabset]').forEach(set => {
+  set.querySelectorAll('[data-tab]').forEach(tab => {
+    tab.addEventListener('click', () => {
+      set.querySelectorAll('[data-tab]').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+    });
+  });
+});
+
+// Table rows selection
+document.querySelectorAll('.tf-table tbody tr').forEach(tr => {
+  tr.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    tr.classList.toggle('selected');
+  });
+});
+
+// Click-outside menu
+document.addEventListener('click', (e) => {
+  document.querySelectorAll('.tf-menu.open').forEach(m => {
+    if (!m.contains(e.target) && !e.target.closest('button')) m.classList.remove('open');
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>CRM — Deal detail (C3)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/><rect x="10" y="4" width="4" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></symbol>
+<symbol id="i-phone" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-warning" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/></symbol>
+<symbol id="i-fire" viewBox="0 0 24 24"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 17c1.7 0 3-1.3 3-3 0-1.4-.7-2.1-1.5-3-1.6-1.6-3-3-3-5 0-2.8 2.2-5 5-5 .5 6 5 8 5 12a8 8 0 1 1-16 0c0-2.2 1.1-4.2 2.7-5.5"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18L4.92 10l5.17 1.82L12 17l1.91-5.18L19.08 10l-5.17-1.82L12 3z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20l3-2 3 2 3-2 3 2 3-2 1 2V2l-3 2-3-2-3 2-3-2-3 2-1-2z"/><path d="M16 8H8"/><path d="M16 12H8"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-arrow-right" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9 14a2 2 0 0 0 2 2h2a2 2 0 0 0 0-4h-2a2 2 0 0 1 0-4h2a2 2 0 0 1 2 2"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 13.5"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>CRM — Deal detail (C3)</h1>
+  <p class="lead">
+    Najważniejszy widok roboczy. Layout 3-kolumnowy: <strong>lewa kolumna</strong> = fakty + inline edit, <strong>środek</strong> = unified timeline (maile + spotkania + notatki + akcje + zmiany), <strong>prawa kolumna</strong> = sekcje wpinane przez inne addony (Contacts, Activity, Documents, Billing) jako contributions.
+    Każda sekcja contributions ma tag <code>contrib-tag</code> wskazujący addon-providera — to wzorzec, którego trzymamy się w całym TentaFlow.
+  </p>
+  <div class="rules">
+    <div class="rule"><h3>Inline edit wszędzie</h3><p>Kliknięcie w wartość, stage, commit, ownera, datę — edycja bez przechodzenia w tryb. Microinteraction pokazuje konsekwencję (np. zmiana stage → diff na forecast).</p></div>
+    <div class="rule"><h3>Unified timeline</h3><p>Jeden strumień zdarzeń ze wszystkich addonów. Każda pozycja ma <code>contrib-tag</code>. Brak osobnych zakładek „Maile / Spotkania / Notatki”.</p></div>
+    <div class="rule"><h3>AI sticky</h3><p>Prawa kolumna góra: AI insights („3 obiekcje z ostatniego spotkania”, „klient otwierał ofertę 4× wczoraj”). Jedno kliknięcie → akcja z confirm dialogiem.</p></div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">C3</span>
+    <h2>Deal detail — Volkswagen Poznań · Wdrożenie ERP fleet</h2>
+    <div class="desc">Faza: Oferta · wartość 480 000 PLN · commit: tak · close 30.06.2026 · owner: Anna Kowalska.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="tf-shell">
+
+      <!-- SIDEBAR -->
+      <aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-deal"/></svg>CRM<span class="badge danger">7</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av indigo">AK</div><div><div class="nm">Anna Kowalska</div><div class="rl">Handlowiec · Wschód</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+
+      <!-- MAIN -->
+      <main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>CRM</strong><span class="sep">›</span><span>Deal: VW Poznań · ERP fleet</span></div>
+  <div class="pill-tabs">
+    <button class="pill-tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-inbox"/></svg>Inbox</button>
+    <button class="pill-tab active"><svg class="icon"><use href="#i-pipeline"/></svg>Pipeline</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-trend"/></svg>Forecast</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-shield-check"/></svg>Akceptacje</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy</button>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+
+        <div class="breadcrumb">
+          <span class="crumb">Deale</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Pipeline · Wschód</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">VW Poznań · ERP fleet</span>
+        </div>
+
+        <!-- HEADER -->
+        <div class="section-card" style="padding:18px;margin-bottom:14px;">
+          <div class="flex align-center gap-md">
+            <div class="av xl company">VW</div>
+            <div style="flex:1;min-width:0;">
+              <div class="flex align-center gap-sm" style="margin-bottom:4px;">
+                <div style="font-size:20px;font-weight:800;">Volkswagen Poznań — Wdrożenie ERP fleet</div>
+                <span class="stage offer"><span></span>Oferta</span>
+                <span class="chip accent"><span class="dot"></span>Commit</span>
+                <button class="btn btn-ghost btn-sm" title="Edytuj"><svg class="icon"><use href="#i-edit"/></svg></button>
+              </div>
+              <div class="text-sm text-3 flex align-center gap-md">
+                <span><svg class="icon icon-sm"><use href="#i-building"/></svg>Volkswagen Poznań sp. z o.o.</span>
+                <span>·</span>
+                <span class="mono">DEAL-2026-0184</span>
+                <span>·</span>
+                <span>utworzony 22.04 przez Annę Kowalską</span>
+              </div>
+            </div>
+            <div style="text-align:right;">
+              <div class="num fw-800" style="font-size:24px;">480 000 <span class="text-3" style="font-size:14px;font-weight:600;">PLN</span></div>
+              <div class="text-xs text-3">marża 18% · 86 400 PLN · prawd. close 65%</div>
+              <div class="flex gap-sm justify-between" style="margin-top:8px;">
+                <button class="btn"><svg class="icon"><use href="#i-mail"/></svg>Email</button>
+                <button class="btn"><svg class="icon"><use href="#i-phone"/></svg>Zadzwoń</button>
+                <button class="btn btn-primary"><svg class="icon"><use href="#i-rocket"/></svg>Promuj fazę</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- STAGE PROGRESSION -->
+          <div class="flex align-center gap-sm" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border);">
+            <div class="stage lead" style="opacity:0.45;"><span></span>Lead</div>
+            <svg class="icon icon-sm text-3"><use href="#i-arrow-right"/></svg>
+            <div class="stage qualifying" style="opacity:0.45;"><span></span>Kwalifikacja</div>
+            <svg class="icon icon-sm text-3"><use href="#i-arrow-right"/></svg>
+            <div class="stage offer"><span></span>Oferta</div>
+            <svg class="icon icon-sm text-3"><use href="#i-arrow-right"/></svg>
+            <div class="stage commit" style="opacity:0.5;"><span></span>Commit</div>
+            <svg class="icon icon-sm text-3"><use href="#i-arrow-right"/></svg>
+            <div class="stage realization" style="opacity:0.4;"><span></span>Realizacja</div>
+            <svg class="icon icon-sm text-3"><use href="#i-arrow-right"/></svg>
+            <div class="stage won" style="opacity:0.35;"><span></span>Won</div>
+            <div style="margin-left:auto;font-size:11.5px;color:var(--text-3);">
+              <strong style="color:var(--text-2)">14 dni</strong> w fazie Oferta · średnia dla branży: 11 dni
+            </div>
+          </div>
+        </div>
+
+        <!-- AI INSIGHTS BAR -->
+        <div class="section-card" style="background:linear-gradient(135deg,rgba(167,139,250,0.08),rgba(99,102,241,0.04));border-color:rgba(167,139,250,0.25);padding:12px 14px;margin-bottom:14px;">
+          <div class="flex align-center gap-sm">
+            <div style="width:28px;height:28px;border-radius:8px;background:var(--gradient-accent);display:flex;align-items:center;justify-content:center;color:white;flex-shrink:0;">
+              <svg class="icon"><use href="#i-sparkles"/></svg>
+            </div>
+            <div style="flex:1;min-width:0;">
+              <div class="text-sm fw-700" style="margin-bottom:2px;">3 obserwacje AI o tym dealu</div>
+              <div class="text-xs text-2">Klient otworzył ofertę <strong>4× wczoraj między 18:00 a 21:00</strong> · po spotkaniu padły <strong>3 obiekcje cenowe</strong> · konkurencja: <strong>Comarch</strong> wzmiankowana 2× w transkrypcji.</div>
+            </div>
+            <button class="btn"><svg class="icon"><use href="#i-brain"/></svg>Co dalej?</button>
+          </div>
+        </div>
+
+        <!-- 3-COLUMN LAYOUT -->
+        <div class="grid-detail">
+
+          <!-- LEFT — FACTS + INLINE EDIT -->
+          <div>
+            <div class="section-card" style="padding:14px 16px;">
+              <h3><svg class="icon"><use href="#i-deal"/></svg>Fakty</h3>
+
+              <div class="flex justify-between" style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border);">
+                <div>
+                  <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Wartość</div>
+                  <div class="fw-800 num" style="font-size:16px;">480 000 PLN</div>
+                </div>
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button>
+              </div>
+
+              <div class="flex justify-between" style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border);">
+                <div>
+                  <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Marża prognoz.</div>
+                  <div class="fw-800 num" style="font-size:16px;">18% · 86 400 PLN</div>
+                </div>
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button>
+              </div>
+
+              <div class="flex justify-between" style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border);">
+                <div>
+                  <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Est. close</div>
+                  <div class="fw-700" style="font-size:13px;">30.06.2026 <span class="text-xs text-3">(za 42 dni)</span></div>
+                </div>
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button>
+              </div>
+
+              <div class="flex justify-between" style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border);">
+                <div>
+                  <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Prawd. close</div>
+                  <div class="flex align-center gap-sm">
+                    <span class="fw-700">65%</span>
+                    <div class="progress" style="width:70px;height:6px;"><div class="fill" style="width:65%;background:var(--gradient-accent);"></div></div>
+                  </div>
+                </div>
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button>
+              </div>
+
+              <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border);">
+                <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px;">Commit</div>
+                <div class="flex align-center gap-sm">
+                  <div class="toggle on"></div>
+                  <span class="text-sm">Tak</span>
+                  <span class="text-xs text-3" style="margin-left:auto">→ zarząd, forecast Maj</span>
+                </div>
+              </div>
+
+              <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border);">
+                <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px;">Owner</div>
+                <div class="flex align-center gap-sm"><div class="av sm indigo">AK</div><span class="text-sm fw-700">Anna Kowalska</span></div>
+              </div>
+
+              <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border);">
+                <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px;">Sekcja</div>
+                <span class="chip accent">Wschód</span>
+              </div>
+
+              <div style="margin-bottom:0;">
+                <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px;">Tagi</div>
+                <div class="flex wrap gap-sm">
+                  <span class="chip">motor</span>
+                  <span class="chip">erp</span>
+                  <span class="chip">fleet</span>
+                  <span class="chip warning"><span class="dot"></span>konkurencja: Comarch</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- NEXT ACTION -->
+            <div class="section-card" style="padding:14px 16px;border-left:3px solid var(--accent-2);">
+              <h3 style="color:var(--accent-2);"><svg class="icon"><use href="#i-target"/></svg>Next action</h3>
+              <div class="text-sm fw-700" style="margin-bottom:4px;">Zadzwoń do Magdy ws. obiekcji cenowych</div>
+              <div class="text-xs text-2" style="line-height:1.6;">Po wczorajszym demo padły 3 obiekcje. Najlepiej dziś. AI ma gotowy briefing.</div>
+              <div class="flex gap-sm" style="margin-top:10px;">
+                <button class="btn btn-primary btn-sm" style="flex:1"><svg class="icon"><use href="#i-phone"/></svg>Zadzwoń teraz</button>
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button>
+              </div>
+            </div>
+          </div>
+
+          <!-- CENTER — UNIFIED TIMELINE -->
+          <div>
+            <div class="section-card" style="padding:14px 16px;">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-history"/></svg>Aktywność</div>
+                <div class="flex gap-sm">
+                  <div class="filter-chip active">Wszystko</div>
+                  <div class="filter-chip">Maile<span class="count">12</span></div>
+                  <div class="filter-chip">Spotkania<span class="count">3</span></div>
+                  <div class="filter-chip">Notatki<span class="count">5</span></div>
+                  <div class="filter-chip">Zmiany<span class="count">14</span></div>
+                </div>
+              </div>
+
+              <div class="timeline">
+
+                <!-- DZISIAJ -->
+                <div class="tl-item">
+                  <div class="tl-dot pink"><svg class="icon"><use href="#i-sparkles"/></svg></div>
+                  <div class="tl-body">
+                    <div class="tl-head">
+                      <span class="who">AI hygiene</span>
+                      <span class="action">wykrył 3 obiekcje cenowe z transkrypcji wczorajszego demo</span>
+                      <span class="contrib-tag crm">crm · ai</span>
+                      <span class="when">dziś 9:08</span>
+                    </div>
+                    <div class="tl-content">
+                      <strong>1.</strong> Cena za moduł fleet o ~15% wyższa niż konkurencja Comarch.
+                      <strong>2.</strong> Brak prostego sposobu wyłączenia modułu CRM (klient ma swój).
+                      <strong>3.</strong> Wątpliwość czy implementacja zmieści się w 4 miesiące.
+                    </div>
+                    <div class="flex gap-sm" style="margin-top:8px;">
+                      <button class="btn btn-sm"><svg class="icon"><use href="#i-edit"/></svg>Zapisz jako risks</button>
+                      <button class="btn btn-sm">Zaproponuj rabat?</button>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- WCZORAJ — spotkanie -->
+                <div class="tl-item">
+                  <div class="tl-dot info"><svg class="icon"><use href="#i-calendar"/></svg></div>
+                  <div class="tl-body">
+                    <div class="tl-head">
+                      <span class="who">Anna Kowalska</span>
+                      <span class="action">odbyła spotkanie demo (4 uczestników, 52 min)</span>
+                      <span class="contrib-tag calendar">calendar</span>
+                      <span class="when">wczoraj 16:30</span>
+                    </div>
+                    <div class="tl-content">
+                      <strong>Uczestnicy:</strong> Anna Kowalska · Magda Wiśniewska (CIO) · Piotr Lewandowski (Dyr. IT) · Konrad Borek (Fleet Manager).
+                      Demo modułów fleet + raportowanie. Transkrypcja: 52 min, AI summary dostępne.
+                    </div>
+                    <div class="flex gap-sm" style="margin-top:8px;">
+                      <button class="btn btn-sm"><svg class="icon"><use href="#i-message"/></svg>Otwórz transkrypcję</button>
+                      <button class="btn btn-sm"><svg class="icon"><use href="#i-mail"/></svg>Draft follow-upu</button>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 4 dni temu — klient otworzył ofertę -->
+                <div class="tl-item">
+                  <div class="tl-dot accent"><svg class="icon"><use href="#i-paperclip"/></svg></div>
+                  <div class="tl-body">
+                    <div class="tl-head">
+                      <span class="who">Magda Wiśniewska</span>
+                      <span class="action">otworzyła PDF <em>Oferta_VW_ERP_v3.pdf</em> 4 razy (18:02, 18:14, 20:31, 21:07)</span>
+                      <span class="contrib-tag documents">documents · tracking</span>
+                      <span class="when">2 dni temu</span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 5 dni temu — wysłana oferta -->
+                <div class="tl-item">
+                  <div class="tl-dot accent"><svg class="icon"><use href="#i-mail"/></svg></div>
+                  <div class="tl-body">
+                    <div class="tl-head">
+                      <span class="who">Anna Kowalska</span>
+                      <span class="action">wysłała ofertę v3 (PDF + spreadsheet) do <strong>Magdy Wiśniewskiej</strong></span>
+                      <span class="contrib-tag email">email</span>
+                      <span class="when">5 dni temu, 11:42</span>
+                    </div>
+                    <div class="tl-content quoted">
+                      „Pani Magdo, zgodnie z ustaleniami przesyłam zaktualizowaną ofertę z modułem fleet i adaptacją do warsztatów serwisowych. Pozostaję do dyspozycji w sprawie pytań…”
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 8 dni temu — zmiana wartości -->
+                <div class="tl-item">
+                  <div class="tl-dot"><svg class="icon"><use href="#i-edit"/></svg></div>
+                  <div class="tl-body">
+                    <div class="tl-head">
+                      <span class="who">Anna Kowalska</span>
+                      <span class="action">zmieniła wartość deala <span class="text-3" style="text-decoration:line-through">420 000</span> → <strong style="color:var(--success)">480 000 PLN</strong> (dodano warsztaty)</span>
+                      <span class="when">8 dni temu</span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 9 dni temu — notatka -->
+                <div class="tl-item">
+                  <div class="tl-dot"><svg class="icon"><use href="#i-message"/></svg></div>
+                  <div class="tl-body">
+                    <div class="tl-head">
+                      <span class="who">Anna Kowalska</span>
+                      <span class="action">dodała notatkę po rozmowie telefonicznej</span>
+                      <span class="when">9 dni temu</span>
+                    </div>
+                    <div class="tl-content">
+                      Magda chce żeby rozszerzyć scope o warsztaty serwisowe (3 lokalizacje). Budżet do uzgodnienia, ale są w stanie zaakceptować +60–80k. Termin wdrożenia: koniec III kw. 2026.
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Lead start -->
+                <div class="tl-item">
+                  <div class="tl-dot success"><svg class="icon"><use href="#i-star"/></svg></div>
+                  <div class="tl-body">
+                    <div class="tl-head">
+                      <span class="who">Anna Kowalska</span>
+                      <span class="action">utworzyła deal z konwersacji LinkedIn z Magdą</span>
+                      <span class="when">22.04 (3 tyg. temu)</span>
+                    </div>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+          </div>
+
+          <!-- RIGHT — CONTRIBUTIONS FROM OTHER ADDONS -->
+          <div class="flex col gap-md">
+
+            <!-- Zespół projektu (NASZE osoby — z katalogu ról) -->
+            <div class="section-card" style="padding:14px;">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-users"/></svg>Zespół projektu (u nas)</div>
+                <span class="contrib-tag crm">crm</span>
+              </div>
+              <div class="flex col gap-sm">
+                <div class="flex align-center gap-sm">
+                  <div class="av sm indigo">AK</div>
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Anna Kowalska <span class="chip success" style="font-size:9px;margin-left:4px">★ lead</span></div>
+                    <div class="text-xs text-3">Rola: <strong style="color:var(--text-2)">Handlowiec</strong> · udział 100%</div>
+                  </div>
+                </div>
+                <div class="flex align-center gap-sm">
+                  <div class="av sm amber">PT</div>
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Piotr Tracz</div>
+                    <div class="text-xs text-3">Rola: <strong style="color:var(--text-2)">PM techniczny</strong> · od fazy realizacji</div>
+                  </div>
+                </div>
+                <div class="flex align-center gap-sm">
+                  <div class="av sm teal">JB</div>
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Jan Bąk</div>
+                    <div class="text-xs text-3">Rola: <strong style="color:var(--text-2)">Senior Architekt</strong> · presales</div>
+                  </div>
+                </div>
+                <div class="flex align-center gap-sm">
+                  <div class="av sm amber">MP</div>
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Marek Pawlak</div>
+                    <div class="text-xs text-3">Rola: <strong style="color:var(--text-2)">Approver budżetu</strong> · z org-structure</div>
+                  </div>
+                  <span class="chip" style="font-size:9px">auto</span>
+                </div>
+              </div>
+              <button class="btn btn-ghost btn-sm" style="margin-top:8px;width:100%;justify-content:center;"><svg class="icon"><use href="#i-plus"/></svg>Dodaj osobę z rolą</button>
+              <div class="text-xs text-3" style="margin-top:6px;text-align:center;">Role z katalogu — admin zarządza w <a>Struktura → Katalog ról</a></div>
+            </div>
+
+            <!-- Strona klienta (z contacts) -->
+            <div class="section-card" style="padding:14px;">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-users"/></svg>Strona klienta</div>
+                <span class="contrib-tag contacts">contacts</span>
+              </div>
+              <div class="flex col gap-sm">
+                <div class="flex align-center gap-sm">
+                  <div class="av sm indigo">MW</div>
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Magda Wiśniewska</div>
+                    <div class="text-xs text-3">Rola: <strong style="color:var(--text-2)">Decydent</strong> · CIO</div>
+                  </div>
+                  <span class="chip success">★</span>
+                </div>
+                <div class="flex align-center gap-sm">
+                  <div class="av sm teal">PL</div>
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Piotr Lewandowski</div>
+                    <div class="text-xs text-3">Rola: <strong style="color:var(--text-2)">Influencer</strong> · Dyr. IT</div>
+                  </div>
+                </div>
+                <div class="flex align-center gap-sm">
+                  <div class="av sm gray">KB</div>
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Konrad Borek</div>
+                    <div class="text-xs text-3">Rola: <strong style="color:var(--text-2)">Power user</strong> · Fleet Manager</div>
+                  </div>
+                </div>
+              </div>
+              <button class="btn btn-ghost btn-sm" style="margin-top:8px;width:100%;justify-content:center;"><svg class="icon"><use href="#i-plus"/></svg>Dodaj kontakt klienta</button>
+            </div>
+
+            <!-- Tasks (from activity) -->
+            <div class="section-card" style="padding:14px;">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-activity"/></svg>Zadania</div>
+                <span class="contrib-tag activity">activity</span>
+              </div>
+              <div class="flex col gap-sm">
+                <div class="flex align-start gap-sm">
+                  <input type="checkbox" style="margin-top:3px;accent-color:var(--accent-1)">
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Zadzwoń do Magdy ws. obiekcji cenowych</div>
+                    <div class="text-xs text-3">dziś · AK</div>
+                  </div>
+                </div>
+                <div class="flex align-start gap-sm">
+                  <input type="checkbox" style="margin-top:3px;accent-color:var(--accent-1)">
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm fw-700">Wysłać 3 case study z motoryzacji</div>
+                    <div class="text-xs text-3">jutro · AK</div>
+                  </div>
+                </div>
+                <div class="flex align-start gap-sm">
+                  <input type="checkbox" checked style="margin-top:3px;accent-color:var(--accent-1)">
+                  <div style="flex:1;min-width:0;">
+                    <div class="text-sm" style="text-decoration:line-through;color:var(--text-3)">Wysłać ofertę v3</div>
+                    <div class="text-xs text-3">5 dni temu · AK</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Calendar -->
+            <div class="section-card" style="padding:14px;">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-calendar"/></svg>Spotkania</div>
+                <span class="contrib-tag calendar">calendar</span>
+              </div>
+              <div class="flex col gap-sm">
+                <div style="padding:8px;background:var(--bg-3);border-radius:6px;border-left:2px solid var(--info);">
+                  <div class="text-sm fw-700">Demo modułów fleet</div>
+                  <div class="text-xs text-3">wczoraj 16:30 · 52 min · 4 osoby</div>
+                </div>
+                <div style="padding:8px;background:var(--bg-3);border-radius:6px;border-left:2px solid var(--text-3);opacity:0.65;">
+                  <div class="text-sm fw-700">Spotkanie wstępne</div>
+                  <div class="text-xs text-3">28.04 · 38 min · 3 osoby</div>
+                </div>
+              </div>
+              <button class="btn btn-ghost btn-sm" style="margin-top:8px;width:100%;justify-content:center;"><svg class="icon"><use href="#i-plus"/></svg>Zaproponuj spotkanie</button>
+            </div>
+
+            <!-- Documents -->
+            <div class="section-card" style="padding:14px;">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-file"/></svg>Dokumenty</div>
+                <span class="contrib-tag documents">documents</span>
+              </div>
+              <div class="flex col gap-sm" style="font-size:12px;">
+                <div class="flex align-center gap-sm"><svg class="icon text-3"><use href="#i-file"/></svg><span class="fw-700" style="flex:1">Oferta_VW_ERP_v3.pdf</span><span class="text-xs text-3">2.1 MB</span></div>
+                <div class="flex align-center gap-sm"><svg class="icon text-3"><use href="#i-file"/></svg><span class="fw-700" style="flex:1">Harmonogram_wdrozenia.xlsx</span><span class="text-xs text-3">340 KB</span></div>
+                <div class="flex align-center gap-sm"><svg class="icon text-3"><use href="#i-file"/></svg><span class="fw-700" style="flex:1">NDA_VW_signed.pdf</span><span class="text-xs text-3">180 KB</span></div>
+              </div>
+            </div>
+
+            <!-- Costs / Refacturing (from billing) -->
+            <div class="section-card" style="padding:14px;">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-coin"/></svg>Koszty &amp; refaktury</div>
+                <span class="contrib-tag billing">billing</span>
+              </div>
+              <div class="flex col gap-sm" style="font-size:12px;">
+                <div class="flex justify-between"><span class="text-2">Plan kosztów</span><span class="fw-700 num">393 600 PLN</span></div>
+                <div class="flex justify-between"><span class="text-2">Marża plan</span><span class="fw-700 num" style="color:var(--success)">86 400 PLN (18%)</span></div>
+                <div class="flex justify-between" style="padding-top:6px;border-top:1px solid var(--border);">
+                  <span class="text-2">E-dokumenty kosztowe</span>
+                  <span class="fw-700">3 podpięte</span>
+                </div>
+                <div class="flex justify-between text-xs text-3">
+                  <span>z czego do akceptacji</span><span class="chip warning"><span class="dot"></span>1</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Risks -->
+            <div class="section-card" style="padding:14px;border-left:3px solid var(--warning);">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon" style="color:var(--warning)"><use href="#i-warning"/></svg>Ryzyka</div>
+                <span class="contrib-tag crm">crm</span>
+              </div>
+              <div class="flex col gap-sm" style="font-size:12px;">
+                <div><span class="chip warning"><span class="dot"></span>cena</span> Comarch tańszy o ~15%</div>
+                <div><span class="chip"><span class="dot"></span>zakres</span> Klient ma własny CRM — chce wyłączyć moduł</div>
+                <div><span class="chip"><span class="dot"></span>termin</span> Wdrożenie w 4 mc. — pytanie czy realne</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

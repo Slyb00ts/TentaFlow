@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Users &amp; Groups management</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.22);
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-accent-hover: linear-gradient(135deg, #7277f3 0%, #b69cfb 100%);
+  --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --radius-lg: 14px;
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+  --shadow-lg: 0 24px 64px rgba(0,0,0,0.7), 0 8px 24px rgba(99, 102, 241, 0.15);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+.intro { max-width: 1400px; margin: 28px auto 16px; padding: 0 24px; }
+.intro h1 {
+  font-size: 24px; font-weight: 800; margin-bottom: 4px;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.intro .lead { color: var(--text-2); max-width: 920px; font-size: 13px; line-height: 1.6; }
+
+.grid {
+  max-width: 1400px; margin: 16px auto 80px; padding: 0 24px;
+  display: grid; gap: 40px;
+}
+.section-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--accent-2); margin-bottom: 12px;
+}
+
+/* ============ Screen shell ============ */
+.screen {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.3);
+}
+.screen-head {
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 14px;
+  flex-wrap: wrap;
+}
+.screen-head .title {
+  font-size: 20px; font-weight: 800;
+  display: flex; align-items: center; gap: 12px;
+}
+.screen-head .title svg {
+  width: 22px; height: 22px; stroke: var(--accent-2); fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+.screen-head .sub {
+  color: var(--text-3); font-size: 13px;
+}
+.screen-head .actions {
+  margin-left: auto; display: flex; gap: 8px;
+}
+.screen-toolbar {
+  padding: 14px 24px;
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.screen-body { padding: 0; }
+
+/* Tabs inside screen */
+.tabs-bar {
+  display: flex;
+  padding: 8px 24px 0;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.tab {
+  padding: 12px 16px;
+  background: transparent; border: 0;
+  color: var(--text-3); font-size: 13px; font-weight: 600;
+  cursor: pointer; position: relative;
+  font-family: inherit;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.tab svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tab:hover { color: var(--text-2); }
+.tab.active { color: var(--accent-2); }
+.tab.active::after {
+  content: '';
+  position: absolute; bottom: -1px; left: 0; right: 0;
+  height: 2px;
+  background: var(--gradient-accent);
+  border-radius: 2px 2px 0 0;
+}
+.tab .count {
+  background: var(--bg-3); padding: 1px 7px;
+  border-radius: 999px; font-size: 11px; color: var(--text-3);
+}
+.tab.active .count { background: var(--accent-glow); color: var(--accent-2); }
+
+/* ============ Buttons ============ */
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 16px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s; min-height: 38px;
+  white-space: nowrap;
+}
+.btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.btn.secondary { background: var(--bg-3); border-color: var(--border); }
+.btn.secondary:hover { background: var(--bg-card-hover); border-color: var(--border-hover); }
+.btn.primary {
+  background: var(--gradient-accent); color: white;
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+}
+.btn.primary:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.btn.ghost { color: var(--text-2); }
+.btn.ghost:hover { background: var(--bg-3); color: var(--text); }
+.btn.danger {
+  background: transparent; color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.btn.danger:hover {
+  background: rgba(239, 68, 68, 0.1); border-color: var(--danger);
+}
+.btn.sm { padding: 6px 10px; font-size: 12px; min-height: 30px; }
+
+/* ============ Searchbox ============ */
+.search-box {
+  flex: 1;
+  max-width: 360px;
+  position: relative;
+  display: flex; align-items: center;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 12px 0 36px;
+  height: 38px;
+}
+.search-box svg {
+  position: absolute; left: 12px;
+  width: 16px; height: 16px;
+  color: var(--text-3);
+  stroke: currentColor; fill: none; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.search-box input {
+  flex: 1;
+  background: transparent; border: 0; outline: none;
+  color: var(--text); font-family: inherit;
+  font-size: 13px;
+}
+.search-box input::placeholder { color: var(--text-3); }
+
+/* ============ Filter group (segmented chips) ============ */
+.filter-group {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 3px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.filter-chip {
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: transparent; color: var(--text-2);
+  border: 0; font-size: 11px; font-weight: 600;
+  cursor: pointer; font-family: inherit;
+  transition: all 0.15s;
+}
+.filter-chip:hover { background: var(--bg-card-hover); color: var(--text); }
+.filter-chip.active { background: var(--accent-glow); color: var(--accent-2); }
+
+/* ============ User table ============ */
+.user-table { width: 100%; border-collapse: collapse; }
+.user-table th,
+.user-table td {
+  padding: 12px 24px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.user-table th {
+  font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-3);
+  background: var(--bg-2);
+  padding-top: 10px; padding-bottom: 10px;
+}
+.user-table tbody tr:hover { background: rgba(99, 102, 241, 0.04); cursor: pointer; }
+.user-table td.user-cell {
+  display: flex; align-items: center; gap: 12px;
+}
+.avatar {
+  width: 36px; height: 36px; border-radius: 10px;
+  background: var(--gradient-accent);
+  color: white; font-size: 14px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.avatar.sm { width: 26px; height: 26px; font-size: 11px; border-radius: 7px; }
+.user-name {
+  font-weight: 700; color: var(--text);
+  display: flex; align-items: center; gap: 8px;
+}
+.user-sub {
+  font-size: 11px; color: var(--text-3);
+  font-family: 'JetBrains Mono', monospace;
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.chip.admin { background: rgba(239, 68, 68, 0.12); color: #ef4444; }
+.chip.active { background: rgba(34, 197, 94, 0.12); color: var(--success); }
+.chip.inactive { background: var(--bg-3); color: var(--text-3); }
+.chip.sso { background: rgba(96, 165, 250, 0.12); color: var(--info); }
+.chip.local { background: rgba(167, 139, 250, 0.12); color: var(--accent-2); }
+.group-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 9px;
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.1);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  color: var(--accent-2);
+  font-size: 11px; font-weight: 600;
+  margin-right: 4px;
+}
+.group-tag svg { width: 11px; height: 11px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+.row-actions {
+  display: flex; gap: 4px; justify-content: flex-end;
+  opacity: 0; transition: opacity 0.15s;
+}
+.user-table tbody tr:hover .row-actions { opacity: 1; }
+.icon-btn {
+  width: 30px; height: 30px; border-radius: 8px;
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-2); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: all 0.15s;
+}
+.icon-btn:hover { background: var(--bg-card-hover); color: var(--text); }
+.icon-btn.danger:hover { background: rgba(239, 68, 68, 0.1); color: var(--danger); border-color: rgba(239, 68, 68, 0.3); }
+.icon-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ============ Detail split ============ */
+.detail-grid {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  gap: 0;
+}
+@media (max-width: 820px) {
+  .detail-grid { grid-template-columns: 1fr; }
+}
+.detail-side {
+  padding: 24px;
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 16px;
+}
+.detail-side .big-avatar {
+  width: 72px; height: 72px; border-radius: 18px;
+  background: var(--gradient-accent);
+  color: white; font-size: 26px; font-weight: 800;
+  display: flex; align-items: center; justify-content: center;
+}
+.detail-side .name { font-size: 18px; font-weight: 800; }
+.detail-side .hex {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; color: var(--text-3);
+}
+.detail-side .stat-line {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px dashed rgba(99, 102, 241, 0.12);
+  font-size: 12px;
+}
+.detail-side .stat-line:last-child { border-bottom: 0; }
+.detail-side .stat-line .k { color: var(--text-3); text-transform: uppercase; font-size: 10px; letter-spacing: 0.06em; font-weight: 700; }
+.detail-side .stat-line .v { color: var(--text); font-weight: 600; }
+.detail-side .actions-stack {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-top: auto;
+}
+.detail-main { padding: 24px; }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px; }
+.form-row.full { grid-template-columns: 1fr; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field label {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--text-2);
+}
+.field input, .field select {
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 12px;
+  color: var(--text); font-family: inherit; font-size: 13px;
+}
+.field input:focus, .field select:focus {
+  outline: none; border-color: var(--accent-1);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+/* ============ Permissions tree / matrix ============ */
+.perm-section {
+  margin-bottom: 18px;
+}
+.perm-section-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 0 8px;
+  font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--text-2);
+}
+.perm-section-head svg { width: 16px; height: 16px; stroke: var(--accent-2); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.perm-section-head .counter {
+  margin-left: auto;
+  color: var(--text-3); font-weight: 600; font-family: 'JetBrains Mono', monospace;
+  text-transform: none;
+}
+.perm-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 14px;
+  align-items: center;
+  padding: 10px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 6px;
+}
+.perm-row .meta .name { font-weight: 700; font-size: 13px; }
+.perm-row .meta .descr { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.perm-row.denied { border-color: rgba(239,68,68,0.35); background: rgba(239,68,68,0.04); }
+.perm-row.denied .meta .name { color: #fca5a5; }
+
+.access-toggle {
+  display: inline-flex; background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: 999px; padding: 2px; gap: 2px;
+}
+.access-toggle button {
+  background: transparent; border: 0; color: var(--text-3);
+  font-family: inherit; font-size: 10px; font-weight: 700;
+  padding: 5px 10px; border-radius: 999px;
+  cursor: pointer;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  transition: all 0.15s;
+}
+.access-toggle button.active.allow { background: var(--success); color: white; }
+.access-toggle button.active.deny { background: var(--danger); color: white; }
+.access-toggle button.active.inherit { background: var(--bg-card-hover); color: var(--accent-2); }
+.access-toggle button:hover:not(.active) { color: var(--text); }
+
+/* ============ Group member chip list ============ */
+.member-list { display: flex; flex-direction: column; gap: 6px; }
+.member-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.member-row .name { flex: 1; font-weight: 700; font-size: 13px; }
+.member-row .email { color: var(--text-3); font-size: 11px; }
+
+/* ============ Modal ============ */
+.modal {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  max-width: 520px; width: 100%;
+  overflow: hidden;
+  margin: 0 auto;
+}
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+.modal-head .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent-1); }
+.modal-head h3 { font-size: 15px; font-weight: 700; color: var(--text); }
+.modal-body { padding: 22px 24px; }
+.modal-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 14px 18px;
+  background: var(--bg-2);
+  border-top: 1px solid var(--border);
+}
+
+/* Group picker (multiselect) */
+.group-picker {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 10px 12px;
+  min-height: 46px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.group-picker .group-tag.removable {
+  padding-right: 4px; cursor: default;
+}
+.group-picker .group-tag .x {
+  width: 16px; height: 16px; border-radius: 50%;
+  background: rgba(99, 102, 241, 0.2);
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent-2);
+  cursor: pointer;
+  margin-left: 2px;
+}
+.group-picker .group-tag .x:hover { background: var(--danger); color: white; }
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>Users &amp; Groups — zarządzanie</h1>
+  <p class="lead">
+    3 ekrany + 1 modal: (1) lista userów z filtrem/wyszukiwarką, (2) detail usera z zakładkami Profil / Grupy / Uprawnienia,
+    (3) lista/detail grup z macierzą uprawnień do modeli/flowów/addonów. Defaults: każdy user widzi wszystko, admin może odebrać
+    wybranej grupie dostęp do konkretnego modelu/flowu/addonu. System ACL replikuje sprawdzony wzorzec z addon_permissions —
+    dodajemy generyczną tabelę <code>resource_permissions(resource_type, resource_id, subject_type, subject_id, access_level)</code>.
+  </p>
+</div>
+
+<div class="grid">
+
+  <!-- ======================= 1. USERS LIST ======================= -->
+  <section>
+    <div class="section-title">1. Lista użytkowników (Admin only)</div>
+    <div class="screen">
+      <div class="screen-head">
+        <div>
+          <div class="title">
+            <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            Użytkownicy <span style="color:var(--text-3); font-weight:600;">· 8</span>
+          </div>
+          <div class="sub">7 aktywnych · 1 nieaktywny · 3 admin</div>
+        </div>
+        <div class="actions">
+          <button class="btn secondary"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Eksport CSV</button>
+          <button class="btn primary"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Nowy user</button>
+        </div>
+      </div>
+      <div class="screen-toolbar">
+        <div class="search-box">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input placeholder="Szukaj po nazwie, email...">
+        </div>
+        <div class="filter-group">
+          <button class="filter-chip active">Wszyscy</button>
+          <button class="filter-chip">Aktywni</button>
+          <button class="filter-chip">Administratorzy</button>
+          <button class="filter-chip">Nieaktywni</button>
+          <button class="filter-chip">SSO</button>
+        </div>
+      </div>
+      <div class="screen-body">
+        <table class="user-table">
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Rola</th>
+              <th>Grupy</th>
+              <th>Źródło</th>
+              <th>Ostatnie logowanie</th>
+              <th style="text-align:right;">Akcje</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>
+                <div class="user-cell">
+                  <div class="avatar">AS</div>
+                  <div>
+                    <div class="user-name">Adam Surowski <span class="chip active">aktywny</span></div>
+                    <div class="user-sub">adam@tentaflow.ai</div>
+                  </div>
+                </div>
+              </td>
+              <td><span class="chip admin">Admin</span></td>
+              <td>
+                <span class="group-tag"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>Admins</span>
+                <span class="group-tag"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Developers</span>
+              </td>
+              <td><span class="chip local">Local</span></td>
+              <td style="color:var(--text-3); font-size:12px;">2 min temu</td>
+              <td>
+                <div class="row-actions">
+                  <button class="icon-btn"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                  <button class="icon-btn danger"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg></button>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td>
+                <div class="user-cell">
+                  <div class="avatar" style="background:linear-gradient(135deg,#22c55e,#10b981);">MK</div>
+                  <div>
+                    <div class="user-name">Maria Kowalska <span class="chip active">aktywny</span></div>
+                    <div class="user-sub">maria@tentaflow.ai</div>
+                  </div>
+                </div>
+              </td>
+              <td><span style="color:var(--text-3);">User</span></td>
+              <td>
+                <span class="group-tag"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Developers</span>
+              </td>
+              <td><span class="chip sso">SSO · Google</span></td>
+              <td style="color:var(--text-3); font-size:12px;">1 godz. temu</td>
+              <td><div class="row-actions"><button class="icon-btn"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button><button class="icon-btn danger"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg></button></div></td>
+            </tr>
+            <tr>
+              <td>
+                <div class="user-cell">
+                  <div class="avatar" style="background:linear-gradient(135deg,#60a5fa,#0ea5e9);">TN</div>
+                  <div>
+                    <div class="user-name">Tomasz Nowak <span class="chip active">aktywny</span></div>
+                    <div class="user-sub">tomasz@tentaflow.ai</div>
+                  </div>
+                </div>
+              </td>
+              <td><span style="color:var(--text-3);">User</span></td>
+              <td>
+                <span class="group-tag"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Support</span>
+                <span class="group-tag"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Viewers</span>
+              </td>
+              <td><span class="chip sso">SSO · Azure</span></td>
+              <td style="color:var(--text-3); font-size:12px;">wczoraj</td>
+              <td><div class="row-actions"><button class="icon-btn"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button><button class="icon-btn danger"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg></button></div></td>
+            </tr>
+            <tr>
+              <td>
+                <div class="user-cell">
+                  <div class="avatar" style="background:linear-gradient(135deg,#6a7196,#525875);">JG</div>
+                  <div>
+                    <div class="user-name">Jan Górski <span class="chip inactive">nieaktywny</span></div>
+                    <div class="user-sub">jan@tentaflow.ai</div>
+                  </div>
+                </div>
+              </td>
+              <td><span style="color:var(--text-3);">User</span></td>
+              <td><span style="color:var(--text-3); font-size:12px;">—</span></td>
+              <td><span class="chip local">Local</span></td>
+              <td style="color:var(--text-3); font-size:12px;">3 mies. temu</td>
+              <td><div class="row-actions"><button class="icon-btn"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button></div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 2. USER DETAIL ======================= -->
+  <section>
+    <div class="section-title">2. Detail użytkownika — zakładki Profil / Grupy / Uprawnienia</div>
+    <div class="screen">
+      <div class="screen-head">
+        <div>
+          <div class="title">
+            <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+            Maria Kowalska
+          </div>
+          <div class="sub">maria@tentaflow.ai · SSO · Google</div>
+        </div>
+        <div class="actions">
+          <button class="btn ghost">Wymuś logout</button>
+          <button class="btn danger"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg>Usuń konto</button>
+        </div>
+      </div>
+      <div class="tabs-bar">
+        <button class="tab active">
+          <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          Profil
+        </button>
+        <button class="tab">
+          <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/></svg>
+          Członkostwa <span class="count">2</span>
+        </button>
+        <button class="tab">
+          <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          Uprawnienia <span class="count">12</span>
+        </button>
+        <button class="tab">
+          <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          Aktywność
+        </button>
+      </div>
+      <div class="detail-grid">
+        <aside class="detail-side">
+          <div class="big-avatar" style="background:linear-gradient(135deg,#22c55e,#10b981);">MK</div>
+          <div>
+            <div class="name">Maria Kowalska</div>
+            <div class="hex">user_123e4567-e89b</div>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:2px; margin-top:6px;">
+            <div class="stat-line"><span class="k">Status</span><span class="v" style="color:var(--success);">Aktywny</span></div>
+            <div class="stat-line"><span class="k">Źródło</span><span class="v">SSO · Google</span></div>
+            <div class="stat-line"><span class="k">Grupy</span><span class="v">2</span></div>
+            <div class="stat-line"><span class="k">Zalogowany</span><span class="v">1 godz. temu</span></div>
+            <div class="stat-line"><span class="k">Utworzony</span><span class="v">2026-01-15</span></div>
+          </div>
+          <div class="actions-stack">
+            <button class="btn secondary" style="justify-content:center;"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Resetuj hasło</button>
+          </div>
+        </aside>
+        <div class="detail-main">
+          <div class="form-row">
+            <div class="field">
+              <label>Username</label>
+              <input value="maria.kowalska" disabled style="opacity:0.7;">
+            </div>
+            <div class="field">
+              <label>Display name</label>
+              <input value="Maria Kowalska">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="field">
+              <label>Email</label>
+              <input value="maria@tentaflow.ai">
+            </div>
+            <div class="field">
+              <label>Rola</label>
+              <select>
+                <option>User — czat, flowy, serwisy (consume)</option>
+                <option>Power User — User + Flow Builder, reguły, prompty</option>
+                <option>Admin — pełne zarządzanie: userzy, nody, deploye</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row full">
+            <div class="field">
+              <label>Status konta</label>
+              <select>
+                <option>Aktywny — może logować się i używać aplikacji</option>
+                <option>Zablokowany — istnieje ale nie może się logować</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
+            <button class="btn ghost">Anuluj</button>
+            <button class="btn primary">Zapisz zmiany</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 3. GROUPS ======================= -->
+  <section>
+    <div class="section-title">3. Grupy — macierz uprawnień do zasobów</div>
+    <div class="screen">
+      <div class="screen-head">
+        <div>
+          <div class="title">
+            <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            Grupa: <span style="color:var(--accent-2);">Developers</span>
+          </div>
+          <div class="sub">7 członków · 23 uprawnienia ustawione</div>
+        </div>
+        <div class="actions">
+          <button class="btn primary"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Dodaj członka</button>
+        </div>
+      </div>
+      <div class="tabs-bar">
+        <button class="tab">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          Informacje
+        </button>
+        <button class="tab">
+          <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+          Członkowie <span class="count">7</span>
+        </button>
+        <button class="tab active">
+          <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          Uprawnienia <span class="count">23</span>
+        </button>
+      </div>
+
+      <div style="padding: 20px 24px;">
+        <div class="perm-section">
+          <div class="perm-section-head">
+            <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+            Modele <span class="counter">4 dozwolone · 1 zablokowany</span>
+          </div>
+          <div class="perm-row">
+            <div class="meta">
+              <div class="name">qwen3.5-0.8b <span style="font-weight:400; color:var(--text-3); font-size:11px;">· LLM, llama-cpp</span></div>
+              <div class="descr">Lokalny Qwen 0.8B — preferowany dla szybkich zapytań orchestrator</div>
+            </div>
+            <div style="font-size:10px; color:var(--text-3); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Domyślnie</div>
+            <div class="access-toggle">
+              <button class="active inherit">Auto</button>
+              <button class="">Zezwól</button>
+              <button class="">Odmów</button>
+            </div>
+          </div>
+          <div class="perm-row">
+            <div class="meta">
+              <div class="name">llama-3.3-70b</div>
+              <div class="descr">Produkcyjny LLM 70B, niższy priorytet przy dużym ruchu</div>
+            </div>
+            <div style="font-size:10px; color:var(--success); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Zezwolono</div>
+            <div class="access-toggle">
+              <button class="">Auto</button>
+              <button class="active allow">Zezwól</button>
+              <button class="">Odmów</button>
+            </div>
+          </div>
+          <div class="perm-row denied">
+            <div class="meta">
+              <div class="name">gpt-4o</div>
+              <div class="descr">External API (OpenAI) — drogi, ograniczony do zespołu platform</div>
+            </div>
+            <div style="font-size:10px; color:var(--danger); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Odmówiono</div>
+            <div class="access-toggle">
+              <button class="">Auto</button>
+              <button class="">Zezwól</button>
+              <button class="active deny">Odmów</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="perm-section">
+          <div class="perm-section-head">
+            <svg viewBox="0 0 24 24"><path d="M5 4v16"/><circle cx="5" cy="4" r="2"/><path d="M19 12v8"/><circle cx="19" cy="12" r="2"/><circle cx="12" cy="20" r="2"/><path d="M12 18V4"/><path d="M5 8h7"/><path d="M12 12h7"/></svg>
+            Flowy <span class="counter">8 dozwolonych · 2 zablokowane</span>
+          </div>
+          <div class="perm-row">
+            <div class="meta">
+              <div class="name">rag-onboarding</div>
+              <div class="descr">Retrieval + chat dla nowych użytkowników</div>
+            </div>
+            <div style="font-size:10px; color:var(--text-3); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Domyślnie</div>
+            <div class="access-toggle">
+              <button class="active inherit">Auto</button>
+              <button class="">Zezwól</button>
+              <button class="">Odmów</button>
+            </div>
+          </div>
+          <div class="perm-row denied">
+            <div class="meta">
+              <div class="name">teams-meeting-summary</div>
+              <div class="descr">Summary + action items z Teams (wymaga Teams OAuth)</div>
+            </div>
+            <div style="font-size:10px; color:var(--danger); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Odmówiono</div>
+            <div class="access-toggle">
+              <button class="">Auto</button>
+              <button class="">Zezwól</button>
+              <button class="active deny">Odmów</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="perm-section">
+          <div class="perm-section-head">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+            Addony <span class="counter">wszystkie widoczne</span>
+          </div>
+          <div class="perm-row">
+            <div class="meta">
+              <div class="name">Microsoft Outlook</div>
+              <div class="descr">Odczyt mail + kalendarza przez Graph API</div>
+            </div>
+            <div style="font-size:10px; color:var(--text-3); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Domyślnie (widoczny)</div>
+            <div class="access-toggle">
+              <button class="active inherit">Auto</button>
+              <button class="">Widoczny</button>
+              <button class="">Ukryty</button>
+            </div>
+          </div>
+          <div class="perm-row denied">
+            <div class="meta">
+              <div class="name">Teams Meeting Bot</div>
+              <div class="descr">Autobot na spotkania Teams — wysoki koszt VRAM</div>
+            </div>
+            <div style="font-size:10px; color:var(--danger); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Ukryty</div>
+            <div class="access-toggle">
+              <button class="">Auto</button>
+              <button class="">Widoczny</button>
+              <button class="active deny">Ukryty</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 4. CREATE USER MODAL ======================= -->
+  <section>
+    <div class="section-title">4. Modal — tworzenie nowego usera</div>
+    <div class="modal">
+      <div class="modal-head">
+        <div class="dot"></div>
+        <h3>Nowy użytkownik</h3>
+      </div>
+      <div class="modal-body">
+        <div class="form-row">
+          <div class="field"><label>Username</label><input placeholder="np. adam.kowalski"></div>
+          <div class="field"><label>Display name</label><input placeholder="Adam Kowalski"></div>
+        </div>
+        <div class="form-row full">
+          <div class="field"><label>Email</label><input type="email" placeholder="adam@firma.com"></div>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label>Hasło początkowe</label>
+            <input type="password" value="tymczasowe_1234">
+          </div>
+          <div class="field">
+            <label>Rola</label>
+            <select><option>User</option><option>Admin</option></select>
+          </div>
+        </div>
+        <div class="form-row full">
+          <div class="field">
+            <label>Grupy (opcjonalne)</label>
+            <div class="group-picker">
+              <span class="group-tag removable"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Developers <span class="x">×</span></span>
+              <span class="group-tag removable"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Viewers <span class="x">×</span></span>
+              <input style="flex:1; min-width:140px; background:transparent; border:0; outline:none; color:var(--text); font-family:inherit; font-size:13px;" placeholder="+ dodaj grupę...">
+            </div>
+          </div>
+        </div>
+        <div style="padding: 8px 10px 0; font-size:11px; color:var(--text-3); line-height:1.5;">
+          User dostanie email z linkiem aktywacji. Pierwsze logowanie wymusi zmianę hasła.
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost">Anuluj</button>
+        <button class="btn primary"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Utwórz</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 5. RESOURCE-SIDE (Models view) ======================= -->
+  <section>
+    <div class="section-title">5. Widok z perspektywy zasobu — kto ma dostęp do modelu</div>
+    <div class="screen">
+      <div class="screen-head">
+        <div>
+          <div class="title">
+            <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+            Model: <span style="color:var(--accent-2);">gpt-4o</span>
+          </div>
+          <div class="sub">LLM · openai-compatible · External API</div>
+        </div>
+        <div class="actions">
+          <button class="btn secondary"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Nadaj dostęp</button>
+        </div>
+      </div>
+      <div style="padding:20px 24px;">
+        <div style="margin-bottom: 14px; padding: 12px 14px; background: var(--bg-input); border:1px solid var(--border); border-radius: var(--radius); display:flex; gap:10px; align-items:center;">
+          <svg style="width:16px; height:16px; stroke:var(--info); fill:none; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; flex-shrink:0;" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          <div style="font-size:12px; color:var(--text-2); line-height:1.5;">
+            Domyślnie <b style="color:var(--text);">każdy user</b> widzi ten model. Dodaj reguły poniżej żeby odebrać dostęp konkretnym grupom lub userom.
+          </div>
+        </div>
+
+        <div class="perm-section">
+          <div class="perm-section-head">Wyjątki (grupy / userzy z innym poziomem)</div>
+          <div class="perm-row denied">
+            <div class="meta" style="display:flex; align-items:center; gap:10px;">
+              <span class="group-tag"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Developers</span>
+              <span style="font-size:11px; color:var(--text-3);">Odebrano dostęp (koszt zewnętrznego API)</span>
+            </div>
+            <div style="font-size:10px; color:var(--danger); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Odmówiono</div>
+            <div class="access-toggle">
+              <button class="">Auto</button>
+              <button class="">Zezwól</button>
+              <button class="active deny">Odmów</button>
+            </div>
+          </div>
+          <div class="perm-row">
+            <div class="meta" style="display:flex; align-items:center; gap:10px;">
+              <div style="display:flex; align-items:center; gap:8px;">
+                <div class="avatar sm" style="background:linear-gradient(135deg,#60a5fa,#0ea5e9);">AS</div>
+                <div>
+                  <div style="font-weight:700; font-size:13px;">Adam Surowski</div>
+                  <div style="font-size:11px; color:var(--text-3);">adam@tentaflow.ai · Admin override</div>
+                </div>
+              </div>
+            </div>
+            <div style="font-size:10px; color:var(--success); text-transform:uppercase; letter-spacing:0.06em; font-weight:700;">Zezwolono</div>
+            <div class="access-toggle">
+              <button class="">Auto</button>
+              <button class="active allow">Zezwól</button>
+              <button class="">Odmów</button>
+            </div>
+          </div>
+        </div>
+
+        <div style="font-size:12px; color:var(--text-3); padding: 10px 0; line-height:1.5;">
+          Efekt: 1 user (Adam) ma zezwolenie, 7 userów z Developers ma odmowę, reszta (3 userów) ma dostęp defaultowy (zezwolenie).
+          <b style="color:var(--text-2);">User &gt; Grupa &gt; Default</b> — override usera wygrywa nad grupą.
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+// Demo — access-toggle
+document.querySelectorAll('.access-toggle').forEach(group => {
+  group.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      group.querySelectorAll('button').forEach(b => {
+        b.className = b.className.replace(/\bactive\b/, '').trim();
+      });
+      btn.classList.add('active');
+      const cls = btn.textContent.trim().toLowerCase();
+      if (cls === 'zezwól' || cls === 'widoczny') btn.classList.add('allow');
+      else if (cls === 'odmów' || cls === 'ukryty') btn.classList.add('deny');
+      else btn.classList.add('inherit');
+      const row = btn.closest('.perm-row');
+      if (btn.classList.contains('deny')) row?.classList.add('denied');
+      else row?.classList.remove('denied');
+    });
+  });
+});
+// Tabs demo
+document.querySelectorAll('.tabs-bar').forEach(bar => {
+  bar.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+      bar.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+    });
+  });
+});
+document.querySelectorAll('.filter-chip').forEach(c => {
+  c.addEventListener('click', () => {
+    c.parentElement.querySelectorAll('.filter-chip').forEach(x => x.classList.remove('active'));
+    c.classList.add('active');
+  });
+});
+</script>
+
+</body>
+</html>

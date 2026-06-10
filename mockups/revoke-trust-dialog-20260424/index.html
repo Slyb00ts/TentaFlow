@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Revoke trust dialog (mockup)</title>
+<style>
+/* =============================================================================
+   Confirm dialog — usuwanie sparowania noda.
+   Zastapienie window.confirm() (dziala flaky w WKWebView na iOS) wlasnym
+   tf-window modalem. Ten sam pattern mozna zastosowac do wszystkich innych
+   potwierdzen usuwania (users, groups, OAuth secret itd.).
+
+   Tokeny + shell tf-window odwzorowane z tentaflow-core/www/css/style.css.
+   ============================================================================= */
+
+:root {
+  color-scheme: dark;
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99,102,241,0.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-lg: 0 20px 60px rgba(0,0,0,0.6), 0 4px 16px rgba(0,0,0,0.4);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', -apple-system, system-ui, sans-serif;
+  font-size: 14px; line-height: 1.5;
+  min-height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+body {
+  min-height: 100vh;
+  display: flex; align-items: center; justify-content: center;
+  padding: 40px;
+  background:
+    radial-gradient(ellipse at top, rgba(99,102,241,0.08), transparent 60%),
+    radial-gradient(ellipse at bottom, rgba(167,139,250,0.05), transparent 60%),
+    var(--bg);
+}
+
+/* -------- Backdrop --------
+   Normalnie pol-przezroczysty overlay. Tutaj pokazujemy w kontekscie preview. */
+.tf-window-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(5,8,24,0.7);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 900;
+}
+
+/* -------- tf-window (confirm variant) -------- */
+.tf-window {
+  position: relative;
+  width: min(460px, calc(100vw - 32px));
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  z-index: 1000;
+  overflow: hidden;
+  animation: tf-window-in 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes tf-window-in {
+  from { opacity: 0; transform: scale(0.96) translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.tf-window-head {
+  padding: 14px 18px;
+  display: flex; align-items: center; gap: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.tf-window-head .head-ico {
+  width: 32px; height: 32px; border-radius: var(--radius-sm);
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: var(--danger);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.tf-window-head .head-ico svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-window-head .head-title {
+  flex: 1;
+  font-size: 14px; font-weight: 700; color: var(--text);
+}
+.tf-window-head .close-btn {
+  width: 28px; height: 28px; border-radius: var(--radius-sm);
+  background: transparent; border: 1px solid transparent;
+  color: var(--text-3); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: all 0.12s;
+}
+.tf-window-head .close-btn:hover { background: var(--bg-3); color: var(--text); border-color: var(--border); }
+.tf-window-head .close-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+.tf-window-body {
+  padding: 18px 20px 14px;
+}
+.tf-window-body .lead {
+  font-size: 13px; color: var(--text-2); line-height: 1.65;
+  margin-bottom: 16px;
+}
+.tf-window-body .lead strong { color: var(--text); font-weight: 700; }
+
+/* Peer summary card — pokazuje kogo dokladnie usuwamy */
+.peer-summary {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 14px;
+}
+.peer-summary .peer-ico {
+  width: 38px; height: 38px; border-radius: var(--radius-sm);
+  background: rgba(99,102,241,0.14);
+  border: 1px solid rgba(99,102,241,0.3);
+  color: var(--accent-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.peer-summary .peer-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; }
+.peer-summary .peer-meta { flex: 1; min-width: 0; }
+.peer-summary .peer-name {
+  font-size: 13px; font-weight: 700; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.peer-summary .peer-id {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10.5px; color: var(--text-3);
+  margin-top: 3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Consequence bulletlist — co zostanie zrobione po potwierdzeniu */
+.consequences {
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 12px 14px;
+  background: rgba(239, 68, 68, 0.06);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  border-radius: var(--radius-sm);
+}
+.consequences .item {
+  display: flex; align-items: flex-start; gap: 8px;
+  font-size: 12px; color: var(--text-2);
+  line-height: 1.5;
+}
+.consequences .item svg {
+  width: 12px; height: 12px; margin-top: 3px;
+  stroke: var(--danger); fill: none; stroke-width: 2.2;
+  flex-shrink: 0;
+}
+
+.tf-window-foot {
+  padding: 12px 18px 14px;
+  display: flex; justify-content: flex-end; gap: 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+}
+
+/* -------- tf-button (ghost + danger) -------- */
+.tf-button {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 9px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px; font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 0.12s;
+  font-family: inherit;
+  background: transparent; color: var(--text);
+  white-space: nowrap;
+  min-height: 36px;
+}
+.tf-button svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-button.ghost {
+  background: var(--bg-3); color: var(--text-2); border-color: var(--border);
+}
+.tf-button.ghost:hover { background: var(--bg-card-hover); color: var(--text); border-color: var(--border-hover); }
+.tf-button.danger {
+  background: var(--danger); color: white;
+  border-color: var(--danger);
+  box-shadow: 0 2px 10px rgba(239, 68, 68, 0.25);
+}
+.tf-button.danger:hover { filter: brightness(1.08); }
+.tf-button:focus-visible {
+  outline: 2px solid var(--accent-1);
+  outline-offset: 2px;
+}
+
+/* Mobile tweaks — iOS WKWebView viewport */
+@media (max-width: 520px) {
+  .tf-window { width: 100%; max-width: 100%; margin: 0 12px; border-radius: var(--radius); }
+  .tf-window-foot { flex-direction: column-reverse; gap: 8px; }
+  .tf-window-foot .tf-button { width: 100%; justify-content: center; padding: 12px 16px; min-height: 44px; }
+}
+</style>
+</head>
+<body>
+
+<!-- Backdrop (pol-przezroczysty overlay z blur) -->
+<div class="tf-window-backdrop"></div>
+
+<!-- =============================================================================
+     Revoke trust dialog — mockup.
+     Struktura: head (ikona warning + tytul + close), body (lead + peer card +
+     consequences), foot (Anuluj + Usun).
+     ============================================================================= -->
+
+<div class="tf-window" role="dialog" aria-modal="true" aria-labelledby="rv-title">
+
+  <div class="tf-window-head">
+    <div class="head-ico">
+      <!-- lucide: alert-triangle -->
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+        <line x1="12" y1="9" x2="12" y2="13"/>
+        <line x1="12" y1="17" x2="12.01" y2="17"/>
+      </svg>
+    </div>
+    <div class="head-title" id="rv-title">Usunąć sparowanie?</div>
+    <button class="close-btn" type="button" aria-label="Zamknij">
+      <!-- lucide: x -->
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="18" y1="6" x2="6" y2="18"/>
+        <line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+
+  <div class="tf-window-body">
+    <p class="lead">
+      Usuniesz ten node z listy sparowanych. Od razu rozłączymy sesję mesh
+      i wyczyścimy jego klucz publiczny z tego urządzenia.
+    </p>
+
+    <!-- Podsumowanie peera -->
+    <div class="peer-summary">
+      <div class="peer-ico">
+        <!-- lucide: cpu -->
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="4" width="16" height="16" rx="2" ry="2"/>
+          <rect x="9" y="9" width="6" height="6"/>
+          <line x1="9" y1="2" x2="9" y2="4"/>
+          <line x1="15" y1="2" x2="15" y2="4"/>
+          <line x1="9" y1="20" x2="9" y2="22"/>
+          <line x1="15" y1="20" x2="15" y2="22"/>
+          <line x1="20" y1="9" x2="22" y2="9"/>
+          <line x1="20" y1="14" x2="22" y2="14"/>
+          <line x1="2" y1="9" x2="4" y2="9"/>
+          <line x1="2" y1="14" x2="4" y2="14"/>
+        </svg>
+      </div>
+      <div class="peer-meta">
+        <div class="peer-name">Piotrs-MacBook-Pro-747.local</div>
+        <div class="peer-id">171a9826251b873d328c4b5285307d83b2916482d500f8cc2e81280d03de5eb1</div>
+      </div>
+    </div>
+
+    <!-- Konsekwencje -->
+    <div class="consequences">
+      <div class="item">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Połączenie mesh zostanie natychmiast zerwane.
+      </div>
+      <div class="item">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Klucz publiczny peera zostanie usunięty z tego urządzenia.
+      </div>
+      <div class="item">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Żeby połączyć się ponownie, trzeba będzie sparować od zera (QR albo PIN).
+      </div>
+    </div>
+  </div>
+
+  <div class="tf-window-foot">
+    <button class="tf-button ghost" type="button" data-action="cancel">Anuluj</button>
+    <button class="tf-button danger" type="button" data-action="confirm">
+      <!-- lucide: trash -->
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="3 6 5 6 21 6"/>
+        <path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>
+        <path d="M10 11v6"/>
+        <path d="M14 11v6"/>
+        <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>
+      </svg>
+      Usuń sparowanie
+    </button>
+  </div>
+</div>
+
+</body>
+</html>

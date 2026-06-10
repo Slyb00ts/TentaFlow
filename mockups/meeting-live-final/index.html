@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Meeting Live View (mockup)</title>
+<style>
+/* =============================================================================
+   CSS variables & base — zrzut z tentaflow-core/www/css/style.css
+   (sekcje :root, .tf-screen*, .tf-detail-header, .tf-section-card,
+    .tf-accounts-table, .tf-breadcrumb, status-pill, role-pill).
+   Dodane style specyficzne dla Meeting Live — .meet-*.
+   ============================================================================= */
+
+:root {
+  color-scheme: dark;
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 2px 6px rgba(0,0,0,0.4);
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Manrope', -apple-system, system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+body { display: flex; flex-direction: column; overflow: hidden; }
+
+/* -------- tf-screen shell -------- */
+.tf-screen {
+  display: flex; flex-direction: column;
+  flex: 1; min-height: 0; height: 100%;
+  background: var(--bg);
+  overflow: hidden;
+}
+.tf-screen-head {
+  flex-shrink: 0;
+  padding: 22px 26px 0;
+}
+.tf-screen-head__crumbs { margin-bottom: 12px; }
+.tf-screen-head__header { margin-bottom: 16px; }
+.tf-screen-body {
+  flex: 1; min-height: 0;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 20px 26px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-hover) transparent;
+}
+.tf-screen-body::-webkit-scrollbar { width: 8px; }
+.tf-screen-body::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 10px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+
+/* -------- Breadcrumb -------- */
+.tf-breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-3);
+}
+.tf-breadcrumb .crumb { color: var(--text-2); cursor: pointer; transition: color 0.12s; }
+.tf-breadcrumb .crumb:hover { color: var(--accent-2); }
+.tf-breadcrumb .crumb.current { color: var(--text); font-weight: 600; cursor: default; }
+.tf-breadcrumb .sep { opacity: 0.5; display: inline-flex; align-items: center; }
+.tf-breadcrumb .sep svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+/* -------- Detail header -------- */
+.tf-detail-header {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  display: flex; align-items: center; gap: 18px;
+}
+.tf-detail-header .big-ico {
+  width: 60px; height: 60px;
+  border-radius: var(--radius);
+  background: var(--gradient-accent);
+  color: white;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  font-weight: 800; font-size: 22px;
+}
+.tf-detail-header .big-ico svg { width: 28px; height: 28px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-detail-header .d-meta { flex: 1; min-width: 0; }
+.tf-detail-header .d-name {
+  font-size: 20px; font-weight: 800; color: var(--text);
+  display: flex; align-items: center; gap: 10px;
+}
+.tf-detail-header .d-sub { font-size: 12px; color: var(--text-3); margin-top: 4px; }
+.tf-detail-header .d-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+/* -------- Section card -------- */
+.tf-section-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 14px;
+}
+.tf-section-card h3 {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+  font-size: 12px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--accent-2);
+  margin: 0 0 12px;
+}
+.tf-section-card h3 .counter {
+  font-size: 10px; color: var(--text-3);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+/* -------- tf-button odwzorowany -------- */
+.tf-button {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px; font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 0.12s;
+  font-family: inherit;
+  background: transparent; color: var(--text);
+  white-space: nowrap;
+}
+.tf-button svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-button.primary {
+  background: var(--gradient-accent); color: white;
+  border-color: transparent;
+  box-shadow: 0 2px 10px var(--accent-glow);
+}
+.tf-button.primary:hover { filter: brightness(1.1); }
+.tf-button.ghost {
+  background: var(--bg-3); color: var(--text-2);
+  border-color: var(--border);
+}
+.tf-button.ghost:hover { background: var(--bg-card-hover); color: var(--text); border-color: var(--border-hover); }
+.tf-button.danger {
+  background: rgba(239, 68, 68, 0.12); color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.tf-button.danger:hover { background: rgba(239, 68, 68, 0.2); }
+
+/* -------- tf-chip -------- */
+.tf-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px; font-weight: 700;
+  letter-spacing: 0.04em;
+  background: var(--bg-3); color: var(--text-2);
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+}
+.tf-chip.success { background: rgba(34, 197, 94, 0.14); color: var(--success); border-color: rgba(34, 197, 94, 0.3); }
+.tf-chip.warning { background: rgba(245, 158, 11, 0.14); color: var(--warning); border-color: rgba(245, 158, 11, 0.3); }
+.tf-chip.danger  { background: rgba(239, 68, 68, 0.14); color: var(--danger); border-color: rgba(239, 68, 68, 0.3); }
+.tf-chip.info    { background: rgba(96, 165, 250, 0.14); color: var(--info); border-color: rgba(96, 165, 250, 0.3); }
+.tf-chip.accent  { background: rgba(167, 139, 250, 0.14); color: var(--accent-2); border-color: rgba(167, 139, 250, 0.3); }
+.tf-chip .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* -------- tf-toggle (mały) -------- */
+.tf-toggle {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--text-2); font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+.tf-toggle .track {
+  width: 32px; height: 18px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  position: relative;
+  transition: all 0.15s;
+}
+.tf-toggle .track::after {
+  content: ""; position: absolute;
+  top: 2px; left: 2px;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--text-3);
+  transition: all 0.15s;
+}
+.tf-toggle.on .track { background: var(--accent-1); border-color: var(--accent-1); }
+.tf-toggle.on .track::after { left: 16px; background: white; }
+
+/* -------- tf-tabs (underline variant) -------- */
+.tf-tabs {
+  display: flex; align-items: center;
+  border-bottom: 1px solid var(--border);
+  gap: 4px;
+  margin-bottom: 14px;
+  padding: 0 4px;
+}
+.tf-tab {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 12px 14px;
+  font-size: 13px; font-weight: 600;
+  color: var(--text-3);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: all 0.12s;
+}
+.tf-tab svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-tab:hover { color: var(--text-2); }
+.tf-tab.active { color: var(--text); border-bottom-color: var(--accent-1); }
+.tf-tab .count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 20px; height: 18px; padding: 0 6px;
+  background: var(--bg-3);
+  color: var(--text-3);
+  border-radius: 999px;
+  font-size: 10px; font-weight: 700;
+}
+.tf-tab.active .count { background: rgba(99, 102, 241, 0.18); color: var(--accent-2); }
+.tf-tabs-right {
+  margin-left: auto;
+  display: flex; align-items: center; gap: 10px;
+  padding-right: 6px;
+}
+
+/* =============================================================================
+   Meeting Live — specyficzny layout
+   ============================================================================= */
+
+.meet-live-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  .meet-live-grid { grid-template-columns: 1fr; }
+}
+
+/* Główna sekcja z tabami (lewa kolumna) — identyczny wygląd tf-section-card */
+.meet-main .tf-section-card { padding: 0; }
+.meet-main .tf-tabs { margin: 0 0 0 0; padding: 0 16px; }
+.meet-main .meet-tab-body {
+  padding: 16px 20px 20px;
+  min-height: 400px;
+}
+
+/* Transkrypt: lista wypowiedzi */
+.meet-entry {
+  display: flex; gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.meet-entry:last-child { border-bottom: 0; }
+.meet-entry-avatar {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--bg-3);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+.meet-entry-avatar.unknown {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warning);
+  border: 1px dashed rgba(245, 158, 11, 0.4);
+}
+.meet-entry-avatar svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; }
+.meet-entry-body { flex: 1; min-width: 0; }
+.meet-entry-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.meet-entry-name { font-weight: 700; color: var(--text); font-size: 13px; }
+.meet-entry-time { color: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.meet-entry-conf { color: var(--text-3); font-size: 11px; margin-left: auto; }
+.meet-entry-text {
+  font-size: 13.5px; color: var(--text-2);
+  line-height: 1.55;
+}
+
+/* Inline karta AI — wykryty action item */
+.meet-ai-detect {
+  display: flex; gap: 12px;
+  padding: 10px 14px;
+  margin: 6px 0;
+  background: rgba(167, 139, 250, 0.06);
+  border-left: 3px solid var(--accent-2);
+  border-radius: var(--radius-sm);
+}
+.meet-ai-detect .ai-ico {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--gradient-accent);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.meet-ai-detect .ai-ico svg { width: 14px; height: 14px; stroke: white; fill: none; stroke-width: 2.2; }
+.meet-ai-detect .ai-body { flex: 1; }
+.meet-ai-detect .ai-label {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+  margin-bottom: 3px;
+}
+.meet-ai-detect .ai-text {
+  font-size: 12.5px; color: var(--text);
+}
+.meet-ai-detect .ai-text strong { color: var(--accent-2); font-weight: 700; }
+
+/* Działania: grupy collapsible */
+.meet-action-group { margin-bottom: 16px; }
+.meet-action-group-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 0;
+  font-size: 11px; font-weight: 700;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.meet-action-group-head .chevron { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; transition: transform 0.15s; }
+.meet-action-group.collapsed .chevron { transform: rotate(-90deg); }
+.meet-action-group.collapsed .meet-action-items { display: none; }
+.meet-action-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 6px;
+}
+.meet-action-item .ai-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+.meet-action-item .ai-meta { flex: 1; min-width: 0; }
+.meet-action-item .ai-owner { font-size: 12px; font-weight: 700; color: var(--text); }
+.meet-action-item .ai-task { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+
+/* Podsumowanie */
+.meet-summary-text {
+  font-size: 13.5px; line-height: 1.65;
+  color: var(--text-2);
+}
+.meet-summary-sep {
+  border: 0; border-top: 1px solid var(--border);
+  margin: 18px 0;
+}
+.meet-summary-list {
+  list-style: none; padding: 0;
+}
+.meet-summary-list li {
+  position: relative;
+  padding: 6px 0 6px 20px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.meet-summary-list li::before {
+  content: ""; position: absolute;
+  left: 4px; top: 14px;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent-2);
+}
+.meet-summary-update {
+  font-size: 11px; color: var(--text-3);
+  margin-top: 14px;
+}
+
+/* Sidebar — uczestnicy, AI summary, backend */
+.meet-side .tf-section-card { padding: 14px 16px; }
+
+.meet-participant {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border-left: 2px solid transparent;
+  margin: 0 -10px;
+}
+.meet-participant.speaking {
+  background: rgba(167, 139, 250, 0.06);
+  border-left-color: var(--accent-2);
+}
+.meet-participant .p-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-3);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+.meet-participant .p-avatar.unknown {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warning);
+  border: 1px dashed rgba(245, 158, 11, 0.4);
+}
+.meet-participant .p-meta { flex: 1; min-width: 0; }
+.meet-participant .p-name {
+  font-size: 12.5px; font-weight: 600; color: var(--text);
+}
+.meet-participant .p-sub {
+  font-size: 10.5px; color: var(--text-3);
+  margin-top: 1px;
+}
+.meet-participant.speaking .p-sub { color: var(--success); font-weight: 600; }
+.meet-participant .p-mic {
+  width: 14px; height: 14px;
+  stroke: var(--text-3); fill: none; stroke-width: 2;
+  opacity: 0;
+}
+.meet-participant.speaking .p-mic { opacity: 1; stroke: var(--success); }
+
+/* AI summary panel sub-sekcje */
+.meet-ai-sub {
+  margin-top: 10px;
+}
+.meet-ai-sub:first-child { margin-top: 0; }
+.meet-ai-sub-label {
+  font-size: 10px; font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-2);
+  margin-bottom: 6px;
+}
+.meet-ai-sub-text {
+  font-size: 12.5px; color: var(--text-2);
+  line-height: 1.55;
+}
+.meet-ai-action {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border);
+  font-size: 12px;
+}
+.meet-ai-action:last-child { border-bottom: 0; }
+.meet-ai-action .owner { color: var(--text); font-weight: 600; }
+.meet-ai-action .arrow { color: var(--text-3); }
+.meet-ai-action .task { color: var(--text-2); flex: 1; min-width: 0; }
+
+/* Backend — key-value */
+.meet-kv { display: flex; flex-direction: column; gap: 6px; }
+.meet-kv-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+}
+.meet-kv-row .k { color: var(--text-3); }
+.meet-kv-row .v {
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+}
+.meet-kv-row .v.ok { color: var(--success); }
+.meet-kv-row .v.warn { color: var(--warning); }
+.meet-kv-row .v.err { color: var(--danger); }
+
+/* -------- Footer -------- */
+.meet-footer {
+  flex-shrink: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap;
+  padding: 10px 26px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.meet-footer .live-dot {
+  display: inline-flex; align-items: center; gap: 8px;
+  color: var(--text-2);
+}
+.meet-footer .live-dot::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent-1);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.meet-footer .mono {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+</style>
+</head>
+<body>
+
+<!-- =============================================================================
+     Meeting Live View — mockup finalny do zatwierdzenia.
+     Semantyka: header (jak detail-header users.js) + 2-kolumny
+     (taby/transkrypt po lewej, sidebar po prawej) + sticky footer.
+     ============================================================================= -->
+
+<div class="tf-screen">
+
+  <div class="tf-screen-head">
+    <!-- Breadcrumb -->
+    <div class="tf-screen-head__crumbs">
+      <div class="tf-breadcrumb">
+        <span class="crumb">Spotkania</span>
+        <span class="sep">
+          <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+        </span>
+        <span class="crumb current">Stand-up 22.04</span>
+      </div>
+    </div>
+
+    <!-- Header karta -->
+    <div class="tf-screen-head__header">
+      <div class="tf-detail-header">
+        <div class="big-ico">
+          <!-- ikona video (lucide: video) -->
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+        </div>
+        <div class="d-meta">
+          <div class="d-name">
+            Stand-up 22.04
+            <span class="tf-chip success"><span class="dot"></span>Live</span>
+          </div>
+          <div class="d-sub">4 uczestników · 14 min 32 s · Microsoft Teams</div>
+        </div>
+        <div class="d-actions">
+          <button class="tf-button ghost">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            Podgląd ekranu
+          </button>
+          <button class="tf-button ghost">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Pobierz .txt
+          </button>
+          <button class="tf-button danger">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            Opuść
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tf-screen-body">
+    <div class="meet-live-grid">
+
+      <!-- ============================== LEWA KOLUMNA ============================== -->
+      <section class="meet-main">
+        <div class="tf-section-card">
+
+          <!-- Tabs -->
+          <div class="tf-tabs" id="meet-tabs">
+            <div class="tf-tab active" data-tab="transcript">
+              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+              Transkrypt
+              <span class="count">87 wpisów</span>
+            </div>
+            <div class="tf-tab" data-tab="actions">
+              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+              Działania
+              <span class="count">4</span>
+            </div>
+            <div class="tf-tab" data-tab="summary">
+              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.09 6.26L20 9l-5 4.87L16.18 22 12 18.27 7.82 22 9 13.87 4 9l5.91-.74z"/></svg>
+              Podsumowanie
+            </div>
+            <div class="tf-tabs-right">
+              <label class="tf-toggle on" id="ai-toggle">
+                <span class="track"></span>
+                <span>AI insights</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- ========== Tab: Transkrypt ========== -->
+          <div class="meet-tab-body" data-tab-body="transcript">
+            <!-- Autoscroll do dolu bedzie w modules/meeting-live.js (requestAnimationFrame po appendChild) -->
+
+            <div class="meet-entry">
+              <div class="meet-entry-avatar">MK</div>
+              <div class="meet-entry-body">
+                <div class="meet-entry-head">
+                  <span class="meet-entry-name">Maja K.</span>
+                  <span class="meet-entry-time">00:00:12</span>
+                  <span class="tf-chip success">known</span>
+                  <span class="meet-entry-conf">conf 94%</span>
+                </div>
+                <div class="meet-entry-text">Dzień dobry, zaczynamy stand-up. Krystian, co masz na dziś?</div>
+              </div>
+            </div>
+
+            <div class="meet-entry">
+              <div class="meet-entry-avatar">AK</div>
+              <div class="meet-entry-body">
+                <div class="meet-entry-head">
+                  <span class="meet-entry-name">Admin Krystian</span>
+                  <span class="meet-entry-time">00:00:24</span>
+                  <span class="tf-chip success">known</span>
+                  <span class="meet-entry-conf">conf 91%</span>
+                </div>
+                <div class="meet-entry-text">Skończyłem review PR #142, dzisiaj do 16:00 wrzucę jeszcze fix do routingu QUIC.</div>
+              </div>
+            </div>
+
+            <!-- Inline AI detect -->
+            <div class="meet-ai-detect">
+              <div class="ai-ico">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.09 6.26L20 9l-5 4.87L16.18 22 12 18.27 7.82 22 9 13.87 4 9l5.91-.74z"/></svg>
+              </div>
+              <div class="ai-body">
+                <div class="ai-label">Wykryto action item</div>
+                <div class="ai-text"><strong>Krystian</strong> → fix routingu QUIC · <span style="color: var(--success);">dziś 16:00</span></div>
+              </div>
+            </div>
+
+            <div class="meet-entry">
+              <div class="meet-entry-avatar">TP</div>
+              <div class="meet-entry-body">
+                <div class="meet-entry-head">
+                  <span class="meet-entry-name">Tomek P.</span>
+                  <span class="meet-entry-time">00:01:02</span>
+                  <span class="tf-chip success">known</span>
+                  <span class="meet-entry-conf">conf 96%</span>
+                </div>
+                <div class="meet-entry-text">Ja dzisiaj ogarniam screen share w mockupach, ale potrzebuję review po merge od kogoś z Was.</div>
+              </div>
+            </div>
+
+            <!-- Unknown speaker -->
+            <div class="meet-entry">
+              <div class="meet-entry-avatar unknown">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              </div>
+              <div class="meet-entry-body">
+                <div class="meet-entry-head">
+                  <span class="meet-entry-name">SPEAKER_04</span>
+                  <span class="meet-entry-time">00:02:17</span>
+                  <span class="tf-chip warning">tymczasowy</span>
+                  <span class="meet-entry-conf">conf 72%</span>
+                </div>
+                <div class="meet-entry-text">Ja mogę wziąć review po merge Tomka, tylko daj znać na slacku jak będzie gotowe.</div>
+              </div>
+            </div>
+
+            <div class="meet-ai-detect">
+              <div class="ai-ico">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.09 6.26L20 9l-5 4.87L16.18 22 12 18.27 7.82 22 9 13.87 4 9l5.91-.74z"/></svg>
+              </div>
+              <div class="ai-body">
+                <div class="ai-label">Wykryto action item</div>
+                <div class="ai-text"><strong>SPEAKER_04</strong> → review PR Tomka · <span style="color: var(--text-3);">po merge</span></div>
+              </div>
+            </div>
+
+            <div class="meet-entry">
+              <div class="meet-entry-avatar">MK</div>
+              <div class="meet-entry-body">
+                <div class="meet-entry-head">
+                  <span class="meet-entry-name">Maja K.</span>
+                  <span class="meet-entry-time">00:03:41</span>
+                  <span class="tf-chip success">known</span>
+                  <span class="meet-entry-conf">conf 93%</span>
+                </div>
+                <div class="meet-entry-text">OK, to ja finalizuję dokumentację mesh-pair flow, ale bez deadline'u na razie — kończę jak skończę.</div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- ========== Tab: Działania ========== -->
+          <div class="meet-tab-body" data-tab-body="actions" hidden>
+
+            <div class="meet-action-group">
+              <div class="meet-action-group-head">
+                <svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+                Otwarte (3)
+              </div>
+              <div class="meet-action-items">
+                <div class="meet-action-item">
+                  <div class="ai-avatar">AK</div>
+                  <div class="ai-meta">
+                    <div class="ai-owner">Admin Krystian</div>
+                    <div class="ai-task">fix routingu QUIC</div>
+                  </div>
+                  <span class="tf-chip success">dziś 16:00</span>
+                  <label class="tf-toggle"><span class="track"></span>pending</label>
+                </div>
+                <div class="meet-action-item">
+                  <div class="ai-avatar" style="background: rgba(245,158,11,0.1); color: var(--warning); border:1px dashed rgba(245,158,11,0.4);">?</div>
+                  <div class="ai-meta">
+                    <div class="ai-owner">SPEAKER_04</div>
+                    <div class="ai-task">review PR Tomka</div>
+                  </div>
+                  <span class="tf-chip accent">po merge</span>
+                  <label class="tf-toggle"><span class="track"></span>pending</label>
+                </div>
+                <div class="meet-action-item">
+                  <div class="ai-avatar">MK</div>
+                  <div class="ai-meta">
+                    <div class="ai-owner">Maja K.</div>
+                    <div class="ai-task">dokumentacja mesh-pair flow</div>
+                  </div>
+                  <span class="tf-chip danger">brak daty</span>
+                  <label class="tf-toggle"><span class="track"></span>pending</label>
+                </div>
+              </div>
+            </div>
+
+            <div class="meet-action-group collapsed">
+              <div class="meet-action-group-head">
+                <svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+                Zakończone (1)
+              </div>
+              <div class="meet-action-items">
+                <div class="meet-action-item">
+                  <div class="ai-avatar">AK</div>
+                  <div class="ai-meta">
+                    <div class="ai-owner">Admin Krystian</div>
+                    <div class="ai-task">review PR #142</div>
+                  </div>
+                  <span class="tf-chip success">done</span>
+                  <label class="tf-toggle on"><span class="track"></span>done</label>
+                </div>
+              </div>
+            </div>
+
+            <div class="meet-action-group collapsed">
+              <div class="meet-action-group-head">
+                <svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+                Anulowane (0)
+              </div>
+              <div class="meet-action-items"></div>
+            </div>
+
+          </div>
+
+          <!-- ========== Tab: Podsumowanie ========== -->
+          <div class="meet-tab-body" data-tab-body="summary" hidden>
+            <div class="meet-summary-text">
+              Zespół omawia bieżące zadania stand-upu. Krystian finalizuje fix routingu QUIC z deadline'em na dziś 16:00, Tomek przygotowuje screen share w mockupach i oczekuje review po merge. SPEAKER_04 (nieenrollowany) deklaruje się do wykonania review. Maja domyka dokumentację mesh-pair flow bez sztywnego terminu.
+            </div>
+
+            <hr class="meet-summary-sep">
+
+            <div class="meet-ai-sub-label">Kluczowe decyzje</div>
+            <ul class="meet-summary-list">
+              <li>Fix routingu QUIC ma być gotowy dziś do 16:00 (Krystian).</li>
+              <li>Review PR Tomka obejmuje SPEAKER_04 — do doprecyzowania po enrollmencie.</li>
+              <li>Dokumentacja mesh-pair flow bez deadline'u — best effort.</li>
+            </ul>
+
+            <div class="meet-summary-update">Aktualizacja 12 s temu · qwen-3.5-0.8b</div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ============================== PRAWA KOLUMNA (SIDEBAR) ============================== -->
+      <aside class="meet-side">
+
+        <!-- Uczestnicy -->
+        <div class="tf-section-card">
+          <h3>Uczestnicy <span class="counter">(4)</span></h3>
+
+          <div class="meet-participant speaking">
+            <div class="p-avatar">MK</div>
+            <div class="p-meta">
+              <div class="p-name">Maja K.</div>
+              <div class="p-sub">Enrolled · mówi teraz</div>
+            </div>
+            <svg class="p-mic" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
+          </div>
+
+          <div class="meet-participant">
+            <div class="p-avatar">TP</div>
+            <div class="p-meta">
+              <div class="p-name">Tomek P.</div>
+              <div class="p-sub">Enrolled · 42 s temu</div>
+            </div>
+          </div>
+
+          <div class="meet-participant">
+            <div class="p-avatar">AK</div>
+            <div class="p-meta">
+              <div class="p-name">Admin Krystian</div>
+              <div class="p-sub">Enrolled · 2 min temu</div>
+            </div>
+          </div>
+
+          <div class="meet-participant">
+            <div class="p-avatar unknown">?</div>
+            <div class="p-meta">
+              <div class="p-name">SPEAKER_04</div>
+              <div class="p-sub">Nieenrollowany · 18 s temu</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AI summary (live) -->
+        <div class="tf-section-card">
+          <h3>AI Summary (live)</h3>
+
+          <div class="meet-ai-sub">
+            <div class="meet-ai-sub-label">Kluczowe decyzje</div>
+            <div class="meet-ai-sub-text">
+              Fix routingu QUIC dostarczony dziś 16:00. Review PR Tomka po merge u SPEAKER_04. Dokumentacja mesh-pair bez deadline'u.
+            </div>
+          </div>
+
+          <div class="meet-ai-sub">
+            <div class="meet-ai-sub-label">Action items (4)</div>
+            <div class="meet-ai-action">
+              <span class="owner">Krystian</span>
+              <span class="arrow">→</span>
+              <span class="task">fix QUIC</span>
+              <span class="tf-chip success">dziś 16:00</span>
+            </div>
+            <div class="meet-ai-action">
+              <span class="owner">SPEAKER_04</span>
+              <span class="arrow">→</span>
+              <span class="task">review PR</span>
+              <span class="tf-chip accent">po merge</span>
+            </div>
+            <div class="meet-ai-action">
+              <span class="owner">Tomek</span>
+              <span class="arrow">→</span>
+              <span class="task">screen share mockup</span>
+              <span class="tf-chip success">dziś</span>
+            </div>
+            <div class="meet-ai-action">
+              <span class="owner">Maja</span>
+              <span class="arrow">→</span>
+              <span class="task">docs mesh-pair</span>
+              <span class="tf-chip danger">brak daty</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Backend -->
+        <div class="tf-section-card">
+          <h3>Backend</h3>
+          <div class="meet-kv">
+            <div class="meet-kv-row"><span class="k">STT</span><span class="v">whisper-large-v3</span></div>
+            <div class="meet-kv-row"><span class="k">Diaryzacja</span><span class="v">pyannote-3.1</span></div>
+            <div class="meet-kv-row"><span class="k">LLM summary</span><span class="v">qwen-3.5-0.8b</span></div>
+            <div class="meet-kv-row"><span class="k">Latency</span><span class="v ok">220 ms</span></div>
+            <div class="meet-kv-row"><span class="k">Enrolled speakers</span><span class="v">3/4</span></div>
+          </div>
+        </div>
+
+      </aside>
+
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer class="meet-footer">
+    <span class="live-dot">Słucha · ostatni wpis 2 s temu · ~220 ms latency</span>
+    <span class="mono">whisper-large-v3 · pyannote-3.1</span>
+  </footer>
+
+</div>
+
+<script>
+  // Tabs: klik w .tf-tab przelacza active + hide/show .meet-tab-body.
+  // W docelowej implementacji (modules/meeting-live.js) zastapione przez <tf-tabs>.
+  document.getElementById('meet-tabs').addEventListener('click', (e) => {
+    const tab = e.target.closest('.tf-tab');
+    if (!tab) return;
+    const id = tab.dataset.tab;
+    document.querySelectorAll('#meet-tabs .tf-tab').forEach(t => t.classList.toggle('active', t === tab));
+    document.querySelectorAll('[data-tab-body]').forEach(b => {
+      b.hidden = b.dataset.tabBody !== id;
+    });
+  });
+
+  // Collapse akcji.
+  document.querySelectorAll('.meet-action-group-head').forEach(h => {
+    h.addEventListener('click', () => h.parentElement.classList.toggle('collapsed'));
+  });
+
+  // Toggle AI insights (czysto wizualny w mockupie).
+  document.getElementById('ai-toggle').addEventListener('click', (e) => {
+    e.currentTarget.classList.toggle('on');
+  });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>TentaFlow — Katalog ról (O2)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css"></head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8z"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778"/></symbol>
+<symbol id="i-briefcase" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>TentaFlow — Katalog ról (O2)</h1>
+  <p class="lead">
+    <strong>Addon-agnostyczny katalog ról.</strong> Rola opisuje <em>kto to jest</em> (Handlowiec L2 / PM techniczny / Decydent klienta), <strong>nie co może robić</strong>.
+    Co rola realnie może robić w danym addonie konfigurujesz w <a href="p02-permissions.html">P2 Permissions</a> jako reguły referujące tę rolę (np. „role=handlowiec_l2 może read+write deal gdy owner_is_self").
+    Tutaj jest tylko: nazwa, kind, opis, ikona, kolor, default visibility scope (orientacyjny dla addonów), platformowa flaga <code>is_manager</code> (potrzebna do layoutu drzewa w O1).
+  </p>
+  <div class="rules">
+    <div class="rule"><h3>Tylko strukturalne atrybuty</h3><p>Brak flag typu <code>can_close_deal</code>, <code>can_approve_budget</code>, <code>can_refacture_cost</code> — to akcje per addon. Tu tylko rzeczy które addon-agnostycznie opisują pozycję (kind, scope, is_manager).</p></div>
+    <div class="rule"><h3>Per-addon capabilities</h3><p>CRM ma własne settings „capabilities" gdzie admin łączy role z akcjami CRMowymi. Billing tak samo. Każdy addon decyduje sam.</p></div>
+    <div class="rule"><h3>Migracja z IntrApp</h3><p>Seedujemy 14 ról ze starego <code>JobType</code> jako wstępny katalog — admin potem edytuje. Wszystkie addon-specific flagi IntrAppa lądują jako reguły w P2, nie tutaj.</p></div>
+  </div>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">O2</span><h2>Katalog ról — CRUD</h2><div class="desc">14 ról aktywnych · 9 zaimportowane z IntrApp · 5 dodane ręcznie.</div></div>
+
+<div class="screen-frame">
+<div class="tf-shell">
+
+<aside class="tf-side">
+  <div class="tf-logo"><div class="tf-octo">tf</div><span>TentaFlow</span></div>
+  <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+  <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+  <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+  <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">14</span></div>
+  <div class="tf-item active"><svg class="icon"><use href="#i-network"/></svg>Struktura organizacyjna</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-key"/></svg>Uprawnienia (RBAC)</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+  <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-deal"/></svg>CRM</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+  <div class="tf-bottom">
+    <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+    <div class="tf-user"><div class="av amber">TW</div><div><div class="nm">Tomasz Wójcik</div><div class="rl">Admin</div></div></div>
+    <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+  </div>
+</aside>
+
+<main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>Struktura organizacyjna</strong><span class="sep">›</span><span>Katalog ról</span></div>
+  <div class="pill-tabs">
+    <button class="pill-tab"><a href="o01-org-structure.html" style="color:inherit;display:flex;align-items:center;gap:6px;text-decoration:none;"><svg class="icon"><use href="#i-network"/></svg>Drzewo</a></button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-grid"/></svg>Lista</button>
+    <button class="pill-tab active"><svg class="icon"><use href="#i-key"/></svg>Katalog ról</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-shield-check"/></svg>Widoczność danych</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-history"/></svg>Historia zmian</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj roli…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowa rola</button>
+  </div>
+</div>
+
+<!-- KPI -->
+<div class="kpi-grid" style="grid-template-columns:repeat(5,1fr);">
+  <div class="kpi"><div class="label">Wszystkich ról</div><div class="value num">14</div><div class="delta">9 z IntrApp + 5 dodane</div><div class="kpi-bar"></div></div>
+  <div class="kpi"><div class="label">Sales</div><div class="value num">3</div><div class="delta">Handlowiec L1/L2/Lead</div><div class="kpi-bar"></div></div>
+  <div class="kpi"><div class="label">Technical</div><div class="value num">5</div><div class="delta">PM/Arch/Konsult.</div><div class="kpi-bar"></div></div>
+  <div class="kpi"><div class="label">Management</div><div class="value num">3</div><div class="delta">Dyrektorzy/Prezes</div><div class="kpi-bar"></div></div>
+  <div class="kpi"><div class="label">External (klient)</div><div class="value num">3</div><div class="delta">Decydent/Sponsor/User</div><div class="kpi-bar"></div></div>
+</div>
+
+<div class="flex gap-sm mb-md">
+  <div class="filter-chip active">Wszystkie<span class="count">14</span></div>
+  <div class="filter-chip">sales<span class="count">3</span></div>
+  <div class="filter-chip">technical<span class="count">5</span></div>
+  <div class="filter-chip">management<span class="count">3</span></div>
+  <div class="filter-chip">external<span class="count">3</span></div>
+</div>
+
+<!-- TABELA ról — bez addon-specific flag, tylko strukturalne -->
+<table class="tf-table">
+<thead><tr><th></th><th>Nazwa</th><th>Kind</th><th>is_manager</th><th>Default visibility scope</th><th>Użycie</th><th></th></tr></thead>
+<tbody>
+
+<!-- SALES -->
+<tr>
+  <td><div class="av sm indigo"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-briefcase"/></svg></div></td>
+  <td><strong>Handlowiec L1</strong><div class="text-xs text-3">Junior · podstawowa rola sprzedażowa</div></td>
+  <td><span class="chip accent">sales</span></td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">assigned (default)</span></td>
+  <td><span class="chip" style="font-size:9px">12 osób</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr>
+  <td><div class="av sm indigo"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-briefcase"/></svg></div></td>
+  <td><strong>Handlowiec L2</strong><div class="text-xs text-3">Senior · samodzielny</div></td>
+  <td><span class="chip accent">sales</span></td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">own + section</span></td>
+  <td><span class="chip" style="font-size:9px">8 osób</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr>
+  <td><div class="av sm indigo"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-briefcase"/></svg></div></td>
+  <td><strong>Sales Lead</strong><div class="text-xs text-3">Lider zespołu sprzedażowego</div></td>
+  <td><span class="chip accent">sales</span></td>
+  <td><span class="chip success" style="font-size:9px"><span class="dot"></span>tak</span></td>
+  <td><span class="chip" style="font-size:9px">own + subordinates</span></td>
+  <td><span class="chip" style="font-size:9px">3 osoby</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+
+<!-- TECHNICAL -->
+<tr>
+  <td><div class="av sm amber"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-briefcase"/></svg></div></td>
+  <td><strong>PM techniczny</strong><div class="text-xs text-3">Kierownik wdrożenia · prowadzi realizację</div></td>
+  <td><span class="chip warning">technical</span></td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">assigned</span></td>
+  <td><span class="chip" style="font-size:9px">3 osoby</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr>
+  <td><div class="av sm amber"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-briefcase"/></svg></div></td>
+  <td><strong>Senior Architekt</strong><div class="text-xs text-3">Wsparcie techniczne · presales</div></td>
+  <td><span class="chip warning">technical</span></td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">assigned</span></td>
+  <td><span class="chip" style="font-size:9px">2 osoby</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr>
+  <td><div class="av sm amber"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-briefcase"/></svg></div></td>
+  <td><strong>Konsultant techniczny</strong><div class="text-xs text-3">Doradca w fazie oferty/realizacji</div></td>
+  <td><span class="chip warning">technical</span></td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">assigned</span></td>
+  <td><span class="chip" style="font-size:9px">5 osób · 1 wakat</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr>
+  <td><div class="av sm amber"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-briefcase"/></svg></div></td>
+  <td><strong>Programista</strong><div class="text-xs text-3">Realizacja · developer</div></td>
+  <td><span class="chip warning">technical</span></td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">assigned</span></td>
+  <td><span class="chip" style="font-size:9px">12 osób</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr>
+  <td><div class="av sm amber"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-briefcase"/></svg></div></td>
+  <td><strong>Tester / QA</strong><div class="text-xs text-3">Realizacja · weryfikacja</div></td>
+  <td><span class="chip warning">technical</span></td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">assigned</span></td>
+  <td><span class="chip" style="font-size:9px">4 osoby</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+
+<!-- MANAGEMENT -->
+<tr style="background:rgba(99,102,241,0.04);">
+  <td><div class="av sm amber"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-shield"/></svg></div></td>
+  <td><strong>Dyrektor sekcji</strong><div class="text-xs text-3">Lider sekcji sprzedażowej</div></td>
+  <td><span class="chip">management</span></td>
+  <td><span class="chip success" style="font-size:9px"><span class="dot"></span>tak</span></td>
+  <td><span class="chip" style="font-size:9px">section</span></td>
+  <td><span class="chip" style="font-size:9px">3 stanowiska</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr style="background:rgba(99,102,241,0.04);">
+  <td><div class="av sm amber"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-shield"/></svg></div></td>
+  <td><strong>Dyrektor handlowy</strong><div class="text-xs text-3">Dział sprzedaży</div></td>
+  <td><span class="chip">management</span></td>
+  <td><span class="chip success" style="font-size:9px"><span class="dot"></span>tak</span></td>
+  <td><span class="chip" style="font-size:9px">department (transitive)</span></td>
+  <td><span class="chip" style="font-size:9px">1 stanowisko</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr style="background:rgba(99,102,241,0.04);">
+  <td><div class="av sm amber"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-shield"/></svg></div></td>
+  <td><strong>Prezes / CEO</strong><div class="text-xs text-3">Najwyższe stanowisko</div></td>
+  <td><span class="chip">management</span></td>
+  <td><span class="chip success" style="font-size:9px"><span class="dot"></span>tak</span></td>
+  <td><span class="chip" style="font-size:9px">all</span></td>
+  <td><span class="chip" style="font-size:9px">1 stanowisko</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+
+<!-- EXTERNAL (klient) -->
+<tr style="background:rgba(96,165,250,0.04);">
+  <td><div class="av sm teal"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-user"/></svg></div></td>
+  <td><strong>Decydent</strong><div class="text-xs text-3">Osoba decyzyjna po stronie klienta</div></td>
+  <td><span class="chip info">external</span></td>
+  <td>—</td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">142 kontakty</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr style="background:rgba(96,165,250,0.04);">
+  <td><div class="av sm teal"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-user"/></svg></div></td>
+  <td><strong>Influencer</strong><div class="text-xs text-3">Wpływowa osoba w kupującej organizacji</div></td>
+  <td><span class="chip info">external</span></td>
+  <td>—</td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">218 kontaktów</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+<tr style="background:rgba(96,165,250,0.04);">
+  <td><div class="av sm teal"><svg class="icon" style="width:13px;height:13px;color:white"><use href="#i-user"/></svg></div></td>
+  <td><strong>Power user / Sponsor</strong><div class="text-xs text-3">User docelowy lub sponsor biznesowy</div></td>
+  <td><span class="chip info">external</span></td>
+  <td>—</td>
+  <td>—</td>
+  <td><span class="chip" style="font-size:9px">98 kontaktów</span></td>
+  <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button></td>
+</tr>
+
+</tbody>
+</table>
+
+<!-- Banner — gdzie są akcje per addon -->
+<div class="section-card mt-md" style="background:rgba(99,102,241,0.05);border-color:rgba(99,102,241,0.25);">
+  <div class="flex align-center gap-md">
+    <svg class="icon" style="color:var(--accent-2);width:20px;height:20px;flex-shrink:0;"><use href="#i-info"/></svg>
+    <div style="flex:1;">
+      <div class="fw-700 text-sm" style="margin-bottom:4px;">Co rola może zrobić w danym addonie — konfigurujesz osobno</div>
+      <div class="text-2 text-xs" style="line-height:1.6;">
+        Akcje typu „edytuj deal", „zatwierdź budżet", „refakturuj koszt", „loguj czas" są <strong>regułami w <a href="p02-permissions.html">P2 Permissions</a></strong> i referują role z tego katalogu.
+        Przykład: reguła „role=handlowiec_l2 może <code>read+write</code> deal gdy <code>owner_is_self</code>" — utworzysz ją w P2, nie tutaj.
+        Tutaj rola to tylko <em>kto to jest</em>, w P2 <em>co może</em>.
+      </div>
+    </div>
+    <a href="p02-permissions.html" class="btn btn-sm"><svg class="icon"><use href="#i-arrow-right" style="display:none;"/><use href="#i-key"/></svg>Otwórz P2 Permissions</a>
+  </div>
+</div>
+
+<!-- Role detail editor — addon-agnostic -->
+<div class="section-card mt-md" style="border-left:3px solid var(--accent-2);">
+  <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-edit"/></svg>Edycja roli: PM techniczny</div><button class="btn btn-ghost btn-sm">Zamknij</button></div>
+
+  <div class="grid-2">
+    <div>
+      <div class="field"><label>Nazwa (UI)</label><input class="input" value="PM techniczny"></div>
+      <div class="field"><label>Slug (stała, używana w kodzie)</label><input class="input mono" value="pm_technical" disabled></div>
+      <div class="field"><label>Kind</label><select class="select"><option>technical</option><option>sales</option><option>management</option><option>external</option><option>other</option></select></div>
+      <div class="field"><label>Opis</label><textarea class="textarea">Kierownik wdrożenia. Prowadzi realizację projektu po wygranej, koordynuje zespół techniczny, kontroluje budżet i terminy.</textarea></div>
+      <div class="field"><label>Ikona</label><div class="flex gap-sm"><div class="av amber"><svg class="icon" style="color:white"><use href="#i-briefcase"/></svg></div><button class="btn btn-ghost btn-sm">Zmień</button></div></div>
+      <div class="field"><label>Kolor</label><div class="flex gap-sm"><div style="width:24px;height:24px;border-radius:6px;background:#f59e0b;"></div><button class="btn btn-ghost btn-sm">Zmień</button></div></div>
+    </div>
+    <div>
+      <div class="field">
+        <label>Platformowe traity (strukturalne)</label>
+        <div class="flex col gap-sm">
+          <label class="flex align-center gap-sm"><div class="toggle"></div><div><div>is_manager</div><div class="hint">Rola menedżerska. Używane w O1 do layoutu drzewa (manager nad podwładnymi).</div></div></label>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:14px;">
+        <label>Default visibility scope</label>
+        <select class="select">
+          <option>assigned — widzi tylko zasoby do których jest przypisany</option>
+          <option>own — widzi tylko własne (gdzie jest owner)</option>
+          <option>section — widzi swoją sekcję</option>
+          <option>department — widzi swój dział (transitive)</option>
+          <option>all — widzi wszystko</option>
+        </select>
+        <div class="hint">Tylko sugestia dla addonów liczących permissions. Każdy addon i tak może override w P2.</div>
+      </div>
+
+      <!-- Informacja o tym że akcje są w P2 -->
+      <div style="margin-top:18px;padding:12px;background:rgba(245,158,11,0.05);border:1px solid rgba(245,158,11,0.25);border-radius:8px;font-size:12px;">
+        <div class="flex align-start gap-sm">
+          <svg class="icon" style="color:var(--warning);flex-shrink:0;margin-top:2px;"><use href="#i-info"/></svg>
+          <div>
+            <strong>Brakuje flag typu can_edit_deal / can_approve_budget?</strong>
+            <div class="text-2" style="margin-top:4px;line-height:1.5;">
+              Tutaj rola jest <em>opisem kim ktoś jest</em>. To co rola realnie może zrobić w konkretnym addonie konfigurujesz w
+              <a href="p02-permissions.html">P2 Permissions</a> jako reguły (np. „role=pm_technical może edit deal gdy assigned_to_self").
+              Zapewnia to czystość: rola jest stała, reguły mogą się zmieniać per addon bez ruszania katalogu.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reguły referujące tę rolę (read-only widok z P2) -->
+  <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);">
+    <div class="flex justify-between align-center mb-md">
+      <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.08em">Reguły uprawnień używające tej roli (read-only — edycja w P2)</div>
+      <a href="p02-permissions.html?filter=role:pm_technical" class="btn btn-ghost btn-sm">Otwórz w P2 →</a>
+    </div>
+    <table class="tf-table" style="font-size:12px;">
+      <thead><tr><th>Reguła</th><th>Addon</th><th>Action</th><th>Resource</th><th>Condition</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>PM edytuje przypisane deale</td>
+          <td><span class="chip accent">crm</span></td>
+          <td><span class="chip">read+write</span></td>
+          <td>deal</td>
+          <td class="text-xs"><code>assigned_to_self</code></td>
+          <td><span class="chip success">allow</span></td>
+        </tr>
+        <tr>
+          <td>PM loguje czas na projekcie</td>
+          <td><span class="chip">timesheet</span></td>
+          <td><span class="chip">write</span></td>
+          <td>time_entry</td>
+          <td class="text-xs"><code>assigned_to_project_of_entry</code></td>
+          <td><span class="chip success">allow</span></td>
+        </tr>
+        <tr>
+          <td>PM widzi karty akceptacji swoich projektów</td>
+          <td><span class="chip accent">crm</span></td>
+          <td><span class="chip">read</span></td>
+          <td>acceptance_card</td>
+          <td class="text-xs"><code>deal_assigned_to_self</code></td>
+          <td><span class="chip success">allow</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="flex justify-between mt-md" style="padding-top:14px;border-top:1px solid var(--border);">
+    <div class="text-xs text-3">Zmiany dotkną <strong style="color:var(--text-2)">3 osoby</strong> aktualnie pełniące tę rolę. Recalculation uprawnień ~5s.</div>
+    <div class="flex gap-sm">
+      <button class="btn btn-ghost"><svg class="icon"><use href="#i-trash"/></svg>Usuń rolę</button>
+      <button class="btn">Anuluj</button>
+      <button class="btn btn-primary">Zapisz</button>
+    </div>
+  </div>
+</div>
+
+</main>
+</div></div>
+</section>
+
+</body>
+</html>

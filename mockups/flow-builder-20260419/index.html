@@ -1,0 +1,2143 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: index.html
+     Opis: Mockup Flow Buildera dla TentaFlow (statyczny HTML+CSS).
+           Pokazuje finalny design do zatwierdzenia przed implementacja.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TentaFlow Flow Builder — Mockup</title>
+  <style>
+    /* =============================================================================
+       Design tokens (z controls.css + style.css) — wklejone inline dla self-contained
+       ============================================================================= */
+    :root {
+      --tf-bg: #050818;
+      --tf-bg-2: #0a0e22;
+      --tf-bg-3: #131736;
+      --tf-bg-card: #141836;
+      --tf-bg-card-hover: #1a1f45;
+      --tf-bg-input: #0b0e22;
+      --tf-border: #1f2548;
+      --tf-border-hover: #2f3668;
+      --tf-text: #f5f6ff;
+      --tf-text-2: #c1c5e0;
+      --tf-text-3: #6a7196;
+      --tf-accent-1: #6366f1;
+      --tf-accent-2: #818cf8;
+      --tf-accent-glow: rgba(99, 102, 241, 0.18);
+      --tf-success: #22c55e;
+      --tf-warning: #f59e0b;
+      --tf-danger: #ef4444;
+      --tf-info: #60a5fa;
+      --tf-gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+      --tf-gradient-accent-hover: linear-gradient(135deg, #7277f3 0%, #b69cfb 100%);
+      --tf-gradient-danger: linear-gradient(135deg, #ef4444 0%, #f97316 100%);
+      --tf-gradient-success: linear-gradient(135deg, #22c55e 0%, #10b981 100%);
+      --tf-shadow-sm: 0 2px 6px rgba(0,0,0,0.4);
+      --tf-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      --tf-shadow-lg: 0 24px 64px rgba(0,0,0,0.7), 0 8px 24px rgba(99,102,241,0.15);
+      --tf-glow-accent: 0 0 14px rgba(99,102,241,0.55), 0 0 28px rgba(99,102,241,0.35), 0 0 52px rgba(99,102,241,0.18), 0 0 84px rgba(99,102,241,0.08);
+      --tf-glow-danger: 0 0 14px rgba(239,68,68,0.55), 0 0 28px rgba(239,68,68,0.35), 0 0 52px rgba(239,68,68,0.18);
+      --tf-glow-success: 0 0 12px rgba(34,197,94,0.35), 0 0 28px rgba(34,197,94,0.18);
+      --tf-radius-sm: 6px;
+      --tf-radius: 10px;
+      --tf-radius-lg: 14px;
+      --tf-spring-snappy: cubic-bezier(0.34, 1.56, 0.64, 1);
+      --tf-spring-smooth: cubic-bezier(0.32, 0.72, 0, 1);
+
+      /* Kolory per typ node'a (z FlowNodePalette.js) */
+      --node-trigger: #22c55e;
+      --node-llm: #6366f1;
+      --node-stt: #f59e0b;
+      --node-tts: #ec4899;
+      --node-rag: #3b82f6;
+      --node-memory: #06b6d4;
+      --node-embeddings: #8b5cf6;
+      --node-reranker: #f472b6;
+      --node-condition: #f97316;
+      --node-switch: #a855f7;
+      --node-template: #64748b;
+      --node-pii: #10b981;
+      --node-tts-clean: #14b8a6;
+      --node-router: #6b7280;
+      --node-output: #ef4444;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--tf-bg);
+      color: var(--tf-text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 13px;
+      line-height: 1.4;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* =============================================================================
+       Przyciski .tf-btn
+       ============================================================================= */
+    .tf-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 16px;
+      border: 1px solid transparent;
+      border-radius: var(--tf-radius);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.15s var(--tf-spring-smooth), box-shadow 0.2s, filter 0.15s, background 0.15s, border-color 0.15s, color 0.15s;
+      min-height: 38px;
+      white-space: nowrap;
+    }
+    .tf-btn:active { transform: scale(0.97); }
+    .tf-btn-primary {
+      background: var(--tf-gradient-accent);
+      color: white;
+      box-shadow: 0 4px 14px rgba(99,102,241,0.35), inset 0 1px 0 rgba(255,255,255,0.18);
+    }
+    .tf-btn-primary:hover {
+      filter: brightness(1.08);
+      transform: translateY(-1px);
+      box-shadow: 0 6px 22px rgba(99,102,241,0.55), 0 0 32px rgba(99,102,241,0.3);
+    }
+    .tf-btn-secondary {
+      background: var(--tf-bg-3);
+      color: var(--tf-text);
+      border-color: var(--tf-border);
+    }
+    .tf-btn-secondary:hover { background: var(--tf-bg-card-hover); border-color: var(--tf-border-hover); transform: translateY(-1px); }
+    .tf-btn-ghost { background: transparent; color: var(--tf-text-2); }
+    .tf-btn-ghost:hover { background: var(--tf-bg-3); color: var(--tf-text); }
+    .tf-btn-success {
+      background: var(--tf-gradient-success);
+      color: white;
+      box-shadow: 0 4px 14px rgba(34,197,94,0.35);
+    }
+    .tf-btn-success:hover { filter: brightness(1.08); transform: translateY(-1px); }
+    .tf-btn-danger {
+      background: transparent;
+      color: var(--tf-danger);
+      border-color: rgba(239,68,68,0.3);
+    }
+    .tf-btn-danger:hover { background: rgba(239,68,68,0.1); border-color: var(--tf-danger); box-shadow: 0 0 20px rgba(239,68,68,0.3); }
+    .tf-btn-sm { padding: 6px 12px; font-size: 11px; min-height: 30px; }
+    .tf-btn-icon { width: 38px; padding: 0; justify-content: center; }
+    .tf-btn-icon.tf-btn-sm { width: 30px; }
+
+    /* =============================================================================
+       Inputy
+       ============================================================================= */
+    .tf-input {
+      width: 100%;
+      padding: 10px 14px;
+      background: var(--tf-bg-input);
+      border: 1px solid var(--tf-border);
+      border-radius: var(--tf-radius);
+      color: var(--tf-text);
+      font-size: 13px;
+      font-family: inherit;
+      min-height: 40px;
+      outline: none;
+      transition: border-color 0.15s, background 0.15s, box-shadow 0.25s;
+    }
+    .tf-input::placeholder { color: var(--tf-text-3); }
+    .tf-input:focus { border-color: var(--tf-accent-1); background: var(--tf-bg-card); box-shadow: var(--tf-glow-accent); }
+    .tf-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--tf-text-2);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      display: block;
+      margin-bottom: 6px;
+    }
+    .tf-searchbox {
+      position: relative;
+      display: flex;
+      align-items: center;
+      background: var(--tf-bg-input);
+      border: 1px solid var(--tf-border);
+      border-radius: var(--tf-radius);
+      padding: 0 12px 0 38px;
+      height: 40px;
+      transition: border-color 0.15s, background 0.15s, box-shadow 0.25s;
+    }
+    .tf-searchbox:focus-within { border-color: var(--tf-accent-1); background: var(--tf-bg-card); box-shadow: var(--tf-glow-accent); }
+    .tf-searchbox svg { position: absolute; left: 12px; width: 16px; height: 16px; color: var(--tf-text-3); }
+    .tf-searchbox input { flex: 1; background: transparent; border: 0; outline: none; color: var(--tf-text); font-size: 13px; }
+    .tf-select {
+      width: 100%;
+      appearance: none;
+      padding: 10px 38px 10px 14px;
+      background: var(--tf-bg-input) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236a7196' stroke-width='2.5'><polyline points='6 9 12 15 18 9'/></svg>") no-repeat right 14px center;
+      border: 1px solid var(--tf-border);
+      border-radius: var(--tf-radius);
+      color: var(--tf-text);
+      font-size: 13px;
+      min-height: 40px;
+      outline: none;
+      cursor: pointer;
+    }
+    .tf-toggle {
+      position: relative;
+      display: inline-flex;
+      width: 44px;
+      height: 24px;
+      background: var(--tf-bg-3);
+      border-radius: 12px;
+      border: 1px solid var(--tf-border);
+      cursor: pointer;
+      padding: 2px;
+      transition: all 0.2s var(--tf-spring-smooth);
+    }
+    .tf-toggle::after {
+      content: '';
+      width: 18px;
+      height: 18px;
+      background: var(--tf-text);
+      border-radius: 50%;
+      transition: all 0.25s var(--tf-spring-snappy);
+    }
+    .tf-toggle.on { background: var(--tf-gradient-accent); border-color: var(--tf-accent-1); box-shadow: 0 0 18px rgba(99,102,241,0.35); }
+    .tf-toggle.on::after { transform: translateX(20px); }
+
+    /* =============================================================================
+       Chipy
+       ============================================================================= */
+    .tf-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .tf-chip.ok { background: rgba(34,197,94,0.15); color: #22c55e; }
+    .tf-chip.warn { background: rgba(245,158,11,0.15); color: #f59e0b; }
+    .tf-chip.info { background: rgba(96,165,250,0.15); color: #60a5fa; }
+    .tf-chip.accent { background: var(--tf-accent-glow); color: var(--tf-accent-2); }
+    .tf-chip .tf-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: tf-chip-pulse 2s ease-in-out infinite; }
+    @keyframes tf-chip-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 currentColor; }
+      50% { box-shadow: 0 0 8px 2px currentColor; }
+    }
+
+    /* =============================================================================
+       Tabs
+       ============================================================================= */
+    .tf-tabs-underline {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--tf-border);
+      padding: 0 4px;
+    }
+    .tf-tabs-underline .tf-tab {
+      padding: 12px 14px 14px;
+      background: transparent;
+      border: 0;
+      color: var(--tf-text-3);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      position: relative;
+      font-family: inherit;
+    }
+    .tf-tabs-underline .tf-tab:hover { color: var(--tf-text); }
+    .tf-tabs-underline .tf-tab.active { color: var(--tf-text); }
+    .tf-tabs-underline .tf-tab.active::after {
+      content: '';
+      position: absolute;
+      left: 8px; right: 8px; bottom: -1px;
+      height: 2px;
+      background: var(--tf-gradient-accent);
+      border-radius: 2px 2px 0 0;
+      box-shadow: 0 0 10px rgba(99,102,241,0.6);
+    }
+
+    /* =============================================================================
+       Shell aplikacji
+       ============================================================================= */
+    .fb-shell {
+      display: grid;
+      grid-template-rows: 56px 1fr 44px;
+      height: 100vh;
+      width: 100vw;
+      background: var(--tf-bg);
+    }
+
+    /* Topbar */
+    .fb-topbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 16px;
+      background: linear-gradient(180deg, var(--tf-bg-2), var(--tf-bg));
+      border-bottom: 1px solid var(--tf-border);
+      position: relative;
+      z-index: 20;
+    }
+    .fb-topbar-separator {
+      width: 1px;
+      height: 24px;
+      background: var(--tf-border);
+    }
+    .fb-flow-name {
+      flex: 0 1 420px;
+      min-width: 200px;
+      font-size: 15px;
+      font-weight: 600;
+      padding: 8px 12px;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: var(--tf-radius);
+      color: var(--tf-text);
+      font-family: inherit;
+      outline: none;
+      transition: all 0.15s;
+    }
+    .fb-flow-name:hover { background: var(--tf-bg-input); border-color: var(--tf-border); }
+    .fb-flow-name:focus { background: var(--tf-bg-input); border-color: var(--tf-accent-1); box-shadow: var(--tf-glow-accent); }
+
+    .fb-status-select {
+      width: auto;
+      padding: 7px 32px 7px 12px;
+      min-height: 32px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .fb-topbar-spacer { flex: 1; }
+
+    .fb-zoom-controls {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      padding: 2px;
+      background: var(--tf-bg-card);
+      border: 1px solid var(--tf-border);
+      border-radius: var(--tf-radius);
+    }
+    .fb-zoom-controls .tf-btn { min-height: 28px; padding: 4px 10px; font-size: 11px; }
+    .fb-zoom-level {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--tf-text-2);
+      padding: 0 10px;
+      min-width: 48px;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .fb-autosave {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: rgba(34, 197, 94, 0.08);
+      border: 1px solid rgba(34, 197, 94, 0.2);
+      border-radius: 999px;
+      font-size: 11px;
+      color: var(--tf-success);
+      font-weight: 600;
+    }
+    .fb-autosave svg { width: 12px; height: 12px; }
+
+    /* =============================================================================
+       Body: 3 kolumny
+       ============================================================================= */
+    .fb-body {
+      display: grid;
+      grid-template-columns: 280px 1fr 340px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* =============================================================================
+       Paleta lewa
+       ============================================================================= */
+    .fb-palette {
+      display: flex;
+      flex-direction: column;
+      background: var(--tf-bg-2);
+      border-right: 1px solid var(--tf-border);
+      overflow: hidden;
+      transition: width 0.28s var(--tf-spring-smooth);
+    }
+    .fb-palette-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 14px 10px;
+    }
+    .fb-panel-title {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--tf-text-3);
+    }
+    .fb-palette-search { padding: 0 14px 12px; }
+    .fb-palette-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0 8px 14px;
+    }
+    .fb-palette-list::-webkit-scrollbar { width: 8px; }
+    .fb-palette-list::-webkit-scrollbar-thumb { background: var(--tf-border); border-radius: 4px; }
+
+    .fb-palette-category { margin-bottom: 4px; }
+    .fb-palette-cat-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--tf-text-3);
+      cursor: pointer;
+      user-select: none;
+      border-radius: var(--tf-radius-sm);
+      transition: background 0.12s;
+    }
+    .fb-palette-cat-header:hover { background: var(--tf-bg-3); color: var(--tf-text-2); }
+    .fb-palette-cat-header .fb-chevron { transition: transform 0.22s var(--tf-spring-smooth); }
+    .fb-palette-category.collapsed .fb-chevron { transform: rotate(-90deg); }
+    .fb-palette-category.collapsed .fb-palette-items { display: none; }
+
+    .fb-palette-items {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 2px 0 8px;
+    }
+    .fb-node-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 10px;
+      border-radius: var(--tf-radius);
+      background: transparent;
+      border: 1px solid transparent;
+      cursor: grab;
+      transition: background 0.12s, border-color 0.12s, transform 0.15s var(--tf-spring-smooth);
+      min-height: 48px;
+    }
+    .fb-node-item:hover {
+      background: var(--tf-bg-card);
+      border-color: var(--tf-border);
+      transform: translateX(2px);
+    }
+    .fb-node-item:active { cursor: grabbing; }
+    .fb-node-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      background: rgba(99, 102, 241, 0.15);
+      color: var(--node-color, #818cf8);
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--node-color, #818cf8) 30%, transparent);
+    }
+    .fb-node-icon svg { width: 16px; height: 16px; }
+    .fb-node-info { min-width: 0; flex: 1; }
+    .fb-node-name {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--tf-text);
+      line-height: 1.2;
+    }
+    .fb-node-desc {
+      font-size: 11px;
+      color: var(--tf-text-3);
+      line-height: 1.3;
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .fb-node-drag-handle {
+      color: var(--tf-text-3);
+      opacity: 0.4;
+      transition: opacity 0.15s;
+    }
+    .fb-node-item:hover .fb-node-drag-handle { opacity: 1; }
+    .fb-node-drag-handle svg { width: 14px; height: 14px; display: block; }
+
+    .fb-palette-empty {
+      text-align: center;
+      padding: 24px 16px;
+      color: var(--tf-text-3);
+      font-size: 12px;
+    }
+
+    /* =============================================================================
+       Canvas srodek
+       ============================================================================= */
+    .fb-canvas-wrap {
+      position: relative;
+      overflow: hidden;
+      background:
+        radial-gradient(1200px 800px at 50% 40%, rgba(99,102,241,0.08), transparent 70%),
+        var(--tf-bg);
+    }
+    .fb-canvas {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      background-image:
+        radial-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
+        radial-gradient(rgba(129,140,248,0.03) 1px, transparent 1px);
+      background-size: 24px 24px, 96px 96px;
+      background-position: 0 0, 12px 12px;
+      touch-action: none; /* pan/pinch obslugiwany wlasnym JS */
+    }
+    /* SVG krawedzi */
+    .fb-edges {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      overflow: visible;
+    }
+    .fb-edge-path {
+      fill: none;
+      stroke: var(--tf-accent-1);
+      stroke-width: 2;
+      filter: drop-shadow(0 0 6px rgba(99,102,241,0.4));
+    }
+    .fb-edge-path.warn { stroke: var(--tf-warning); filter: drop-shadow(0 0 6px rgba(245,158,11,0.4)); }
+    .fb-edge-path.error { stroke: var(--tf-danger); stroke-dasharray: 6 4; filter: drop-shadow(0 0 6px rgba(239,68,68,0.4)); }
+    /* Animowane kropki przeplywu */
+    .fb-edge-flow {
+      fill: #a78bfa;
+      r: 3;
+      filter: drop-shadow(0 0 6px rgba(167,139,250,0.8));
+    }
+    @keyframes fb-flow-dot {
+      from { offset-distance: 0%; }
+      to { offset-distance: 100%; }
+    }
+
+    /* Nody na canvas */
+    .fb-node {
+      position: absolute;
+      min-width: 220px;
+      background: var(--tf-bg-card);
+      border: 1px solid var(--tf-border);
+      border-left: 3px solid var(--node-color, #818cf8);
+      border-radius: var(--tf-radius);
+      box-shadow: var(--tf-shadow);
+      transition: box-shadow 0.2s, transform 0.15s var(--tf-spring-smooth), border-color 0.15s;
+      user-select: none;
+    }
+    .fb-node:hover {
+      border-color: var(--tf-border-hover);
+      box-shadow: var(--tf-shadow), 0 0 0 1px color-mix(in srgb, var(--node-color, #818cf8) 40%, transparent);
+    }
+    .fb-node.selected {
+      border-color: var(--node-color, var(--tf-accent-1));
+      box-shadow: var(--tf-shadow), 0 0 0 2px var(--node-color, var(--tf-accent-1)), 0 0 32px color-mix(in srgb, var(--node-color, #818cf8) 40%, transparent);
+      animation: fb-node-pulse 2.4s ease-in-out infinite;
+    }
+    @keyframes fb-node-pulse {
+      0%, 100% { box-shadow: var(--tf-shadow), 0 0 0 2px var(--node-color, var(--tf-accent-1)), 0 0 24px color-mix(in srgb, var(--node-color, #818cf8) 30%, transparent); }
+      50% { box-shadow: var(--tf-shadow), 0 0 0 2px var(--node-color, var(--tf-accent-1)), 0 0 48px color-mix(in srgb, var(--node-color, #818cf8) 60%, transparent); }
+    }
+    .fb-node.error {
+      border-color: var(--tf-danger);
+      box-shadow: var(--tf-shadow), 0 0 0 1px var(--tf-danger), 0 0 24px rgba(239,68,68,0.3);
+    }
+    .fb-node.dragging {
+      transform: rotate(1.5deg) scale(1.02);
+      box-shadow: 0 24px 48px rgba(0,0,0,0.6), 0 0 32px rgba(99,102,241,0.35);
+      cursor: grabbing;
+      z-index: 10;
+    }
+
+    .fb-node-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px 10px;
+      cursor: grab;
+    }
+    .fb-node-header:active { cursor: grabbing; }
+    .fb-node-badge {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      background: color-mix(in srgb, var(--node-color, #818cf8) 18%, transparent);
+      color: var(--node-color, #818cf8);
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--node-color, #818cf8) 35%, transparent);
+    }
+    .fb-node-badge svg { width: 14px; height: 14px; }
+    .fb-node-title {
+      flex: 1;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--tf-text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .fb-node-type {
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--tf-text-3);
+      padding: 2px 6px;
+      background: var(--tf-bg-3);
+      border-radius: 4px;
+    }
+    .fb-node-error-icon {
+      color: var(--tf-danger);
+      animation: fb-chip-pulse 1.2s ease-in-out infinite;
+    }
+    .fb-node-error-icon svg { width: 14px; height: 14px; display: block; }
+
+    .fb-node-body {
+      padding: 0 14px 12px;
+      font-size: 11px;
+      color: var(--tf-text-2);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .fb-node-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 3px 0;
+    }
+    .fb-node-row .fb-key { color: var(--tf-text-3); font-weight: 500; }
+    .fb-node-row .fb-val { color: var(--tf-text); font-family: 'SF Mono', Menlo, monospace; font-size: 10.5px; }
+
+    /* Porty */
+    .fb-port {
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--tf-bg);
+      border: 2px solid var(--node-color, var(--tf-accent-1));
+      top: 50%;
+      transform: translateY(-50%);
+      cursor: crosshair;
+      transition: all 0.18s var(--tf-spring-smooth);
+      z-index: 2;
+    }
+    .fb-port::before {
+      content: '';
+      position: absolute;
+      inset: -8px;
+      /* touch target 32px */
+    }
+    .fb-port:hover {
+      background: var(--node-color, var(--tf-accent-1));
+      transform: translateY(-50%) scale(1.3);
+      box-shadow: 0 0 12px color-mix(in srgb, var(--node-color, #818cf8) 70%, transparent);
+    }
+    .fb-port-in { left: -9px; }
+    .fb-port-out { right: -9px; }
+    /* Multi-output porty */
+    .fb-node.multi-out .fb-port-out { top: auto; transform: none; }
+    .fb-node.multi-out .fb-port-out.p1 { top: 28%; }
+    .fb-node.multi-out .fb-port-out.p2 { top: 50%; }
+    .fb-node.multi-out .fb-port-out.p3 { top: 72%; }
+
+    /* Empty state canvas */
+    .fb-canvas-hint {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+      color: var(--tf-text-3);
+      font-size: 12px;
+      opacity: 0.3;
+    }
+
+    /* Mini-mapa */
+    .fb-minimap {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      width: 180px;
+      height: 120px;
+      background: rgba(10, 14, 34, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--tf-border);
+      border-radius: var(--tf-radius);
+      overflow: hidden;
+      box-shadow: var(--tf-shadow);
+      z-index: 5;
+    }
+    .fb-minimap-viewport {
+      position: absolute;
+      border: 1.5px solid var(--tf-accent-2);
+      background: rgba(99, 102, 241, 0.08);
+      border-radius: 4px;
+      box-shadow: 0 0 12px rgba(99,102,241,0.4);
+      cursor: move;
+    }
+    .fb-minimap-node {
+      position: absolute;
+      border-radius: 2px;
+      background: var(--node-color, #818cf8);
+      opacity: 0.8;
+    }
+    .fb-minimap-label {
+      position: absolute;
+      top: 4px;
+      left: 8px;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--tf-text-3);
+    }
+
+    /* =============================================================================
+       Prawy panel konfiguracji
+       ============================================================================= */
+    .fb-config {
+      display: flex;
+      flex-direction: column;
+      background: var(--tf-bg-2);
+      border-left: 1px solid var(--tf-border);
+      overflow: hidden;
+    }
+    .fb-config-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--tf-border);
+    }
+    .fb-config-header .fb-node-badge { width: 32px; height: 32px; }
+    .fb-config-title-wrap { flex: 1; min-width: 0; }
+    .fb-config-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--tf-text);
+    }
+    .fb-config-subtitle {
+      font-size: 11px;
+      color: var(--tf-text-3);
+      margin-top: 2px;
+    }
+    .fb-config-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .fb-config-body::-webkit-scrollbar { width: 8px; }
+    .fb-config-body::-webkit-scrollbar-thumb { background: var(--tf-border); border-radius: 4px; }
+
+    .fb-field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .fb-field-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .fb-field-row .tf-label { margin-bottom: 0; }
+    .fb-field-hint {
+      font-size: 11px;
+      color: var(--tf-text-3);
+    }
+
+    .fb-config-preview {
+      background: var(--tf-bg-input);
+      border: 1px solid var(--tf-border);
+      border-radius: var(--tf-radius);
+      padding: 12px;
+      font-family: 'SF Mono', Menlo, monospace;
+      font-size: 11px;
+      color: var(--tf-text-2);
+      white-space: pre-wrap;
+      line-height: 1.5;
+      max-height: 180px;
+      overflow-y: auto;
+    }
+    .fb-config-preview .k { color: var(--tf-accent-2); }
+    .fb-config-preview .s { color: #10b981; }
+    .fb-config-preview .n { color: var(--tf-warning); }
+
+    .fb-config-footer {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--tf-border);
+      background: var(--tf-bg-2);
+    }
+    .fb-config-footer .tf-btn { flex: 1; justify-content: center; }
+
+    /* Empty state konfiguracji */
+    .fb-config-empty {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 24px;
+      text-align: center;
+      color: var(--tf-text-3);
+    }
+    .fb-config-empty-icon {
+      width: 64px;
+      height: 64px;
+      border-radius: 16px;
+      background: var(--tf-bg-card);
+      border: 1px dashed var(--tf-border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 16px;
+      color: var(--tf-text-3);
+    }
+    .fb-config-empty-icon svg { width: 28px; height: 28px; }
+    .fb-config-empty h4 { margin: 0 0 4px; font-size: 14px; color: var(--tf-text-2); }
+    .fb-config-empty p { margin: 0; font-size: 12px; max-width: 220px; }
+
+    /* =============================================================================
+       Dolny toolbar sticky
+       ============================================================================= */
+    .fb-bottombar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 16px;
+      background: linear-gradient(0deg, var(--tf-bg-2), var(--tf-bg));
+      border-top: 1px solid var(--tf-border);
+      font-size: 11px;
+      color: var(--tf-text-3);
+    }
+    .fb-breadcrumb {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .fb-breadcrumb .fb-crumb { color: var(--tf-text-3); }
+    .fb-breadcrumb .fb-crumb.active { color: var(--tf-accent-2); }
+    .fb-breadcrumb .fb-sep { opacity: 0.4; }
+    .fb-bottombar-separator {
+      width: 1px;
+      height: 20px;
+      background: var(--tf-border);
+    }
+    .fb-tool-group {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+    .fb-tool-group .tf-btn { padding: 4px 8px; min-height: 26px; font-size: 11px; }
+    .fb-bottombar-spacer { flex: 1; }
+    .fb-kbd {
+      display: inline-flex;
+      padding: 1px 5px;
+      background: var(--tf-bg-3);
+      border: 1px solid var(--tf-border);
+      border-radius: 4px;
+      font-family: 'SF Mono', Menlo, monospace;
+      font-size: 10px;
+      color: var(--tf-text-2);
+    }
+
+    /* =============================================================================
+       Responsive preview (ramki obok mockupu)
+       ============================================================================= */
+    .responsive-preview-section {
+      padding: 48px 32px;
+      background: linear-gradient(180deg, var(--tf-bg), var(--tf-bg-2));
+      border-top: 1px solid var(--tf-border);
+    }
+    .responsive-preview-section h2 {
+      font-size: 20px;
+      font-weight: 700;
+      margin: 0 0 8px;
+      background: var(--tf-gradient-accent);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .responsive-preview-section p {
+      color: var(--tf-text-3);
+      margin: 0 0 32px;
+    }
+    .responsive-frames {
+      display: flex;
+      gap: 24px;
+      align-items: flex-end;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .responsive-frame {
+      background: var(--tf-bg-card);
+      border: 1px solid var(--tf-border);
+      border-radius: var(--tf-radius-lg);
+      box-shadow: var(--tf-shadow-lg);
+      overflow: hidden;
+      position: relative;
+    }
+    .responsive-frame-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: var(--tf-bg-2);
+      border-bottom: 1px solid var(--tf-border);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--tf-text-2);
+    }
+    .responsive-frame-label .dim { color: var(--tf-text-3); font-family: 'SF Mono', Menlo, monospace; }
+    .responsive-frame-canvas {
+      background:
+        radial-gradient(rgba(255,255,255,0.05) 1px, transparent 1px) 0 0 / 16px 16px,
+        var(--tf-bg);
+      position: relative;
+    }
+
+    /* Desktop preview */
+    .rf-desktop { width: 640px; }
+    .rf-desktop .responsive-frame-canvas {
+      height: 360px;
+      display: grid;
+      grid-template-columns: 92px 1fr 108px;
+    }
+    .rf-desktop .rf-palette { background: var(--tf-bg-2); border-right: 1px solid var(--tf-border); padding: 10px 6px; }
+    .rf-desktop .rf-palette-item { height: 10px; background: var(--tf-bg-card); border-radius: 3px; margin-bottom: 4px; }
+    .rf-desktop .rf-palette-item.accent { background: color-mix(in srgb, var(--node-color, #818cf8) 40%, var(--tf-bg-card)); }
+    .rf-desktop .rf-canvas { position: relative; padding: 16px; }
+    .rf-desktop .rf-config { background: var(--tf-bg-2); border-left: 1px solid var(--tf-border); padding: 10px 6px; }
+    .rf-mini-node {
+      position: absolute;
+      padding: 4px 6px;
+      background: var(--tf-bg-card);
+      border: 1px solid var(--tf-border);
+      border-left: 2px solid var(--node-color, #818cf8);
+      border-radius: 4px;
+      font-size: 8px;
+      font-weight: 600;
+      color: var(--tf-text);
+      min-width: 56px;
+    }
+
+    /* Tablet preview */
+    .rf-tablet { width: 320px; }
+    .rf-tablet .responsive-frame-canvas { height: 320px; position: relative; padding: 12px; }
+    .rf-tablet-overlay {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 60%;
+      background: rgba(20, 24, 54, 0.95);
+      backdrop-filter: blur(8px);
+      border-right: 1px solid var(--tf-border);
+      padding: 10px 6px;
+      box-shadow: 8px 0 24px rgba(0,0,0,0.5);
+    }
+
+    /* Mobile preview */
+    .rf-mobile { width: 180px; }
+    .rf-mobile .responsive-frame-canvas { height: 320px; position: relative; }
+    .rf-mobile-tabbar {
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 44px;
+      background: var(--tf-bg-2);
+      border-top: 1px solid var(--tf-border);
+      display: flex;
+    }
+    .rf-mobile-tab {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      font-weight: 700;
+      color: var(--tf-text-3);
+    }
+    .rf-mobile-tab.active { color: var(--tf-accent-2); position: relative; }
+    .rf-mobile-tab.active::after {
+      content: '';
+      position: absolute;
+      left: 30%; right: 30%; top: 2px;
+      height: 2px;
+      background: var(--tf-gradient-accent);
+      border-radius: 2px;
+    }
+
+    /* =============================================================================
+       SVG Icon sprite helper
+       ============================================================================= */
+    .ico { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+    .ico-sm { width: 14px; height: 14px; }
+    .ico-lg { width: 20px; height: 20px; }
+
+    /* =============================================================================
+       States demo section
+       ============================================================================= */
+    .states-section {
+      padding: 48px 32px;
+      background: var(--tf-bg);
+      border-top: 1px solid var(--tf-border);
+    }
+    .states-section h2 {
+      font-size: 20px;
+      font-weight: 700;
+      margin: 0 0 8px;
+      color: var(--tf-text);
+    }
+    .states-section > p { color: var(--tf-text-3); margin: 0 0 24px; }
+    .states-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      max-width: 1200px;
+    }
+    .state-card {
+      background: var(--tf-bg-card);
+      border: 1px solid var(--tf-border);
+      border-radius: var(--tf-radius-lg);
+      padding: 20px;
+      position: relative;
+      overflow: hidden;
+    }
+    .state-card-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--tf-text-3);
+      margin-bottom: 14px;
+    }
+    .state-card .fb-node {
+      position: relative;
+      min-width: 0;
+      width: 100%;
+      margin: 0;
+    }
+
+    /* =============================================================================
+       Bardzo wąskie ekrany (pokazujemy placeholder zamiast całości)
+       ============================================================================= */
+    @media (max-width: 1023px) {
+      .fb-shell { display: none; }
+      .mobile-notice { display: flex !important; }
+    }
+    .mobile-notice {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 48px 24px;
+      text-align: center;
+      min-height: 60vh;
+    }
+    .mobile-notice h2 { font-size: 20px; margin: 12px 0 6px; }
+    .mobile-notice p { color: var(--tf-text-3); max-width: 400px; }
+  </style>
+</head>
+<body>
+
+  <!-- =============================================================================
+       SVG sprite z ikonami (re-uzywane przez <use href="#id">)
+       ============================================================================= -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-back" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+      <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+      <symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+      <symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+      <symbol id="i-fit" viewBox="0 0 24 24"><polyline points="4 4 4 10 10 10"/><polyline points="20 4 20 10 14 10"/><polyline points="4 20 4 14 10 14"/><polyline points="20 20 20 14 14 14"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+      <symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+      <symbol id="i-grip" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1" fill="currentColor"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="9" cy="18" r="1" fill="currentColor"/><circle cx="15" cy="6" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="18" r="1" fill="currentColor"/></symbol>
+      <symbol id="i-bolt" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+      <symbol id="i-db" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v7c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12v7c0 1.66 4 3 9 3s9-1.34 9-3v-7"/></symbol>
+      <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+      <symbol id="i-branch" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+      <symbol id="i-out" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+      <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></symbol>
+      <symbol id="i-speaker" viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></symbol>
+      <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+      <symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+      <symbol id="i-undo" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+      <symbol id="i-redo" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+      <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+      <symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 14"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+      <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3zM5 17l.75 2.25L8 20l-2.25.75L5 23l-.75-2.25L2 20l2.25-.75L5 17zM19 13l.75 2.25L22 16l-2.25.75L19 19l-.75-2.25L16 16l2.25-.75L19 13z" fill="currentColor" stroke="none"/></symbol>
+    </defs>
+  </svg>
+
+  <!-- =============================================================================
+       Mobile notice (viewport <1024px — mockup jest przeznaczony na desktop)
+       ============================================================================= -->
+  <div class="mobile-notice">
+    <svg class="ico-lg" style="width:56px;height:56px;color:var(--tf-accent-2)"><use href="#i-sparkle"/></svg>
+    <h2>Otwórz na szerszym ekranie</h2>
+    <p>Mockup Flow Buildera zaprojektowany jest dla szerokości &ge;&nbsp;1024&nbsp;px. Responsywne warianty dla tabletu i telefonu są zilustrowane w sekcji "Responsive preview" poniżej.</p>
+  </div>
+
+  <!-- =============================================================================
+       GŁÓWNY SHELL APLIKACJI — 3 wiersze: topbar / body / bottombar
+       ============================================================================= -->
+  <div class="fb-shell">
+
+    <!-- ==========================================================================
+         TOPBAR: back, nazwa flow, status, autosave, zoom, testuj, zapisz, settings
+         ========================================================================== -->
+    <header class="fb-topbar">
+      <button class="tf-btn tf-btn-ghost tf-btn-sm" title="Powrót do listy flow">
+        <svg class="ico ico-sm"><use href="#i-back"/></svg>
+        Wstecz
+      </button>
+
+      <div class="fb-topbar-separator"></div>
+
+      <!-- Edytowalna nazwa flow -->
+      <input class="fb-flow-name" value="Asystent RAG" aria-label="Nazwa flow">
+
+      <!-- Status: chip + select sterujacy -->
+      <span class="tf-chip accent" title="Wybierz status">
+        <span class="tf-chip-dot"></span>
+        Draft
+      </span>
+
+      <select class="tf-select fb-status-select" aria-label="Status flow">
+        <option>draft</option>
+        <option>active</option>
+        <option>archived</option>
+      </select>
+
+      <div class="fb-topbar-separator"></div>
+
+      <!-- Auto-save indicator -->
+      <span class="fb-autosave" title="Ostatni zapis: 2 sekundy temu">
+        <svg class="ico ico-sm"><use href="#i-check"/></svg>
+        Zapisano 2s temu
+      </span>
+
+      <div class="fb-topbar-spacer"></div>
+
+      <!-- Zoom controls -->
+      <div class="fb-zoom-controls" role="group" aria-label="Zoom">
+        <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" title="Oddal (Ctrl+-)">
+          <svg class="ico ico-sm"><use href="#i-zoom-out"/></svg>
+        </button>
+        <span class="fb-zoom-level">100%</span>
+        <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" title="Przybliż (Ctrl++)">
+          <svg class="ico ico-sm"><use href="#i-zoom-in"/></svg>
+        </button>
+        <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" title="Dopasuj do ekranu (F)">
+          <svg class="ico ico-sm"><use href="#i-fit"/></svg>
+        </button>
+      </div>
+
+      <div class="fb-topbar-separator"></div>
+
+      <!-- Testuj (odpala testowy run) -->
+      <button class="tf-btn tf-btn-success tf-btn-sm" title="Uruchom flow w trybie testowym">
+        <svg class="ico ico-sm"><use href="#i-play"/></svg>
+        Testuj
+      </button>
+
+      <!-- Zapisz -->
+      <button class="tf-btn tf-btn-primary tf-btn-sm">
+        <svg class="ico ico-sm"><use href="#i-save"/></svg>
+        Zapisz
+      </button>
+
+      <!-- Settings (metadane flow) -->
+      <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" title="Ustawienia flow">
+        <svg class="ico ico-sm"><use href="#i-gear"/></svg>
+      </button>
+    </header>
+
+    <!-- ==========================================================================
+         BODY: 3 kolumny (paleta / canvas / konfiguracja)
+         ========================================================================== -->
+    <div class="fb-body">
+
+      <!-- ========================================================================
+           LEWA PALETA NODE'ÓW — zwijana, z searchem i kategoriami
+           ======================================================================== -->
+      <aside class="fb-palette" aria-label="Paleta node'ów">
+        <div class="fb-palette-header">
+          <span class="fb-panel-title">Paleta</span>
+          <span class="tf-chip info">24</span>
+        </div>
+
+        <div class="fb-palette-search">
+          <div class="tf-searchbox">
+            <svg><use href="#i-search"/></svg>
+            <input type="search" placeholder="Szukaj node..." aria-label="Szukaj node">
+          </div>
+        </div>
+
+        <div class="fb-palette-list">
+
+          <!-- Kategoria: Triggers -->
+          <div class="fb-palette-category">
+            <div class="fb-palette-cat-header">
+              <span>Triggers</span>
+              <svg class="ico ico-sm fb-chevron"><use href="#i-chevron-down"/></svg>
+            </div>
+            <div class="fb-palette-items">
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-trigger)">
+                <div class="fb-node-icon"><svg><use href="#i-globe"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">HTTP Request</div>
+                  <div class="fb-node-desc">Trigger HTTP endpoint</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-trigger)">
+                <div class="fb-node-icon"><svg><use href="#i-history"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Schedule</div>
+                  <div class="fb-node-desc">Cron / interval</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-trigger)">
+                <div class="fb-node-icon"><svg><use href="#i-bolt"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Event</div>
+                  <div class="fb-node-desc">Mesh event listener</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-trigger)">
+                <div class="fb-node-icon"><svg><use href="#i-globe"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Webhook</div>
+                  <div class="fb-node-desc">Zewnętrzny webhook</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kategoria: AI Services -->
+          <div class="fb-palette-category">
+            <div class="fb-palette-cat-header">
+              <span>AI Services</span>
+              <svg class="ico ico-sm fb-chevron"><use href="#i-chevron-down"/></svg>
+            </div>
+            <div class="fb-palette-items">
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-llm)">
+                <div class="fb-node-icon"><svg><use href="#i-cpu"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">LLM</div>
+                  <div class="fb-node-desc">Large Language Model</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-embeddings)">
+                <div class="fb-node-icon"><svg><use href="#i-sparkle"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Embeddings</div>
+                  <div class="fb-node-desc">Wektoryzacja tekstu</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-reranker)">
+                <div class="fb-node-icon"><svg><use href="#i-sparkle"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Reranker</div>
+                  <div class="fb-node-desc">Re-ranking wyników</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-stt)">
+                <div class="fb-node-icon"><svg><use href="#i-mic"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">STT</div>
+                  <div class="fb-node-desc">Speech-to-Text</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-tts)">
+                <div class="fb-node-icon"><svg><use href="#i-speaker"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">TTS</div>
+                  <div class="fb-node-desc">Text-to-Speech</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kategoria: RAG -->
+          <div class="fb-palette-category">
+            <div class="fb-palette-cat-header">
+              <span>RAG</span>
+              <svg class="ico ico-sm fb-chevron"><use href="#i-chevron-down"/></svg>
+            </div>
+            <div class="fb-palette-items">
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-rag)">
+                <div class="fb-node-icon"><svg><use href="#i-db"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Retrieve</div>
+                  <div class="fb-node-desc">Wyszukaj kontekst w bazie</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-memory)">
+                <div class="fb-node-icon"><svg><use href="#i-db"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Memory</div>
+                  <div class="fb-node-desc">Pamięć konwersacji</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-rag)">
+                <div class="fb-node-icon"><svg><use href="#i-db"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Context Store</div>
+                  <div class="fb-node-desc">Zapisz do bazy wiedzy</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kategoria: Transform -->
+          <div class="fb-palette-category">
+            <div class="fb-palette-cat-header">
+              <span>Transform</span>
+              <svg class="ico ico-sm fb-chevron"><use href="#i-chevron-down"/></svg>
+            </div>
+            <div class="fb-palette-items">
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-template)">
+                <div class="fb-node-icon"><svg><use href="#i-code"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Template</div>
+                  <div class="fb-node-desc">Handlebars template</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-template)">
+                <div class="fb-node-icon"><svg><use href="#i-code"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">JSON Transform</div>
+                  <div class="fb-node-desc">JSONata / jq</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-template)">
+                <div class="fb-node-icon"><svg><use href="#i-code"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Map</div>
+                  <div class="fb-node-desc">Iteracja po tablicy</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kategoria: Logic -->
+          <div class="fb-palette-category">
+            <div class="fb-palette-cat-header">
+              <span>Logic</span>
+              <svg class="ico ico-sm fb-chevron"><use href="#i-chevron-down"/></svg>
+            </div>
+            <div class="fb-palette-items">
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-condition)">
+                <div class="fb-node-icon"><svg><use href="#i-branch"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Condition</div>
+                  <div class="fb-node-desc">If / else branching</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-switch)">
+                <div class="fb-node-icon"><svg><use href="#i-branch"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Switch</div>
+                  <div class="fb-node-desc">Multi-case routing</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-condition)">
+                <div class="fb-node-icon"><svg><use href="#i-branch"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Loop</div>
+                  <div class="fb-node-desc">Iteracja w pętli</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kategoria: Filters -->
+          <div class="fb-palette-category">
+            <div class="fb-palette-cat-header">
+              <span>Filters</span>
+              <svg class="ico ico-sm fb-chevron"><use href="#i-chevron-down"/></svg>
+            </div>
+            <div class="fb-palette-items">
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-pii)">
+                <div class="fb-node-icon"><svg><use href="#i-filter"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">PII Filter</div>
+                  <div class="fb-node-desc">Usuwa dane osobowe</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-tts-clean)">
+                <div class="fb-node-icon"><svg><use href="#i-filter"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">TTS Clean</div>
+                  <div class="fb-node-desc">Sanityzacja pod TTS</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kategoria: Outputs -->
+          <div class="fb-palette-category">
+            <div class="fb-palette-cat-header">
+              <span>Outputs</span>
+              <svg class="ico ico-sm fb-chevron"><use href="#i-chevron-down"/></svg>
+            </div>
+            <div class="fb-palette-items">
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-output)">
+                <div class="fb-node-icon"><svg><use href="#i-out"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">HTTP Response</div>
+                  <div class="fb-node-desc">Zwróć HTTP</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-output)">
+                <div class="fb-node-icon"><svg><use href="#i-out"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Webhook</div>
+                  <div class="fb-node-desc">POST do URL</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-output)">
+                <div class="fb-node-icon"><svg><use href="#i-out"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Log</div>
+                  <div class="fb-node-desc">Zapis do logów</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+              <div class="fb-node-item" draggable="true" style="--node-color: var(--node-output)">
+                <div class="fb-node-icon"><svg><use href="#i-db"/></svg></div>
+                <div class="fb-node-info">
+                  <div class="fb-node-name">Store</div>
+                  <div class="fb-node-desc">Zapisz do DB</div>
+                </div>
+                <div class="fb-node-drag-handle"><svg><use href="#i-grip"/></svg></div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </aside>
+
+      <!-- ========================================================================
+           CANVAS — main workspace z przykladowym flow "Asystent RAG"
+           ======================================================================== -->
+      <main class="fb-canvas-wrap">
+        <div class="fb-canvas" data-allow-pinch>
+
+          <!-- ======================================================================
+               SVG z krawedziami (zakrzywione bezier'y laczace porty nodów)
+               Kolejność połączeń:
+                 HTTP Request (n1) -> Template (n2)
+                 Template (n2) -> PII Filter (n3)
+                 PII Filter (n3) -> Retrieve (n4)
+                 Retrieve (n4) -> Memory (n5)
+                 Memory (n5) -> Reranker (n6)
+                 Reranker (n6) -> LLM (n7)
+                 LLM (n7) -> HTTP Response (n8)
+               ====================================================================== -->
+          <svg class="fb-edges" viewBox="0 0 1600 900" preserveAspectRatio="none">
+            <!-- n1 -> n2: HTTP Request -> Template -->
+            <path class="fb-edge-path" d="M 290 140 C 380 140 340 240 430 240"/>
+            <circle class="fb-edge-flow" r="3">
+              <animateMotion dur="2.4s" repeatCount="indefinite" path="M 290 140 C 380 140 340 240 430 240"/>
+            </circle>
+
+            <!-- n2 -> n3: Template -> PII Filter -->
+            <path class="fb-edge-path" d="M 650 240 C 740 240 700 340 790 340"/>
+            <circle class="fb-edge-flow" r="3">
+              <animateMotion dur="2.4s" begin="0.3s" repeatCount="indefinite" path="M 650 240 C 740 240 700 340 790 340"/>
+            </circle>
+
+            <!-- n3 -> n4: PII Filter -> Retrieve -->
+            <path class="fb-edge-path" d="M 1010 340 C 1100 340 1060 440 1150 440"/>
+            <circle class="fb-edge-flow" r="3">
+              <animateMotion dur="2.4s" begin="0.6s" repeatCount="indefinite" path="M 1010 340 C 1100 340 1060 440 1150 440"/>
+            </circle>
+
+            <!-- n4 -> n5: Retrieve -> Memory (poniżej) -->
+            <path class="fb-edge-path" d="M 1370 470 C 1440 540 1300 560 1230 600"/>
+            <circle class="fb-edge-flow" r="3">
+              <animateMotion dur="2.4s" begin="0.9s" repeatCount="indefinite" path="M 1370 470 C 1440 540 1300 560 1230 600"/>
+            </circle>
+
+            <!-- n5 -> n6: Memory -> Reranker -->
+            <path class="fb-edge-path" d="M 1010 620 C 920 620 900 520 790 520"/>
+            <circle class="fb-edge-flow" r="3">
+              <animateMotion dur="2.4s" begin="1.2s" repeatCount="indefinite" path="M 1010 620 C 920 620 900 520 790 520"/>
+            </circle>
+
+            <!-- n6 -> n7: Reranker -> LLM -->
+            <path class="fb-edge-path" d="M 570 520 C 500 520 520 700 460 700"/>
+            <circle class="fb-edge-flow" r="3">
+              <animateMotion dur="2.4s" begin="1.5s" repeatCount="indefinite" path="M 570 520 C 500 520 520 700 460 700"/>
+            </circle>
+
+            <!-- n7 -> n8: LLM -> HTTP Response -->
+            <path class="fb-edge-path" d="M 680 700 C 800 700 780 780 900 780"/>
+            <circle class="fb-edge-flow" r="3">
+              <animateMotion dur="2.4s" begin="1.8s" repeatCount="indefinite" path="M 680 700 C 800 700 780 780 900 780"/>
+            </circle>
+          </svg>
+
+          <!-- NODE 1: HTTP Request (trigger) -->
+          <div class="fb-node" style="--node-color: var(--node-trigger); left: 70px; top: 110px; width: 220px;">
+            <div class="fb-node-header">
+              <div class="fb-node-badge"><svg><use href="#i-globe"/></svg></div>
+              <div class="fb-node-title">HTTP Request</div>
+              <span class="fb-node-type">trigger</span>
+            </div>
+            <div class="fb-node-body">
+              <div class="fb-node-row"><span class="fb-key">method</span><span class="fb-val">POST</span></div>
+              <div class="fb-node-row"><span class="fb-key">path</span><span class="fb-val">/api/chat</span></div>
+            </div>
+            <div class="fb-port fb-port-out" title="Wyjście"></div>
+          </div>
+
+          <!-- NODE 2: Template -->
+          <div class="fb-node" style="--node-color: var(--node-template); left: 430px; top: 210px; width: 220px;">
+            <div class="fb-node-header">
+              <div class="fb-node-badge"><svg><use href="#i-code"/></svg></div>
+              <div class="fb-node-title">Template</div>
+              <span class="fb-node-type">transform</span>
+            </div>
+            <div class="fb-node-body">
+              <div class="fb-node-row"><span class="fb-key">engine</span><span class="fb-val">handlebars</span></div>
+              <div class="fb-node-row"><span class="fb-key">vars</span><span class="fb-val">3</span></div>
+            </div>
+            <div class="fb-port fb-port-in" title="Wejście"></div>
+            <div class="fb-port fb-port-out" title="Wyjście"></div>
+          </div>
+
+          <!-- NODE 3: PII Filter (SELECTED — pokazuje stan zaznaczony) -->
+          <div class="fb-node selected" style="--node-color: var(--node-pii); left: 790px; top: 310px; width: 220px;">
+            <div class="fb-node-header">
+              <div class="fb-node-badge"><svg><use href="#i-filter"/></svg></div>
+              <div class="fb-node-title">PII Filter</div>
+              <span class="fb-node-type">filter</span>
+            </div>
+            <div class="fb-node-body">
+              <div class="fb-node-row"><span class="fb-key">mode</span><span class="fb-val">strict</span></div>
+              <div class="fb-node-row"><span class="fb-key">types</span><span class="fb-val">email, phone, pesel</span></div>
+            </div>
+            <div class="fb-port fb-port-in"></div>
+            <div class="fb-port fb-port-out"></div>
+          </div>
+
+          <!-- NODE 4: Retrieve (RAG) -->
+          <div class="fb-node" style="--node-color: var(--node-rag); left: 1150px; top: 410px; width: 220px;">
+            <div class="fb-node-header">
+              <div class="fb-node-badge"><svg><use href="#i-db"/></svg></div>
+              <div class="fb-node-title">Retrieve</div>
+              <span class="fb-node-type">rag</span>
+            </div>
+            <div class="fb-node-body">
+              <div class="fb-node-row"><span class="fb-key">index</span><span class="fb-val">docs-v2</span></div>
+              <div class="fb-node-row"><span class="fb-key">top_k</span><span class="fb-val">8</span></div>
+              <div class="fb-node-row"><span class="fb-key">threshold</span><span class="fb-val">0.72</span></div>
+            </div>
+            <div class="fb-port fb-port-in"></div>
+            <div class="fb-port fb-port-out"></div>
+          </div>
+
+          <!-- NODE 5: Memory (ERROR state — pokazuje blad konfiguracji) -->
+          <div class="fb-node error" style="--node-color: var(--node-memory); left: 1010px; top: 590px; width: 220px;">
+            <div class="fb-node-header">
+              <div class="fb-node-badge"><svg><use href="#i-db"/></svg></div>
+              <div class="fb-node-title">Memory</div>
+              <span class="fb-node-error-icon" title="Brak klucza API — flow nie wystartuje">
+                <svg><use href="#i-alert"/></svg>
+              </span>
+            </div>
+            <div class="fb-node-body">
+              <div class="fb-node-row"><span class="fb-key">scope</span><span class="fb-val">session</span></div>
+              <div class="fb-node-row"><span class="fb-key">ttl</span><span class="fb-val" style="color: var(--tf-danger)">missing</span></div>
+            </div>
+            <div class="fb-port fb-port-in"></div>
+            <div class="fb-port fb-port-out"></div>
+          </div>
+
+          <!-- NODE 6: Reranker -->
+          <div class="fb-node" style="--node-color: var(--node-reranker); left: 570px; top: 490px; width: 220px;">
+            <div class="fb-node-header">
+              <div class="fb-node-badge"><svg><use href="#i-sparkle"/></svg></div>
+              <div class="fb-node-title">Reranker</div>
+              <span class="fb-node-type">ai</span>
+            </div>
+            <div class="fb-node-body">
+              <div class="fb-node-row"><span class="fb-key">model</span><span class="fb-val">bge-reranker</span></div>
+              <div class="fb-node-row"><span class="fb-key">top_n</span><span class="fb-val">4</span></div>
+            </div>
+            <div class="fb-port fb-port-in"></div>
+            <div class="fb-port fb-port-out"></div>
+          </div>
+
+          <!-- NODE 7: LLM (duży akcent kolorystyczny) -->
+          <div class="fb-node" style="--node-color: var(--node-llm); left: 240px; top: 670px; width: 220px;">
+            <div class="fb-node-header">
+              <div class="fb-node-badge"><svg><use href="#i-cpu"/></svg></div>
+              <div class="fb-node-title">LLM</div>
+              <span class="fb-node-type">ai</span>
+            </div>
+            <div class="fb-node-body">
+              <div class="fb-node-row"><span class="fb-key">model</span><span class="fb-val">llm-big</span></div>
+              <div class="fb-node-row"><span class="fb-key">temp</span><span class="fb-val">0.7</span></div>
+              <div class="fb-node-row"><span class="fb-key">max_tokens</span><span class="fb-val">2048</span></div>
+            </div>
+            <div class="fb-port fb-port-in"></div>
+            <div class="fb-port fb-port-out"></div>
+          </div>
+
+          <!-- NODE 8: HTTP Response (output) -->
+          <div class="fb-node" style="--node-color: var(--node-output); left: 900px; top: 750px; width: 220px;">
+            <div class="fb-node-header">
+              <div class="fb-node-badge"><svg><use href="#i-out"/></svg></div>
+              <div class="fb-node-title">HTTP Response</div>
+              <span class="fb-node-type">output</span>
+            </div>
+            <div class="fb-node-body">
+              <div class="fb-node-row"><span class="fb-key">status</span><span class="fb-val">200</span></div>
+              <div class="fb-node-row"><span class="fb-key">format</span><span class="fb-val">json</span></div>
+            </div>
+            <div class="fb-port fb-port-in"></div>
+          </div>
+
+        </div>
+
+        <!-- Mini-mapa w prawym dolnym rogu canvas -->
+        <div class="fb-minimap" aria-label="Mini-mapa">
+          <span class="fb-minimap-label">Mapa</span>
+          <!-- Pozycje nodów zeskalowane do miniatury 180×120 -->
+          <div class="fb-minimap-node" style="left: 10px; top: 24px; width: 26px; height: 12px; --node-color: var(--node-trigger)"></div>
+          <div class="fb-minimap-node" style="left: 48px; top: 36px; width: 26px; height: 12px; --node-color: var(--node-template)"></div>
+          <div class="fb-minimap-node" style="left: 86px; top: 48px; width: 26px; height: 12px; --node-color: var(--node-pii)"></div>
+          <div class="fb-minimap-node" style="left: 128px; top: 60px; width: 26px; height: 12px; --node-color: var(--node-rag)"></div>
+          <div class="fb-minimap-node" style="left: 114px; top: 82px; width: 26px; height: 12px; --node-color: var(--node-memory)"></div>
+          <div class="fb-minimap-node" style="left: 64px; top: 72px; width: 26px; height: 12px; --node-color: var(--node-reranker)"></div>
+          <div class="fb-minimap-node" style="left: 26px; top: 92px; width: 26px; height: 12px; --node-color: var(--node-llm)"></div>
+          <div class="fb-minimap-node" style="left: 100px; top: 100px; width: 26px; height: 12px; --node-color: var(--node-output)"></div>
+          <!-- Viewport mini-mapy -->
+          <div class="fb-minimap-viewport" style="left: 20px; top: 18px; width: 116px; height: 72px;"></div>
+        </div>
+      </main>
+
+      <!-- ========================================================================
+           PRAWY PANEL KONFIGURACJI — pokazuje zaznaczony node (PII Filter)
+           ======================================================================== -->
+      <aside class="fb-config" aria-label="Konfiguracja node">
+        <div class="fb-config-header">
+          <div class="fb-node-badge" style="--node-color: var(--node-pii)"><svg><use href="#i-filter"/></svg></div>
+          <div class="fb-config-title-wrap">
+            <div class="fb-config-title">PII Filter</div>
+            <div class="fb-config-subtitle">pii_filter · id: node_3</div>
+          </div>
+        </div>
+
+        <!-- Zakładki: Konfiguracja / Porty / Zaawansowane -->
+        <nav class="tf-tabs-underline" role="tablist">
+          <button class="tf-tab active" role="tab">Konfiguracja</button>
+          <button class="tf-tab" role="tab">Porty</button>
+          <button class="tf-tab" role="tab">Zaawansowane</button>
+        </nav>
+
+        <div class="fb-config-body">
+
+          <div class="fb-field">
+            <label class="tf-label">Nazwa</label>
+            <input class="tf-input" value="Filtr danych osobowych">
+          </div>
+
+          <div class="fb-field">
+            <label class="tf-label">Tryb działania</label>
+            <select class="tf-select">
+              <option>strict — blokuj gdy wykryto PII</option>
+              <option>redact — zamaskuj wartości</option>
+              <option>log — tylko zaloguj</option>
+            </select>
+            <span class="fb-field-hint">Strict zatrzyma flow gdy znajdzie dane osobowe.</span>
+          </div>
+
+          <div class="fb-field">
+            <label class="tf-label">Wykrywane typy</label>
+            <input class="tf-input" value="email, phone, pesel, credit_card">
+          </div>
+
+          <div class="fb-field fb-field-row">
+            <div>
+              <label class="tf-label" style="margin-bottom: 2px">Ignoruj w promptach systemowych</label>
+              <span class="fb-field-hint">Nie filtruje treści systemowych.</span>
+            </div>
+            <span class="tf-toggle on" role="switch" aria-checked="true"></span>
+          </div>
+
+          <div class="fb-field fb-field-row">
+            <div>
+              <label class="tf-label" style="margin-bottom: 2px">Raportuj do metryk</label>
+            </div>
+            <span class="tf-toggle" role="switch" aria-checked="false"></span>
+          </div>
+
+          <!-- Preview testu noda (input/output) -->
+          <div class="fb-field">
+            <label class="tf-label">Podgląd testowy</label>
+            <div class="fb-config-preview">{
+  <span class="k">"input"</span>: {
+    <span class="k">"text"</span>: <span class="s">"Mój email to jan@example.com"</span>
+  },
+  <span class="k">"output"</span>: {
+    <span class="k">"blocked"</span>: <span class="n">true</span>,
+    <span class="k">"reason"</span>: <span class="s">"email detected"</span>
+  }
+}</div>
+            <button class="tf-btn tf-btn-secondary tf-btn-sm" style="align-self: flex-start">
+              <svg class="ico ico-sm"><use href="#i-play"/></svg>
+              Uruchom test noda
+            </button>
+          </div>
+
+        </div>
+
+        <!-- Stopka z akcjami noda -->
+        <footer class="fb-config-footer">
+          <button class="tf-btn tf-btn-secondary tf-btn-sm">
+            <svg class="ico ico-sm"><use href="#i-copy"/></svg>
+            Duplikuj
+          </button>
+          <button class="tf-btn tf-btn-danger tf-btn-sm">
+            <svg class="ico ico-sm"><use href="#i-trash"/></svg>
+            Usuń
+          </button>
+        </footer>
+      </aside>
+
+    </div>
+
+    <!-- ==========================================================================
+         DOLNY TOOLBAR: breadcrumb, undo/redo, copy/paste/cut, grid snap, version
+         ========================================================================== -->
+    <footer class="fb-bottombar">
+      <div class="fb-breadcrumb">
+        <span class="fb-crumb">Flow</span>
+        <span class="fb-sep">›</span>
+        <span class="fb-crumb">Asystent RAG</span>
+        <span class="fb-sep">›</span>
+        <span class="fb-crumb active">PII Filter</span>
+      </div>
+
+      <div class="fb-bottombar-separator"></div>
+
+      <div class="fb-tool-group" role="group" aria-label="Historia">
+        <button class="tf-btn tf-btn-ghost" title="Cofnij (Ctrl+Z)">
+          <svg class="ico ico-sm"><use href="#i-undo"/></svg>
+        </button>
+        <button class="tf-btn tf-btn-ghost" title="Ponów (Ctrl+Shift+Z)">
+          <svg class="ico ico-sm"><use href="#i-redo"/></svg>
+        </button>
+      </div>
+
+      <div class="fb-bottombar-separator"></div>
+
+      <div class="fb-tool-group" role="group" aria-label="Schowek">
+        <button class="tf-btn tf-btn-ghost" title="Kopiuj"><span class="fb-kbd">⌘C</span></button>
+        <button class="tf-btn tf-btn-ghost" title="Wklej"><span class="fb-kbd">⌘V</span></button>
+        <button class="tf-btn tf-btn-ghost" title="Wytnij"><span class="fb-kbd">⌘X</span></button>
+      </div>
+
+      <div class="fb-bottombar-separator"></div>
+
+      <div class="fb-tool-group">
+        <button class="tf-btn tf-btn-ghost" title="Przyciąganie do siatki">
+          <svg class="ico ico-sm"><use href="#i-grid"/></svg>
+          Snap
+          <span class="tf-chip ok" style="margin-left: 4px"><span class="tf-chip-dot"></span>ON</span>
+        </button>
+      </div>
+
+      <div class="fb-bottombar-spacer"></div>
+
+      <!-- Stats i version -->
+      <span style="color: var(--tf-text-3)">8 nodów · 7 połączeń</span>
+      <div class="fb-bottombar-separator"></div>
+      <button class="tf-btn tf-btn-ghost" title="Historia wersji">
+        <svg class="ico ico-sm"><use href="#i-history"/></svg>
+        v3 · 5 min temu
+      </button>
+    </footer>
+
+  </div>
+
+  <!-- =============================================================================
+       SEKCJA: STANY UI
+       ============================================================================= -->
+  <section class="states-section">
+    <h2>Stany UI</h2>
+    <p>Wszystkie wizualne stany node'a widoczne w jednym miejscu — do zatwierdzenia przez product.</p>
+
+    <div class="states-grid">
+
+      <!-- Stan: Normal -->
+      <div class="state-card">
+        <div class="state-card-label">Normal</div>
+        <div class="fb-node" style="--node-color: var(--node-llm)">
+          <div class="fb-node-header">
+            <div class="fb-node-badge"><svg><use href="#i-cpu"/></svg></div>
+            <div class="fb-node-title">LLM</div>
+            <span class="fb-node-type">ai</span>
+          </div>
+          <div class="fb-node-body">
+            <div class="fb-node-row"><span class="fb-key">model</span><span class="fb-val">llm-big</span></div>
+          </div>
+          <div class="fb-port fb-port-in"></div>
+          <div class="fb-port fb-port-out"></div>
+        </div>
+      </div>
+
+      <!-- Stan: Hover -->
+      <div class="state-card">
+        <div class="state-card-label">Hover</div>
+        <div class="fb-node" style="--node-color: var(--node-llm); border-color: var(--tf-border-hover); box-shadow: var(--tf-shadow), 0 0 0 1px color-mix(in srgb, var(--node-llm) 40%, transparent);">
+          <div class="fb-node-header">
+            <div class="fb-node-badge"><svg><use href="#i-cpu"/></svg></div>
+            <div class="fb-node-title">LLM</div>
+            <span class="fb-node-type">ai</span>
+          </div>
+          <div class="fb-node-body">
+            <div class="fb-node-row"><span class="fb-key">model</span><span class="fb-val">llm-big</span></div>
+          </div>
+          <div class="fb-port fb-port-in"></div>
+          <div class="fb-port fb-port-out"></div>
+        </div>
+      </div>
+
+      <!-- Stan: Selected -->
+      <div class="state-card">
+        <div class="state-card-label">Selected (pulsujący border)</div>
+        <div class="fb-node selected" style="--node-color: var(--node-llm)">
+          <div class="fb-node-header">
+            <div class="fb-node-badge"><svg><use href="#i-cpu"/></svg></div>
+            <div class="fb-node-title">LLM</div>
+            <span class="fb-node-type">ai</span>
+          </div>
+          <div class="fb-node-body">
+            <div class="fb-node-row"><span class="fb-key">model</span><span class="fb-val">llm-big</span></div>
+          </div>
+          <div class="fb-port fb-port-in"></div>
+          <div class="fb-port fb-port-out"></div>
+        </div>
+      </div>
+
+      <!-- Stan: Error -->
+      <div class="state-card">
+        <div class="state-card-label">Error (brak konfiguracji)</div>
+        <div class="fb-node error" style="--node-color: var(--node-memory)">
+          <div class="fb-node-header">
+            <div class="fb-node-badge"><svg><use href="#i-db"/></svg></div>
+            <div class="fb-node-title">Memory</div>
+            <span class="fb-node-error-icon"><svg><use href="#i-alert"/></svg></span>
+          </div>
+          <div class="fb-node-body">
+            <div class="fb-node-row"><span class="fb-key">ttl</span><span class="fb-val" style="color: var(--tf-danger)">missing</span></div>
+          </div>
+          <div class="fb-port fb-port-in"></div>
+          <div class="fb-port fb-port-out"></div>
+        </div>
+      </div>
+
+      <!-- Stan: Dragging -->
+      <div class="state-card">
+        <div class="state-card-label">Dragging (tactile feedback)</div>
+        <div class="fb-node dragging" style="--node-color: var(--node-reranker)">
+          <div class="fb-node-header">
+            <div class="fb-node-badge"><svg><use href="#i-sparkle"/></svg></div>
+            <div class="fb-node-title">Reranker</div>
+            <span class="fb-node-type">ai</span>
+          </div>
+          <div class="fb-node-body">
+            <div class="fb-node-row"><span class="fb-key">top_n</span><span class="fb-val">4</span></div>
+          </div>
+          <div class="fb-port fb-port-in"></div>
+          <div class="fb-port fb-port-out"></div>
+        </div>
+      </div>
+
+      <!-- Stan: Multi-output (switch) -->
+      <div class="state-card">
+        <div class="state-card-label">Switch (3 porty wyjściowe)</div>
+        <div class="fb-node multi-out" style="--node-color: var(--node-switch)">
+          <div class="fb-node-header">
+            <div class="fb-node-badge"><svg><use href="#i-branch"/></svg></div>
+            <div class="fb-node-title">Switch</div>
+            <span class="fb-node-type">logic</span>
+          </div>
+          <div class="fb-node-body">
+            <div class="fb-node-row"><span class="fb-key">cases</span><span class="fb-val">3</span></div>
+          </div>
+          <div class="fb-port fb-port-in"></div>
+          <div class="fb-port fb-port-out p1" title="case: success"></div>
+          <div class="fb-port fb-port-out p2" title="case: partial"></div>
+          <div class="fb-port fb-port-out p3" title="default"></div>
+        </div>
+      </div>
+
+      <!-- Stan: Empty search palette -->
+      <div class="state-card" style="grid-column: span 2">
+        <div class="state-card-label">Paleta — pusty wynik wyszukiwania</div>
+        <div class="tf-searchbox" style="margin-bottom: 12px">
+          <svg><use href="#i-search"/></svg>
+          <input type="search" value="nieistniejacy" readonly>
+        </div>
+        <div class="fb-palette-empty">
+          <svg class="ico ico-lg" style="width: 32px; height: 32px; opacity: 0.4; margin-bottom: 8px"><use href="#i-search"/></svg>
+          <div style="font-weight: 600; color: var(--tf-text-2); margin-bottom: 4px">Brak wyników</div>
+          <div>Nie znaleziono node'a pasującego do zapytania "nieistniejacy".</div>
+        </div>
+      </div>
+
+      <!-- Stan: Konfiguracja pusta (nic nie zaznaczone) -->
+      <div class="state-card" style="grid-column: span 2">
+        <div class="state-card-label">Panel konfiguracji — stan pusty</div>
+        <div class="fb-config-empty">
+          <div class="fb-config-empty-icon"><svg><use href="#i-plus"/></svg></div>
+          <h4>Nic nie jest zaznaczone</h4>
+          <p>Wybierz node na canvasie, aby zobaczyć jego konfigurację, lub przeciągnij nowy node z palety.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- =============================================================================
+       SEKCJA: RESPONSIVE PREVIEW — 3 mini ramki (desktop / tablet / mobile)
+       ============================================================================= -->
+  <section class="responsive-preview-section">
+    <h2>Responsive preview</h2>
+    <p>Jak layout adaptuje się do szerokości ekranu. Breakpointy: desktop ≥1024px, tablet 768-1023px, mobile &lt;768px.</p>
+
+    <div class="responsive-frames">
+
+      <!-- Desktop: 3-column layout -->
+      <div class="responsive-frame rf-desktop">
+        <div class="responsive-frame-label">
+          <span>Desktop</span>
+          <span class="dim">≥1024 px</span>
+        </div>
+        <div class="responsive-frame-canvas">
+          <!-- Paleta (skondensowana) -->
+          <div class="rf-palette">
+            <div class="rf-palette-item accent" style="--node-color: var(--node-trigger)"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item accent" style="--node-color: var(--node-llm)"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item accent" style="--node-color: var(--node-pii)"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item accent" style="--node-color: var(--node-output)"></div>
+          </div>
+          <!-- Canvas -->
+          <div class="rf-canvas">
+            <div class="rf-mini-node" style="--node-color: var(--node-trigger); left: 10px; top: 30px">HTTP</div>
+            <div class="rf-mini-node" style="--node-color: var(--node-pii); left: 100px; top: 70px">PII</div>
+            <div class="rf-mini-node" style="--node-color: var(--node-rag); left: 200px; top: 110px">Retrieve</div>
+            <div class="rf-mini-node" style="--node-color: var(--node-llm); left: 100px; top: 180px">LLM</div>
+            <div class="rf-mini-node" style="--node-color: var(--node-output); left: 240px; top: 230px">Resp</div>
+            <!-- Łączenia (prosto dla uproszczenia) -->
+            <svg style="position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none" viewBox="0 0 460 360" preserveAspectRatio="none">
+              <path d="M 60 45 C 100 45 90 85 120 85" stroke="#6366f1" stroke-width="1.5" fill="none"/>
+              <path d="M 150 95 C 200 95 200 125 220 125" stroke="#6366f1" stroke-width="1.5" fill="none"/>
+              <path d="M 280 135 C 200 160 160 180 120 195" stroke="#6366f1" stroke-width="1.5" fill="none"/>
+              <path d="M 150 205 C 220 220 220 240 260 245" stroke="#6366f1" stroke-width="1.5" fill="none"/>
+            </svg>
+          </div>
+          <!-- Config panel -->
+          <div class="rf-config">
+            <div class="rf-palette-item" style="background: var(--tf-accent-glow); height: 14px"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item" style="background: var(--tf-bg-card-hover)"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tablet: overlay palette z lewej, canvas na calym ekranie -->
+      <div class="responsive-frame rf-tablet">
+        <div class="responsive-frame-label">
+          <span>Tablet</span>
+          <span class="dim">768-1023 px</span>
+        </div>
+        <div class="responsive-frame-canvas">
+          <!-- Canvas w tle -->
+          <div class="rf-mini-node" style="--node-color: var(--node-trigger); left: 40px; top: 30px">HTTP</div>
+          <div class="rf-mini-node" style="--node-color: var(--node-pii); left: 120px; top: 80px">PII</div>
+          <div class="rf-mini-node" style="--node-color: var(--node-llm); left: 180px; top: 160px">LLM</div>
+          <div class="rf-mini-node" style="--node-color: var(--node-output); left: 80px; top: 210px">Resp</div>
+
+          <!-- Overlay palety z lewej (swipe from left) -->
+          <div class="rf-tablet-overlay">
+            <div style="font-size: 9px; font-weight: 700; color: var(--tf-text-3); text-transform: uppercase; margin-bottom: 6px; padding-left: 4px">Paleta</div>
+            <div class="rf-palette-item accent" style="--node-color: var(--node-trigger)"></div>
+            <div class="rf-palette-item accent" style="--node-color: var(--node-llm)"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item accent" style="--node-color: var(--node-pii)"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item accent" style="--node-color: var(--node-rag)"></div>
+            <div class="rf-palette-item"></div>
+            <div class="rf-palette-item accent" style="--node-color: var(--node-output)"></div>
+          </div>
+
+          <!-- Grip (swipe hint) -->
+          <div style="position: absolute; right: 4px; top: 50%; width: 4px; height: 40px; background: var(--tf-accent-2); opacity: 0.4; border-radius: 4px; transform: translateY(-50%)"></div>
+        </div>
+      </div>
+
+      <!-- Mobile: bottom tab bar nawigacja -->
+      <div class="responsive-frame rf-mobile">
+        <div class="responsive-frame-label">
+          <span>Mobile</span>
+          <span class="dim">&lt;768 px</span>
+        </div>
+        <div class="responsive-frame-canvas">
+          <!-- Pelnoekranowy canvas -->
+          <div class="rf-mini-node" style="--node-color: var(--node-trigger); left: 20px; top: 30px">HTTP</div>
+          <div class="rf-mini-node" style="--node-color: var(--node-pii); left: 80px; top: 90px">PII</div>
+          <div class="rf-mini-node" style="--node-color: var(--node-llm); left: 30px; top: 160px">LLM</div>
+          <div class="rf-mini-node" style="--node-color: var(--node-output); left: 90px; top: 220px">Resp</div>
+
+          <svg style="position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none" viewBox="0 0 180 320" preserveAspectRatio="none">
+            <path d="M 50 40 C 70 40 60 100 90 100" stroke="#6366f1" stroke-width="1.2" fill="none"/>
+            <path d="M 110 110 C 80 130 60 150 50 170" stroke="#6366f1" stroke-width="1.2" fill="none"/>
+            <path d="M 65 180 C 90 200 100 220 110 230" stroke="#6366f1" stroke-width="1.2" fill="none"/>
+          </svg>
+
+          <!-- Bottom sheet (konfiguracja noda) wysuwany z dolu -->
+          <div style="position: absolute; left: 8px; right: 8px; bottom: 52px; height: 84px; background: var(--tf-bg-card); border: 1px solid var(--tf-border); border-radius: 10px 10px 4px 4px; padding: 8px; box-shadow: 0 -8px 24px rgba(0,0,0,0.4)">
+            <div style="width: 32px; height: 3px; background: var(--tf-text-3); border-radius: 2px; margin: 0 auto 8px"></div>
+            <div style="font-size: 9px; font-weight: 700; color: var(--tf-text)">PII Filter</div>
+            <div style="font-size: 8px; color: var(--tf-text-3); margin-top: 2px">2 ustawienia · bottom sheet</div>
+          </div>
+
+          <!-- Bottom tab bar -->
+          <div class="rf-mobile-tabbar">
+            <div class="rf-mobile-tab">Paleta</div>
+            <div class="rf-mobile-tab active">Canvas</div>
+            <div class="rf-mobile-tab">Config</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Note dla designera -->
+    <div style="max-width: 820px; margin: 32px auto 0; padding: 16px 20px; background: var(--tf-bg-card); border: 1px solid var(--tf-border); border-radius: var(--tf-radius); color: var(--tf-text-2); font-size: 12px; line-height: 1.6">
+      <strong style="color: var(--tf-accent-2)">Uwagi touch</strong> — wszystkie interaktywne elementy mają minimum 44×44 px.
+      Canvas używa <code style="background: var(--tf-bg-input); padding: 2px 6px; border-radius: 4px; font-size: 11px">touch-action: none</code>
+      z własną obsługą pan/pinch (data-allow-pinch). Na tabletach paleta i config są panelami overlay z animacją swipe.
+      Na mobile — bottom tab bar między trzema ekranami; tapnięcie noda otwiera bottom sheet z konfiguracją.
+    </div>
+  </section>
+
+  <!-- =============================================================================
+       Minimalny JS do demo animacji (zwijanie kategorii palety, toggle)
+       ============================================================================= -->
+  <script>
+    // =============================================================================
+    // Demo: zwijanie kategorii palety
+    // =============================================================================
+    document.querySelectorAll('.fb-palette-cat-header').forEach(header => {
+      header.addEventListener('click', () => {
+        header.parentElement.classList.toggle('collapsed');
+      });
+    });
+
+    // =============================================================================
+    // Demo: przelacznik tf-toggle
+    // =============================================================================
+    document.querySelectorAll('.tf-toggle').forEach(toggle => {
+      toggle.addEventListener('click', () => {
+        toggle.classList.toggle('on');
+        toggle.setAttribute('aria-checked', toggle.classList.contains('on'));
+      });
+    });
+
+    // =============================================================================
+    // Demo: przelaczanie zakladek w konfiguracji
+    // =============================================================================
+    document.querySelectorAll('.tf-tabs-underline').forEach(tabs => {
+      tabs.querySelectorAll('.tf-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+          tabs.querySelectorAll('.tf-tab').forEach(t => t.classList.remove('active'));
+          tab.classList.add('active');
+        });
+      });
+    });
+  </script>
+
+</body>
+</html>

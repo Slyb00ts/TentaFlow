@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Bindings &amp; Storage (M14)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.alias-row { display: grid; grid-template-columns: 220px 1fr 120px 110px 100px; gap: 12px; padding: 12px 14px;
+  border-bottom: 1px solid var(--border); align-items: center; }
+.alias-row:last-child { border-bottom: 0; }
+.alias-row .alias-name { font-family: ui-monospace,monospace; font-size: 12.5px; font-weight: 700; color: var(--accent-2); }
+.alias-row .alias-methods { font-size: 11px; color: var(--text-3); margin-top: 3px; }
+.alias-row .service-bound { font-size: 12px; font-weight: 700; }
+.alias-row .service-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.usage-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.usage-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+.usage-card .h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-3); font-weight: 700; display: flex; align-items: center; gap: 7px; margin-bottom: 8px; }
+.usage-card .v { font-size: 22px; font-weight: 800; }
+.usage-card .v .small { font-size: 13px; color: var(--text-2); font-weight: 600; }
+.usage-card .sub { font-size: 11px; color: var(--text-3); margin-top: 4px; }
+.bar-thin { height: 5px; background: var(--bg-3); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+.bar-thin .fill { height: 100%; background: var(--gradient-accent); border-radius: 3px; }
+.bar-thin .fill.warn { background: var(--warning); }
+.bar-thin .fill.danger { background: var(--danger); }
+.namespace-row { display: grid; grid-template-columns: 1fr 110px 90px 110px 80px; gap: 10px; padding: 10px 0;
+  border-bottom: 1px dashed var(--border); align-items: center; }
+.namespace-row:last-child { border-bottom: 0; }
+.namespace-row .ns-name { font-family: ui-monospace,monospace; font-size: 12.5px; font-weight: 700; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-warning" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></symbol>
+  <symbol id="i-hash" viewBox="0 0 24 24"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M14</span><h2>Bindings &amp; Storage</h2>
+    <div class="desc">Mapowanie 6 aliasów AI na konkretne services + status wbudowanych API: KV, SQL, Vector, Recording.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Bindings &amp; Storage</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Bindings &amp; Storage <span class="chip success"><span class="dot"></span>5/6 aliasów aktywnych</span> <span class="chip">1 niezmapowany</span></div>
+            <div class="d-sub">Konfiguracja wykonawcza addona: które konkretne services pod aliasy AI · stan wbudowanych API (KV / SQL / Vector / Recording / Evidence)</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Re-check</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-check"/></svg>Test wszystkich aliasów</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab active"><svg class="icon"><use href="#i-link"/></svg>Bindings</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+        </div>
+
+        <!-- 1. Aliasy AI — READONLY VIEW -->
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-brain"/></svg>Aliasy AI utworzone przez addon · 6 sztuk</div>
+            <a href="m16-global-aliases.html" class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-link"/></svg>Skonfiguruj w Serwisy → Aliasy</a>
+          </div>
+
+          <div class="section-card" style="background:rgba(96,165,250,0.06);border-color:rgba(96,165,250,0.25);padding:11px;margin:0 0 14px">
+            <div class="text-xs text-2 flex align-center gap-sm">
+              <svg class="icon" style="color:var(--info);flex-shrink:0"><use href="#i-info"/></svg>
+              <span>To jest <strong>readonly podgląd</strong>. Aliasy żyją w globalnej tabeli <code class="mono">model_aliases</code> TentaFlow. Addon je utworzył przy instalacji i wywołuje przez <code class="mono">service_call(alias, method, payload)</code>. <strong>Konfiguracja target + fallback + strategy</strong> odbywa się w <a href="m16-global-aliases.html">Serwisy → Aliasy</a> przez admina TentaFlow. Tu addon tylko obserwuje stan i historię użycia.</span>
+            </div>
+          </div>
+
+          <div class="alias-row" style="font-size:10.5px;text-transform:uppercase;color:var(--text-3);font-weight:700;letter-spacing:0.06em;padding:8px 14px">
+            <div>Alias / methods</div><div>Aktualnie rozwiązuje na</div><div>Strategy</div><div>Ostatnio użyto</div><div></div>
+          </div>
+
+          <div class="alias-row">
+            <div>
+              <div class="alias-name">tentavision-yolo</div>
+              <div class="alias-methods">detect · track</div>
+            </div>
+            <div>
+              <div class="service-bound">yolo11m-detector</div>
+              <div class="service-meta">fallback chain: yolo11s, yolo11n-cpu</div>
+            </div>
+            <div><span class="chip" style="font-size:10px">first_available</span></div>
+            <div>
+              <div class="text-sm fw-700">yolo11m-detector</div>
+              <div class="text-xs text-3">3 414 wywołań · 12 ms p95</div>
+            </div>
+            <div><span class="status-pill ok">active</span></div>
+          </div>
+
+          <div class="alias-row">
+            <div>
+              <div class="alias-name">tentavision-ocr</div>
+              <div class="alias-methods">recognize · recognize_cropped</div>
+            </div>
+            <div>
+              <div class="service-bound">ppocrv5-ocr</div>
+              <div class="service-meta">fallback: parseq-adr</div>
+            </div>
+            <div><span class="chip" style="font-size:10px">first_available</span></div>
+            <div>
+              <div class="text-sm fw-700">ppocrv5-ocr</div>
+              <div class="text-xs text-3">1 244 wywołań · 28 ms p95</div>
+            </div>
+            <div><span class="status-pill ok">active</span></div>
+          </div>
+
+          <div class="alias-row">
+            <div>
+              <div class="alias-name">tentavision-action</div>
+              <div class="alias-methods">classify_window</div>
+            </div>
+            <div>
+              <div class="service-bound">videomae-v2-rwf2k</div>
+              <div class="service-meta">brak fallbacku · shadow A/B</div>
+            </div>
+            <div><span class="chip" style="font-size:10px">first_available</span></div>
+            <div>
+              <div class="text-sm fw-700 text-3">—</div>
+              <div class="text-xs text-3">profil nie aktywny (F5)</div>
+            </div>
+            <div><span class="status-pill warn">shadow</span></div>
+          </div>
+
+          <div class="alias-row">
+            <div>
+              <div class="alias-name">tentavision-vlm</div>
+              <div class="alias-methods">embed · caption</div>
+            </div>
+            <div>
+              <div class="service-bound">siglip2-vit-l14</div>
+              <div class="service-meta">fallback: eva-clip-large</div>
+            </div>
+            <div><span class="chip" style="font-size:10px">first_available</span></div>
+            <div>
+              <div class="text-sm fw-700">eva-clip-large <span class="chip warning" style="font-size:9px">fallback</span></div>
+              <div class="text-xs text-3">42 wywołań · primary down 14 min</div>
+            </div>
+            <div><span class="status-pill warn">degraded</span></div>
+          </div>
+
+          <div class="alias-row" style="opacity:0.65">
+            <div>
+              <div class="alias-name">tentavision-face-embed</div>
+              <div class="alias-methods">embed · <span style="color:var(--danger)">gate: d4-historical</span></div>
+            </div>
+            <div>
+              <div class="service-bound text-3">— (alias istnieje, ale gated)</div>
+              <div class="service-meta">target ustawiony przez admina: adaface-r100</div>
+            </div>
+            <div><span class="chip" style="font-size:10px">first_available</span></div>
+            <div>
+              <div class="text-sm fw-700 text-3">—</div>
+              <div class="text-xs text-3">brak aktywnego LegalGrant</div>
+            </div>
+            <div><span class="status-pill err"><svg class="icon" style="width:9px;height:9px"><use href="#i-lock"/></svg>gated</span></div>
+          </div>
+
+          <div class="alias-row" style="border-color:rgba(245,158,11,0.4)">
+            <div>
+              <div class="alias-name">tentavision-reid</div>
+              <div class="alias-methods">embed · match · <span style="color:var(--warning)">gate: d4-historical</span></div>
+            </div>
+            <div>
+              <div class="service-bound" style="color:var(--warning)">target nie ustawiony</div>
+              <div class="service-meta">addon utworzył alias z pustym targetem · admin musi przypisać</div>
+            </div>
+            <div><span class="chip" style="font-size:10px">first_available</span></div>
+            <div>
+              <div class="text-sm fw-700 text-3">—</div>
+              <div class="text-xs text-3">brak konfiguracji</div>
+            </div>
+            <div><span class="status-pill warn"><svg class="icon" style="width:9px;height:9px"><use href="#i-warning"/></svg>unconfigured</span></div>
+          </div>
+        </section>
+
+        <!-- 2. Storage usage -->
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-database"/></svg>Storage — wbudowane API TentaFlow</div>
+          </div>
+
+          <div class="usage-grid">
+            <!-- KV -->
+            <div class="usage-card">
+              <div class="h"><svg class="icon"><use href="#i-hash"/></svg>KV store</div>
+              <div class="v">147 <span class="small">/ 10 000 kluczy</span></div>
+              <div class="sub">12.4 KB · wspólna baza TentaFlow</div>
+              <div class="bar-thin"><div class="fill" style="width:1.5%"></div></div>
+            </div>
+
+            <!-- SQL -->
+            <div class="usage-card">
+              <div class="h"><svg class="icon"><use href="#i-database"/></svg>SQL · SQLite</div>
+              <div class="v">84 <span class="small">MB</span></div>
+              <div class="sub">~/.tentaflow/addons/tentavision/data.db · 6 tabel · 5 indeksów</div>
+              <div class="bar-thin"><div class="fill" style="width:8%"></div></div>
+            </div>
+
+            <!-- Vector -->
+            <div class="usage-card">
+              <div class="h"><svg class="icon"><use href="#i-cpu"/></svg>Vector store</div>
+              <div class="v">2.1M <span class="small">wektorów</span></div>
+              <div class="sub">4 namespaces · 1.4 GB HNSW · embedded</div>
+              <div class="bar-thin"><div class="fill warn" style="width:35%"></div></div>
+            </div>
+
+            <!-- Recording -->
+            <div class="usage-card">
+              <div class="h"><svg class="icon"><use href="#i-video"/></svg>Recording</div>
+              <div class="v">2.4 <span class="small">TB / 4 TB</span></div>
+              <div class="sub">22 strumieni · 47 dni ring-buffer · oldest 2026-03-27</div>
+              <div class="bar-thin"><div class="fill" style="width:60%"></div></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SQL detail -->
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-database"/></svg>SQL · zawartość bazy TentaVision</div>
+            <div class="flex gap-sm">
+              <span class="chip success">backend: SQLite</span>
+              <span class="chip">dialect: ANSI</span>
+              <span class="chip">migracje: 4 zastosowane (v1.0.0..v1.0.3)</span>
+            </div>
+          </div>
+          <table class="tf-table" style="border:0">
+            <thead><tr><th>Tabela</th><th>Wierszy</th><th>Rozmiar</th><th>Klasa danych</th><th>Indeksy</th></tr></thead>
+            <tbody>
+              <tr><td class="fw-700 mono">cameras</td><td>24</td><td>14 KB</td><td><span class="risk A">A</span></td><td>1</td></tr>
+              <tr><td class="fw-700 mono">profiles</td><td>6</td><td>3 KB</td><td><span class="risk A">A</span></td><td>0</td></tr>
+              <tr><td class="fw-700 mono">alarms</td><td>147 312</td><td>52 MB</td><td><span class="risk B">B</span></td><td>2 (ts, camera_id+ts)</td></tr>
+              <tr><td class="fw-700 mono">recordings_meta</td><td>284 192</td><td>28 MB</td><td><span class="risk B">B</span></td><td>1 (camera_id)</td></tr>
+              <tr><td class="fw-700 mono">legal_grants</td><td>3</td><td>4 KB</td><td><span class="risk C">C</span></td><td>1 (expiry)</td></tr>
+              <tr><td class="fw-700 mono">audit_local</td><td>84 232</td><td>4 MB</td><td>—</td><td>1 (ts)</td></tr>
+            </tbody>
+          </table>
+          <div class="flex gap-sm mt-md">
+            <button class="btn btn-secondary btn-sm">Backup → snapshot</button>
+            <button class="btn btn-secondary btn-sm">VACUUM + ANALYZE</button>
+            <button class="btn btn-secondary btn-sm">Migrate → PostgreSQL</button>
+            <span class="ml-auto text-xs text-3 flex align-center gap-sm"><svg class="icon"><use href="#i-info"/></svg>Backup automatyczny co 24h o 03:00 · ostatni: dziś 03:00 (64 MB compressed)</span>
+          </div>
+        </section>
+
+        <!-- Vector namespaces -->
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-cpu"/></svg>Vector namespaces (z manifestu)</div>
+            <span class="text-xs text-3">embedded HNSW · per-namespace persistence</span>
+          </div>
+          <div class="namespace-row" style="font-size:10.5px;text-transform:uppercase;color:var(--text-3);font-weight:700;letter-spacing:0.06em">
+            <div>Namespace</div><div>Wymiary · dist</div><div>Wektorów</div><div>Rozmiar</div><div>Klasa</div>
+          </div>
+          <div class="namespace-row">
+            <div class="ns-name">attributes</div>
+            <div class="text-sm text-2">768 · cosine</div>
+            <div class="fw-700 mono">1 842 100</div>
+            <div class="fw-700 mono">980 MB</div>
+            <div><span class="risk B">B</span></div>
+          </div>
+          <div class="namespace-row">
+            <div class="ns-name">plates</div>
+            <div class="text-sm text-2">256 · cosine</div>
+            <div class="fw-700 mono">221 480</div>
+            <div class="fw-700 mono">42 MB</div>
+            <div><span class="risk B">B</span></div>
+          </div>
+          <div class="namespace-row" style="opacity:0.55">
+            <div class="ns-name flex align-center gap-sm">faces <svg class="icon" style="width:11px;height:11px;color:var(--text-3)"><use href="#i-lock"/></svg></div>
+            <div class="text-sm text-2">512 · cosine</div>
+            <div class="fw-700 mono text-3">— (gate)</div>
+            <div class="fw-700 mono text-3">—</div>
+            <div><span class="risk C">C</span></div>
+          </div>
+          <div class="namespace-row" style="opacity:0.55">
+            <div class="ns-name flex align-center gap-sm">persons <svg class="icon" style="width:11px;height:11px;color:var(--text-3)"><use href="#i-lock"/></svg></div>
+            <div class="text-sm text-2">512 · cosine</div>
+            <div class="fw-700 mono text-3">— (gate)</div>
+            <div class="fw-700 mono text-3">—</div>
+            <div><span class="risk C">C</span></div>
+          </div>
+        </section>
+
+        <!-- Camera + Streaming + Evidence -->
+        <div class="grid-3">
+          <section class="section-card">
+            <h3><svg class="icon"><use href="#i-camera"/></svg>Camera API</h3>
+            <table class="tf-table" style="background:transparent;border:0">
+              <tbody>
+                <tr><td class="text-2 text-sm">Zarządzane</td><td class="fw-700">24</td></tr>
+                <tr><td class="text-2 text-sm">Online</td><td class="fw-700">22</td></tr>
+                <tr><td class="text-2 text-sm">Współdzielone</td><td class="fw-700">8 (z AccessControl-addon)</td></tr>
+                <tr><td class="text-2 text-sm">Credentials rotacja</td><td class="fw-700">co 90 dni</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="section-card">
+            <h3><svg class="icon"><use href="#i-video"/></svg>Streaming API</h3>
+            <table class="tf-table" style="background:transparent;border:0">
+              <tbody>
+                <tr><td class="text-2 text-sm">Aktywne streamy</td><td class="fw-700">22 frame + 22 events</td></tr>
+                <tr><td class="text-2 text-sm">Mode</td><td class="fw-700">pull (on_tick 250ms)</td></tr>
+                <tr><td class="text-2 text-sm">Drop rate 1h</td><td><span class="chip success">0.2%</span></td></tr>
+                <tr><td class="text-2 text-sm">FrameRefs/s</td><td class="fw-700">312</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="section-card">
+            <h3><svg class="icon"><use href="#i-shield"/></svg>Evidence API</h3>
+            <table class="tf-table" style="background:transparent;border:0">
+              <tbody>
+                <tr><td class="text-2 text-sm">HSM</td><td class="fw-700">Yubikey HSM2</td></tr>
+                <tr><td class="text-2 text-sm">TSA</td><td class="fw-700">freetsa.org</td></tr>
+                <tr><td class="text-2 text-sm">Paczek 30d</td><td class="fw-700">12</td></tr>
+                <tr><td class="text-2 text-sm">Anchoring</td><td class="fw-700">BTC mainnet</td></tr>
+              </tbody>
+            </table>
+          </section>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

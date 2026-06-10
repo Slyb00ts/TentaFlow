@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Install wizard · Krok 4 (M15b)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.install-wrap { max-width: 920px; margin: 0 auto; padding: 16px 0; }
+.install-header {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 18px 22px; margin-bottom: 18px; display: flex; gap: 16px; align-items: center;
+}
+.install-header .big-ico {
+  width: 56px; height: 56px; border-radius: var(--radius); background: var(--gradient-accent);
+  display: flex; align-items: center; justify-content: center; color: white; flex-shrink: 0;
+}
+.install-header .big-ico svg { width: 28px; height: 28px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+.install-header h1 { font-size: 20px; font-weight: 800; }
+.install-header .sub { font-size: 12.5px; color: var(--text-2); margin-top: 3px; }
+
+.install-progress { display: flex; gap: 4px; margin-bottom: 20px; }
+.install-step {
+  flex: 1; padding: 9px 10px; border-radius: var(--radius-sm);
+  background: var(--bg-3); border: 1px solid var(--border); font-size: 11px; color: var(--text-3);
+  display: flex; align-items: center; gap: 6px;
+}
+.install-step .num { font-weight: 800; background: var(--bg); padding: 1px 6px; border-radius: 10px; }
+.install-step.active { background: var(--accent-glow); border-color: var(--accent-1); color: var(--text); }
+.install-step.active .num { background: var(--accent-1); color: white; }
+.install-step.done { color: var(--success); border-color: rgba(34,197,94,0.3); }
+.install-step.done .num { background: var(--success); color: white; }
+
+.req-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px 18px; margin-bottom: 12px;
+}
+.req-card.required { border-left: 3px solid var(--danger); }
+.req-card.optional { border-left: 3px solid var(--text-3); }
+.req-card.public { border-left: 3px solid var(--success); }
+.req-card .head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+.req-card .id { font-family: ui-monospace,monospace; font-size: 14px; font-weight: 800; color: var(--accent-2); }
+.req-card .reason {
+  background: var(--bg-2); border-left: 2px solid var(--accent-1); padding: 8px 12px;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0; font-size: 12px; color: var(--text-2);
+  font-style: italic; margin: 8px 0;
+}
+.req-card .reason::before { content: '"'; color: var(--accent-2); font-weight: 800; }
+.req-card .reason::after { content: '"'; color: var(--accent-2); font-weight: 800; }
+
+.addon-pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 700; background: rgba(167,139,250,0.15); color: var(--accent-2);
+}
+.req-badge {
+  font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+.req-badge.required { background: rgba(239,68,68,0.15); color: var(--danger); }
+.req-badge.optional { background: var(--bg-3); color: var(--text-3); }
+.vis-pill {
+  font-size: 10px; font-weight: 800; padding: 2px 8px; border-radius: 12px;
+  text-transform: uppercase; letter-spacing: 0.04em; display: inline-flex; align-items: center; gap: 4px;
+}
+.vis-pill.private { background: rgba(239,68,68,0.15); color: var(--danger); }
+.vis-pill.restricted { background: rgba(245,158,11,0.15); color: var(--warning); }
+.vis-pill.public { background: rgba(34,197,94,0.15); color: var(--success); }
+.vis-pill .icon { width: 11px; height: 11px; }
+
+.decision-row { display: flex; gap: 8px; margin-top: 10px; }
+.decision-radio {
+  flex: 1; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px;
+}
+.decision-radio input { accent-color: var(--accent-1); }
+.decision-radio.accept.selected { background: rgba(34,197,94,0.08); border-color: var(--success); }
+.decision-radio.reject.selected { background: rgba(239,68,68,0.08); border-color: var(--danger); }
+.decision-radio .lname { font-size: 12.5px; font-weight: 700; }
+.decision-radio .ldesc { font-size: 10.5px; color: var(--text-3); }
+
+.auto-info {
+  background: rgba(34,197,94,0.06); border: 1px solid rgba(34,197,94,0.25);
+  padding: 10px 12px; border-radius: var(--radius-sm); display: flex; align-items: center; gap: 10px;
+  font-size: 12px; color: var(--success);
+}
+.private-block {
+  background: rgba(239,68,68,0.06); border: 1px solid rgba(239,68,68,0.25);
+  padding: 10px 12px; border-radius: var(--radius-sm); font-size: 12px; color: var(--text-2);
+}
+
+.wizard-foot {
+  display: flex; justify-content: space-between; align-items: center; margin-top: 20px;
+  padding: 14px 18px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-warning" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/></symbol>
+  <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+  <symbol id="i-arrow-right" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M15b</span><h2>Install wizard · Krok 4/6 — Zewnętrzny dostęp</h2>
+    <div class="desc">Nowy krok wizardu: akceptacja grantów do cudzych aliasów/modeli zadeklarowanych w manifeście (<code>uses_alias</code>, <code>uses_model</code>).</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Registry</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Instalacja: TentaVision · Krok 4</span>
+        </div>
+
+        <div class="install-wrap">
+
+          <div class="install-header">
+            <div class="big-ico"><svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div>
+            <div style="flex:1">
+              <h1>TentaVision <span class="chip">v0.1.0</span></h1>
+              <div class="sub">Krok 4 z 6 — Zewnętrzny dostęp do aliasów i modeli innych addonów</div>
+            </div>
+          </div>
+
+          <div class="install-progress">
+            <div class="install-step done"><span class="num">1</span>Permissions <svg class="icon" style="width:11px;height:11px"><use href="#i-check"/></svg></div>
+            <div class="install-step done"><span class="num">2</span>Storage <svg class="icon" style="width:11px;height:11px"><use href="#i-check"/></svg></div>
+            <div class="install-step done"><span class="num">3</span>Aliasy AI <svg class="icon" style="width:11px;height:11px"><use href="#i-check"/></svg></div>
+            <div class="install-step active"><span class="num">4</span>Zewnętrzny dostęp</div>
+            <div class="install-step"><span class="num">5</span>Profil prawny</div>
+            <div class="install-step"><span class="num">6</span>Pierwsza kamera</div>
+          </div>
+
+          <!-- Info-box u góry -->
+          <section class="section-card" style="background:rgba(96,165,250,0.06);border-color:rgba(96,165,250,0.25)">
+            <h3 style="color:var(--info)"><svg class="icon"><use href="#i-info"/></svg>Co zatwierdzasz w tym kroku</h3>
+            <div class="text-xs text-2" style="line-height:1.7">
+              TentaVision prosi o dostęp do następujących <strong>aliasów i modeli należących do innych addonów</strong> lub konfiguracji systemowej. Dostęp wymagany dla funkcji oznaczonych <span class="req-badge required">required</span> <strong>blokuje uruchomienie addona</strong> jeśli odrzucisz. Pozycje <span class="req-badge optional">optional</span> są bezpieczne do odrzucenia — addon sam radzi sobie z brakiem (np. fallback do alternatywnej ścieżki).
+            </div>
+          </section>
+
+          <!-- Karta 1: PUBLIC — auto-grant -->
+          <div class="req-card public">
+            <div class="head">
+              <svg class="icon icon-lg" style="color:var(--accent-2)"><use href="#i-link"/></svg>
+              <span class="id">teams-stt</span>
+              <span class="chip">alias</span>
+              <span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>owner: teams-bot</span>
+              <span class="vis-pill public"><svg class="icon"><use href="#i-unlock"/></svg>public</span>
+              <span class="req-badge required" style="margin-left:auto">required</span>
+            </div>
+            <div class="reason">Transkrypcja audio z mikrofonów kamer do logów BHP — wymagane dla raportu incydentów Art. 207 KP.</div>
+            <div class="auto-info">
+              <svg class="icon"><use href="#i-check"/></svg>
+              <div><strong>Grant automatyczny.</strong> Alias jest publiczny — każdy addon z deklaracją <code class="mono">uses_alias</code> dostaje dostęp natychmiast po instalacji. Nie musisz nic robić.</div>
+            </div>
+          </div>
+
+          <!-- Karta 2: RESTRICTED REQUIRED — radio -->
+          <div class="req-card required">
+            <div class="head">
+              <svg class="icon icon-lg" style="color:var(--accent-2)"><use href="#i-cpu"/></svg>
+              <span class="id">yolov8-pose-v3</span>
+              <span class="chip" style="background:rgba(96,165,250,0.12);color:var(--info);border-color:rgba(96,165,250,0.3)">model</span>
+              <span class="addon-pill" style="background:rgba(96,165,250,0.15);color:var(--info)"><svg class="icon"><use href="#i-users"/></svg>owner: manual:admin.krystian</span>
+              <span class="vis-pill restricted"><svg class="icon"><use href="#i-shield"/></svg>restricted</span>
+              <span class="req-badge required" style="margin-left:auto">required</span>
+            </div>
+            <div class="reason">Wykrywanie upadków u pacjentów geriatrycznych — primary input dla D2 (action recognition). Model wytrenowany na danych medycznych.</div>
+            <div class="text-xs text-3">Model systemowy — admin ma whitelist konsumentów. TentaVision zostanie dodany do listy po Twojej akceptacji.</div>
+            <div class="decision-row">
+              <label class="decision-radio accept selected">
+                <input type="radio" name="d-yolo-pose" checked>
+                <div>
+                  <div class="lname"><svg class="icon" style="color:var(--success);display:inline"><use href="#i-check"/></svg> Zaakceptuj grant</div>
+                  <div class="ldesc">TentaVision będzie mógł wywoływać <code class="mono">yolov8-pose-v3</code> przez router</div>
+                </div>
+              </label>
+              <label class="decision-radio reject">
+                <input type="radio" name="d-yolo-pose">
+                <div>
+                  <div class="lname"><svg class="icon" style="color:var(--danger);display:inline"><use href="#i-x"/></svg> Odrzuć</div>
+                  <div class="ldesc"><strong>UWAGA:</strong> required ⇒ addon nie wystartuje</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Karta 3: RESTRICTED OPTIONAL — radio -->
+          <div class="req-card optional">
+            <div class="head">
+              <svg class="icon icon-lg" style="color:var(--accent-2)"><use href="#i-link"/></svg>
+              <span class="id">default-llm</span>
+              <span class="chip">alias</span>
+              <span class="addon-pill" style="background:rgba(96,165,250,0.15);color:var(--info)"><svg class="icon"><use href="#i-users"/></svg>owner: manual (admin)</span>
+              <span class="vis-pill restricted"><svg class="icon"><use href="#i-shield"/></svg>restricted</span>
+              <span class="req-badge optional" style="margin-left:auto">optional</span>
+            </div>
+            <div class="reason">Klasyfikacja kontekstu alarmu (skąd, kto, co) dla operatora — opcjonalne wzbogacenie raportu. Bez grantu kontekst tworzony jest z reguł heurystycznych.</div>
+            <div class="text-xs text-3">Alias systemowy zarządzany przez administratora TentaFlow.</div>
+            <div class="decision-row">
+              <label class="decision-radio accept selected">
+                <input type="radio" name="d-llm" checked>
+                <div>
+                  <div class="lname"><svg class="icon" style="color:var(--success);display:inline"><use href="#i-check"/></svg> Zaakceptuj grant</div>
+                  <div class="ldesc">Pełne wzbogacanie alarmów przez LLM</div>
+                </div>
+              </label>
+              <label class="decision-radio reject">
+                <input type="radio" name="d-llm">
+                <div>
+                  <div class="lname"><svg class="icon" style="color:var(--danger);display:inline"><use href="#i-x"/></svg> Odrzuć</div>
+                  <div class="ldesc">Bezpieczne — addon użyje fallbacku</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Karta 4 (bonus): PRIVATE — blokada -->
+          <div class="req-card optional" style="opacity:0.85">
+            <div class="head">
+              <svg class="icon icon-lg" style="color:var(--accent-2)"><use href="#i-link"/></svg>
+              <span class="id">erp-employee-lookup</span>
+              <span class="chip">alias</span>
+              <span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>owner: hr-bridge</span>
+              <span class="vis-pill private"><svg class="icon"><use href="#i-lock"/></svg>private</span>
+              <span class="req-badge optional" style="margin-left:auto">optional</span>
+            </div>
+            <div class="reason">Identyfikacja pracownika po ID karty — alternatywa do D4 face dla deploymentów bez DPIA.</div>
+            <div class="private-block">
+              <strong style="color:var(--danger)">Brak dostępu.</strong> Owner <code class="mono">hr-bridge</code> nie udostępnia tego aliasu nikomu (visibility = <code class="mono">private</code>). Skontaktuj się z administratorem hr-bridge aby zmienił visibility na <code class="mono">restricted</code> i dodał TentaVision do whitelisty. Ten krok wizardu pominie tę deklarację — addon wystartuje (optional).
+            </div>
+          </div>
+
+          <!-- Stopka wizardu -->
+          <div class="wizard-foot">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-arrow-left"/></svg>Wstecz: Aliasy AI</button>
+            <div class="flex gap-md align-center">
+              <div class="text-xs text-2">Zaakceptowane: <strong style="color:var(--success)">2/3</strong> · auto-grant: 1 · pominięte: 1 (private)</div>
+              <button class="btn btn-primary">Dalej: Profil prawny <svg class="icon"><use href="#i-arrow-right"/></svg></button>
+            </div>
+          </div>
+
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

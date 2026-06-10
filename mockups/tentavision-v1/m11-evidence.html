@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Eksport dowodowy (M11)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.evidence-card { display: grid; grid-template-columns: 80px 1fr auto; gap: 14px; padding: 14px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 8px; }
+.evidence-card .ico { width: 80px; height: 80px; background: var(--bg); border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center; color: var(--accent-2); }
+.evidence-card .ico svg { width: 32px; height: 32px; }
+.evidence-card .head { display: flex; gap: 10px; align-items: baseline; }
+.evidence-card .title { font-weight: 800; font-size: 14px; }
+.evidence-card .meta { font-size: 11.5px; color: var(--text-2); display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
+.evidence-card .meta span { display: inline-flex; align-items: center; gap: 4px; }
+.evidence-card .hashes { font-family: ui-monospace,monospace; font-size: 10.5px; color: var(--text-3); margin-top: 8px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7" cy="14" r="4"/><path d="m10 11 10-5"/><path d="m14 9 2 1"/><path d="m18 7 2 1"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M11</span><h2>Eksport dowodowy</h2>
+    <div class="desc">Paczki dowodowe podpisane HSM/TSA, lista uprawnionych odbiorców, log eksportów z sygnaturą sprawy.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Analyst</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Eksport dowodowy</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Eksport dowodowy <span class="chip success"><svg class="icon"><use href="#i-key"/></svg>HSM Yubikey HSM2 podłączony</span></div>
+            <div class="d-sub">12 paczek wygenerowanych w ostatnich 30 dniach · TSA aktywne (RFC 3161 · freetsa.org)</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-download"/></svg>Eksportuj log</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg>Nowa paczka</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab active"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+        </div>
+
+        <div class="grid-2">
+          <section class="section-card">
+            <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-users"/></svg>Uprawnieni odbiorcy</div><button class="btn btn-sm btn-secondary"><svg class="icon"><use href="#i-plus"/></svg>Dodaj</button></div>
+            <table class="tf-table" style="border:0">
+              <thead><tr><th>Organ</th><th>Klucz publiczny</th><th>Aktywny</th></tr></thead>
+              <tbody>
+                <tr><td class="fw-700">Prokuratura Rejonowa Warszawa-Mokotów</td><td class="mono text-xs">PGP 4F2A...8E91</td><td><span class="status-pill ok">active</span></td></tr>
+                <tr><td class="fw-700">KPP Warszawa I</td><td class="mono text-xs">PGP A192...4471</td><td><span class="status-pill ok">active</span></td></tr>
+                <tr><td class="fw-700">Sąd Rejonowy Warszawa-Śródmieście</td><td class="mono text-xs">PGP 7C44...E102</td><td><span class="status-pill ok">active</span></td></tr>
+                <tr><td class="fw-700">ABW (na wniosek)</td><td class="mono text-xs">PGP 9F11...2BB7</td><td><span class="status-pill idle">on-demand</span></td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="section-card">
+            <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-shield"/></svg>Łańcuch zaufania</div></div>
+            <table class="tf-table" style="border:0;background:transparent">
+              <tbody>
+                <tr><td class="text-2 text-sm">HSM</td><td class="fw-700 text-sm">Yubikey HSM2 · serial 12347842</td></tr>
+                <tr><td class="text-2 text-sm">Klucz podpisu</td><td class="fw-700 text-sm mono">ed25519 / 4F2A...8E91</td></tr>
+                <tr><td class="text-2 text-sm">TSA (timestamping)</td><td class="fw-700 text-sm">freetsa.org · RFC 3161 (zapasowo: digistamp.com)</td></tr>
+                <tr><td class="text-2 text-sm">Audit anchoring</td><td class="fw-700 text-sm">co 24h do publicznego blockchainu (anchor BTC mainnet)</td></tr>
+                <tr><td class="text-2 text-sm">Verifier CLI</td><td class="fw-700 text-sm mono">tentavision verify package.tvevidence</td></tr>
+              </tbody>
+            </table>
+          </section>
+        </div>
+
+        <section class="section-card">
+          <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-package"/></svg>Ostatnie paczki dowodowe</div></div>
+
+          <div class="evidence-card">
+            <div class="ico"><svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg></div>
+            <div>
+              <div class="head"><span class="title">EV-2026-051</span><span class="chip success">podpisana</span><span class="chip"><svg class="icon"><use href="#i-clock"/></svg>TSA OK</span></div>
+              <div class="meta">
+                <span><svg class="icon"><use href="#i-video"/></svg>3 klipy · 4:32 min · 287 MB</span>
+                <span><svg class="icon"><use href="#i-camera"/></svg>C-04, C-07</span>
+                <span><svg class="icon"><use href="#i-clock"/></svg>2026-05-12 12:43</span>
+                <span><svg class="icon"><use href="#i-users"/></svg>KPP Warszawa I</span>
+              </div>
+              <div class="hashes">
+                sygn. sprawy: PR-3-K-247/2026 · LegalGrant: LG-2026-051<br>
+                SHA-256 manifest: 7c4ae91f8c01b9224471a4d2ee9312bb88a3e10288a3e10288a3e102<br>
+                TSA token: 2026-05-12T12:48:11Z · ed25519 sig: 4F2A...8E91
+              </div>
+            </div>
+            <div class="flex col gap-sm">
+              <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-download"/></svg>Pobierz</button>
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Weryfikuj</button>
+            </div>
+          </div>
+
+          <div class="evidence-card">
+            <div class="ico"><svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg></div>
+            <div>
+              <div class="head"><span class="title">EV-2026-050</span><span class="chip success">podpisana</span><span class="chip">wysłana</span></div>
+              <div class="meta">
+                <span><svg class="icon"><use href="#i-video"/></svg>1 klip · 0:30 · 28 MB</span>
+                <span><svg class="icon"><use href="#i-camera"/></svg>C-22</span>
+                <span><svg class="icon"><use href="#i-clock"/></svg>2026-05-11 09:14</span>
+                <span><svg class="icon"><use href="#i-users"/></svg>Prokuratura Warszawa-Mokotów</span>
+              </div>
+              <div class="hashes">
+                sygn. sprawy: 1842/26 · LegalGrant: LG-2026-049<br>
+                SHA-256: 88a3e102b9224471a4d2ee9312bb...
+              </div>
+            </div>
+            <div class="flex col gap-sm">
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-download"/></svg>Pobierz</button>
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Weryfikuj</button>
+            </div>
+          </div>
+
+          <div class="evidence-card">
+            <div class="ico"><svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg></div>
+            <div>
+              <div class="head"><span class="title">EV-2026-049</span><span class="chip success">podpisana</span></div>
+              <div class="meta">
+                <span><svg class="icon"><use href="#i-video"/></svg>5 klipów · 8:42 · 612 MB</span>
+                <span><svg class="icon"><use href="#i-camera"/></svg>C-01, C-04, C-22</span>
+                <span><svg class="icon"><use href="#i-clock"/></svg>2026-05-08 14:21</span>
+                <span><svg class="icon"><use href="#i-users"/></svg>Sąd Rejonowy Warszawa-Śródmieście</span>
+              </div>
+              <div class="hashes">sygn. sprawy: II K 332/26 · LegalGrant: LG-2026-047</div>
+            </div>
+            <div class="flex col gap-sm">
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-download"/></svg>Pobierz</button>
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Weryfikuj</button>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

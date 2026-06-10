@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Model detail · Dostęp (M8b)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.vis-segmented {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 4px;
+}
+.vis-segmented label {
+  cursor: pointer; padding: 10px 12px; border-radius: var(--radius-sm);
+  display: flex; flex-direction: column; gap: 4px;
+  border: 1px solid transparent;
+}
+.vis-segmented label.active { background: var(--accent-glow); border-color: var(--accent-1); }
+.vis-segmented input { display: none; }
+.vis-segmented .vname { font-family: ui-monospace,monospace; font-size: 12.5px; font-weight: 800; display: flex; align-items: center; gap: 6px; }
+.vis-segmented .vdesc { font-size: 10.5px; color: var(--text-3); }
+.vis-segmented label.active .vname { color: var(--accent-2); }
+.addon-pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 700; background: rgba(167,139,250,0.15); color: var(--accent-2);
+}
+.icon-btn {
+  background: transparent; border: 0; color: var(--text-3); cursor: pointer;
+  width: 28px; height: 28px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center;
+}
+.icon-btn:hover { background: var(--bg-3); color: var(--text); }
+.sparkline { display: flex; align-items: flex-end; gap: 2px; height: 32px; }
+.sparkline .b { width: 6px; background: var(--accent-1); border-radius: 1px 1px 0 0; opacity: 0.85; }
+.bench-bar { flex:1; height: 8px; background: var(--bg-input); border-radius: 4px; overflow: hidden; }
+.bench-bar .fill { height: 100%; background: var(--gradient-accent); border-radius: 4px; }
+.vram-bar { display: flex; gap: 2px; height: 24px; background: var(--bg-input); border-radius: var(--radius-sm); overflow: hidden; }
+.vram-seg { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; color: white; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-users-2" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M8b</span><h2>Modele → yolov8-pose-v3 · Dostęp i konsumenci</h2>
+    <div class="desc">Drill-down do pojedynczego modelu — visibility (restricted/public) + lista addonów-konsumentów + statystyki użycia.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">General</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Services</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Modele</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">yolov8-pose-v3</span>
+        </div>
+
+        <!-- Header modelu -->
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">yolov8-pose-v3
+              <span class="chip accent">pose-detection</span>
+              <span class="chip success"><span class="dot"></span>live</span>
+            </div>
+            <div class="d-sub">v3.2.1 · sha256 c4f0...d12e · <span class="addon-pill" style="background:rgba(96,165,250,0.15);color:var(--info)"><svg class="icon"><use href="#i-users"/></svg>owner: manual:admin.krystian</span> · TensorRT 9.x · RTX 4070</div>
+            <div class="d-badges">
+              <span class="chip">VRAM 1.4 GB</span>
+              <span class="chip">182 fps batch=4</span>
+              <span class="chip">3 konsumentów</span>
+              <span class="chip warning">restricted</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-activity"/></svg>Benchmark</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-check"/></svg>Zapisz</button>
+          </div>
+        </div>
+
+        <!-- Quick stats row -->
+        <div class="grid-3" style="margin-bottom:16px">
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-cpu"/></svg>VRAM</div>
+            <div class="value">1.4 <span class="small">/ 12 GB</span></div>
+            <div class="vram-bar" style="margin-top:8px;height:8px">
+              <div class="vram-seg" style="width:11.7%;background:#6366f1"></div>
+              <div class="vram-seg" style="width:88.3%;background:var(--bg-3)"></div>
+            </div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-activity"/></svg>Benchmark p95</div>
+            <div class="value">12 <span class="small">ms</span></div>
+            <div class="benchmark-bar" style="margin-top:8px"><div class="bench-bar"><div class="fill" style="width:88%"></div></div></div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-users-2"/></svg>Konsumenci</div>
+            <div class="value">3 <span class="small">addony</span></div>
+            <div class="delta up">+1 ostatnie 7 dni</div>
+          </div>
+        </div>
+
+        <!-- Panel: Widoczność i konsumenci -->
+        <section class="section-card">
+          <h3><svg class="icon"><use href="#i-eye"/></svg>Widoczność i konsumenci</h3>
+          <p class="section-sub">Kontroluje które inne addony mogą wywoływać ten model przez router. Każdy consumer musi zadeklarować <code class="mono">[[uses_model]]</code> w swoim manifeście.</p>
+
+          <div class="vis-segmented" style="margin-bottom:16px">
+            <label class="active">
+              <input type="radio" name="visibility" checked>
+              <div class="vname"><svg class="icon"><use href="#i-shield"/></svg>restricted</div>
+              <div class="vdesc">Whitelist konsumentów. Admin manualnie nadaje grant per addon (poniżej).</div>
+            </label>
+            <label>
+              <input type="radio" name="visibility">
+              <div class="vname"><svg class="icon"><use href="#i-unlock"/></svg>public</div>
+              <div class="vdesc">Auto-grant dla każdego addona który zadeklaruje <code class="mono">uses_model</code>.</div>
+            </label>
+          </div>
+
+          <!-- Tabela konsumentów (restricted aktywne) -->
+          <div class="section-card-head" style="margin-bottom:10px">
+            <div class="title"><svg class="icon"><use href="#i-users-2"/></svg>Lista konsumentów <span class="chip">3 addonów</span></div>
+            <div class="flex gap-sm align-center">
+              <div class="search-box" style="min-width:200px"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Filtruj addony..."></div>
+              <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Dodaj konsumenta</button>
+            </div>
+          </div>
+
+          <table class="tf-table">
+            <thead>
+              <tr><th>Addon</th><th>Dodał</th><th>Kiedy</th><th>Status</th><th>Reason (z manifestu)</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>teams-bot</span></td>
+                <td class="text-xs">aleksandra.dpo@tentaflow.local</td>
+                <td class="text-xs text-3"><svg class="icon icon-sm"><use href="#i-clock"/></svg> 2 dni temu</td>
+                <td><span class="status-pill ok">granted</span></td>
+                <td class="text-xs text-2">Wykrywanie pozy uczestników spotkania dla raportu zaangażowania</td>
+                <td><button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button></td>
+              </tr>
+              <tr>
+                <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>fall-detector</span></td>
+                <td class="text-xs">admin.krystian@tentaflow.local</td>
+                <td class="text-xs text-3"><svg class="icon icon-sm"><use href="#i-clock"/></svg> 14 dni temu</td>
+                <td><span class="status-pill ok">granted</span></td>
+                <td class="text-xs text-2">Detekcja upadków u pacjentów geriatrycznych — primary input modelu klasyfikacji</td>
+                <td><button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button></td>
+              </tr>
+              <tr>
+                <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>ergonomics-watch</span></td>
+                <td class="text-xs">— (zgłoszony przez addon)</td>
+                <td class="text-xs text-3"><svg class="icon icon-sm"><use href="#i-clock"/></svg> 4 godz. temu</td>
+                <td><span class="status-pill warn">pending</span></td>
+                <td class="text-xs text-2">Analiza postawy operatorów stanowisk produkcyjnych (BHP — Art. 207 KP)</td>
+                <td class="flex gap-sm" style="border:0">
+                  <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-check"/></svg>Zatwierdź</button>
+                  <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-x"/></svg>Odrzuć</button>
+                </td>
+              </tr>
+              <tr style="opacity:0.6">
+                <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>marketing-heatmap</span></td>
+                <td class="text-xs">admin.krystian@tentaflow.local</td>
+                <td class="text-xs text-3"><svg class="icon icon-sm"><use href="#i-clock"/></svg> 8 dni temu</td>
+                <td><span class="status-pill err">denied</span></td>
+                <td class="text-xs text-2">Analiza ruchu klientów w sklepie — odrzucono ze względu na cel niezgodny z DPIA</td>
+                <td><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-info"/></svg>Zobacz powód</button></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="flex justify-between mt-md">
+            <div class="text-xs text-3">3 addonów ma dostęp (granted), 1 czeka na decyzję, 1 odrzucony</div>
+            <div class="flex gap-sm">
+              <span class="filter-chip active"><svg class="icon"><use href="#i-filter"/></svg>Wszystkie 4</span>
+              <span class="filter-chip">granted 2</span>
+              <span class="filter-chip">pending 1</span>
+              <span class="filter-chip">denied 1</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Panel: Statystyki użycia -->
+        <section class="section-card">
+          <h3><svg class="icon"><use href="#i-activity"/></svg>Statystyki użycia (ostatnie 24h)</h3>
+          <div class="grid-2">
+            <div>
+              <div class="text-xs text-3 fw-700" style="margin-bottom:8px">Wywołania per consumer</div>
+              <table class="tf-table">
+                <thead><tr><th>Consumer</th><th>Wywołania</th><th>p95</th><th>Trend 24h</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>fall-detector</span></td>
+                    <td class="fw-700">14 220</td>
+                    <td>11 ms</td>
+                    <td><div class="sparkline"><div class="b" style="height:30%"></div><div class="b" style="height:45%"></div><div class="b" style="height:38%"></div><div class="b" style="height:62%"></div><div class="b" style="height:55%"></div><div class="b" style="height:70%"></div><div class="b" style="height:85%"></div><div class="b" style="height:78%"></div></div></td>
+                  </tr>
+                  <tr>
+                    <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>teams-bot</span></td>
+                    <td class="fw-700">2 871</td>
+                    <td>14 ms</td>
+                    <td><div class="sparkline"><div class="b" style="height:10%"></div><div class="b" style="height:18%"></div><div class="b" style="height:22%"></div><div class="b" style="height:28%"></div><div class="b" style="height:35%"></div><div class="b" style="height:30%"></div><div class="b" style="height:24%"></div><div class="b" style="height:20%"></div></div></td>
+                  </tr>
+                  <tr>
+                    <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>tentavision (self)</span></td>
+                    <td class="fw-700">42 118</td>
+                    <td>9 ms</td>
+                    <td><div class="sparkline"><div class="b" style="height:80%"></div><div class="b" style="height:88%"></div><div class="b" style="height:82%"></div><div class="b" style="height:95%"></div><div class="b" style="height:90%"></div><div class="b" style="height:85%"></div><div class="b" style="height:92%"></div><div class="b" style="height:88%"></div></div></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div>
+              <div class="text-xs text-3 fw-700" style="margin-bottom:8px">Całkowity ruch (sumarycznie)</div>
+              <div class="kpi" style="margin-bottom:8px">
+                <div class="label"><svg class="icon"><use href="#i-activity"/></svg>Total calls 24h</div>
+                <div class="value">59 209</div>
+                <div class="delta up">+12% w stosunku do wczoraj</div>
+              </div>
+              <div class="kpi">
+                <div class="label"><svg class="icon"><use href="#i-clock"/></svg>Średnia latencja p95</div>
+                <div class="value">10 <span class="small">ms</span></div>
+                <div class="delta">stabilnie · brak alertów</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Help / info -->
+        <section class="section-card" style="background:rgba(96,165,250,0.06);border-color:rgba(96,165,250,0.25)">
+          <h3 style="color:var(--info)"><svg class="icon"><use href="#i-info"/></svg>Jak działa model w modelu uprawnień</h3>
+          <div class="text-xs text-2" style="line-height:1.7">
+            Modele są zasobami systemowymi — owner to <em>manual</em> (admin) lub <em>system</em>, nigdy addon. <strong>Consumer</strong> to addon który chce wywoływać ten model — musi w swoim manifeście mieć <code class="mono">[[uses_model]] id = "yolov8-pose-v3"</code>. Visibility kontroluje co się dzieje po deklaracji: <code class="mono">restricted</code> ⇒ pending → admin zatwierdza tutaj; <code class="mono">public</code> ⇒ auto-grant.
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

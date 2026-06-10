@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Edit Service modal + wizard krok Advanced (uzupełniony)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818; --bg-2: #0a0d24; --bg-3: #111535; --bg-card: #141836;
+  --bg-card-hover: #1a1f45; --bg-input: #0b0e22;
+  --border: #1f2548; --border-hover: #2f3668;
+  --text: #e8ebf5; --text-2: #a0a8c8; --text-3: #6a7196;
+  --accent-1: #6366f1; --accent-2: #a78bfa; --accent-glow: rgba(99,102,241,0.22);
+  --success: #22c55e; --danger: #ef4444; --warning: #f59e0b; --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
+  --radius: 10px; --radius-sm: 6px; --radius-lg: 14px;
+  --shadow-lg: 0 24px 64px rgba(0,0,0,0.7), 0 8px 24px rgba(99,102,241,0.15);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased; min-height: 100vh;
+}
+code, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+.intro { max-width: 1200px; margin: 28px auto 12px; padding: 0 24px; }
+.intro h1 {
+  font-size: 24px; font-weight: 800; margin-bottom: 4px;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.intro .lead { color: var(--text-2); max-width: 920px; font-size: 13px; line-height: 1.6; }
+.intro .lead code { background: var(--bg-3); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+
+.grid {
+  max-width: 1200px; margin: 16px auto 80px; padding: 0 24px;
+  display: grid; gap: 32px;
+}
+.section-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--accent-2); margin-bottom: 10px;
+}
+
+/* ============ Modal shell (1:1 z deploy-wizard) ============ */
+.modal-shell {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg); overflow: hidden;
+  width: 100%; max-width: 820px; margin: 0 auto;
+}
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px; border-bottom: 1px solid var(--border); background: var(--bg-2);
+}
+.modal-head .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
+.modal-head .dot.warn { background: var(--warning); }
+.modal-head .dot.ok { background: var(--success); }
+.modal-head h3 { font-size: 15px; font-weight: 700; color: var(--text); flex: 1; }
+.modal-head .head-meta { font-size: 11px; color: var(--text-3); font-family: 'JetBrains Mono', monospace; }
+.modal-body { padding: 24px 28px; }
+.modal-foot {
+  display: flex; justify-content: flex-end; align-items: center; gap: 10px;
+  padding: 14px 18px; border-top: 1px solid var(--border); background: var(--bg-2);
+}
+.modal-foot .spacer { flex: 1; }
+
+/* stepper */
+.stepper { display: flex; align-items: center; gap: 10px; justify-content: center; margin-bottom: 22px; }
+.stepper .step {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-3); border: 1px solid var(--border);
+  color: var(--text-3); font-weight: 700; font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+}
+.stepper .step.active { background: var(--gradient-accent); color: white; border-color: transparent; box-shadow: 0 0 0 4px var(--accent-glow); }
+.stepper .step.done { background: var(--success); color: white; border-color: transparent; }
+.stepper .line { flex: 0 0 48px; height: 2px; background: var(--border); border-radius: 2px; }
+.stepper .line.done { background: var(--success); }
+
+.step-heading h2 { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 4px; }
+.step-heading p { color: var(--text-2); font-size: 13px; line-height: 1.55; margin-bottom: 14px; }
+
+/* ============ Adv sekcje (zachowane 1:1 z istniejącego wizard CSS) ============ */
+.adv-section {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px; margin-bottom: 12px;
+}
+.adv-sec-title {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--accent-2); margin-bottom: 12px;
+}
+.adv-sec-title svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+.adv-sec-title .adv-sec-actions { margin-left: auto; }
+
+/* summary grid */
+.adv-summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.adv-summary-cell { display: flex; flex-direction: column; gap: 2px; }
+.adv-cell-label { font-size: 10.5px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+.adv-cell-value { font-size: 13px; color: var(--text); font-weight: 700; }
+.adv-cell-value code { background: var(--bg-3); padding: 2px 7px; border-radius: 4px; font-size: 11.5px; font-weight: 500; }
+.adv-cell-sub { font-size: 11px; color: var(--text-3); }
+
+/* KPI grid */
+.adv-kpi-grid {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+  margin-bottom: 10px;
+}
+.adv-kpi {
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.adv-kpi .k-label { font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+.adv-kpi .k-value { font-size: 16px; font-weight: 800; color: var(--text); font-family: 'JetBrains Mono', monospace; }
+.adv-kpi .k-sub { font-size: 10.5px; color: var(--text-3); line-height: 1.3; }
+.adv-kpi.success .k-value { color: var(--success); }
+.adv-kpi.warn .k-value { color: var(--warning); }
+.adv-kpi.danger .k-value { color: var(--danger); }
+.adv-kpi.accent .k-value { color: var(--accent-2); }
+
+/* VRAM bar (segmentowany — weights+kv+act+free) */
+.adv-vram-bar-wrap { margin-top: 8px; }
+.adv-vram-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; color: var(--text-2); margin-bottom: 6px;
+}
+.adv-vram-head .pct { font-weight: 700; font-family: 'JetBrains Mono', monospace; color: var(--accent-2); }
+.adv-vram-bar {
+  position: relative; height: 28px; background: var(--bg-3); border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--border);
+}
+.adv-vram-bar .fill {
+  position: absolute; inset: 0; right: auto;
+  background: linear-gradient(90deg, #6366f1 0%, #a78bfa 50%, #c4b5fd 100%);
+  display: flex;
+}
+.adv-vram-bar .fill.warn { background: linear-gradient(90deg, var(--warning) 0%, #fbbf24 100%); }
+.adv-vram-bar .fill.danger { background: linear-gradient(90deg, var(--danger) 0%, #f87171 100%); }
+.adv-vram-bar .fill .seg-w { background: rgba(255,255,255,0.04); border-right: 1px solid rgba(255,255,255,0.18); height: 100%; }
+.adv-vram-bar .fill .seg-kv { background: rgba(255,255,255,0.08); border-right: 1px solid rgba(255,255,255,0.18); height: 100%; }
+.adv-vram-bar .fill .seg-act { background: rgba(255,255,255,0.04); height: 100%; }
+
+.adv-vram-legend {
+  display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px;
+  font-size: 11px; color: var(--text-2);
+}
+.adv-vram-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.adv-vram-legend span::before { content: ''; width: 10px; height: 10px; border-radius: 2px; background: var(--accent-1); }
+.adv-vram-legend .lg-w::before { background: rgba(99,102,241,0.85); }
+.adv-vram-legend .lg-kv::before { background: rgba(167,139,250,0.85); }
+.adv-vram-legend .lg-act::before { background: rgba(196,181,253,0.85); }
+.adv-vram-legend .lg-free::before { background: rgba(34,197,94,0.4); }
+.adv-vram-legend .lg-free.danger::before { background: rgba(239,68,68,0.65); }
+.adv-vram-legend .lg-free.danger { color: var(--danger); font-weight: 700; }
+
+/* ============ NOWE: External GPU usage section (mój dorzucony) ============ */
+.adv-extern {
+  margin-top: 14px; padding: 12px 14px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.adv-extern-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.08em;
+  font-weight: 700; margin-bottom: 8px;
+}
+.adv-extern-head .extern-total { color: var(--warning); font-family: 'JetBrains Mono', monospace; text-transform: none; letter-spacing: 0; font-size: 12px; }
+.adv-extern-bar {
+  position: relative; height: 20px; background: var(--bg-2); border-radius: 4px; overflow: hidden;
+  display: flex; margin-bottom: 8px;
+}
+.adv-extern-bar .ext-seg { background: rgba(245,158,11,0.55); height: 100%; border-right: 1px solid rgba(245,158,11,0.85); }
+.adv-extern-bar .ext-seg:last-child { border-right: 0; }
+.adv-extern-bar .deploy-room { background: rgba(34,197,94,0.18); height: 100%; }
+.adv-extern-procs { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; font-size: 11.5px; }
+.adv-extern-procs .name { color: var(--text-2); font-family: 'JetBrains Mono', monospace; }
+.adv-extern-procs .mb { color: var(--warning); font-family: 'JetBrains Mono', monospace; text-align: right; }
+.adv-extern .extern-foot {
+  margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border);
+  font-size: 11px; color: var(--text-3); display: flex; justify-content: space-between;
+}
+
+/* mode toggle (tf-segmented styl) */
+.tf-segmented {
+  display: inline-flex; gap: 0; background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: 8px; padding: 3px;
+}
+.tf-segmented button {
+  padding: 6px 14px; background: transparent; border: 0; color: var(--text-3);
+  font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer;
+  border-radius: 6px;
+}
+.tf-segmented button.active { background: var(--accent-1); color: white; }
+
+/* auto-mode alert (info banner) */
+.adv-alert {
+  margin-top: 10px; padding: 12px 14px; border-radius: 8px;
+  display: flex; gap: 10px; align-items: flex-start;
+}
+.adv-alert.info { background: rgba(99,102,241,0.07); border: 1px solid rgba(99,102,241,0.25); }
+.adv-alert-ico { color: var(--accent-2); flex-shrink: 0; }
+.adv-alert-body { font-size: 12px; color: var(--text-2); line-height: 1.55; }
+.adv-alert-body strong { color: var(--text); display: block; margin-bottom: 4px; }
+.adv-alert-args {
+  margin-top: 8px; padding: 8px 10px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 6px;
+  font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--accent-2);
+  white-space: pre-wrap; word-break: break-all;
+}
+
+/* manual controls */
+.adv-manual { margin-top: 14px; }
+.adv-form-row { margin-bottom: 14px; }
+.adv-form-row label {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 11.5px; font-weight: 600; color: var(--text-2); margin-bottom: 4px;
+}
+.adv-form-row label .v { color: var(--accent-2); font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 13px; }
+.adv-form-row .adv-hint { font-size: 11px; color: var(--text-3); margin-top: 6px; line-height: 1.45; }
+.adv-form-row .adv-hint.adjust-warn { color: var(--warning); }
+.adv-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+.adv-range { width: 100%; margin: 4px 0 0; -webkit-appearance: none; appearance: none; background: transparent; height: 22px; }
+.adv-range::-webkit-slider-runnable-track { height: 4px; background: var(--bg-3); border-radius: 2px; }
+.adv-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--gradient-accent); border: 2px solid var(--bg);
+  margin-top: -7px; cursor: grab; box-shadow: 0 0 0 1px var(--accent-1);
+}
+
+.adv-lock-tag { font-size: 10px; padding: 2px 7px; background: rgba(245,158,11,0.15); color: var(--warning); border-radius: 999px; margin-left: 6px; }
+.adv-pill { font-size: 11px; padding: 4px 9px; border-radius: 999px; font-weight: 700; letter-spacing: 0.04em; }
+.adv-pill.ok { background: rgba(34,197,94,0.14); color: var(--success); }
+.adv-pill.warn { background: rgba(245,158,11,0.14); color: var(--warning); }
+.adv-pill.danger { background: rgba(239,68,68,0.14); color: var(--danger); }
+.adv-reset-lock {
+  background: transparent; border: 1px solid var(--border); color: var(--text-2);
+  font-size: 11px; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-family: inherit;
+}
+.adv-reset-lock:hover { color: var(--text); border-color: var(--border-hover); }
+
+/* ctx preset chips */
+.ctx-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.ctx-chip {
+  font-size: 10.5px; padding: 4px 9px; background: var(--bg-3); color: var(--text-2);
+  border: 1px solid var(--border); border-radius: 999px; cursor: pointer; font-family: 'JetBrains Mono', monospace;
+}
+.ctx-chip:hover { border-color: var(--border-hover); }
+.ctx-chip.active { background: rgba(99,102,241,0.18); border-color: var(--accent-1); color: var(--accent-2); }
+.ctx-chip.exceeds { opacity: 0.4; cursor: not-allowed; text-decoration: line-through; }
+
+/* speculative panel */
+.adv-spec-fields { margin-top: 10px; }
+
+tf-toggle { display: inline-block; }
+.toggle-fake {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+}
+.toggle-fake .sw { width: 32px; height: 18px; background: var(--bg-3); border-radius: 999px; position: relative; transition: background 0.15s; }
+.toggle-fake .sw::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: var(--text-3); border-radius: 50%; transition: all 0.15s; }
+.toggle-fake.on .sw { background: var(--accent-1); }
+.toggle-fake.on .sw::after { left: 16px; background: white; }
+
+/* ============ Edit-only stuff ============ */
+.body-section { margin-bottom: 22px; }
+.body-section:last-child { margin-bottom: 0; }
+.body-section .body-section-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--accent-2); margin-bottom: 10px;
+  display: flex; align-items: center; gap: 6px;
+}
+.body-section .body-section-title svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+.step-warn {
+  background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.25);
+  border-radius: var(--radius); padding: 11px 14px;
+  display: flex; align-items: flex-start; gap: 10px; margin-bottom: 18px;
+}
+.step-warn svg { width: 16px; height: 16px; stroke: var(--warning); fill: none; stroke-width: 2; flex-shrink: 0; margin-top: 1px; }
+.step-warn .txt { font-size: 12px; color: var(--text-2); line-height: 1.55; }
+.step-warn .txt strong { color: var(--warning); }
+
+/* opt-cards (Preset / Custom HF) */
+.opt-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+.opt-card {
+  position: relative; background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px; cursor: pointer;
+  transition: all 0.18s cubic-bezier(0.32, 0.72, 0, 1);
+  display: flex; flex-direction: column; gap: 6px; min-height: 88px;
+}
+.opt-card:hover { border-color: var(--border-hover); background: var(--bg-card-hover); }
+.opt-card.active {
+  border-color: var(--accent-1); background: rgba(99,102,241,0.08);
+  box-shadow: 0 0 0 1px var(--accent-1), 0 4px 14px rgba(99,102,241,0.25);
+}
+.opt-card.active::before {
+  content: ''; position: absolute; top: 10px; right: 10px;
+  width: 16px; height: 16px; border-radius: 50%; background: var(--gradient-accent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: center; box-shadow: 0 0 0 3px rgba(99,102,241,0.2);
+}
+.opt-card .opt-icon {
+  width: 34px; height: 34px; border-radius: 9px;
+  background: rgba(99,102,241,0.12); color: var(--accent-2);
+  display: flex; align-items: center; justify-content: center;
+}
+.opt-card .opt-icon svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; }
+.opt-card .opt-title { font-size: 13px; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 6px; }
+.opt-card .opt-title .tag { font-size: 10px; padding: 2px 6px; background: rgba(99,102,241,0.15); color: var(--accent-2); border-radius: 999px; }
+.opt-card .opt-desc { font-size: 11.5px; color: var(--text-3); line-height: 1.45; }
+
+/* preset list (Edit) */
+.preset-list { display: flex; flex-direction: column; gap: 8px; }
+.preset-card {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; background: var(--bg-input);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  cursor: pointer; transition: all 0.15s;
+}
+.preset-card:hover { border-color: var(--border-hover); background: var(--bg-card-hover); }
+.preset-card.selected { border-color: var(--accent-1); background: rgba(99,102,241,0.06); box-shadow: 0 0 0 1px var(--accent-1); }
+.preset-radio { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border-hover); background: var(--bg-3); flex-shrink: 0; position: relative; }
+.preset-card.selected .preset-radio { border-color: var(--accent-1); }
+.preset-card.selected .preset-radio::after { content: ''; position: absolute; inset: 3px; border-radius: 50%; background: var(--gradient-accent); }
+.preset-info { flex: 1; min-width: 0; }
+.preset-name { font-size: 13px; font-weight: 700; color: var(--text); display: flex; align-items: baseline; gap: 6px; }
+.preset-name .preset-rec { font-size: 10px; padding: 2px 7px; background: rgba(34,197,94,0.14); color: var(--success); border-radius: 999px; letter-spacing: 0.04em; }
+.preset-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap; }
+.preset-meta .sep { opacity: 0.5; }
+
+/* fact list */
+.fact-list { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 24px; padding: 12px 14px; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius); }
+.fact-list .row { display: flex; flex-direction: column; gap: 2px; }
+.fact-list .key { font-size: 10.5px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.fact-list .val { font-size: 12.5px; color: var(--text-2); font-family: 'JetBrains Mono', monospace; }
+
+/* ============ Buttons ============ */
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 16px; border-radius: var(--radius); border: 1px solid transparent;
+  background: transparent; color: var(--text);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s; min-height: 38px; white-space: nowrap;
+}
+.btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.btn.secondary { background: var(--bg-3); color: var(--text); border-color: var(--border); }
+.btn.secondary:hover { background: var(--bg-card-hover); border-color: var(--border-hover); }
+.btn.primary { background: var(--gradient-accent); color: white; box-shadow: 0 4px 14px rgba(99,102,241,0.35); }
+.btn.primary:hover { filter: brightness(1.08); transform: translateY(-1px); box-shadow: 0 6px 22px rgba(99,102,241,0.55); }
+.btn.ghost { color: var(--text-2); }
+.btn.ghost:hover { background: var(--bg-3); color: var(--text); }
+.btn.danger { background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.4); color: var(--danger); }
+.btn.danger:hover { background: rgba(239,68,68,0.2); border-color: var(--danger); }
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>Edit Service modal + wizard krok Advanced (z external GPU info)</h1>
+  <p class="lead">
+    <strong>Stan A</strong>: krok <code>Advanced</code> deploy wizardu — <em>wszystko co już jest</em>
+    (summary, VRAM calculator z 5 KPI, tryb Auto/Manual z recommended
+    args, speculative decoding) plus <strong>nowy mały panel "External GPU usage"</strong> pokazujący
+    co już zajmuje GPU (sunshine, chrome) — refresh co 2 s z <code>nvidia-smi --query-compute-apps</code>.
+    <strong>Stan B</strong>: nowy modal Edit Service (po deploy) który reużywa tej samej sekcji VRAM/Mode/Spec.
+  </p>
+</div>
+
+<div class="grid">
+
+  <!-- =========================================================== -->
+  <!-- STAN A: Wizard krok Advanced — pełen layout + nowy External -->
+  <!-- =========================================================== -->
+  <section>
+    <div class="section-title">Stan A · Wizard krok Advanced (auto mode) z dorzuconym External GPU usage</div>
+    <div class="modal-shell">
+      <div class="modal-head">
+        <div class="dot"></div>
+        <h3>Wdrażanie silnika: vLLM</h3>
+        <span class="head-meta">krok 4/5 · Advanced</span>
+      </div>
+      <div class="modal-body">
+        <div class="stepper">
+          <div class="step done">1</div><div class="line done"></div>
+          <div class="step done">2</div><div class="line done"></div>
+          <div class="step done">3</div><div class="line done"></div>
+          <div class="step active">4</div><div class="line"></div>
+          <div class="step">5</div>
+        </div>
+
+        <div class="step-heading">
+          <h2>Konfiguracja zaawansowana (vLLM)</h2>
+          <p>Backend liczy realne VRAM z model_spec + GPU specs. Tryb Auto stosuje rekomendowane args; Manual pozwala lock'ować pojedyncze parametry.</p>
+        </div>
+
+        <!-- ===== summaryCard ===== -->
+        <div class="adv-section">
+          <div class="adv-sec-title">
+            <svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+            Podsumowanie wyboru
+          </div>
+          <div class="adv-summary-grid">
+            <div class="adv-summary-cell">
+              <div class="adv-cell-label">Model</div>
+              <div class="adv-cell-value"><code>AxionML/Qwen3.5-9B-NVFP4</code></div>
+              <div class="adv-cell-sub">9.0B params · NVFP4 (4-bit) · max ctx 262 144</div>
+            </div>
+            <div class="adv-summary-cell">
+              <div class="adv-cell-label">GPU</div>
+              <div class="adv-cell-value">1 × NVIDIA RTX 4090 · 23.5 GB VRAM</div>
+              <div class="adv-cell-sub">GPU 0</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== vramCard (5 KPI + segmented bar) ===== -->
+        <div class="adv-section">
+          <div class="adv-sec-title">
+            <svg viewBox="0 0 24 24"><path d="M2 3h20v18H2z"/><path d="M2 9h20"/></svg>
+            Kalkulator VRAM
+            <div class="adv-sec-actions">
+              <span class="adv-pill ok">Mieści się · 78 % użycia</span>
+            </div>
+          </div>
+          <div class="adv-kpi-grid">
+            <div class="adv-kpi">
+              <div class="k-label">Wagi (weights)</div>
+              <div class="k-value">8.4 GB</div>
+              <div class="k-sub">NVFP4 4-bit</div>
+            </div>
+            <div class="adv-kpi">
+              <div class="k-label">KV cache</div>
+              <div class="k-value">7.8 GB</div>
+              <div class="k-sub">ctx 32 768 · fp8</div>
+            </div>
+            <div class="adv-kpi">
+              <div class="k-label">Activations</div>
+              <div class="k-value">2.1 GB</div>
+              <div class="k-sub">peak (max_num_seqs × ctx)</div>
+            </div>
+            <div class="adv-kpi success">
+              <div class="k-label">Headroom</div>
+              <div class="k-value">3.3 GB</div>
+              <div class="k-sub">22 % zostaje</div>
+            </div>
+            <div class="adv-kpi accent">
+              <div class="k-label">Razem</div>
+              <div class="k-value">18.3 / 23.5</div>
+              <div class="k-sub">78 % · 1 GPU</div>
+            </div>
+          </div>
+          <div class="adv-vram-bar-wrap">
+            <div class="adv-vram-head"><span>Użycie GPU 0 (24 GB total)</span><span class="pct">78%</span></div>
+            <div class="adv-vram-bar">
+              <div class="fill" style="width: 78%;">
+                <div class="seg-w" style="width: 46%;"></div>
+                <div class="seg-kv" style="width: 43%;"></div>
+                <div class="seg-act" style="width: 11%;"></div>
+              </div>
+            </div>
+            <div class="adv-vram-legend">
+              <span class="lg-w">Wagi 36 %</span>
+              <span class="lg-kv">KV 33 %</span>
+              <span class="lg-act">Aktywacje 9 %</span>
+              <span class="lg-free">Wolne 22 %</span>
+            </div>
+          </div>
+
+          <!-- ===== NOWE: External GPU usage panel ===== -->
+          <div class="adv-extern">
+            <div class="adv-extern-head">
+              <span>Co już używa GPU (poza tym deploy'em)</span>
+              <span class="extern-total">1 933 MiB · 8 %</span>
+            </div>
+            <div class="adv-extern-bar">
+              <div class="ext-seg" title="sunshine 395 MiB" style="width: 1.6%;"></div>
+              <div class="ext-seg" title="chrome 1538 MiB" style="width: 6.4%;"></div>
+              <div class="deploy-room" style="width: 92%;"></div>
+            </div>
+            <div class="adv-extern-procs">
+              <span class="name">/usr/bin/sunshine (PID 2080)</span><span class="mb">395 MiB</span>
+              <span class="name">/opt/google/chrome (gpu-process)</span><span class="mb">1 538 MiB</span>
+            </div>
+            <div class="extern-foot">
+              <span>Aktualizacja co 2 s · <code class="mono">nvidia-smi --query-compute-apps</code></span>
+              <span style="color:var(--text-2);">Realnie wolne dla deploy'u: <b style="color:var(--success);font-family:'JetBrains Mono',monospace;">21.6 GiB</b></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== modeCard auto/manual ===== -->
+        <div class="adv-section">
+          <div class="adv-sec-title">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></svg>
+            Tryb konfiguracji
+          </div>
+          <div class="tf-segmented">
+            <button class="active">Auto (rekomendowane)</button>
+            <button>Manual override</button>
+          </div>
+
+          <div class="adv-alert info">
+            <div class="adv-alert-ico">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+            </div>
+            <div class="adv-alert-body">
+              <strong>Backend dopasował parametry pod twój GPU:</strong>
+              tensor_parallel=1, pipeline_parallel=1, max_model_len=32768, max_num_seqs=1,
+              kv_cache_dtype=fp8, gpu_memory_utilization=0.78.
+              <div class="adv-alert-args">--dtype auto --tensor-parallel-size 1 --max-model-len 32768 --max-num-seqs 1 --gpu-memory-utilization 0.78 --kv-cache-dtype fp8 --enable-chunked-prefill</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== speculativeCard ===== -->
+        <div class="adv-section">
+          <div class="adv-sec-title">
+            <svg viewBox="0 0 24 24"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
+            Speculative Decoding
+            <div class="adv-sec-actions" style="font-size:10.5px;color:var(--text-3);font-weight:500;text-transform:none;letter-spacing:0;">vLLM --speculative-config</div>
+          </div>
+          <div class="toggle-fake">
+            <span class="sw"></span>
+            <span style="font-size:12.5px;color:var(--text-2);">Włącz speculative decoding</span>
+          </div>
+          <div class="adv-hint" style="margin-top: 8px;">
+            Drafter musi być kompatybilny z modelem (np. ten sam tokenizer / wytrenowany pod target).
+            Brak parowania — startup vLLM zakończy się błędem. Zysk do 2× szybszy decode bez utraty jakości.
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-foot">
+        <button class="btn ghost">Anuluj</button>
+        <div class="spacer"></div>
+        <button class="btn secondary"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>Wstecz</button>
+        <button class="btn primary">Dalej <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></button>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- =========================================================== -->
+  <!-- STAN B: Edit Service modal — reuse tych samych komponentów  -->
+  <!-- =========================================================== -->
+  <section>
+    <div class="section-title">Stan B · Edit Service modal — reużywa Advanced sekcji + dodaje Model picker</div>
+    <div class="modal-shell">
+      <div class="modal-head">
+        <div class="dot warn"></div>
+        <h3>Edycja serwisu: vllm</h3>
+        <span class="head-meta">#1 · :5004 · Starting · alive 42s</span>
+      </div>
+      <div class="modal-body">
+
+        <div class="step-heading">
+          <h2>Konfiguracja silnika vllm</h2>
+          <p>Zmiana modelu, alokacji VRAM lub parametrów runtime. Engine_id / deploy_method / port są niezmienne.</p>
+        </div>
+        <div class="step-warn">
+          <svg viewBox="0 0 24 24"><path d="M12 9v3M12 17h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z"/></svg>
+          <div class="txt">
+            <strong>Serwis żyje teraz.</strong> Zapisanie zatrzyma serwis, zaktualizuje konfigurację
+            i uruchomi go ponownie. Strumienie chat / TTS aktywne dostaną <em>503</em>. Reload modelu ~30–180 s.
+          </div>
+        </div>
+
+        <!-- ===== MODEL PICKER (nowy w Edit) ===== -->
+        <div class="body-section">
+          <div class="body-section-title">
+            <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+            Model
+          </div>
+          <div class="opt-cards">
+            <div class="opt-card active">
+              <div class="opt-icon">
+                <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+              </div>
+              <div class="opt-title">Preset z manifestu <span class="tag">5</span></div>
+              <div class="opt-desc">Wybierz z listy presetów wkompilowanych w manifest silnika.</div>
+            </div>
+            <div class="opt-card">
+              <div class="opt-icon">
+                <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              </div>
+              <div class="opt-title">Custom HF repo</div>
+              <div class="opt-desc">Dowolny model z HuggingFace. Wpisz <code>org/repo</code>.</div>
+            </div>
+          </div>
+          <div class="preset-list">
+            <div class="preset-card selected">
+              <div class="preset-radio"></div>
+              <div class="preset-info">
+                <div class="preset-name">Qwen3.5-9B-NVFP4 <span class="preset-rec">RECOMMENDED</span></div>
+                <div class="preset-meta">
+                  <span>AxionML/Qwen3.5-9B-NVFP4</span><span class="sep">·</span>
+                  <span>~8.4 GiB weights</span><span class="sep">·</span>
+                  <span>4-bit NVFP4</span>
+                </div>
+              </div>
+            </div>
+            <div class="preset-card">
+              <div class="preset-radio"></div>
+              <div class="preset-info">
+                <div class="preset-name">Qwen3.5-0.8B-NVFP4</div>
+                <div class="preset-meta">
+                  <span>AxionML/Qwen3.5-0.8B-NVFP4</span><span class="sep">·</span>
+                  <span>~1.2 GiB weights</span>
+                </div>
+              </div>
+            </div>
+            <div class="preset-card">
+              <div class="preset-radio"></div>
+              <div class="preset-info">
+                <div class="preset-name">DeepSeek-R1-Distill-Qwen-7B</div>
+                <div class="preset-meta">
+                  <span>deepseek-ai/DeepSeek-R1-Distill-Qwen-7B</span><span class="sep">·</span>
+                  <span>~14 GiB FP16</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== Reuse: vramCard (5 KPI + segmented + external panel) ===== -->
+        <div class="adv-section">
+          <div class="adv-sec-title">
+            <svg viewBox="0 0 24 24"><path d="M2 3h20v18H2z"/><path d="M2 9h20"/></svg>
+            Kalkulator VRAM (po zmianie konfiguracji)
+            <div class="adv-sec-actions">
+              <span class="adv-pill danger">Nie mieści się · 102 % użycia</span>
+            </div>
+          </div>
+          <div class="adv-kpi-grid">
+            <div class="adv-kpi"><div class="k-label">Wagi</div><div class="k-value">8.4 GB</div><div class="k-sub">NVFP4</div></div>
+            <div class="adv-kpi danger"><div class="k-label">KV cache</div><div class="k-value">14.6 GB</div><div class="k-sub">ctx 68 608 · fp8</div></div>
+            <div class="adv-kpi"><div class="k-label">Activations</div><div class="k-value">2.1 GB</div><div class="k-sub">peak</div></div>
+            <div class="adv-kpi danger"><div class="k-label">Headroom</div><div class="k-value">−1.5 GB</div><div class="k-sub">brakuje</div></div>
+            <div class="adv-kpi danger"><div class="k-label">Razem</div><div class="k-value">25.1 / 23.5</div><div class="k-sub">102 %</div></div>
+          </div>
+          <div class="adv-vram-bar-wrap">
+            <div class="adv-vram-head"><span>Użycie GPU 0</span><span class="pct" style="color:var(--danger);">102 %</span></div>
+            <div class="adv-vram-bar">
+              <div class="fill danger" style="width: 100%;">
+                <div class="seg-w" style="width: 33%;"></div>
+                <div class="seg-kv" style="width: 58%;"></div>
+                <div class="seg-act" style="width: 9%;"></div>
+              </div>
+            </div>
+            <div class="adv-vram-legend">
+              <span class="lg-w">Wagi 33 %</span>
+              <span class="lg-kv">KV 58 %</span>
+              <span class="lg-act">Aktywacje 9 %</span>
+              <span class="lg-free danger">Brakuje 1.5 GB</span>
+            </div>
+          </div>
+
+          <!-- External panel (ten sam co w wizardzie) -->
+          <div class="adv-extern">
+            <div class="adv-extern-head">
+              <span>Co już używa GPU (poza deploy'em)</span>
+              <span class="extern-total">1 933 MiB</span>
+            </div>
+            <div class="adv-extern-bar">
+              <div class="ext-seg" style="width: 1.6%;"></div>
+              <div class="ext-seg" style="width: 6.4%;"></div>
+              <div class="deploy-room" style="width: 92%;"></div>
+            </div>
+            <div class="adv-extern-procs">
+              <span class="name">/usr/bin/sunshine (PID 2080)</span><span class="mb">395 MiB</span>
+              <span class="name">/opt/google/chrome (gpu-process)</span><span class="mb">1 538 MiB</span>
+            </div>
+            <div class="extern-foot">
+              <span>Aktualizacja co 2 s</span>
+              <span style="color:var(--text-2);">Realnie wolne: <b style="color:var(--success);font-family:'JetBrains Mono',monospace;">21.6 GiB</b> · ale wymagane <b style="color:var(--danger);font-family:'JetBrains Mono',monospace;">25.1 GiB</b></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== modeCard manual (z lock parametrów) ===== -->
+        <div class="adv-section">
+          <div class="adv-sec-title">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></svg>
+            Tryb konfiguracji
+            <div class="adv-sec-actions">
+              <button class="adv-reset-lock">🔄 Reset lock</button>
+            </div>
+          </div>
+          <div class="tf-segmented">
+            <button>Auto</button>
+            <button class="active">Manual</button>
+          </div>
+
+          <div class="adv-manual">
+            <div class="adv-row-2">
+              <div class="adv-form-row">
+                <label>
+                  <span>Tensor parallel <span class="adv-lock-tag">🔒 LOCKED</span></span>
+                  <span class="v">1</span>
+                </label>
+                <input type="range" class="adv-range" min="1" max="8" step="1" value="1">
+                <div class="adv-hint adjust-warn">⚙ auto-fit zmienił z 2 → 1 (model nie wymagał split)</div>
+              </div>
+              <div class="adv-form-row">
+                <label>
+                  <span>Pipeline parallel</span>
+                  <span class="v">1</span>
+                </label>
+                <input type="range" class="adv-range" min="1" max="4" step="1" value="1">
+              </div>
+            </div>
+
+            <div class="adv-form-row">
+              <label>
+                <span>Max model len (context)</span>
+                <span class="v">68 608</span>
+              </label>
+              <input type="range" class="adv-range" min="4096" max="262144" step="4096" value="68608">
+              <div class="ctx-chips">
+                <span class="ctx-chip">4k</span>
+                <span class="ctx-chip">8k</span>
+                <span class="ctx-chip">16k</span>
+                <span class="ctx-chip">32k</span>
+                <span class="ctx-chip active">64k</span>
+                <span class="ctx-chip">128k</span>
+                <span class="ctx-chip">262k</span>
+                <span class="ctx-chip exceeds">512k</span>
+                <span class="ctx-chip exceeds">1M</span>
+              </div>
+              <div class="adv-hint">Live KV estimate: 14.6 GB (przekracza dostępny VRAM — zmniejsz lub zwiększ utilization).</div>
+            </div>
+
+            <div class="adv-row-2">
+              <div class="adv-form-row">
+                <label>
+                  <span>Max num seqs</span>
+                  <span class="v">1</span>
+                </label>
+                <input type="range" class="adv-range" min="1" max="64" step="1" value="1">
+              </div>
+              <div class="adv-form-row">
+                <label>
+                  <span>KV cache dtype</span>
+                  <span class="v">fp8</span>
+                </label>
+                <div class="tf-segmented" style="margin-top:4px;">
+                  <button>auto</button><button class="active">fp8</button><button>fp16</button><button>bf16</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="adv-form-row">
+              <label>
+                <span>GPU memory utilization</span>
+                <span class="v">0.60</span>
+              </label>
+              <input type="range" class="adv-range" min="0.10" max="0.95" step="0.01" value="0.60">
+              <div class="adv-hint">Cap: 14.1 GiB · zwiększ do <b>≥0.78</b> żeby model się zmieścił, albo skróć ctx.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== speculative ===== -->
+        <div class="adv-section">
+          <div class="adv-sec-title">
+            <svg viewBox="0 0 24 24"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
+            Speculative Decoding
+          </div>
+          <div class="toggle-fake">
+            <span class="sw"></span>
+            <span style="font-size:12.5px;color:var(--text-2);">Włącz speculative decoding</span>
+          </div>
+        </div>
+
+        <!-- ===== READ-ONLY ===== -->
+        <div class="body-section">
+          <div class="body-section-title">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+            Niezmienne
+          </div>
+          <div class="fact-list">
+            <div class="row"><span class="key">Engine ID</span><span class="val">vllm</span></div>
+            <div class="row"><span class="key">Deploy method</span><span class="val">native_python_bundle</span></div>
+            <div class="row"><span class="key">Transport</span><span class="val">http_direct</span></div>
+            <div class="row"><span class="key">Port (allocator)</span><span class="val">5004</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-foot">
+        <button class="btn ghost">Anuluj</button>
+        <div class="spacer"></div>
+        <button class="btn danger"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>Zatrzymaj serwis</button>
+        <button class="btn secondary"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>Tylko zapisz</button>
+        <button class="btn primary"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>Zapisz i restartuj</button>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+document.querySelectorAll('.tf-segmented').forEach(seg => {
+  seg.querySelectorAll('button').forEach(b => {
+    b.addEventListener('click', () => {
+      seg.querySelectorAll('button').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+    });
+  });
+});
+document.querySelectorAll('.preset-list').forEach(list => {
+  list.querySelectorAll('.preset-card').forEach(card => {
+    card.addEventListener('click', () => {
+      list.querySelectorAll('.preset-card').forEach(c => c.classList.remove('selected'));
+      card.classList.add('selected');
+    });
+  });
+});
+document.querySelectorAll('.opt-cards').forEach(cards => {
+  cards.querySelectorAll('.opt-card').forEach(card => {
+    card.addEventListener('click', () => {
+      cards.querySelectorAll('.opt-card').forEach(c => c.classList.remove('active'));
+      card.classList.add('active');
+    });
+  });
+});
+document.querySelectorAll('.toggle-fake').forEach(t => {
+  t.addEventListener('click', () => t.classList.toggle('on'));
+});
+document.querySelectorAll('.ctx-chips').forEach(chips => {
+  chips.querySelectorAll('.ctx-chip:not(.exceeds)').forEach(c => {
+    c.addEventListener('click', () => {
+      chips.querySelectorAll('.ctx-chip').forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+    });
+  });
+});
+</script>
+
+</body>
+</html>

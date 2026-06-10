@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>CRM — Pipeline kanban (C2)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/><rect x="10" y="4" width="4" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20l3-2 3 2 3-2 3 2 3-2 1 2V2l-3 2-3-2-3 2-3-2-3 2-1-2z"/></symbol>
+<symbol id="i-fire" viewBox="0 0 24 24"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 17c1.7 0 3-1.3 3-3 0-1.4-.7-2.1-1.5-3-1.6-1.6-3-3-3-5 0-2.8 2.2-5 5-5 .5 6 5 8 5 12a8 8 0 1 1-16 0c0-2.2 1.1-4.2 2.7-5.5"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18L4.92 10l5.17 1.82L12 17l1.91-5.18L19.08 10l-5.17-1.82L12 3z"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 13.5"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9 14a2 2 0 0 0 2 2h2a2 2 0 0 0 0-4h-2a2 2 0 0 1 0-4h2a2 2 0 0 1 2 2"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>CRM — Pipeline kanban (C2)</h1>
+  <p class="lead">
+    Drugorzędny widok dealów. <strong>Kanban jest dobry do widzenia kształtu pipeline'u</strong> — gdzie się zbiera, gdzie się sypie — ale to nie jest centrum dnia pracy (to robi <a href="c01-daily-inbox.html">Inbox</a>).
+    Kolumny po fazach pipeline, kolory boków kart: różowy = commit, pomarańczowy = stale (brak aktywności &gt; 7 dni).
+    U góry filtry: po sekcji, po ownerze, po wartości, po czasie. Po prawej grid/list/kanban switch.
+  </p>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">C2</span>
+    <h2>Pipeline — sekcja Wschód · Maj 2026</h2>
+    <div class="desc">Drag-drop między kolumnami. Zmiana fazy → AI proponuje update wymaganych pól.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="tf-shell">
+      <aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-deal"/></svg>CRM<span class="badge danger">7</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av indigo">AK</div><div><div class="nm">Anna Kowalska</div><div class="rl">Handlowiec · Wschód</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+
+      <main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>CRM</strong></div>
+  <div class="pill-tabs">
+    <button class="pill-tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-inbox"/></svg>Inbox</button>
+    <button class="pill-tab active"><svg class="icon"><use href="#i-pipeline"/></svg>Pipeline</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-trend"/></svg>Forecast</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-shield-check"/></svg>Akceptacje</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy</button>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+        <div class="page-head">
+          <div class="title">Pipeline<div class="sub">32 deale · łącznie 8.4 mln PLN · ważone 4.2 mln PLN</div></div>
+          <div class="actions">
+            <div class="segmented">
+              <button><svg class="icon"><use href="#i-list"/></svg>Lista</button>
+              <button class="active"><svg class="icon"><use href="#i-grid"/></svg>Kanban</button>
+              <button><svg class="icon"><use href="#i-trend"/></svg>Funnel</button>
+            </div>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg>Nowy deal</button>
+          </div>
+        </div>
+
+        <div class="flex gap-sm mb-md align-center wrap">
+          <span class="filter-chip active"><svg class="icon"><use href="#i-target"/></svg>Sekcja: Wschód</span>
+          <span class="filter-chip">Owner: wszyscy<span class="count">5</span></span>
+          <span class="filter-chip">Wartość: dowolna</span>
+          <span class="filter-chip">Tylko commit<span class="count">8</span></span>
+          <span class="filter-chip">Stale &gt; 7d<span class="count">4</span></span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-sparkles"/></svg>Z ryzykiem AI<span class="count">5</span></span>
+          <div class="search-box" style="margin-left:auto;min-width:200px;"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w pipeline…"></div>
+        </div>
+
+        <div class="pipeline">
+
+          <!-- LEAD -->
+          <div class="pipe-col">
+            <div class="pipe-head"><span class="pipe-name" style="color:#94a3b8">Lead</span><span class="pipe-count">5</span><span class="pipe-val">340 k PLN</span></div>
+            <div class="pipe-body">
+              <div class="pipe-card"><div class="pc-name">Żabka Polska · loyalty</div><div class="pc-co">CIO Patrycja Mazur</div><div class="pc-meta"><div class="av sm indigo">AK</div>nowy <span class="pc-val">80k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Decathlon · POS pilot</div><div class="pc-co">Pilot dla 3 sklepów</div><div class="pc-meta"><div class="av sm indigo">MK</div>2 dni <span class="pc-val">45k</span></div></div>
+              <div class="pipe-card stale"><div class="pc-name">Empik · audyt dat. centr.</div><div class="pc-co">audytowy projekt</div><div class="pc-meta"><div class="av sm gray">JN</div>12 dni <span class="pc-val">28k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Lotos · konsultacje IT</div><div class="pc-co">enterprise consulting</div><div class="pc-meta"><div class="av sm indigo">AK</div>4 dni <span class="pc-val">120k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Polkomtel · audyt 5G</div><div class="pc-co">audyt sieci</div><div class="pc-meta"><div class="av sm teal">PL</div>5 dni <span class="pc-val">67k</span></div></div>
+            </div>
+          </div>
+
+          <!-- KWALIFIKACJA -->
+          <div class="pipe-col">
+            <div class="pipe-head"><span class="pipe-name" style="color:var(--info)">Kwalifikacja</span><span class="pipe-count">6</span><span class="pipe-val">680 k PLN</span></div>
+            <div class="pipe-body">
+              <div class="pipe-card"><div class="pc-name">Castorama · Wdrożenie ERP</div><div class="pc-co">CFO P. Lewandowski</div><div class="pc-meta"><div class="av sm indigo">AK</div>3 dni <span class="pc-val">87.5k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Auchan · BI dla zakupów</div><div class="pc-co">Dyr. zakupów</div><div class="pc-meta"><div class="av sm indigo">MK</div>1 dzień <span class="pc-val">140k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">PGNiG · platforma kons.</div><div class="pc-co">Sales engineer review</div><div class="pc-meta"><div class="av sm amber">RT</div>6 dni <span class="pc-val">95k</span></div></div>
+              <div class="pipe-card stale"><div class="pc-name">PZU · CRM offline</div><div class="pc-co">tracimy kontakt</div><div class="pc-meta"><div class="av sm gray">JN</div>15 dni <span class="pc-val">78k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Comp · cyfryzacja HR</div><div class="pc-co">drugie spotkanie</div><div class="pc-meta"><div class="av sm teal">PL</div>2 dni <span class="pc-val">180k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Inter Cars · katalog</div><div class="pc-co">B2B portal</div><div class="pc-meta"><div class="av sm indigo">AK</div>nowy <span class="pc-val">99k</span></div></div>
+            </div>
+          </div>
+
+          <!-- OFERTA -->
+          <div class="pipe-col">
+            <div class="pipe-head"><span class="pipe-name" style="color:var(--accent-2)">Oferta</span><span class="pipe-count">9</span><span class="pipe-val">2.4 M PLN</span></div>
+            <div class="pipe-body">
+              <div class="pipe-card commit"><div class="pc-name">Volkswagen Poznań · ERP fleet</div><div class="pc-co">CIO Magda Wiśniewska</div><div class="pc-meta"><div class="av sm indigo">AK</div>14 dni <span class="pc-val">480k</span></div></div>
+              <div class="pipe-card commit"><div class="pc-name">Santander · prezentacja</div><div class="pc-co">spotkanie dziś 10:00</div><div class="pc-meta"><div class="av sm indigo">AK</div>5 dni <span class="pc-val">520k</span></div></div>
+              <div class="pipe-card stale commit"><div class="pc-name">PKO BP · platforma wniosków</div><div class="pc-co">14 dni cisza</div><div class="pc-meta"><div class="av sm indigo">MK</div>14 dni <span class="pc-val">340k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Tauron · CRM migracja</div><div class="pc-co">v3 wysłana</div><div class="pc-meta"><div class="av sm teal">PL</div>4 dni <span class="pc-val">220k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">ING Bank Śląski · ECM</div><div class="pc-co">demo zakończone</div><div class="pc-meta"><div class="av sm amber">RT</div>2 dni <span class="pc-val">410k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">CD Projekt · BI gamedev</div><div class="pc-co">draft v2</div><div class="pc-meta"><div class="av sm indigo">MK</div>6 dni <span class="pc-val">160k</span></div></div>
+              <div class="pipe-card stale"><div class="pc-name">Asseco · konsulting</div><div class="pc-co">brak odpowiedzi</div><div class="pc-meta"><div class="av sm gray">JN</div>11 dni <span class="pc-val">98k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Allegro · marketplace int.</div><div class="pc-co">scoping</div><div class="pc-meta"><div class="av sm indigo">AK</div>3 dni <span class="pc-val">280k</span></div></div>
+            </div>
+          </div>
+
+          <!-- COMMIT -->
+          <div class="pipe-col">
+            <div class="pipe-head"><span class="pipe-name" style="color:var(--accent-2)">Commit</span><span class="pipe-count">5</span><span class="pipe-val">2.8 M PLN</span></div>
+            <div class="pipe-body">
+              <div class="pipe-card commit"><div class="pc-name">mBank · CBA migracja</div><div class="pc-co">akceptacja budżetu</div><div class="pc-meta"><div class="av sm indigo">AK</div>9 dni <span class="pc-val">120k</span></div></div>
+              <div class="pipe-card commit"><div class="pc-name">Orlen · Cyfryzacja CRO</div><div class="pc-co">karta zaakcept. 8:42</div><div class="pc-meta"><div class="av sm indigo">AK</div>1 dzień <span class="pc-val">420k</span></div></div>
+              <div class="pipe-card commit"><div class="pc-name">Polsat · CRM dla call</div><div class="pc-co">finalizujemy umowę</div><div class="pc-meta"><div class="av sm teal">PL</div>3 dni <span class="pc-val">680k</span></div></div>
+              <div class="pipe-card commit"><div class="pc-name">PKO BP · backup OPS</div><div class="pc-co">parafa CTO</div><div class="pc-meta"><div class="av sm amber">RT</div>2 dni <span class="pc-val">920k</span></div></div>
+              <div class="pipe-card commit stale"><div class="pc-name">Polskie LNG · katalog</div><div class="pc-co">commit od 17 dni</div><div class="pc-meta"><div class="av sm gray">JN</div>17 dni <span class="pc-val">680k</span></div></div>
+            </div>
+          </div>
+
+          <!-- REALIZACJA -->
+          <div class="pipe-col">
+            <div class="pipe-head"><span class="pipe-name" style="color:var(--warning)">Realizacja</span><span class="pipe-count">4</span><span class="pipe-val">1.6 M PLN</span></div>
+            <div class="pipe-body">
+              <div class="pipe-card"><div class="pc-name">Żabka · self-checkout</div><div class="pc-co">faza 2/3 · 67%</div><div class="pc-meta"><div class="av sm indigo">AK</div>4 mc <span class="pc-val">540k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">Bank Millennium · ECM</div><div class="pc-co">faza 1/2 · 38%</div><div class="pc-meta"><div class="av sm indigo">MK</div>2 mc <span class="pc-val">380k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">PŻM · audyt</div><div class="pc-co">finalna faza</div><div class="pc-meta"><div class="av sm teal">PL</div>3 mc <span class="pc-val">220k</span></div></div>
+              <div class="pipe-card"><div class="pc-name">ING · platforma wniosków</div><div class="pc-co">w trakcie testów</div><div class="pc-meta"><div class="av sm amber">RT</div>1 mc <span class="pc-val">460k</span></div></div>
+            </div>
+          </div>
+
+          <!-- WON / LOST -->
+          <div class="pipe-col">
+            <div class="pipe-head"><span class="pipe-name" style="color:var(--success)">Won</span><span class="pipe-count">3</span><span class="pipe-val">580 k PLN</span></div>
+            <div class="pipe-body">
+              <div class="pipe-card" style="border-left:3px solid var(--success);padding-left:8px;"><div class="pc-name">Tauron · CRM faza 0</div><div class="pc-co">zamknięty 8.05</div><div class="pc-meta"><div class="av sm indigo">AK</div>·<span class="pc-val">180k</span></div></div>
+              <div class="pipe-card" style="border-left:3px solid var(--success);padding-left:8px;"><div class="pc-name">ING · ECM extension</div><div class="pc-co">zamknięty 2.05</div><div class="pc-meta"><div class="av sm indigo">MK</div>·<span class="pc-val">240k</span></div></div>
+              <div class="pipe-card" style="border-left:3px solid var(--success);padding-left:8px;"><div class="pc-name">PKO · backup pilot</div><div class="pc-co">zamknięty 28.04</div><div class="pc-meta"><div class="av sm amber">RT</div>·<span class="pc-val">160k</span></div></div>
+              <div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);">
+                <div class="text-xs text-3" style="text-transform:uppercase;letter-spacing:0.08em;font-weight:800;margin-bottom:8px;">Lost · 2</div>
+                <div class="pipe-card" style="border-left:3px solid var(--danger);padding-left:8px;opacity:0.7"><div class="pc-name">BNP · pilot</div><div class="pc-co">wygrał Comarch</div><div class="pc-meta"><div class="av sm gray">JN</div>·<span class="pc-val">95k</span></div></div>
+                <div class="pipe-card" style="border-left:3px solid var(--danger);padding-left:8px;opacity:0.7;margin-top:6px;"><div class="pc-name">Avon · CRM</div><div class="pc-co">budżet zatrzymany</div><div class="pc-meta"><div class="av sm gray">JN</div>·<span class="pc-val">120k</span></div></div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

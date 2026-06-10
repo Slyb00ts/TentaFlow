@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Re-ID (M7)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.gate-modal {
+  background: var(--bg-2); border: 1px solid var(--danger); border-radius: var(--radius-lg);
+  padding: 30px 32px; max-width: 720px; margin: 0 auto;
+  box-shadow: 0 0 60px rgba(239,68,68,0.15);
+}
+.gate-modal .gate-icon {
+  width: 64px; height: 64px; border-radius: var(--radius);
+  background: rgba(239,68,68,0.15); color: var(--danger);
+  display: flex; align-items: center; justify-content: center;
+  margin-bottom: 18px;
+}
+.gate-modal h2 { font-size: 22px; font-weight: 800; margin-bottom: 6px; }
+.gate-modal .gate-sub { color: var(--text-2); font-size: 13px; margin-bottom: 22px; line-height: 1.6; }
+.check-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 22px; }
+.check-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.check-row.done { border-color: rgba(34,197,94,0.3); }
+.check-row.pending { border-color: rgba(245,158,11,0.3); }
+.check-row.blocked { border-color: rgba(239,68,68,0.3); }
+.check-row .ico { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.check-row.done .ico { background: rgba(34,197,94,0.15); color: var(--success); }
+.check-row.pending .ico { background: rgba(245,158,11,0.15); color: var(--warning); }
+.check-row.blocked .ico { background: rgba(239,68,68,0.15); color: var(--danger); }
+.check-row .label { font-size: 13px; font-weight: 700; }
+.check-row .desc { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+.check-row .ico .icon { width: 14px; height: 14px; stroke-width: 2.5; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-warning" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7" cy="14" r="4"/><path d="m10 11 10-5"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M7</span><h2>Re-ID (D4) — pod legal gate</h2>
+    <div class="desc">PIN + role + LegalGrant. Bez aktywnego grantu runtime odmawia query — to nie tylko UI, to twardy gate.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Analyst</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Re-ID (D4)</span>
+        </div>
+
+        <div class="detail-header" style="border-color:rgba(239,68,68,0.3)">
+          <div class="big-ico" style="background:linear-gradient(135deg,#ef4444 0%,#a78bfa 100%)"><svg viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Re-ID osób (D4) <span class="risk C">C</span> <span class="chip danger"><svg class="icon"><use href="#i-lock"/></svg>zablokowany</span></div>
+            <div class="d-sub">EU AI Act Annex III (high-risk) · Art. 5 (real-time w przestrzeni publicznej zakazane bez wyjątku) · wymaga aktywnego LegalGrant + DPIA/FRIA</div>
+            <div class="d-badges">
+              <span class="chip"><svg class="icon"><use href="#i-shield"/></svg>profil: Komercja prywatna</span>
+              <span class="chip danger">runtime: BLOCKED</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary" disabled><svg class="icon"><use href="#i-search"/></svg>Query disabled</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-key"/></svg>Wnioskuj o LegalGrant</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab active"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+        </div>
+
+        <!-- Hard gate panel -->
+        <div class="gate-modal">
+          <div class="gate-icon"><svg class="icon icon-xl" style="width:32px;height:32px"><use href="#i-lock"/></svg></div>
+          <h2>Moduł Re-ID jest zablokowany</h2>
+          <p class="gate-sub">
+            Re-identyfikacja osób (twarz + person re-id) jest klasyfikowana jako <strong>high-risk AI</strong> wg EU AI Act (Annex III).
+            W trybie real-time w przestrzeni publicznej jest <strong>zakazana</strong> (Art. 5) poza wąskimi wyjątkami dla służb uprawnionych.
+            Aby uruchomić ten moduł musisz spełnić poniższe warunki — bez nich runtime <em>fizycznie odrzuci</em> każde zapytanie.
+          </p>
+
+          <div class="check-list">
+            <div class="check-row done">
+              <div class="ico"><svg class="icon"><use href="#i-check"/></svg></div>
+              <div style="flex:1">
+                <div class="label">DPIA wypełniona i podpisana przez DPO</div>
+                <div class="desc">DPIA-2026-014 · podpis Inspektora Ochrony Danych z 2026-05-08 · review w 2027-05-08</div>
+              </div>
+              <span class="chip success">OK</span>
+            </div>
+
+            <div class="check-row pending">
+              <div class="ico"><svg class="icon"><use href="#i-warning"/></svg></div>
+              <div style="flex:1">
+                <div class="label">FRIA (Fundamental Rights Impact Assessment) — wymagana AI Act art. 27</div>
+                <div class="desc">Status: szkic 60% · właściciel: Inspektor Ochrony Danych</div>
+              </div>
+              <button class="btn btn-sm">Otwórz wniosek</button>
+            </div>
+
+            <div class="check-row blocked">
+              <div class="ico"><svg class="icon"><use href="#i-x"/></svg></div>
+              <div style="flex:1">
+                <div class="label">Aktywny LegalGrant z udokumentowanym authority</div>
+                <div class="desc">Wymóg: organ wnoszący · sygnatura sprawy · expiry · podpis kierownika jednostki</div>
+              </div>
+              <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-key"/></svg>Wnioskuj</button>
+            </div>
+
+            <div class="check-row blocked">
+              <div class="ico"><svg class="icon"><use href="#i-x"/></svg></div>
+              <div style="flex:1">
+                <div class="label">Profil deployment ≠ "Komercja prywatna"</div>
+                <div class="desc">Aktualny profil <strong>Komercja prywatna</strong> nie daje dostępu do D4 real-time. Wymagany profil "Lotnisko (operator)", "Transport publiczny" lub "Służby uprawnione".</div>
+              </div>
+              <button class="btn btn-sm">Zmień profil</button>
+            </div>
+
+            <div class="check-row done">
+              <div class="ico"><svg class="icon"><use href="#i-check"/></svg></div>
+              <div style="flex:1">
+                <div class="label">Hash-chain audit log uruchomiony i synchronizowany z WORM</div>
+                <div class="desc">Ostatnia synchronizacja: 5 min temu · S3 immutable bucket OK</div>
+              </div>
+              <span class="chip success">OK</span>
+            </div>
+
+            <div class="check-row done">
+              <div class="ico"><svg class="icon"><use href="#i-check"/></svg></div>
+              <div style="flex:1">
+                <div class="label">Post-market monitoring (AI Act art. 72)</div>
+                <div class="desc">Eval harness aktywny · FP/h/kamera w celu · fairness metrics w celu</div>
+              </div>
+              <span class="chip success">OK</span>
+            </div>
+          </div>
+
+          <div class="section-card" style="background:var(--bg);border-color:var(--border-hover);padding:14px;margin:0">
+            <div class="text-xs fw-700 flex align-center gap-sm" style="color:var(--accent-2)"><svg class="icon"><use href="#i-shield"/></svg>Podstawa prawna referencyjna</div>
+            <p class="text-xs text-2 mt-sm">
+              <strong>EU AI Act 2024/1689 art. 5(1)(h)</strong> — zakaz real-time remote biometric ID w publicznych przestrzeniach dla ścigania,
+              poza: poszukiwanie ofiar/zaginionych, zapobieżenie istotnemu zagrożeniu (terroryzm), ściganie sprawców poważnych przestępstw z autoryzacją organu sądowego.
+              <strong>RODO art. 9</strong> — przetwarzanie danych biometrycznych. <strong>EDPB Guidelines 3/2019</strong> — wideo i biometria.
+            </p>
+          </div>
+
+        </div>
+
+        <!-- After gate — would show audit log + galeria (preview) -->
+        <section class="section-card mt-md" style="opacity:0.4;pointer-events:none">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-fingerprint"/></svg>Indeks Re-ID (widok po uzyskaniu grantu)</div>
+            <span class="chip">odblokowane po spełnieniu warunków powyżej</span>
+          </div>
+          <table class="tf-table" style="border:0">
+            <thead><tr><th>Subject ID</th><th>Podstawa prawna</th><th>Sygn. sprawy</th><th>Authority</th><th>Expiry</th><th>Operator</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">subj-7842</td><td>AI Act art. 5(1)(h)(ii)</td><td class="mono">PR-3-K-247/2026</td><td>Prokuratura Rejonowa Warszawa-Mokotów</td><td>2026-05-19</td><td>analyst-lea-04</td></tr>
+              <tr><td class="mono">subj-7843</td><td>RODO art. 6(1)(e) + ust. o Policji</td><td class="mono">L.dz. 1842/26</td><td>KPP Warszawa I</td><td>2026-05-22</td><td>analyst-lea-04</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

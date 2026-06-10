@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Dashboard (M1)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-luggage" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="14" rx="2"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><line x1="6" y1="12" x2="18" y2="12"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>TentaVision — Dashboard (M1)</h1>
+  <p class="lead">
+    Addon <strong>TentaVision</strong> osadzony w globalnym shellu TentaFlow. Lewa kolumna to
+    standardowa nawigacja TentaFlow (Home / Dashboard / Services / Addons...) — addon jest "wybranym addonem" w sekcji Integrations.
+    Cała wewnętrzna nawigacja TentaVision odbywa się przez <strong>zakładki</strong> w detail-header (Dashboard / Live / Kamery / Profile / Alarmy...).
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-puzzle"/></svg>Addon w TentaFlow</h3>
+      <p>Sidebar = globalna nawigacja TentaFlow. Addon TentaVision jest wybrany w sekcji "Integrations → Addons".</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-eye"/></svg>Wewnętrzna nawigacja</h3>
+      <p>W obrębie addona poruszamy się przez zakładki w detail-header (jak w addons-permissions Detail panel).</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-shield"/></svg>Zgodność z systemem</h3>
+      <p>Tylko SVG (z <code>&lt;defs&gt;</code>), Manrope, paleta TentaFlow, komponenty tf-* — bez emoji, bez własnych primitive'ów.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M1</span>
+    <h2>Dashboard — TentaVision (kontekst: pełny shell TentaFlow)</h2>
+    <div class="desc">KPI systemu, ostatnie alarmy, mapa cieplna aktywności 24h × kamera. Operator: analyst.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <!-- ============ GLOBAL TENTAFLOW SIDEBAR ============ -->
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div>
+        </div>
+
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+
+        <div class="footer">
+          <div class="user-chip">
+            <div class="avatar">PJ</div>
+            <div>
+              <div class="name-t">Piotr Jarocki</div>
+              <div class="role">Analyst</div>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- ============ MAIN ============ -->
+      <main class="main">
+
+        <!-- Breadcrumb -->
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Dashboard</span>
+        </div>
+
+        <!-- Detail header (addon "header") -->
+        <div class="detail-header">
+          <div class="big-ico">
+            <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+          </div>
+          <div class="d-meta">
+            <div class="d-name">
+              TentaVision
+              <span class="chip success"><span class="dot"></span>runtime online</span>
+            </div>
+            <div class="d-sub">Analiza obrazu z kamer · deployment <span class="mono" style="color:var(--text-2)">depo-warszawa-pn</span> · v0.4.2</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-camera"/></svg>22 / 24 kamer</span>
+              <span class="chip"><svg class="icon"><use href="#i-brain"/></svg>8 detektorów aktywnych</span>
+              <span class="chip warning"><svg class="icon"><use href="#i-alert"/></svg>3 critical (24h)</span>
+              <span class="chip"><svg class="icon"><use href="#i-cpu"/></svg>GPU RTX 4070 · 68%</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież</button>
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-download"/></svg>Eksport raportu</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-eye"/></svg>Live view</button>
+          </div>
+        </div>
+
+        <!-- Tabs (internal addon navigation) -->
+        <div class="tabs-bar">
+          <button class="tab active"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile analityczne<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy &amp; reguły</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt &amp; RODO</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport dowodowy</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          <div class="tabs-right">
+            <div class="segmented">
+              <button><svg class="icon"><use href="#i-clock"/></svg>1h</button>
+              <button>6h</button>
+              <button class="active">24h</button>
+              <button>7d</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- KPI tiles -->
+        <div class="kpi-grid">
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-camera"/></svg>Aktywne kamery</div>
+            <div class="value">22 <span class="small">/ 24</span></div>
+            <div class="delta warn"><svg class="icon" style="width:12px;height:12px"><use href="#i-alert"/></svg>2 offline (C-12, C-19)</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-brain"/></svg>Aktywne detektory</div>
+            <div class="value">8</div>
+            <div class="delta">D1 · D2 · D3 · D5 · D6</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-alert"/></svg>Alarmy 24h</div>
+            <div class="value">147</div>
+            <div class="delta up">▲ 23% vs. wczoraj · 3 critical</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-cpu"/></svg>GPU / latencja p95</div>
+            <div class="value">68% <span class="small">· 1.2s</span></div>
+            <div class="delta up">w budżecie SLO</div>
+          </div>
+        </div>
+
+        <!-- Two columns: alarms + runtime health -->
+        <div class="grid-2">
+
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-alert"/></svg>Ostatnie alarmy</div>
+              <a href="#" class="text-sm">Wszystkie 147 <svg class="icon" style="width:12px;height:12px;vertical-align:middle"><use href="#i-chevron"/></svg></a>
+            </div>
+            <div class="flex col gap-sm">
+              <div class="alarm-card critical">
+                <div class="thumb"><svg class="icon"><use href="#i-video"/></svg></div>
+                <div>
+                  <div class="title fw-700">D2 · podejrzenie agresji</div>
+                  <div class="meta">
+                    <span><svg class="icon"><use href="#i-camera"/></svg>C-04 wjazd</span>
+                    <span><svg class="icon"><use href="#i-clock"/></svg>12:43:21</span>
+                    <span class="chip danger"><span class="dot"></span>krytyczne</span>
+                    <span class="chip">conf 0.87</span>
+                  </div>
+                </div>
+                <button class="btn btn-primary btn-sm">Otwórz</button>
+              </div>
+              <div class="alarm-card warning">
+                <div class="thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+                <div>
+                  <div class="title fw-700">D1 · nieczytelna tablica ADR (UN 1203)</div>
+                  <div class="meta">
+                    <span><svg class="icon"><use href="#i-camera"/></svg>C-01 brama</span>
+                    <span><svg class="icon"><use href="#i-clock"/></svg>12:38:04</span>
+                    <span class="chip warning">ostrzeżenie</span>
+                    <span class="chip">legibility 0.42</span>
+                  </div>
+                </div>
+                <button class="btn btn-sm">Otwórz</button>
+              </div>
+              <div class="alarm-card warning">
+                <div class="thumb"><svg class="icon"><use href="#i-luggage"/></svg></div>
+                <div>
+                  <div class="title fw-700">D3 · pozostawiony bagaż &gt; 90s</div>
+                  <div class="meta">
+                    <span><svg class="icon"><use href="#i-camera"/></svg>C-07 peron</span>
+                    <span><svg class="icon"><use href="#i-clock"/></svg>12:31:55</span>
+                    <span class="chip warning">ostrzeżenie</span>
+                    <span class="chip">unowned 102s</span>
+                  </div>
+                </div>
+                <button class="btn btn-sm">Otwórz</button>
+              </div>
+              <div class="alarm-card info">
+                <div class="thumb"><svg class="icon"><use href="#i-camera"/></svg></div>
+                <div>
+                  <div class="title fw-700">D6 · pojazd w strefie zakazu</div>
+                  <div class="meta">
+                    <span><svg class="icon"><use href="#i-camera"/></svg>C-15 magazyn</span>
+                    <span><svg class="icon"><use href="#i-clock"/></svg>12:22:09</span>
+                    <span class="chip info">info</span>
+                  </div>
+                </div>
+                <button class="btn btn-sm">Otwórz</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-activity"/></svg>Stan natywnego runtime</div>
+              <span class="status-pill ok">runtime ok</span>
+            </div>
+            <table class="tf-table" style="background:transparent;border:0">
+              <tbody>
+                <tr><td class="text-2 text-sm">Frame bus throughput</td><td class="fw-700 text-sm">312 fps łącznie</td></tr>
+                <tr><td class="text-2 text-sm">Queue depth (max)</td><td class="fw-700 text-sm">12 (kam. C-04, tier 0)</td></tr>
+                <tr><td class="text-2 text-sm">Drop rate 1h</td><td><span class="chip success">0.4%</span></td></tr>
+                <tr><td class="text-2 text-sm">VRAM użycie</td><td class="fw-700 text-sm">8.2 / 12 GB <span class="chip warning">tight</span></td></tr>
+                <tr><td class="text-2 text-sm">Modele załadowane</td><td class="fw-700 text-sm">6 (YOLO11m, PP-OCRv5, BoT-SORT...)</td></tr>
+                <tr><td class="text-2 text-sm">Clock-sync dryf max</td><td class="fw-700 text-sm">12 ms (PTP OK)</td></tr>
+                <tr><td class="text-2 text-sm">Audit log → WORM</td><td><span class="chip success"><svg class="icon"><use href="#i-shield"/></svg>synced (5 min temu)</span></td></tr>
+                <tr><td class="text-2 text-sm">Eval harness (daily)</td><td class="text-sm"><span class="chip success">P/R w celu</span> · ostatnio 03:00</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+        </div>
+
+        <!-- Heatmap -->
+        <section class="section-card mt-md">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-activity"/></svg>Mapa cieplna aktywności · ostatnie 24h × kamera</div>
+            <div class="flex gap-sm align-center text-xs text-3">
+              <span>niska</span>
+              <span style="width:14px;height:14px;background:rgba(99,102,241,0.2);border-radius:2px"></span>
+              <span style="width:14px;height:14px;background:rgba(99,102,241,0.45);border-radius:2px"></span>
+              <span style="width:14px;height:14px;background:rgba(167,139,250,0.7);border-radius:2px"></span>
+              <span style="width:14px;height:14px;background:rgba(239,68,68,0.85);border-radius:2px"></span>
+              <span>wysoka</span>
+            </div>
+          </div>
+          <div class="heatmap-wrap">
+            <div class="heatmap-header">
+              <span></span>
+              <span>0</span><span></span><span>2</span><span></span><span>4</span><span></span><span>6</span><span></span><span>8</span><span></span><span>10</span><span></span><span>12</span><span></span><span>14</span><span></span><span>16</span><span></span><span>18</span><span></span><span>20</span><span></span><span>22</span><span></span>
+            </div>
+            <div class="heatmap-grid" id="hm"></div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<script>
+const cams = ['C-01 brama','C-04 wjazd','C-07 peron','C-09 hala','C-12 magazyn','C-15 parking','C-18 dok','C-22 wjazd-2'];
+const hm = document.getElementById('hm');
+cams.forEach((cam, ci) => {
+  const label = document.createElement('div');
+  label.className = 'row-label';
+  label.textContent = cam;
+  hm.appendChild(label);
+  for (let h = 0; h < 24; h++) {
+    const c = document.createElement('div');
+    c.className = 'heatmap-cell';
+    const peak = (h > 7 && h < 18) ? 1 : 0.2;
+    const noise = Math.random();
+    const v = peak * noise * (ci === 1 ? 1.4 : 1);
+    if (v > 0.75) c.classList.add('lvl-4');
+    else if (v > 0.5) c.classList.add('lvl-3');
+    else if (v > 0.3) c.classList.add('lvl-2');
+    else if (v > 0.15) c.classList.add('lvl-1');
+    hm.appendChild(c);
+  }
+});
+</script>
+</body>
+</html>

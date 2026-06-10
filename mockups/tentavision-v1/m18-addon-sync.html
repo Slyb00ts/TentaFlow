@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Addon Sync Policy (M18)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.policy-row {
+  display: grid;
+  grid-template-columns: 190px 150px 160px 1fr 132px;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.policy-row.head {
+  background: var(--bg-3);
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.policy-row:last-child { border-bottom: 0; }
+.scope-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+.target-list {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.mini-chart {
+  display: grid;
+  grid-template-columns: repeat(16, 1fr);
+  gap: 3px;
+  height: 42px;
+  align-items: end;
+}
+.mini-chart span {
+  display: block;
+  min-height: 4px;
+  border-radius: 3px 3px 0 0;
+  background: var(--accent-1);
+}
+.mini-chart span.warn { background: var(--warning); }
+.mini-chart span.good { background: var(--success); }
+.decision-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+.decision-card strong { display: block; margin-bottom: 5px; }
+@media (max-width: 980px) {
+  .app { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  .policy-row { grid-template-columns: 1fr; }
+  .screen-header .desc { max-width: none; text-align: left; margin-left: 0; }
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M18</span><h2>Addon settings → Sync</h2>
+    <div class="desc">Miejsce: Addons → dowolny addon → Ustawienia → nowa zakładka Sync. Tu administrator ustawia politykę platformową dla danych addonu, bez wpisywania trybów w manifest WASM.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">15</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-link"/></svg>Sync &amp; Nodes<span class="badge danger">2</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer"><div class="user-chip"><div class="avatar">KC</div><div><div class="name-t">Krystian C.</div><div class="role">Platform admin</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Contacts</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Ustawienia</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Sync</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Contacts · Sync <span class="chip success"><span class="dot"></span>policy active</span></div>
+            <div class="d-sub">Addon data: SQLite contacts/activity, KV preferences, blob attachments · org acme-main</div>
+            <div class="d-badges">
+              <span class="chip accent">4 resource classes</span>
+              <span class="chip success">3 targets allowed</span>
+              <span class="chip warning">1 central-only source</span>
+              <span class="chip">retention inherited</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary">Discard</button>
+            <button class="btn btn-secondary">Dry run</button>
+            <button class="btn btn-primary">Save policy</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-users"/></svg>Kontakty</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Storage</button>
+          <button class="tab"><svg class="icon"><use href="#i-shield"/></svg>Dostęp</button>
+          <button class="tab active"><svg class="icon"><use href="#i-link"/></svg>Sync</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audit</button>
+        </div>
+
+        <section class="section-card" style="background:rgba(96,165,250,0.06);border-color:rgba(96,165,250,0.25)">
+          <h3 style="color:var(--info)"><svg class="icon"><use href="#i-shield"/></svg>Zakres odpowiedzialności</h3>
+          <p class="text-xs text-2" style="line-height:1.7">
+            Addon nadal tylko zapisuje dane przez TentaFlow Core. Ten ekran ustawia platformowe reguły propagacji: kto dostaje operacje, czy dane mają działać offline, kiedy budować snapshoty oraz które zasoby są central-only. Manifest addonu nie definiuje trybów synchronizacji.
+          </p>
+        </section>
+
+        <div class="grid-3">
+          <div class="scope-box"><div class="chip accent">Default policy</div><div class="fw-800 mt-sm">Permission-based sync</div><div class="text-xs text-2 mt-sm">Core wylicza targety z owner/user/department/org graph.</div></div>
+          <div class="scope-box"><div class="chip warning">Source-side ACL</div><div class="fw-800 mt-sm">Push, repair, snapshot</div><div class="text-xs text-2 mt-sm">Źródło nie wysyła danych do peera bez uprawnień.</div></div>
+          <div class="scope-box"><div class="chip success">Offline</div><div class="fw-800 mt-sm">Enabled for mobile/laptop</div><div class="text-xs text-2 mt-sm">Outbox trzyma zmiany do czasu reconnectu.</div></div>
+        </div>
+
+        <section class="section-card mt-md">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-database"/></svg>Resource sync policy</div>
+            <span class="hint">Policy rows are stored in TentaFlow Core, not in addon TOML</span>
+          </div>
+          <div style="border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+            <div class="policy-row head"><div>Resource</div><div>Backend</div><div>Mode</div><div>Targets</div><div>Conflicts</div></div>
+            <div class="policy-row">
+              <div><div class="fw-800">contacts.person</div><div class="mono text-xs text-3">SQLite table contacts</div></div>
+              <div><span class="chip accent">SQLite</span></div>
+              <div><span class="status-pill ok">sync offline</span></div>
+              <div class="target-list"><span class="chip">owner user</span><span class="chip">department</span><span class="chip">manager chain</span></div>
+              <div><select class="select"><option>manual merge</option><option>server wins</option><option>latest signed write</option></select></div>
+            </div>
+            <div class="policy-row">
+              <div><div class="fw-800">contacts.company</div><div class="mono text-xs text-3">SQLite table companies</div></div>
+              <div><span class="chip accent">SQLite</span></div>
+              <div><span class="status-pill ok">sync offline</span></div>
+              <div class="target-list"><span class="chip">org sales</span><span class="chip">crm admins</span></div>
+              <div><select class="select"><option>field merge</option><option>manual merge</option></select></div>
+            </div>
+            <div class="policy-row">
+              <div><div class="fw-800">contacts.preferences</div><div class="mono text-xs text-3">KV namespace contacts/ui</div></div>
+              <div><span class="chip info">KV</span></div>
+              <div><span class="status-pill ok">local user sync</span></div>
+              <div class="target-list"><span class="chip">same user devices</span></div>
+              <div><select class="select"><option>latest local clock</option></select></div>
+            </div>
+            <div class="policy-row">
+              <div><div class="fw-800">attachments</div><div class="mono text-xs text-3">chunked blob</div></div>
+              <div><span class="chip warning">Blob</span></div>
+              <div><span class="status-pill info">on demand</span></div>
+              <div class="target-list"><span class="chip">metadata sync</span><span class="chip">blob fetch on open</span></div>
+              <div><select class="select"><option>immutable hash</option></select></div>
+            </div>
+            <div class="policy-row">
+              <div><div class="fw-800">rag.company_notes</div><div class="mono text-xs text-3">external index</div></div>
+              <div><span class="chip">Remote</span></div>
+              <div><span class="status-pill idle">central only</span></div>
+              <div class="target-list"><span class="chip">server warsaw only</span><span class="chip">no offline copy</span></div>
+              <div><select class="select"><option>no local write</option></select></div>
+            </div>
+          </div>
+        </section>
+
+        <div class="grid-2">
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-users"/></svg>Target rules</div>
+              <button class="btn btn-secondary btn-sm">Edit graph rule</button>
+            </div>
+            <div class="form-row">
+              <label>Owner scope<div class="label-desc">dla rekordów z owner_user_id</div></label>
+              <select class="select"><option>Owner devices + managers in hierarchy</option><option>Owner devices only</option><option>Department only</option></select>
+            </div>
+            <div class="form-row">
+              <label>Manager depth</label>
+              <div class="flex gap-sm"><input class="input" type="number" value="unlimited"><span class="chip success">recursive</span></div>
+            </div>
+            <div class="form-row">
+              <label>Department sharing</label>
+              <div class="toggle-row"><span class="toggle on"></span>Allow department nodes when policy grants department read</div>
+            </div>
+            <div class="form-row">
+              <label>Multi-user devices</label>
+              <select class="select"><option>Sync only currently signed-in user's data</option><option>Sync encrypted per-profile stores</option><option>Block offline cache</option></select>
+            </div>
+          </section>
+
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-clock"/></svg>Snapshots &amp; retention</div>
+              <span class="hint">Default inherits global policy</span>
+            </div>
+            <div class="form-row">
+              <label>SQL snapshot trigger</label>
+              <select class="select"><option>After safe compaction or repair gap</option><option>Every 10k operations</option><option>Manual only</option></select>
+            </div>
+            <div class="form-row">
+              <label>Ledger retention</label>
+              <select class="select"><option>Inherit global: unlimited</option><option>Keep 6 months after safe compaction</option><option>Keep latest snapshot + 30 days</option></select>
+            </div>
+            <div class="form-row">
+              <label>Disk guard</label>
+              <div class="toggle-row"><span class="toggle on"></span>Warn at 10% free, block noncritical blob at critical level</div>
+            </div>
+            <div class="mini-chart mt-md">
+              <span class="good" style="height:20%"></span><span class="good" style="height:24%"></span><span class="good" style="height:30%"></span><span style="height:36%"></span><span style="height:42%"></span><span style="height:45%"></span><span style="height:48%"></span><span style="height:52%"></span><span style="height:54%"></span><span style="height:58%"></span><span class="warn" style="height:65%"></span><span class="warn" style="height:70%"></span><span class="warn" style="height:76%"></span><span class="warn" style="height:80%"></span><span class="warn" style="height:84%"></span><span class="warn" style="height:87%"></span>
+            </div>
+            <div class="text-xs text-3 mt-sm">Projected ledger + blob growth for this addon, 16 weeks.</div>
+          </section>
+        </div>
+
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-shield"/></svg>Dry-run result before save</div>
+            <span class="hint">Shows actual target expansion from current users, roles and groups</span>
+          </div>
+          <div class="grid-3">
+            <div class="decision-card"><strong>person/person-1</strong><div class="target-list"><span class="chip">Anna laptop</span><span class="chip">Anna phone</span><span class="chip">Marek manager</span></div><div class="text-xs text-2 mt-sm">3 target nodes, offline enabled.</div></div>
+            <div class="decision-card"><strong>company/vw-poznan</strong><div class="target-list"><span class="chip">sales dept 8 nodes</span><span class="chip">crm admin 2 nodes</span></div><div class="text-xs text-2 mt-sm">10 target nodes, snapshot allowed.</div></div>
+            <div class="decision-card"><strong>rag.company_notes</strong><div class="target-list"><span class="chip info">server warsaw only</span><span class="chip">read-through</span></div><div class="text-xs text-2 mt-sm">No local cache, no offline writes.</div></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

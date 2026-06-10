@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>CRM — Dashboard zarządu (C7)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css"></head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></symbol>
+<symbol id="i-trend-down" viewBox="0 0 24 24"><polyline points="23 18 13.5 8.5 8.5 13.5 1 6"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/></symbol>
+<symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/></symbol>
+<symbol id="i-warning" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-fire" viewBox="0 0 24 24"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 17c1.7 0 3-1.3 3-3 0-1.4-.7-2.1-1.5-3-1.6-1.6-3-3-3-5 0-2.8 2.2-5 5-5 .5 6 5 8 5 12a8 8 0 1 1-16 0c0-2.2 1.1-4.2 2.7-5.5"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/><rect x="10" y="4" width="4" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18L4.92 10l5.17 1.82L12 17l1.91-5.18L19.08 10l-5.17-1.82L12 3z"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 13.5"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>CRM — Dashboard zarządu (C7)</h1>
+  <p class="lead">
+    <strong>Tomasz Wójcik — Prezes.</strong> Prawda o pieniądzach: pipeline ważony, commit vs best case, marża, forecast, ranking sekcji.
+    <strong>Ten sam silnik widgetów</strong> co u handlowca (C5) i dyrektora (C6) — inne query, inny preset układu, inne uprawnienia.
+    Zarząd nie widzi operacyjnych spraw, ale widzi sumę i kierunek.
+  </p>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">C7</span><h2>Dashboard zarządu — Maj 2026</h2><div class="desc">3 sekcje · 14 handlowców · cel kwartalny 9.6 mln PLN.</div></div>
+<div class="screen-frame"><div class="tf-shell">
+
+<aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-deal"/></svg>CRM<span class="badge danger">7</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av amber">TW</div><div><div class="nm">Tomasz Wójcik</div><div class="rl">Prezes</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+
+<main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>CRM</strong></div>
+  <div class="pill-tabs">
+    <button class="pill-tab active"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-inbox"/></svg>Inbox</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-pipeline"/></svg>Pipeline</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-trend"/></svg>Forecast</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-shield-check"/></svg>Akceptacje</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy</button>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+<div class="page-head"><div class="title">Zarząd <div class="sub">Maj 2026 · 14 handlowców · 3 sekcje</div></div>
+<div class="actions">
+<div class="segmented"><button>Miesiąc</button><button class="active">Kwartał</button><button>Rok</button></div>
+<button class="btn"><svg class="icon"><use href="#i-edit"/></svg>Edytuj widgety</button>
+</div>
+</div>
+
+<div class="kpi-grid">
+  <div class="kpi">
+    <div class="label"><svg class="icon"><use href="#i-target"/></svg>Cel kwartału</div>
+    <div class="value num">8.4 <span class="small">/ 9.6 mln</span></div>
+    <div class="delta up">88% · w drodze do celu</div>
+    <div class="kpi-bar success"></div>
+  </div>
+  <div class="kpi">
+    <div class="label"><svg class="icon"><use href="#i-rocket"/></svg>Commit forecast Q2</div>
+    <div class="value num">10.2 <span class="small">mln</span></div>
+    <div class="delta up">+ 0.6 mln nad cel</div>
+    <div class="kpi-bar crm"></div>
+  </div>
+  <div class="kpi">
+    <div class="label"><svg class="icon"><use href="#i-coin"/></svg>Marża plan</div>
+    <div class="value num">19.4%</div>
+    <div class="delta down">↓ 0.8 pp vs Q1</div>
+    <div class="kpi-bar warning"></div>
+  </div>
+  <div class="kpi">
+    <div class="label"><svg class="icon" style="color:var(--danger)"><use href="#i-warning"/></svg>Ryzyko pieniężne</div>
+    <div class="value num" style="color:var(--danger)">1.6 <span class="small">mln</span></div>
+    <div class="delta warn">5 dealów w red zone</div>
+    <div class="kpi-bar danger"></div>
+  </div>
+</div>
+
+<!-- WATERFALL FORECAST -->
+<div class="section-card">
+  <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-trend"/></svg>Forecast Q2 — waterfall</div><span class="contrib-tag crm">crm</span></div>
+  <div class="bar-chart" style="height:160px;margin-bottom:24px;align-items:flex-end;">
+    <div class="bar" data-label="Plan Q2" style="height:96%;background:var(--info)"></div>
+    <div class="bar commit" data-label="Commit" style="height:102%"></div>
+    <div class="bar" data-label="Best case" style="height:128%"></div>
+    <div class="bar warn" data-label="Risk - " style="height:16%;background:var(--danger)"></div>
+    <div class="bar" data-label="Real Q1" style="height:88%;background:var(--success)"></div>
+    <div class="bar muted" data-label="Real Q4'25" style="height:74%"></div>
+    <div class="bar muted" data-label="Real Q3'25" style="height:69%"></div>
+    <div class="bar muted" data-label="Real Q2'25" style="height:64%"></div>
+  </div>
+  <div class="flex justify-between text-xs text-2 mt-md" style="padding-top:10px;border-top:1px solid var(--border)">
+    <span>Cel: <strong style="color:var(--text)">9.6 mln PLN</strong></span>
+    <span>Commit: <strong style="color:var(--accent-2)">10.2 mln</strong> (106%)</span>
+    <span>Best case: <strong style="color:var(--accent-2)">12.8 mln</strong> (133%)</span>
+    <span>Ryzyko –: <strong style="color:var(--danger)">1.6 mln</strong> (16%)</span>
+  </div>
+</div>
+
+<div class="grid-2 mt-md">
+  <!-- RANKING SEKCJI -->
+  <div class="section-card">
+    <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-users"/></svg>Ranking sekcji</div><span class="contrib-tag crm">crm</span></div>
+    <table class="tf-table">
+      <thead><tr><th>#</th><th>Sekcja</th><th class="num">Real.</th><th class="num">Cel</th><th>%</th><th class="num">Marża</th></tr></thead>
+      <tbody>
+        <tr><td><span class="chip success">1</span></td><td><strong>Centrala</strong> · M. Wiśniewski</td><td class="num fw-700">4.1 mln</td><td class="num">4.4 mln</td><td><span class="chip success">93%</span></td><td class="num">21.2%</td></tr>
+        <tr><td><span class="chip">2</span></td><td><strong>Wschód</strong> · M. Pawlak</td><td class="num fw-700">2.9 mln</td><td class="num">3.6 mln</td><td><span class="chip">81%</span></td><td class="num">18.7%</td></tr>
+        <tr><td><span class="chip warning">3</span></td><td><strong>Zachód</strong> · K. Sokół</td><td class="num fw-700">1.4 mln</td><td class="num">1.6 mln</td><td><span class="chip warning">88%</span></td><td class="num" style="color:var(--warning)">15.8%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- TOP DEALS -->
+  <div class="section-card">
+    <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-deal"/></svg>Top 5 dealów w org</div><span class="contrib-tag crm">crm</span></div>
+    <table class="tf-table">
+      <thead><tr><th>Deal</th><th>Owner</th><th class="num">Wartość</th><th>Faza</th></tr></thead>
+      <tbody>
+        <tr><td><strong>PKO BP · backup OPS</strong></td><td>R. Trzaska</td><td class="num fw-700">920k</td><td><span class="stage commit"><span></span>Commit</span></td></tr>
+        <tr><td><strong>Polsat · CRM call</strong></td><td>P. Łapa</td><td class="num fw-700">680k</td><td><span class="stage commit"><span></span>Commit</span></td></tr>
+        <tr><td><strong>Polskie LNG · katalog</strong></td><td>J. Niedzielski</td><td class="num fw-700">680k</td><td><span class="stage commit" style="opacity:0.6"><span></span>Commit (stale)</span></td></tr>
+        <tr><td><strong>Santander · prezent.</strong></td><td>A. Kowalska</td><td class="num fw-700">520k</td><td><span class="stage offer"><span></span>Oferta</span></td></tr>
+        <tr><td><strong>VW Poznań · ERP</strong></td><td>A. Kowalska</td><td class="num fw-700">480k</td><td><span class="stage offer"><span></span>Oferta</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid-2 mt-md">
+  <!-- RYZYKO -->
+  <div class="section-card">
+    <div class="section-card-head"><div class="title"><svg class="icon" style="color:var(--danger)"><use href="#i-fire"/></svg>Deale w red zone — 5</div><span class="contrib-tag crm">crm · ai</span></div>
+    <div class="flex col gap-sm">
+      <div style="padding:10px;border-left:3px solid var(--danger);background:rgba(239,68,68,0.04);border-radius:0 6px 6px 0;"><div class="fw-700 text-sm">Polskie LNG · katalog — 680k</div><div class="text-xs text-3">commit od 17 dni, brak aktywności, J. Niedzielski</div></div>
+      <div style="padding:10px;border-left:3px solid var(--danger);background:rgba(239,68,68,0.04);border-radius:0 6px 6px 0;"><div class="fw-700 text-sm">PKO BP · backup OPS — 920k</div><div class="text-xs text-3">CTO nie odbiera, ostatnia akt. 8 dni</div></div>
+      <div style="padding:10px;border-left:3px solid var(--warning);background:rgba(245,158,11,0.04);border-radius:0 6px 6px 0;"><div class="fw-700 text-sm">PKO BP · platforma wn. — 340k</div><div class="text-xs text-3">14 dni cisza, brak otwarcia oferty</div></div>
+      <div style="padding:10px;border-left:3px solid var(--warning);background:rgba(245,158,11,0.04);border-radius:0 6px 6px 0;"><div class="fw-700 text-sm">VW Poznań · ERP — 480k</div><div class="text-xs text-3">marża spadła 22→18%, ryzyko Comarch</div></div>
+      <div style="padding:10px;border-left:3px solid var(--warning);background:rgba(245,158,11,0.04);border-radius:0 6px 6px 0;"><div class="fw-700 text-sm">mBank · CBA — 120k</div><div class="text-xs text-3">commit, 9 dni cisza</div></div>
+    </div>
+  </div>
+
+  <!-- MARGIN TREND -->
+  <div class="section-card">
+    <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-coin"/></svg>Marża — 6 miesięcy</div><span class="contrib-tag billing">billing</span></div>
+    <div class="bar-chart" style="height:120px;margin-bottom:24px;">
+      <div class="bar muted" data-label="Gru" style="height:78%"></div>
+      <div class="bar muted" data-label="Sty" style="height:82%"></div>
+      <div class="bar" data-label="Lut" style="height:91%"></div>
+      <div class="bar" data-label="Mar" style="height:84%"></div>
+      <div class="bar warn" data-label="Kwi" style="height:79%"></div>
+      <div class="bar warn" data-label="Maj" style="height:74%"></div>
+    </div>
+    <div class="text-xs text-2 mt-md" style="padding-top:10px;border-top:1px solid var(--border);">
+      Marża plan: <strong>19.4%</strong> (vs 22.1% w lutym) — <span style="color:var(--warning)">spadek 2.7 pp w 3 mc.</span> Główny powód: rabaty cenowe na 2 dealach &gt; 500k.
+    </div>
+  </div>
+</div>
+
+<!-- BOARD ATTENTION -->
+<div class="section-card mt-md" style="border-left:3px solid var(--accent-2);">
+  <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-sparkles"/></svg>AI · co warto omówić na zarządzie</div><span class="contrib-tag crm">crm · ai</span></div>
+  <div class="flex col gap-sm" style="font-size:13px;">
+    <div>· Spadek marży o 2.7 pp w Q2 — 2 deale z dużym rabatem (PKO BP backup 920k, Polsat 680k). <strong style="color:var(--warning)">Polityka cenowa do dyskusji.</strong></div>
+    <div>· Jakub Niedzielski (sekcja Wschód) — pipeline pusty, realizacja 55% celu, 2 commit'y nadal stale. <strong style="color:var(--warning)">Wymagana rozmowa z Markiem Pawlakiem.</strong></div>
+    <div>· Sekcja Zachód: dobre tempo, ale marża najniższa (15.8%). Możliwy konflikt z Centralą na podobnych dealach. <strong>Sprawdzić.</strong></div>
+    <div>· Top deal kwartału (PKO BP backup OPS 920k) — CTO nie odbiera 8 dni. <strong style="color:var(--danger)">Eskalacja do Prezesa zalecana.</strong></div>
+  </div>
+</div>
+
+</main></div></div>
+</section>
+
+</body>
+</html>

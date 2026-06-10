@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>Contacts — mapa relacji (K4)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css"></head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/></symbol>
+<symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16"/></symbol>
+<symbol id="i-phone" viewBox="0 0 24 24"><path d="M22 16.92v3"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 13.5"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20l3-2 3 2 3-2 3 2 3-2 1 2V2l-3 2-3-2-3 2-3-2-3 2-1-2z"/><path d="M16 8H8"/><path d="M16 12H8"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9 14a2 2 0 0 0 2 2h2a2 2 0 0 0 0-4h-2a2 2 0 0 1 0-4h2a2 2 0 0 1 2 2"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/><rect x="10" y="4" width="4" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>Contacts — Mapa relacji (K4)</h1>
+  <p class="lead">
+    Single-context widok dla account-based selling. Pokazuje graf osób w firmie + kto z kim się komunikuje + decydenci/influencerzy/użytkownicy/blokerzy.
+    Dane: relacje raportowania (z LinkedIn / strukturalnie zadeklarowane) + częstotliwość interakcji (z addonu activity + email). Spatial canvas tu ma sens — bo jest to <em>celowy</em> widok, nie codzienny.
+  </p>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">K4</span><h2>Mapa relacji — Volkswagen Poznań (deal: ERP fleet)</h2><div class="desc">12 zidentyfikowanych osób · 1 decydent · 4 influencerzy · 2 blokerzy.</div></div>
+<div class="screen-frame">
+<div class="tf-shell">
+
+<aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-deal"/></svg>CRM</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av indigo">AK</div><div><div class="nm">Anna Kowalska</div><div class="rl">Handlowiec · Wschód</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+
+<main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>Contacts</strong><span class="sep">›</span><span>VW Poznań</span></div>
+  <div class="pill-tabs">
+    <button class="pill-tab"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-building"/></svg>Firmy</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-users"/></svg>Osoby</button>
+    <button class="pill-tab active"><svg class="icon"><use href="#i-network"/></svg>Mapy relacji</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-star"/></svg>Smart lists</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy</button>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+
+<div class="page-head">
+<div class="title">Mapa relacji — VW Poznań<div class="sub">Account based selling · deal ERP fleet (480k)</div></div>
+<div class="actions">
+  <div class="segmented"><button class="active">Hierarchia</button><button>Komunikacja</button><button>Wpływ</button></div>
+</div>
+</div>
+
+<!-- Map area -->
+<div style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);padding:24px;position:relative;min-height:540px;overflow:hidden;">
+
+  <!-- Legend -->
+  <div style="position:absolute;top:12px;right:12px;background:var(--bg-3);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:11px;color:var(--text-2);display:flex;flex-direction:column;gap:4px;z-index:10;">
+    <div class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:50%;background:var(--success);box-shadow:0 0 6px var(--success)"></span>Decydent</div>
+    <div class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 6px var(--accent-2)"></span>Influencer</div>
+    <div class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:50%;background:var(--info)"></span>User</div>
+    <div class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:50%;background:var(--danger)"></span>Bloker</div>
+    <div class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:50%;background:var(--text-3)"></span>Nieznana rola</div>
+  </div>
+
+  <!-- SVG graph -->
+  <svg viewBox="0 0 900 500" style="width:100%;height:480px;">
+    <!-- relations lines -->
+    <line x1="450" y1="80" x2="450" y2="170" stroke="#3a4070" stroke-width="2"/>
+    <line x1="450" y1="200" x2="200" y2="320" stroke="#3a4070" stroke-width="1.5"/>
+    <line x1="450" y1="200" x2="450" y2="320" stroke="#a78bfa" stroke-width="2.5"/>
+    <line x1="450" y1="200" x2="700" y2="320" stroke="#3a4070" stroke-width="1.5"/>
+    <line x1="200" y1="350" x2="120" y2="450" stroke="#3a4070" stroke-width="1"/>
+    <line x1="200" y1="350" x2="280" y2="450" stroke="#3a4070" stroke-width="1"/>
+    <line x1="450" y1="350" x2="380" y2="450" stroke="#3a4070" stroke-width="1"/>
+    <line x1="450" y1="350" x2="520" y2="450" stroke="#3a4070" stroke-width="1"/>
+    <line x1="700" y1="350" x2="640" y2="450" stroke="#3a4070" stroke-width="1"/>
+    <line x1="700" y1="350" x2="780" y2="450" stroke="#3a4070" stroke-width="1"/>
+
+    <!-- CEO -->
+    <g>
+      <circle cx="450" cy="50" r="32" fill="#0a0d24" stroke="#3a4070" stroke-width="2"/>
+      <text x="450" y="55" text-anchor="middle" fill="#a0a8c8" font-size="11" font-weight="800" font-family="Manrope">CEO</text>
+      <text x="450" y="20" text-anchor="middle" fill="#a0a8c8" font-size="10" font-family="Manrope">Tomasz Adamski</text>
+    </g>
+
+    <!-- CIO (decydent) -->
+    <g>
+      <circle cx="450" cy="200" r="40" fill="#0a0d24" stroke="#22c55e" stroke-width="3" filter="drop-shadow(0 0 12px rgba(34,197,94,0.4))"/>
+      <text x="450" y="205" text-anchor="middle" fill="#22c55e" font-size="12" font-weight="800" font-family="Manrope">MW</text>
+      <text x="450" y="160" text-anchor="middle" fill="#e8ebf5" font-size="11" font-weight="700" font-family="Manrope">Magda Wiśniewska</text>
+      <text x="450" y="173" text-anchor="middle" fill="#a0a8c8" font-size="10" font-family="Manrope">CIO · DECYDENT</text>
+    </g>
+
+    <!-- Mid managers -->
+    <g>
+      <circle cx="200" cy="320" r="32" fill="#0a0d24" stroke="#a78bfa" stroke-width="2.5"/>
+      <text x="200" y="325" text-anchor="middle" fill="#a78bfa" font-size="11" font-weight="800" font-family="Manrope">PL</text>
+      <text x="200" y="285" text-anchor="middle" fill="#e8ebf5" font-size="11" font-weight="700" font-family="Manrope">Piotr Lewandowski</text>
+      <text x="200" y="298" text-anchor="middle" fill="#a0a8c8" font-size="10" font-family="Manrope">Dyr. IT</text>
+    </g>
+
+    <g>
+      <circle cx="450" cy="320" r="32" fill="#0a0d24" stroke="#a78bfa" stroke-width="2.5"/>
+      <text x="450" y="325" text-anchor="middle" fill="#a78bfa" font-size="11" font-weight="800" font-family="Manrope">KB</text>
+      <text x="450" y="285" text-anchor="middle" fill="#e8ebf5" font-size="11" font-weight="700" font-family="Manrope">Konrad Borek</text>
+      <text x="450" y="298" text-anchor="middle" fill="#a0a8c8" font-size="10" font-family="Manrope">Fleet Manager</text>
+    </g>
+
+    <g>
+      <circle cx="700" cy="320" r="32" fill="#0a0d24" stroke="#ef4444" stroke-width="2.5"/>
+      <text x="700" y="325" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="800" font-family="Manrope">MK</text>
+      <text x="700" y="285" text-anchor="middle" fill="#e8ebf5" font-size="11" font-weight="700" font-family="Manrope">Marcin Kowalski</text>
+      <text x="700" y="298" text-anchor="middle" fill="#ef4444" font-size="10" font-family="Manrope">CFO · BLOKER (budżet)</text>
+    </g>
+
+    <!-- Users -->
+    <g>
+      <circle cx="120" cy="450" r="24" fill="#0a0d24" stroke="#60a5fa" stroke-width="2"/>
+      <text x="120" y="455" text-anchor="middle" fill="#60a5fa" font-size="10" font-weight="800" font-family="Manrope">JK</text>
+      <text x="120" y="490" text-anchor="middle" fill="#a0a8c8" font-size="9" font-family="Manrope">J. Kos · user</text>
+    </g>
+    <g>
+      <circle cx="280" cy="450" r="24" fill="#0a0d24" stroke="#60a5fa" stroke-width="2"/>
+      <text x="280" y="455" text-anchor="middle" fill="#60a5fa" font-size="10" font-weight="800" font-family="Manrope">AM</text>
+      <text x="280" y="490" text-anchor="middle" fill="#a0a8c8" font-size="9" font-family="Manrope">A. Misiak · user</text>
+    </g>
+    <g>
+      <circle cx="380" cy="450" r="24" fill="#0a0d24" stroke="#60a5fa" stroke-width="2"/>
+      <text x="380" y="455" text-anchor="middle" fill="#60a5fa" font-size="10" font-weight="800" font-family="Manrope">PT</text>
+      <text x="380" y="490" text-anchor="middle" fill="#a0a8c8" font-size="9" font-family="Manrope">P. Tracz · user</text>
+    </g>
+    <g>
+      <circle cx="520" cy="450" r="24" fill="#0a0d24" stroke="#60a5fa" stroke-width="2"/>
+      <text x="520" y="455" text-anchor="middle" fill="#60a5fa" font-size="10" font-weight="800" font-family="Manrope">RM</text>
+      <text x="520" y="490" text-anchor="middle" fill="#a0a8c8" font-size="9" font-family="Manrope">R. Mróz · user</text>
+    </g>
+    <g>
+      <circle cx="640" cy="450" r="24" fill="#0a0d24" stroke="#ef4444" stroke-width="2"/>
+      <text x="640" y="455" text-anchor="middle" fill="#ef4444" font-size="10" font-weight="800" font-family="Manrope">DK</text>
+      <text x="640" y="490" text-anchor="middle" fill="#a0a8c8" font-size="9" font-family="Manrope">D. Krawczyk · risk</text>
+    </g>
+    <g>
+      <circle cx="780" cy="450" r="24" fill="#0a0d24" stroke="#6a7196" stroke-width="2"/>
+      <text x="780" y="455" text-anchor="middle" fill="#6a7196" font-size="10" font-weight="800" font-family="Manrope">??</text>
+      <text x="780" y="490" text-anchor="middle" fill="#a0a8c8" font-size="9" font-family="Manrope">+ 2 nieznane</text>
+    </g>
+  </svg>
+</div>
+
+<!-- AI insights -->
+<div class="grid-2 mt-md">
+  <div class="section-card" style="background:linear-gradient(135deg,rgba(167,139,250,0.06),rgba(99,102,241,0.04));border-color:rgba(167,139,250,0.25);">
+    <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-sparkles"/></svg>AI · sieć decyzyjna</div><span class="contrib-tag contacts">contacts · ai</span></div>
+    <div class="flex col gap-sm text-sm" style="line-height:1.6;">
+      <div>· <strong>Magda (CIO)</strong> ma 5 z 8 zidentyfikowanych ścieżek decyzyjnych. Klucz tego deala.</div>
+      <div>· <strong>Marcin Kowalski (CFO)</strong> — <span style="color:var(--danger)">bloker budżetu</span>. Bez jego OK nic się nie ruszy mimo zgody Magdy.</div>
+      <div>· <strong>Konrad Borek (Fleet)</strong> — operator wymagań technicznych. Jego wkład zwiększy sukces wdrożenia.</div>
+      <div>· <strong>Brak kontaktu z 2 osobami</strong> w grupie — możliwe że istnieją jeszcze stakeholderzy.</div>
+    </div>
+  </div>
+
+  <div class="section-card">
+    <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-info"/></svg>Sugerowane działania</div></div>
+    <div class="flex col gap-sm">
+      <div style="padding:10px;background:var(--bg-3);border-radius:6px;border-left:2px solid var(--success);"><div class="fw-700 text-sm">Spotkanie z Marcinem Kowalskim (CFO)</div><div class="text-xs text-2 mt-sm">Bez jego akceptacji budżetu deal nie pójdzie. Magda może załatwić termin.</div><button class="btn btn-sm" style="margin-top:6px"><svg class="icon"><use href="#i-mail"/></svg>Poproś Magdę o intro</button></div>
+      <div style="padding:10px;background:var(--bg-3);border-radius:6px;border-left:2px solid var(--accent-2);"><div class="fw-700 text-sm">Demo dla Konrada (Fleet)</div><div class="text-xs text-2 mt-sm">Operacyjny user — buy-in zwiększa szanse wdrożenia bez sabotażu.</div></div>
+    </div>
+  </div>
+</div>
+
+</main>
+</div></div>
+</section>
+
+</body>
+</html>

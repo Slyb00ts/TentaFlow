@@ -1,0 +1,1586 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Addons (WASM) — pełny mockup docelowy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --shadow-sm: 0 2px 6px rgba(0,0,0,0.4);
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+  --shadow-lg: 0 16px 48px rgba(0,0,0,0.7);
+  --glow-indigo: 0 0 30px rgba(99, 102, 241, 0.3);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+img { display: block; }
+.icon { width: 16px; height: 16px; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; fill: none; flex-shrink: 0; }
+.icon-lg { width: 20px; height: 20px; }
+.icon-xl { width: 24px; height: 24px; }
+.icon-sm { width: 13px; height: 13px; }
+
+/* Top intro */
+.intro {
+  max-width: 1440px; margin: 36px auto 0; padding: 0 24px;
+}
+.intro h1 {
+  font-size: 26px; font-weight: 800; margin-bottom: 6px;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.intro .lead { color: var(--text-2); max-width: 860px; font-size: 14px; line-height: 1.7; }
+.intro .rules {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 18px;
+}
+.intro .rule {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.intro .rule h3 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent-2);
+  margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+}
+.intro .rule p { font-size: 12.5px; color: var(--text-2); line-height: 1.6; }
+
+/* Screen */
+.screen { max-width: 1440px; margin: 40px auto; padding: 0 24px; }
+.screen-header {
+  display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px;
+  padding: 14px 18px; background: var(--bg-2); border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+.screen-header .num {
+  background: var(--gradient-accent); color: white; font-weight: 800; font-size: 12px;
+  padding: 4px 10px; border-radius: 20px;
+}
+.screen-header h2 { font-size: 18px; font-weight: 700; }
+.screen-header .desc { color: var(--text-2); font-size: 12.5px; margin-left: auto; text-align: right; max-width: 60%; }
+.screen-frame {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  overflow: hidden; box-shadow: var(--shadow-lg);
+}
+
+/* App shell */
+.app { display: grid; grid-template-columns: 240px 1fr; min-height: 780px; }
+.sidebar {
+  background: var(--bg-2); border-right: 1px solid var(--border);
+  padding: 18px 0 12px; display: flex; flex-direction: column; overflow-y: auto;
+}
+.sidebar .logo { display: flex; align-items: center; gap: 10px; padding: 0 20px 18px; }
+.sidebar .logo .name {
+  font-weight: 800; font-size: 16px;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.nav-section { padding: 0 12px; margin-bottom: 12px; }
+.nav-section .heading {
+  color: var(--accent-2); font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.12em; padding: 8px 10px 4px; display: flex; align-items: center; gap: 8px;
+}
+.nav-section .heading .icon { width: 13px; height: 13px; color: var(--accent-1); }
+.nav-item {
+  display: flex; align-items: center; gap: 10px; padding: 7px 10px;
+  font-size: 12.5px; color: var(--text-2); border-radius: var(--radius-sm);
+  cursor: pointer; transition: all 0.12s; margin-bottom: 1px;
+  border-left: 3px solid transparent; padding-left: 7px;
+}
+.nav-item:hover { background: var(--bg-3); color: var(--text); }
+.nav-item.active { background: var(--accent-glow); color: var(--text); border-left-color: var(--accent-1); }
+.nav-item.active .icon { color: var(--accent-1); }
+.nav-item .badge {
+  margin-left: auto; font-size: 10px; font-weight: 700;
+  padding: 1px 6px; border-radius: 8px; background: var(--accent-glow); color: var(--accent-2);
+}
+.sidebar .footer { margin-top: auto; padding: 12px 12px 0; border-top: 1px solid var(--border); }
+.user-chip { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--radius-sm); }
+.user-chip .avatar {
+  width: 30px; height: 30px; border-radius: 50%; background: var(--gradient-accent);
+  display: flex; align-items: center; justify-content: center; font-weight: 700; color: white; font-size: 11px;
+}
+.user-chip .name-t { font-size: 12px; font-weight: 700; }
+.user-chip .role { font-size: 10px; color: var(--text-3); }
+
+/* Main */
+.main { padding: 22px 26px; overflow-y: auto; }
+.page-header { display: flex; align-items: center; margin-bottom: 20px; gap: 12px; }
+.page-header h1 { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 10px; }
+.page-header .sub { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+.page-header .actions { margin-left: auto; display: flex; gap: 8px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px;
+  border-radius: var(--radius-sm); font-weight: 600; font-size: 12.5px;
+  cursor: pointer; border: 1px solid transparent; transition: all 0.12s;
+}
+.btn-primary { background: var(--gradient-accent); color: white; }
+.btn-primary:hover { box-shadow: var(--glow-indigo); }
+.btn-secondary { background: var(--bg-3); color: var(--text-2); border-color: var(--border); }
+.btn-secondary:hover { color: var(--text); border-color: var(--border-hover); }
+.btn-danger { background: rgba(239,68,68,0.1); color: var(--danger); border-color: rgba(239,68,68,0.3); }
+.btn-ghost { background: transparent; color: var(--text-2); }
+.btn-ghost:hover { color: var(--text); background: var(--bg-3); }
+.btn-sm { padding: 4px 9px; font-size: 11px; }
+
+/* Breadcrumb */
+.breadcrumb { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-3); margin-bottom: 12px; }
+.breadcrumb .crumb { color: var(--text-2); }
+.breadcrumb .crumb.active { color: var(--text); font-weight: 600; }
+.breadcrumb .sep { opacity: 0.5; }
+
+/* Addon cards grid */
+.addons-toolbar {
+  display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap;
+}
+.search-box {
+  flex: 1; min-width: 240px;
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 7px 10px; display: flex; gap: 8px; align-items: center;
+  font-size: 12.5px; color: var(--text-2);
+}
+.search-box input { background: transparent; border: none; outline: none; color: var(--text); flex: 1; font-size: 12.5px; }
+.filter-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px;
+  border-radius: 14px; background: var(--bg-3); color: var(--text-2);
+  font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid var(--border);
+}
+.filter-chip.active { background: var(--accent-glow); color: var(--accent-2); border-color: var(--accent-1); }
+
+.addon-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px;
+}
+.addon-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px; cursor: pointer; transition: all 0.15s; position: relative;
+}
+.addon-card:hover { background: var(--bg-card-hover); border-color: var(--border-hover); }
+.addon-card.disabled { opacity: 0.55; }
+.addon-card.selected { border-color: var(--accent-1); box-shadow: var(--glow-indigo); }
+.addon-head { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 8px; }
+.addon-ico {
+  width: 40px; height: 40px; border-radius: var(--radius-sm);
+  background: var(--gradient-accent); display: flex; align-items: center; justify-content: center;
+  color: white; flex-shrink: 0;
+}
+.addon-meta { flex: 1; min-width: 0; }
+.a-name { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 6px; }
+.a-version { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.a-desc { font-size: 12px; color: var(--text-2); line-height: 1.5; margin: 6px 0 10px; min-height: 34px; }
+.a-badges { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 10px; }
+.badge-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 7px; border-radius: 10px; font-size: 10px; font-weight: 600;
+  background: var(--bg-3); color: var(--text-2); border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.badge-pill .icon { width: 10px; height: 10px; stroke-width: 2.2; }
+.badge-pill.runtime { background: rgba(96,165,250,0.12); color: var(--info); border-color: rgba(96,165,250,0.3); }
+.badge-pill.oauth-global { background: rgba(34,197,94,0.12); color: var(--success); border-color: rgba(34,197,94,0.3); }
+.badge-pill.oauth-individual { background: rgba(167,139,250,0.15); color: var(--accent-2); border-color: rgba(167,139,250,0.35); }
+.badge-pill.oauth-none { background: var(--bg-3); color: var(--text-3); }
+.badge-pill.visibility { background: rgba(245,158,11,0.12); color: var(--warning); border-color: rgba(245,158,11,0.3); }
+.badge-pill.perms { background: rgba(99,102,241,0.1); color: var(--accent-2); border-color: rgba(99,102,241,0.25); }
+.a-foot {
+  display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-3);
+  padding-top: 10px; border-top: 1px solid var(--border);
+}
+.a-status { font-weight: 700; }
+.a-status.on { color: var(--success); }
+.a-status.off { color: var(--text-3); }
+
+/* Toggle */
+.toggle {
+  width: 34px; height: 18px; background: var(--bg-3); border-radius: 10px; position: relative;
+  cursor: pointer; border: 1px solid var(--border); transition: all 0.2s; margin-left: auto;
+}
+.toggle::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 12px; height: 12px; border-radius: 50%; background: var(--text-3); transition: all 0.2s;
+}
+.toggle.on { background: var(--accent-1); border-color: var(--accent-1); }
+.toggle.on::after { left: 18px; background: white; }
+.toggle-sm { width: 28px; height: 15px; }
+.toggle-sm::after { width: 9px; height: 9px; }
+.toggle-sm.on::after { left: 14px; }
+
+/* Detail panel layout */
+.detail-layout {
+  display: grid; grid-template-columns: 1fr; gap: 0;
+}
+.detail-header {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 20px; margin-bottom: 16px; display: flex; gap: 18px; align-items: center;
+}
+.detail-header .big-ico {
+  width: 60px; height: 60px; border-radius: var(--radius);
+  background: var(--gradient-accent); display: flex; align-items: center; justify-content: center; color: white;
+}
+.detail-header .d-meta { flex: 1; }
+.detail-header .d-name { font-size: 20px; font-weight: 800; }
+.detail-header .d-sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+.detail-header .d-badges { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.detail-header .d-actions { display: flex; gap: 8px; align-items: center; }
+
+/* Tabs */
+.tabs-bar {
+  display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 20px;
+  padding: 0 2px;
+}
+.tab {
+  padding: 10px 16px; font-size: 13px; font-weight: 600; color: var(--text-3);
+  cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s;
+  display: flex; align-items: center; gap: 7px;
+}
+.tab:hover { color: var(--text-2); }
+.tab.active { color: var(--text); border-bottom-color: var(--accent-1); }
+.tab .count {
+  font-size: 10px; background: var(--bg-3); padding: 1px 6px; border-radius: 8px; color: var(--text-2);
+}
+.tab.active .count { background: var(--accent-glow); color: var(--accent-2); }
+
+/* Section card */
+.section-card {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 20px; margin-bottom: 16px;
+}
+.section-card h3 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent-2);
+  margin-bottom: 12px; font-weight: 700; display: flex; align-items: center; gap: 8px;
+}
+.section-card .section-sub { font-size: 12px; color: var(--text-3); margin-bottom: 14px; }
+
+/* Permission matrix */
+.perm-matrix {
+  width: 100%; border-collapse: separate; border-spacing: 0;
+  background: var(--bg-input); border-radius: var(--radius); overflow: hidden;
+  border: 1px solid var(--border);
+}
+.perm-matrix th, .perm-matrix td {
+  padding: 11px 13px; font-size: 12px; text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.perm-matrix th {
+  background: var(--bg-3); color: var(--text-2); font-weight: 700;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+  position: sticky; top: 0;
+}
+.perm-matrix th.func { text-align: center; min-width: 90px; }
+.perm-matrix td { color: var(--text-2); }
+.perm-matrix tr:last-child td { border-bottom: none; }
+.perm-matrix tr:hover td { background: var(--bg-3); }
+.perm-matrix td.func { text-align: center; }
+.perm-matrix .group-name { font-weight: 700; color: var(--text); }
+.perm-matrix .group-meta { font-size: 10px; color: var(--text-3); margin-top: 2px; }
+
+/* Permission dot buttons */
+.perm-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--bg-3); border: 1px solid var(--border);
+  cursor: pointer; transition: all 0.15s; color: var(--text-3);
+}
+.perm-btn:hover { border-color: var(--border-hover); }
+.perm-btn.allow { background: rgba(34,197,94,0.15); border-color: var(--success); color: var(--success); }
+.perm-btn.deny { background: rgba(239,68,68,0.15); border-color: var(--danger); color: var(--danger); }
+.perm-btn.inherit { background: transparent; color: var(--text-3); border-style: dashed; }
+.perm-btn .icon { width: 12px; height: 12px; stroke-width: 2.5; }
+
+/* Legend row */
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 11px; color: var(--text-3); margin-top: 12px; }
+.legend .li { display: flex; align-items: center; gap: 6px; }
+.legend .dot { width: 10px; height: 10px; border-radius: 50%; }
+.legend .dot.allow { background: var(--success); }
+.legend .dot.deny { background: var(--danger); }
+.legend .dot.inherit { background: transparent; border: 1px dashed var(--text-3); }
+
+/* Groups visibility panel */
+.group-row {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  margin-bottom: 6px;
+}
+.group-row .g-ico {
+  width: 30px; height: 30px; border-radius: var(--radius-sm);
+  background: var(--bg-3); display: flex; align-items: center; justify-content: center; color: var(--accent-2);
+}
+.group-row .g-info { flex: 1; }
+.group-row .g-name { font-weight: 600; font-size: 13px; }
+.group-row .g-meta { font-size: 11px; color: var(--text-3); }
+.group-row.selected { border-color: var(--accent-1); background: var(--accent-glow); }
+
+/* OAuth mode selector */
+.oauth-mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 18px; }
+.oauth-mode-card {
+  background: var(--bg-input); border: 2px solid var(--border); border-radius: var(--radius);
+  padding: 18px; cursor: pointer; transition: all 0.2s;
+}
+.oauth-mode-card:hover { border-color: var(--border-hover); }
+.oauth-mode-card.active { border-color: var(--accent-1); background: var(--accent-glow); }
+.oauth-mode-card .mode-icon {
+  width: 40px; height: 40px; border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center; margin-bottom: 10px;
+}
+.oauth-mode-card.global .mode-icon { background: rgba(34,197,94,0.15); color: var(--success); }
+.oauth-mode-card.individual .mode-icon { background: rgba(167,139,250,0.2); color: var(--accent-2); }
+.oauth-mode-card h4 { font-size: 14px; font-weight: 700; margin-bottom: 4px; display: flex; align-items: center; gap: 7px; }
+.oauth-mode-card p { font-size: 12px; color: var(--text-2); line-height: 1.55; }
+.oauth-mode-card .mode-radio {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid var(--border); float: right; margin-top: -30px; position: relative;
+}
+.oauth-mode-card.active .mode-radio { border-color: var(--accent-1); }
+.oauth-mode-card.active .mode-radio::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 8px; height: 8px; border-radius: 50%; background: var(--accent-1);
+}
+
+/* Form */
+.form-row { display: grid; grid-template-columns: 220px 1fr; gap: 16px; align-items: flex-start; margin-bottom: 12px; }
+.form-row label { font-size: 12px; color: var(--text-2); padding-top: 7px; font-weight: 600; }
+.form-row .label-desc { font-size: 10.5px; color: var(--text-3); font-weight: 400; margin-top: 2px; }
+.input, .select, .textarea {
+  width: 100%; background: var(--bg-input); border: 1px solid var(--border); color: var(--text);
+  padding: 7px 10px; border-radius: var(--radius-sm); font-size: 12.5px;
+  font-family: inherit;
+}
+.input:focus, .select:focus { outline: none; border-color: var(--accent-1); }
+.input.mono { font-family: ui-monospace, 'SF Mono', monospace; font-size: 11.5px; }
+
+/* Status pill */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 700;
+}
+.status-pill.ok { background: rgba(34,197,94,0.15); color: var(--success); }
+.status-pill.warn { background: rgba(245,158,11,0.15); color: var(--warning); }
+.status-pill.err { background: rgba(239,68,68,0.15); color: var(--danger); }
+.status-pill.info { background: rgba(96,165,250,0.15); color: var(--info); }
+
+/* Linked accounts table */
+.accounts-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.accounts-table th, .accounts-table td {
+  padding: 10px 12px; font-size: 12px; text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.accounts-table th {
+  background: var(--bg-3); color: var(--text-2); font-weight: 700;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+}
+.accounts-table tr:hover td { background: var(--bg-3); }
+.accounts-table .account-cell { display: flex; align-items: center; gap: 10px; }
+.accounts-table .account-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-3); display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; color: var(--accent-2);
+}
+
+/* End-user view — app card grid */
+.myapps-grid {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px;
+}
+.myapp-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.myapp-head { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 10px; }
+.myapp-head .myapp-ico {
+  width: 44px; height: 44px; border-radius: var(--radius-sm);
+  background: var(--gradient-accent); display: flex; align-items: center; justify-content: center; color: white;
+}
+.myapp-head .myapp-name { font-size: 14px; font-weight: 700; }
+.myapp-head .myapp-desc { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+.myapp-linked {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px; display: flex; align-items: center; gap: 10px; margin-top: 10px;
+}
+.myapp-linked .linked-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--gradient-accent); display: flex; align-items: center; justify-content: center;
+  color: white; font-size: 11px; font-weight: 700;
+}
+.myapp-linked .linked-info { flex: 1; }
+.myapp-linked .linked-email { font-size: 12px; font-weight: 600; color: var(--text); }
+.myapp-linked .linked-meta { font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
+.myapp-unlinked {
+  background: var(--bg-input); border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  padding: 12px; text-align: center;
+}
+.myapp-unlinked .muted { font-size: 11.5px; color: var(--text-3); margin-bottom: 8px; }
+
+/* OAuth consent modal (inline visual) */
+.consent-modal {
+  max-width: 520px; margin: 0 auto;
+  background: #ffffff; color: #1a1a1a; border-radius: 12px; overflow: hidden;
+  box-shadow: 0 30px 80px rgba(0,0,0,0.6); border: 1px solid rgba(0,0,0,0.1);
+}
+.consent-header {
+  background: #f5f5f7; padding: 18px 22px; border-bottom: 1px solid #e5e5ea;
+  display: flex; align-items: center; gap: 12px;
+}
+.consent-header .ms-logo {
+  width: 32px; height: 32px; border-radius: 6px;
+  background: linear-gradient(135deg, #0078d4, #50e6ff);
+  display: flex; align-items: center; justify-content: center; color: white; font-weight: 800; font-size: 11px;
+}
+.consent-header .ms-brand { font-size: 13px; font-weight: 700; color: #1a1a1a; }
+.consent-header .ms-sub { font-size: 11px; color: #6b6b6b; margin-top: 2px; }
+.consent-body { padding: 22px; }
+.consent-body h4 { font-size: 16px; font-weight: 700; margin-bottom: 14px; color: #1a1a1a; }
+.consent-scopes { list-style: none; padding: 0; }
+.consent-scopes li {
+  padding: 8px 0; font-size: 12.5px; color: #1a1a1a; border-bottom: 1px solid #e5e5ea;
+  display: flex; align-items: flex-start; gap: 10px;
+}
+.consent-scopes li:last-child { border: none; }
+.consent-scopes li::before {
+  content: '✓'; color: #0078d4; font-weight: 800; flex-shrink: 0;
+}
+.consent-footer {
+  padding: 16px 22px; background: #f5f5f7; border-top: 1px solid #e5e5ea;
+  display: flex; gap: 10px; justify-content: flex-end;
+}
+.consent-btn {
+  padding: 8px 16px; font-size: 12.5px; font-weight: 600;
+  border-radius: 4px; border: none; cursor: pointer;
+}
+.consent-btn.primary { background: #0078d4; color: white; }
+.consent-btn.secondary { background: white; color: #1a1a1a; border: 1px solid #c6c6c8; }
+
+/* Alert banner */
+.alert {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 12px 14px; border-radius: var(--radius-sm);
+  font-size: 12.5px; margin-bottom: 16px;
+}
+.alert .icon { margin-top: 2px; flex-shrink: 0; }
+.alert.info { background: rgba(96,165,250,0.1); border: 1px solid rgba(96,165,250,0.3); color: var(--info); }
+.alert.warn { background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); color: var(--warning); }
+.alert.success { background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.3); color: var(--success); }
+.alert strong { font-weight: 700; }
+
+/* Sub tabs */
+.subtabs {
+  display: flex; gap: 6px; background: var(--bg-3); padding: 4px; border-radius: var(--radius-sm);
+  width: fit-content; margin-bottom: 16px;
+}
+.subtab {
+  padding: 6px 12px; font-size: 11.5px; font-weight: 600; color: var(--text-3);
+  cursor: pointer; border-radius: var(--radius-sm);
+}
+.subtab.active { background: var(--accent-glow); color: var(--accent-2); }
+</style>
+</head>
+<body>
+
+<!-- SVG SPRITE -->
+<svg width="0" height="0" style="position:absolute">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7" cy="14" r="4"/><path d="m10 11 10-5"/><path d="m14 9 2 1"/><path d="m18 7 2 1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-network" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><circle cx="12" cy="12" r="2"/><path d="M6.4 7.1 10.6 10.9"/><path d="M17.6 7.1 13.4 10.9"/><path d="M6.4 16.9 10.6 13.1"/><path d="M17.6 16.9 13.4 13.1"/></symbol>
+  <symbol id="i-cluster" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v5"/><path d="M12 12 5.5 17.5"/><path d="M12 12 18.5 17.5"/></symbol>
+  <symbol id="i-model" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></symbol>
+  <symbol id="i-prompt" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5 11 16.5"/><path d="M16.5 7.5 13 16.5"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-rules" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+  <symbol id="i-registry" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-unlink" viewBox="0 0 24 24"><path d="M18.84 12.25 20 11a5 5 0 0 0-7.07-7.07L11 5.16"/><path d="M5.16 13 4 14a5 5 0 0 0 7.07 7.07L13 18.84"/><line x1="16" y1="16" x2="20" y2="20"/><line x1="4" y1="4" x2="8" y2="8"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-warning" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-meeting" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><polygon points="16 10 22 6 22 18 16 14"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+  <symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+  <symbol id="i-notion" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><line x1="8" y1="4" x2="8" y2="20"/><line x1="16" y1="4" x2="16" y2="20"/></symbol>
+  <symbol id="i-webhook" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92 1.61 0 2.92-1.31 2.92-2.92s-1.31-2.92-2.92-2.92z"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+</defs>
+</svg>
+
+<!-- =========== INTRO =========== -->
+<div class="intro">
+  <h1>Addons (WASM) — docelowy model uprawnień i OAuth</h1>
+  <p class="lead">
+    Trzy niezależne, nakładające się osie: <strong>kto widzi addon</strong> (visibility / grupa), <strong>co może robić</strong>
+    (function-level permissions per grupa) i <strong>czyim kontem to się loguje</strong> (OAuth global vs individual).
+    Każda oś zarządzana w osobnej zakładce detail panelu, plus końcowa zakładka dla administratora do podglądu tokenów
+    użytkowników i osobny widok "Moje konta" dla zwykłego użytkownika.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-eye"/></svg>Visibility (widoczność)</h3>
+      <p>Admin wybiera, które <strong>grupy</strong> w ogóle widzą addon w katalogu. Grupa bez widoczności — addon nie istnieje dla niej.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-shield"/></svg>Function permissions</h3>
+      <p>Dla każdej grupy — macierz funkcji addona (czytaj, pisz, usuwaj...). Grupa X tylko czyta Teams; Grupa Y czyta i pisze.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-link"/></svg>OAuth mode</h3>
+      <p>Global: admin raz podłącza konto, wszyscy go używają (read-only dla userów). Individual: każdy user loguje się swoim kontem OAuth.</p>
+    </div>
+  </div>
+</div>
+
+<!-- =================================================================== -->
+<!-- SCREEN 1: ADDON GRID (ADMIN)                                         -->
+<!-- =================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">1</span>
+    <h2>Addons — lista (widok administratora)</h2>
+    <div class="desc">Grid kart z rozszerzonymi badge'ami: runtime · liczba perms · tryb OAuth · liczba grup z dostępem. Filtrowanie po kategorii, runtime i trybie OAuth.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div><div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div><div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div><div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div><div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div><div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div><div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div><div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users & Groups<span class="badge">5</span></div><div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+      <main class="main">
+        <div class="page-header">
+          <div>
+            <h1><svg class="icon icon-xl"><use href="#i-puzzle"/></svg>Addons (WASM)</h1>
+            <div class="sub">7 addonów · 5 aktywnych · 3 z OAuth · sandboxed wasmtime/wasmi</div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-globe"/></svg>Browse registry</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-upload"/></svg>Install ZIP</button>
+          </div>
+        </div>
+
+        <div class="addons-toolbar">
+          <div class="search-box"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj po nazwie, kategorii lub permission..."></div>
+          <div class="filter-chip active">Wszystkie</div>
+          <div class="filter-chip">Włączone</div>
+          <div class="filter-chip">Wyłączone</div>
+          <div class="filter-chip"><svg class="icon icon-sm"><use href="#i-globe"/></svg>OAuth global</div>
+          <div class="filter-chip"><svg class="icon icon-sm"><use href="#i-user"/></svg>OAuth individual</div>
+        </div>
+
+        <div class="addon-grid">
+          <div class="addon-card selected">
+            <div class="addon-head">
+              <div class="addon-ico"><svg class="icon icon-lg"><use href="#i-meeting"/></svg></div>
+              <div class="addon-meta">
+                <div class="a-name">teams-bot</div>
+                <div class="a-version">v0.5.2 · 4.2 MB · wasmtime</div>
+              </div>
+            </div>
+            <div class="a-desc">Microsoft Teams bot · audio capture + STT + wysyłanie wiadomości.</div>
+            <div class="a-badges">
+              <span class="badge-pill oauth-individual"><svg class="icon"><use href="#i-user"/></svg>OAuth: individual</span>
+              <span class="badge-pill visibility"><svg class="icon"><use href="#i-users"/></svg>3 grupy</span>
+              <span class="badge-pill perms"><svg class="icon"><use href="#i-shield"/></svg>5 perms</span>
+            </div>
+            <div class="a-foot">
+              <span class="a-status on">● enabled</span>
+              <span>·</span>
+              <span>12 użytkowników połączyło konta</span>
+              <div class="toggle on toggle-sm"></div>
+            </div>
+          </div>
+
+          <div class="addon-card">
+            <div class="addon-head">
+              <div class="addon-ico" style="background:linear-gradient(135deg,#f97316,#fb923c);"><svg class="icon icon-lg"><use href="#i-notion"/></svg></div>
+              <div class="addon-meta">
+                <div class="a-name">notion-sync</div>
+                <div class="a-version">v1.2.0 · 1.8 MB · wasmtime</div>
+              </div>
+            </div>
+            <div class="a-desc">Notion API bridge · bidirectional sync · używany przez flows.</div>
+            <div class="a-badges">
+              <span class="badge-pill oauth-global"><svg class="icon"><use href="#i-globe"/></svg>OAuth: global</span>
+              <span class="badge-pill visibility"><svg class="icon"><use href="#i-users"/></svg>wszyscy</span>
+              <span class="badge-pill perms"><svg class="icon"><use href="#i-shield"/></svg>3 perms</span>
+            </div>
+            <div class="a-foot">
+              <span class="a-status on">● enabled</span>
+              <span>·</span>
+              <span>1 shared account</span>
+              <div class="toggle on toggle-sm"></div>
+            </div>
+          </div>
+
+          <div class="addon-card">
+            <div class="addon-head">
+              <div class="addon-ico" style="background:linear-gradient(135deg,#06b6d4,#22d3ee);"><svg class="icon icon-lg"><use href="#i-calendar"/></svg></div>
+              <div class="addon-meta">
+                <div class="a-name">calendar-events</div>
+                <div class="a-version">v0.9.0 · 2.1 MB · wasmtime</div>
+              </div>
+            </div>
+            <div class="a-desc">Google Calendar · iCal webhook listener · trigger dla flows.</div>
+            <div class="a-badges">
+              <span class="badge-pill oauth-individual"><svg class="icon"><use href="#i-user"/></svg>OAuth: individual</span>
+              <span class="badge-pill visibility"><svg class="icon"><use href="#i-users"/></svg>2 grupy</span>
+              <span class="badge-pill perms"><svg class="icon"><use href="#i-shield"/></svg>2 perms</span>
+            </div>
+            <div class="a-foot">
+              <span class="a-status on">● enabled</span>
+              <span>·</span>
+              <span>7 użytkowników</span>
+              <div class="toggle on toggle-sm"></div>
+            </div>
+          </div>
+
+          <div class="addon-card">
+            <div class="addon-head">
+              <div class="addon-ico" style="background:linear-gradient(135deg,#22c55e,#4ade80);"><svg class="icon icon-lg"><use href="#i-shield"/></svg></div>
+              <div class="addon-meta">
+                <div class="a-name">pii-detector-pl</div>
+                <div class="a-version">v2.0.1 · 800 KB · wasmtime</div>
+              </div>
+            </div>
+            <div class="a-desc">Enhanced PII detection specyficzny dla polskich dokumentów.</div>
+            <div class="a-badges">
+              <span class="badge-pill oauth-none"><svg class="icon"><use href="#i-x"/></svg>no OAuth</span>
+              <span class="badge-pill visibility"><svg class="icon"><use href="#i-users"/></svg>wszyscy</span>
+              <span class="badge-pill perms"><svg class="icon"><use href="#i-shield"/></svg>1 perm</span>
+            </div>
+            <div class="a-foot">
+              <span class="a-status on">● enabled</span>
+              <span>·</span>
+              <span>stateless filter</span>
+              <div class="toggle on toggle-sm"></div>
+            </div>
+          </div>
+
+          <div class="addon-card">
+            <div class="addon-head">
+              <div class="addon-ico" style="background:linear-gradient(135deg,#64748b,#94a3b8);"><svg class="icon icon-lg"><use href="#i-webhook"/></svg></div>
+              <div class="addon-meta">
+                <div class="a-name">webhook-receiver</div>
+                <div class="a-version">v1.0.4 · 420 KB · wasmtime</div>
+              </div>
+            </div>
+            <div class="a-desc">Generic webhook listener · HTTP POST → flow trigger.</div>
+            <div class="a-badges">
+              <span class="badge-pill oauth-none"><svg class="icon"><use href="#i-x"/></svg>no OAuth</span>
+              <span class="badge-pill visibility"><svg class="icon"><use href="#i-users"/></svg>admin only</span>
+              <span class="badge-pill perms"><svg class="icon"><use href="#i-shield"/></svg>2 perms</span>
+            </div>
+            <div class="a-foot">
+              <span class="a-status on">● enabled</span>
+              <span>·</span>
+              <span>exposed :8765</span>
+              <div class="toggle on toggle-sm"></div>
+            </div>
+          </div>
+
+          <div class="addon-card disabled">
+            <div class="addon-head">
+              <div class="addon-ico" style="background:linear-gradient(135deg,#475569,#64748b);"><svg class="icon icon-lg"><use href="#i-filter"/></svg></div>
+              <div class="addon-meta">
+                <div class="a-name">dedup-filter</div>
+                <div class="a-version">v0.3.0 · 210 KB · wasmi</div>
+              </div>
+            </div>
+            <div class="a-desc">Deduplication filter dla stream data w flows.</div>
+            <div class="a-badges">
+              <span class="badge-pill oauth-none"><svg class="icon"><use href="#i-x"/></svg>no OAuth</span>
+              <span class="badge-pill visibility"><svg class="icon"><use href="#i-users"/></svg>wszyscy</span>
+              <span class="badge-pill perms"><svg class="icon"><use href="#i-shield"/></svg>1 perm</span>
+            </div>
+            <div class="a-foot">
+              <span class="a-status off">● disabled</span>
+              <span>·</span>
+              <span>not loaded</span>
+              <div class="toggle toggle-sm"></div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- =================================================================== -->
+<!-- SCREEN 2: DETAIL — VISIBILITY TAB                                    -->
+<!-- =================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">2</span>
+    <h2>Detail → Visibility (widoczność per grupa)</h2>
+    <div class="desc">Toggle per user-group: czy grupa w ogóle widzi addon (w swojej liście). Bez widoczności addon nie pokazuje się userowi. Osobny checkbox "admin only" ukrywa z list wszystkich userów oprócz administratorów.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div><div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div><div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div><div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div><div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users & Groups<span class="badge">5</span></div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <svg class="icon icon-sm sep"><use href="#i-chevron"/></svg>
+          <span class="crumb active">teams-bot</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg class="icon icon-xl"><use href="#i-meeting"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">teams-bot</div>
+            <div class="d-sub">v0.5.2 · 4.2 MB · wasmtime · by Microsoft Partners · Apache-2.0</div>
+            <div class="d-badges">
+              <span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>enabled</span>
+              <span class="badge-pill oauth-individual"><svg class="icon"><use href="#i-user"/></svg>OAuth: individual</span>
+              <span class="badge-pill visibility"><svg class="icon"><use href="#i-users"/></svg>3/5 grup</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Reload WASM</button>
+            <button class="btn btn-danger"><svg class="icon"><use href="#i-trash"/></svg>Uninstall</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-settings"/></svg>Settings</div>
+          <div class="tab active"><svg class="icon icon-sm"><use href="#i-eye"/></svg>Visibility <span class="count">3/5</span></div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-shield"/></svg>Permissions <span class="count">5</span></div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-link"/></svg>OAuth <span class="count">individual</span></div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-user"/></svg>Linked accounts <span class="count">12</span></div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-audit"/></svg>Logs</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-play"/></svg>Tools <span class="count">8</span></div>
+        </div>
+
+        <div class="alert info">
+          <svg class="icon"><use href="#i-info"/></svg>
+          <div><strong>Widoczność ≠ uprawnienia.</strong> Grupa która widzi addon, nadal potrzebuje konkretnych uprawnień funkcyjnych (zakładka Permissions) żeby cokolwiek z nim zrobić. Grupa bez visibility w ogóle nie zobaczy addonu na listach.</div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-users"/></svg>Widoczność dla grup użytkowników</h3>
+          <div class="section-sub">Zaznacz grupy, które mają widzieć ten addon w swoim katalogu i móc go użyć w workflowach.</div>
+
+          <div class="group-row selected">
+            <div class="g-ico"><svg class="icon"><use href="#i-users"/></svg></div>
+            <div class="g-info"><div class="g-name">Sales Team</div><div class="g-meta">8 użytkowników · dostęp do CRM i komunikatorów</div></div>
+            <span class="status-pill info">visible</span>
+            <div class="toggle on"></div>
+          </div>
+          <div class="group-row selected">
+            <div class="g-ico"><svg class="icon"><use href="#i-users"/></svg></div>
+            <div class="g-info"><div class="g-name">Customer Support</div><div class="g-meta">12 użytkowników · helpdesk + escalation</div></div>
+            <span class="status-pill info">visible</span>
+            <div class="toggle on"></div>
+          </div>
+          <div class="group-row selected">
+            <div class="g-ico"><svg class="icon"><use href="#i-users"/></svg></div>
+            <div class="g-info"><div class="g-name">Engineering</div><div class="g-meta">5 użytkowników · dev + infra</div></div>
+            <span class="status-pill info">visible</span>
+            <div class="toggle on"></div>
+          </div>
+          <div class="group-row">
+            <div class="g-ico"><svg class="icon"><use href="#i-users"/></svg></div>
+            <div class="g-info"><div class="g-name">Finance</div><div class="g-meta">3 użytkowników · accounting, invoices</div></div>
+            <span class="status-pill" style="background:var(--bg-3);color:var(--text-3);">hidden</span>
+            <div class="toggle"></div>
+          </div>
+          <div class="group-row">
+            <div class="g-ico"><svg class="icon"><use href="#i-users"/></svg></div>
+            <div class="g-info"><div class="g-name">External Contractors</div><div class="g-meta">2 użytkowników · ograniczony dostęp</div></div>
+            <span class="status-pill" style="background:var(--bg-3);color:var(--text-3);">hidden</span>
+            <div class="toggle"></div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-lock"/></svg>Opcje dodatkowe</h3>
+          <div class="form-row">
+            <label>Admin only<div class="label-desc">Ukrywa addon z list wszystkich userów oprócz Administratorów (nadpisuje wybór grup powyżej).</div></label>
+            <div class="toggle"></div>
+          </div>
+          <div class="form-row">
+            <label>Pokaż w katalogu "Available apps"<div class="label-desc">Użytkownicy mogą sami prosić o dodanie do tego addonu (wysyła request do admina).</div></label>
+            <div class="toggle on"></div>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- =================================================================== -->
+<!-- SCREEN 3: DETAIL — PERMISSIONS TAB                                   -->
+<!-- =================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">3</span>
+    <h2>Detail → Permissions (macierz grupy × funkcje)</h2>
+    <div class="desc">Deklarowane w manifeście addona funkcje (np. teams.read_messages, teams.send_message) × grupy. Per komórka: allow / deny / inherit from default. Manifest decyduje co addon MOŻE robić (sandbox); tu admin decyduje, kto z grup ma dostęp do której funkcji.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div><div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div><div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <svg class="icon icon-sm sep"><use href="#i-chevron"/></svg>
+          <span class="crumb active">teams-bot</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg class="icon icon-xl"><use href="#i-meeting"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">teams-bot</div>
+            <div class="d-sub">v0.5.2 · 5 deklarowanych funkcji · 3 grupy z dostępem</div>
+            <div class="d-badges">
+              <span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>enabled</span>
+              <span class="badge-pill perms"><svg class="icon"><use href="#i-shield"/></svg>5 perms</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-ghost"><svg class="icon"><use href="#i-audit"/></svg>Zobacz changelog</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-settings"/></svg>Settings</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-eye"/></svg>Visibility <span class="count">3/5</span></div>
+          <div class="tab active"><svg class="icon icon-sm"><use href="#i-shield"/></svg>Permissions <span class="count">5</span></div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-link"/></svg>OAuth</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-user"/></svg>Linked accounts <span class="count">12</span></div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-audit"/></svg>Logs</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-play"/></svg>Tools</div>
+        </div>
+
+        <div class="subtabs">
+          <div class="subtab active">Per grupa</div>
+          <div class="subtab">Per user (override)</div>
+          <div class="subtab">Default (fallback)</div>
+        </div>
+
+        <div class="alert info">
+          <svg class="icon"><use href="#i-info"/></svg>
+          <div><strong>Kolejność rozstrzygania:</strong> admin bypass → deny (user) → allow (user) → deny (grupa) → allow (grupa) → default. Pierwsze dopasowanie wygrywa.</div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-shield"/></svg>Macierz uprawnień — teams-bot</h3>
+          <div class="section-sub">Kolumny = funkcje zadeklarowane w manifeście addona. Wiersze = user groups. Kliknij komórkę żeby przełączyć allow / deny / inherit.</div>
+
+          <table class="perm-matrix">
+            <thead>
+              <tr>
+                <th style="min-width:220px;">User group</th>
+                <th class="func">read<br>messages</th>
+                <th class="func">send<br>message</th>
+                <th class="func">join<br>meeting</th>
+                <th class="func">capture<br>audio</th>
+                <th class="func">write<br>transcript</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><div class="group-name">Sales Team</div><div class="group-meta">8 użytkowników · visible: tak</div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+                <td class="func"><div class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></div></td>
+                <td class="func"><div class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></div></td>
+              </tr>
+              <tr>
+                <td><div class="group-name">Customer Support</div><div class="group-meta">12 użytkowników · visible: tak</div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+                <td class="func"><div class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></div></td>
+                <td class="func"><div class="perm-btn inherit">—</div></td>
+                <td class="func"><div class="perm-btn inherit">—</div></td>
+                <td class="func"><div class="perm-btn inherit">—</div></td>
+              </tr>
+              <tr>
+                <td><div class="group-name">Engineering</div><div class="group-meta">5 użytkowników · visible: tak</div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+                <td class="func"><div class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></div></td>
+              </tr>
+              <tr style="opacity:0.6;">
+                <td><div class="group-name">Finance</div><div class="group-meta">3 użytkowników · visible: NIE (zablokowane)</div></td>
+                <td class="func"><div class="perm-btn inherit">—</div></td>
+                <td class="func"><div class="perm-btn inherit">—</div></td>
+                <td class="func"><div class="perm-btn inherit">—</div></td>
+                <td class="func"><div class="perm-btn inherit">—</div></td>
+                <td class="func"><div class="perm-btn inherit">—</div></td>
+              </tr>
+              <tr style="background:rgba(99,102,241,0.05);">
+                <td><div class="group-name" style="color:var(--accent-2);">Default (fallback)</div><div class="group-meta">używane gdy inherit w grupie</div></td>
+                <td class="func"><div class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></div></td>
+                <td class="func"><div class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></div></td>
+                <td class="func"><div class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></div></td>
+                <td class="func"><div class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></div></td>
+                <td class="func"><div class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></div></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="legend">
+            <div class="li"><span class="dot allow"></span>allow — jawnie pozwala</div>
+            <div class="li"><span class="dot deny"></span>deny — jawnie blokuje</div>
+            <div class="li"><span class="dot inherit"></span>inherit — bierze z Default (fallback)</div>
+            <div class="li" style="margin-left:auto;">Ostatnia zmiana: Admin Krystian · 2026-04-20 08:14</div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-info"/></svg>Opis funkcji (z manifestu addona)</h3>
+          <table class="perm-matrix" style="background:var(--bg-input);">
+            <thead><tr><th style="min-width:180px;">Permission ID</th><th>Opis</th><th style="width:140px;">Poziom ryzyka</th></tr></thead>
+            <tbody>
+              <tr><td class="group-name" style="font-family:ui-monospace,monospace;font-size:11.5px;">teams.read_messages</td><td>Odczyt wiadomości z kanałów i czatów Teams</td><td><span class="status-pill info">low</span></td></tr>
+              <tr><td class="group-name" style="font-family:ui-monospace,monospace;font-size:11.5px;">teams.send_message</td><td>Wysyłanie wiadomości w imieniu użytkownika</td><td><span class="status-pill warn">medium</span></td></tr>
+              <tr><td class="group-name" style="font-family:ui-monospace,monospace;font-size:11.5px;">teams.join_meeting</td><td>Dołączanie do spotkań jako bot</td><td><span class="status-pill warn">medium</span></td></tr>
+              <tr><td class="group-name" style="font-family:ui-monospace,monospace;font-size:11.5px;">teams.capture_audio</td><td>Przechwytywanie audio ze spotkań (RODO)</td><td><span class="status-pill err">high</span></td></tr>
+              <tr><td class="group-name" style="font-family:ui-monospace,monospace;font-size:11.5px;">teams.write_transcript</td><td>Zapis transkrypcji do storage i event bus</td><td><span class="status-pill warn">medium</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- =================================================================== -->
+<!-- SCREEN 4: DETAIL — OAUTH TAB                                         -->
+<!-- =================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">4</span>
+    <h2>Detail → OAuth configuration</h2>
+    <div class="desc">Wybór trybu: global (admin konfiguruje jedno konto, wszyscy z niego korzystają) vs individual (każdy user loguje się swoim kontem). Przełączenie trybu wymaga potwierdzenia — zmienia zachowanie dla wszystkich obecnie połączonych.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div><div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div><div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <svg class="icon icon-sm sep"><use href="#i-chevron"/></svg>
+          <span class="crumb active">teams-bot</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg class="icon icon-xl"><use href="#i-meeting"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">teams-bot</div>
+            <div class="d-sub">Provider: Microsoft Identity Platform · Scopes: Teams.Read, Chat.ReadWrite, OnlineMeetings.Read</div>
+            <div class="d-badges">
+              <span class="badge-pill oauth-individual"><svg class="icon"><use href="#i-user"/></svg>Current mode: individual</span>
+              <span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>Provider OK</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-settings"/></svg>Settings</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-eye"/></svg>Visibility</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-shield"/></svg>Permissions</div>
+          <div class="tab active"><svg class="icon icon-sm"><use href="#i-link"/></svg>OAuth</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-user"/></svg>Linked accounts <span class="count">12</span></div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-audit"/></svg>Logs</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-play"/></svg>Tools</div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-link"/></svg>Tryb uwierzytelniania OAuth</h3>
+          <div class="section-sub">Określa, czyje konto Microsoft/Google/... jest używane przy wywołaniach API z poziomu tego addona.</div>
+
+          <div class="oauth-mode-grid">
+            <div class="oauth-mode-card global">
+              <div class="mode-icon"><svg class="icon icon-lg"><use href="#i-globe"/></svg></div>
+              <div class="mode-radio"></div>
+              <h4>Global (shared account)</h4>
+              <p>Admin raz podłącza jedno konto serwisowe (np. <code>bot@firma.com</code>). Wszyscy użytkownicy z dostępem korzystają z tego samego tokena. User <strong>nie może</strong> zmienić ani odłączyć konta.</p>
+              <div style="margin-top:10px;font-size:10.5px;color:var(--text-3);">Użyj gdy: bot-y serwisowe, wspólne dashboardy, brak personalizacji per-user.</div>
+            </div>
+            <div class="oauth-mode-card individual active">
+              <div class="mode-icon"><svg class="icon icon-lg"><use href="#i-user"/></svg></div>
+              <div class="mode-radio"></div>
+              <h4>Individual (per-user account) <svg class="icon icon-sm" style="color:var(--success);"><use href="#i-check"/></svg></h4>
+              <p>Każdy użytkownik loguje się <strong>własnym</strong> kontem OAuth. Addon działa w imieniu użytkownika (RODO-friendly, audit trail per osoba, personalizowany access).</p>
+              <div style="margin-top:10px;font-size:10.5px;color:var(--text-3);">Użyj gdy: czyta prywatne wiadomości, wysyła w imieniu usera, integracja z kalendarzem, skrzynkami mailowymi.</div>
+            </div>
+          </div>
+
+          <div class="alert warn">
+            <svg class="icon"><use href="#i-warning"/></svg>
+            <div><strong>Zmiana trybu dotyka 12 aktywnych połączeń.</strong> Przełączenie z individual na global odłączy wszystkie tokeny userów. Przełączenie z global na individual usunie konto shared i zmusi każdego usera do ponownego połączenia.</div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-key"/></svg>Dane providera OAuth (client credentials)</h3>
+          <div class="section-sub">Dane aplikacji zarejestrowanej w Azure/Google/... Wspólne dla wszystkich trybów.</div>
+
+          <div class="form-row">
+            <label>Provider<div class="label-desc">Typ dostawcy OAuth 2.0</div></label>
+            <select class="select">
+              <option>Microsoft Identity Platform (Azure AD)</option>
+              <option>Google OAuth 2.0</option>
+              <option>GitHub OAuth</option>
+              <option>Custom OIDC</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>Client ID<div class="label-desc">Application (client) ID z Azure Portal</div></label>
+            <input class="input mono" value="7e9c1f82-4c5b-4a3d-9f21-d8e7b3a5c1f2" readonly>
+          </div>
+          <div class="form-row">
+            <label>Client Secret<div class="label-desc">AES-256-GCM encrypted w addon_oauth_config. Nigdy nie eksportowane.</div></label>
+            <div style="display:flex;gap:8px;">
+              <input class="input mono" type="password" value="••••••••••••••••••••••••••••••••" readonly style="flex:1;">
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-eye"/></svg></button>
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-edit"/></svg>Change</button>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Tenant ID<div class="label-desc">Azure tenant (pusty = multi-tenant)</div></label>
+            <input class="input mono" value="common" >
+          </div>
+          <div class="form-row">
+            <label>Scopes (z manifestu)<div class="label-desc">Deklarowane przez addon, admin nie może zmienić</div></label>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              <span class="badge-pill perms" style="font-family:ui-monospace,monospace;">Teams.Read</span>
+              <span class="badge-pill perms" style="font-family:ui-monospace,monospace;">Chat.ReadWrite</span>
+              <span class="badge-pill perms" style="font-family:ui-monospace,monospace;">OnlineMeetings.Read</span>
+              <span class="badge-pill perms" style="font-family:ui-monospace,monospace;">User.Read</span>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Redirect URI<div class="label-desc">Skonfiguruj w Azure Portal → App registrations</div></label>
+            <input class="input mono" value="https://tentaflow.local:8090/api/addons/teams-bot/oauth/callback" readonly>
+          </div>
+
+          <div style="display:flex;gap:8px;margin-top:16px;">
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-check"/></svg>Zapisz konfigurację</button>
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-external"/></svg>Test connection</button>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-info"/></svg>Informacja dla trybu individual</h3>
+          <p style="font-size:12.5px;color:var(--text-2);line-height:1.7;">
+            W trybie <strong>individual</strong> powyższe dane (Client ID / Secret) są używane tylko do inicjacji flow OAuth. Każdy użytkownik przechodzi przez standardowy consent screen Microsoft/Google i sam autoryzuje aplikację. Tokeny zapisywane są w <code>user_oauth_accounts</code> (szyfrowane per-user), refresh odbywa się automatycznie.
+          </p>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- =================================================================== -->
+<!-- SCREEN 5: DETAIL — LINKED ACCOUNTS TAB (ADMIN VIEW)                  -->
+<!-- =================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">5</span>
+    <h2>Detail → Linked accounts (admin view)</h2>
+    <div class="desc">Admin widzi listę WSZYSTKICH użytkowników którzy podłączyli swoje konto OAuth do tego addona (w trybie individual). Może wymusić rozłączenie (revoke token) konkretnemu userowi w przypadku incydentu.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div><div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div><div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <svg class="icon icon-sm sep"><use href="#i-chevron"/></svg>
+          <span class="crumb active">teams-bot</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg class="icon icon-xl"><use href="#i-meeting"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">teams-bot</div>
+            <div class="d-sub">12 połączonych kont · 1 wygasły token · 0 revoked</div>
+            <div class="d-badges">
+              <span class="badge-pill oauth-individual"><svg class="icon"><use href="#i-user"/></svg>individual mode</span>
+              <span class="status-pill warn">1 token expired</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-danger"><svg class="icon"><use href="#i-unlink"/></svg>Revoke all</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-settings"/></svg>Settings</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-eye"/></svg>Visibility</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-shield"/></svg>Permissions</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-link"/></svg>OAuth</div>
+          <div class="tab active"><svg class="icon icon-sm"><use href="#i-user"/></svg>Linked accounts <span class="count">12</span></div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-audit"/></svg>Logs</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-play"/></svg>Tools</div>
+        </div>
+
+        <div class="addons-toolbar">
+          <div class="search-box"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj po użytkowniku lub emailu..."></div>
+          <div class="filter-chip active">Wszystkie (12)</div>
+          <div class="filter-chip">Aktywne (11)</div>
+          <div class="filter-chip">Wygasłe (1)</div>
+          <div class="filter-chip">Revoked (0)</div>
+        </div>
+
+        <div class="section-card" style="padding:0;">
+          <table class="accounts-table">
+            <thead>
+              <tr>
+                <th>TentaFlow user</th>
+                <th>OAuth account</th>
+                <th>Połączono</th>
+                <th>Ostatnio użyte</th>
+                <th>Status tokena</th>
+                <th>Scopes</th>
+                <th style="width:140px;">Akcje</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>
+                  <div class="account-cell">
+                    <div class="account-avatar">JK</div>
+                    <div><div style="font-weight:600;color:var(--text);">Jan Kowalski</div><div style="font-size:10.5px;color:var(--text-3);">Sales Team</div></div>
+                  </div>
+                </td>
+                <td><div style="font-family:ui-monospace,monospace;font-size:11.5px;">j.kowalski@firma.com</div><div style="font-size:10.5px;color:var(--text-3);">MS tenant: firma.onmicrosoft.com</div></td>
+                <td>2026-03-14 09:22</td>
+                <td>2026-04-20 08:01 <br><span style="font-size:10px;color:var(--text-3);">(4 min temu)</span></td>
+                <td><span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>active</span></td>
+                <td><span class="badge-pill perms">4</span></td>
+                <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-unlink"/></svg>Revoke</button></td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-cell">
+                    <div class="account-avatar">AN</div>
+                    <div><div style="font-weight:600;color:var(--text);">Anna Nowak</div><div style="font-size:10.5px;color:var(--text-3);">Customer Support</div></div>
+                  </div>
+                </td>
+                <td><div style="font-family:ui-monospace,monospace;font-size:11.5px;">anna.nowak@firma.com</div><div style="font-size:10.5px;color:var(--text-3);">MS tenant: firma.onmicrosoft.com</div></td>
+                <td>2026-03-21 14:55</td>
+                <td>2026-04-19 16:44</td>
+                <td><span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>active</span></td>
+                <td><span class="badge-pill perms">4</span></td>
+                <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-unlink"/></svg>Revoke</button></td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-cell">
+                    <div class="account-avatar" style="color:var(--warning);">PZ</div>
+                    <div><div style="font-weight:600;color:var(--text);">Piotr Zieliński</div><div style="font-size:10.5px;color:var(--text-3);">Engineering</div></div>
+                  </div>
+                </td>
+                <td><div style="font-family:ui-monospace,monospace;font-size:11.5px;">p.zielinski@firma.com</div><div style="font-size:10.5px;color:var(--text-3);">MS tenant: firma.onmicrosoft.com</div></td>
+                <td>2026-02-08 11:33</td>
+                <td>2026-04-18 09:12</td>
+                <td><span class="status-pill warn"><svg class="icon icon-sm"><use href="#i-warning"/></svg>expired</span><div style="font-size:10px;color:var(--text-3);margin-top:2px;">refresh failed</div></td>
+                <td><span class="badge-pill perms">4</span></td>
+                <td style="display:flex;gap:4px;"><button class="btn btn-secondary btn-sm">Re-auth</button><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-unlink"/></svg></button></td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-cell">
+                    <div class="account-avatar">MW</div>
+                    <div><div style="font-weight:600;color:var(--text);">Maria Wiśniewska</div><div style="font-size:10.5px;color:var(--text-3);">Sales Team</div></div>
+                  </div>
+                </td>
+                <td><div style="font-family:ui-monospace,monospace;font-size:11.5px;">m.wisniewska@firma.com</div><div style="font-size:10.5px;color:var(--text-3);">MS tenant: firma.onmicrosoft.com</div></td>
+                <td>2026-01-17 08:10</td>
+                <td>2026-04-20 07:55 <br><span style="font-size:10px;color:var(--text-3);">(10 min temu)</span></td>
+                <td><span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>active</span></td>
+                <td><span class="badge-pill perms">4</span></td>
+                <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-unlink"/></svg>Revoke</button></td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-cell">
+                    <div class="account-avatar">TK</div>
+                    <div><div style="font-weight:600;color:var(--text);">Tomasz Kamiński</div><div style="font-size:10.5px;color:var(--text-3);">Customer Support</div></div>
+                  </div>
+                </td>
+                <td><div style="font-family:ui-monospace,monospace;font-size:11.5px;">t.kaminski@firma.com</div><div style="font-size:10.5px;color:var(--text-3);">MS tenant: firma.onmicrosoft.com</div></td>
+                <td>2026-03-02 13:40</td>
+                <td>2026-04-19 22:18</td>
+                <td><span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>active</span></td>
+                <td><span class="badge-pill perms">4</span></td>
+                <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-unlink"/></svg>Revoke</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- =================================================================== -->
+<!-- SCREEN 6: USER VIEW — MY CONNECTED ACCOUNTS                          -->
+<!-- =================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">6</span>
+    <h2>Moje konta (widok użytkownika)</h2>
+    <div class="desc">Zwykły użytkownik (nie admin) widzi tylko addony w trybie <strong>individual</strong> dla których ma visibility. Dla każdego: podłącz / odłącz / re-auth. Global addon-y nie pojawiają się tutaj (user nie ma nad nimi kontroli).</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-user"/></svg>My Workspace</div><div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div><div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>My Apps</div><div class="nav-item active"><svg class="icon"><use href="#i-link"/></svg>Connected Accounts<span class="badge">3</span></div><div class="nav-item"><svg class="icon"><use href="#i-settings"/></svg>Settings</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar" style="background:linear-gradient(135deg,#22c55e,#4ade80);">JK</div><div><div class="name-t">Jan Kowalski</div><div class="role">Sales Team</div></div></div></div>
+      </aside>
+      <main class="main">
+        <div class="page-header">
+          <div>
+            <h1><svg class="icon icon-xl"><use href="#i-link"/></svg>Moje połączone konta</h1>
+            <div class="sub">Konta zewnętrzne których używasz w addonach · 3 aktywne połączenia</div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież tokeny</button>
+          </div>
+        </div>
+
+        <div class="alert info">
+          <svg class="icon"><use href="#i-info"/></svg>
+          <div><strong>Co to są połączone konta?</strong> Niektóre addony (np. Teams, Google Calendar) działają w Twoim imieniu — potrzebują Twojego osobistego tokena OAuth. Tutaj zarządzasz tymi połączeniami. Możesz je w każdej chwili odłączyć.</div>
+        </div>
+
+        <div class="myapps-grid">
+          <div class="myapp-card">
+            <div class="myapp-head">
+              <div class="myapp-ico"><svg class="icon icon-lg"><use href="#i-meeting"/></svg></div>
+              <div style="flex:1;">
+                <div class="myapp-name">teams-bot <span class="badge-pill perms" style="font-size:9.5px;margin-left:6px;">v0.5.2</span></div>
+                <div class="myapp-desc">Bot do spotkań Teams: transkrypcja + powiadomienia</div>
+              </div>
+              <span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>connected</span>
+            </div>
+            <div class="myapp-linked">
+              <div class="linked-avatar">JK</div>
+              <div class="linked-info">
+                <div class="linked-email">j.kowalski@firma.com</div>
+                <div class="linked-meta">Połączono 14 mar · ostatnio użyte 4 min temu · scopes: Teams.Read, Chat.ReadWrite +2</div>
+              </div>
+              <div style="display:flex;gap:6px;">
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-refresh"/></svg></button>
+                <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-unlink"/></svg>Odłącz</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="myapp-card">
+            <div class="myapp-head">
+              <div class="myapp-ico" style="background:linear-gradient(135deg,#06b6d4,#22d3ee);"><svg class="icon icon-lg"><use href="#i-calendar"/></svg></div>
+              <div style="flex:1;">
+                <div class="myapp-name">calendar-events <span class="badge-pill perms" style="font-size:9.5px;margin-left:6px;">v0.9.0</span></div>
+                <div class="myapp-desc">Google Calendar · triggery dla flows z twojego kalendarza</div>
+              </div>
+              <span class="status-pill ok"><svg class="icon icon-sm"><use href="#i-check"/></svg>connected</span>
+            </div>
+            <div class="myapp-linked">
+              <div class="linked-avatar" style="background:linear-gradient(135deg,#ea4335,#fbbc04);">JK</div>
+              <div class="linked-info">
+                <div class="linked-email">jan.kowalski.sales@gmail.com</div>
+                <div class="linked-meta">Połączono 28 mar · ostatnio użyte wczoraj · scope: calendar.readonly</div>
+              </div>
+              <div style="display:flex;gap:6px;">
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-refresh"/></svg></button>
+                <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-unlink"/></svg>Odłącz</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="myapp-card">
+            <div class="myapp-head">
+              <div class="myapp-ico" style="background:linear-gradient(135deg,#ea4335,#fbbc04);"><svg class="icon icon-lg"><use href="#i-mail"/></svg></div>
+              <div style="flex:1;">
+                <div class="myapp-name">gmail-inbox <span class="badge-pill perms" style="font-size:9.5px;margin-left:6px;">v1.1.0</span></div>
+                <div class="myapp-desc">Gmail · inbox search, label management, compose drafts</div>
+              </div>
+              <span class="status-pill warn"><svg class="icon icon-sm"><use href="#i-warning"/></svg>expired</span>
+            </div>
+            <div class="myapp-linked" style="border-color:var(--warning);">
+              <div class="linked-avatar" style="background:linear-gradient(135deg,#ea4335,#fbbc04);">JK</div>
+              <div class="linked-info">
+                <div class="linked-email">jan.kowalski.sales@gmail.com</div>
+                <div class="linked-meta" style="color:var(--warning);">Token wygasł 2 dni temu · wymagana ponowna autoryzacja</div>
+              </div>
+              <div style="display:flex;gap:6px;">
+                <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-link"/></svg>Re-authorize</button>
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-unlink"/></svg></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="myapp-card">
+            <div class="myapp-head">
+              <div class="myapp-ico" style="background:linear-gradient(135deg,#64748b,#94a3b8);"><svg class="icon icon-lg"><use href="#i-send"/></svg></div>
+              <div style="flex:1;">
+                <div class="myapp-name">slack-notifier <span class="badge-pill perms" style="font-size:9.5px;margin-left:6px;">v0.8.1</span></div>
+                <div class="myapp-desc">Slack · DM + channel posts in your name</div>
+              </div>
+              <span class="status-pill" style="background:var(--bg-3);color:var(--text-3);">not connected</span>
+            </div>
+            <div class="myapp-unlinked">
+              <div class="muted">Nie połączyłeś jeszcze konta Slack. Kliknij aby autoryzować i zacząć używać addona.</div>
+              <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-link"/></svg>Połącz konto Slack</button>
+            </div>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- =================================================================== -->
+<!-- SCREEN 7: OAUTH CONSENT POPUP (browser-native)                       -->
+<!-- =================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">7</span>
+    <h2>OAuth consent popup (flow od użytkownika)</h2>
+    <div class="desc">Klik "Połącz konto" otwiera popup providera (tutaj: Microsoft). Standardowy Microsoft consent screen, scopes wzięte z manifestu addona. Po Accept → token landuje w <code>user_oauth_accounts</code>, popup się zamyka, lista w My Accounts się odświeża.</div>
+  </div>
+  <div class="screen-frame" style="padding:60px 40px;background:var(--bg-2);">
+    <div class="consent-modal">
+      <div class="consent-header">
+        <div class="ms-logo">MS</div>
+        <div>
+          <div class="ms-brand">Microsoft</div>
+          <div class="ms-sub">j.kowalski@firma.com</div>
+        </div>
+      </div>
+      <div class="consent-body">
+        <h4>TentaFlow teams-bot wants to:</h4>
+        <ul class="consent-scopes">
+          <li><div><strong>Read messages in Teams channels and chats</strong><br><span style="color:#6b6b6b;font-size:11px;">Allows the app to read messages you have access to in Microsoft Teams.</span></div></li>
+          <li><div><strong>Send chat messages</strong><br><span style="color:#6b6b6b;font-size:11px;">Allows the app to send new chat messages in your name.</span></div></li>
+          <li><div><strong>Read your meetings</strong><br><span style="color:#6b6b6b;font-size:11px;">View scheduled meetings and join links.</span></div></li>
+          <li><div><strong>Sign you in and read your profile</strong><br><span style="color:#6b6b6b;font-size:11px;">Basic profile info: name, email, photo.</span></div></li>
+        </ul>
+        <p style="font-size:11px;color:#6b6b6b;margin-top:14px;">Accepting these permissions means that you allow this app to use your data as specified in their Terms of Service and Privacy Statement. <strong>You can change these permissions at any time at microsoft.com/consent.</strong></p>
+      </div>
+      <div class="consent-footer">
+        <button class="consent-btn secondary">Cancel</button>
+        <button class="consent-btn primary">Accept</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- =================================================================== -->
+<!-- BACKEND MODEL NOTE                                                   -->
+<!-- =================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">∞</span>
+    <h2>Model danych backend — nowe tabele / rozszerzenia manifestu</h2>
+    <div class="desc">Co dodać do bazy + addon.toml żeby to działało.</div>
+  </div>
+  <div class="screen-frame" style="padding:24px 28px;">
+    <div class="section-card">
+      <h3><svg class="icon icon-sm"><use href="#i-audit"/></svg>Nowe tabele DB (migracja 38)</h3>
+      <pre style="background:var(--bg-input);padding:14px 16px;border-radius:var(--radius-sm);overflow-x:auto;font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.6;color:var(--text-2);border:1px solid var(--border);">
+-- 1. Konfiguracja providera OAuth per addon
+CREATE TABLE addon_oauth_config (
+  id INTEGER PRIMARY KEY,
+  addon_id TEXT NOT NULL UNIQUE,
+  provider TEXT NOT NULL,                    -- 'microsoft' | 'google' | 'github' | 'custom-oidc'
+  client_id TEXT NOT NULL,
+  client_secret_encrypted BLOB NOT NULL,     -- AES-256-GCM
+  tenant_id TEXT,
+  oauth_mode TEXT NOT NULL CHECK (oauth_mode IN ('global','individual')),
+  global_account_token_encrypted BLOB,       -- tylko gdy mode = 'global'
+  global_account_email TEXT,
+  redirect_uri TEXT NOT NULL,
+  configured_by INTEGER REFERENCES user_accounts(id),
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL
+);
+
+-- 2. Widoczność addonu per grupa
+CREATE TABLE addon_group_visibility (
+  id INTEGER PRIMARY KEY,
+  addon_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+  visible INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (addon_id, group_id)
+);
+
+-- 3. Per-user, per-addon zapisane tokeny OAuth (mode='individual')
+CREATE TABLE user_oauth_accounts (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+  addon_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  account_email TEXT NOT NULL,
+  account_display_name TEXT,
+  access_token_encrypted BLOB NOT NULL,
+  refresh_token_encrypted BLOB,
+  expires_at DATETIME,
+  scopes TEXT NOT NULL,                      -- JSON array
+  created_at DATETIME NOT NULL,
+  last_used_at DATETIME,
+  UNIQUE (user_id, addon_id)
+);
+
+-- 4. Per-grupa granty uprawnień (rozszerzenie istniejącego addon_permissions)
+--    użyj subject_type='group' na istniejącej tabeli + dodaj resource_name TEXT
+ALTER TABLE addon_permissions ADD COLUMN resource_name TEXT;  -- np. "teams.read_messages"
+CREATE INDEX idx_addon_perms_lookup ON addon_permissions(addon_id, subject_type, subject_id, permission_id, resource_name);
+</pre>
+    </div>
+
+    <div class="section-card">
+      <h3><svg class="icon icon-sm"><use href="#i-puzzle"/></svg>Rozszerzenie addon.toml (manifest)</h3>
+      <pre style="background:var(--bg-input);padding:14px 16px;border-radius:var(--radius-sm);overflow-x:auto;font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.6;color:var(--text-2);border:1px solid var(--border);">
+[addon]
+id = "teams-bot"
+name = "Microsoft Teams Bot"
+version = "0.5.2"
+
+# NOWE: Deklaracja OAuth providera
+[[oauth_provider]]
+provider = "microsoft"
+scopes = ["Teams.Read", "Chat.ReadWrite", "OnlineMeetings.Read", "User.Read"]
+supported_modes = ["global", "individual"]    # które tryby są dozwolone
+default_mode = "individual"
+
+# NOWE: Deklaracja funkcji (permissions) per-resource
+[[permission]]
+id = "teams.read_messages"
+display_name = "Read Teams messages"
+description = "Odczyt wiadomości z kanałów i czatów"
+risk = "low"                                   # low | medium | high
+
+[[permission]]
+id = "teams.send_message"
+display_name = "Send Teams messages"
+description = "Wysyłanie wiadomości w imieniu użytkownika"
+risk = "medium"
+
+[[permission]]
+id = "teams.capture_audio"
+risk = "high"
+# ...
+
+# NOWE: Domyślna widoczność
+[visibility]
+default = "admin_only"   # admin_only | all_groups | listed
+# jeśli default = "listed":
+# groups = ["Sales Team", "Customer Support"]
+</pre>
+    </div>
+
+    <div class="section-card">
+      <h3><svg class="icon icon-sm"><use href="#i-check"/></svg>Nowe binary protocol messages (rkyv)</h3>
+      <pre style="background:var(--bg-input);padding:14px 16px;border-radius:var(--radius-sm);overflow-x:auto;font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.6;color:var(--text-2);border:1px solid var(--border);">
+AddonVisibilityListRequest         { addon_id }                    → [Group{id,name,visible}]
+AddonVisibilityUpdateRequest       { addon_id, group_id, visible }
+
+AddonGroupPermissionsListRequest   { addon_id }                    → matrix [group × permission]
+AddonGroupPermissionUpdateRequest  { addon_id, group_id, perm_id, grant: allow|deny|inherit }
+
+AddonOAuthConfigGetRequest         { addon_id }
+AddonOAuthConfigUpdateRequest      { addon_id, provider, client_id, client_secret, tenant_id, mode, redirect_uri }
+AddonOAuthTestConnectionRequest    { addon_id }                    → {ok, error?}
+AddonOAuthModeSwitchRequest        { addon_id, new_mode }          → {affected_users_count}
+
+AddonLinkedAccountsListRequest     { addon_id }                    → [UserOAuthAccount]  (admin-only)
+AddonLinkedAccountRevokeRequest    { addon_id, user_id }
+
+UserOAuthAccountsListRequest       { }                             → [własne accounty userów]
+UserOAuthInitiateRequest           { addon_id }                    → {authorize_url}
+UserOAuthCallbackRequest           { addon_id, code, state }       → {account_email}
+UserOAuthDisconnectRequest         { addon_id }
+</pre>
+    </div>
+
+  </div>
+</section>
+
+<div style="max-width:1440px;margin:30px auto 60px;padding:0 24px;color:var(--text-3);font-size:12px;">
+  Mockup: <strong>addons-permissions-20260420</strong> · zgodny stylistycznie z wireframes-20260417 · 6 ekranów + popup + backend notes
+</div>
+
+</body>
+</html>
