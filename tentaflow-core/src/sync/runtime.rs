@@ -78,6 +78,11 @@ pub struct SyncRuntime {
     /// the hot admission path's return type so the many internal callers of
     /// `store_incoming_operations` (tests, snapshot tail) are unaffected.
     pending_epoch_reconcile: parking_lot::Mutex<Vec<EpochReconcileRequest>>,
+    /// Target chains for which a below-floor pull with no covering snapshot was
+    /// already logged. Serving such a pull is handled gracefully (floor-anchored
+    /// slice), but the state still deserves ONE warn per target — repair pulls
+    /// retry on a timer, so an unconditional warn would flood the log.
+    floor_anchor_warned: parking_lot::Mutex<HashSet<String>>,
 }
 
 struct RuntimeSigner {
@@ -202,6 +207,7 @@ pub fn init(
         max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
         adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
         pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
+        floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
     let runtime = SYNC_RUNTIME
@@ -1114,7 +1120,8 @@ impl SyncRuntime {
                 payload.from_node_id
             )));
         }
-        let operation_ids = self.store_incoming_operations(source_node_id, payload.operations)?;
+        let operation_ids =
+            self.store_incoming_operations(source_node_id, payload.operations, None)?;
         if let Err(e) = self.apply_unapplied_inbox(128) {
             warn!("sync runtime: apply incoming operations failed: {}", e);
         }
@@ -1185,29 +1192,43 @@ impl SyncRuntime {
                 .map(|f| f.last_seq)
                 .unwrap_or(0)
         };
+        let mut from_node_seq = payload.from_node_seq;
         if serving_floor_node_seq > payload.from_node_seq {
             match self.escalate_pull_to_snapshot(source_node_id, &payload, serving_floor_node_seq)? {
                 Some(result) => return Ok(result),
-                // CR-W3: the requester sits below our compaction floor but we hold
-                // no snapshot covering it. Serving the log slice would silently skip
-                // the compacted prefix and leave the requester looping on the gap
-                // forever (the floor advances every pull, the prefix never arrives).
-                // Compaction NEVER prunes a partition without first persisting a
-                // covering snapshot, so reaching here means that invariant was
-                // violated (e.g. a snapshot pruned out from under the floor). Fail
-                // loudly instead of spinning so the operator sees the broken state.
+                // CR-W3: the requester sits below our serving floor but we hold no
+                // snapshot covering the prefix. This is the normal state after a
+                // baseline-epoch adopt: the reset deleted the core prefix (its ops
+                // are fenced by every peer's epoch check, so they are unservable
+                // anyway) without persisting a snapshot. Serve the chain FROM THE
+                // FLOOR instead — the response advertises `serving_floor_node_seq`
+                // and the requester anchors the author-signed entry at the floor
+                // exactly like the first op of a snapshot tail anchors a writer it
+                // has never seen. A hard error here (the old behaviour) deadlocked
+                // every below-floor requester forever. Outside the post-adopt case
+                // this still indicates a violated compaction invariant (compaction
+                // never prunes without a covering snapshot), so warn once per
+                // target chain.
                 None => {
-                    return Err(SyncLedgerError::Runtime(format!(
-                        "sync pull below compaction floor {serving_floor_node_seq} for node {} \
-                         but no snapshot covers it (requested from {})",
-                        payload.target_node_id, payload.from_node_seq
-                    )));
+                    if self
+                        .floor_anchor_warned
+                        .lock()
+                        .insert(payload.target_node_id.clone())
+                    {
+                        warn!(
+                            "sync pull below serving floor {serving_floor_node_seq} for node {} \
+                             with no covering snapshot (requested from {}); serving the chain \
+                             from the floor so the requester can anchor there",
+                            payload.target_node_id, payload.from_node_seq
+                        );
+                    }
+                    from_node_seq = serving_floor_node_seq;
                 }
             }
         }
         let mut entries = self.ledger.get_node_chain_entries(NodeLogQuery {
             node_id: payload.target_node_id.clone(),
-            from_node_seq: Some(payload.from_node_seq),
+            from_node_seq: Some(from_node_seq),
             to_node_seq: None,
             limit: Some(payload.limit as usize),
         })?;
@@ -1226,7 +1247,10 @@ impl SyncRuntime {
             MeshSyncPullResponsePayload {
                 from_node_id: self.local_node_id.clone(),
                 target_node_id: payload.target_node_id,
-                from_node_seq: payload.from_node_seq,
+                // The EFFECTIVE start of the served slice (the floor when the
+                // request sat below it): the requester validates density against
+                // this value, and a floor-anchored slice starts at the floor.
+                from_node_seq,
                 operations: wire,
                 serving_floor_node_seq,
                 serving_tip_node_seq,
@@ -1241,8 +1265,8 @@ impl SyncRuntime {
     /// Applying it advances the requester's node-frontier for every node the
     /// snapshot covers; successive pulls then drive the remaining partitions until
     /// the frontier passes the floor, so the catch-up is bounded by partition
-    /// count. `None` if we hold no snapshot to serve (the requester keeps retrying
-    /// the log pull, which is harmless).
+    /// count. `None` if we hold no snapshot to serve; the caller then answers with
+    /// a floor-anchored log slice instead of failing the pull.
     fn escalate_pull_to_snapshot(
         &self,
         source_node_id: &str,
@@ -1287,7 +1311,15 @@ impl SyncRuntime {
         validate_pull_response_wire(&payload)?;
         let target_node_id = payload.target_node_id.clone();
         let serving_tip = payload.serving_tip_node_seq;
-        let operation_ids = self.store_incoming_operations(source_node_id, payload.operations)?;
+        // The anchor must compare against the PRE-admission expectation: it only
+        // engages when the serving peer's floor sits above the next seq we still
+        // need, i.e. the peer declared it cannot relay the prefix and holds no
+        // snapshot covering it (otherwise it would have answered with a snapshot).
+        let (expected_before, _) = self.initial_node_frontier(&target_node_id)?;
+        let floor_anchor = (payload.serving_floor_node_seq > expected_before)
+            .then_some(payload.serving_floor_node_seq);
+        let operation_ids =
+            self.store_incoming_operations(source_node_id, payload.operations, floor_anchor)?;
         if let Err(e) = self.apply_unapplied_inbox(128) {
             warn!("sync runtime: apply pulled operations failed: {}", e);
         }
@@ -1613,10 +1645,16 @@ impl SyncRuntime {
             .retain(|key| !key.starts_with(&prefix));
     }
 
+    /// `floor_anchor` carries a pull-serving peer's compaction/adopt floor when it
+    /// sits above our next expected seq for the pulled chain: the prefix below it
+    /// is unobtainable from that peer (compacted or abandoned by a baseline-epoch
+    /// adopt, with no covering snapshot), so the entry AT the floor anchors the
+    /// chain instead of being classified as a gap. Push deliveries pass `None`.
     fn store_incoming_operations(
         &self,
         source_node_id: &str,
         operations: Vec<MeshSyncOperationWire>,
+        floor_anchor: Option<u64>,
     ) -> LedgerResult<Vec<Vec<u8>>> {
         let source = PeerId::new(source_node_id.to_string())?;
         // Admit each authoring node's chain in node_seq order. A batch may carry
@@ -1663,7 +1701,21 @@ impl SyncRuntime {
             let node_seq = entry.node_seq();
             let op_id = entry.op_id();
             if !expected_seqs.contains_key(&node_id) {
-                let (seq, hash) = self.initial_node_frontier(&node_id)?;
+                let (mut seq, mut hash) = self.initial_node_frontier(&node_id)?;
+                // Floor anchor: the serving peer cannot relay anything below
+                // `floor` and no snapshot covers that prefix. The author-signed
+                // entry AT the floor anchors the chain the same way the first op
+                // of a snapshot tail anchors a writer the receiver has never seen:
+                // its `prev_node_hash` claim seeds the frontier. Entries are
+                // sorted, so this runs for the node's lowest-seq entry only, and
+                // admission still verifies the signature (which covers node_seq
+                // and prev_node_hash) before anything is persisted.
+                if let Some(floor) = floor_anchor {
+                    if seq < floor && node_seq == floor {
+                        seq = floor;
+                        hash = chain_entry_prev_hash(&entry);
+                    }
+                }
                 expected_seqs.insert(node_id.clone(), seq);
                 frontier_hashes.insert(node_id.clone(), hash);
             }
@@ -3407,6 +3459,7 @@ mod tests {
                 max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
                 adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                 pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
+                floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
             },
             _ledger_dir: ledger_dir,
         }
@@ -3432,6 +3485,7 @@ mod tests {
             max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
             adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
             pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
+            floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -8184,7 +8238,7 @@ mod tests {
             .expect("build push")
             .expect("push");
         let operation_ids = receiver
-            .store_incoming_operations(&source.runtime.local_node_id, push.operations)
+            .store_incoming_operations(&source.runtime.local_node_id, push.operations, None)
             .expect("store inbox");
         drop(receiver);
 
@@ -8255,7 +8309,11 @@ mod tests {
             .expect("push");
         assert_eq!(push.operations.len(), 4);
         let first_ids = receiver
-            .store_incoming_operations(&source.runtime.local_node_id, push.operations[..2].to_vec())
+            .store_incoming_operations(
+                &source.runtime.local_node_id,
+                push.operations[..2].to_vec(),
+                None,
+            )
             .expect("store first chunks");
         assert_eq!(receiver.apply_unapplied_inbox(16).expect("apply chunks"), 2);
         assert!(blob_chunk_dir(&sha).expect("chunk dir").exists());
@@ -8264,7 +8322,11 @@ mod tests {
 
         let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 94);
         let operation_ids = receiver
-            .store_incoming_operations(&source.runtime.local_node_id, push.operations[2..].to_vec())
+            .store_incoming_operations(
+                &source.runtime.local_node_id,
+                push.operations[2..].to_vec(),
+                None,
+            )
             .expect("store remaining blob operations");
         let applied = receiver.apply_unapplied_inbox(16).expect("apply manifest");
         source
@@ -10015,6 +10077,7 @@ mod tests {
                 max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
                 adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                 pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
+                floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
             },
             _ledger_dir: ledger_dir,
         }
@@ -10149,7 +10212,7 @@ mod tests {
             .collect::<LedgerResult<Vec<_>>>()?;
         target
             .runtime
-            .store_incoming_operations(source_node_id, wire)?;
+            .store_incoming_operations(source_node_id, wire, None)?;
         target.runtime.apply_unapplied_inbox(128)?;
         Ok(())
     }
@@ -10824,6 +10887,7 @@ mod tests {
                     max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
                     adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                     pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
+                    floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
                 },
                 _ledger_dir: tempfile::tempdir().expect("forge tempdir"),
             };
@@ -10866,7 +10930,7 @@ mod tests {
             let wire = vec![operation_to_wire(&forged_op2).expect("wire")];
             let err = fresh_victim
                 .runtime
-                .store_incoming_operations(&author_id, wire)
+                .store_incoming_operations(&author_id, wire, None)
                 .expect_err("forked chain must be rejected");
             match err {
                 SyncLedgerError::HashChainMismatch { node, node_seq } => {
@@ -11190,6 +11254,187 @@ mod tests {
             );
 
             drop((local, remote));
+        });
+    }
+
+    /// Live-bug regression: after a mesh-wide baseline-epoch adopt, a relay's
+    /// serving floor for a foreign chain sits ABOVE the pre-adopt prefix — the
+    /// reset deleted those core ops without persisting any snapshot. A pull from
+    /// seq 1 used to hard-error ("sync pull below compaction floor ... but no
+    /// snapshot covers it") and deadlock the requester forever. Now the relay
+    /// serves a floor-anchored log slice and the requester anchors at the floor,
+    /// admits the post-adopt chain and ends with no repair left to loop on. The
+    /// test also proves the post-adopt PUSH path: chains continue across the
+    /// adopt (node_heads survive the reset), so the author's first post-adopt op
+    /// chains onto the relay's preserved frontier and MATERIALIZES instead of
+    /// being swallowed as already-known or rejected as an equivocation.
+    #[test]
+    fn post_adopt_pull_below_floor_serves_floor_anchored_slice() {
+        with_tmp_home(|| {
+            let relay = make_convergence_node(64);
+            let author = make_convergence_node(65);
+            let joiner = make_convergence_node(66);
+            for node in [&author, &joiner] {
+                allow_self_target(node, "core.organization");
+            }
+            let author_id = author.node_id().to_string();
+            // The relay must BOTH materialize organization ops itself (admission
+            // gates on `local_target_allowed`) AND serve them full to the joiner
+            // (`peer_target_allowed`). An authority policy yields a single target,
+            // so use the production default for global core resources instead:
+            // `replicated_by_permission` blanket-allows every trusted node.
+            repository::upsert_sync_policy(
+                &relay.runtime.db,
+                "policy-core-core.organization",
+                "org-default",
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                Some("core.organization"),
+                None,
+                "replicated_by_permission",
+                None,
+                None,
+                true,
+            )
+            .expect("relay sync policy");
+            for node_id in [relay.node_id(), joiner.node_id()] {
+                repository::upsert_sync_node_identity(
+                    &relay.runtime.db,
+                    node_id,
+                    "pub",
+                    "ed25519",
+                    "Trusted Node",
+                    "laptop",
+                    "trusted",
+                    None,
+                    "standard",
+                )
+                .expect("relay sync node");
+            }
+
+            // Pre-adopt: the author mints a core chain and the relay admits it.
+            let pre_adopt: Vec<SyncOperation> = (0..3)
+                .map(|i| author_org_op(&author, "org-alpha", &format!("pre-{i}"), 1_000 + i))
+                .collect();
+            deliver(&relay, &author_id, &pre_adopt).expect("relay admits pre-adopt chain");
+            let pre_adopt_tip = pre_adopt.last().expect("pre-adopt ops").body.node_seq;
+
+            // Mesh-wide convergence on a winning epoch: every node runs the
+            // production adopt (set_epoch + core-partition reset + reseed).
+            let winning = BaselineEpoch {
+                counter: 7,
+                origin_node: author_id.clone(),
+            };
+            for node in [&relay, &author, &joiner] {
+                node.runtime
+                    .adopt_donor_baseline_epoch(&winning)
+                    .expect("baseline adopt");
+            }
+
+            // Post-adopt write: the author's chain CONTINUES above the old tip
+            // (the adopt reseed already minted its current rows from there on).
+            let post = author_org_op(&author, "org-beta", "post-adopt", 2_000);
+            assert!(
+                post.body.node_seq > pre_adopt_tip,
+                "the adopt must not restart the author's chain at seq 1"
+            );
+
+            // The relay catches up on the whole post-adopt segment via the normal
+            // push path: the preserved frontier (pre-adopt tip) chains straight
+            // onto the first post-adopt op.
+            let segment = author
+                .runtime
+                .ledger
+                .get_node_operations(NodeLogQuery {
+                    node_id: author_id.clone(),
+                    from_node_seq: Some(pre_adopt_tip + 1),
+                    to_node_seq: None,
+                    limit: None,
+                })
+                .expect("post-adopt segment");
+            deliver(&relay, &author_id, &segment).expect("post-adopt push admits");
+            assert!(
+                node_holds_op(&relay, &author_id, post.op_id),
+                "post-adopt op must materialize on the relay, not be swallowed"
+            );
+            let relay_frontier = relay
+                .runtime
+                .ledger
+                .get_node_frontier(&author_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(
+                relay_frontier.last_seq, post.body.node_seq,
+                "relay frontier advances to the post-adopt tip"
+            );
+
+            // Re-delivering the (now old-epoch) pre-adopt chain stays idempotent:
+            // same op_id at a known position acks as already-known — never an
+            // equivocation error, never a re-admission under the wrong epoch.
+            deliver(&relay, &author_id, &pre_adopt).expect("old-epoch redelivery is idempotent");
+
+            // The relay's serving floor sits above the deleted prefix: only
+            // current-epoch FULL content counts (the reseed ops the relay holds
+            // redacted do not, the dangling pre-adopt entries do not).
+            let floor = relay
+                .runtime
+                .ledger
+                .earliest_live_node_seq(&author_id)
+                .expect("serving floor")
+                .expect("relay holds live post-adopt content");
+            assert!(floor > pre_adopt_tip, "floor must sit above the deleted prefix");
+
+            // THE LIVE BUG: a pull for the author's chain from seq 1.
+            let pull = MeshSyncPullPayload {
+                from_node_id: joiner.node_id().to_string(),
+                target_node_id: author_id.clone(),
+                from_node_seq: 1,
+                limit: 4096,
+            };
+            let result = relay
+                .runtime
+                .handle_pull_payload(joiner.node_id(), pull)
+                .expect("below-floor pull with no covering snapshot must not hard-error");
+            let MeshSyncPullResult::Operations(response) = result else {
+                panic!("no snapshot exists, so the relay must serve a floor-anchored log slice");
+            };
+            assert_eq!(
+                response.from_node_seq, floor,
+                "the served slice starts at the serving floor"
+            );
+            assert_eq!(response.serving_floor_node_seq, floor);
+            assert!(!response.operations.is_empty());
+
+            // The joiner anchors at the floor: the slice admits, its frontier
+            // jumps to the post-adopt tip and nothing is left to loop on.
+            let relay_id = relay.node_id().to_string();
+            joiner
+                .runtime
+                .handle_pull_response_payload(&relay_id, response)
+                .expect("floor-anchored response admits on the joiner");
+            assert!(
+                node_holds_op(&joiner, &author_id, post.op_id),
+                "joiner must admit the post-adopt op pulled from the relay"
+            );
+            let joiner_frontier = joiner
+                .runtime
+                .ledger
+                .get_node_frontier(&author_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(
+                joiner_frontier.last_seq, post.body.node_seq,
+                "joiner frontier reaches the post-adopt tip via the floor anchor"
+            );
+            assert_eq!(
+                read_org_name(&joiner, "org-beta").as_deref(),
+                Some("post-adopt"),
+                "the pulled post-adopt write must materialize on the joiner"
+            );
+            assert_eq!(
+                total_repair_queue_len(&joiner, &[relay_id]),
+                0,
+                "catch-up satisfied: no repair request left to loop on"
+            );
         });
     }
 }
