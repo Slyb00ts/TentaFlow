@@ -2,10 +2,10 @@
 // Plik: mesh/node_info_collector.rs
 // Opis: Zbieranie informacji o lokalnym systemie — hostname, OS, CPU, RAM, GPU,
 //       sieci. Cross-platform: Linux, macOS, Windows, iOS, Android.
-//       GPU detection WYLACZNIE przez wgpu (Metal, Vulkan, DX12, GL) —
-//       jedna metoda, zero duplikatow. Live metryki GPU: nvidia-smi (NVIDIA),
+//       GPU detection przez wgpu dotyczy tylko targetow niemobilnych.
+//       Live metryki GPU: nvidia-smi (NVIDIA),
 //       ioreg (macOS Apple Silicon), amd-smi/sysfs (AMD), sysfs hwmon (Intel),
-//       sysfs kgsl/mali (Android), Metal (iOS).
+//       sysfs kgsl/mali (Android).
 //       Wyniki uzywane do wymiany NodeInfo z peerami przez QUIC.
 // =============================================================================
 
@@ -101,11 +101,13 @@ pub fn infer_vendor(name: &str) -> crate::mesh::peer_store::GpuVendor {
 
 /// GPU z wgpu — enumerowane w tle. NIE blokuje startu mesh.
 /// None = jeszcze nie gotowe lub nie zainicjalizowane, Some = wynik.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 static WGPU_RESULT: std::sync::OnceLock<Mutex<Option<Vec<PeerGpuInfo>>>> =
     std::sync::OnceLock::new();
 
 /// Startuje wgpu enumeration w tle — wywolaj raz przy starcie aplikacji.
 /// Nie blokuje — wynik bedzie dostepny pozniej.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn start_wgpu_enumeration() {
     let store = WGPU_RESULT.get_or_init(|| Mutex::new(None));
     // Jesli juz mamy wynik, nie startuj ponownie
@@ -125,15 +127,25 @@ fn start_wgpu_enumeration() {
     });
 }
 
+#[cfg(any(target_os = "ios", target_os = "android"))]
+fn start_wgpu_enumeration() {}
+
 /// Pobiera wynik wgpu enumeration (None jesli jeszcze nie gotowe)
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn get_wgpu_gpus() -> Option<Vec<PeerGpuInfo>> {
     WGPU_RESULT.get().and_then(|store| store.lock().clone())
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+fn get_wgpu_gpus() -> Option<Vec<PeerGpuInfo>> {
+    Some(Vec::new())
 }
 
 /// Detekcja GPU WYLACZNIE przez wgpu — jedna metoda, zero duplikatow.
 /// Dziala na: Metal (macOS/iOS), Vulkan (Linux/Android), DX12 (Windows), GL (fallback).
 /// Deduplikacja po nazwie — wgpu moze zwrocic ten sam GPU na roznych backendach.
 /// Timeout 3s — jesli wgpu wisi (headless server, brak drivera), zwraca pusty Vec.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
     let (tx, rx) = std::sync::mpsc::channel();
 

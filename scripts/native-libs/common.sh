@@ -175,3 +175,42 @@ append_manifest_library() {
     printf 'note = "%s"\n\n' "$note"
   } >> "$manifest"
 }
+
+android_host_tag() {
+  case "$(uname -s)" in
+    Linux*) printf '%s\n' "linux-x86_64" ;;
+    Darwin*) printf '%s\n' "darwin-x86_64" ;;
+    *) echo "Nieobsługiwany host Android NDK: $(uname -s)" >&2; return 1 ;;
+  esac
+}
+
+find_android_ndk() {
+  local candidate
+  local candidates=()
+  if [ -n "${ANDROID_NDK_HOME:-}" ]; then candidates+=("$ANDROID_NDK_HOME"); fi
+  if [ -n "${ANDROID_NDK_ROOT:-}" ]; then candidates+=("$ANDROID_NDK_ROOT"); fi
+  if [ -n "${ANDROID_HOME:-}" ]; then candidates+=("$ANDROID_HOME/ndk"/*); fi
+  if [ -n "${ANDROID_SDK_ROOT:-}" ]; then candidates+=("$ANDROID_SDK_ROOT/ndk"/*); fi
+  candidates+=("$HOME/Android/Sdk/ndk"/*)
+  candidates+=("/opt/android-sdk/ndk"/*)
+  candidates+=("/opt/android-ndk")
+
+  for candidate in "${candidates[@]}"; do
+    [ -f "$candidate/build/cmake/android.toolchain.cmake" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+require_android_ndk() {
+  local ndk_root
+  if ! ndk_root="$(find_android_ndk)"; then
+    echo "ERROR: Nie znaleziono Android NDK." >&2
+    echo "Uruchom ./scripts/setup.sh albo zainstaluj NDK przez Android SDK Manager." >&2
+    return 1
+  fi
+  export ANDROID_NDK_HOME="$ndk_root"
+  export ANDROID_NDK_ROOT="$ndk_root"
+  printf '%s\n' "$ndk_root"
+}

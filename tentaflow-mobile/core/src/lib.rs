@@ -2,7 +2,7 @@
 // Plik: lib.rs
 // Opis: Glowny modul biblioteki TentaFlow Mobile — punkty wejscia dla iOS
 //       (extern "C") i Android (JNI). Uruchamia serwisy Core w tle
-//       i GUI egui/wgpu (identycznie jak Desktop) + HTTPS server na porcie 8090.
+//       oraz lokalny server HTTPS dla dashboardu WebView na porcie 8090.
 // =============================================================================
 
 pub mod lifecycle;
@@ -12,6 +12,10 @@ pub mod ffi_discovery;
 mod diagnostics;
 
 use anyhow::Result;
+#[cfg(target_os = "android")]
+use jni::{objects::{JClass, JString}, JNIEnv};
+#[cfg(target_os = "android")]
+use std::path::PathBuf;
 use tentaflow_core::config::NodeConfig;
 use tracing::{info, error};
 
@@ -37,7 +41,7 @@ pub extern "C" fn tentaflow_mobile_start() {
         eprintln!("RUST PANIC: {} at {}", msg, location);
     }));
 
-    if let Err(e) = start_app() {
+    if let Err(e) = start_app(None) {
         error!("Blad uruchomienia aplikacji: {:#}", e);
     }
 }
@@ -48,11 +52,21 @@ pub extern "C" fn tentaflow_mobile_start() {
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "C" fn Java_ai_tentaflow_mobile_NativeLib_start(
-    _env: *mut std::ffi::c_void,
-    _class: *mut std::ffi::c_void,
+pub extern "system" fn Java_ai_tentaflow_mobile_NativeLib_start(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
 ) {
-    if let Err(e) = start_app() {
+    let data_dir = match env.get_string(&data_dir) {
+        Ok(value) => Some(PathBuf::from(value.to_string_lossy().into_owned())),
+        Err(e) => {
+            platform::init_logging();
+            error!("Blad odczytu katalogu danych z JNI: {}", e);
+            None
+        }
+    };
+
+    if let Err(e) = start_app(data_dir) {
         error!("Blad uruchomienia aplikacji: {}", e);
     }
 }
@@ -95,7 +109,7 @@ pub extern "C" fn Java_ai_tentaflow_mobile_NativeLib_onMemoryWarning(
 /// Uruchamia aplikacje mobilna — serwisy Core w tle + HTTPS server.
 /// Na iOS wywolywane z didFinishLaunchingWithOptions (main thread).
 /// Serwisy startuja w osobnym watku, funkcja NIE blokuje.
-fn start_app() -> Result<()> {
+fn start_app(data_dir_override: Option<std::path::PathBuf>) -> Result<()> {
     // Logging specyficzny dla platformy
     platform::init_logging();
 
@@ -113,7 +127,7 @@ fn start_app() -> Result<()> {
     info!("device={}, os={}, ram={}MB", device.model, device.os_version, device.ram_mb);
 
     // Katalog danych aplikacji
-    let data_dir = platform::data_dir();
+    let data_dir = data_dir_override.unwrap_or_else(platform::data_dir);
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         error!("Blad tworzenia katalogu danych: {}", e);
         return Err(e.into());

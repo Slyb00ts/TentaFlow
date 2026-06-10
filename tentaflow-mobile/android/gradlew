@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Plik: gradlew
+# Opis: Lokalny bootstrap Gradle dla projektu Android bez wymagania systemowego
+#       Gradle ani binarnego wrappera w repozytorium.
+# =============================================================================
+set -euo pipefail
+
+GRADLE_VERSION="${GRADLE_VERSION:-8.2.1}"
+ANDROID_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$ANDROID_ROOT/../.." && pwd)"
+NATIVE_CACHE="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
+GRADLE_HOME="$NATIVE_CACHE/gradle/gradle-$GRADLE_VERSION"
+GRADLE_BIN="$GRADLE_HOME/bin/gradle"
+
+install_cached_jdk() {
+  local os arch api_arch jdk_root archive archive_path
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "$os:$arch" in
+    Linux:x86_64) api_arch="x64" ;;
+    Linux:aarch64|Linux:arm64) api_arch="aarch64" ;;
+    *) return 1 ;;
+  esac
+
+  jdk_root="$NATIVE_CACHE/jdk"
+  archive="temurin-17-$api_arch.tar.gz"
+  archive_path="$NATIVE_CACHE/downloads/$archive"
+  mkdir -p "$NATIVE_CACHE/downloads" "$jdk_root"
+
+  if [ ! -f "$archive_path" ]; then
+    curl -fL --progress-bar \
+      -o "$archive_path" \
+      "https://api.adoptium.net/v3/binary/latest/17/ga/linux/$api_arch/jdk/hotspot/normal/eclipse?project=jdk"
+  fi
+
+  rm -rf "$jdk_root/temurin-17-$api_arch"
+  mkdir -p "$jdk_root/temurin-17-$api_arch"
+  tar -xzf "$archive_path" -C "$jdk_root/temurin-17-$api_arch" --strip-components=1
+  export JAVA_HOME="$jdk_root/temurin-17-$api_arch"
+  export PATH="$JAVA_HOME/bin:$PATH"
+}
+
+select_java_home() {
+  if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+    "$JAVA_HOME/bin/java" -version 2>&1 | grep -Eq 'version "(17|18|19|20|21)\.' && return 0
+  fi
+
+  local candidate
+  for candidate in \
+    /usr/lib/jvm/java-17-openjdk \
+    /usr/lib/jvm/java-21-openjdk \
+    /usr/lib/jvm/temurin-17-jdk \
+    /usr/lib/jvm/temurin-21-jdk \
+    /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
+    /usr/local/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+  do
+    if [ -x "$candidate/bin/java" ]; then
+      export JAVA_HOME="$candidate"
+      export PATH="$JAVA_HOME/bin:$PATH"
+      return 0
+    fi
+  done
+
+  if command -v java >/dev/null 2>&1 && java -version 2>&1 | grep -Eq 'version "(17|18|19|20|21)\.'; then
+    return 0
+  fi
+
+  if install_cached_jdk; then
+    return 0
+  fi
+
+  echo "Android Gradle wymaga JDK 17-21. Uruchom ./scripts/setup.sh albo ustaw JAVA_HOME na JDK 17." >&2
+  exit 1
+}
+
+select_java_home
+
+if [ ! -x "$GRADLE_BIN" ]; then
+  mkdir -p "$NATIVE_CACHE/downloads" "$NATIVE_CACHE/gradle"
+  archive="gradle-$GRADLE_VERSION-bin.zip"
+  archive_path="$NATIVE_CACHE/downloads/$archive"
+  sha_path="$archive_path.sha256"
+  base_url="https://services.gradle.org/distributions"
+
+  if [ ! -f "$archive_path" ]; then
+    curl -fL --progress-bar -o "$archive_path" "$base_url/$archive"
+  fi
+  if [ ! -f "$sha_path" ]; then
+    curl -fL -o "$sha_path" "$base_url/$archive.sha256"
+  fi
+
+  expected="$(tr -d ' \n\r' < "$sha_path")"
+  actual="$(sha256sum "$archive_path" | awk '{print $1}')"
+  if [ "$expected" != "$actual" ]; then
+    echo "Gradle checksum mismatch for $archive_path" >&2
+    exit 1
+  fi
+
+  command -v unzip >/dev/null 2>&1 || {
+    echo "Brak unzip. Uruchom ./scripts/setup.sh albo zainstaluj unzip." >&2
+    exit 1
+  }
+  rm -rf "$GRADLE_HOME"
+  unzip -q "$archive_path" -d "$NATIVE_CACHE/gradle"
+fi
+
+cd "$ANDROID_ROOT"
+exec "$GRADLE_BIN" "$@"

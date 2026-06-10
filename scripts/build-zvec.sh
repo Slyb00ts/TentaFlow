@@ -31,6 +31,7 @@ ZVEC_REF="${ZVEC_REF:-f562bdd636d454f18128cb18b41578128d1415a4}"
 PLATFORM="${1:-linux-x86_64}"
 
 SRC_DIR="${ZVEC_SRC_DIR:-/tmp/zvec-build}"
+ZVEC_PATCH_DIR="$ROOT/scripts/native-libs/patches/zvec"
 
 # zvec submoduly wymagaja cmake<4 (CMake 4 wywalil kompatybilnosc z
 # cmake_minimum_required<3.5); zwraca major cmake albo nic.
@@ -87,6 +88,45 @@ SHIM
   export CMAKE_PROGRAM_PATH="$shim_dir${CMAKE_PROGRAM_PATH:+:$CMAKE_PROGRAM_PATH}"
 }
 
+android_abi_for_platform() {
+  case "$1" in
+    android-arm64) printf '%s\n' "arm64-v8a" ;;
+    android-armv7) printf '%s\n' "armeabi-v7a" ;;
+    android-x86_64) printf '%s\n' "x86_64" ;;
+    *) return 1 ;;
+  esac
+}
+
+apply_zvec_patches() {
+  local patch
+  for patch in "$ZVEC_PATCH_DIR"/*.patch; do
+    [ -e "$patch" ] || continue
+    git -C "$SRC_DIR" apply "$patch"
+  done
+}
+
+merge_static_archive() {
+  local output="$1"
+  shift
+  local ar_bin="${ANDROID_AR:-${AR:-ar}}"
+  local mri
+  mri="$(mktemp)"
+  {
+    printf 'create %s\n' "$output"
+    local input
+    for input in "$@"; do
+      case "$input" in
+        *.a|*.lib) printf 'addlib %s\n' "$input" ;;
+        *) printf 'addmod %s\n' "$input" ;;
+      esac
+    done
+    printf 'save\n'
+    printf 'end\n'
+  } > "$mri"
+  "$ar_bin" -M < "$mri"
+  rm -f "$mri"
+}
+
 echo "=========================================="
 echo "  Build zvec static archive (model B)"
 echo "  Platform: $PLATFORM | ref: $ZVEC_REF"
@@ -117,6 +157,8 @@ fi
   # eksportu). Czyscimy untracked w submodulach, by patche nalozyly sie od nowa na
   # czyste zrodla.
   git submodule foreach --recursive 'git clean -fdxq' 2>/dev/null || true )
+
+apply_zvec_patches
 
 OUT_LIB_DIR="$SYS_CRATE/vendor/lib/$PLATFORM"
 # Zapewnij, ze katalogi docelowe naleza do biezacego usera. Jesli istnieja jako
@@ -331,11 +373,122 @@ case "$PLATFORM" in
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.a"
     echo "  deps scalone z ${#DEP_LIBS[@]} archiwow third-party"
     ;;
-  android-arm64)
-    echo "Mobile ($PLATFORM) needs a STATIC build and must run on the platform SDK:"
-    echo "  Android: zvec/scripts/build_android.sh (NDK)"
-    echo "Then vendor libzvec_c_api.a (+ libzvec_deps.a) into $OUT_LIB_DIR."
-    exit 1
+  android-*)
+    ANDROID_ABI="$(android_abi_for_platform "$PLATFORM")"
+    ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-26}"
+    ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/opt/android-sdk}}"
+    ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/opt/android-ndk}}"
+    ANDROID_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    if [ ! -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
+        echo "Build Android zvec wymaga Android NDK (ustaw ANDROID_NDK_HOME)." >&2
+        exit 1
+    fi
+    if [ ! -x "$ANDROID_TOOLCHAIN/llvm-ar" ]; then
+        echo "Nie znaleziono llvm-ar w Android NDK: $ANDROID_TOOLCHAIN" >&2
+        exit 1
+    fi
+    export ANDROID_SDK_ROOT ANDROID_HOME="$ANDROID_SDK_ROOT" ANDROID_NDK_HOME
+    export ANDROID_AR="$ANDROID_TOOLCHAIN/llvm-ar"
+    unset RUSTC_WRAPPER
+    unset CMAKE_C_COMPILER_LAUNCHER
+    unset CMAKE_CXX_COMPILER_LAUNCHER
+    unset CMAKE_CUDA_COMPILER_LAUNCHER
+    unset CMAKE_HIP_COMPILER_LAUNCHER
+    export CCACHE_DISABLE=1
+    export SCCACHE_DISABLE=1
+
+    ensure_cmake_pin_on_path
+
+    echo "  [1/3] protoc dla hosta..."
+    HOST_BUILD="$SRC_DIR/build_host"
+    ( cd "$SRC_DIR" && mkdir -p build_host && cd build_host
+      env \
+        -u CMAKE_C_COMPILER_LAUNCHER \
+        -u CMAKE_CXX_COMPILER_LAUNCHER \
+        cmake -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER_LAUNCHER= \
+        -DCMAKE_CXX_COMPILER_LAUNCHER= \
+        -DBUILD_PYTHON_BINDINGS=OFF \
+        -DBUILD_TOOLS=OFF \
+        -DBUILD_TESTING=OFF \
+        ..
+      ninja protoc -j"$(nproc 2>/dev/null || echo 4)" )
+    PROTOC_BIN="$(find "$HOST_BUILD" \( -name protoc -o -name 'protoc-*' \) -type f -perm -111 | head -n1)"
+    if [ -z "$PROTOC_BIN" ]; then
+        echo "Nie znaleziono zbudowanego protoc w $HOST_BUILD"
+        exit 1
+    fi
+
+    echo "  reset thirdparty (host -> Android)..."
+    ( cd "$SRC_DIR" && git submodule foreach --recursive \
+        'git checkout -q -- . 2>/dev/null || true; git clean -fdxq' >/dev/null 2>&1 || true )
+
+    echo "  [2/3] cross-build zvec ($PLATFORM, ABI $ANDROID_ABI, API $ANDROID_API_LEVEL)..."
+    ANDROID_BUILD="$SRC_DIR/build_android_${ANDROID_ABI}"
+    rm -rf "$ANDROID_BUILD"
+    ( cd "$SRC_DIR" && rm -rf "build_android_${ANDROID_ABI}" && mkdir -p "build_android_${ANDROID_ABI}" && cd "build_android_${ANDROID_ABI}"
+      env \
+        -u CMAKE_C_COMPILER_LAUNCHER \
+        -u CMAKE_CXX_COMPILER_LAUNCHER \
+        cmake -G Ninja \
+        -DANDROID_NDK="$ANDROID_NDK_HOME" \
+        -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+        -DANDROID_ABI="$ANDROID_ABI" \
+        -DANDROID_NATIVE_API_LEVEL="$ANDROID_API_LEVEL" \
+        -DANDROID_STL="c++_static" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER_LAUNCHER= \
+        -DCMAKE_CXX_COMPILER_LAUNCHER= \
+        -DBUILD_PYTHON_BINDINGS=OFF \
+        -DBUILD_TOOLS=OFF \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_C_BINDINGS=ON \
+        -DENABLE_NATIVE=OFF \
+        -DAUTO_DETECT_ARCH=OFF \
+        -DGLOBAL_CC_PROTOBUF_PROTOC="$PROTOC_BIN" \
+        ..
+      ninja zvec_c_api -j"$(nproc 2>/dev/null || echo 4)" )
+
+    echo "  [3/3] scalanie archiwow (llvm-ar MRI)..."
+    OWN_LIBS=()
+    for name in zvec_db zvec_core zvec_ailego zvec_turbo; do
+        a="$ANDROID_BUILD/lib/lib${name}.a"
+        [ -f "$a" ] || a="$(find "$ANDROID_BUILD" -name "lib${name}.a" -type f | head -n1)"
+        if [ -z "$a" ] || [ ! -f "$a" ]; then
+            echo "Brak wewnetrznej biblioteki lib${name}.a w $ANDROID_BUILD"
+            exit 1
+        fi
+        OWN_LIBS+=("$a")
+    done
+    CAPI_OBJ="$(find "$ANDROID_BUILD" -path '*zvec_c_api*' -name 'c_api.cc.o' -type f | head -n1)"
+    if [ -z "$CAPI_OBJ" ]; then
+        echo "Nie znaleziono obiektu bindingu C (c_api.cc.o) w $ANDROID_BUILD"
+        exit 1
+    fi
+
+    DEP_LIBS=()
+    seen_bases=""
+    while IFS= read -r a; do
+        base="$(basename "$a")"
+        case "$base" in
+            libzvec_*.a) continue ;;
+        esac
+        case "$seen_bases" in
+            *"|$base|"*) continue ;;
+        esac
+        seen_bases="${seen_bases}|$base|"
+        DEP_LIBS+=("$a")
+    done < <(find "$ANDROID_BUILD" -name '*.a' -type f | sort)
+    if [ "${#DEP_LIBS[@]}" -eq 0 ]; then
+        echo "Nie znaleziono archiwow third-party w $ANDROID_BUILD"
+        exit 1
+    fi
+
+    merge_static_archive "$OUT_LIB_DIR/libzvec_c_api.a" "${OWN_LIBS[@]}" "$CAPI_OBJ"
+    merge_static_archive "$OUT_LIB_DIR/libzvec_deps.a" "${DEP_LIBS[@]}"
+    ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.a"
+    echo "  deps scalone z ${#DEP_LIBS[@]} archiwow third-party"
     ;;
   *)
     echo "Unknown platform: $PLATFORM"

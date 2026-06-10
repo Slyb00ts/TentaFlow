@@ -11,7 +11,9 @@
   "lang": "pl",
   "dir": "ltr",
   "icons": [
-    { "src": "/tentaflow.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+    { "src": "/icons/tentaflow-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/tentaflow-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/tentaflow-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ],
   "protocol_handlers": [
     {
