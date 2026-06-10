@@ -252,8 +252,10 @@ zstd = "0.13.3"
 zip = "8.5.1"
 rcgen = "0.14.7"
 
-# Pobieranie modeli z HuggingFace
-hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"] }
+# Pobieranie modeli z HuggingFace. `tokio` = async API (model_manager, stt);
+# `ureq` = sync API (`api::sync`) wymagane przez loader Apple MLX Kokoro
+# (tts/mlx_kokoro.rs). Oba klienty współdzielą backend rustls.
+hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 
 # Hub — wyszukiwanie i magazyn modeli
 urlencoding = "2"
