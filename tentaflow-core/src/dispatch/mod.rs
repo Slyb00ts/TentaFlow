@@ -1152,11 +1152,20 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
+        // Also pin TENTAFLOW_HOME: tentaflow_home() prefers the repo's live
+        // .runtime/ over HOME, so HOME alone would not isolate the test.
+        let prev_tf = std::env::var_os("TENTAFLOW_HOME");
+        std::env::set_var("TENTAFLOW_HOME", tmp.path());
         f();
         if let Some(p) = prev {
             std::env::set_var("HOME", p);
         } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(p) = prev_tf {
+            std::env::set_var("TENTAFLOW_HOME", p);
+        } else {
+            std::env::remove_var("TENTAFLOW_HOME");
         }
     }
 

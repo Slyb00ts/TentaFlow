@@ -542,6 +542,37 @@ fn prefer_address_first(addresses: &mut Vec<String>, preferred: Option<&str>) {
     }
 }
 
+/// Drains the baseline-epoch reconcile requests the sync runtime produced while
+/// admitting incoming ops and, for each, runs ONE baseline adopt from the donor
+/// whose epoch canonically won. This is the self-heal for diverged epochs: a node
+/// that minted its own epoch during a migration adopts the mesh-wide winner's
+/// baseline instead of rejecting its ops forever. The adopt is single-flight
+/// (debounced in the runtime; `pull_baseline_from_donor` further serializes via
+/// `begin_adopt_atomic`), so a flood of mismatched ops triggers exactly one pull
+/// per donor+epoch. The debounce key is released when the pull settles so a later
+/// divergence can retry.
+fn spawn_epoch_reconcile_adopts(qm_events: &Arc<IrohMeshManager>) {
+    let requests = crate::sync::runtime::take_pending_epoch_reconcile();
+    for request in requests {
+        let qm = qm_events.clone();
+        tokio::spawn(async move {
+            let donor = request.donor_node_id;
+            let epoch_counter = request.donor_epoch_counter;
+            if let Err(e) = qm.pull_baseline_from_donor(&donor, epoch_counter).await {
+                warn!(
+                    donor = %donor,
+                    "sync runtime: epoch-reconcile baseline adopt failed (will retry on next mismatch): {}",
+                    e
+                );
+            }
+            // Release the debounce regardless of outcome: a failed adopt must be
+            // retryable on the next mismatch, and a successful one bumped our epoch
+            // so the next op no longer mismatches anyway.
+            crate::sync::runtime::clear_epoch_adopt_inflight(&donor, epoch_counter);
+        });
+    }
+}
+
 /// [SCALE] Handler PeerConnected wywolywany w tokio::spawn z per-peer lockiem
 /// w event loopie mesh. Debounce 150ms + send Hello/KnownPeers/NodeInfo +
 /// TrustedKeysSync. 100 peerow na raz daje ~150ms total zamiast 100*150ms
@@ -2186,6 +2217,7 @@ fn spawn_quic_event_handler(
                                     warn!(peer = %from_node_id, "SyncPush handle failed: {}", e)
                                 }
                             }
+                            spawn_epoch_reconcile_adopts(&qm_events);
                         }
                         Err(e) => warn!(peer = %from_node_id, "SyncPush decode error: {}", e),
                     }
@@ -2319,6 +2351,7 @@ fn spawn_quic_event_handler(
                             warn!(peer = %from_node_id, "SyncPullResponse decode error: {}", e)
                         }
                     }
+                    spawn_epoch_reconcile_adopts(&qm_events);
                 }
                 Ok(IrohMeshEvent::SyncSnapshotPullReceived { from_node_id, data }) => {
                     let is_trusted = match &mesh_security {

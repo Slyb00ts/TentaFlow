@@ -1116,20 +1116,39 @@ pub struct MeshSyncSnapshotResponsePayload {
 // opisuja wire format negocjacji donora i transferu. Faza A dodaje wylacznie
 // definicje + (de)serializacje; podpiecie do ledgera nastapi w fazie B.
 
-/// Monotoniczny epoch baseline'u. Porzadek leksykograficzny (counter,
-/// origin_node) daje deterministyczny tie-break gdy dwa nody wybija ten sam
-/// licznik.
+/// Monotoniczny epoch baseline'u. Canonical total order: a HIGHER `counter`
+/// wins; on a tie the LOWER `origin_node` (lexicographically) wins. The order is
+/// what every node converges to under `EpochMismatch` reconciliation — exactly
+/// one epoch (the global maximum by this order) survives a mesh-wide reset and
+/// every other node adopts it. The low-origin tie-break is deliberate: after a
+/// migration where each node independently bumps to `counter:1` under its own
+/// `origin_node`, the winner is the node with the lowest `node_id`, which is the
+/// same node the baseline-adopt election (`decide_roles`) picks as donor, so the
+/// epoch winner and the data donor agree without extra negotiation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BaselineEpoch {
     pub counter: u64,
     pub origin_node: String,
 }
 
+impl BaselineEpoch {
+    /// `true` iff `self` is the canonical winner over `other`: higher `counter`,
+    /// or equal `counter` with a lexicographically LOWER `origin_node`. Equal
+    /// epochs do not win over each other. This is the single decision the
+    /// `EpochMismatch` reconciler uses to choose which side adopts the other's
+    /// baseline, so it must be antisymmetric and transitive (covered by tests).
+    pub fn wins_over(&self, other: &Self) -> bool {
+        matches!(self.cmp(other), std::cmp::Ordering::Greater)
+    }
+}
+
 impl Ord for BaselineEpoch {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Higher counter is greater; on a tie a LOWER origin_node is greater, so
+        // the canonical winner (lowest origin at equal counter) is the maximum.
         self.counter
             .cmp(&other.counter)
-            .then_with(|| self.origin_node.cmp(&other.origin_node))
+            .then_with(|| other.origin_node.cmp(&self.origin_node))
     }
 }
 
@@ -1382,6 +1401,87 @@ impl MeshMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn epoch(counter: u64, origin: &str) -> BaselineEpoch {
+        BaselineEpoch {
+            counter,
+            origin_node: origin.to_string(),
+        }
+    }
+
+    #[test]
+    fn higher_counter_epoch_wins_over_lower() {
+        // A higher counter wins regardless of origin_node (even a "higher" origin).
+        let high = epoch(2, "node_z");
+        let low = epoch(1, "node_a");
+        assert!(high.wins_over(&low));
+        assert!(!low.wins_over(&high));
+        assert!(high > low);
+    }
+
+    #[test]
+    fn equal_counter_lower_origin_wins() {
+        // The migration case: every node bumped to counter:1 under its own id. The
+        // canonical winner is the LOWEST origin_node, so everyone converges to the
+        // lowest-node-id epoch.
+        let a = epoch(1, "node_a");
+        let b = epoch(1, "node_b");
+        assert!(a.wins_over(&b));
+        assert!(!b.wins_over(&a));
+        assert!(a > b);
+    }
+
+    #[test]
+    fn epoch_ordering_total_and_deterministic() {
+        let samples = [
+            epoch(0, ""),
+            epoch(1, "node_a"),
+            epoch(1, "node_b"),
+            epoch(1, "node_c"),
+            epoch(2, "node_a"),
+            epoch(2, "node_z"),
+        ];
+        for a in &samples {
+            // Reflexive: an epoch never wins over itself.
+            assert!(!a.wins_over(a));
+            for b in &samples {
+                // Antisymmetric: at most one direction wins; ties (equal epochs)
+                // win in neither.
+                if a == b {
+                    assert!(!a.wins_over(b) && !b.wins_over(a));
+                } else {
+                    assert!(a.wins_over(b) ^ b.wins_over(a));
+                }
+                // wins_over agrees with Ord.
+                assert_eq!(a.wins_over(b), a.cmp(b) == std::cmp::Ordering::Greater);
+            }
+        }
+        // Transitive over a chain a > b > c.
+        let a = epoch(2, "node_a");
+        let b = epoch(1, "node_a");
+        let c = epoch(1, "node_b");
+        assert!(a.wins_over(&b) && b.wins_over(&c) && a.wins_over(&c));
+    }
+
+    #[test]
+    fn migration_set_converges_to_lowest_node_id() {
+        // N nodes each minted counter:1 under their own id. The unique max by the
+        // canonical order is the epoch of the lexicographically lowest node_id —
+        // the single epoch the whole mesh adopts.
+        let epochs = [
+            epoch(1, "node_c"),
+            epoch(1, "node_a"),
+            epoch(1, "node_d"),
+            epoch(1, "node_b"),
+        ];
+        let winner = epochs.iter().max().expect("non-empty");
+        assert_eq!(winner.origin_node, "node_a");
+        for e in &epochs {
+            if e != winner {
+                assert!(winner.wins_over(e));
+            }
+        }
+    }
 
     #[test]
     fn test_ping_roundtrip() {

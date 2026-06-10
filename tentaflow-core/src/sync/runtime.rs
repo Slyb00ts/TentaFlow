@@ -3,7 +3,7 @@
 // Opis: Procesowy runtime Sync Ledger laczacy zapisy SQL addonow z Fjall i outbox.
 // =============================================================================
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
@@ -64,6 +64,20 @@ pub struct SyncRuntime {
     /// terminal conflict. Defaults to `MAX_INBOX_DEFER_ATTEMPTS`; only lowered in
     /// tests so escalation can be exercised without thousands of drains.
     max_inbox_defer_attempts: u32,
+    /// Epoch-reconciliation debounce: `(donor_node_id, epoch_counter, origin)`
+    /// keys for which a baseline adopt has already been REQUESTED and is assumed
+    /// in flight. An EpochMismatch surfaces once per op, but the adopt is a single
+    /// async handshake — without this guard a batch of N mismatched ops would
+    /// request N adopts. The mesh layer clears a key (via `clear_adopt_inflight`)
+    /// when its adopt attempt finishes or fails, so a later mismatch can retry.
+    adopt_inflight: parking_lot::Mutex<HashSet<String>>,
+    /// Epoch-reconcile requests produced while admitting incoming ops (a remote
+    /// op carried the canonically-winning epoch, so the local node must adopt that
+    /// peer's baseline). Drained by the push/pull-response handlers and handed to
+    /// the mesh layer, which owns the transport needed to run the adopt. Kept off
+    /// the hot admission path's return type so the many internal callers of
+    /// `store_incoming_operations` (tests, snapshot tail) are unaffected.
+    pending_epoch_reconcile: parking_lot::Mutex<Vec<EpochReconcileRequest>>,
 }
 
 struct RuntimeSigner {
@@ -138,11 +152,31 @@ pub enum MeshSyncPullResult {
     Snapshot(MeshSyncSnapshotResponsePayload),
 }
 
+/// A request to converge a diverged baseline epoch: the local node admitted an
+/// operation stamped with `donor_epoch`, which is the canonical WINNER over the
+/// local epoch (`BaselineEpoch::wins_over`), so the local node must adopt the
+/// winning peer's baseline. The mesh layer turns this into a single async
+/// `pull_baseline_from_donor(donor_node_id, donor_epoch_counter)` — the same
+/// machinery an admin-triggered or pairing-triggered adopt uses. It is emitted at
+/// most once per `(donor, epoch)` while an adopt is in flight (see the runtime's
+/// adopt-debounce), so a flood of epoch-mismatched ops never starts N adopts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochReconcileRequest {
+    pub donor_node_id: String,
+    pub donor_epoch_counter: u64,
+}
+
 pub fn init(
     db: DbPool,
     signer: Arc<MeshSecurity>,
     settings_cipher: Arc<crate::crypto::SettingsCipher>,
 ) -> LedgerResult<Arc<SyncRuntime>> {
+    // The runtime is process-global: a second init in the same process (tests,
+    // defensive restart paths) must not re-open the Fjall ledger, which is
+    // exclusively locked by the first instance, so return the existing runtime.
+    if let Some(existing) = SYNC_RUNTIME.get() {
+        return Ok(existing.clone());
+    }
     let ledger_path = paths::tentaflow_home().join("sync").join("ledger");
     let ledger = Arc::new(FjallSyncLedgerStore::open(&ledger_path)?);
     let needs_baseline_reset = ledger.needs_baseline_reset();
@@ -166,6 +200,8 @@ pub fn init(
         hlc,
         addon_reconciler: parking_lot::RwLock::new(None),
         max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
+        adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
+        pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
     let runtime = SYNC_RUNTIME
@@ -370,6 +406,27 @@ pub fn handle_push_payload(
     runtime
         .handle_push_payload(source_node_id, payload)
         .map(Some)
+}
+
+/// Drains baseline-epoch reconcile requests accumulated while admitting incoming
+/// operations. The mesh layer calls this right after a push / pull-response was
+/// handled and, for each request, runs a single `pull_baseline_from_donor` to
+/// adopt the canonically-winning peer's baseline. Empty when no epoch divergence
+/// was observed (the common case).
+pub fn take_pending_epoch_reconcile() -> Vec<EpochReconcileRequest> {
+    match SYNC_RUNTIME.get() {
+        Some(runtime) => runtime.take_pending_reconcile(),
+        None => Vec::new(),
+    }
+}
+
+/// Releases the adopt-debounce for a `(donor, epoch_counter)` whose adopt attempt
+/// just finished (success or failure), so a later epoch mismatch toward the same
+/// target can request a fresh adopt instead of being suppressed forever.
+pub fn clear_epoch_adopt_inflight(donor_node_id: &str, epoch_counter: u64) {
+    if let Some(runtime) = SYNC_RUNTIME.get() {
+        runtime.clear_adopt_inflight(donor_node_id, epoch_counter);
+    }
 }
 
 pub fn handle_ack_payload(source_node_id: &str, payload: MeshSyncAckPayload) -> LedgerResult<()> {
@@ -1483,6 +1540,79 @@ impl SyncRuntime {
         })
     }
 
+    /// Stable debounce key for an in-flight adopt toward `(donor, epoch)`.
+    fn adopt_inflight_key(donor_node_id: &str, epoch: &BaselineEpoch) -> String {
+        format!("{donor_node_id}|{}|{}", epoch.counter, epoch.origin_node)
+    }
+
+    /// Decides how the local node reacts to an operation that arrived under a
+    /// DIFFERENT baseline epoch than the locally-active one. This is the self-heal
+    /// that replaces the old behaviour of rejecting the op forever (the warn-spin):
+    ///
+    ///  - `remote_epoch` is the canonical WINNER (`wins_over` the local epoch) →
+    ///    the local node must adopt that peer's baseline. Returns a single
+    ///    `EpochReconcileRequest` the FIRST time per `(donor, epoch)`; later
+    ///    mismatches for the same target return `None` (debounced via
+    ///    `adopt_inflight`) so a batch of mismatched ops starts exactly one adopt.
+    ///  - the local epoch wins (or the epochs are equal) → `None`. We simply drop
+    ///    the stale remote op; the peer will itself adopt once it observes one of
+    ///    OUR ops under the winning epoch (symmetry), so no node spins and exactly
+    ///    one epoch survives mesh-wide.
+    fn note_epoch_mismatch(
+        &self,
+        source_node_id: &str,
+        remote_epoch: &BaselineEpoch,
+    ) -> LedgerResult<Option<EpochReconcileRequest>> {
+        let local_epoch = self.ledger.current_epoch()?;
+        if !remote_epoch.wins_over(&local_epoch) {
+            return Ok(None);
+        }
+        let key = Self::adopt_inflight_key(source_node_id, remote_epoch);
+        // Debounce: only the first mismatch toward this donor+epoch requests an
+        // adopt; the async handshake is single-flight and clears the key when done.
+        if !self.adopt_inflight.lock().insert(key) {
+            return Ok(None);
+        }
+        warn!(
+            donor = %source_node_id,
+            "sync runtime: remote epoch counter={} origin={} wins over local counter={} origin={}; \
+             requesting baseline adopt to converge",
+            remote_epoch.counter, remote_epoch.origin_node, local_epoch.counter, local_epoch.origin_node
+        );
+        Ok(Some(EpochReconcileRequest {
+            donor_node_id: source_node_id.to_string(),
+            donor_epoch_counter: remote_epoch.counter,
+        }))
+    }
+
+    /// Records a reconcile request for the push/pull handlers to drain and hand to
+    /// the mesh layer. De-dupes within one drain window so one batch yields at most
+    /// one request per donor.
+    fn push_pending_reconcile(&self, request: EpochReconcileRequest) {
+        let mut pending = self.pending_epoch_reconcile.lock();
+        if !pending.contains(&request) {
+            pending.push(request);
+        }
+    }
+
+    /// Drains the reconcile requests accumulated since the last call.
+    fn take_pending_reconcile(&self) -> Vec<EpochReconcileRequest> {
+        std::mem::take(&mut *self.pending_epoch_reconcile.lock())
+    }
+
+    /// Releases the adopt-debounce for `(donor, epoch_counter)`. The mesh layer
+    /// calls this when its adopt attempt finishes (success or failure) so a later
+    /// epoch mismatch toward the same target can request a fresh adopt instead of
+    /// being silently suppressed forever. We clear EVERY in-flight key whose donor
+    /// + counter match (origin is not known at the call site), which is safe: at
+    /// most one origin is ever in flight per donor+counter.
+    fn clear_adopt_inflight(&self, donor_node_id: &str, epoch_counter: u64) {
+        let prefix = format!("{donor_node_id}|{epoch_counter}|");
+        self.adopt_inflight
+            .lock()
+            .retain(|key| !key.starts_with(&prefix));
+    }
+
     fn store_incoming_operations(
         &self,
         source_node_id: &str,
@@ -1540,21 +1670,34 @@ impl SyncRuntime {
             let expected = expected_seqs[&node_id];
             let frontier_hash = frontier_hashes[&node_id];
 
-            match self.admit_chain_entry(&source, &entry, expected, frontier_hash)? {
-                NodeAdmission::Accepted => {
+            match self.admit_chain_entry(&source, &entry, expected, frontier_hash) {
+                Ok(NodeAdmission::Accepted) => {
                     let advanced_hash = chain_entry_hash(&entry);
                     expected_seqs.insert(node_id.clone(), node_seq.saturating_add(1));
                     frontier_hashes.insert(node_id, Some(advanced_hash));
                     accepted.push(op_id.as_bytes().to_vec());
                 }
                 // Already known (node_seq below frontier): idempotent, ACK it.
-                NodeAdmission::AlreadyKnown => {
+                Ok(NodeAdmission::AlreadyKnown) => {
                     accepted.push(op_id.as_bytes().to_vec());
                 }
                 // Gap above the frontier: legal catch-up. Queue a per-node pull
                 // and stop advancing this node's batch state — later ops of the
                 // same node would also gap until the pull lands.
-                NodeAdmission::Gap => {}
+                Ok(NodeAdmission::Gap) => {}
+                // The op carries a different baseline epoch. Do NOT reject forever
+                // (that was the warn-spin with no convergence). Decide who adopts
+                // whom from the canonical epoch order: if the remote epoch wins, we
+                // request a baseline adopt from this peer (debounced, one per
+                // donor+epoch); if ours wins we just drop the stale op — the peer
+                // adopts when it sees our op under the winning epoch. Either way the
+                // op is skipped here, never re-admitted under the wrong epoch.
+                Err(SyncLedgerError::EpochMismatch { actual, .. }) => {
+                    if let Some(request) = self.note_epoch_mismatch(source.as_str(), &actual)? {
+                        self.push_pending_reconcile(request);
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(accepted)
@@ -3262,6 +3405,8 @@ mod tests {
                 hlc,
                 addon_reconciler: parking_lot::RwLock::new(None),
                 max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
+                adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
+                pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
             },
             _ledger_dir: ledger_dir,
         }
@@ -3285,6 +3430,8 @@ mod tests {
             hlc,
             addon_reconciler: parking_lot::RwLock::new(None),
             max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
+            adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
+            pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -3842,11 +3989,20 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
+        // Also pin TENTAFLOW_HOME: tentaflow_home() prefers the repo's live
+        // .runtime/ over HOME, so HOME alone would not isolate the test.
+        let prev_tf = std::env::var_os("TENTAFLOW_HOME");
+        std::env::set_var("TENTAFLOW_HOME", tmp.path());
         f();
         if let Some(p) = prev {
             std::env::set_var("HOME", p);
         } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(p) = prev_tf {
+            std::env::set_var("TENTAFLOW_HOME", p);
+        } else {
+            std::env::remove_var("TENTAFLOW_HOME");
         }
     }
 
@@ -9690,10 +9846,12 @@ mod tests {
     }
 
     /// Epoch fencing after baseline adopt: an operation minted under the OLD
-    /// (pre-adopt) epoch is rejected by the receiver's inbox once the receiver has
-    /// adopted a newer epoch. `put_verified_in_inbox` returns `EpochMismatch` and
-    /// nothing materializes — stale-epoch writes from before the merge cannot leak
-    /// into the merged organization.
+    /// (pre-adopt) epoch is dropped by the receiver once the receiver has adopted a
+    /// newer (canonically-winning) epoch. The push is admitted without error (the
+    /// stale op is silently skipped, not a hard failure that spins), nothing
+    /// materializes, and — because the LOCAL epoch wins — no baseline adopt is
+    /// requested (we never adopt a losing baseline). Stale-epoch writes from before
+    /// the merge cannot leak into the merged organization.
     #[test]
     fn e2e_epoch_fencing_rejects_pre_adopt_operation() {
         with_tmp_home(|| {
@@ -9736,23 +9894,29 @@ mod tests {
                 .set_epoch(new_epoch.clone())
                 .expect("set epoch");
 
-            // The push carries the stale-epoch op; the receiver's inbox fences it.
+            // The push carries the stale-epoch op; the receiver's higher epoch wins,
+            // so the op is dropped during admission. The push itself succeeds (no
+            // hard error / spin) and reports no accepted op.
             let push = source
                 .runtime
                 .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
                 .expect("build push")
                 .expect("pending push");
-            let err = receiver
+            let ack = receiver
                 .runtime
                 .handle_push_payload(&source.runtime.local_node_id, push)
-                .expect_err("stale-epoch push must be fenced");
-            match err {
-                SyncLedgerError::EpochMismatch { expected, actual } => {
-                    assert_eq!(expected, new_epoch, "fence expects the adopted epoch");
-                    assert_eq!(actual.counter, 0, "rejected op carried the old epoch");
-                }
-                other => panic!("expected EpochMismatch, got: {other:?}"),
-            }
+                .expect("stale-epoch push is absorbed, not errored");
+            assert!(
+                ack.operation_ids.is_empty(),
+                "stale-epoch op must not be accepted"
+            );
+
+            // The local epoch wins, so no baseline adopt is requested (we never
+            // adopt a losing baseline; the peer will adopt ours instead).
+            assert!(
+                receiver.runtime.take_pending_reconcile().is_empty(),
+                "winning local epoch must not request an adopt"
+            );
 
             // Nothing materialized: the receiver has no such flow row.
             assert!(
@@ -9849,6 +10013,8 @@ mod tests {
                 hlc,
                 addon_reconciler: parking_lot::RwLock::new(None),
                 max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
+                adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
+                pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
             },
             _ledger_dir: ledger_dir,
         }
@@ -10656,6 +10822,8 @@ mod tests {
                     hlc: HlcClock::new(author_id.clone(), None),
                     addon_reconciler: parking_lot::RwLock::new(None),
                     max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
+                    adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
+                    pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
                 },
                 _ledger_dir: tempfile::tempdir().expect("forge tempdir"),
             };
@@ -10795,6 +10963,233 @@ mod tests {
                 3,
                 "all three ops present after catch-up"
             );
+        });
+    }
+
+    /// Forces `node`'s locally-active epoch to `(counter, node_id)`, modelling a
+    /// migration where each node independently bumped to its own epoch. Ops the
+    /// node mints afterwards carry this epoch.
+    fn set_node_epoch(node: &ConvergenceNode, counter: u64) {
+        node.runtime
+            .ledger
+            .set_epoch(BaselineEpoch {
+                counter,
+                origin_node: node.node_id().to_string(),
+            })
+            .expect("set epoch");
+    }
+
+    /// Authors one Organization write on `node` under its current epoch and
+    /// returns the signed operation.
+    fn author_org_op(node: &ConvergenceNode, key: &str, value: &str, wall: i64) -> SyncOperation {
+        let cap = org_capture(key, value, hlc_at(wall, 0, node.node_id()));
+        let result = node.runtime.record_core_capture(cap).expect("author op");
+        node.runtime
+            .ledger
+            .get_operation(result.op_id)
+            .expect("authored op")
+    }
+
+    /// The migration bug, fixed: every node starts under its OWN epoch (counter:1,
+    /// distinct origin) with the same data. Delivering each node's op to the others
+    /// must NOT spin on EpochMismatch — instead the lower-epoch nodes request a
+    /// baseline adopt from the canonical winner (lowest node_id), and after they
+    /// adopt that epoch every op is accepted with no further mismatch.
+    #[test]
+    fn divergent_epochs_converge_to_canonical() {
+        with_tmp_home(|| {
+            let nodes: Vec<ConvergenceNode> = (0..4u8)
+                .map(|i| make_convergence_node(80u8.wrapping_add(i)))
+                .collect();
+            for node in &nodes {
+                allow_self_target(node, "core.organization");
+                set_node_epoch(node, 1);
+            }
+
+            // The canonical winner is the lowest node_id at counter:1.
+            let node_ids: Vec<String> = nodes.iter().map(|n| n.node_id().to_string()).collect();
+            let winner_idx = (0..nodes.len())
+                .min_by(|&a, &b| node_ids[a].cmp(&node_ids[b]))
+                .expect("non-empty");
+            let winner_epoch = nodes[winner_idx].runtime.ledger.current_epoch().unwrap();
+
+            // Each node authors one op under its own epoch.
+            let ops: Vec<SyncOperation> = (0..nodes.len())
+                .map(|i| author_org_op(&nodes[i], "org-alpha", &format!("v-{i}"), 1_000 + i as i64))
+                .collect();
+
+            // Deliver every author's op to every OTHER node. A loser delivering to
+            // the winner is dropped as stale (no request). A winner (or higher
+            // node) delivering to a loser triggers exactly one adopt request toward
+            // that author. No delivery returns an error.
+            for target_idx in 0..nodes.len() {
+                let _ = nodes[target_idx].runtime.take_pending_reconcile();
+                for src_idx in 0..nodes.len() {
+                    if src_idx == target_idx {
+                        continue;
+                    }
+                    deliver(&nodes[target_idx], &node_ids[src_idx], std::slice::from_ref(&ops[src_idx]))
+                        .expect("delivery never errors on epoch mismatch");
+                }
+            }
+
+            // Every node that is NOT the winner must have requested an adopt toward
+            // the canonical winner (it saw the winner's op under the winning epoch).
+            // The winner requested nothing (its own epoch already wins over all).
+            for (idx, node) in nodes.iter().enumerate() {
+                let requests = node.runtime.take_pending_reconcile();
+                if idx == winner_idx {
+                    assert!(
+                        requests.is_empty(),
+                        "winner must never request an adopt; got {requests:?}"
+                    );
+                } else {
+                    assert!(
+                        requests
+                            .iter()
+                            .any(|r| r.donor_node_id == node_ids[winner_idx]
+                                && r.donor_epoch_counter == winner_epoch.counter),
+                        "node {idx} must request adopt from canonical winner; got {requests:?}"
+                    );
+                }
+            }
+
+            // Simulate the adopt: every loser adopts the winner's epoch (in
+            // production `pull_baseline_from_donor` does this via the donor's
+            // snapshot). After that, re-delivering the winner's op is ACCEPTED with
+            // no mismatch and no new reconcile request.
+            for (idx, node) in nodes.iter().enumerate() {
+                if idx == winner_idx {
+                    continue;
+                }
+                node.runtime.ledger.set_epoch(winner_epoch.clone()).expect("adopt epoch");
+            }
+            for target_idx in 0..nodes.len() {
+                if target_idx == winner_idx {
+                    continue;
+                }
+                deliver(
+                    &nodes[target_idx],
+                    &node_ids[winner_idx],
+                    std::slice::from_ref(&ops[winner_idx]),
+                )
+                .expect("post-adopt delivery");
+                let requests = nodes[target_idx].runtime.take_pending_reconcile();
+                assert!(
+                    requests.is_empty(),
+                    "after adopting the winning epoch there must be no further mismatch"
+                );
+                assert!(
+                    node_holds_op(&nodes[target_idx], &node_ids[winner_idx], ops[winner_idx].op_id),
+                    "winner's op must be admitted once epochs agree"
+                );
+            }
+
+            drop(nodes);
+        });
+    }
+
+    /// A flood of epoch-mismatched ops from one donor under one winning epoch must
+    /// produce exactly ONE adopt request (debounce), not one per op. A different
+    /// donor/epoch is a distinct key and is allowed through.
+    #[test]
+    fn epoch_reconcile_adopt_is_debounced_per_donor_epoch() {
+        with_tmp_home(|| {
+            let local = make_convergence_node(96);
+            allow_self_target(&local, "core.organization");
+            set_node_epoch(&local, 1); // local epoch: (1, local_id)
+
+            // A donor whose epoch wins over local: same counter, lower origin. We
+            // cannot pick the donor's node_id (it is its ed25519 key), so author the
+            // donor's ops on a node and only keep the ops; what matters for the
+            // debounce is the (donor_node_id, epoch) the local node observes.
+            let donor = make_convergence_node(50);
+            set_node_epoch(&donor, 2); // higher counter → always wins regardless of origin
+            allow_self_target(&donor, "core.organization");
+            let donor_id = donor.node_id().to_string();
+            let donor_epoch = donor.runtime.ledger.current_epoch().unwrap();
+
+            // Three ops from the same donor under the same winning epoch.
+            let ops: Vec<SyncOperation> = (0..3)
+                .map(|i| author_org_op(&donor, "org-alpha", &format!("d-{i}"), 3_000 + i))
+                .collect();
+
+            let _ = local.runtime.take_pending_reconcile();
+            // The three ops form a contiguous chain seq1..3; the mismatch is hit on
+            // the FIRST admitted op (seq1 == expected), which fences on epoch before
+            // advancing. Deliver them one batch at a time to exercise repeated
+            // mismatches against the same (donor, epoch).
+            for op in &ops {
+                deliver(&local, &donor_id, std::slice::from_ref(op)).expect("deliver");
+            }
+            let requests = local.runtime.take_pending_reconcile();
+            assert_eq!(
+                requests.len(),
+                1,
+                "debounce: many mismatched ops from one donor+epoch yield ONE adopt request"
+            );
+            assert_eq!(requests[0].donor_node_id, donor_id);
+            assert_eq!(requests[0].donor_epoch_counter, donor_epoch.counter);
+
+            // Until the in-flight adopt is cleared, a further mismatch is suppressed.
+            deliver(&local, &donor_id, std::slice::from_ref(&ops[0])).expect("redeliver");
+            assert!(
+                local.runtime.take_pending_reconcile().is_empty(),
+                "still in flight: no duplicate request"
+            );
+
+            // Once the adopt settles (cleared), a fresh mismatch may request again.
+            local
+                .runtime
+                .clear_adopt_inflight(&donor_id, donor_epoch.counter);
+            deliver(&local, &donor_id, std::slice::from_ref(&ops[0])).expect("redeliver after clear");
+            assert_eq!(
+                local.runtime.take_pending_reconcile().len(),
+                1,
+                "after clearing the debounce a new mismatch requests an adopt again"
+            );
+
+            drop((local, donor));
+        });
+    }
+
+    /// The local epoch wins over the remote's: the stale remote op is dropped with
+    /// NO adopt request (we do not adopt a losing baseline). The remote peer will
+    /// itself adopt when it observes our op under the winning epoch.
+    #[test]
+    fn winning_local_epoch_drops_stale_remote_without_adopt() {
+        with_tmp_home(|| {
+            let local = make_convergence_node(60); // will hold the winning epoch
+            allow_self_target(&local, "core.organization");
+            local
+                .runtime
+                .ledger
+                .set_epoch(BaselineEpoch {
+                    counter: 5,
+                    origin_node: local.node_id().to_string(),
+                })
+                .expect("local epoch");
+
+            // Remote authors under a strictly-lower epoch (counter 1).
+            let remote = make_convergence_node(61);
+            set_node_epoch(&remote, 1);
+            allow_self_target(&remote, "core.organization");
+            let remote_id = remote.node_id().to_string();
+            let stale = author_org_op(&remote, "org-alpha", "stale", 4_000);
+
+            let _ = local.runtime.take_pending_reconcile();
+            deliver(&local, &remote_id, std::slice::from_ref(&stale))
+                .expect("stale delivery is dropped, not errored");
+            assert!(
+                local.runtime.take_pending_reconcile().is_empty(),
+                "local epoch wins: no adopt requested, op simply dropped"
+            );
+            assert!(
+                !node_holds_op(&local, &remote_id, stale.op_id),
+                "the stale op under the losing epoch is not admitted"
+            );
+
+            drop((local, remote));
         });
     }
 }

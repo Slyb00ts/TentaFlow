@@ -4008,7 +4008,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::AuditEventBody(e) => {
             set(&obj, "variant", "AuditEvent".into());
-            set(&obj, "tsEpoch", e.ts_epoch.into());
+            set(&obj, "tsEpoch", (e.ts_epoch as f64).into());
             if let Some(u) = e.user_id {
                 set(&obj, "userId", js_sys::Uint8Array::from(&u[..]).into());
             }
@@ -4070,7 +4070,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "containerId", c.container_id.into());
                 set(&obj, "stream", c.stream.into());
                 set(&obj, "line", c.line.into());
-                set(&obj, "tsEpoch", c.ts_epoch.into());
+                set(&obj, "tsEpoch", (c.ts_epoch as f64).into());
             }
         },
         MessageBody::VoiceProfileListRequest => {
@@ -4281,7 +4281,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "endpoint", ep.into());
                 }
                 if let Some(ls) = p.last_seen_epoch {
-                    set(&item, "lastSeenEpoch", ls.into());
+                    set(&item, "lastSeenEpoch", (ls as f64).into());
                 }
                 arr.push(&item.into());
             }
@@ -7191,8 +7191,8 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "isLocal", n.is_local.into());
     set(&obj, "is_local", n.is_local.into());
     if let Some(v) = n.uptime_secs {
-        set(&obj, "uptimeSecs", v.clone().into());
-        set(&obj, "uptime_secs", v.clone().into());
+        set(&obj, "uptimeSecs", (v as f64).into());
+        set(&obj, "uptime_secs", (v as f64).into());
     }
     let ifs = js_sys::Array::new();
     let mut total_rx: u64 = 0;
@@ -7420,8 +7420,8 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&item, "backend", v.into());
         }
         if let Some(v) = m.size_mb {
-            set(&item, "sizeMb", v.clone().into());
-            set(&item, "size_mb", v.clone().into());
+            set(&item, "sizeMb", (v as f64).into());
+            set(&item, "size_mb", (v as f64).into());
         }
         set(&item, "loaded", m.loaded.into());
         models.push(&item.into());
@@ -7447,8 +7447,8 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&item, "memory_mb", (v as f64).into());
         }
         if let Some(v) = c.memory_limit_mb {
-            set(&item, "memoryLimitMb", v.clone().into());
-            set(&item, "memory_limit_mb", v.clone().into());
+            set(&item, "memoryLimitMb", (v as f64).into());
+            set(&item, "memory_limit_mb", (v as f64).into());
         }
         containers.push(&item.into());
     }
@@ -7457,8 +7457,8 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "containers_running", containers_running.into());
     set(&obj, "containers_total", containers_total.into());
     if let Some(v) = n.last_seen_epoch {
-        set(&obj, "lastSeenEpoch", v.clone().into());
-        set(&obj, "last_seen_epoch", v.clone().into());
+        set(&obj, "lastSeenEpoch", (v as f64).into());
+        set(&obj, "last_seen_epoch", (v as f64).into());
     }
     if let Some(r) = n.route {
         let route = js_sys::Object::new();
