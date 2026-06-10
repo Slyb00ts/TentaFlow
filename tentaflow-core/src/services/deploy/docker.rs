@@ -1043,6 +1043,7 @@ mod tests {
                 homepage: "".into(),
                 license: "".into(),
                 icon: None,
+                provider: None,
                 resource_kind: None,
                 requires_model: None,
                 gpu_supported: None,
