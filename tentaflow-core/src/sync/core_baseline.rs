@@ -37,6 +37,17 @@ pub const BASELINE_ADOPT_REPORT_KEY: &str = "baseline_adopt_report";
 /// `BaselineChunk` (seq + 32-bajtowy hash + length-prefix bytes).
 pub const BASELINE_CHUNK_BYTES: usize = 48 * 1024;
 
+/// TTL for an armed-only adopt state (phase `Elected`, no transfer ever ran).
+/// An armed slot whose counterpart vanished (e.g. the joiner never pulled the
+/// baseline) must not wedge the mesh: epoch-reconcile self-heal depends on this
+/// slot freeing itself so later adopts toward/through this node can proceed.
+const BASELINE_ADOPT_ARMED_TTL_SECS: i64 = 10 * 60;
+
+/// TTL for any other non-terminal phase (an active transfer that died
+/// mid-flight). Longer than the armed TTL because a live transfer of a large
+/// snapshot may legitimately take a while between phase persists.
+const BASELINE_ADOPT_ACTIVE_TTL_SECS: i64 = 60 * 60;
+
 // =============================================================================
 // Single-flight stan adopcji (crash-recovery)
 // =============================================================================
@@ -164,6 +175,31 @@ fn conflicts_with(
     !same_target
 }
 
+/// Age of the persisted adopt state in seconds, derived from
+/// `settings.updated_at` (SQLite `datetime('now')` format, UTC). `None` when the
+/// timestamp is missing or unparseable — callers treat that as stale.
+fn adopt_state_age_secs(updated_at: Option<&str>) -> Option<i64> {
+    let parsed = chrono::NaiveDateTime::parse_from_str(updated_at?, "%Y-%m-%d %H:%M:%S").ok()?;
+    Some((chrono::Utc::now().naive_utc() - parsed).num_seconds())
+}
+
+/// Whether a CONFLICTING adopt state is stale and may be evicted. Pure decision
+/// function — the age is computed by the caller. An armed adopt whose
+/// counterpart vanished (e.g. the joiner never pulled the baseline) must not
+/// wedge the single-flight slot forever: mesh self-heal via epoch-reconcile
+/// depends on this slot freeing itself. A missing/unparseable timestamp
+/// (`None`) counts as stale — a corrupt timestamp must not wedge the slot.
+fn is_stale_adopt_state(phase: BaselinePhase, age_secs: Option<i64>) -> bool {
+    let Some(age) = age_secs else {
+        return true;
+    };
+    let ttl = match phase {
+        BaselinePhase::Elected => BASELINE_ADOPT_ARMED_TTL_SECS,
+        _ => BASELINE_ADOPT_ACTIVE_TTL_SECS,
+    };
+    age > ttl
+}
+
 /// Atomowy start adopcji single-flight. Sprawdzenie istniejacego stanu I zapis
 /// nowego stanu dziela jedna transakcje SQLite na wspoldzielonym (Mutex)
 /// polaczeniu, wiec dwa rownolegle starty nie moga oba przejsc bramki: pierwszy
@@ -194,19 +230,21 @@ pub fn begin_adopt_atomic(
         .transaction()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
 
-    let existing: Option<BaselineAdoptState> = tx
+    let existing: Option<(BaselineAdoptState, Option<String>)> = tx
         .query_row(
-            "SELECT value FROM settings WHERE key = ?1",
+            "SELECT value, updated_at FROM settings WHERE key = ?1",
             params![BASELINE_ADOPT_STATE_KEY],
-            |r| r.get::<_, String>(0),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .optional()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
-        .map(|json| serde_json::from_str(&json))
+        .map(|(json, updated_at)| {
+            serde_json::from_str(&json).map(|state: BaselineAdoptState| (state, updated_at))
+        })
         .transpose()
         .map_err(|e| SyncLedgerError::Decode(format!("baseline adopt state decode: {e}")))?;
 
-    if let Some(existing) = existing {
+    if let Some((existing, updated_at)) = existing {
         // Wznowienie tej samej adopcji (same peer+epoch+rola) w fazie
         // przetrwalej awarie post-commit lub juz zakonczonej: DB jest scalony,
         // wiec wywolujacy ma tylko dokonczyc post-commit, nie importowac od nowa.
@@ -222,19 +260,34 @@ pub fn begin_adopt_atomic(
         }
         // Single-flight: KAZDA trwajaca adopcja o innym celu (inna rola/peer/epoch,
         // faza != Completed) blokuje nowy start. Tylko identyczny cel (wznowienie
-        // wczesnej fazy) lub poprzedni `Completed` przepuszczaja dalej.
+        // wczesnej fazy) lub poprzedni `Completed` przepuszczaja dalej. A stale
+        // conflicting state (counterpart vanished, TTL exceeded) is EVICTED: it is
+        // simply overwritten by the new state within this same transaction.
         if conflicts_with(&existing, desired, peer, epoch) {
-            return Err(SyncLedgerError::Runtime(format!(
-                "baseline adopt already in progress as {:?} with peer {} epoch {} (phase {:?}); \
-                 refusing to start as {:?} with peer {} epoch {}",
-                existing.role,
-                existing.peer,
-                existing.epoch.counter,
-                existing.phase,
-                desired,
-                peer,
-                epoch.counter
-            )));
+            let age_secs = adopt_state_age_secs(updated_at.as_deref());
+            if is_stale_adopt_state(existing.phase, age_secs) {
+                warn!(
+                    role = ?existing.role,
+                    peer = %existing.peer,
+                    epoch = existing.epoch.counter,
+                    phase = ?existing.phase,
+                    age_secs = ?age_secs,
+                    "baseline adopt: evicting stale single-flight state \
+                     (counterpart never completed); slot taken over by new adopt"
+                );
+            } else {
+                return Err(SyncLedgerError::Runtime(format!(
+                    "baseline adopt already in progress as {:?} with peer {} epoch {} (phase {:?}); \
+                     refusing to start as {:?} with peer {} epoch {}",
+                    existing.role,
+                    existing.peer,
+                    existing.epoch.counter,
+                    existing.phase,
+                    desired,
+                    peer,
+                    epoch.counter
+                )));
+            }
         }
     }
 

@@ -318,14 +318,26 @@ pub async fn run_donor_session<S: FrameStream>(
 
     // Single-flight: zajmij slot jako Donor. `Resume` (ten sam peer+epoch) tez
     // jest OK — donor moze ponawiac wysylke; capture jest idempotentne (read-only).
+    // On refusal send an explicit nack first: bare `?` would just drop the stream
+    // and the joiner would only see "connection lost" instead of "donor refused".
     match begin_adopt_atomic(
         &security.db,
         BaselineRole::Donor,
         remote_node_id,
         &epoch,
         BaselinePhase::Elected,
-    )? {
-        BeginOutcome::Started | BeginOutcome::Resume(_) => {}
+    ) {
+        Ok(BeginOutcome::Started | BeginOutcome::Resume(_)) => {}
+        Err(err) => {
+            let nack = BaselineAck {
+                accepted: false,
+                donor: donor.clone(),
+                joiner: joiner.clone(),
+                epoch: 0,
+            };
+            let _ = write_frame(stream, &nack, "ack").await;
+            return Err(err);
+        }
     }
 
     let cipher = security.settings_cipher_ref();
