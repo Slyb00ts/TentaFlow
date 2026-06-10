@@ -1,0 +1,30 @@
+[engine]
+id = "openrouter"
+category = "llm"
+resource_kind = "ai"
+provider = "external"
+name = "OpenRouter"
+description_pl = "Agregator wielu dostawców LLM przez jedno API zgodne z OpenAI."
+description_en = "Aggregator routing many LLM providers through one OpenAI-compatible API."
+homepage = "https://openrouter.ai"
+license = "Proprietary"
+default_port = 443
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_endpoint = "https://openrouter.ai/api/v1"
+detection_health_path = "/models"
+requires_api_key = true
+
+[[model_preset]]
+id = "openai-gpt-5-1"
+display_name = "OpenAI GPT-5.1"
+repo = "openai/gpt-5.1"
+recommended = true
+
+[[model_preset]]
+id = "anthropic-claude-opus-4-8"
+display_name = "Anthropic Claude Opus 4.8"
+repo = "anthropic/claude-opus-4-8"

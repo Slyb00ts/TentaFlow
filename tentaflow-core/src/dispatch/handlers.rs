@@ -3579,6 +3579,32 @@ pub async fn service_manifest_deploy(
         serde_json::from_str(&payload.config_json)
             .map_err(|e| ProtocolError::bad_request(format!("invalid config_json: {}", e)))?
     };
+    // Subscription login: the wizard sends an `oauth_flow_id` instead of a key.
+    // Swap it for the tokens captured by the completed OAuth flow on this node
+    // (the credential blob then follows the normal encrypted `api_key` path).
+    let user_config = {
+        let mut cfg = user_config;
+        if let Some(obj) = cfg.as_object_mut() {
+            if let Some(flow_id) = obj
+                .get("oauth_flow_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                if let Some(blob) = crate::services::backend::codex_oauth::take_tokens(&flow_id) {
+                    obj.insert("api_key".to_string(), serde_json::Value::String(blob));
+                }
+                obj.remove("oauth_flow_id");
+            }
+        }
+        cfg
+    };
+
+    // Cloud external providers carry an `api_key` — encrypt it with this node's
+    // settings cipher before it flows into the placeholder/deployment/service
+    // config_json. The key stays node-local; remote deploys are forwarded with
+    // the plaintext key over the encrypted mesh and re-encrypted by the receiver.
+    let user_config =
+        crate::services::deploy::encrypt_api_key_in_config(&user_config, &ctx.state.settings_cipher);
 
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
         ProtocolError::internal("port allocator not initialized (supervisor disabled)")
@@ -6559,6 +6585,29 @@ async fn forward_service_action(
     }
 }
 
+/// Forward a mesh command and return the FULL response (so callers can read the
+/// typed payload, not just ok/error). Trust + transport errors become `Err`.
+async fn forward_command(
+    ctx: &HandlerContext,
+    target_node_id: &str,
+    cmd: tentaflow_protocol::mesh::MeshCommandType,
+) -> Result<crate::mesh::iroh_manager::CommandWaitResponse, String> {
+    let iroh = ctx
+        .state
+        .quic_mesh
+        .as_ref()
+        .ok_or("mesh transport not available on this node")?
+        .clone();
+    if let Some(security) = ctx.state.mesh_security.as_ref() {
+        if !security.is_trusted(target_node_id) {
+            return Err(format!("peer {} is not trusted", target_node_id));
+        }
+    }
+    iroh.send_command_and_wait(target_node_id, cmd, 15)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Resolves a service row by id, returning a NotFound protocol error when the
 /// row is gone. Caller drops the lock before doing async work.
 fn fetch_service_row(
@@ -7231,6 +7280,334 @@ pub async fn service_update(
             restarted,
         }),
     ))
+}
+
+/// Resolve the request context for calling an external provider's API from a
+/// service row: its `ApiKind` (from the manifest), base URL (`endpoint_url`),
+/// DECRYPTED api key and optional api version (Azure). The key is decrypted
+/// here on the owning node and never returned to the client.
+fn resolve_external_request_ctx(
+    ctx: &HandlerContext,
+    row: &crate::services_repo::services::ServiceRow,
+) -> Result<(crate::services::manifest::ApiKind, String, String, Option<String>), String> {
+    if row.deploy_method != crate::services_repo::services::DeployMethod::External {
+        return Err("service is not an external provider".to_string());
+    }
+    let manifest = crate::services::manifest::registry()
+        .by_id(&row.engine_id)
+        .ok_or_else(|| format!("engine '{}' not found in manifest", row.engine_id))?;
+    let api = manifest.engine.api;
+    let base_url = row
+        .endpoint_url
+        .clone()
+        .ok_or_else(|| "service has no endpoint_url".to_string())?;
+    let cfg: serde_json::Value =
+        serde_json::from_str(&row.config_json).unwrap_or(serde_json::Value::Null);
+    let api_version = cfg
+        .get("api_version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let api_key = cfg
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .map(|raw| ctx.state.settings_cipher.decrypt(raw).unwrap_or_default())
+        .unwrap_or_default();
+    Ok((api, base_url, api_key, api_version))
+}
+
+/// Classify a selected model's modality without an extra API round-trip:
+/// ElevenLabs = tts, Soniox = stt, Anthropic = chat, everything else by id.
+fn modality_for(api: crate::services::manifest::ApiKind, id: &str) -> String {
+    use crate::services::manifest::ApiKind;
+    match api {
+        ApiKind::Elevenlabs => "tts".to_string(),
+        ApiKind::Soniox => "stt".to_string(),
+        ApiKind::Anthropic => "chat".to_string(),
+        _ => crate::services::providers::classify_openai_model_id(id).to_string(),
+    }
+}
+
+#[handler(variant = "ServiceModelCatalogRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_model_catalog(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqModelCatalog(p)) => {
+            p.clone()
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqModelCatalog",
+            ));
+        }
+    };
+
+    let resp = |models, error| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResModelCatalog(
+                tentaflow_protocol::ServiceModelCatalogResponse { models, error },
+            ),
+        ))
+    };
+
+    // Provider keys are node-local; listing must run on the owning node.
+    if forward_target_node(ctx, &payload.node_id).is_some() {
+        return resp(
+            Vec::new(),
+            Some("model listing must be performed on the node that owns the provider".to_string()),
+        );
+    }
+
+    let row = fetch_service_row(ctx, payload.service_id)?;
+    let (api, base_url, api_key, api_version) = match resolve_external_request_ctx(ctx, &row) {
+        Ok(v) => v,
+        Err(e) => return resp(Vec::new(), Some(e)),
+    };
+
+    // Subscription (ChatGPT plan) tokens are rejected by the standard
+    // `/v1/models`, so list from the Codex backend instead.
+    let subscription = serde_json::from_str::<serde_json::Value>(&row.config_json)
+        .ok()
+        .and_then(|c| {
+            c.get("auth_mode")
+                .and_then(|v| v.as_str())
+                .map(|m| m.eq_ignore_ascii_case("subscription"))
+        })
+        .unwrap_or(false);
+
+    let fetch = if subscription && row.engine_id.eq_ignore_ascii_case("openai") {
+        crate::services::backend::codex::list_models(&api_key).await
+    } else {
+        crate::services::providers::list_models(api, &base_url, &api_key, api_version.as_deref())
+            .await
+    };
+    let fetched = match fetch {
+        Ok(m) => m,
+        Err(e) => return resp(Vec::new(), Some(e.to_string())),
+    };
+
+    let selected: std::collections::HashSet<String> = {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::models::list_for_service(&conn, payload.service_id)
+            .map_err(db_err)?
+            .into_iter()
+            .map(|m| m.model_name)
+            .collect()
+    };
+
+    let models = fetched
+        .into_iter()
+        .map(|m| tentaflow_protocol::ServiceModelCatalogEntry {
+            selected: selected.contains(&m.id),
+            id: m.id,
+            display_name: m.display_name,
+            modality: m.modality,
+            context_length: m.context_length,
+        })
+        .collect();
+
+    resp(models, None)
+}
+
+#[handler(variant = "ServiceModelSelectionRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_model_selection(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqModelSelection(p)) => {
+            p.clone()
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqModelSelection",
+            ));
+        }
+    };
+
+    let resp = |success, error| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResModelSelection(
+                tentaflow_protocol::ServiceModelSelectionResponse { success, error },
+            ),
+        ))
+    };
+
+    if forward_target_node(ctx, &payload.node_id).is_some() {
+        return resp(
+            false,
+            Some("model selection must be performed on the node that owns the provider".to_string()),
+        );
+    }
+
+    let row = fetch_service_row(ctx, payload.service_id)?;
+    let api = match resolve_external_request_ctx(ctx, &row) {
+        Ok((api, _, _, _)) => api,
+        Err(e) => return resp(false, Some(e)),
+    };
+
+    let selected: Vec<crate::services_repo::models::SelectedModel> = payload
+        .selected_model_ids
+        .iter()
+        .map(|id| crate::services_repo::models::SelectedModel {
+            model_name: id.clone(),
+            display_name: None,
+            modality: modality_for(api, id),
+            context_length: None,
+        })
+        .collect();
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        if let Err(e) =
+            crate::services_repo::models::replace_selection(&conn, payload.service_id, &selected)
+        {
+            return resp(false, Some(e.to_string()));
+        }
+    }
+
+    audit(
+        ctx,
+        require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b)).as_deref(),
+        "service.model.selection",
+        Some(&row.engine_id),
+        Some(&format!("{} models", selected.len())),
+    );
+
+    resp(true, None)
+}
+
+#[handler(variant = "ServiceOauthStartRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_oauth_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqOauthStart(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqOauthStart",
+            ));
+        }
+    };
+
+    let resp = |flow_id: String, authorize_url: String, user_code: String, error: Option<String>| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResOauthStart(
+                tentaflow_protocol::ServiceOauthStartResponse {
+                    flow_id,
+                    authorize_url,
+                    user_code,
+                    error,
+                },
+            ),
+        ))
+    };
+
+    // The OAuth flow must run on the node that will own the service + tokens.
+    // When deploying to a mesh peer, forward the login there (the peer holds the
+    // device-code flow and later resolves the tokens at deploy time).
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::OauthStart {
+            provider: payload.provider.clone(),
+        };
+        return match forward_command(ctx, target, cmd).await {
+            Ok(r) => match r.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::OauthStartResult {
+                    flow_id,
+                    authorize_url,
+                    user_code,
+                    error,
+                } => resp(flow_id, authorize_url, user_code, error),
+                _ => resp(
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    Some("unexpected mesh response".to_string()),
+                ),
+            },
+            Err(e) => resp(String::new(), String::new(), String::new(), Some(e)),
+        };
+    }
+    if !payload.provider.eq_ignore_ascii_case("openai") {
+        return resp(
+            String::new(),
+            String::new(),
+            String::new(),
+            Some("subscription login is only available for OpenAI".to_string()),
+        );
+    }
+
+    match crate::services::backend::codex_oauth::start_login().await {
+        Ok((flow_id, authorize_url, user_code)) => resp(flow_id, authorize_url, user_code, None),
+        Err(e) => resp(String::new(), String::new(), String::new(), Some(e)),
+    }
+}
+
+#[handler(variant = "ServiceOauthPollRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_oauth_poll(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqOauthPoll(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqOauthPoll",
+            ));
+        }
+    };
+
+    let poll_resp = |status: String, account_label: Option<String>, error: Option<String>| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResOauthPoll(
+                tentaflow_protocol::ServiceOauthPollResponse {
+                    status,
+                    account_label,
+                    error,
+                },
+            ),
+        ))
+    };
+
+    // The flow lives on the node that started it — poll the same node.
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::OauthPoll {
+            flow_id: payload.flow_id.clone(),
+        };
+        return match forward_command(ctx, target, cmd).await {
+            Ok(r) => match r.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::OauthPollResult {
+                    status,
+                    account_label,
+                    error,
+                } => poll_resp(status, account_label, error),
+                _ => poll_resp("error".to_string(), None, Some("unexpected mesh response".to_string())),
+            },
+            Err(e) => poll_resp("error".to_string(), None, Some(e)),
+        };
+    }
+
+    let (status, account_label, error) =
+        crate::services::backend::codex_oauth::poll(&payload.flow_id);
+    poll_resp(status, account_label, error)
 }
 
 #[handler(variant = "ServiceVramHintRequest", since = (1, 0))]

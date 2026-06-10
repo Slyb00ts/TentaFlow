@@ -334,6 +334,8 @@ install_base() {
                 lld
                 git
                 git-lfs
+                jdk17-openjdk
+                unzip
                 pkg-config
                 glib2
                 gstreamer
@@ -362,7 +364,7 @@ install_base() {
                 run_privileged pacman -S --needed --noconfirm protobuf
                 INSTALLED+=("protobuf")
             fi
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "git-lfs" "glib2" "gstreamer" "gst-plugins-base-libs" "vulkan-loader" "sqlite" "perf" "sysstat")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "git-lfs" "jdk17-openjdk" "unzip" "glib2" "gstreamer" "gst-plugins-base-libs" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -375,6 +377,8 @@ install_base() {
                 lld
                 git
                 git-lfs
+                openjdk-17-jdk
+                unzip
                 pkg-config
                 libglib2.0-dev
                 libgstreamer1.0-dev
@@ -397,7 +401,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "openjdk-17-jdk" "unzip" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
@@ -409,6 +413,8 @@ install_base() {
                 lld
                 git
                 git-lfs
+                java-17-openjdk-devel
+                unzip
                 pkg-config
                 # sherpa-onnx (Eigen/openfst) buduje z -static-libstdc++ -static-libgcc;
                 # na Fedorze static libstdc++ to osobny pakiet. Bez niego KAZDY test
@@ -432,7 +438,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-17-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -450,6 +456,8 @@ install_base() {
                 llvm
                 git
                 git-lfs
+                openjdk@17
+                unzip
                 pkg-config
                 glib
                 gstreamer
@@ -462,7 +470,7 @@ install_base() {
             brew install "${pkgs[@]}"
             configure_macos_gstreamer_pkg_config
             ensure_macos_metal_toolchain
-            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "git" "git-lfs" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
+            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "git" "git-lfs" "openjdk@17" "unzip" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
             ;;
     esac
 
@@ -787,6 +795,31 @@ install_wasm_bindgen_cli() {
     log_ok "wasm-bindgen CLI gotowy"
 }
 
+# --- Android Rust/mobile toolchain ---
+
+install_android_rust_tools() {
+    log_section "Android Rust toolchain"
+
+    local target
+    for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
+        if rustup target list --installed | grep -q "^$target$"; then
+            log_ok "$target juz zainstalowany"
+        else
+            log_info "Dodawanie targetu $target..."
+            rustup target add "$target"
+            INSTALLED+=("$target")
+        fi
+    done
+
+    if command -v cargo-ndk &>/dev/null; then
+        log_ok "cargo-ndk juz zainstalowany"
+    else
+        log_info "Instalacja cargo-ndk..."
+        cargo install cargo-ndk
+        INSTALLED+=("cargo-ndk")
+    fi
+}
+
 # --- iOS targets (macOS only) ---
 
 install_ios_targets() {
@@ -1056,6 +1089,95 @@ Libs: -L$libdir -lGStreamer
 EOF
     done
     log_ok "pkg-config dla iOS xcframework: $pkgconfig_dir"
+}
+
+# --- GStreamer Android SDK ---
+
+find_gstreamer_android_pkg_config_dir() {
+    local root="$1"
+    local target_hint="$2"
+    local match
+    [ -d "$root" ] || return 1
+    match=$(find "$root" -path "*/lib/pkgconfig/gstreamer-1.0.pc" 2>/dev/null | grep -E "$target_hint" | head -1 || true)
+    if [[ -z "$match" ]]; then
+        match=$(find "$root" -path "*/pkgconfig/gstreamer-1.0.pc" 2>/dev/null | grep -E "$target_hint" | head -1 || true)
+    fi
+    if [[ -n "$match" ]]; then
+        dirname "$match"
+        return 0
+    fi
+    return 1
+}
+
+install_android_gstreamer_sdk() {
+    log_section "GStreamer Android SDK"
+
+    local gst_version="1.28.3"
+    local cache_dir="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
+    local target_dir="$cache_dir/gstreamer/android/$gst_version"
+    local existing
+
+    existing="$(find_gstreamer_android_pkg_config_dir "$target_dir" 'arm64|aarch64' 2>/dev/null || true)"
+    if [[ -z "$existing" && -n "${GSTREAMER_ANDROID_ROOT:-}" ]]; then
+        existing="$(find_gstreamer_android_pkg_config_dir "$GSTREAMER_ANDROID_ROOT" 'arm64|aarch64' 2>/dev/null || true)"
+    fi
+    if [[ -z "$existing" ]]; then
+        existing="$(find_gstreamer_android_pkg_config_dir "$HOME/Library/GStreamer" 'arm64|aarch64' 2>/dev/null || true)"
+    fi
+    if [[ -n "$existing" ]]; then
+        log_ok "GStreamer Android SDK juz dostepny: $existing"
+        return
+    fi
+
+    local archive="gstreamer-1.0-android-universal-${gst_version}.tar.xz"
+    local archive_url="https://gstreamer.freedesktop.org/data/pkg/android/${gst_version}/${archive}"
+    local sha_url="${archive_url}.sha256sum"
+    local download_dir="$cache_dir/downloads"
+    local archive_path="$download_dir/$archive"
+    local sha_path="$archive_path.sha256sum"
+
+    mkdir -p "$download_dir" "$target_dir"
+    if [[ ! -f "$archive_path" ]]; then
+        log_info "Pobieranie GStreamer Android SDK ${gst_version} (~939 MB)..."
+        curl -fL --progress-bar -o "$archive_path" "$archive_url"
+    fi
+    if [[ ! -f "$sha_path" ]]; then
+        curl -fL -o "$sha_path" "$sha_url"
+    fi
+    ( cd "$download_dir" && sha256sum -c "$(basename "$sha_path")" )
+
+    log_info "Wypakowuje GStreamer Android SDK do $target_dir..."
+    rm -rf "$target_dir"
+    mkdir -p "$target_dir"
+    tar -xJf "$archive_path" -C "$target_dir"
+
+    existing="$(find_gstreamer_android_pkg_config_dir "$target_dir" 'arm64|aarch64' 2>/dev/null || true)"
+    if [[ -z "$existing" ]]; then
+        log_error "Po wypakowaniu nie znaleziono gstreamer-1.0.pc dla arm64 w $target_dir"
+        return 1
+    fi
+
+    log_ok "GStreamer Android SDK zainstalowany: $target_dir"
+    INSTALLED+=("GStreamer Android SDK $gst_version")
+}
+
+install_android_gradle_runner() {
+    log_section "Android Gradle"
+
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [[ -z "$repo_root" ]]; then
+        log_warn "Nie znaleziono repo git — pomijam bootstrap Gradle."
+        return
+    fi
+
+    local gradlew="$repo_root/tentaflow-mobile/android/gradlew"
+    if [[ ! -x "$gradlew" ]]; then
+        chmod +x "$gradlew"
+    fi
+    "$gradlew" --version >/dev/null
+    log_ok "Android Gradle gotowy"
+    INSTALLED+=("Android Gradle")
 }
 
 # --- CUDA ---
@@ -1611,6 +1733,9 @@ main() {
     install_rust
     install_wasm_target
     install_wasm_bindgen_cli
+    install_android_rust_tools
+    install_android_gstreamer_sdk
+    install_android_gradle_runner
     install_ios_targets
     require_full_xcode
     install_metal_toolchain

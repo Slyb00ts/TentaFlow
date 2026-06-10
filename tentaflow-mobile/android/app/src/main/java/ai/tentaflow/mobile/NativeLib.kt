@@ -10,7 +10,7 @@ object NativeLib {
     }
 
     /** Uruchamia Rust core — Router, API server, mesh, inference */
-    external fun start()
+    external fun start(dataDir: String)
 
     /** Powiadomienie o przejsciu aplikacji w tlo */
     external fun onPause()

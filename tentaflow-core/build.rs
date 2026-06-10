@@ -876,6 +876,10 @@ mod services_manifest_build {
         SherpaTts,
         SherpaStt,
         Comfyui,
+        Anthropic,
+        AzureOpenai,
+        Elevenlabs,
+        Soniox,
         Custom,
     }
 
@@ -946,10 +950,13 @@ mod services_manifest_build {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ExternalDeploy {
         pub platforms: Vec<TargetOs>,
+        #[serde(default)]
         pub detection_binary: String,
         pub detection_endpoint: String,
         #[serde(default = "default_health_path")]
         pub detection_health_path: String,
+        #[serde(default)]
+        pub requires_api_key: bool,
     }
     fn default_health_path() -> String {
         "/".to_string()

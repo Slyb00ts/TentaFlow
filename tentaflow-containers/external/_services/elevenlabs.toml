@@ -1,0 +1,35 @@
+[engine]
+id = "elevenlabs"
+category = "tts"
+resource_kind = "ai"
+provider = "external"
+name = "ElevenLabs"
+description_pl = "Chmurowa synteza mowy ElevenLabs z wielojęzycznymi głosami."
+description_en = "ElevenLabs cloud text-to-speech with multilingual voices."
+homepage = "https://elevenlabs.io"
+license = "Proprietary"
+default_port = 443
+api = "elevenlabs"
+version = "1.0.0"
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_endpoint = "https://api.elevenlabs.io"
+detection_health_path = "/v1/models"
+requires_api_key = true
+
+[[model_preset]]
+id = "eleven-v3"
+display_name = "Eleven v3"
+repo = "eleven_v3"
+recommended = true
+
+[[model_preset]]
+id = "eleven-multilingual-v2"
+display_name = "Eleven Multilingual v2"
+repo = "eleven_multilingual_v2"
+
+[[model_preset]]
+id = "eleven-flash-v2-5"
+display_name = "Eleven Flash v2.5"
+repo = "eleven_flash_v2_5"

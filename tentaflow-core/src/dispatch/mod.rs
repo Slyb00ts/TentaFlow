@@ -607,6 +607,16 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResEnginePresets(_) => {
                 "ServiceEnginePresetsResponse"
             }
+            tentaflow_protocol::ServicePayload::ReqModelCatalog(_) => "ServiceModelCatalogRequest",
+            tentaflow_protocol::ServicePayload::ResModelCatalog(_) => "ServiceModelCatalogResponse",
+            tentaflow_protocol::ServicePayload::ReqModelSelection(_) => "ServiceModelSelectionRequest",
+            tentaflow_protocol::ServicePayload::ResModelSelection(_) => {
+                "ServiceModelSelectionResponse"
+            }
+            tentaflow_protocol::ServicePayload::ReqOauthStart(_) => "ServiceOauthStartRequest",
+            tentaflow_protocol::ServicePayload::ResOauthStart(_) => "ServiceOauthStartResponse",
+            tentaflow_protocol::ServicePayload::ReqOauthPoll(_) => "ServiceOauthPollRequest",
+            tentaflow_protocol::ServicePayload::ResOauthPoll(_) => "ServiceOauthPollResponse",
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {

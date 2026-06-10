@@ -371,15 +371,9 @@ impl SttManager {
                 "Pobieranie modelu Whisper '{}' z HuggingFace...",
                 WHISPER_MODEL_NAME
             );
-            let repo_id = WHISPER_HF_REPO.to_string();
-            let fname = filename.to_string();
-            let hf_path = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
-                let api = hf_hub::api::sync::Api::new()?;
-                let repo = api.model(repo_id);
-                let path = repo.get(&fname)?;
-                Ok(path)
-            })
-            .await??;
+            let api = hf_hub::api::tokio::Api::new()?;
+            let repo = api.model(WHISPER_HF_REPO.to_string());
+            let hf_path = repo.get(filename).await?;
             std::fs::copy(&hf_path, &model_path)?;
             info!(
                 "Model Whisper '{}' pobrany: {:?}",

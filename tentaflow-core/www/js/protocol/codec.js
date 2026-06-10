@@ -1150,6 +1150,42 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ServiceBody(ServicePayload::ReqModelCatalog) */
+  serviceModelCatalogRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceModelCatalogRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqModelSelection) */
+  serviceModelSelectionRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceModelSelectionRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqOauthStart) */
+  serviceOauthStartRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceOauthStartRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqOauthPoll) */
+  serviceOauthPollRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceOauthPollRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
   /** MessageBody::ServiceQuicStatusRequest (unit) */
   serviceQuicStatusRequest(correlationId, sequence = 1) {
     assertReady();
@@ -3242,6 +3278,10 @@ export function validateFrame(bytes) {
  * obiektu (rekursja niepotrzebna dla naszych payloadów które są płaskie).
  */
 function camelToSnakePayload(obj) {
+  // i64 fields (e.g. service_id) decode to JS BigInt, which JSON.stringify
+  // cannot serialize. Coerce to Number — these ids are well within the safe
+  // integer range, and the wasm decoder parses them back into i64.
+  if (typeof obj === 'bigint') return Number(obj);
   if (obj == null || typeof obj !== 'object') return obj;
   if (Array.isArray(obj)) return obj.map(camelToSnakePayload);
   const out = {};
