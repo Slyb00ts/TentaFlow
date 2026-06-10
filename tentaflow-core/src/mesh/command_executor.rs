@@ -397,7 +397,49 @@ impl MeshCommandExecutor {
                 self.handle_web_research(request_json).await
             }
             MeshCommandType::VectorOp { request_cbor } => self.handle_vector_op(request_cbor).await,
+            MeshCommandType::OauthStart { provider } => self.handle_oauth_start(provider).await,
+            MeshCommandType::OauthPoll { flow_id } => self.handle_oauth_poll(flow_id).await,
         }
+    }
+
+    /// Owner side of a forwarded subscription OAuth start: run the device-code
+    /// flow on THIS node (it owns the service + tokens) and return the URL/code.
+    async fn handle_oauth_start(&self, provider: String) -> CommandResponse {
+        if !provider.eq_ignore_ascii_case("openai") {
+            return CommandResponse::ok(MeshCommandResponsePayload::OauthStartResult {
+                flow_id: String::new(),
+                authorize_url: String::new(),
+                user_code: String::new(),
+                error: Some("subscription login is only available for OpenAI".to_string()),
+            });
+        }
+        match crate::services::backend::codex_oauth::start_login().await {
+            Ok((flow_id, authorize_url, user_code)) => {
+                CommandResponse::ok(MeshCommandResponsePayload::OauthStartResult {
+                    flow_id,
+                    authorize_url,
+                    user_code,
+                    error: None,
+                })
+            }
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::OauthStartResult {
+                flow_id: String::new(),
+                authorize_url: String::new(),
+                user_code: String::new(),
+                error: Some(e),
+            }),
+        }
+    }
+
+    /// Owner side of a forwarded subscription OAuth poll.
+    async fn handle_oauth_poll(&self, flow_id: String) -> CommandResponse {
+        let (status, account_label, error) =
+            crate::services::backend::codex_oauth::poll(&flow_id);
+        CommandResponse::ok(MeshCommandResponsePayload::OauthPollResult {
+            status,
+            account_label,
+            error,
+        })
     }
 
     /// Owner side of a forwarded vector op: run it against THIS node's local
@@ -913,6 +955,27 @@ impl MeshCommandExecutor {
                 Ok(v) => v,
                 Err(e) => return CommandResponse::fail(format!("invalid config_json: {}", e)),
             }
+        };
+        // Subscription login: the OAuth flow ran on THIS node (forwarded
+        // OauthStart/Poll), so swap the `oauth_flow_id` for the tokens captured
+        // in this node's local flow store.
+        let user_config = {
+            let mut cfg = user_config;
+            if let Some(obj) = cfg.as_object_mut() {
+                if let Some(flow_id) = obj
+                    .get("oauth_flow_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                {
+                    if let Some(blob) =
+                        crate::services::backend::codex_oauth::take_tokens(&flow_id)
+                    {
+                        obj.insert("api_key".to_string(), serde_json::Value::String(blob));
+                    }
+                    obj.remove("oauth_flow_id");
+                }
+            }
+            cfg
         };
         // Cloud external provider keys arrive plaintext over the encrypted mesh;
         // re-encrypt with THIS node's settings cipher so the key is node-local

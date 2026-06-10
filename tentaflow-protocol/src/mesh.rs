@@ -430,6 +430,17 @@ pub enum MeshCommandType {
     VectorOp {
         request_cbor: Vec<u8>,
     },
+    /// Forwarded subscription OAuth login start. The receiver owns the service
+    /// and tokens, so it runs the device-code flow locally and returns an
+    /// `OauthStartResult`. Appended at END (ciborium index rule).
+    OauthStart {
+        provider: String,
+    },
+    /// Forwarded subscription OAuth poll — receiver checks its local flow store
+    /// and returns an `OauthPollResult`. Appended at END.
+    OauthPoll {
+        flow_id: String,
+    },
 }
 
 // =============================================================================
@@ -494,6 +505,19 @@ pub enum MeshCommandResponsePayload {
     /// Opaque minicbor `VectorOpResponse` produced by the receiver running a
     /// forwarded `VectorOp` against its local Milvus. Appended at END.
     VectorOpResult { result_cbor: Vec<u8> },
+    /// Subscription OAuth login-start result from the receiver. Appended at END.
+    OauthStartResult {
+        flow_id: String,
+        authorize_url: String,
+        user_code: String,
+        error: Option<String>,
+    },
+    /// Subscription OAuth poll result from the receiver. Appended at END.
+    OauthPollResult {
+        status: String,
+        account_label: Option<String>,
+        error: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -633,6 +657,11 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("VectorOp")
                 .field("request_len", &request_cbor.len())
                 .finish(),
+            Self::OauthStart { provider } => f
+                .debug_struct("OauthStart")
+                .field("provider", provider)
+                .finish(),
+            Self::OauthPoll { .. } => write!(f, "OauthPoll"),
         }
     }
 }
