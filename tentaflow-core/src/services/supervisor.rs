@@ -1093,7 +1093,7 @@ impl Supervisor {
                 None => HealthStatus::Failed("HttpDirect: missing endpoint_url".into()),
             },
             Transport::ExternalHttp => match endpoint_url {
-                Some(url) => http_probe(url, self.health_timeout).await,
+                Some(url) => http_probe_external(url, self.health_timeout).await,
                 None => HealthStatus::Failed("ExternalHttp: missing endpoint_url".into()),
             },
             Transport::SidecarQuic => {
@@ -1378,6 +1378,34 @@ async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
         Err(e) if e.is_timeout() => HealthStatus::Failed(format!("timeout: {}", e)),
         Err(e) if e.is_connect() => HealthStatus::Failed(format!("connect: {}", e)),
         Err(e) => HealthStatus::Failed(format!("http error: {}", e)),
+    }
+}
+
+/// Health probe for external cloud providers (OpenAI, Anthropic, …). Unlike
+/// local engines, every provider endpoint is auth-gated, so an unauthenticated
+/// probe legitimately gets 401/403 — and some providers expose no `/v1/models`
+/// (404). Any HTTP response below 500 proves the provider is REACHABLE, which is
+/// "running" for us (the real key/token is sent on actual requests). Only a 5xx
+/// or a transport error counts against it, and even then we stay `Degraded`
+/// rather than `Failed` — the provider is user-owned, we never restart it.
+async fn http_probe_external(url: &str, timeout: Duration) -> HealthStatus {
+    let trimmed = url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1/models")
+        .trim_end_matches("/v1");
+    let probe_url = if url.contains("/health") {
+        url.to_string()
+    } else {
+        format!("{}/v1/models", trimmed)
+    };
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
+        Ok(c) => c,
+        Err(e) => return HealthStatus::Failed(format!("reqwest builder: {}", e)),
+    };
+    match client.get(&probe_url).send().await {
+        Ok(resp) if resp.status().as_u16() < 500 => HealthStatus::Ok,
+        Ok(resp) => HealthStatus::Degraded(format!("provider http {}", resp.status())),
+        Err(e) => HealthStatus::Degraded(format!("provider unreachable: {}", e)),
     }
 }
 
