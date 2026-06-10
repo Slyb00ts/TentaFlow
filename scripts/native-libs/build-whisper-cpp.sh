@@ -70,29 +70,35 @@ backend_enabled() {
 build_isolated_dylib() {
   local backend="$1" static_dir="$2" out_dir="$3" build="$4"
   shift 4
-  local enabled=("$@")
   local cxx="${CXX:-c++}"
 
-  local archives=(
-    "$static_dir/libwhisper.a"
-    "$static_dir/libggml.a"
-    "$static_dir/libggml-base.a"
-    "$static_dir/libggml-cpu.a"
-  )
-  backend_enabled cuda "${enabled[@]}"   && archives+=("$static_dir/libggml-cuda.a")
-  backend_enabled vulkan "${enabled[@]}" && archives+=("$static_dir/libggml-vulkan.a")
-  backend_enabled rocm "${enabled[@]}"   && archives+=("$static_dir/libggml-hip.a")
-  backend_enabled metal "${enabled[@]}"  && archives+=("$static_dir/libggml-metal.a")
+  # Wciagamy WSZYSTKIE zbudowane archiwa whisper.cpp (whisper + ggml + kazdy
+  # backend: cpu/cuda/metal/blas/vulkan/hip). Kazdy backend rejestruje sie w
+  # ggml_backend_registry() przez symbol `*_reg`, wiec pominiecie ktoregos (np.
+  # ggml-blas auto-wykrytego z Accelerate na macOS) = "Undefined symbols:
+  # _ggml_backend_blas_reg". Glob jest odporny na to, ktore backendy cmake
+  # faktycznie wlaczyl (czasem wiecej niz w MULTI_BACKENDS).
+  local archives=() a
+  for a in "$static_dir"/lib*.a; do
+    [ -f "$a" ] && archives+=("$a")
+  done
+  if [ "${#archives[@]}" -eq 0 ]; then
+    echo "[whisper.cpp] brak archiwow .a w $static_dir" >&2
+    exit 1
+  fi
+  # Liby systemowe/frameworki dobieramy po OBECNOSCI archiwum backendu, nie po
+  # liscie enabled — spojnie z globem powyzej.
+  has_lib() { [ -f "$static_dir/lib$1.a" ]; }
 
   case "$PLATFORM" in
     macos-*)
-      # macOS: two-level namespace sam w sobie blokuje interpozycje, ale i tak
-      # eksportujemy tylko `_whisper_*` lista symboli. `-all_load` wciaga calosc
-      # archiwow (odpowiednik --whole-archive).
+      # macOS: two-level namespace sam blokuje interpozycje, ale i tak
+      # eksportujemy tylko `_whisper_*`. `-all_load` wciaga calosc archiwow
+      # (odpowiednik --whole-archive). Accelerate pokrywa backend BLAS.
       local list="$build/whisper_exports.list"
       printf '_whisper_*\n' > "$list"
       local frameworks=(-framework Accelerate -framework Foundation)
-      backend_enabled metal "${enabled[@]}" && frameworks+=(-framework Metal -framework MetalKit)
+      has_lib ggml-metal && frameworks+=(-framework Metal -framework MetalKit)
       "$cxx" -dynamiclib -fPIC \
         -install_name "@rpath/libwhisper_tf.dylib" \
         -o "$out_dir/libwhisper_tf.dylib" \
@@ -114,15 +120,16 @@ build_isolated_dylib() {
       local map="$build/whisper_exports.map"
       printf '{ global: whisper_*; local: *; };\n' > "$map"
       local syslibs=(-fopenmp -lm -ldl -lpthread -lrt)
-      if backend_enabled cuda "${enabled[@]}"; then
+      if has_lib ggml-cuda; then
         syslibs+=(-L/usr/local/cuda/lib64 -L/usr/local/cuda/lib64/stubs -L/opt/cuda/lib64 -L/opt/cuda/lib64/stubs)
         syslibs+=(-lcudart -lcublas -lcublasLt -lcuda -lculibos)
       fi
-      backend_enabled vulkan "${enabled[@]}" && syslibs+=(-lvulkan)
-      if backend_enabled rocm "${enabled[@]}"; then
+      has_lib ggml-vulkan && syslibs+=(-lvulkan)
+      if has_lib ggml-hip; then
         local hip="${HIP_PATH:-/opt/rocm}"
         syslibs+=(-L"$hip/lib" -lhipblas -lrocblas -lamdhip64)
       fi
+      has_lib ggml-blas && syslibs+=(-lopenblas)
       "$cxx" -shared -fPIC \
         -o "$out_dir/libwhisper_tf.so" \
         -Wl,--version-script="$map" \
@@ -215,7 +222,7 @@ build_backend() {
   # build_isolated_dylib. Glowna binarka linkuje go dynamicznie, a llama.cpp
   # zostaje statycznie ze swoim ggml. To eliminuje kolizje symboli ggml_*.
   append_manifest_library "$PLATFORM" "whisper-cpp-$backend" "static-input-for-dylib" "$WHISPER_CPP_REF" "Backend: ${enabled_backends[*]:-cpu}. Wejscie do izolowanego dylib."
-  build_isolated_dylib "$backend" "$static_dir" "$dynamic_dir" "$build" "${enabled_backends[@]}"
+  build_isolated_dylib "$backend" "$static_dir" "$dynamic_dir" "$build"
 }
 
 for backend in "${BACKEND_LIST[@]}"; do
