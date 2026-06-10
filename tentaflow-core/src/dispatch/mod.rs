@@ -517,6 +517,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "SchedulerJobRunNowResponse"
             }
         },
+        MessageBody::SkillsBody(p) => match p {
+            tentaflow_protocol::SkillsPayload::ListRequest(_) => "SkillsListRequest",
+            tentaflow_protocol::SkillsPayload::ListResponse(_) => "SkillsListResponse",
+            tentaflow_protocol::SkillsPayload::DetailRequest(_) => "SkillsDetailRequest",
+            tentaflow_protocol::SkillsPayload::DetailResponse(_) => "SkillsDetailResponse",
+            tentaflow_protocol::SkillsPayload::UpsertRequest(_) => "SkillsUpsertRequest",
+            tentaflow_protocol::SkillsPayload::UpsertResponse(_) => "SkillsUpsertResponse",
+            tentaflow_protocol::SkillsPayload::DeleteRequest(_) => "SkillsDeleteRequest",
+            tentaflow_protocol::SkillsPayload::DeleteResponse(_) => "SkillsDeleteResponse",
+            tentaflow_protocol::SkillsPayload::ForkRequest(_) => "SkillsForkRequest",
+            tentaflow_protocol::SkillsPayload::ForkResponse(_) => "SkillsForkResponse",
+        },
         MessageBody::SyncConflictBody(p) => match p {
             tentaflow_protocol::SyncConflictPayload::ListRequest(_) => "SyncConflictsListRequest",
             tentaflow_protocol::SyncConflictPayload::ListResponse(_) => "SyncConflictsListResponse",

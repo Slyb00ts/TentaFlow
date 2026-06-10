@@ -56,6 +56,7 @@ import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
 import LegalScreen from '/js/modules/legal/index.js';
 import SchedulerScreen from '/js/modules/scheduler.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
+import SkillsScreen from '/js/modules/skills.js';
 
 // Adapter: profile-report eksponuje statyczne `render(container, params)`,
 // podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
@@ -120,6 +121,13 @@ const ADMIN_NAV = [
       { id: 'flows', labelKey: 'nav.flows', icon: 'flow' },
       { id: 'scheduler', labelKey: 'nav.scheduler', icon: 'clock' },
       { id: 'rules', labelKey: 'nav.rules', icon: 'rules' },
+    ],
+  },
+  {
+    headingKey: 'nav.section_ai_agents',
+    icon: 'brain',
+    items: [
+      { id: 'skills', labelKey: 'nav.skills', icon: 'sparkle' },
     ],
   },
   {
@@ -484,6 +492,7 @@ async function renderApp() {
   Router.register('flows', FlowsScreen);
   Router.register('flow-builder', FlowBuilderScreen);
   Router.register('scheduler', SchedulerScreen);
+  Router.register('skills', SkillsScreen);
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
   Router.register('users', UsersScreen);

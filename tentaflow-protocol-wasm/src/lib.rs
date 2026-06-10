@@ -1498,6 +1498,63 @@ pub fn encode_scheduler_job_run_now_request(job_id: String) -> Result<Vec<u8>, J
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeSkillsListRequest)]
+pub fn encode_skills_list_request(
+    tag: Option<String>,
+    source: Option<String>,
+    status: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::ListRequest(tentaflow_protocol::SkillsListRequest {
+            tag,
+            source,
+            status,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsDetailRequest)]
+pub fn encode_skills_detail_request(skill_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::DetailRequest(tentaflow_protocol::SkillsDetailRequest {
+            skill_id,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsUpsertRequest)]
+pub fn encode_skills_upsert_request(skill_json: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::UpsertRequest(tentaflow_protocol::SkillsUpsertRequest {
+            skill_json,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsDeleteRequest)]
+pub fn encode_skills_delete_request(skill_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::DeleteRequest(tentaflow_protocol::SkillsDeleteRequest {
+            skill_id,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsForkRequest)]
+pub fn encode_skills_fork_request(skill_id: String, new_name: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::ForkRequest(tentaflow_protocol::SkillsForkRequest {
+            skill_id,
+            new_name,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 fn parse_sync_conflict_resolution(
     resolution: &str,
 ) -> Result<tentaflow_protocol::SyncConflictResolution, JsError> {
@@ -3741,6 +3798,62 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "SchedulerJobRunNowResponse".into());
                 set(&obj, "runJson", resp.run_json.clone().into());
                 set(&obj, "run_json", resp.run_json.into());
+            }
+        },
+        MessageBody::SkillsBody(payload) => match payload {
+            tentaflow_protocol::SkillsPayload::ListRequest(req) => {
+                set(&obj, "variant", "SkillsListRequest".into());
+                set_optional_string(&obj, "tag", req.tag);
+                set_optional_string(&obj, "source", req.source);
+                set_optional_string(&obj, "status", req.status);
+            }
+            tentaflow_protocol::SkillsPayload::ListResponse(resp) => {
+                set(&obj, "variant", "SkillsListResponse".into());
+                set(&obj, "skillsJson", resp.skills_json.clone().into());
+                set(&obj, "skills_json", resp.skills_json.into());
+            }
+            tentaflow_protocol::SkillsPayload::DetailRequest(req) => {
+                set(&obj, "variant", "SkillsDetailRequest".into());
+                set(&obj, "skillId", req.skill_id.clone().into());
+                set(&obj, "skill_id", req.skill_id.into());
+            }
+            tentaflow_protocol::SkillsPayload::DetailResponse(resp) => {
+                set(&obj, "variant", "SkillsDetailResponse".into());
+                set(&obj, "skillJson", resp.skill_json.clone().into());
+                set(&obj, "skill_json", resp.skill_json.into());
+                set(&obj, "filesJson", resp.files_json.clone().into());
+                set(&obj, "files_json", resp.files_json.into());
+            }
+            tentaflow_protocol::SkillsPayload::UpsertRequest(req) => {
+                set(&obj, "variant", "SkillsUpsertRequest".into());
+                set(&obj, "skillJson", req.skill_json.clone().into());
+                set(&obj, "skill_json", req.skill_json.into());
+            }
+            tentaflow_protocol::SkillsPayload::UpsertResponse(resp) => {
+                set(&obj, "variant", "SkillsUpsertResponse".into());
+                set(&obj, "skillId", resp.skill_id.clone().into());
+                set(&obj, "skill_id", resp.skill_id.into());
+            }
+            tentaflow_protocol::SkillsPayload::DeleteRequest(req) => {
+                set(&obj, "variant", "SkillsDeleteRequest".into());
+                set(&obj, "skillId", req.skill_id.clone().into());
+                set(&obj, "skill_id", req.skill_id.into());
+            }
+            tentaflow_protocol::SkillsPayload::DeleteResponse(resp) => {
+                set(&obj, "variant", "SkillsDeleteResponse".into());
+                set(&obj, "deleted", resp.deleted.into());
+            }
+            tentaflow_protocol::SkillsPayload::ForkRequest(req) => {
+                set(&obj, "variant", "SkillsForkRequest".into());
+                set(&obj, "skillId", req.skill_id.clone().into());
+                set(&obj, "skill_id", req.skill_id.into());
+                set(&obj, "newName", req.new_name.clone().into());
+                set(&obj, "new_name", req.new_name.into());
+            }
+            tentaflow_protocol::SkillsPayload::ForkResponse(resp) => {
+                set(&obj, "variant", "SkillsForkResponse".into());
+                set(&obj, "skillId", resp.skill_id.clone().into());
+                set(&obj, "skill_id", resp.skill_id.into());
             }
         },
         MessageBody::SyncConflictBody(payload) => match payload {

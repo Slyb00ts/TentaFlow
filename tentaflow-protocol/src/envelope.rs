@@ -128,7 +128,10 @@ mod serde_array64 {
 // komponenty, bez HTML renderingu po stronie hosta). Trzy nowe
 // MessageBody warianty (6 paired structs) — dodanie wariantu do enum
 // zmienia tag value w CBOR, wymagany handshake bump.
-pub const SCHEMA_VERSION: u16 = 14;
+// v15 changes: added `MessageBody::SkillsBody(SkillsPayload)` (Skills
+// registry, Harness plan §3.2: List/Detail/Upsert/Delete/Fork pairs).
+// New enum variant shifts CBOR tag values — handshake bump required.
+pub const SCHEMA_VERSION: u16 = 15;
 
 // =============================================================================
 // Message kind discriminants

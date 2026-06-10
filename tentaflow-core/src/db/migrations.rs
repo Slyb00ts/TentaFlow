@@ -355,8 +355,46 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "repair_default_flow_random_id",
             MigrationStep::RustSelfManaged(repair_default_flow_random_id),
         ),
+        (62, "skills_registry", MigrationStep::Sql(SKILLS_REGISTRY)),
     ]
 }
+
+// Skills registry (Harness plan §3.2): instruction-only skills (markdown +
+// text references, never scripts). `name` is deliberately NOT UNIQUE — the
+// table replicates fleet-wide (like `flows`) and a UNIQUE constraint would
+// break sync apply when two nodes mint same-named skills concurrently;
+// soft uniqueness is enforced at the handler/UI layer. `use_count` /
+// `last_used_at` are node-local usage stats and never travel through sync.
+const SKILLS_REGISTRY: &str = "
+CREATE TABLE skills (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    display_name TEXT,
+    description TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    category TEXT,
+    source TEXT NOT NULL CHECK(source IN ('user','addon','hub')),
+    source_ref TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','disabled','quarantine','archived')),
+    use_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE skill_files (
+    skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    content TEXT NOT NULL,
+    PRIMARY KEY (skill_id, path)
+);
+
+CREATE INDEX idx_skills_source ON skills(source);
+CREATE INDEX idx_skills_status ON skills(status);
+";
 
 // Multi-instance addons: split the single `addons.addon_id` identity into a
 // versioned PACKAGE (the template — wasm + manifest + migrations, catalogued in
@@ -692,6 +730,13 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "sync_explicit_shares",
             "subject_id",
             "polymorphic user|node id stored as free TEXT (subject_type discriminator)",
+        ),
+        t(
+            "skills",
+            "created_by",
+            "creator provenance marker born TEXT in v62 (post-flip, never held an \
+             INTEGER id); nullable, no declared user_accounts FK — synced rows may \
+             reference an account the receiving node has not materialized yet",
         ),
         t(
             "compliance_data_subjects",
