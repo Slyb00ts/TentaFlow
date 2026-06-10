@@ -13,8 +13,13 @@ fn main() {
     let variant = env::var("WHISPER_CPP_NATIVE_VARIANT").unwrap_or_else(|_| "multi".to_string());
     let platform_root = native_root.join(platform);
     let include_dir = platform_root.join("include").join("whisper");
+    // Whisper jest linkowany jako IZOLOWANY dylib (prywatny ggml, eksport tylko
+    // whisper_*) — budowany przez scripts/native-libs/build-whisper-cpp.sh. Dzieki
+    // temu glowna binarka moze rownoczesnie linkowac STATYCZNY ggml z llama.cpp
+    // (inna wersja) bez kolizji symboli. NIE linkujemy tu statycznych ggml ani
+    // libow backendow (cuda/vulkan/...) — wszystko jest zamkniete w .so.
     let lib_dir = platform_root
-        .join("lib-static")
+        .join("lib-dynamic")
         .join("whisper-cpp")
         .join(&variant);
 
@@ -25,26 +30,16 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
 
     require(&include_dir.join("whisper.h"));
-    require(&lib_dir.join(static_name("whisper", &target)));
-    require(&lib_dir.join(static_name("ggml", &target)));
-    require(&lib_dir.join(static_name("ggml-base", &target)));
-    require(&lib_dir.join(static_name("ggml-cpu", &target)));
+    require(&lib_dir.join(dynamic_name("whisper_tf", &target)));
 
     generate_bindings(&include_dir);
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    link_static_if_exists(&lib_dir, "whisper", &target);
-    link_static_if_exists(&lib_dir, "ggml", &target);
-    link_static_if_exists(&lib_dir, "ggml-base", &target);
-    link_static_if_exists(&lib_dir, "ggml-cpu", &target);
-    link_static_if_exists(&lib_dir, "ggml-vulkan", &target);
-    link_static_if_exists(&lib_dir, "ggml-cuda", &target);
-    link_static_if_exists(&lib_dir, "ggml-hip", &target);
-    link_static_if_exists(&lib_dir, "ggml-metal", &target);
+    println!("cargo:rustc-link-lib=dylib=whisper_tf");
+    // Runtime: tentaflow/build.rs kopiuje libwhisper_tf.* obok binarki ($ORIGIN
+    // rpath); na macOS install-name to @rpath/libwhisper_tf.dylib.
 
-    link_system_libs(&lib_dir, &target);
-
-    println!("cargo:WHISPER_CPP_VERSION=native-libs");
+    println!("cargo:WHISPER_CPP_VERSION=native-libs-isolated-dylib");
 }
 
 fn native_root() -> PathBuf {
@@ -73,11 +68,13 @@ fn platform_name(target: &str) -> &'static str {
     }
 }
 
-fn static_name(name: &str, target: &str) -> String {
+fn dynamic_name(name: &str, target: &str) -> String {
     if target.contains("windows-msvc") {
-        format!("{name}.lib")
+        format!("{name}.dll")
+    } else if target.contains("apple") {
+        format!("lib{name}.dylib")
     } else {
-        format!("lib{name}.a")
+        format!("lib{name}.so")
     }
 }
 
@@ -105,47 +102,3 @@ fn generate_bindings(include_dir: &Path) {
         .expect("whisper-rs-sys: nie mozna zapisac bindings.rs");
 }
 
-fn link_static_if_exists(lib_dir: &Path, name: &str, target: &str) {
-    if lib_dir.join(static_name(name, target)).exists() {
-        println!("cargo:rustc-link-lib=static={name}");
-    }
-}
-
-fn link_system_libs(lib_dir: &Path, target: &str) {
-    if target.contains("linux") {
-        println!("cargo:rustc-link-lib=dylib=stdc++");
-        println!("cargo:rustc-link-lib=dylib=gomp");
-    } else if target.contains("apple") {
-        println!("cargo:rustc-link-lib=c++");
-        println!("cargo:rustc-link-lib=framework=Accelerate");
-        if lib_dir.join("libggml-metal.a").exists() {
-            println!("cargo:rustc-link-lib=framework=Foundation");
-            println!("cargo:rustc-link-lib=framework=Metal");
-            println!("cargo:rustc-link-lib=framework=MetalKit");
-        }
-    }
-
-    if lib_dir.join(static_name("ggml-vulkan", target)).exists() {
-        println!("cargo:rustc-link-lib=dylib=vulkan");
-    }
-
-    if lib_dir.join(static_name("ggml-cuda", target)).exists() {
-        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
-        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64/stubs");
-        println!("cargo:rustc-link-search=native=/opt/cuda/lib64");
-        println!("cargo:rustc-link-search=native=/opt/cuda/lib64/stubs");
-        println!("cargo:rustc-link-lib=dylib=cublas");
-        println!("cargo:rustc-link-lib=dylib=cudart");
-        println!("cargo:rustc-link-lib=dylib=cublasLt");
-        println!("cargo:rustc-link-lib=dylib=cuda");
-        println!("cargo:rustc-link-lib=static=culibos");
-    }
-
-    if lib_dir.join(static_name("ggml-hip", target)).exists() {
-        let hip_path = env::var("HIP_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
-        println!("cargo:rustc-link-search=native={}/lib", hip_path);
-        println!("cargo:rustc-link-lib=dylib=hipblas");
-        println!("cargo:rustc-link-lib=dylib=rocblas");
-        println!("cargo:rustc-link-lib=dylib=amdhip64");
-    }
-}

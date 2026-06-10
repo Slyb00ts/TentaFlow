@@ -305,11 +305,24 @@ access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write
 - `tentaflow-wrappers/examples/whisper_smoke.rs` ładuje model whisper.cpp przez
   nasz wrapper i wykonuje krótką transkrypcję ciszy, żeby sprawdzić runtime bez
   uruchamiania całego API.
-- `inference-whisper` nie jest częścią domyślnego ani `gpu-*` buildu `tentaflow`.
-  Statyczne `llama.cpp` i `whisper.cpp` mają kolidujące symbole `ggml/ggml-cuda`;
-  linkowanie obu do jednej binarki może mieszać implementacje CUDA i kończyć się
-  `SIGABRT` podczas inferencji LLM. Whisper włączaj jawnie tylko do testów albo
-  wydziel jako osobny proces/dylib z odizolowanymi symbolami.
+- `inference-whisper` jest ZAWSZE wbudowany na nie-Apple (Linux/Windows w
+  `tentaflow/Cargo.toml`, Android w `tentaflow-mobile/core/Cargo.toml`) — engine
+  STT `whisper` musi byc dostepny w runtime na tych platformach, to nie jest
+  feature opt-in. Apple (macOS/iOS) NIE linkuje whisper.cpp — STT idzie przez
+  MLX-whisper / natywny Swift. Wpiete per-target przez osobny blok
+  `[target.'cfg(...)'.dependencies]`, zeby Apple bylo z niego wykluczone.
+- Whisper.cpp i llama.cpp ZAWSZE wspolistnieja w binarce (kazdy `gpu-*` feature
+  pociaga `inference-llamacpp`), a oba projekty wnosza WLASNY, ROZNYCH WERSJI
+  ggml (llama master vs whisper `v1.8.3`) z identycznymi nazwami symboli `ggml_*`.
+  Zeby to nie konczylo sie `SIGABRT` (mieszanie dwoch implementacji ggml), whisper
+  jest linkowany jako IZOLOWANY dylib: `build-whisper-cpp.sh` linkuje whisper +
+  jego ggml w jeden `libwhisper_tf.so` z version-scriptem `{ global: whisper_*;
+  local: *; }` (ggml_* UKRYTE), `whisper-rs-sys/build.rs` linkuje ten dylib
+  dynamicznie (a NIE statyczne ggml), a `tentaflow/build.rs` kopiuje go plasko
+  obok binarki (`$ORIGIN`). Dzieki temu llama.cpp zostaje statycznie ze swoim
+  ggml i nie ma kolizji — bez dawnego hacka `--allow-multiple-definition`.
+  Izolacja jest zaimplementowana dla Linux i macOS w `build-whisper-cpp.sh`;
+  na Windows izolowany DLL (eksport whisper_* przez `.def`) buduje `build-all.ps1`.
 - Deploy `llama.cpp` z HuggingFace GGUF musi wskazywać pojedynczy plik `.gguf`
   (`config_json.model_file`) albo preset z `quantization`; downloader nie powinien
   pobierać wszystkich kwantyzacji z repozytorium.
