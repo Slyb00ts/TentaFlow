@@ -26,6 +26,7 @@ fn make_engine(id: &str, category: Category) -> Engine {
         homepage: "https://example.com".to_string(),
         license: "MIT".to_string(),
         icon: None,
+        provider: None,
         default_port: 8000,
         api: ApiKind::OpenaiCompatible,
         version: "1.0.0".to_string(),
