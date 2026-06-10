@@ -14,6 +14,11 @@
 /// oraz przez flow_engine adapter `tts_clean`.
 pub mod clean_cache;
 
+// Pure file I/O (Piper phoneme map -> sherpa tokens.txt) — kept outside the
+// `inference-sherpa` gate so the logic and its tests build without linking
+// the native sherpa-onnx library.
+pub mod piper_tokens;
+
 #[cfg(feature = "inference-sherpa")]
 pub mod sherpa;
 

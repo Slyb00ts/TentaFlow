@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::info;
 
+use super::piper_tokens::{generate_tokens_from_piper_json, heal_missing_space_token};
 use super::{SynthesizeParams, SynthesizeResult, TtsEngine, TtsModelInfo};
 
 /// Katalog cache na pobrane bundle VITS Piper. Wspolny prefix dla wszystkich
@@ -72,11 +73,18 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
             target.display()
         );
         // Cache z wczesniejszej wersji moze nie miec wstrzyknietych metadanych
-        // ONNX dla raw Piper voices — domykamy idempotentnie.
+        // ONNX dla raw Piper voices — domykamy idempotentnie. tokens.txt moze
+        // tez pochodzic z wersji pomijajacej phoneme spacji — naprawiamy
+        // (patrz piper_tokens::heal_missing_space_token).
         let t = target.clone();
-        tokio::task::spawn_blocking(move || ensure_piper_onnx_metadata(&t))
-            .await
-            .context("blocking task panic")??;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            if let Some(onnx_json) = find_file_with_ext(&t, ".onnx.json") {
+                heal_missing_space_token(&t.join("tokens.txt"), &onnx_json)?;
+            }
+            ensure_piper_onnx_metadata(&t)
+        })
+        .await
+        .context("blocking task panic")??;
         return Ok(target);
     }
 
@@ -308,52 +316,6 @@ fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
         })?;
     }
 
-    Ok(())
-}
-
-/// Konwertuje Piper `.onnx.json` -> sherpa `tokens.txt`. Format Piper:
-/// `phoneme_id_map: { "<phoneme>": [<id>, ...] }` — sherpa uzywa pierwszego
-/// ID z tablicy. Phoneme zlozone z samych whitespace pomijamy, bo sherpa
-/// parsuje tokens.txt po `split(' ')` i nie ma sposobu zakodowac tokena
-/// "spacja" jednoznacznie.
-fn generate_tokens_from_piper_json(json_path: &Path, out_path: &Path) -> Result<()> {
-    let bytes =
-        std::fs::read(json_path).with_context(|| format!("read {}", json_path.display()))?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse json {}", json_path.display()))?;
-    let map = v
-        .get("phoneme_id_map")
-        .and_then(|x| x.as_object())
-        .ok_or_else(|| anyhow!("brak phoneme_id_map w {}", json_path.display()))?;
-
-    let mut entries: Vec<(String, i64)> = Vec::with_capacity(map.len());
-    for (phoneme, ids) in map.iter() {
-        if phoneme.is_empty() || phoneme.chars().all(char::is_whitespace) {
-            continue;
-        }
-        let first_id = ids
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|x| x.as_i64())
-            .ok_or_else(|| {
-                anyhow!(
-                    "phoneme_id_map['{}'] nie jest tablica intow w {}",
-                    phoneme,
-                    json_path.display()
-                )
-            })?;
-        entries.push((phoneme.clone(), first_id));
-    }
-    entries.sort_by_key(|(_, id)| *id);
-
-    let mut out = String::with_capacity(entries.len() * 8);
-    for (phoneme, id) in &entries {
-        out.push_str(phoneme);
-        out.push(' ');
-        out.push_str(&id.to_string());
-        out.push('\n');
-    }
-    std::fs::write(out_path, out).with_context(|| format!("write {}", out_path.display()))?;
     Ok(())
 }
 
