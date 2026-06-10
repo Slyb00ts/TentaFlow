@@ -3111,6 +3111,60 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            K::Skill => {
+                let mut stmt = tx.prepare(&format!("SELECT {SKILL_COLS} FROM skills"))?;
+                let rows = stmt
+                    .query_map([], row_to_skill)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for skill in rows {
+                    let params = SkillParams {
+                        id: &skill.id,
+                        name: &skill.name,
+                        display_name: skill.display_name.as_deref(),
+                        description: &skill.description,
+                        content: &skill.content,
+                        tags_json: &skill.tags_json,
+                        category: skill.category.as_deref(),
+                        source: &skill.source,
+                        source_ref: skill.source_ref.as_deref(),
+                        status: &skill.status,
+                        created_by: skill.created_by.as_deref(),
+                        actor_user_id: None,
+                    };
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        skill.id.clone(),
+                        Insert,
+                        skill_changed_fields(&params),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::SkillFile => {
+                let mut stmt = tx.prepare("SELECT skill_id, path, content FROM skill_files")?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (skill_id, path, content) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        skill_file_resource_id(&skill_id, &path),
+                        Insert,
+                        skill_file_changed_fields(&skill_id, &path, Some(&content)),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
             K::SyncPolicy => {
                 let mut stmt = tx.prepare(
                     "SELECT policy_id, org_id, addon_id, resource_type, resource_id, mode, \
@@ -4042,6 +4096,725 @@ pub fn delete_flow_model_binding(pool: &DbPool, id: &str) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+// --- Skills ---
+
+/// Hard limits of the Skills registry (Harness plan §3.2, Hermes parity).
+/// Enforced on every handler-facing write (`upsert_skill`, `replace_skill_files`).
+pub const SKILL_NAME_MAX_CHARS: usize = 64;
+pub const SKILL_DESCRIPTION_MAX_CHARS: usize = 1024;
+pub const SKILL_CONTENT_MAX_CHARS: usize = 100_000;
+pub const SKILL_FILE_MAX_BYTES: usize = 1024 * 1024;
+/// Reference-file path prefixes a skill may carry. `scripts/` is deliberately
+/// absent: skills are instruction-only (executable parts belong to addons).
+pub const SKILL_FILE_ALLOWED_PREFIXES: &[&str] = &["references/", "templates/"];
+
+const SKILL_COLS: &str = "id, name, display_name, description, content, tags_json, category, \
+     source, source_ref, status, use_count, last_used_at, created_by, created_at, updated_at";
+
+fn row_to_skill(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbSkill> {
+    Ok(DbSkill {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        display_name: row.get(2)?,
+        description: row.get(3)?,
+        content: row.get(4)?,
+        tags_json: row.get(5)?,
+        category: row.get(6)?,
+        source: row.get(7)?,
+        source_ref: row.get(8)?,
+        status: row.get(9)?,
+        use_count: row.get(10)?,
+        last_used_at: row.get(11)?,
+        created_by: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    })
+}
+
+/// True for non-empty kebab-case: lowercase ASCII alphanumerics separated by
+/// single hyphens, no leading/trailing hyphen.
+pub fn is_kebab_case(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Validates the §3.2 limits for a skill write. Public so stage-B protocol
+/// handlers can pre-validate and surface the exact message to the dashboard.
+pub fn validate_skill_params(params: &SkillParams<'_>) -> Result<()> {
+    if params.name.chars().count() > SKILL_NAME_MAX_CHARS || !is_kebab_case(params.name) {
+        return Err(anyhow::anyhow!(
+            "skill name must be kebab-case, 1..={SKILL_NAME_MAX_CHARS} chars: '{}'",
+            params.name
+        ));
+    }
+    if params.description.is_empty()
+        || params.description.chars().count() > SKILL_DESCRIPTION_MAX_CHARS
+    {
+        return Err(anyhow::anyhow!(
+            "skill description must be 1..={SKILL_DESCRIPTION_MAX_CHARS} chars"
+        ));
+    }
+    if params.content.chars().count() > SKILL_CONTENT_MAX_CHARS {
+        return Err(anyhow::anyhow!(
+            "skill content exceeds {SKILL_CONTENT_MAX_CHARS} chars"
+        ));
+    }
+    if !matches!(params.source, "user" | "addon" | "hub") {
+        return Err(anyhow::anyhow!("invalid skill source: '{}'", params.source));
+    }
+    if !matches!(
+        params.status,
+        "active" | "disabled" | "quarantine" | "archived"
+    ) {
+        return Err(anyhow::anyhow!("invalid skill status: '{}'", params.status));
+    }
+    let tags: Vec<String> = serde_json::from_str(params.tags_json)
+        .map_err(|e| anyhow::anyhow!("skill tags_json must be a JSON array of strings: {e}"))?;
+    drop(tags);
+    Ok(())
+}
+
+/// Validates a single skill reference file: path confined to the allowed
+/// prefixes (relative, no traversal, no backslashes), content within 1 MiB.
+pub fn validate_skill_file(path: &str, content: &str) -> Result<()> {
+    let allowed_prefix = SKILL_FILE_ALLOWED_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix) && path.len() > prefix.len());
+    if !allowed_prefix {
+        return Err(anyhow::anyhow!(
+            "skill file path must live under references/ or templates/ (scripts are not allowed): '{path}'"
+        ));
+    }
+    if path.len() > 256
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path.split('/').any(|segment| {
+            segment.is_empty() || segment == "." || segment == ".." || segment.starts_with('~')
+        })
+    {
+        return Err(anyhow::anyhow!("invalid skill file path: '{path}'"));
+    }
+    if content.len() > SKILL_FILE_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "skill file '{path}' exceeds {SKILL_FILE_MAX_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// Synced field set of a skill row. Node-local columns (use_count,
+/// last_used_at) are deliberately excluded so a replicated edit never resets
+/// another node's usage stats; created_by travels for provenance and is applied
+/// on insert only.
+fn skill_changed_fields(
+    params: &SkillParams<'_>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), field_string(params.name));
+    fields.insert(
+        "display_name".to_string(),
+        field_optional_string(params.display_name),
+    );
+    fields.insert("description".to_string(), field_string(params.description));
+    fields.insert("content".to_string(), field_string(params.content));
+    fields.insert("tags_json".to_string(), field_string(params.tags_json));
+    fields.insert(
+        "category".to_string(),
+        field_optional_string(params.category),
+    );
+    fields.insert("source".to_string(), field_string(params.source));
+    fields.insert(
+        "source_ref".to_string(),
+        field_optional_string(params.source_ref),
+    );
+    fields.insert("status".to_string(), field_string(params.status));
+    fields.insert(
+        "created_by".to_string(),
+        field_optional_string(params.created_by),
+    );
+    fields
+}
+
+fn skill_file_resource_id(skill_id: &str, path: &str) -> String {
+    crate::sync::resource_id::composite_resource_id(&[skill_id, path])
+}
+
+fn skill_file_changed_fields(
+    skill_id: &str,
+    path: &str,
+    content: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("skill_id".to_string(), field_string(skill_id));
+    fields.insert("path".to_string(), field_string(path));
+    if let Some(content) = content {
+        fields.insert("content".to_string(), field_string(content));
+    }
+    fields
+}
+
+pub fn list_skills(pool: &DbPool, filter: &SkillListFilter<'_>) -> Result<Vec<DbSkill>> {
+    let conn = acquire(pool)?;
+    let mut sql = format!("SELECT {SKILL_COLS} FROM skills WHERE 1=1");
+    let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+    if let Some(source) = &filter.source {
+        sql.push_str(" AND source = ?");
+        binds.push(source);
+    }
+    if let Some(status) = &filter.status {
+        sql.push_str(" AND status = ?");
+        binds.push(status);
+    }
+    if let Some(tag) = &filter.tag {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM json_each(skills.tags_json) WHERE json_each.value = ?)",
+        );
+        binds.push(tag);
+    }
+    sql.push_str(" ORDER BY name, created_at, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(&binds[..], row_to_skill)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn get_skill(pool: &DbPool, id: &str) -> Result<Option<DbSkill>> {
+    let conn = acquire(pool)?;
+    let mut stmt =
+        conn.prepare_cached(&format!("SELECT {SKILL_COLS} FROM skills WHERE id = ?1"))?;
+    let result = stmt
+        .query_row(rusqlite::params![id], row_to_skill)
+        .optional()?;
+    Ok(result)
+}
+
+/// Names are soft-unique (no UNIQUE constraint — sync); pick the oldest row
+/// deterministically when concurrent nodes minted the same name.
+pub fn get_skill_by_name(pool: &DbPool, name: &str) -> Result<Option<DbSkill>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {SKILL_COLS} FROM skills WHERE name = ?1 ORDER BY created_at, id LIMIT 1"
+    ))?;
+    let result = stmt
+        .query_row(rusqlite::params![name], row_to_skill)
+        .optional()?;
+    Ok(result)
+}
+
+/// Insert-or-update a skill. Every upsert is captured as a full-row Insert (the
+/// receiver applies it as an upsert), so a replicated edit never depends on
+/// UPDATE-after-INSERT causal ordering. On conflict the local-only columns
+/// (use_count, last_used_at, created_by, created_at) are preserved.
+pub fn upsert_skill(pool: &DbPool, params: &SkillParams<'_>) -> Result<()> {
+    validate_skill_params(params)?;
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO skills \
+         (id, name, display_name, description, content, tags_json, category, source, source_ref, status, created_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+         ON CONFLICT(id) DO UPDATE SET \
+         name = excluded.name, display_name = excluded.display_name, \
+         description = excluded.description, content = excluded.content, \
+         tags_json = excluded.tags_json, category = excluded.category, \
+         source = excluded.source, source_ref = excluded.source_ref, \
+         status = excluded.status, updated_at = datetime('now')",
+        rusqlite::params![
+            params.id,
+            params.name,
+            params.display_name,
+            params.description,
+            params.content,
+            params.tags_json,
+            params.category,
+            params.source,
+            params.source_ref,
+            params.status,
+            params.created_by,
+        ],
+    )?;
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Skill,
+        params.id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        skill_changed_fields(params),
+        params.actor_user_id.map(|id| id.to_string()),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes a skill (reference files go via FK cascade — locally and on every
+/// receiver, so no per-file tombstones are emitted). Returns true when a row
+/// was removed.
+pub fn delete_skill(pool: &DbPool, id: &str) -> Result<bool> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute("DELETE FROM skills WHERE id = ?1", rusqlite::params![id])?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), field_string(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::Skill,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(rows_affected > 0)
+}
+
+/// Removes every skill materialized from the given addon (uninstall path).
+/// Returns the number of removed rows.
+pub fn delete_addon_skills(pool: &DbPool, addon_id: &str) -> Result<usize> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let ids: Vec<String> = {
+        let mut stmt =
+            tx.prepare("SELECT id FROM skills WHERE source = 'addon' AND source_ref = ?1")?;
+        let rows = stmt
+            .query_map(rusqlite::params![addon_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for id in &ids {
+        tx.execute("DELETE FROM skills WHERE id = ?1", rusqlite::params![id])?;
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), field_string(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::Skill,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(ids.len())
+}
+
+pub fn list_skill_files(pool: &DbPool, skill_id: &str) -> Result<Vec<DbSkillFile>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT skill_id, path, content FROM skill_files WHERE skill_id = ?1 ORDER BY path",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![skill_id], |row| {
+            Ok(DbSkillFile {
+                skill_id: row.get(0)?,
+                path: row.get(1)?,
+                content: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Replaces the full reference-file set of a skill. Validates every file before
+/// any write; emits per-file sync captures (Delete for paths that disappeared,
+/// Insert-upsert for every file in the new set).
+pub fn replace_skill_files(
+    pool: &DbPool,
+    skill_id: &str,
+    files: &[(String, String)],
+    actor_user_id: Option<&str>,
+) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (path, content) in files {
+        validate_skill_file(path, content)?;
+        if !seen.insert(path.as_str()) {
+            return Err(anyhow::anyhow!("duplicate skill file path: '{path}'"));
+        }
+    }
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM skills WHERE id = ?1",
+            rusqlite::params![skill_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        return Err(anyhow::anyhow!("skill not found: {skill_id}"));
+    }
+    let old_paths: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT path FROM skill_files WHERE skill_id = ?1")?;
+        let rows = stmt
+            .query_map(rusqlite::params![skill_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    tx.execute(
+        "DELETE FROM skill_files WHERE skill_id = ?1",
+        rusqlite::params![skill_id],
+    )?;
+    for old_path in &old_paths {
+        if seen.contains(old_path.as_str()) {
+            continue;
+        }
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::SkillFile,
+            skill_file_resource_id(skill_id, old_path),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            skill_file_changed_fields(skill_id, old_path, None),
+            actor_user_id.map(|id| id.to_string()),
+        )?;
+    }
+    for (path, content) in files {
+        tx.execute(
+            "INSERT INTO skill_files (skill_id, path, content) VALUES (?1, ?2, ?3)",
+            rusqlite::params![skill_id, path, content],
+        )?;
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::SkillFile,
+            skill_file_resource_id(skill_id, path),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            skill_file_changed_fields(skill_id, path, Some(content)),
+            actor_user_id.map(|id| id.to_string()),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod skills_repository_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn setup_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("test db")
+    }
+
+    fn skill_params<'a>(id: &'a str, name: &'a str) -> SkillParams<'a> {
+        SkillParams {
+            id,
+            name,
+            display_name: Some("Test Skill"),
+            description: "How to do the thing",
+            content: "# Skill\n\nDo the thing.",
+            tags_json: r#"["research","web"]"#,
+            category: Some("tools"),
+            source: "user",
+            source_ref: None,
+            status: "active",
+            created_by: None,
+            actor_user_id: None,
+        }
+    }
+
+    #[test]
+    fn migration_creates_skills_tables_with_constraints() {
+        let db = setup_db();
+        let conn = db.lock().expect("db lock");
+        for table in ["skills", "skill_files"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |r| r.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(n, 1, "missing table {table}");
+        }
+        for index in ["idx_skills_source", "idx_skills_status"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    rusqlite::params![index],
+                    |r| r.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(n, 1, "missing index {index}");
+        }
+        // The CHECK constraints must reject out-of-domain values at SQL level.
+        let bad_source = conn.execute(
+            "INSERT INTO skills (id, name, description, content, source) \
+             VALUES ('x', 'x', 'd', 'c', 'pirate')",
+            [],
+        );
+        assert!(bad_source.is_err(), "CHECK(source) must reject 'pirate'");
+        let bad_status = conn.execute(
+            "INSERT INTO skills (id, name, description, content, source, status) \
+             VALUES ('x', 'x', 'd', 'c', 'user', 'gone')",
+            [],
+        );
+        assert!(bad_status.is_err(), "CHECK(status) must reject 'gone'");
+    }
+
+    #[test]
+    fn upsert_get_list_roundtrip() {
+        let db = setup_db();
+        let id = uuid::Uuid::new_v4().to_string();
+        upsert_skill(&db, &skill_params(&id, "my-skill")).expect("upsert");
+
+        let skill = get_skill(&db, &id).expect("get").expect("exists");
+        assert_eq!(skill.name, "my-skill");
+        assert_eq!(skill.display_name.as_deref(), Some("Test Skill"));
+        assert_eq!(skill.description, "How to do the thing");
+        assert_eq!(skill.content, "# Skill\n\nDo the thing.");
+        assert_eq!(skill.tags_json, r#"["research","web"]"#);
+        assert_eq!(skill.category.as_deref(), Some("tools"));
+        assert_eq!(skill.source, "user");
+        assert_eq!(skill.status, "active");
+        assert_eq!(skill.use_count, 0);
+
+        let by_name = get_skill_by_name(&db, "my-skill")
+            .expect("get by name")
+            .expect("exists");
+        assert_eq!(by_name.id, id);
+
+        // Update in place keeps the row count at one and refreshes content.
+        let mut updated = skill_params(&id, "my-skill");
+        updated.content = "# Skill v2";
+        updated.status = "disabled";
+        upsert_skill(&db, &updated).expect("upsert update");
+        let skill = get_skill(&db, &id).expect("get").expect("exists");
+        assert_eq!(skill.content, "# Skill v2");
+        assert_eq!(skill.status, "disabled");
+        assert_eq!(
+            list_skills(&db, &SkillListFilter::default())
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn list_filters_by_source_status_and_tag() {
+        let db = setup_db();
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        upsert_skill(&db, &skill_params(&a, "skill-a")).expect("upsert a");
+        let mut hub = skill_params(&b, "skill-b");
+        hub.source = "hub";
+        hub.source_ref = Some("github.com/anthropics/skills");
+        hub.status = "quarantine";
+        hub.tags_json = r#"["imported"]"#;
+        upsert_skill(&db, &hub).expect("upsert b");
+
+        let user_only = list_skills(
+            &db,
+            &SkillListFilter {
+                source: Some("user"),
+                ..Default::default()
+            },
+        )
+        .expect("list");
+        assert_eq!(user_only.len(), 1);
+        assert_eq!(user_only[0].name, "skill-a");
+
+        let quarantined = list_skills(
+            &db,
+            &SkillListFilter {
+                status: Some("quarantine"),
+                ..Default::default()
+            },
+        )
+        .expect("list");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].name, "skill-b");
+
+        let tagged = list_skills(
+            &db,
+            &SkillListFilter {
+                tag: Some("research"),
+                ..Default::default()
+            },
+        )
+        .expect("list");
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].name, "skill-a");
+
+        let no_match = list_skills(
+            &db,
+            &SkillListFilter {
+                source: Some("user"),
+                tag: Some("imported"),
+                ..Default::default()
+            },
+        )
+        .expect("list");
+        assert!(no_match.is_empty());
+    }
+
+    #[test]
+    fn limits_are_rejected() {
+        let db = setup_db();
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let mut bad = skill_params(&id, "Not-Kebab");
+        assert!(upsert_skill(&db, &bad).is_err(), "uppercase name");
+        bad.name = "double--dash";
+        assert!(upsert_skill(&db, &bad).is_err(), "double dash");
+        let long_name = "a".repeat(SKILL_NAME_MAX_CHARS + 1);
+        bad.name = &long_name;
+        assert!(upsert_skill(&db, &bad).is_err(), "name too long");
+
+        let long_description = "d".repeat(SKILL_DESCRIPTION_MAX_CHARS + 1);
+        let mut bad = skill_params(&id, "ok-name");
+        bad.description = &long_description;
+        assert!(upsert_skill(&db, &bad).is_err(), "description too long");
+        bad.description = "";
+        assert!(upsert_skill(&db, &bad).is_err(), "empty description");
+
+        let long_content = "c".repeat(SKILL_CONTENT_MAX_CHARS + 1);
+        let mut bad = skill_params(&id, "ok-name");
+        bad.content = &long_content;
+        assert!(upsert_skill(&db, &bad).is_err(), "content too long");
+
+        let mut bad = skill_params(&id, "ok-name");
+        bad.tags_json = "not-json";
+        assert!(upsert_skill(&db, &bad).is_err(), "invalid tags_json");
+        bad.tags_json = r#"{"a":1}"#;
+        assert!(upsert_skill(&db, &bad).is_err(), "tags_json not an array");
+
+        assert!(
+            get_skill(&db, &id).expect("get").is_none(),
+            "no rejected write may persist"
+        );
+    }
+
+    #[test]
+    fn skill_file_paths_and_size_are_validated() {
+        let db = setup_db();
+        let id = uuid::Uuid::new_v4().to_string();
+        upsert_skill(&db, &skill_params(&id, "with-files")).expect("upsert");
+
+        for bad_path in [
+            "scripts/run.sh",
+            "references/../../../etc/passwd",
+            "references/",
+            "notes.md",
+            "templates\\win.md",
+            "/references/abs.md",
+            "references//double.md",
+        ] {
+            assert!(
+                replace_skill_files(&db, &id, &[(bad_path.to_string(), "x".to_string())], None)
+                    .is_err(),
+                "path must be rejected: {bad_path}"
+            );
+        }
+
+        let oversized = "x".repeat(SKILL_FILE_MAX_BYTES + 1);
+        assert!(
+            replace_skill_files(
+                &db,
+                &id,
+                &[("references/big.md".to_string(), oversized)],
+                None
+            )
+            .is_err(),
+            "file over 1 MiB must be rejected"
+        );
+
+        let dup = vec![
+            ("references/a.md".to_string(), "a".to_string()),
+            ("references/a.md".to_string(), "b".to_string()),
+        ];
+        assert!(
+            replace_skill_files(&db, &id, &dup, None).is_err(),
+            "duplicate paths must be rejected"
+        );
+    }
+
+    #[test]
+    fn replace_and_list_skill_files_roundtrip_and_cascade() {
+        let db = setup_db();
+        let id = uuid::Uuid::new_v4().to_string();
+        upsert_skill(&db, &skill_params(&id, "with-files")).expect("upsert");
+
+        let files = vec![
+            ("references/api.md".to_string(), "# API".to_string()),
+            ("templates/report.md".to_string(), "# Report".to_string()),
+        ];
+        replace_skill_files(&db, &id, &files, None).expect("replace");
+        let listed = list_skill_files(&db, &id).expect("list files");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].path, "references/api.md");
+        assert_eq!(listed[0].content, "# API");
+        assert_eq!(listed[1].path, "templates/report.md");
+
+        // Shrinking the set drops the removed path.
+        let files = vec![("references/api.md".to_string(), "# API v2".to_string())];
+        replace_skill_files(&db, &id, &files, None).expect("replace 2");
+        let listed = list_skill_files(&db, &id).expect("list files");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].content, "# API v2");
+
+        // Deleting the skill cascades its files.
+        assert!(delete_skill(&db, &id).expect("delete"));
+        assert!(list_skill_files(&db, &id).expect("list").is_empty());
+        assert!(get_skill(&db, &id).expect("get").is_none());
+    }
+
+    #[test]
+    fn upsert_preserves_local_usage_stats() {
+        let db = setup_db();
+        let id = uuid::Uuid::new_v4().to_string();
+        upsert_skill(&db, &skill_params(&id, "counted")).expect("upsert");
+        // Usage stats are node-local runtime data (the skill_view consumer
+        // bumps them); seed them directly to prove upserts leave them alone.
+        {
+            let conn = db.lock().expect("db lock");
+            conn.execute(
+                "UPDATE skills SET use_count = 2, last_used_at = datetime('now') WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .expect("seed usage");
+        }
+        upsert_skill(&db, &skill_params(&id, "counted")).expect("upsert again");
+        let skill = get_skill(&db, &id).expect("get").expect("exists");
+        assert_eq!(skill.use_count, 2);
+        assert!(skill.last_used_at.is_some());
+    }
+
+    #[test]
+    fn skill_writes_record_sync_captures() {
+        let db = setup_db();
+        let id = uuid::Uuid::new_v4().to_string();
+        upsert_skill(&db, &skill_params(&id, "synced")).expect("upsert");
+        replace_skill_files(
+            &db,
+            &id,
+            &[("references/a.md".to_string(), "a".to_string())],
+            None,
+        )
+        .expect("files");
+        delete_skill(&db, &id).expect("delete");
+
+        let conn = db.lock().expect("db lock");
+        let count_ops = |resource_type: &str, action: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = ?1 AND action = ?2",
+                rusqlite::params![resource_type, action],
+                |r| r.get(0),
+            )
+            .expect("count captures")
+        };
+        assert_eq!(count_ops("core.skill", "insert"), 1);
+        assert_eq!(count_ops("core.skill", "delete"), 1);
+        assert_eq!(count_ops("core.skill_file", "insert"), 1);
+    }
 }
 
 // --- Flow Node Templates ---
