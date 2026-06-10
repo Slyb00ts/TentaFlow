@@ -204,7 +204,9 @@ access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write
 - `scripts/native-libs/build-all.sh` (Linux/macOS) i `scripts/native-libs/build-all.ps1`
   (Windows) wykrywają platformę i budują natywne zależności do `native-libs/<platform>/`.
 - Źródła pobierane przez skrypty trafiają poza repo do `TENTAFLOW_NATIVE_CACHE`
-  (domyślnie `/tmp/tentaflow-native-libs`), więc repo przechowuje **tylko skrypty**.
+  (domyślnie `${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs` — trwały cache na
+  dysku, NIE `/tmp`: tmpfs w RAM urywa rozpakowanie na małym RAM-ie → CMake „Parse
+  error ... bad character"), więc repo przechowuje **tylko skrypty**.
   Cała zawartość `native-libs/<platform>/` (nagłówki, biblioteki, `manifest.toml`)
   jest generowana lokalnie i NIE jest commitowana — `.gitignore` ignoruje `native-libs/*`
   poza `README.md`. Każdy buduje u siebie: `./scripts/native-libs/build-all.sh`.
