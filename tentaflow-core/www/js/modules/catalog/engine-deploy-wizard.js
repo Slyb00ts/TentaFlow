@@ -1529,8 +1529,12 @@ function renderStepRuntime() {
   // zmiany. Dla native (python-bundle / binary / embedded) backend zawsze sam
   // alokuje port z puli i ignoruje wartosc z formularza, wiec tam pokazujemy
   // tylko informacyjny opis.
+  // Cloud API providers have no local port — the endpoint is the provider URL.
+  const isCloudExternal = externalCredsConfig().requiresApiKey;
   const isDocker = selection.deployMethod === 'docker';
-  const portField = isDocker
+  const portField = isCloudExternal
+    ? ''
+    : isDocker
     ? `
       <div class="form-group">
         <tf-input type="number" id="edw-port"
@@ -1618,6 +1622,9 @@ function renderExternalCredsFields() {
 function shouldSkipModelStep() {
   const eng = engineEntry?.engine;
   if (!eng) return false;
+  // Cloud API providers don't pick a model at deploy time — the model picker in
+  // the service edit view selects from the provider's live catalog instead.
+  if (externalCredsConfig().requiresApiKey) return true;
   if (eng.requires_model === false) return true;
   if (eng.requires_model === true) return false;
   const category = String(eng.category || '').toLowerCase();
@@ -1631,6 +1638,8 @@ function shouldSkipModelStep() {
 // engine manifest may opt out via `engine.gpu_supported === false`; by default
 // (field absent) we assume the engine can use GPUs if the node has any.
 function shouldSkipGpuStep() {
+  // Cloud API providers run remotely — there is no local GPU to allocate.
+  if (externalCredsConfig().requiresApiKey) return true;
   const gpus = nodeGpus(selection.nodeId);
   if (gpus.length === 0) return true;
   if (usesDockerCompose()) return true;
