@@ -231,6 +231,11 @@ pub fn llm_generate(
         instance_id: Some(caller.data().instance_id.clone()),
         flow_id: None,
         flow_node_id: None,
+        agent_id: None,
+        agent_run_id: None,
+        // Root context: the routing session event anchors the turn to its own
+        // request_id (§3.4); per-call flow events copy it from there.
+        correlation_id: None,
     };
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(router.route_chat_completion(

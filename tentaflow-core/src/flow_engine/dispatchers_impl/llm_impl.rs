@@ -17,9 +17,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::{build_user_context, ModelRuntimeSlot};
 use crate::api::openai::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ContentPart, FunctionCall, FunctionDefinition,
-    ImageUrl, Message, MessageContent, Tool, ToolCall, ToolChoice,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart,
+    FunctionCall, FunctionDefinition, ImageUrl, Message, MessageContent, Tool, ToolCall,
+    ToolChoice, Usage,
 };
+use crate::auth::acl::UserContext;
+use crate::compliance::ai_gateway::{AiGateway, AiGatewayContext};
+use crate::db::DbPool;
 use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse, LlmToolSpec};
 use crate::flow_engine::envelope::{
@@ -35,11 +39,28 @@ pub struct LlmDispatcherImpl {
     /// Etap 3b: BlobStore do rozwijania `MessagePart::Image.blob_ref` na
     /// data URL przed wysłaniem do backendu.
     blobs: Arc<dyn BlobStore>,
+    /// Harness §3.4: DbPool backing the AiGateway so every blocking
+    /// `execute_chat` opens/finishes one `compliance_ai_events` row. `None` in
+    /// tests / DB-less bootstraps — audit is then skipped, generation unchanged.
+    db: Option<DbPool>,
+    /// Node id stamped on AI audit events (the local node, like the routing
+    /// layer's gateway).
+    node_id: String,
 }
 
 impl LlmDispatcherImpl {
-    pub fn new(runtime: ModelRuntimeSlot, blobs: Arc<dyn BlobStore>) -> Self {
-        Self { runtime, blobs }
+    pub fn new(
+        runtime: ModelRuntimeSlot,
+        blobs: Arc<dyn BlobStore>,
+        db: Option<DbPool>,
+        node_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            blobs,
+            db,
+            node_id: node_id.into(),
+        }
     }
 
     fn runtime(
@@ -51,6 +72,95 @@ impl LlmDispatcherImpl {
             .cloned()
             .ok_or_else(|| anyhow!("LlmDispatcher: ModelRuntimeExecutor not wired"))
     }
+
+    /// Opens a `compliance_ai_events` row for one blocking chat call. Returns
+    /// `None` when there is no DB (tests) — audit is then a no-op. The gateway
+    /// mints a fresh per-call `request_id` (distinct so it never collides with
+    /// the routing-layer session event on `UNIQUE(org_id, request_id)`), while
+    /// `correlation_id` carries the turn's shared key from `envelope.meta` so
+    /// the session row and every per-call row of one user turn link (§3.4). A
+    /// failed audit-start must NOT block generation, so the error is logged and
+    /// treated as "no event".
+    fn start_audit_event(
+        &self,
+        req: &LlmRequest,
+        api_req: &ChatCompletionRequest,
+    ) -> Option<crate::compliance::ai_gateway::AiEventHandle> {
+        let db = self.db.as_ref()?;
+        let gateway = AiGateway::new(db.clone(), self.node_id.clone());
+        let user = req.user_id.as_ref().map(|uid| UserContext {
+            user_id: uid.clone(),
+            role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
+        });
+        let context = AiGatewayContext {
+            org_id: None,
+            addon_id: None,
+            instance_id: None,
+            flow_id: req.flow_id.clone(),
+            flow_node_id: req.flow_node_id.clone(),
+            agent_id: req.agent_id.clone(),
+            agent_run_id: req.agent_run_id.clone(),
+            correlation_id: req.correlation_id.clone(),
+        };
+        let mut per_call = api_req.clone();
+        per_call.user = None;
+        match gateway.start_chat_event(&per_call, user.as_ref(), Some(&context)) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::warn!("gateway-aware LLM audit start failed (skipping event): {e}");
+                None
+            }
+        }
+    }
+}
+
+/// Builds a minimal `ChatCompletionResponse` from the flow-engine `LlmResponse`
+/// so the AiGateway records the real response text, usage and tool calls per
+/// call. The gateway only reads content/usage/tool_calls, so the synthetic
+/// wrapper is faithful for audit purposes.
+fn llm_response_to_chat_response(response: &LlmResponse, model: &str) -> ChatCompletionResponse {
+    let tool_calls = if response.tool_calls.is_empty() {
+        None
+    } else {
+        Some(
+            response
+                .tool_calls
+                .iter()
+                .map(envelope_tool_call_to_openai)
+                .collect(),
+        )
+    };
+    ChatCompletionResponse {
+        id: String::new(),
+        object: "chat.completion".to_string(),
+        created: 0,
+        model: model.to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Text(response.content.clone())),
+                reasoning_content: None,
+                name: None,
+                tool_calls,
+                tool_call_id: None,
+            },
+            finish_reason: response.finish_reason.as_openai_str().map(|s| s.to_string()),
+            logprobs: None,
+        }],
+        usage: Some(Usage {
+            prompt_tokens: response.usage.prompt_tokens as u32,
+            completion_tokens: response.usage.completion_tokens as u32,
+            total_tokens: response.usage.total_tokens as u32,
+        }),
+        system_fingerprint: None,
+        transcribed_text: None,
+        speaker_id: None,
+        speaker_name: None,
+        speaker_confidence: None,
+        detected_intent: None,
+        detected_tools: None,
+    }
 }
 
 #[async_trait]
@@ -59,6 +169,11 @@ impl LlmDispatcher for LlmDispatcherImpl {
         let cancel = req.cancel_token.clone();
         let deadline = req.deadline;
         let api_req = build_chat_request(&req, false, self.blobs.as_ref()).await?;
+        // Harness §3.4: open one compliance_ai_events row per call BEFORE
+        // dispatch so the prompt is recorded even if the backend hangs / the
+        // request is cancelled mid-flight (the event then finishes failed).
+        let audit_event = self.start_audit_event(&req, &api_req);
+        let model = api_req.model.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let mut rctx = RuntimeContext::new(user);
         // Cancel + deadline są egzekwowane na poziomie wrappera bo
@@ -67,19 +182,33 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // klient disconnect / timeout abort'uje request natychmiast nawet
         // jeśli backend nie odpowiada.
         let runtime = self.runtime()?;
-        let response = run_with_deadline_and_cancel(
+        let response = match run_with_deadline_and_cancel(
             runtime.execute_chat(api_req, &mut rctx),
             deadline,
             cancel,
         )
         .await
-        .map_err(|e| anyhow!("LlmDispatcher execute_chat: {e}"))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("LlmDispatcher execute_chat: {e}");
+                if let Some(event) = audit_event.as_ref() {
+                    let _ = event.finish_failed(&msg);
+                }
+                return Err(anyhow!(msg));
+            }
+        };
 
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("LlmDispatcher: backend returned 0 choices"))?;
+        let choice = match response.choices.into_iter().next() {
+            Some(c) => c,
+            None => {
+                let msg = "LlmDispatcher: backend returned 0 choices".to_string();
+                if let Some(event) = audit_event.as_ref() {
+                    let _ = event.finish_failed(&msg);
+                }
+                return Err(anyhow!(msg));
+            }
+        };
 
         let tool_calls: Vec<LlmToolCall> = choice
             .message
@@ -113,12 +242,23 @@ impl LlmDispatcher for LlmDispatcherImpl {
 
         let finish_reason = openai_finish_to_envelope(choice.finish_reason.as_deref());
 
-        Ok(LlmResponse {
+        let llm_response = LlmResponse {
             content,
             usage,
             finish_reason,
             tool_calls,
-        })
+        };
+        // Finish the audit event with the real response (text, usage, the tool
+        // calls the model REQUESTED — their execution outcome lands later via
+        // record_tool_execution in tool_exec). Audit-write failure is logged,
+        // never propagated: a generated response must still reach the caller.
+        if let Some(event) = audit_event.as_ref() {
+            let response = llm_response_to_chat_response(&llm_response, &model);
+            if let Err(e) = event.finish_success(&response) {
+                tracing::warn!("gateway-aware LLM audit finish failed: {e}");
+            }
+        }
+        Ok(llm_response)
     }
 
     async fn stream_chat(
@@ -433,6 +573,134 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::migrations;
+    use crate::flow_engine::blob_store::InMemoryBlobStore;
+    use crate::flow_engine::dispatchers::LlmResponse;
+    use crate::flow_engine::envelope::{ChatMessage, FinishReason, TokenUsage};
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    fn audit_db() -> DbPool {
+        let conn = Connection::open_in_memory().expect("memory db");
+        migrations::run(&conn).expect("migrations");
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn dispatcher_with_db(db: DbPool) -> LlmDispatcherImpl {
+        let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
+        let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+        LlmDispatcherImpl::new(runtime, blobs, Some(db), "node-test")
+    }
+
+    /// Harness §3.4: the gateway-aware dispatcher opens one compliance_ai_events
+    /// row per call carrying the agent context, and finishing it on success
+    /// stamps status + the response payload. Exercises start/finish directly
+    /// (the backend dispatch in execute_chat needs a full runtime, out of scope
+    /// for a unit test).
+    #[tokio::test]
+    async fn gateway_aware_audit_writes_event_with_agent_context() {
+        let db = audit_db();
+        // The run principal is a real account (compliance_ai_events.user_id FKs
+        // user_accounts) — seed it, like production where the flow's user_id is
+        // a logged-in user.
+        db.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO user_accounts (id, username, password_hash) \
+                 VALUES ('u-agent', 'agent-user', 'x')",
+                [],
+            )
+            .expect("seed user");
+        let dispatcher = dispatcher_with_db(db.clone());
+
+        let mut req = LlmRequest::new("bielik");
+        req.messages = vec![ChatMessage::user("remember my favorite color")];
+        req.user_id = Some("u-agent".into());
+        req.flow_id = None;
+        req.flow_node_id = Some("llm-1".into());
+        req.agent_id = Some("agent-research".into());
+        req.agent_run_id = Some("run-42".into());
+        req.correlation_id = Some("turn-corr-1".into());
+
+        let api_req = build_chat_request(&req, false, dispatcher.blobs.as_ref())
+            .await
+            .expect("build chat request");
+        let event = dispatcher
+            .start_audit_event(&req, &api_req)
+            .expect("audit event opened");
+
+        let response = LlmResponse {
+            content: "Noted — blue.".into(),
+            usage: TokenUsage {
+                prompt_tokens: 6,
+                completion_tokens: 3,
+                total_tokens: 9,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: Vec::new(),
+        };
+        let chat_response = llm_response_to_chat_response(&response, &api_req.model);
+        event.finish_success(&chat_response).expect("finish event");
+
+        let conn = db.lock().expect("db lock");
+        let (status, agent_id, agent_run_id, flow_node_id, model, correlation_id): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, agent_id, agent_run_id, flow_node_id, model_id, correlation_id \
+                 FROM compliance_ai_events WHERE event_id = ?1",
+                rusqlite::params![event.event_id()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("event row");
+        assert_eq!(status, "success");
+        assert_eq!(agent_id.as_deref(), Some("agent-research"));
+        assert_eq!(agent_run_id.as_deref(), Some("run-42"));
+        assert_eq!(flow_node_id.as_deref(), Some("llm-1"));
+        assert_eq!(model, "bielik");
+        // The per-call event copies the turn's correlation key (§3.4), so it
+        // links to the routing session event of the same user turn.
+        assert_eq!(correlation_id.as_deref(), Some("turn-corr-1"));
+
+        // Prompt + response payloads recorded for this one call.
+        let payload_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM compliance_ai_payloads WHERE event_id = ?1",
+                rusqlite::params![event.event_id()],
+                |row| row.get(0),
+            )
+            .expect("payload count");
+        assert_eq!(payload_count, 2);
+    }
+
+    /// Without a DB the dispatcher must still work — audit is simply skipped
+    /// (start_audit_event returns None), generation is unaffected.
+    #[tokio::test]
+    async fn no_db_skips_audit() {
+        let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
+        let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+        let dispatcher = LlmDispatcherImpl::new(runtime, blobs, None, "node-test");
+        let mut req = LlmRequest::new("m");
+        req.messages = vec![ChatMessage::user("hi")];
+        let api_req = build_chat_request(&req, false, dispatcher.blobs.as_ref())
+            .await
+            .expect("build");
+        assert!(dispatcher.start_audit_event(&req, &api_req).is_none());
+    }
 
     #[test]
     fn finish_reason_mapping_covers_canonical_values() {

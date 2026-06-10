@@ -5215,6 +5215,477 @@ pub fn skills_fork(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     ))
 }
 
+// =============================================================================
+// Agents registry (Harness plan §3.3)
+// =============================================================================
+
+/// Handler-side shape of `AgentsUpsertRequest.agent_json`. `id` absent =
+/// create (a fresh UUIDv4 is assigned); present = update of an existing row.
+/// Tool/skill allowlists and per-call params arrive as structured JSON so the
+/// editor never has to hand-build the `*_json` column strings. Defaults mirror
+/// the `agents` table column defaults so the editor may omit unset fields.
+#[derive(serde::Deserialize)]
+struct AgentUpsertInput {
+    id: Option<String>,
+    name: String,
+    display_name: Option<String>,
+    description: String,
+    system_prompt: Option<String>,
+    model: Option<String>,
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default = "default_skills_selection")]
+    skills: serde_json::Value,
+    #[serde(default = "default_params")]
+    params: serde_json::Value,
+    #[serde(default = "default_max_iterations")]
+    max_iterations: i64,
+    #[serde(default = "default_timeout_secs")]
+    timeout_secs: i64,
+    #[serde(default)]
+    max_subagents: i64,
+    #[serde(default = "default_max_spawn_depth")]
+    max_spawn_depth: i64,
+    flow_id: Option<String>,
+    #[serde(default = "default_true")]
+    routable: bool,
+    #[serde(default = "default_true")]
+    is_enabled: bool,
+}
+
+fn default_skills_selection() -> serde_json::Value {
+    serde_json::json!({})
+}
+fn default_params() -> serde_json::Value {
+    serde_json::json!({})
+}
+fn default_max_iterations() -> i64 {
+    25
+}
+fn default_timeout_secs() -> i64 {
+    600
+}
+fn default_max_spawn_depth() -> i64 {
+    1
+}
+fn default_true() -> bool {
+    true
+}
+
+/// List projection of `DbAgent` — the columns the list screen renders plus the
+/// tool/skill JSON the editor preloads. Drops nothing today (agents are small),
+/// but kept as an explicit shape so future wide columns (e.g. long prompts) can
+/// be excluded from the list without breaking the detail fetch.
+#[derive(serde::Serialize)]
+struct AgentSummary<'a> {
+    id: &'a str,
+    name: &'a str,
+    display_name: Option<&'a str>,
+    description: &'a str,
+    model: Option<&'a str>,
+    tools_json: &'a str,
+    skills_json: &'a str,
+    max_iterations: i64,
+    routable: bool,
+    is_enabled: bool,
+    created_at: &'a str,
+    updated_at: &'a str,
+}
+
+/// Run-list projection of `DbAgentRun` — every index field except `run_log`,
+/// which holds the full step timeline and is fetched on demand by
+/// `AgentRunDetailRequest`.
+#[derive(serde::Serialize)]
+struct AgentRunSummary<'a> {
+    id: &'a str,
+    agent_id: &'a str,
+    parent_run_id: Option<&'a str>,
+    flow_execution_id: Option<i64>,
+    user_id: Option<&'a str>,
+    status: &'a str,
+    exit_reason: Option<&'a str>,
+    iterations: i64,
+    total_tokens: i64,
+    last_heartbeat_at: Option<&'a str>,
+    started_at: Option<&'a str>,
+    finished_at: Option<&'a str>,
+    created_at: &'a str,
+}
+
+/// One pickable tool in the catalog the editor renders as a checkbox tree:
+/// addon tools grouped by `addon_id`, then the `core.*` builtins.
+#[derive(serde::Serialize)]
+struct CatalogTool {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+struct CatalogAddonGroup {
+    addon_id: String,
+    tools: Vec<CatalogTool>,
+}
+
+#[derive(serde::Serialize)]
+struct ToolsCatalog {
+    addons: Vec<CatalogAddonGroup>,
+    core: Vec<CatalogTool>,
+}
+
+/// True when the acting session is an admin. Non-admins only ever see their own
+/// runs (Harness §3.3 ACL) — enforced here, never in the UI.
+fn session_is_admin(ctx: &HandlerContext) -> bool {
+    matches!(
+        &ctx.session,
+        SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+    )
+}
+
+#[handler(variant = "AgentsListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn agents_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::ListRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentsListRequest")),
+    };
+    let filter = db::models::AgentListFilter {
+        is_enabled: payload.enabled,
+        routable: payload.routable,
+    };
+    let agents = repository::list_agents(&ctx.state.db, &filter).map_err(db_err)?;
+    let summaries: Vec<AgentSummary<'_>> = agents
+        .iter()
+        .map(|a| AgentSummary {
+            id: &a.id,
+            name: &a.name,
+            display_name: a.display_name.as_deref(),
+            description: &a.description,
+            model: a.model.as_deref(),
+            tools_json: &a.tools_json,
+            skills_json: &a.skills_json,
+            max_iterations: a.max_iterations,
+            routable: a.routable,
+            is_enabled: a.is_enabled,
+            created_at: &a.created_at,
+            updated_at: &a.updated_at,
+        })
+        .collect();
+    let agents_json = serde_json::to_string(&summaries)
+        .map_err(|e| ProtocolError::internal(format!("agents encode failed: {}", e)))?;
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::ListResponse(tentaflow_protocol::AgentsListResponse {
+            agents_json,
+        }),
+    ))
+}
+
+#[handler(variant = "AgentsDetailRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn agents_detail(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::DetailRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentsDetailRequest")),
+    };
+    let agent = repository::get_agent(&ctx.state.db, &payload.agent_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("agent not found: {}", payload.agent_id))
+        })?;
+    let agent_json = serde_json::to_string(&agent)
+        .map_err(|e| ProtocolError::internal(format!("agent encode failed: {}", e)))?;
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::DetailResponse(
+            tentaflow_protocol::AgentsDetailResponse { agent_json },
+        ),
+    ))
+}
+
+#[handler(variant = "AgentsUpsertRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn agents_upsert(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::UpsertRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentsUpsertRequest")),
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let input: AgentUpsertInput = serde_json::from_str(&payload.agent_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid agent json: {}", e)))?;
+
+    let existing = match &input.id {
+        Some(id) => Some(
+            repository::get_agent(&ctx.state.db, id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found(format!("agent not found: {}", id)))?,
+        ),
+        None => None,
+    };
+
+    // No UNIQUE on name (sync apply across nodes), so soft-uniqueness is checked
+    // here on create and rename only — same contract as skills.
+    let name_changed = existing
+        .as_ref()
+        .map(|e| e.name != input.name)
+        .unwrap_or(true);
+    if name_changed
+        && repository::get_agent_by_name(&ctx.state.db, &input.name)
+            .map_err(db_err)?
+            .is_some()
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "agent name already in use: '{}'",
+            input.name
+        )));
+    }
+
+    // An empty flow_id from the editor means "use the seeded Agent Run flow"
+    // (NULL column), not a reference to a flow literally named "".
+    let flow_id = input.flow_id.as_deref().filter(|s| !s.is_empty());
+    if let Some(flow_id) = flow_id {
+        if repository::get_flow(&ctx.state.db, flow_id)
+            .map_err(db_err)?
+            .is_none()
+        {
+            return Err(ProtocolError::bad_request(format!(
+                "agent flow_id references a missing flow: '{}'",
+                flow_id
+            )));
+        }
+    }
+
+    let agent_id = existing
+        .as_ref()
+        .map(|e| e.id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let tools_json = serde_json::to_string(&input.tools)
+        .map_err(|e| ProtocolError::internal(format!("agent tools encode failed: {}", e)))?;
+    let skills_json = serde_json::to_string(&input.skills)
+        .map_err(|e| ProtocolError::internal(format!("agent skills encode failed: {}", e)))?;
+    let params_json = serde_json::to_string(&input.params)
+        .map_err(|e| ProtocolError::internal(format!("agent params encode failed: {}", e)))?;
+
+    let params = db::models::AgentParams {
+        id: &agent_id,
+        name: &input.name,
+        display_name: input.display_name.as_deref(),
+        description: &input.description,
+        system_prompt: input.system_prompt.as_deref(),
+        model: input.model.as_deref().filter(|s| !s.is_empty()),
+        tools_json: &tools_json,
+        skills_json: &skills_json,
+        params_json: &params_json,
+        max_iterations: input.max_iterations,
+        timeout_secs: input.timeout_secs,
+        max_subagents: input.max_subagents,
+        max_spawn_depth: input.max_spawn_depth,
+        flow_id,
+        routable: input.routable,
+        is_enabled: input.is_enabled,
+        actor_user_id: Some(&user_id),
+    };
+    repository::validate_agent_params(&params)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    repository::upsert_agent(&ctx.state.db, &params).map_err(db_err)?;
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "agent.upsert",
+        Some(&format!("agent:{}", agent_id)),
+        Some(&input.name),
+    );
+
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::UpsertResponse(
+            tentaflow_protocol::AgentsUpsertResponse { agent_id },
+        ),
+    ))
+}
+
+#[handler(variant = "AgentsDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn agents_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::DeleteRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentsDeleteRequest")),
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let agent = repository::get_agent(&ctx.state.db, &payload.agent_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("agent not found: {}", payload.agent_id))
+        })?;
+    let deleted = repository::delete_agent(&ctx.state.db, &payload.agent_id).map_err(db_err)?;
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "agent.delete",
+        Some(&format!("agent:{}", payload.agent_id)),
+        Some(&agent.name),
+    );
+
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::DeleteResponse(
+            tentaflow_protocol::AgentsDeleteResponse { deleted },
+        ),
+    ))
+}
+
+#[handler(variant = "AgentRunsListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn agent_runs_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::RunsListRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentRunsListRequest")),
+    };
+    let actor_id = user_id_to_uuid(&require_user_id(ctx)?);
+    // ACL: admins see every run; everyone else only their own principal's runs.
+    let user_filter = if session_is_admin(ctx) {
+        None
+    } else {
+        Some(actor_id.as_str())
+    };
+    let filter = db::models::AgentRunListFilter {
+        agent_id: payload.agent_id.as_deref().filter(|s| !s.is_empty()),
+        status: payload.status.as_deref().filter(|s| !s.is_empty()),
+        parent_run_id: payload.parent_run_id.as_deref().filter(|s| !s.is_empty()),
+        user_id: user_filter,
+    };
+    let runs = repository::list_agent_runs(&ctx.state.db, &filter).map_err(db_err)?;
+    let summaries: Vec<AgentRunSummary<'_>> = runs
+        .iter()
+        .map(|r| AgentRunSummary {
+            id: &r.id,
+            agent_id: &r.agent_id,
+            parent_run_id: r.parent_run_id.as_deref(),
+            flow_execution_id: r.flow_execution_id,
+            user_id: r.user_id.as_deref(),
+            status: &r.status,
+            exit_reason: r.exit_reason.as_deref(),
+            iterations: r.iterations,
+            total_tokens: r.total_tokens,
+            last_heartbeat_at: r.last_heartbeat_at.as_deref(),
+            started_at: r.started_at.as_deref(),
+            finished_at: r.finished_at.as_deref(),
+            created_at: &r.created_at,
+        })
+        .collect();
+    let runs_json = serde_json::to_string(&summaries)
+        .map_err(|e| ProtocolError::internal(format!("agent runs encode failed: {}", e)))?;
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunsListResponse(
+            tentaflow_protocol::AgentRunsListResponse { runs_json },
+        ),
+    ))
+}
+
+#[handler(variant = "AgentRunDetailRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn agent_run_detail(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::RunDetailRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentRunDetailRequest")),
+    };
+    let actor_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let run = repository::get_agent_run(&ctx.state.db, &payload.run_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found(format!("agent run not found: {}", payload.run_id)))?;
+    // ACL: a non-admin can only read a run whose principal is themselves. A run
+    // with no principal (unattended) is admin-only.
+    if !session_is_admin(ctx) && run.user_id.as_deref() != Some(actor_id.as_str()) {
+        return Err(ProtocolError::not_found(format!(
+            "agent run not found: {}",
+            payload.run_id
+        )));
+    }
+    let run_json = serde_json::to_string(&run)
+        .map_err(|e| ProtocolError::internal(format!("agent run encode failed: {}", e)))?;
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunDetailResponse(
+            tentaflow_protocol::AgentRunDetailResponse { run_json },
+        ),
+    ))
+}
+
+#[handler(variant = "ToolsCatalogRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn tools_catalog(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    // Admin-only: the only consumer is the admin-gated agent editor, and the
+    // catalog discloses every addon's full tool surface (names, descriptions,
+    // JSON schemas) regardless of the caller's own "llm" grants. Matching the
+    // handler policy to its sole consumer keeps the disclosure admin-scoped.
+    // Addon tools grouped by addon, then the core builtins — the pickable
+    // surface the editor renders as a checkbox tree (plus its own addon.*
+    // wildcard rows). The catalog is the universe; the agent's allowlist is the
+    // selection, intersected with live permissions at execution time (§3.3).
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<String, Vec<CatalogTool>> = BTreeMap::new();
+    if let Some(manager) = &ctx.state.addon_manager {
+        for tool in manager.list_tools() {
+            grouped
+                .entry(tool.addon_id.clone())
+                .or_default()
+                .push(CatalogTool {
+                    name: format!("{}.{}", tool.addon_id, tool.tool_name),
+                    description: tool.description,
+                    parameters: tool.parameters_schema,
+                });
+        }
+    }
+    let addons = grouped
+        .into_iter()
+        .map(|(addon_id, mut tools)| {
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+            CatalogAddonGroup { addon_id, tools }
+        })
+        .collect();
+    let core = crate::agents::CoreToolName::all()
+        .iter()
+        .map(|t| {
+            let spec = t.spec();
+            CatalogTool {
+                name: spec.name,
+                description: spec.description,
+                parameters: spec.parameters,
+            }
+        })
+        .collect();
+    let catalog = ToolsCatalog { addons, core };
+    let tools_json = serde_json::to_string(&catalog)
+        .map_err(|e| ProtocolError::internal(format!("tools catalog encode failed: {}", e)))?;
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::ToolsCatalogResponse(
+            tentaflow_protocol::ToolsCatalogResponse { tools_json },
+        ),
+    ))
+}
+
 #[handler(variant = "AuditLogListRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]

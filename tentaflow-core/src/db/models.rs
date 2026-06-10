@@ -328,6 +328,120 @@ pub struct SkillListFilter<'a> {
     pub tag: Option<&'a str>,
 }
 
+/// Agent — a harness definition from the Agents registry (Harness §3.3).
+/// Replicates fleet-wide like skills/flows; `name` is soft-unique (no UNIQUE).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAgent {
+    pub id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: String,
+    pub system_prompt: Option<String>,
+    pub model: Option<String>,
+    pub tools_json: String,
+    pub skills_json: String,
+    pub params_json: String,
+    pub max_iterations: i64,
+    pub timeout_secs: i64,
+    pub max_subagents: i64,
+    pub max_spawn_depth: i64,
+    pub flow_id: Option<String>,
+    pub routable: bool,
+    pub is_enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Agent upsert parameters. `id` is caller-supplied: a random UUIDv4 for
+/// user-created agents, a stable UUID for seeded agents (phase 5) so fleet-wide
+/// sync apply stays idempotent.
+#[derive(Debug, Clone)]
+pub struct AgentParams<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub display_name: Option<&'a str>,
+    pub description: &'a str,
+    pub system_prompt: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub tools_json: &'a str,
+    pub skills_json: &'a str,
+    pub params_json: &'a str,
+    pub max_iterations: i64,
+    pub timeout_secs: i64,
+    pub max_subagents: i64,
+    pub max_spawn_depth: i64,
+    pub flow_id: Option<&'a str>,
+    pub routable: bool,
+    pub is_enabled: bool,
+    pub actor_user_id: Option<&'a str>,
+}
+
+/// Agent list filters (all optional, combined with AND).
+#[derive(Debug, Clone, Default)]
+pub struct AgentListFilter {
+    pub is_enabled: Option<bool>,
+    pub routable: Option<bool>,
+}
+
+/// Agent run — RUNTIME state, one row per harness execution (Harness §3.3).
+/// NOT a sync resource (like `flow_executions`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAgentRun {
+    pub id: String,
+    pub agent_id: String,
+    pub parent_run_id: Option<String>,
+    pub flow_execution_id: Option<i64>,
+    pub user_id: Option<String>,
+    pub org_id: Option<String>,
+    pub status: String,
+    pub prompt: String,
+    pub result: Option<String>,
+    pub exit_reason: Option<String>,
+    pub iterations: i64,
+    pub total_tokens: i64,
+    pub run_log: Option<String>,
+    pub last_heartbeat_at: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+}
+
+/// Parameters for creating an agent run (the `queued` insert).
+#[derive(Debug, Clone)]
+pub struct NewAgentRun<'a> {
+    pub id: &'a str,
+    pub agent_id: &'a str,
+    pub parent_run_id: Option<&'a str>,
+    pub flow_execution_id: Option<i64>,
+    pub user_id: Option<&'a str>,
+    pub org_id: Option<&'a str>,
+    pub prompt: &'a str,
+}
+
+/// Status update for an agent run. Counters and terminal fields are optional so
+/// a heartbeat, an iteration tick and a terminal write share one update path.
+#[derive(Debug, Clone, Default)]
+pub struct AgentRunStatusUpdate<'a> {
+    pub status: &'a str,
+    pub result: Option<&'a str>,
+    pub exit_reason: Option<&'a str>,
+    pub iterations: Option<i64>,
+    pub total_tokens: Option<i64>,
+    /// True once the run reaches a terminal state, stamping `finished_at`.
+    pub set_finished: bool,
+    /// True the first time the run enters `running`, stamping `started_at`.
+    pub set_started: bool,
+}
+
+/// Agent-run list filters (all optional, combined with AND).
+#[derive(Debug, Clone, Default)]
+pub struct AgentRunListFilter<'a> {
+    pub agent_id: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub parent_run_id: Option<&'a str>,
+    pub user_id: Option<&'a str>,
+}
+
 /// Parametry tworzenia/aktualizacji szablonu wezla flow
 #[derive(Debug, Clone)]
 pub struct FlowNodeTemplateParams<'a> {

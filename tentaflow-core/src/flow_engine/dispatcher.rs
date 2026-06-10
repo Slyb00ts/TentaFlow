@@ -36,10 +36,11 @@ use crate::flow_engine::envelope::{
 use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
-    CombineNodeAdapter, ConditionNodeAdapter, ConversationHistoryNodeAdapter,
-    EmbeddingsNodeAdapter, LlmNodeAdapter, MemoryNodeAdapter, OutputNodeAdapter,
-    PiiFilterNodeAdapter, SessionContextNodeAdapter, SpeakerContextNodeAdapter, SttNodeAdapter,
-    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
+    AgentContextNodeAdapter, CombineNodeAdapter, ConditionNodeAdapter,
+    ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, LlmNodeAdapter, MemoryNodeAdapter,
+    OutputNodeAdapter, PiiFilterNodeAdapter, SessionContextNodeAdapter, SpeakerContextNodeAdapter,
+    SttNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter,
+    VisionNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::synthetic;
@@ -134,6 +135,13 @@ pub struct FlowDispatcher {
     /// razem z resolverem dla AdapterRegistry — single touchpoint w main.rs.
     addon_flow_blocks:
         parking_lot::RwLock<Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>>>,
+    /// Harness §3.5.0: AgentServiceSlot — wypełniany z main.rs przez
+    /// `set_agent_service` po zbudowaniu AddonManager/AppState. Phase-3 bloki
+    /// (`agent_context`, `tool_exec`) trzymają KLON tego slotu (wpięty w
+    /// `build_registry`), więc `set_agent_service` zapełnia go dla adapterów i
+    /// dispatchera naraz. Pusty slot = błąd node'a (sloty wypełniane na starcie,
+    /// przed obsługą ruchu).
+    agent_service: crate::agents::AgentServiceSlot,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -210,8 +218,18 @@ impl FlowDispatcher {
         let quic_finder = Arc::new(ServiceManagerQuicFinder::new(service_manager.clone()));
         let memory: Arc<dyn MemoryStore> = Arc::new(MemoryStoreImpl::new(quic_finder));
 
-        let llm: Arc<dyn LlmDispatcher> =
-            Arc::new(LlmDispatcherImpl::new(runtime_slot.clone(), blobs.clone()));
+        // Harness §3.4: the LLM dispatcher is gateway-aware — it gets the
+        // DbPool so it can open one compliance_ai_events row per `execute_chat`,
+        // auditing every `llm` node in every flow per call. The node id matches
+        // the routing layer's gateway (local hostname; the mesh registry isn't
+        // populated yet at FlowDispatcher::new).
+        let audit_node_id = crate::mesh::node_info_collector::local_hostname();
+        let llm: Arc<dyn LlmDispatcher> = Arc::new(LlmDispatcherImpl::new(
+            runtime_slot.clone(),
+            blobs.clone(),
+            Some(db.clone()),
+            audit_node_id,
+        ));
         let embeddings: Arc<dyn EmbeddingsDispatcher> =
             Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
         let tts: Arc<dyn TtsDispatcher> =
@@ -235,13 +253,16 @@ impl FlowDispatcher {
             tts_cleaning,
         });
 
-        let registry = build_registry();
+        let agent_service: crate::agents::AgentServiceSlot =
+            Arc::new(parking_lot::RwLock::new(None));
+        let registry = build_registry(agent_service.clone());
         Self {
             db,
             cache: FlowCache::new(60),
             registry: Arc::new(registry),
             ctx_factory,
             addon_flow_blocks: parking_lot::RwLock::new(None),
+            agent_service,
         }
     }
 
@@ -281,6 +302,20 @@ impl FlowDispatcher {
     /// blocks do palety Flow Buildera.
     pub fn addon_flow_blocks(&self) -> Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>> {
         self.addon_flow_blocks.read().clone()
+    }
+
+    /// Harness §3.5.0: wpina `AgentService` do slotu. Wołane raz z main.rs po
+    /// zbudowaniu `AddonManager`/`AppState` (analogicznie do
+    /// `set_addon_resolver`). Phase-3 bloki czytają slot przez `agent_service`.
+    pub fn set_agent_service(&self, service: Arc<crate::agents::AgentService>) {
+        *self.agent_service.write() = Some(service);
+    }
+
+    /// Zwraca `AgentService` jeśli slot został wypełniony. Bloki `agent_context`
+    /// / `tool_exec` czytają ten sam slot przez swój klon (wpięty w
+    /// `build_registry`); ten accessor służy callerom dispatchera.
+    pub fn agent_service(&self) -> Option<Arc<crate::agents::AgentService>> {
+        self.agent_service.read().clone()
     }
 
     /// Etap 2: BlobStore handle — używane przez TTS-as-flow path w
@@ -735,7 +770,7 @@ fn wrap_blocking_as_stream(
 /// rejestrowane przez `register_streaming<T>` — landują w obu slotach
 /// (blocking + streaming). Czysta NodeAdapter rejestracja przez
 /// `register` dla nodów które nie mają stream variant'a.
-fn build_registry() -> AdapterRegistry {
+fn build_registry(agent_service: crate::agents::AgentServiceSlot) -> AdapterRegistry {
     use crate::flow_engine::node_adapters::SentenceBufferNodeAdapter;
 
     let mut r = AdapterRegistry::new();
@@ -755,6 +790,10 @@ fn build_registry() -> AdapterRegistry {
     for a in arcs {
         r.register(a);
     }
+    // Harness §3.5: agent_context + tool_exec share the late-bound
+    // AgentServiceSlot (filled by main.rs after the AddonManager exists).
+    r.register(Arc::new(AgentContextNodeAdapter::new(agent_service.clone())));
+    r.register(Arc::new(ToolExecNodeAdapter::new(agent_service)));
     r.register_llm(Arc::new(LlmNodeAdapter::new()));
     // Streaming-aware adaptery (dual-trait NodeAdapter + StreamingNodeAdapter)
     // trafiają do obu slotów. `tts` jest dual: blocking (całość) + streaming
@@ -772,7 +811,7 @@ mod tests {
 
     #[test]
     fn registry_includes_all_node_types() {
-        let r = build_registry();
+        let r = build_registry(Arc::new(parking_lot::RwLock::new(None)));
         let types: std::collections::BTreeSet<&str> = r.registered_types().into_iter().collect();
         for expected in [
             "trigger",
@@ -789,6 +828,8 @@ mod tests {
             "speaker_context",
             "llm",
             "sentence_buffer",
+            "agent_context",
+            "tool_exec",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }

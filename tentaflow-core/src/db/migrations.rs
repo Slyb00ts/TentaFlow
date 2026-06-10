@@ -361,6 +361,17 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             MigrationStep::Sql(COMPLIANCE_AI_TOOL_CALLS_LLM_CALL_ID),
         ),
         (63, "skills_registry", MigrationStep::Sql(SKILLS_REGISTRY)),
+        (64, "agents_registry", MigrationStep::Sql(AGENTS_REGISTRY)),
+        (
+            65,
+            "compliance_retention_agent_runs_scope",
+            MigrationStep::RustSelfManaged(widen_retention_scope_for_agent_runs),
+        ),
+        (
+            66,
+            "compliance_ai_events_agent_context",
+            MigrationStep::RustSelfManaged(add_ai_events_agent_context),
+        ),
     ]
 }
 
@@ -399,6 +410,68 @@ CREATE TABLE skill_files (
 
 CREATE INDEX idx_skills_source ON skills(source);
 CREATE INDEX idx_skills_status ON skills(status);
+";
+
+// Agents registry (Harness plan §3.3). `agents` replicates fleet-wide like
+// `flows`/`skills` (replicated_by_permission), so `name` is deliberately NOT
+// UNIQUE — a UNIQUE constraint would break sync apply when two nodes mint a
+// same-named agent concurrently; soft uniqueness is enforced in the handler/UI.
+// Seeded agents (phase 5) carry stable UUIDs so every fleet node mints an
+// identical row and sync apply is idempotent.
+//
+// `agent_runs` is RUNTIME state (one row per harness execution) and is NOT a
+// sync resource — exactly like `flow_executions`. It carries the run principal
+// (user_id/org_id) inherited by spawned children and a `run_log` whose PII is
+// governed by a dedicated retention policy (see migration 65). The status set
+// matches the lifecycle in §3.3 (queued → running → waiting/waiting_user →
+// terminal).
+const AGENTS_REGISTRY: &str = "
+CREATE TABLE agents (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    display_name TEXT,
+    description TEXT NOT NULL,
+    system_prompt TEXT,
+    model TEXT,
+    tools_json TEXT NOT NULL DEFAULT '[]',
+    skills_json TEXT NOT NULL DEFAULT '{}',
+    params_json TEXT NOT NULL DEFAULT '{}',
+    max_iterations INTEGER NOT NULL DEFAULT 25,
+    timeout_secs INTEGER NOT NULL DEFAULT 600,
+    max_subagents INTEGER NOT NULL DEFAULT 0,
+    max_spawn_depth INTEGER NOT NULL DEFAULT 1,
+    flow_id TEXT,
+    routable INTEGER NOT NULL DEFAULT 1,
+    is_enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE agent_runs (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    parent_run_id TEXT,
+    flow_execution_id INTEGER,
+    user_id TEXT,
+    org_id TEXT,
+    status TEXT NOT NULL CHECK(status IN \
+        ('queued','running','waiting','waiting_user','completed','failed','cancelled','interrupted')),
+    prompt TEXT NOT NULL,
+    result TEXT,
+    exit_reason TEXT,
+    iterations INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    run_log TEXT,
+    last_heartbeat_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_agents_enabled ON agents(is_enabled);
+CREATE INDEX idx_agent_runs_agent ON agent_runs(agent_id);
+CREATE INDEX idx_agent_runs_status ON agent_runs(status);
+CREATE INDEX idx_agent_runs_parent ON agent_runs(parent_run_id);
 ";
 
 // Multi-instance addons: split the single `addons.addon_id` identity into a
@@ -744,6 +817,19 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
              reference an account the receiving node has not materialized yet",
         ),
         t(
+            "agents",
+            "flow_id",
+            "agent harness flow id (flows.id is TEXT UUID); born TEXT in v64, no declared \
+             FK so the agent row can sync ahead of (or independently of) the flow row",
+        ),
+        t(
+            "agent_runs",
+            "user_id",
+            "run principal born TEXT in v64; runtime row, no declared user_accounts FK — \
+             the run survives the account's deletion for audit, and a NULL principal is \
+             the unattended-call case (§3.3)",
+        ),
+        t(
             "compliance_data_subjects",
             "subject_id",
             "PK of compliance_data_subjects (TEXT UUID), a data-subject, not a platform user",
@@ -925,6 +1011,135 @@ fn core_identity_int_to_uuid(conn: &Connection, version: i64, name: &str) -> Res
             Err(e)
         }
     }
+}
+
+// =============================================================================
+// v65 — poszerzenie CHECK scope_kind o 'agent_runs' (Harness §3.3)
+// =============================================================================
+//
+// `compliance_retention_policies.scope_kind` ma zaszyty CHECK z listy 7 zakresow
+// (v50). `agent_runs.run_log` bywa danymi osobowymi (wyniki narzedzi CRM/memory),
+// wiec dostaje wlasny zakres retencji. Dodanie nowej wartosci do CHECK wymaga
+// przebudowy tabeli — `compliance_data_subject_retention` ma do niej FK, wiec
+// rebuild idzie z `foreign_keys=OFF` POZA transakcja (jak rebuildy v56), z
+// `foreign_key_check` przed commitem. Domyslna polityka 30 dni dla zakresu
+// 'agent_runs' jest seedowana przez `compliance::seed_org_compliance_defaults`
+// (idempotentnie, na kazdym starcie, ze stalym `retention_policy_id`). Sam job
+// czyszczacy (purge `run_log`/`prompt`/`result` po terminie) to faza 6/7.
+fn widen_retention_scope_for_agent_runs(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    // Defensive idempotency: a re-run after success would find the widened CHECK
+    // already in place. Detect it by attempting a no-op insert of the new value
+    // into a probe and rolling back; simpler: read the table SQL and short-circuit.
+    let already_widened: bool = conn
+        .query_row(
+            "SELECT instr(sql, 'agent_runs') > 0 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'compliance_retention_policies'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    if already_widened {
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        // Rebuild the table with the widened CHECK, preserving every other column
+        // definition, constraint, default, trigger and index exactly as v50.
+        tx.execute_batch(
+            "
+            CREATE TABLE compliance_retention_policies_new (
+                retention_policy_id TEXT PRIMARY KEY,
+                org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+                slug TEXT NOT NULL,
+                name_translations TEXT NOT NULL DEFAULT '{}',
+                scope_kind TEXT NOT NULL CHECK(scope_kind IN \
+                    ('audit','ai_audit','data_category','document','dsar','breach','general','agent_runs')),
+                category_id TEXT NULL REFERENCES compliance_data_categories(category_id) ON DELETE SET NULL,
+                retention_days INTEGER NOT NULL,
+                minimum_days INTEGER NOT NULL DEFAULT 0,
+                action_after_retention TEXT NOT NULL DEFAULT 'delete'
+                    CHECK(action_after_retention IN ('delete','anonymize','archive')),
+                is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+                is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                CHECK(retention_days >= minimum_days),
+                UNIQUE(org_id, slug),
+                CHECK(json_valid(name_translations))
+            );
+            INSERT INTO compliance_retention_policies_new
+                SELECT retention_policy_id, org_id, slug, name_translations, scope_kind, \
+                       category_id, retention_days, minimum_days, action_after_retention, \
+                       is_default, is_active, created_at, updated_at \
+                FROM compliance_retention_policies;
+            DROP TABLE compliance_retention_policies;
+            ALTER TABLE compliance_retention_policies_new RENAME TO compliance_retention_policies;
+            CREATE INDEX IF NOT EXISTS idx_compliance_retention_policies_lookup
+                ON compliance_retention_policies(org_id, scope_kind, category_id, is_active);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_compliance_retention_one_default
+                ON compliance_retention_policies(org_id, scope_kind)
+                WHERE is_default = 1 AND category_id IS NULL AND is_active = 1;
+            CREATE TRIGGER IF NOT EXISTS compliance_retention_policies_updated_at
+            AFTER UPDATE ON compliance_retention_policies
+            FOR EACH ROW
+            BEGIN
+                UPDATE compliance_retention_policies
+                SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                WHERE retention_policy_id = NEW.retention_policy_id;
+            END;
+            ",
+        )?;
+
+        // Seed the default 30-day agent_runs policy for every existing org. Fresh
+        // installs get this via `ensure_org_defaults` at migration v50; upgrade
+        // DBs already ran v50 (without this entry) and never re-run it, so this
+        // migration is the one chance to backfill the policy on upgraded fleets.
+        // The retention_policy_id matches `default_record_id` (bare base_id for the
+        // default org, '{org}:{base}' otherwise) so the row stays stable and an
+        // org-creation re-seed is an INSERT OR IGNORE no-op.
+        tx.execute(
+            "INSERT OR IGNORE INTO compliance_retention_policies \
+                (retention_policy_id, org_id, slug, name_translations, scope_kind, category_id, \
+                 retention_days, minimum_days, action_after_retention, is_default, is_active) \
+             SELECT CASE WHEN org_id = ?1 THEN ?2 ELSE printf('%s:%s', org_id, ?2) END, \
+                    org_id, 'agent_runs_default', \
+                    json_object('pl','Przebiegi agentów', 'en','Agent runs'), \
+                    'agent_runs', NULL, 30, 0, 'delete', 1, 1 \
+             FROM organizations WHERE status <> 'deleted'",
+            rusqlite::params![
+                crate::services::org::DEFAULT_ORG_ID,
+                "ret-core-agent-runs-default",
+            ],
+        )?;
+
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "widen_retention_scope_for_agent_runs: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
 }
 
 // =============================================================================
@@ -4445,7 +4660,7 @@ CREATE TABLE IF NOT EXISTS compliance_retention_policies (
     org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
     slug TEXT NOT NULL,
     name_translations TEXT NOT NULL DEFAULT '{}',
-    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('audit','ai_audit','data_category','document','dsar','breach','general')),
+    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('audit','ai_audit','data_category','document','dsar','breach','general','agent_runs')),
     category_id TEXT NULL REFERENCES compliance_data_categories(category_id) ON DELETE SET NULL,
     retention_days INTEGER NOT NULL,
     minimum_days INTEGER NOT NULL DEFAULT 0,
@@ -4526,7 +4741,10 @@ CREATE TABLE IF NOT EXISTS compliance_ai_events (
     instance_id TEXT NULL,
     flow_id TEXT NULL REFERENCES flows(id) ON DELETE SET NULL,
     flow_node_id TEXT NULL,
+    agent_id TEXT NULL,
+    agent_run_id TEXT NULL,
     request_id TEXT NOT NULL,
+    correlation_id TEXT NULL,
     model_id TEXT NOT NULL DEFAULT '',
     backend TEXT NOT NULL DEFAULT '',
     started_at TEXT NOT NULL,
@@ -4551,6 +4769,10 @@ CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_addon
     ON compliance_ai_events(org_id, addon_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_status
     ON compliance_ai_events(org_id, status, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_agent_run
+    ON compliance_ai_events(agent_run_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_correlation
+    ON compliance_ai_events(correlation_id, started_at DESC);
 
 CREATE TRIGGER IF NOT EXISTS compliance_ai_events_updated_at
 AFTER UPDATE ON compliance_ai_events
@@ -4774,6 +4996,50 @@ END;
 const COMPLIANCE_AI_TOOL_CALLS_LLM_CALL_ID: &str = r#"
 ALTER TABLE compliance_ai_tool_calls ADD COLUMN llm_tool_call_id TEXT NULL;
 "#;
+
+// v66 — agent + cross-event correlation on AI audit events (Harness §3.1 /
+// §3.4): the gateway-aware LlmDispatcherImpl opens one compliance_ai_events row
+// per `execute_chat`, so a single agent run that loops the model N times
+// stitches all N events together by `agent_run_id`. For the common (non-agent)
+// chat path there is no agent_run_id, yet routing still writes a session event
+// AND the flow's `llm` node writes a per-call event for the same user turn. The
+// `correlation_id` column links those: routing seeds it with the session
+// event's own `request_id`, and every per-call event copies that value, so one
+// user turn's rows share a correlation key even though `UNIQUE(org_id,
+// request_id)` forces each row a distinct `request_id`. All plain TEXT (no FK):
+// the event must survive an agent definition edit/delete and may be written
+// before the agent row syncs in from another node. Indexes on `agent_run_id`
+// and `correlation_id` so the dashboard can fetch one run's / one turn's AI-call
+// timeline cheaply.
+//
+// Fresh installs get the columns from the inlined v50 foundation DDL, so the
+// ADD COLUMN must be idempotent (a plain SQL migration would fail with
+// "duplicate column name" on a fresh DB where v50 already added them). Each
+// ALTER is gated by a PRAGMA table_info probe; the indexes use IF NOT EXISTS.
+fn add_ai_events_agent_context(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    if !column_exists(conn, "compliance_ai_events", "agent_id")? {
+        conn.execute_batch("ALTER TABLE compliance_ai_events ADD COLUMN agent_id TEXT NULL;")?;
+    }
+    if !column_exists(conn, "compliance_ai_events", "agent_run_id")? {
+        conn.execute_batch("ALTER TABLE compliance_ai_events ADD COLUMN agent_run_id TEXT NULL;")?;
+    }
+    if !column_exists(conn, "compliance_ai_events", "correlation_id")? {
+        conn.execute_batch(
+            "ALTER TABLE compliance_ai_events ADD COLUMN correlation_id TEXT NULL;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_agent_run \
+             ON compliance_ai_events(agent_run_id, started_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_compliance_ai_events_correlation \
+             ON compliance_ai_events(correlation_id, started_at DESC);",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+        rusqlite::params![version, name],
+    )?;
+    Ok(())
+}
 
 // v40 — `platform_locales`: katalog jezykow interfejsu per organizacja.
 // Tabela trzyma kody ISO 639-1 dostepne dla danej organizacji oraz wskazuje
@@ -5627,6 +5893,165 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn migration_v65_widens_retention_scope_and_seeds_agent_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Reproduce a pre-v65 database: rebuild the retention table with the old
+        // 7-value CHECK and drop the seeded agent_runs policy + the v65 stamp.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE compliance_retention_policies_old (
+                retention_policy_id TEXT PRIMARY KEY,
+                org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+                slug TEXT NOT NULL,
+                name_translations TEXT NOT NULL DEFAULT '{}',
+                scope_kind TEXT NOT NULL CHECK(scope_kind IN \
+                    ('audit','ai_audit','data_category','document','dsar','breach','general')),
+                category_id TEXT NULL REFERENCES compliance_data_categories(category_id) ON DELETE SET NULL,
+                retention_days INTEGER NOT NULL,
+                minimum_days INTEGER NOT NULL DEFAULT 0,
+                action_after_retention TEXT NOT NULL DEFAULT 'delete'
+                    CHECK(action_after_retention IN ('delete','anonymize','archive')),
+                is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+                is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                CHECK(retention_days >= minimum_days),
+                UNIQUE(org_id, slug),
+                CHECK(json_valid(name_translations))
+            );
+            INSERT INTO compliance_retention_policies_old
+                SELECT retention_policy_id, org_id, slug, name_translations, scope_kind, \
+                       category_id, retention_days, minimum_days, action_after_retention, \
+                       is_default, is_active, created_at, updated_at \
+                FROM compliance_retention_policies WHERE scope_kind <> 'agent_runs';
+            DROP TABLE compliance_retention_policies;
+            ALTER TABLE compliance_retention_policies_old RENAME TO compliance_retention_policies;
+            ",
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("DELETE FROM _migrations WHERE version = 65", [])
+            .unwrap();
+
+        // The old CHECK rejects the new scope, proving we reproduced pre-v65.
+        let pre = conn.execute(
+            "INSERT INTO compliance_retention_policies \
+                (retention_policy_id, org_id, slug, name_translations, scope_kind, \
+                 retention_days, is_default, is_active) \
+             VALUES ('probe', 'org-default', 'probe', '{}', 'agent_runs', 30, 0, 1)",
+            [],
+        );
+        assert!(pre.is_err(), "pre-v65 CHECK must reject 'agent_runs'");
+
+        widen_retention_scope_for_agent_runs(&conn, 65, "compliance_retention_agent_runs_scope")
+            .unwrap();
+
+        // (a) the widened CHECK now accepts the new scope.
+        let policy_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM compliance_retention_policies \
+                 WHERE scope_kind = 'agent_runs' AND org_id = 'org-default'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(policy_count, 1, "agent_runs policy must be backfilled");
+
+        // (b) the seeded policy is the 30-day default with the stable id.
+        let (id, days, action): (String, i64, String) = conn
+            .query_row(
+                "SELECT retention_policy_id, retention_days, action_after_retention \
+                 FROM compliance_retention_policies \
+                 WHERE scope_kind = 'agent_runs' AND org_id = 'org-default'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "ret-core-agent-runs-default");
+        assert_eq!(days, 30);
+        assert_eq!(action, "delete");
+
+        // (c) v65 stamped, FKs intact.
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 65",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1, "v65 must be recorded in _migrations");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        // (d) idempotency: a second call short-circuits and does not duplicate.
+        conn.execute("DELETE FROM _migrations WHERE version = 65", [])
+            .unwrap();
+        widen_retention_scope_for_agent_runs(&conn, 65, "compliance_retention_agent_runs_scope")
+            .unwrap();
+        let policy_count_again: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM compliance_retention_policies WHERE scope_kind = 'agent_runs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(policy_count_again, 1, "no duplicate agent_runs policy");
+    }
+
+    #[test]
+    fn migration_v66_adds_agent_context_columns_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Reproduce a pre-v66 database: drop the two columns by rebuilding only
+        // the schema shape that matters here is the absence of the columns —
+        // simplest is to assert the fresh DB already has them (v50 inlined them),
+        // then prove the migration is a no-op (idempotent) when re-run.
+        assert!(
+            column_exists(&conn, "compliance_ai_events", "agent_id").unwrap(),
+            "fresh install must already carry agent_id from the v50 foundation"
+        );
+        assert!(column_exists(&conn, "compliance_ai_events", "agent_run_id").unwrap());
+        assert!(column_exists(&conn, "compliance_ai_events", "correlation_id").unwrap());
+
+        // Re-running v66 on a DB that already has the columns must not fail with
+        // "duplicate column name" (the bug the PRAGMA probe guards against).
+        conn.execute("DELETE FROM _migrations WHERE version = 66", [])
+            .unwrap();
+        add_ai_events_agent_context(&conn, 66, "compliance_ai_events_agent_context").unwrap();
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 66",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1, "v66 must be recorded in _migrations");
+
+        // The upgrade path (columns missing) also works: simulate a legacy
+        // compliance_ai_events lacking the agent columns (but with started_at,
+        // which the agent-run index orders by) and run v66 over it.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_compliance_ai_events_agent_run;
+             DROP TABLE compliance_ai_events;
+             CREATE TABLE compliance_ai_events (
+                event_id TEXT PRIMARY KEY,
+                flow_node_id TEXT NULL,
+                started_at TEXT NOT NULL DEFAULT ''
+             );",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM _migrations WHERE version = 66", [])
+            .unwrap();
+        add_ai_events_agent_context(&conn, 66, "compliance_ai_events_agent_context").unwrap();
+        assert!(column_exists(&conn, "compliance_ai_events", "agent_id").unwrap());
+        assert!(column_exists(&conn, "compliance_ai_events", "agent_run_id").unwrap());
+        assert!(column_exists(&conn, "compliance_ai_events", "correlation_id").unwrap());
     }
 
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by

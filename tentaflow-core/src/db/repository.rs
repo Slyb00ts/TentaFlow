@@ -3165,6 +3165,42 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            K::Agent => {
+                let mut stmt = tx.prepare(&format!("SELECT {AGENT_COLS} FROM agents"))?;
+                let rows = stmt
+                    .query_map([], row_to_agent)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for agent in rows {
+                    let params = AgentParams {
+                        id: &agent.id,
+                        name: &agent.name,
+                        display_name: agent.display_name.as_deref(),
+                        description: &agent.description,
+                        system_prompt: agent.system_prompt.as_deref(),
+                        model: agent.model.as_deref(),
+                        tools_json: &agent.tools_json,
+                        skills_json: &agent.skills_json,
+                        params_json: &agent.params_json,
+                        max_iterations: agent.max_iterations,
+                        timeout_secs: agent.timeout_secs,
+                        max_subagents: agent.max_subagents,
+                        max_spawn_depth: agent.max_spawn_depth,
+                        flow_id: agent.flow_id.as_deref(),
+                        routable: agent.routable,
+                        is_enabled: agent.is_enabled,
+                        actor_user_id: None,
+                    };
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        agent.id.clone(),
+                        Insert,
+                        agent_changed_fields(&params),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
             K::SyncPolicy => {
                 let mut stmt = tx.prepare(
                     "SELECT policy_id, org_id, addon_id, resource_type, resource_id, mode, \
@@ -4309,6 +4345,22 @@ pub fn get_skill_by_name(pool: &DbPool, name: &str) -> Result<Option<DbSkill>> {
     Ok(result)
 }
 
+/// Records one use of a skill: bumps `use_count` and stamps `last_used_at`.
+/// Called when `core.skill_view` loads a skill into an agent turn. `use_count`
+/// and `last_used_at` are local-only columns (the upsert path preserves them on
+/// conflict), so this write is intentionally NOT a sync capture — a skill's
+/// usage statistics are per-node and never replicated. Returns true when a row
+/// was updated.
+pub fn bump_skill_use(pool: &DbPool, id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let rows = conn.execute(
+        "UPDATE skills SET use_count = use_count + 1, last_used_at = datetime('now') \
+         WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(rows > 0)
+}
+
 /// Insert-or-update a skill. Every upsert is captured as a full-row Insert (the
 /// receiver applies it as an upsert), so a replicated edit never depends on
 /// UPDATE-after-INSERT causal ordering. On conflict the local-only columns
@@ -4814,6 +4866,890 @@ mod skills_repository_tests {
         assert_eq!(count_ops("core.skill", "insert"), 1);
         assert_eq!(count_ops("core.skill", "delete"), 1);
         assert_eq!(count_ops("core.skill_file", "insert"), 1);
+    }
+}
+
+// --- Agents ---
+
+/// Hard limits of the Agents registry (Harness plan §3.3). Enforced on every
+/// handler-facing write (`upsert_agent`).
+pub const AGENT_NAME_MAX_CHARS: usize = 64;
+/// Twin of `loop.max_iterations` hard cap (§3.5): an agent cannot request a
+/// budget the loop block would refuse anyway.
+pub const AGENT_MAX_ITERATIONS_CAP: i64 = 100;
+
+/// Terminal-and-transient lifecycle states, mirroring the migration CHECK.
+pub const AGENT_RUN_STATES: &[&str] = &[
+    "queued",
+    "running",
+    "waiting",
+    "waiting_user",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+];
+
+const AGENT_COLS: &str = "id, name, display_name, description, system_prompt, model, tools_json, \
+     skills_json, params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, \
+     flow_id, routable, is_enabled, created_at, updated_at";
+
+const AGENT_RUN_COLS: &str = "id, agent_id, parent_run_id, flow_execution_id, user_id, org_id, \
+     status, prompt, result, exit_reason, iterations, total_tokens, run_log, last_heartbeat_at, \
+     started_at, finished_at, created_at";
+
+fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgent> {
+    Ok(DbAgent {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        display_name: row.get(2)?,
+        description: row.get(3)?,
+        system_prompt: row.get(4)?,
+        model: row.get(5)?,
+        tools_json: row.get(6)?,
+        skills_json: row.get(7)?,
+        params_json: row.get(8)?,
+        max_iterations: row.get(9)?,
+        timeout_secs: row.get(10)?,
+        max_subagents: row.get(11)?,
+        max_spawn_depth: row.get(12)?,
+        flow_id: row.get(13)?,
+        routable: row.get::<_, i64>(14)? != 0,
+        is_enabled: row.get::<_, i64>(15)? != 0,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+    })
+}
+
+fn row_to_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgentRun> {
+    Ok(DbAgentRun {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        parent_run_id: row.get(2)?,
+        flow_execution_id: row.get(3)?,
+        user_id: row.get(4)?,
+        org_id: row.get(5)?,
+        status: row.get(6)?,
+        prompt: row.get(7)?,
+        result: row.get(8)?,
+        exit_reason: row.get(9)?,
+        iterations: row.get(10)?,
+        total_tokens: row.get(11)?,
+        run_log: row.get(12)?,
+        last_heartbeat_at: row.get(13)?,
+        started_at: row.get(14)?,
+        finished_at: row.get(15)?,
+        created_at: row.get(16)?,
+    })
+}
+
+/// Validates the §3.3 limits for an agent write. Public so the protocol handler
+/// can pre-validate and surface the exact message to the dashboard.
+pub fn validate_agent_params(params: &AgentParams<'_>) -> Result<()> {
+    if params.name.chars().count() > AGENT_NAME_MAX_CHARS || !is_kebab_case(params.name) {
+        return Err(anyhow::anyhow!(
+            "agent name must be kebab-case, 1..={AGENT_NAME_MAX_CHARS} chars: '{}'",
+            params.name
+        ));
+    }
+    if params.description.trim().is_empty() {
+        return Err(anyhow::anyhow!("agent description is required"));
+    }
+    if params.max_iterations < 1 || params.max_iterations > AGENT_MAX_ITERATIONS_CAP {
+        return Err(anyhow::anyhow!(
+            "agent max_iterations must be 1..={AGENT_MAX_ITERATIONS_CAP}"
+        ));
+    }
+    if params.timeout_secs < 1 {
+        return Err(anyhow::anyhow!("agent timeout_secs must be >= 1"));
+    }
+    if params.max_subagents < 0 {
+        return Err(anyhow::anyhow!("agent max_subagents must be >= 0"));
+    }
+    if params.max_spawn_depth < 1 {
+        return Err(anyhow::anyhow!("agent max_spawn_depth must be >= 1"));
+    }
+    // tools_json is an allowlist array; skills_json and params_json are objects.
+    let _tools: Vec<String> = serde_json::from_str(params.tools_json)
+        .map_err(|e| anyhow::anyhow!("agent tools_json must be a JSON array of strings: {e}"))?;
+    let skills: serde_json::Value = serde_json::from_str(params.skills_json)
+        .map_err(|e| anyhow::anyhow!("agent skills_json must be valid JSON: {e}"))?;
+    if !skills.is_object() {
+        return Err(anyhow::anyhow!("agent skills_json must be a JSON object"));
+    }
+    let prms: serde_json::Value = serde_json::from_str(params.params_json)
+        .map_err(|e| anyhow::anyhow!("agent params_json must be valid JSON: {e}"))?;
+    if !prms.is_object() {
+        return Err(anyhow::anyhow!("agent params_json must be a JSON object"));
+    }
+    Ok(())
+}
+
+/// Synced field set of an agent row. There are no node-local columns to exclude
+/// (unlike skills' usage stats), so every persisted column except the immutable
+/// `id`/`created_at` travels.
+fn agent_changed_fields(
+    params: &AgentParams<'_>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), field_string(params.name));
+    fields.insert(
+        "display_name".to_string(),
+        field_optional_string(params.display_name),
+    );
+    fields.insert("description".to_string(), field_string(params.description));
+    fields.insert(
+        "system_prompt".to_string(),
+        field_optional_string(params.system_prompt),
+    );
+    fields.insert("model".to_string(), field_optional_string(params.model));
+    fields.insert("tools_json".to_string(), field_string(params.tools_json));
+    fields.insert("skills_json".to_string(), field_string(params.skills_json));
+    fields.insert("params_json".to_string(), field_string(params.params_json));
+    fields.insert(
+        "max_iterations".to_string(),
+        crate::sync::ledger::FieldValue::I64(params.max_iterations),
+    );
+    fields.insert(
+        "timeout_secs".to_string(),
+        crate::sync::ledger::FieldValue::I64(params.timeout_secs),
+    );
+    fields.insert(
+        "max_subagents".to_string(),
+        crate::sync::ledger::FieldValue::I64(params.max_subagents),
+    );
+    fields.insert(
+        "max_spawn_depth".to_string(),
+        crate::sync::ledger::FieldValue::I64(params.max_spawn_depth),
+    );
+    fields.insert(
+        "flow_id".to_string(),
+        field_optional_string(params.flow_id),
+    );
+    fields.insert(
+        "routable".to_string(),
+        crate::sync::ledger::FieldValue::Bool(params.routable),
+    );
+    fields.insert(
+        "is_enabled".to_string(),
+        crate::sync::ledger::FieldValue::Bool(params.is_enabled),
+    );
+    fields
+}
+
+pub fn list_agents(pool: &DbPool, filter: &AgentListFilter) -> Result<Vec<DbAgent>> {
+    let conn = acquire(pool)?;
+    let mut sql = format!("SELECT {AGENT_COLS} FROM agents WHERE 1=1");
+    let mut binds: Vec<i64> = Vec::new();
+    if let Some(enabled) = filter.is_enabled {
+        sql.push_str(" AND is_enabled = ?");
+        binds.push(enabled as i64);
+    }
+    if let Some(routable) = filter.routable {
+        sql.push_str(" AND routable = ?");
+        binds.push(routable as i64);
+    }
+    sql.push_str(" ORDER BY name, created_at, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let bind_refs: Vec<&dyn rusqlite::ToSql> =
+        binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+    let rows = stmt
+        .query_map(&bind_refs[..], row_to_agent)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn get_agent(pool: &DbPool, id: &str) -> Result<Option<DbAgent>> {
+    let conn = acquire(pool)?;
+    let mut stmt =
+        conn.prepare_cached(&format!("SELECT {AGENT_COLS} FROM agents WHERE id = ?1"))?;
+    let result = stmt
+        .query_row(rusqlite::params![id], row_to_agent)
+        .optional()?;
+    Ok(result)
+}
+
+/// Names are soft-unique (no UNIQUE constraint — sync); pick the oldest row
+/// deterministically when concurrent nodes minted the same name.
+pub fn get_agent_by_name(pool: &DbPool, name: &str) -> Result<Option<DbAgent>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {AGENT_COLS} FROM agents WHERE name = ?1 ORDER BY created_at, id LIMIT 1"
+    ))?;
+    let result = stmt
+        .query_row(rusqlite::params![name], row_to_agent)
+        .optional()?;
+    Ok(result)
+}
+
+/// Insert-or-update an agent. Every upsert is captured as a full-row Insert (the
+/// receiver applies it as an upsert), so a replicated edit never depends on
+/// UPDATE-after-INSERT causal ordering. On conflict `created_at` is preserved.
+pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
+    validate_agent_params(params)?;
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO agents \
+         (id, name, display_name, description, system_prompt, model, tools_json, skills_json, \
+          params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, flow_id, \
+          routable, is_enabled) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+         ON CONFLICT(id) DO UPDATE SET \
+         name = excluded.name, display_name = excluded.display_name, \
+         description = excluded.description, system_prompt = excluded.system_prompt, \
+         model = excluded.model, tools_json = excluded.tools_json, \
+         skills_json = excluded.skills_json, params_json = excluded.params_json, \
+         max_iterations = excluded.max_iterations, timeout_secs = excluded.timeout_secs, \
+         max_subagents = excluded.max_subagents, max_spawn_depth = excluded.max_spawn_depth, \
+         flow_id = excluded.flow_id, routable = excluded.routable, \
+         is_enabled = excluded.is_enabled, updated_at = datetime('now')",
+        rusqlite::params![
+            params.id,
+            params.name,
+            params.display_name,
+            params.description,
+            params.system_prompt,
+            params.model,
+            params.tools_json,
+            params.skills_json,
+            params.params_json,
+            params.max_iterations,
+            params.timeout_secs,
+            params.max_subagents,
+            params.max_spawn_depth,
+            params.flow_id,
+            params.routable as i64,
+            params.is_enabled as i64,
+        ],
+    )?;
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Agent,
+        params.id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        agent_changed_fields(params),
+        params.actor_user_id.map(|id| id.to_string()),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes an agent. Returns true when a row was removed. `agent_runs` carry no
+/// FK to `agents` (runtime rows survive an agent's deletion for audit), so a
+/// delete leaves historical runs intact.
+pub fn delete_agent(pool: &DbPool, id: &str) -> Result<bool> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute("DELETE FROM agents WHERE id = ?1", rusqlite::params![id])?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), field_string(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::Agent,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(rows_affected > 0)
+}
+
+// --- Agent runs (runtime, not synced) ---
+
+/// Creates a run in the `queued` state. The caller owns `id` (a fresh UUID).
+pub fn create_agent_run(pool: &DbPool, run: &NewAgentRun<'_>) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO agent_runs \
+         (id, agent_id, parent_run_id, flow_execution_id, user_id, org_id, status, prompt) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+        rusqlite::params![
+            run.id,
+            run.agent_id,
+            run.parent_run_id,
+            run.flow_execution_id,
+            run.user_id,
+            run.org_id,
+            run.prompt,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_agent_run(pool: &DbPool, id: &str) -> Result<Option<DbAgentRun>> {
+    let conn = acquire(pool)?;
+    let mut stmt =
+        conn.prepare_cached(&format!("SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE id = ?1"))?;
+    let result = stmt
+        .query_row(rusqlite::params![id], row_to_agent_run)
+        .optional()?;
+    Ok(result)
+}
+
+/// Applies a lifecycle/counter update to a run. `started_at`/`finished_at` are
+/// stamped from the flags so the caller never races the wall clock per field;
+/// `last_heartbeat_at` always advances (the watchdog reads it).
+pub fn update_agent_run_status(
+    pool: &DbPool,
+    id: &str,
+    update: &AgentRunStatusUpdate<'_>,
+) -> Result<bool> {
+    if !AGENT_RUN_STATES.contains(&update.status) {
+        return Err(anyhow::anyhow!(
+            "invalid agent run status: '{}'",
+            update.status
+        ));
+    }
+    let conn = acquire(pool)?;
+    let rows = conn.execute(
+        "UPDATE agent_runs SET \
+         status = ?2, \
+         result = COALESCE(?3, result), \
+         exit_reason = COALESCE(?4, exit_reason), \
+         iterations = COALESCE(?5, iterations), \
+         total_tokens = COALESCE(?6, total_tokens), \
+         started_at = CASE WHEN ?7 AND started_at IS NULL THEN datetime('now') ELSE started_at END, \
+         finished_at = CASE WHEN ?8 THEN datetime('now') ELSE finished_at END, \
+         last_heartbeat_at = datetime('now') \
+         WHERE id = ?1",
+        rusqlite::params![
+            id,
+            update.status,
+            update.result,
+            update.exit_reason,
+            update.iterations,
+            update.total_tokens,
+            update.set_started as i64,
+            update.set_finished as i64,
+        ],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Bumps `last_heartbeat_at` without touching status — the liveness ping a
+/// long-running task sends while it works (and while parked in `waiting_user`).
+pub fn touch_agent_run_heartbeat(pool: &DbPool, id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let rows = conn.execute(
+        "UPDATE agent_runs SET last_heartbeat_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Appends a JSON step to `run_log`. The column holds a JSON array; an empty or
+/// NULL log is initialized to `[step]`, otherwise the step is pushed with
+/// `json_insert` so concurrent appends from one writer stay ordered.
+pub fn append_agent_run_log(pool: &DbPool, id: &str, step_json: &str) -> Result<bool> {
+    // Validate the caller handed us a single JSON value, not a fragment that
+    // would corrupt the stored array.
+    let step: serde_json::Value = serde_json::from_str(step_json)
+        .map_err(|e| anyhow::anyhow!("run_log step must be valid JSON: {e}"))?;
+    let conn = acquire(pool)?;
+    let rows = conn.execute(
+        "UPDATE agent_runs SET run_log = json_insert( \
+             CASE WHEN run_log IS NULL OR run_log = '' THEN '[]' ELSE run_log END, \
+             '$[#]', json(?2)), \
+         last_heartbeat_at = datetime('now') \
+         WHERE id = ?1",
+        rusqlite::params![id, serde_json::to_string(&step)?],
+    )?;
+    Ok(rows > 0)
+}
+
+pub fn list_agent_runs(
+    pool: &DbPool,
+    filter: &AgentRunListFilter<'_>,
+) -> Result<Vec<DbAgentRun>> {
+    let conn = acquire(pool)?;
+    let mut sql = format!("SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE 1=1");
+    let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+    if let Some(agent_id) = &filter.agent_id {
+        sql.push_str(" AND agent_id = ?");
+        binds.push(agent_id);
+    }
+    if let Some(status) = &filter.status {
+        sql.push_str(" AND status = ?");
+        binds.push(status);
+    }
+    if let Some(parent_run_id) = &filter.parent_run_id {
+        sql.push_str(" AND parent_run_id = ?");
+        binds.push(parent_run_id);
+    }
+    if let Some(user_id) = &filter.user_id {
+        sql.push_str(" AND user_id = ?");
+        binds.push(user_id);
+    }
+    sql.push_str(" ORDER BY created_at DESC, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(&binds[..], row_to_agent_run)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Active runs are everything not in a terminal state — the set the
+/// `AgentRunManager` rehydrates and the dashboard shows as "in flight".
+pub fn list_active_agent_runs(pool: &DbPool) -> Result<Vec<DbAgentRun>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {AGENT_RUN_COLS} FROM agent_runs \
+         WHERE status IN ('queued','running','waiting','waiting_user') \
+         ORDER BY created_at, id"
+    ))?;
+    let rows = stmt
+        .query_map([], row_to_agent_run)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Children of a run, oldest first — the spawn tree a parent walks in
+/// `agent_wait` and the dashboard renders under its parent.
+pub fn list_agent_runs_by_parent(pool: &DbPool, parent_run_id: &str) -> Result<Vec<DbAgentRun>> {
+    list_agent_runs(
+        pool,
+        &AgentRunListFilter {
+            parent_run_id: Some(parent_run_id),
+            ..Default::default()
+        },
+    )
+}
+
+#[cfg(test)]
+mod agents_repository_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn setup_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("test db")
+    }
+
+    fn agent_params<'a>(id: &'a str, name: &'a str) -> AgentParams<'a> {
+        AgentParams {
+            id,
+            name,
+            display_name: Some("Research Agent"),
+            description: "General research agent",
+            system_prompt: Some("You research topics."),
+            model: None,
+            tools_json: r#"["core.skill_view","memory.memory_search"]"#,
+            skills_json: r#"{"names":["web-research"],"tags":["research"]}"#,
+            params_json: r#"{"temperature":0.2}"#,
+            max_iterations: 25,
+            timeout_secs: 600,
+            max_subagents: 0,
+            max_spawn_depth: 1,
+            flow_id: None,
+            routable: true,
+            is_enabled: true,
+            actor_user_id: None,
+        }
+    }
+
+    #[test]
+    fn migration_creates_agent_tables_with_constraints() {
+        let db = setup_db();
+        let conn = db.lock().expect("db lock");
+        for table in ["agents", "agent_runs"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |r| r.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(n, 1, "missing table {table}");
+        }
+        for index in [
+            "idx_agents_enabled",
+            "idx_agent_runs_agent",
+            "idx_agent_runs_status",
+            "idx_agent_runs_parent",
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    rusqlite::params![index],
+                    |r| r.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(n, 1, "missing index {index}");
+        }
+        // The status CHECK must reject out-of-domain values at SQL level.
+        let bad_status = conn.execute(
+            "INSERT INTO agent_runs (id, agent_id, status, prompt) \
+             VALUES ('r', 'a', 'spinning', 'do it')",
+            [],
+        );
+        assert!(bad_status.is_err(), "CHECK(status) must reject 'spinning'");
+    }
+
+    #[test]
+    fn upsert_get_list_roundtrip_and_filters() {
+        let db = setup_db();
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        upsert_agent(&db, &agent_params(&a, "research-agent")).expect("upsert a");
+
+        let mut hidden = agent_params(&b, "ops-agent");
+        hidden.routable = false;
+        hidden.is_enabled = false;
+        hidden.model = Some("qwen3.6:27b");
+        upsert_agent(&db, &hidden).expect("upsert b");
+
+        let agent = get_agent(&db, &a).expect("get").expect("exists");
+        assert_eq!(agent.name, "research-agent");
+        assert_eq!(agent.display_name.as_deref(), Some("Research Agent"));
+        assert_eq!(agent.max_iterations, 25);
+        assert!(agent.routable);
+        assert!(agent.is_enabled);
+        assert!(agent.model.is_none());
+
+        let by_name = get_agent_by_name(&db, "ops-agent")
+            .expect("by name")
+            .expect("exists");
+        assert_eq!(by_name.id, b);
+        assert_eq!(by_name.model.as_deref(), Some("qwen3.6:27b"));
+
+        let enabled = list_agents(
+            &db,
+            &AgentListFilter {
+                is_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .expect("list enabled");
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].id, a);
+
+        let routable = list_agents(
+            &db,
+            &AgentListFilter {
+                routable: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("list routable");
+        assert_eq!(routable.len(), 1);
+        assert_eq!(routable[0].id, b);
+
+        // Update in place: still one row, fields refreshed.
+        let mut updated = agent_params(&a, "research-agent");
+        updated.description = "Updated description";
+        updated.max_iterations = 40;
+        updated.is_enabled = false;
+        upsert_agent(&db, &updated).expect("upsert update");
+        let agent = get_agent(&db, &a).expect("get").expect("exists");
+        assert_eq!(agent.description, "Updated description");
+        assert_eq!(agent.max_iterations, 40);
+        assert!(!agent.is_enabled);
+        assert_eq!(
+            list_agents(&db, &AgentListFilter::default())
+                .expect("list all")
+                .len(),
+            2
+        );
+
+        assert!(delete_agent(&db, &a).expect("delete"));
+        assert!(get_agent(&db, &a).expect("get").is_none());
+    }
+
+    #[test]
+    fn validation_rejects_bad_params() {
+        let db = setup_db();
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let mut bad = agent_params(&id, "Not-Kebab");
+        assert!(upsert_agent(&db, &bad).is_err(), "uppercase name");
+
+        bad = agent_params(&id, "ok-name");
+        bad.description = "   ";
+        assert!(upsert_agent(&db, &bad).is_err(), "blank description");
+
+        bad = agent_params(&id, "ok-name");
+        bad.max_iterations = AGENT_MAX_ITERATIONS_CAP + 1;
+        assert!(upsert_agent(&db, &bad).is_err(), "iterations over cap");
+        bad.max_iterations = 0;
+        assert!(upsert_agent(&db, &bad).is_err(), "iterations below 1");
+
+        bad = agent_params(&id, "ok-name");
+        bad.tools_json = "{}";
+        assert!(upsert_agent(&db, &bad).is_err(), "tools_json not an array");
+        bad.tools_json = "not-json";
+        assert!(upsert_agent(&db, &bad).is_err(), "tools_json invalid");
+
+        bad = agent_params(&id, "ok-name");
+        bad.skills_json = "[]";
+        assert!(upsert_agent(&db, &bad).is_err(), "skills_json not an object");
+
+        bad = agent_params(&id, "ok-name");
+        bad.params_json = "5";
+        assert!(upsert_agent(&db, &bad).is_err(), "params_json not an object");
+
+        bad = agent_params(&id, "ok-name");
+        bad.max_spawn_depth = 0;
+        assert!(upsert_agent(&db, &bad).is_err(), "spawn depth below 1");
+
+        assert!(
+            get_agent(&db, &id).expect("get").is_none(),
+            "no rejected write may persist"
+        );
+    }
+
+    #[test]
+    fn agent_run_lifecycle_transitions() {
+        let db = setup_db();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        upsert_agent(&db, &agent_params(&agent_id, "runner")).expect("agent");
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        create_agent_run(
+            &db,
+            &NewAgentRun {
+                id: &run_id,
+                agent_id: &agent_id,
+                parent_run_id: None,
+                flow_execution_id: Some(7),
+                user_id: Some("user-1"),
+                org_id: Some("org-default"),
+                prompt: "find the answer",
+            },
+        )
+        .expect("create run");
+
+        let run = get_agent_run(&db, &run_id).expect("get").expect("exists");
+        assert_eq!(run.status, "queued");
+        assert_eq!(run.prompt, "find the answer");
+        assert_eq!(run.flow_execution_id, Some(7));
+        assert!(run.started_at.is_none());
+
+        // queued -> running stamps started_at.
+        assert!(update_agent_run_status(
+            &db,
+            &run_id,
+            &AgentRunStatusUpdate {
+                status: "running",
+                set_started: true,
+                ..Default::default()
+            }
+        )
+        .expect("to running"));
+        let run = get_agent_run(&db, &run_id).expect("get").expect("exists");
+        assert_eq!(run.status, "running");
+        assert!(run.started_at.is_some());
+        assert!(run.finished_at.is_none());
+
+        // Iteration tick + heartbeat advance counters without finishing.
+        update_agent_run_status(
+            &db,
+            &run_id,
+            &AgentRunStatusUpdate {
+                status: "running",
+                iterations: Some(3),
+                total_tokens: Some(1200),
+                ..Default::default()
+            },
+        )
+        .expect("tick");
+        let run = get_agent_run(&db, &run_id).expect("get").expect("exists");
+        assert_eq!(run.iterations, 3);
+        assert_eq!(run.total_tokens, 1200);
+
+        // Parking in waiting_user keeps started_at and does not stamp finish.
+        update_agent_run_status(
+            &db,
+            &run_id,
+            &AgentRunStatusUpdate {
+                status: "waiting_user",
+                ..Default::default()
+            },
+        )
+        .expect("wait user");
+        assert_eq!(list_active_agent_runs(&db).expect("active").len(), 1);
+
+        // Terminal completion stamps finished_at and stores result/exit_reason.
+        update_agent_run_status(
+            &db,
+            &run_id,
+            &AgentRunStatusUpdate {
+                status: "completed",
+                result: Some("the answer is 42"),
+                exit_reason: Some("final_response"),
+                set_finished: true,
+                ..Default::default()
+            },
+        )
+        .expect("complete");
+        let run = get_agent_run(&db, &run_id).expect("get").expect("exists");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.result.as_deref(), Some("the answer is 42"));
+        assert_eq!(run.exit_reason.as_deref(), Some("final_response"));
+        assert!(run.finished_at.is_some());
+        assert!(list_active_agent_runs(&db).expect("active").is_empty());
+
+        // An out-of-domain status is rejected before touching the row.
+        assert!(
+            update_agent_run_status(
+                &db,
+                &run_id,
+                &AgentRunStatusUpdate {
+                    status: "bogus",
+                    ..Default::default()
+                }
+            )
+            .is_err(),
+            "invalid status rejected"
+        );
+    }
+
+    #[test]
+    fn run_log_appends_ordered_json_array() {
+        let db = setup_db();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        upsert_agent(&db, &agent_params(&agent_id, "logger")).expect("agent");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        create_agent_run(
+            &db,
+            &NewAgentRun {
+                id: &run_id,
+                agent_id: &agent_id,
+                parent_run_id: None,
+                flow_execution_id: None,
+                user_id: None,
+                org_id: None,
+                prompt: "p",
+            },
+        )
+        .expect("create");
+
+        append_agent_run_log(&db, &run_id, r#"{"step":"llm","i":1}"#).expect("step 1");
+        append_agent_run_log(&db, &run_id, r#"{"step":"tool","i":2}"#).expect("step 2");
+        assert!(
+            append_agent_run_log(&db, &run_id, "not-json").is_err(),
+            "fragment rejected"
+        );
+
+        let run = get_agent_run(&db, &run_id).expect("get").expect("exists");
+        let log: Vec<serde_json::Value> =
+            serde_json::from_str(run.run_log.as_deref().expect("log present")).expect("array");
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0]["i"], 1);
+        assert_eq!(log[1]["step"], "tool");
+    }
+
+    #[test]
+    fn list_runs_by_parent_and_filters() {
+        let db = setup_db();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        upsert_agent(&db, &agent_params(&agent_id, "tree")).expect("agent");
+
+        let parent = uuid::Uuid::new_v4().to_string();
+        create_agent_run(
+            &db,
+            &NewAgentRun {
+                id: &parent,
+                agent_id: &agent_id,
+                parent_run_id: None,
+                flow_execution_id: None,
+                user_id: Some("user-1"),
+                org_id: None,
+                prompt: "parent",
+            },
+        )
+        .expect("parent");
+        for label in ["child-a", "child-b"] {
+            let child = uuid::Uuid::new_v4().to_string();
+            create_agent_run(
+                &db,
+                &NewAgentRun {
+                    id: &child,
+                    agent_id: &agent_id,
+                    parent_run_id: Some(&parent),
+                    flow_execution_id: None,
+                    user_id: Some("user-2"),
+                    org_id: None,
+                    prompt: label,
+                },
+            )
+            .expect("child");
+        }
+
+        let children = list_agent_runs_by_parent(&db, &parent).expect("children");
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|r| r.parent_run_id.as_deref() == Some(parent.as_str())));
+
+        let by_user = list_agent_runs(
+            &db,
+            &AgentRunListFilter {
+                user_id: Some("user-1"),
+                ..Default::default()
+            },
+        )
+        .expect("by user");
+        assert_eq!(by_user.len(), 1);
+        assert_eq!(by_user[0].id, parent);
+    }
+
+    #[test]
+    fn agent_writes_record_sync_captures_runs_do_not() {
+        let db = setup_db();
+        let id = uuid::Uuid::new_v4().to_string();
+        upsert_agent(&db, &agent_params(&id, "synced")).expect("upsert");
+        delete_agent(&db, &id).expect("delete");
+
+        // A run write must never emit a core sync capture (runtime-only).
+        let id2 = uuid::Uuid::new_v4().to_string();
+        upsert_agent(&db, &agent_params(&id2, "with-run")).expect("upsert 2");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        create_agent_run(
+            &db,
+            &NewAgentRun {
+                id: &run_id,
+                agent_id: &id2,
+                parent_run_id: None,
+                flow_execution_id: None,
+                user_id: None,
+                org_id: None,
+                prompt: "p",
+            },
+        )
+        .expect("create run");
+        update_agent_run_status(
+            &db,
+            &run_id,
+            &AgentRunStatusUpdate {
+                status: "running",
+                set_started: true,
+                ..Default::default()
+            },
+        )
+        .expect("status");
+
+        let conn = db.lock().expect("db lock");
+        let count_ops = |resource_type: &str, action: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = ?1 AND action = ?2",
+                rusqlite::params![resource_type, action],
+                |r| r.get(0),
+            )
+            .expect("count captures")
+        };
+        assert_eq!(count_ops("core.agent", "insert"), 2);
+        assert_eq!(count_ops("core.agent", "delete"), 1);
+        // No agent_runs resource_type exists; nothing runtime should be captured.
+        let total_run_caps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures WHERE resource_type LIKE '%agent_run%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count run captures");
+        assert_eq!(total_run_caps, 0);
     }
 }
 

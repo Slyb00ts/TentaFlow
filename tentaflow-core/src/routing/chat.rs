@@ -126,9 +126,19 @@ impl Router {
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
-            let (initial, meta) =
+            let (mut initial, meta) =
                 crate::routing::build_initial_envelope_for_user(&request, user.clone(), &blobs)
                     .await?;
+            // §3.4: seed the turn's correlation key with the session event's
+            // request_id so every per-call `llm` event in the flow links back to
+            // this one row. Without a session event (no DB) there is nothing to
+            // correlate, so the key is simply absent.
+            if let Some(handle) = compliance_event.as_ref() {
+                initial.meta.insert(
+                    "correlation_id".into(),
+                    serde_json::Value::String(handle.request_id().to_string()),
+                );
+            }
 
             match dispatcher
                 .try_dispatch(&request.model, "chat", initial, meta)

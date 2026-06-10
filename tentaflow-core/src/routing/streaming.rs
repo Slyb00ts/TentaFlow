@@ -662,9 +662,17 @@ impl Router {
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
             // Najpierw streamowa sciezka — tylko gdy flow ma edge from_port="stream".
-            let (initial_stream, meta_stream) =
+            let (mut initial_stream, meta_stream) =
                 crate::routing::build_initial_envelope_for_user(&request, user.clone(), &blobs)
                     .await?;
+            // §3.4: seed the turn's correlation key with the session event's
+            // request_id so per-call `llm` events in the flow link to this row.
+            if let Some(handle) = compliance_event.as_ref() {
+                initial_stream.meta.insert(
+                    "correlation_id".into(),
+                    serde_json::Value::String(handle.request_id().to_string()),
+                );
+            }
             // Disconnect bridge: ten sam cancel_token co w meta dostaje
             // CancelOnDropStream poniżej, więc gdy hyper droppuje SSE body
             // (klient się rozłączył), token zostaje cancelled i finalizer
