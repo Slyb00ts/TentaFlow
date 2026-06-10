@@ -169,6 +169,13 @@ pub fn ui_render_cbor(mut caller: WasmCaller<'_, AddonState>, cbor_ptr: i32, cbo
         }
     }
 
+    // The addon binary stamps its compile-time package id into every payload,
+    // but multi-instance addons run under a host-assigned instance id. The
+    // host is authoritative about sender identity, so the addon_id field is
+    // rewritten before the bytes reach any sink — this also prevents an addon
+    // from impersonating another addon's panels.
+    let cbor_bytes = rewrite_addon_id(&cbor_bytes, &addon_id).unwrap_or(cbor_bytes);
+
     info!(
         "ui_render_cbor: addon='{}', tag=0x{:04X}, bytes={}",
         addon_id,
@@ -270,6 +277,91 @@ fn extract_ui_tag(bytes: &[u8]) -> Option<UiTag> {
     }
     let tag_raw: u16 = dec.u16().ok()?;
     UiTag::from_u16(tag_raw)
+}
+
+/// Splices the host-side addon_id over the body map's key-0 text value of a
+/// `[tag, body]` UI payload. Every addon-originated UI struct carries
+/// `addon_id` (or `source_addon_id`) at map key 0, so the rewrite is uniform
+/// across tags; a `Batch` body holds nested `[tag, body]` members instead, so
+/// each member's body gets the same key-0 splice. Returns `None` when no
+/// rewrite is needed (values already match) or the payload shape carries no
+/// key-0 text value (e.g. Command) — callers must then forward the original
+/// bytes unchanged.
+fn rewrite_addon_id(cbor: &[u8], addon_id: &str) -> Option<Vec<u8>> {
+    let mut dec = minicbor::Decoder::new(cbor);
+    if dec.array().ok()?? != 2 {
+        return None;
+    }
+    let tag = dec.u16().ok()?;
+
+    let mut splices: Vec<(usize, usize)> = Vec::new();
+    if tag == UiTag::Batch.as_u16() {
+        // Batch bodies use TEXT keys; the addon_ids live inside each member's
+        // own [tag, body] pair under "members".
+        let entries = dec.map().ok()??;
+        for _ in 0..entries {
+            if dec.str().ok()? != "members" {
+                dec.skip().ok()?;
+                continue;
+            }
+            let members = dec.array().ok()??;
+            for _ in 0..members {
+                if dec.array().ok()?? != 2 {
+                    return None;
+                }
+                dec.u16().ok()?;
+                let body_start = dec.position();
+                dec.skip().ok()?;
+                // A member without a rewritable key-0 text value (e.g. a
+                // Command body) contributes no splice and stays as-is.
+                if let Some((start, end)) =
+                    find_key0_splice(cbor.get(body_start..dec.position())?, addon_id)
+                {
+                    splices.push((body_start + start, body_start + end));
+                }
+            }
+        }
+    } else {
+        let body_start = dec.position();
+        if let Some((start, end)) = find_key0_splice(cbor.get(body_start..)?, addon_id) {
+            splices.push((body_start + start, body_start + end));
+        }
+    }
+    if splices.is_empty() {
+        return None;
+    }
+
+    // 9 bytes covers the largest possible CBOR text header.
+    let mut out = Vec::with_capacity(cbor.len() + splices.len() * (addon_id.len() + 9));
+    let mut cursor = 0;
+    for (start, end) in splices {
+        out.extend_from_slice(cbor.get(cursor..start)?);
+        minicbor::encode(addon_id, &mut out).ok()?;
+        cursor = end;
+    }
+    out.extend_from_slice(cbor.get(cursor..)?);
+    Some(out)
+}
+
+/// Locates a body map's key-0 text value and returns its byte range
+/// (relative to `body`) when it differs from `addon_id`.
+fn find_key0_splice(body: &[u8], addon_id: &str) -> Option<(usize, usize)> {
+    let mut dec = minicbor::Decoder::new(body);
+    // Derive emits definite-length maps; indefinite (None) is left untouched.
+    let entries = dec.map().ok()??;
+    for _ in 0..entries {
+        let key = dec.u32().ok()?;
+        if key != 0 {
+            dec.skip().ok()?;
+            continue;
+        }
+        let start = dec.position();
+        if dec.str().ok()? == addon_id {
+            return None;
+        }
+        return Some((start, dec.position()));
+    }
+    None
 }
 
 // =============================================================================
@@ -1453,5 +1545,170 @@ mod tests {
 
         let err = validate_batch(&buf, "a", &mut session);
         assert!(err.is_err());
+    }
+
+    // =========================================================================
+    // addon_id rewrite tests
+    // =========================================================================
+
+    fn sample_panel_shell(addon_id: &str) -> PanelShell {
+        PanelShell {
+            addon_id: addon_id.into(),
+            panel_id: "main".into(),
+            panel_epoch: 7,
+            layout: empty_comp(),
+            slots: vec![SlotDecl {
+                id: "content".into(),
+                semantics: SlotSemantics::MainContent,
+                default_state: SlotDefault::Empty,
+                cache_policy: CachePolicy::None,
+                visibility: SlotVisibility::Always,
+                max_payload_bytes: None,
+            }],
+            initial_state: vec![],
+            initial_commands: vec![],
+        }
+    }
+
+    #[test]
+    fn rewrite_addon_id_panel_shell_to_longer_id() {
+        let bytes = encode_payload(&UiPayload::PanelShell(sample_panel_shell("tentavision")));
+
+        let rewritten = rewrite_addon_id(&bytes, "tentavision-47128c6a").unwrap();
+
+        let decoded: UiPayload = minicbor::decode(&rewritten).unwrap();
+        assert_eq!(
+            decoded,
+            UiPayload::PanelShell(sample_panel_shell("tentavision-47128c6a"))
+        );
+    }
+
+    #[test]
+    fn rewrite_addon_id_panel_shell_to_shorter_id() {
+        let bytes = encode_payload(&UiPayload::PanelShell(sample_panel_shell(
+            "tentavision-47128c6a",
+        )));
+
+        let rewritten = rewrite_addon_id(&bytes, "tv").unwrap();
+
+        let decoded: UiPayload = minicbor::decode(&rewritten).unwrap();
+        assert_eq!(decoded, UiPayload::PanelShell(sample_panel_shell("tv")));
+    }
+
+    #[test]
+    fn rewrite_addon_id_noop_when_already_matching() {
+        let bytes = encode_payload(&UiPayload::PanelShell(sample_panel_shell("tentavision")));
+        assert!(rewrite_addon_id(&bytes, "tentavision").is_none());
+    }
+
+    #[test]
+    fn rewrite_addon_id_garbage_bytes_returns_none() {
+        assert!(rewrite_addon_id(&[], "a").is_none());
+        assert!(rewrite_addon_id(&[0xff, 0x00, 0x12, 0x34], "a").is_none());
+        // Valid outer array but non-map body.
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u16(0x0102).unwrap();
+            enc.str("not-a-map").unwrap();
+        }
+        assert!(rewrite_addon_id(&buf, "a").is_none());
+    }
+
+    #[test]
+    fn rewrite_addon_id_slot_content_roundtrip() {
+        let make = |addon_id: &str| {
+            UiPayload::SlotContent(SlotContent {
+                addon_id: addon_id.into(),
+                panel_id: "main".into(),
+                panel_epoch: 3,
+                slot_id: "content".into(),
+                fragment: empty_comp(),
+                state_overlay: None,
+            })
+        };
+        let bytes = encode_payload(&make("contacts"));
+
+        let rewritten = rewrite_addon_id(&bytes, "contacts-deadbeef").unwrap();
+
+        let decoded: UiPayload = minicbor::decode(&rewritten).unwrap();
+        assert_eq!(decoded, make("contacts-deadbeef"));
+    }
+
+    #[test]
+    fn rewrite_addon_id_batch_rewrites_all_members() {
+        use tentaflow_sdk_spec::protocol::ui::state::StateSnapshot;
+
+        let make = |addon_id: &str| {
+            UiPayload::Batch(Batch {
+                atomic: true,
+                members: vec![
+                    BatchMember {
+                        tag: tentaflow_sdk_spec::UiTag::SlotContent,
+                        body: UiPayload::SlotContent(SlotContent {
+                            addon_id: addon_id.into(),
+                            panel_id: "main".into(),
+                            panel_epoch: 3,
+                            slot_id: "content".into(),
+                            fragment: empty_comp(),
+                            state_overlay: None,
+                        }),
+                    },
+                    BatchMember {
+                        tag: tentaflow_sdk_spec::UiTag::StateSnapshot,
+                        body: UiPayload::StateSnapshot(StateSnapshot {
+                            addon_id: addon_id.into(),
+                            panel_id: "main".into(),
+                            panel_epoch: 3,
+                            state_revision: 1,
+                            entries: vec![],
+                            truncated: false,
+                        }),
+                    },
+                ],
+            })
+        };
+        let bytes = encode_payload(&make("tentavision"));
+
+        let rewritten = rewrite_addon_id(&bytes, "tentavision-47128c6a").unwrap();
+
+        let decoded: UiPayload = minicbor::decode(&rewritten).unwrap();
+        assert_eq!(decoded, make("tentavision-47128c6a"));
+    }
+
+    #[test]
+    fn rewrite_addon_id_batch_noop_when_members_already_match() {
+        let batch = UiPayload::Batch(Batch {
+            atomic: false,
+            members: vec![BatchMember {
+                tag: tentaflow_sdk_spec::UiTag::SlotContent,
+                body: UiPayload::SlotContent(SlotContent {
+                    addon_id: "tentavision-47128c6a".into(),
+                    panel_id: "main".into(),
+                    panel_epoch: 3,
+                    slot_id: "content".into(),
+                    fragment: empty_comp(),
+                    state_overlay: None,
+                }),
+            }],
+        });
+        let bytes = encode_payload(&batch);
+
+        assert!(rewrite_addon_id(&bytes, "tentavision-47128c6a").is_none());
+    }
+
+    #[test]
+    fn rewrite_addon_id_non_string_key0_returns_none() {
+        // Hand-encoded body map {0: 5} — key 0 holds an int, not text.
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u16(0x0102).unwrap();
+            enc.map(1).unwrap();
+            enc.u32(0).unwrap().u32(5).unwrap();
+        }
+        assert!(rewrite_addon_id(&buf, "a").is_none());
     }
 }
