@@ -643,9 +643,13 @@ pub trait SyncLedgerStore: Send + Sync {
         node_seq: u64,
     ) -> LedgerResult<Option<OperationId>>;
     /// The lowest `node_seq` for `node_id` whose operation row is still present
-    /// (not compacted away), i.e. the earliest position this node can RELAY to a
-    /// peer. `None` if we hold nothing live for that chain. A pull asking below
-    /// this floor cannot be served from the log and must escalate to a snapshot.
+    /// (not compacted away) AND carries the current baseline epoch, i.e. the
+    /// earliest position this node can RELAY to a peer — an op kept under an
+    /// abandoned epoch is rejected by every peer's admission fence, so it is not
+    /// servable. `None` if we hold nothing live for that chain. A pull asking
+    /// below this floor cannot be served from the log: it escalates to a snapshot
+    /// or, when no snapshot covers the prefix, is served from the floor so the
+    /// requester can anchor there.
     fn earliest_live_node_seq(&self, node_id: &str) -> LedgerResult<Option<u64>>;
     fn put_in_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn get_outbox_entry(&self, target: SyncTarget, op_id: OperationId)

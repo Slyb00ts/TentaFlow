@@ -371,7 +371,13 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
     fn earliest_live_node_seq(&self, node_id: &str) -> LedgerResult<Option<u64>> {
         // node_log is keyed node_id||0x00||node_seq.be, so the prefix scan yields
         // seqs in ascending order; the first entry whose `operations` row still
-        // exists is the earliest position we can relay.
+        // exists AND was minted under the live epoch is the earliest position we
+        // can relay. An op kept under an abandoned epoch is not servable: every
+        // peer's admission fences on the current epoch, so relaying it can never
+        // advance a requester's frontier — treating it as live would also anchor
+        // the serving floor below the first admissible position and make the
+        // served slice gap across the epoch boundary.
+        let current_epoch = self.current_epoch()?;
         let prefix = node_prefix(node_id);
         for item in self.node_log.prefix(&prefix) {
             let (key, value) = item.into_inner()?;
@@ -379,8 +385,11 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
                 continue;
             };
             let op_id = operation_id_from_bytes(value.as_ref())?;
-            if self.operations.get(op_id.as_bytes())?.is_some() {
-                return Ok(Some(node_seq));
+            if let Some(op_bytes) = self.operations.get(op_id.as_bytes())? {
+                let operation: SyncOperation = decode(op_bytes.as_ref())?;
+                if operation.body.epoch == current_epoch {
+                    return Ok(Some(node_seq));
+                }
             }
         }
         Ok(None)
