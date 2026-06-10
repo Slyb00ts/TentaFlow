@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Meeting Bot (landing mockup)</title>
+<style>
+/* =============================================================================
+   Meeting Bot — ekran glowny (idle).
+   Shell: <tf-screen> (breadcrumb + tf-detail-header + body), zgodnie z users.js.
+   Layout body: 2 kolumny (join card po lewej, sidebar config+recent po prawej).
+   Bazowe tokeny i komponenty (tf-detail-header, tf-section-card, tf-chip,
+   tf-button, kv-row) odwzorowane z style.css i meeting-live-final.
+   ============================================================================= */
+
+:root {
+  color-scheme: dark;
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 2px 6px rgba(0,0,0,0.4);
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', -apple-system, system-ui, sans-serif;
+  font-size: 14px; line-height: 1.5;
+  height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+body { display: flex; flex-direction: column; overflow: hidden; }
+
+/* -------- tf-screen shell (odwzorowanie tf-screen.js + CSS screen-head*) ------ */
+.tf-screen {
+  display: flex; flex-direction: column;
+  flex: 1; min-height: 0; height: 100%;
+  background: var(--bg); overflow: hidden;
+}
+.tf-screen-head { flex-shrink: 0; padding: 22px 26px 0; }
+.tf-screen-head__crumbs { margin-bottom: 12px; }
+.tf-screen-head__header { margin-bottom: 18px; }
+.tf-screen-body {
+  flex: 1; min-height: 0;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 0 26px 26px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-hover) transparent;
+}
+.tf-screen-body::-webkit-scrollbar { width: 8px; }
+.tf-screen-body::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 10px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+
+/* -------- Breadcrumb -------- */
+.tf-breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-3);
+}
+.tf-breadcrumb .crumb { color: var(--text-2); cursor: pointer; transition: color 0.12s; }
+.tf-breadcrumb .crumb:hover { color: var(--accent-2); }
+.tf-breadcrumb .crumb.current { color: var(--text); font-weight: 600; cursor: default; }
+.tf-breadcrumb .sep { opacity: 0.5; display: inline-flex; align-items: center; }
+.tf-breadcrumb .sep svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+/* -------- tf-detail-header -------- */
+.tf-detail-header {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  display: flex; align-items: center; gap: 18px;
+}
+.tf-detail-header .big-ico {
+  width: 60px; height: 60px; border-radius: var(--radius);
+  background: var(--gradient-accent); color: white;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0; font-weight: 800; font-size: 22px;
+}
+.tf-detail-header .big-ico svg { width: 28px; height: 28px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-detail-header .d-meta { flex: 1; min-width: 0; }
+.tf-detail-header .d-name {
+  font-size: 20px; font-weight: 800; color: var(--text);
+  display: flex; align-items: center; gap: 10px;
+}
+.tf-detail-header .d-sub { font-size: 12px; color: var(--text-3); margin-top: 4px; }
+.tf-detail-header .d-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+/* -------- Section card -------- */
+.tf-section-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 14px;
+}
+.tf-section-card h3 {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+  font-size: 12px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--accent-2);
+  margin: 0 0 14px;
+}
+.tf-section-card h3 .counter { font-size: 10px; color: var(--text-3); font-weight: 600; letter-spacing: 0.04em; }
+
+/* -------- tf-button -------- */
+.tf-button {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px; border-radius: var(--radius-sm);
+  font-size: 12.5px; font-weight: 600;
+  border: 1px solid transparent; cursor: pointer;
+  transition: all 0.12s; font-family: inherit;
+  background: transparent; color: var(--text); white-space: nowrap;
+}
+.tf-button svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-button.primary {
+  background: var(--gradient-accent); color: white;
+  box-shadow: 0 2px 10px var(--accent-glow);
+}
+.tf-button.primary:hover { filter: brightness(1.1); }
+.tf-button.ghost {
+  background: var(--bg-3); color: var(--text-2); border-color: var(--border);
+}
+.tf-button.ghost:hover { background: var(--bg-card-hover); color: var(--text); border-color: var(--border-hover); }
+.tf-button.lg { padding: 11px 20px; font-size: 13.5px; }
+.tf-button.lg svg { width: 16px; height: 16px; }
+
+/* -------- tf-chip -------- */
+.tf-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
+  background: var(--bg-3); color: var(--text-2);
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+}
+.tf-chip.idle { background: rgba(106,113,150,0.14); color: var(--text-3); }
+.tf-chip.success { background: rgba(34,197,94,0.14); color: var(--success); border-color: rgba(34,197,94,0.3); }
+.tf-chip.warning { background: rgba(245,158,11,0.14); color: var(--warning); border-color: rgba(245,158,11,0.3); }
+.tf-chip.info    { background: rgba(96,165,250,0.14); color: var(--info); border-color: rgba(96,165,250,0.3); }
+.tf-chip .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor;
+}
+
+/* =============================================================================
+   Meeting landing — specyficzny layout
+   ============================================================================= */
+
+.meet-land-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+  gap: 14px;
+  align-items: start;
+  padding-top: 2px;
+}
+@media (max-width: 1100px) {
+  .meet-land-grid { grid-template-columns: 1fr; }
+}
+
+/* -------- Join card (lewa kolumna) -------- */
+.meet-join-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 32px 34px 36px;
+  min-height: 560px;
+}
+.meet-join-ico {
+  width: 64px; height: 64px; border-radius: var(--radius);
+  background: linear-gradient(135deg, rgba(99,102,241,0.22) 0%, rgba(167,139,250,0.18) 100%);
+  border: 1px solid rgba(99,102,241,0.28);
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent-2);
+  margin-bottom: 20px;
+}
+.meet-join-ico svg { width: 28px; height: 28px; stroke: currentColor; fill: none; stroke-width: 2; }
+.meet-join-title {
+  font-size: 22px; font-weight: 800; color: var(--text);
+  margin-bottom: 10px;
+}
+.meet-join-desc {
+  font-size: 13px; color: var(--text-3);
+  line-height: 1.65;
+  max-width: 560px;
+  margin-bottom: 26px;
+}
+.meet-join-desc strong { color: var(--accent-2); font-weight: 700; }
+
+/* -------- Input row (tf-input + tf-button odwzorowane) -------- */
+.meet-join-input-row {
+  display: flex; gap: 10px; align-items: stretch;
+}
+.tf-input {
+  flex: 1;
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.tf-input:focus-within {
+  border-color: var(--accent-1);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.tf-input svg { width: 16px; height: 16px; stroke: var(--text-3); fill: none; stroke-width: 2; flex-shrink: 0; }
+.tf-input input {
+  flex: 1; background: transparent; border: 0; outline: 0;
+  color: var(--text); font: inherit; font-size: 13.5px;
+  padding: 12px 0;
+}
+.tf-input input::placeholder { color: var(--text-3); }
+
+/* -------- Hint + platform badges -------- */
+.meet-join-hint {
+  margin-top: 10px;
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--text-3);
+}
+.meet-join-hint svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+.meet-join-hint kbd {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10.5px; font-weight: 700;
+  padding: 2px 6px; border-radius: 4px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  color: var(--text-2);
+}
+
+.meet-platform-row {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin-top: 20px; padding-top: 18px;
+  border-top: 1px dashed var(--border);
+}
+.meet-platform {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 7px 12px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px; font-weight: 600; color: var(--text-2);
+}
+.meet-platform .dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  flex-shrink: 0;
+}
+.meet-platform .dot.teams   { background: #5059c9; }
+.meet-platform .dot.meet    { background: #22c55e; }
+.meet-platform .dot.zoom    { background: #60a5fa; }
+.meet-platform .dot.discord { background: #a78bfa; }
+.meet-platform.active {
+  background: rgba(99,102,241,0.1);
+  border-color: rgba(99,102,241,0.3);
+  color: var(--text);
+}
+.meet-platform small {
+  font-size: 9.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--accent-2);
+  padding: 2px 6px; border-radius: 4px;
+  background: rgba(167,139,250,0.14);
+  border: 1px solid rgba(167,139,250,0.3);
+}
+
+/* -------- Sidebar (prawa kolumna) -------- */
+.meet-side .tf-section-card { padding: 14px 16px; }
+
+/* Backend / Config — kv */
+.meet-kv { display: flex; flex-direction: column; gap: 8px; }
+.meet-kv-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; font-size: 12px;
+}
+.meet-kv-row .k { color: var(--text-3); }
+.meet-kv-row .v {
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 11.5px; color: var(--text);
+}
+.meet-kv-row .v.plain { font-family: inherit; font-size: 12px; color: var(--text); font-weight: 600; }
+
+/* Recent list */
+.meet-recent-list { display: flex; flex-direction: column; gap: 6px; }
+.meet-recent-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.meet-recent-item:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--border-hover);
+}
+.meet-recent-item .ri-ico {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-2);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent-2); flex-shrink: 0;
+}
+.meet-recent-item .ri-ico svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.meet-recent-item .ri-body { flex: 1; min-width: 0; }
+.meet-recent-item .ri-title {
+  font-size: 12.5px; font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.meet-recent-item .ri-meta {
+  font-size: 10.5px; color: var(--text-3); margin-top: 2px;
+  display: flex; align-items: center; gap: 6px;
+}
+.meet-recent-item .ri-meta .sep::before { content: '·'; margin: 0 3px; opacity: 0.6; }
+.meet-recent-item .ri-chev {
+  width: 14px; height: 14px;
+  stroke: var(--text-3); fill: none; stroke-width: 2;
+  flex-shrink: 0;
+}
+
+/* Empty state dla recent */
+.meet-empty-hint {
+  padding: 14px 2px; text-align: center;
+  font-size: 11.5px; color: var(--text-3);
+  font-style: italic;
+}
+</style>
+</head>
+<body>
+
+<!-- =============================================================================
+     Meeting Bot — ekran glowny (idle) — mockup.
+     Shell <tf-screen>: breadcrumb + tf-detail-header + body.
+     Zgodnosc z users.js (widok uzytkownikow) — ten sam header/breadcrumb/
+     section-card pattern. Body: 2 kolumny. Lewa: karta "Dolacz do spotkania"
+     (input URL + przycisk + podpowiedz + badge platform). Prawa: Konfiguracja
+     bota (kv) + Ostatnie spotkania (recent list).
+     ============================================================================= -->
+
+<div class="tf-screen">
+
+  <div class="tf-screen-head">
+    <!-- Breadcrumb -->
+    <div class="tf-screen-head__crumbs">
+      <div class="tf-breadcrumb">
+        <span class="crumb current">Meeting Bot</span>
+      </div>
+    </div>
+
+    <!-- Detail header — ten sam pattern co users.js -->
+    <div class="tf-screen-head__header">
+      <div class="tf-detail-header">
+        <div class="big-ico">
+          <!-- lucide: video -->
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="23 7 16 12 23 17 23 7"/>
+            <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+          </svg>
+        </div>
+        <div class="d-meta">
+          <div class="d-name">
+            Meeting Bot
+            <span class="tf-chip idle"><span class="dot"></span>Bezczynny</span>
+          </div>
+          <div class="d-sub">Bot dołącza do spotkań Teams/Meet/Zoom/Discord i robi live transcript.</div>
+        </div>
+        <div class="d-actions">
+          <button class="tf-button ghost">
+            <!-- lucide: clock -->
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            Historia
+          </button>
+          <button class="tf-button ghost">
+            <!-- lucide: settings -->
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            Ustawienia
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tf-screen-body">
+    <div class="meet-land-grid">
+
+      <!-- ============================== LEWA KOLUMNA ============================== -->
+      <section class="meet-main">
+        <div class="meet-join-card">
+
+          <div class="meet-join-ico">
+            <!-- lucide: link -->
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+            </svg>
+          </div>
+
+          <h2 class="meet-join-title">Wklej link spotkania</h2>
+          <p class="meet-join-desc">Bot dołączy pod podanym URL, włączy mikrofon listen-only i zacznie transkrybować. Uczestnicy widzą go jak zwykłego gościa z etykietą <strong>AI transcription</strong>.</p>
+
+          <div class="meet-join-input-row">
+            <div class="tf-input">
+              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+              </svg>
+              <input type="text" placeholder="https://teams.microsoft.com/l/meetup-join/...">
+            </div>
+            <button class="tf-button primary lg">
+              <!-- lucide: play -->
+              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Dołącz
+            </button>
+          </div>
+
+          <div class="meet-join-hint">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+            Naciśnij <kbd>Enter</kbd> w polu URL aby dołączyć · bot uruchamia się w ~12–20 s
+          </div>
+
+          <!-- Platform badges — obecne platformy -->
+          <div class="meet-platform-row">
+            <span class="meet-platform active"><span class="dot teams"></span>Microsoft Teams</span>
+            <span class="meet-platform"><span class="dot meet"></span>Google Meet</span>
+            <span class="meet-platform"><span class="dot zoom"></span>Zoom</span>
+            <span class="meet-platform"><span class="dot discord"></span>Discord <small>beta</small></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================== PRAWA KOLUMNA (SIDEBAR) ============================== -->
+      <aside class="meet-side">
+
+        <!-- Konfiguracja bota -->
+        <div class="tf-section-card">
+          <h3>Konfiguracja bota</h3>
+          <div class="meet-kv">
+            <div class="meet-kv-row"><span class="k">Nazwa wyświetlana</span><span class="v plain">TentaFlow Bot</span></div>
+            <div class="meet-kv-row"><span class="k">Model STT</span><span class="v">whisper-large-v3</span></div>
+            <div class="meet-kv-row"><span class="k">Diaryzacja</span><span class="v">pyannote-3.1</span></div>
+            <div class="meet-kv-row"><span class="k">AI summary</span><span class="v">qwen-3.5-0.8b</span></div>
+            <div class="meet-kv-row"><span class="k">Retencja</span><span class="v plain">30 dni</span></div>
+          </div>
+        </div>
+
+        <!-- Ostatnie spotkania -->
+        <div class="tf-section-card">
+          <h3>Ostatnie spotkania <span class="counter">(5)</span></h3>
+          <div class="meet-recent-list">
+
+            <div class="meet-recent-item">
+              <div class="ri-ico">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+              </div>
+              <div class="ri-body">
+                <div class="ri-title">Stand-up 22.04</div>
+                <div class="ri-meta">
+                  <span>2026-04-24 06:37</span>
+                  <span class="sep"></span>
+                  <span>87 wpisów</span>
+                  <span class="sep"></span>
+                  <span style="color:var(--success); font-weight:600;">teams</span>
+                </div>
+              </div>
+              <svg class="ri-chev" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </div>
+
+            <div class="meet-recent-item">
+              <div class="ri-ico">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+              </div>
+              <div class="ri-body">
+                <div class="ri-title">standalone</div>
+                <div class="ri-meta">
+                  <span>2026-04-24 06:20</span>
+                  <span class="sep"></span>
+                  <span>2 wpisy</span>
+                  <span class="sep"></span>
+                  <span style="color:var(--text-3);">local</span>
+                </div>
+              </div>
+              <svg class="ri-chev" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </div>
+
+            <div class="meet-recent-item">
+              <div class="ri-ico">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+              </div>
+              <div class="ri-body">
+                <div class="ri-title">Weekly sync · Backend</div>
+                <div class="ri-meta">
+                  <span>2026-04-23 15:25</span>
+                  <span class="sep"></span>
+                  <span>142 wpisy</span>
+                  <span class="sep"></span>
+                  <span style="color:var(--info); font-weight:600;">meet</span>
+                </div>
+              </div>
+              <svg class="ri-chev" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </div>
+
+            <div class="meet-recent-item">
+              <div class="ri-ico">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+              </div>
+              <div class="ri-body">
+                <div class="ri-title">Design review — flow builder v2</div>
+                <div class="ri-meta">
+                  <span>2026-04-23 14:08</span>
+                  <span class="sep"></span>
+                  <span>56 wpisów</span>
+                  <span class="sep"></span>
+                  <span style="color:var(--success); font-weight:600;">teams</span>
+                </div>
+              </div>
+              <svg class="ri-chev" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </div>
+
+            <div class="meet-recent-item">
+              <div class="ri-ico">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+              </div>
+              <div class="ri-body">
+                <div class="ri-title">1:1 Adam / Krystian</div>
+                <div class="ri-meta">
+                  <span>2026-04-23 10:30</span>
+                  <span class="sep"></span>
+                  <span>18 wpisów</span>
+                  <span class="sep"></span>
+                  <span style="color:var(--accent-2); font-weight:600;">zoom</span>
+                </div>
+              </div>
+              <svg class="ri-chev" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </div>
+
+          </div>
+        </div>
+
+      </aside>
+
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>

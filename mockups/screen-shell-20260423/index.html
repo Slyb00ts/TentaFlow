@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Screen Shell (tf-screen) — jednolity layout ekranów</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.22);
+  --success: #22c55e;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --radius-lg: 14px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+.intro { max-width: 1400px; margin: 28px auto 16px; padding: 0 24px; }
+.intro h1 {
+  font-size: 26px; font-weight: 800; margin-bottom: 6px;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.intro .lead { color: var(--text-2); max-width: 960px; font-size: 13px; line-height: 1.6; }
+.intro .lead code { background: var(--bg-3); padding: 1px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+
+.grid {
+  max-width: 1400px; margin: 16px auto 80px; padding: 0 24px;
+  display: grid; gap: 40px;
+}
+.section-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--accent-2); margin-bottom: 12px;
+}
+.section-note {
+  font-size: 12px; color: var(--text-3); margin-bottom: 14px; line-height: 1.6;
+  max-width: 900px;
+}
+.section-note code { background: var(--bg-3); padding: 1px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent-2); }
+
+/* =========================================================================
+   TF-SCREEN — jednolity screen shell
+   Struktura (DOM):
+     <tf-screen>
+       [slot="breadcrumb"] (opcjonalny — pokazuje kontekst wejścia wgłąb)
+       .tf-screen-header
+         [back-btn]  .title-block (title + sub)   [slot="actions"]
+       [slot="toolbar"] (opcjonalny — search + filtry)
+       [slot="tabs"]    (opcjonalny — tf-tabs)
+       .tf-screen-body  (slot default)
+   ========================================================================= */
+
+/* Viewport frame — symuluje .main container w dashboardzie */
+.viewport {
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  min-height: 640px;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+.viewport::before {
+  content: '.main (scroll container, flex: 1, padding: 16px)';
+  position: absolute;
+  top: -9px; left: 18px;
+  background: var(--bg);
+  padding: 0 8px;
+  font-size: 10px; color: var(--text-3); font-family: 'JetBrains Mono', monospace;
+  letter-spacing: 0.04em;
+}
+
+.tf-screen {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Header — zawsze jest, nawet na detail. */
+.tf-screen-header {
+  display: flex; align-items: center; gap: 14px;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+  flex-shrink: 0;
+}
+.tf-screen-header .back-btn {
+  width: 32px; height: 32px; border-radius: 8px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  color: var(--text-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all 0.15s;
+  flex-shrink: 0;
+}
+.tf-screen-header .back-btn:hover { background: var(--bg-card-hover); color: var(--text); border-color: var(--border-hover); }
+.tf-screen-header .back-btn svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+
+.tf-screen-header .title-block { flex: 1; min-width: 0; }
+.tf-screen-header .title-block .title {
+  font-size: 20px; font-weight: 800;
+  display: flex; align-items: center; gap: 10px;
+  color: var(--text);
+}
+.tf-screen-header .title-block .title svg {
+  width: 22px; height: 22px; stroke: var(--accent-2);
+  fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  flex-shrink: 0;
+}
+.tf-screen-header .title-block .title .accent { color: var(--accent-2); }
+.tf-screen-header .title-block .title .count-badge {
+  font-size: 13px; font-weight: 600; color: var(--text-3);
+}
+.tf-screen-header .title-block .sub {
+  font-size: 13px; color: var(--text-3); margin-top: 2px;
+}
+.tf-screen-header .actions {
+  display: flex; gap: 8px; flex-shrink: 0;
+}
+
+/* Toolbar — opcjonalny pas pod headerem */
+.tf-screen-toolbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 24px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+/* Tabs bar — opcjonalny */
+.tf-screen-tabs {
+  display: flex;
+  padding: 8px 24px 0;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  flex-shrink: 0;
+}
+.tab {
+  padding: 12px 14px;
+  background: transparent; border: 0;
+  color: var(--text-3); font-size: 13px; font-weight: 600;
+  cursor: pointer; position: relative;
+  font-family: inherit;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.tab svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tab:hover { color: var(--text-2); }
+.tab.active { color: var(--accent-2); }
+.tab.active::after {
+  content: ''; position: absolute; bottom: -1px; left: 0; right: 0;
+  height: 2px; background: var(--gradient-accent); border-radius: 2px 2px 0 0;
+}
+.tab .count {
+  background: var(--bg-3); padding: 1px 7px;
+  border-radius: 999px; font-size: 11px; color: var(--text-3);
+}
+.tab.active .count { background: var(--accent-glow); color: var(--accent-2); }
+
+/* Breadcrumb (opcjonalny, nad headerem — pokazuje wejście wgłąb) */
+.tf-screen-breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  padding: 10px 24px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.tf-screen-breadcrumb a,
+.tf-screen-breadcrumb span {
+  color: var(--text-3); text-decoration: none;
+  font-weight: 600;
+}
+.tf-screen-breadcrumb a { cursor: pointer; }
+.tf-screen-breadcrumb a:hover { color: var(--text-2); }
+.tf-screen-breadcrumb .sep { color: var(--text-3); opacity: 0.5; }
+.tf-screen-breadcrumb .current { color: var(--text); }
+
+/* Body — wypełnia resztę, scrolluje się jeśli content > viewport */
+.tf-screen-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--bg-card);
+}
+.tf-screen-body.padded { padding: 24px; }
+
+/* Split body — aside + main (np. detail usera) */
+.tf-screen-body.split {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  padding: 0;
+}
+@media (max-width: 900px) {
+  .tf-screen-body.split { grid-template-columns: 1fr; }
+}
+.tf-screen-body.split .aside {
+  padding: 24px;
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 16px;
+  background: var(--bg-2);
+}
+.tf-screen-body.split .main { padding: 24px; min-width: 0; }
+
+/* ============ Buttons ============ */
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 16px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s; min-height: 38px;
+  white-space: nowrap;
+}
+.btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.btn.secondary { background: var(--bg-3); border-color: var(--border); }
+.btn.secondary:hover { background: var(--bg-card-hover); border-color: var(--border-hover); }
+.btn.primary {
+  background: var(--gradient-accent); color: white;
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+}
+.btn.primary:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.btn.ghost { color: var(--text-2); }
+.btn.ghost:hover { background: var(--bg-3); color: var(--text); }
+.btn.danger {
+  background: transparent; color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.btn.danger:hover { background: rgba(239, 68, 68, 0.1); border-color: var(--danger); }
+.btn.sm { padding: 6px 10px; font-size: 12px; min-height: 30px; }
+
+/* ============ Searchbox ============ */
+.search-box {
+  flex: 1; max-width: 360px; position: relative;
+  display: flex; align-items: center;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 12px 0 36px; height: 38px;
+}
+.search-box svg {
+  position: absolute; left: 12px;
+  width: 16px; height: 16px;
+  color: var(--text-3);
+  stroke: currentColor; fill: none; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.search-box input {
+  flex: 1; background: transparent; border: 0; outline: none;
+  color: var(--text); font-family: inherit; font-size: 13px;
+}
+.search-box input::placeholder { color: var(--text-3); }
+
+/* ============ Filter group ============ */
+.filter-group {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 3px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.filter-chip {
+  padding: 5px 12px; border-radius: 999px;
+  background: transparent; color: var(--text-2);
+  border: 0; font-size: 11px; font-weight: 600;
+  cursor: pointer; font-family: inherit;
+  transition: all 0.15s;
+}
+.filter-chip:hover { background: var(--bg-card-hover); color: var(--text); }
+.filter-chip.active { background: var(--accent-glow); color: var(--accent-2); }
+
+/* ============ Generic table (użyta w list screens) ============ */
+.tf-table { width: 100%; border-collapse: collapse; }
+.tf-table th, .tf-table td {
+  padding: 12px 24px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.tf-table th {
+  font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-3);
+  background: var(--bg-2);
+  padding-top: 10px; padding-bottom: 10px;
+  position: sticky; top: 0; z-index: 1;
+}
+.tf-table tbody tr { transition: background 0.12s; }
+.tf-table tbody tr:hover { background: rgba(99, 102, 241, 0.04); cursor: pointer; }
+.tf-table tbody tr:last-child td { border-bottom: 0; }
+
+/* avatar/pill helpers */
+.avatar {
+  width: 36px; height: 36px; border-radius: 10px;
+  background: var(--gradient-accent);
+  color: white; font-size: 14px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.user-cell { display: flex; align-items: center; gap: 12px; }
+.user-name { font-weight: 700; color: var(--text); }
+.user-sub { font-size: 11px; color: var(--text-3); font-family: 'JetBrains Mono', monospace; }
+.pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.pill.ok { background: rgba(34, 197, 94, 0.14); color: var(--success); }
+.pill.admin { background: rgba(239, 68, 68, 0.14); color: var(--danger); }
+.pill.info { background: rgba(96, 165, 250, 0.14); color: var(--info); }
+
+/* stat-lines */
+.stat-line {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px dashed rgba(99, 102, 241, 0.12);
+  font-size: 12px;
+}
+.stat-line:last-child { border-bottom: 0; }
+.stat-line .k { color: var(--text-3); text-transform: uppercase; font-size: 10px; letter-spacing: 0.06em; font-weight: 700; }
+.stat-line .v { color: var(--text); font-weight: 600; }
+.big-avatar {
+  width: 72px; height: 72px; border-radius: 18px;
+  background: var(--gradient-accent);
+  color: white; font-size: 26px; font-weight: 800;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* anatomy annotation */
+.anatomy {
+  background: var(--bg-2);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  margin-top: 12px;
+}
+.anatomy h4 { font-size: 12px; font-weight: 700; color: var(--accent-2); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.08em; }
+.anatomy ul { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.anatomy ul li { font-size: 12px; color: var(--text-2); display: flex; gap: 8px; align-items: baseline; }
+.anatomy ul li code { background: var(--bg-3); padding: 1px 6px; border-radius: 3px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent-2); flex-shrink: 0; }
+.anatomy ul li span { color: var(--text-3); }
+
+/* card list (dla clusters-like) */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+  padding: 24px;
+}
+.card-tile {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.card-tile:hover { border-color: var(--border-hover); background: var(--bg-card-hover); }
+.card-tile .ct-title { font-weight: 700; font-size: 14px; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.card-tile .ct-sub { color: var(--text-3); font-size: 12px; margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
+.card-tile .ct-stats { display: flex; gap: 14px; margin-top: 12px; font-size: 12px; color: var(--text-2); }
+
+/* perm row (reused from users mockup) */
+.perm-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 14px;
+  align-items: center;
+  padding: 10px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 6px;
+}
+.perm-row .meta .name { font-weight: 700; font-size: 13px; }
+.perm-row .meta .descr { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.access-toggle {
+  display: inline-flex; background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: 999px; padding: 2px; gap: 2px;
+}
+.access-toggle button {
+  background: transparent; border: 0; color: var(--text-3);
+  font-family: inherit; font-size: 10px; font-weight: 700;
+  padding: 5px 10px; border-radius: 999px;
+  cursor: pointer;
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.access-toggle button.active.allow { background: var(--success); color: white; }
+.access-toggle button.active.inherit { background: var(--bg-card-hover); color: var(--accent-2); }
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>tf-screen — jednolity shell dla wszystkich ekranów</h1>
+  <p class="lead">
+    Jeden component <code>&lt;tf-screen&gt;</code> zastępuje obecne rozbieżne wrappery
+    (<code>.page</code>, <code>.mesh-shell</code>, <code>.clusters-shell</code>, <code>.addons-screen</code>,
+    <code>.mesh-detail-topbar</code>, <code>.cluster-detail-topbar</code>, <code>.detail-head</code>).
+    Karta wypełnia cały viewport <code>.main</code>, ma ramkę, zaokrąglone rogi, scrolluje tylko body
+    (header/toolbar/tabs są sticky). Obsługuje: listę, detail (z back-btn), nested detail (breadcrumb),
+    split-view (aside + main), taby, toolbar, actions. Wszystkie ekrany (Users, Mesh, Services,
+    Clusters, Addons, Flows, Audit, Settings, API Keys) powinny używać tego samego szablonu.
+  </p>
+</div>
+
+<div class="grid">
+
+  <!-- =================================================================
+       1. LIST SCREEN — przykład: Users list
+       ================================================================= -->
+  <section>
+    <div class="section-title">1. List screen — header + toolbar + table</div>
+    <div class="section-note">
+      Standardowy widok listy (Users, Mesh nodes, Services, API Keys, Audit…).
+      <code>tf-screen</code> z headerem, toolbarem (search + filtry) i table w body.
+      <b>Nie ma</b> back-btn (to ekran top-level). Actions po prawej stronie headera.
+    </div>
+    <div class="viewport">
+      <div class="tf-screen">
+        <div class="tf-screen-header">
+          <div class="title-block">
+            <div class="title">
+              <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg>
+              Użytkownicy <span class="count-badge">· 8</span>
+            </div>
+            <div class="sub">7 aktywnych · 1 nieaktywny · 3 admin</div>
+          </div>
+          <div class="actions">
+            <button class="btn secondary"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Eksport CSV</button>
+            <button class="btn primary"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Nowy user</button>
+          </div>
+        </div>
+        <div class="tf-screen-toolbar">
+          <div class="search-box">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input placeholder="Szukaj po nazwie, email...">
+          </div>
+          <div class="filter-group">
+            <button class="filter-chip active">Wszyscy</button>
+            <button class="filter-chip">Aktywni</button>
+            <button class="filter-chip">Administratorzy</button>
+            <button class="filter-chip">SSO</button>
+          </div>
+        </div>
+        <div class="tf-screen-body">
+          <table class="tf-table">
+            <thead>
+              <tr><th>User</th><th>Rola</th><th>Źródło</th><th>Ostatnie logowanie</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>
+                  <div class="user-cell">
+                    <div class="avatar">AS</div>
+                    <div>
+                      <div class="user-name">Adam Surowski <span class="pill ok">aktywny</span></div>
+                      <div class="user-sub">adam@tentaflow.ai</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="pill admin">Admin</span></td>
+                <td><span class="pill info">Local</span></td>
+                <td style="color:var(--text-3); font-size:12px;">2 min temu</td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="user-cell">
+                    <div class="avatar" style="background:linear-gradient(135deg,#22c55e,#10b981);">MK</div>
+                    <div>
+                      <div class="user-name">Maria Kowalska</div>
+                      <div class="user-sub">maria@tentaflow.ai</div>
+                    </div>
+                  </div>
+                </td>
+                <td style="color:var(--text-3);">User</td>
+                <td><span class="pill info">SSO · Google</span></td>
+                <td style="color:var(--text-3); font-size:12px;">1 godz. temu</td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="user-cell">
+                    <div class="avatar" style="background:linear-gradient(135deg,#60a5fa,#0ea5e9);">TN</div>
+                    <div>
+                      <div class="user-name">Tomasz Nowak</div>
+                      <div class="user-sub">tomasz@tentaflow.ai</div>
+                    </div>
+                  </div>
+                </td>
+                <td style="color:var(--text-3);">User</td>
+                <td><span class="pill info">SSO · Azure</span></td>
+                <td style="color:var(--text-3); font-size:12px;">wczoraj</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="anatomy">
+      <h4>DOM / API</h4>
+      <ul>
+        <li><code>&lt;tf-screen&gt;</code> <span>— root, flex column, wypełnia .main</span></li>
+        <li><code>attr: title="Użytkownicy"</code> <span>— renderuje .title-block</span></li>
+        <li><code>attr: subtitle="..."</code> <span>— linia subtitle</span></li>
+        <li><code>attr: icon="users"</code> <span>— ikona przy tytule (ze sprite)</span></li>
+        <li><code>attr: count="8"</code> <span>— count-badge przy tytule</span></li>
+        <li><code>slot="actions"</code> <span>— przyciski po prawej</span></li>
+        <li><code>slot="toolbar"</code> <span>— search + filtry</span></li>
+        <li><code>slot default</code> <span>— content w body (table / grid)</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- =================================================================
+       2. DETAIL SCREEN — z back-btn, split aside + main
+       ================================================================= -->
+  <section>
+    <div class="section-title">2. Detail screen — back-btn + tabs + split body (aside + main)</div>
+    <div class="section-note">
+      Widok detail (User detail, Cluster detail, Mesh node detail).
+      <code>back-btn</code> po lewej headera → wraca do listy. Taby w osobnym pasie.
+      Body w wariancie <code>split</code>: aside (stat-lines, avatar, akcje) + main (form).
+    </div>
+    <div class="viewport">
+      <div class="tf-screen">
+        <div class="tf-screen-header">
+          <button class="back-btn" title="Wróć">
+            <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <div class="title-block">
+            <div class="title">Maria Kowalska</div>
+            <div class="sub">maria@tentaflow.ai · SSO · Google</div>
+          </div>
+          <div class="actions">
+            <button class="btn ghost">Wymuś logout</button>
+            <button class="btn danger">Usuń konto</button>
+          </div>
+        </div>
+        <div class="tf-screen-tabs">
+          <button class="tab active">
+            <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            Profil
+          </button>
+          <button class="tab">
+            <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+            Członkostwa <span class="count">2</span>
+          </button>
+          <button class="tab">
+            <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            Uprawnienia <span class="count">12</span>
+          </button>
+          <button class="tab">
+            <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            Aktywność
+          </button>
+        </div>
+        <div class="tf-screen-body split">
+          <aside class="aside">
+            <div class="big-avatar" style="background:linear-gradient(135deg,#22c55e,#10b981);">MK</div>
+            <div>
+              <div style="font-size:18px; font-weight:800;">Maria Kowalska</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-3);">user_123e4567-e89b</div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:2px; margin-top:6px;">
+              <div class="stat-line"><span class="k">Status</span><span class="v" style="color:var(--success);">Aktywny</span></div>
+              <div class="stat-line"><span class="k">Źródło</span><span class="v">SSO · Google</span></div>
+              <div class="stat-line"><span class="k">Grupy</span><span class="v">2</span></div>
+              <div class="stat-line"><span class="k">Zalogowany</span><span class="v">1 godz. temu</span></div>
+            </div>
+            <div style="margin-top:auto;">
+              <button class="btn secondary" style="width:100%; justify-content:center;">
+                <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                Resetuj hasło
+              </button>
+            </div>
+          </aside>
+          <div class="main">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:14px;">
+              <div>
+                <label style="font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:var(--text-2); display:block; margin-bottom:6px;">Username</label>
+                <input value="maria.kowalska" disabled style="width:100%; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; color:var(--text); font-family:inherit; font-size:13px; opacity:0.7;">
+              </div>
+              <div>
+                <label style="font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:var(--text-2); display:block; margin-bottom:6px;">Display name</label>
+                <input value="Maria Kowalska" style="width:100%; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; color:var(--text); font-family:inherit; font-size:13px;">
+              </div>
+            </div>
+            <div style="margin-bottom:14px;">
+              <label style="font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:var(--text-2); display:block; margin-bottom:6px;">Rola</label>
+              <select style="width:100%; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; color:var(--text); font-family:inherit; font-size:13px;">
+                <option>User — czat, flowy, serwisy (consume)</option>
+                <option>Power User — User + Flow Builder, reguły, prompty</option>
+                <option>Admin — pełne zarządzanie: userzy, nody, deploye</option>
+              </select>
+            </div>
+            <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
+              <button class="btn ghost">Anuluj</button>
+              <button class="btn primary">Zapisz zmiany</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="anatomy">
+      <h4>DOM / API</h4>
+      <ul>
+        <li><code>attr: back</code> <span>— renderuje back-btn; event <code>back</code> emitowany przy kliknięciu</span></li>
+        <li><code>slot="tabs"</code> <span>— <code>&lt;tf-tabs&gt;</code> w pasie pod headerem</span></li>
+        <li><code>attr: layout="split"</code> <span>— body jako grid aside + main</span></li>
+        <li><code>slot="aside"</code> <span>— zawartość lewej kolumny (avatar, stat-lines, akcje)</span></li>
+        <li><code>slot default</code> <span>— main content (form, perm-matrix itp.)</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- =================================================================
+       3. NESTED DETAIL — breadcrumb + tabs
+       ================================================================= -->
+  <section>
+    <div class="section-title">3. Nested detail — breadcrumb pokazuje ścieżkę wgłąb</div>
+    <div class="section-note">
+      Sytuacja: z listy Mesh wszedłeś w node <code>node-alpha</code>, z niego w konkretny model
+      <code>qwen3.5-0.8b</code>. Breadcrumb (opcjonalny pas nad headerem) pokazuje drogę powrotu,
+      każdy poziom klikalny. Back-btn zawsze wraca o jeden poziom.
+    </div>
+    <div class="viewport">
+      <div class="tf-screen">
+        <div class="tf-screen-breadcrumb">
+          <a>Mesh</a>
+          <span class="sep">/</span>
+          <a>node-alpha</a>
+          <span class="sep">/</span>
+          <span class="current">qwen3.5-0.8b</span>
+        </div>
+        <div class="tf-screen-header">
+          <button class="back-btn" title="Wróć do node-alpha">
+            <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <div class="title-block">
+            <div class="title">
+              <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+              Model: <span class="accent">qwen3.5-0.8b</span>
+            </div>
+            <div class="sub">LLM · llama-cpp · node-alpha · 4.2 GB VRAM</div>
+          </div>
+          <div class="actions">
+            <button class="btn secondary">Restart</button>
+            <button class="btn danger">Unload</button>
+          </div>
+        </div>
+        <div class="tf-screen-tabs">
+          <button class="tab active">Overview</button>
+          <button class="tab">Metryki <span class="count">live</span></button>
+          <button class="tab">Logi</button>
+          <button class="tab">Uprawnienia <span class="count">3</span></button>
+        </div>
+        <div class="tf-screen-body padded">
+          <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px;">
+            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">
+              <div style="font-size:10px; text-transform:uppercase; color:var(--text-3); letter-spacing:0.06em; font-weight:700;">Tokens/s</div>
+              <div style="font-size:22px; font-weight:800; margin-top:4px;">84.2</div>
+            </div>
+            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">
+              <div style="font-size:10px; text-transform:uppercase; color:var(--text-3); letter-spacing:0.06em; font-weight:700;">Active requests</div>
+              <div style="font-size:22px; font-weight:800; margin-top:4px;">3</div>
+            </div>
+            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">
+              <div style="font-size:10px; text-transform:uppercase; color:var(--text-3); letter-spacing:0.06em; font-weight:700;">Uptime</div>
+              <div style="font-size:22px; font-weight:800; margin-top:4px;">2d 14h</div>
+            </div>
+          </div>
+          <div style="font-size:12px; color:var(--text-3); line-height:1.6;">
+            Content ekranu idzie tutaj. Body scrolluje się niezależnie od headera/tabs/breadcrumb —
+            te są sticky na górze. Padding wbudowany przez <code>attr: padded</code> lub <code>slot</code>
+            bez paddingu dla table/card-grid.
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="anatomy">
+      <h4>DOM / API</h4>
+      <ul>
+        <li><code>slot="breadcrumb"</code> <span>— element nad headerem; lista linków</span></li>
+        <li><code>attr: padded</code> <span>— dodaje padding:24px do body (domyślnie brak, dla table)</span></li>
+        <li><code>Router event: back</code> <span>— wraca o jeden poziom; breadcrumb używa pełnej ścieżki</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- =================================================================
+       4. CARD GRID — przykład: Clusters
+       ================================================================= -->
+  <section>
+    <div class="section-title">4. Card grid — ekran bez table, z siatką kafelków</div>
+    <div class="section-note">
+      Ten sam shell (<code>tf-screen</code>), ale body to grid kart zamiast tabeli.
+      Używany w Clusters, Services, Addons.
+    </div>
+    <div class="viewport">
+      <div class="tf-screen">
+        <div class="tf-screen-header">
+          <div class="title-block">
+            <div class="title">
+              <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+              Klastry <span class="count-badge">· 3</span>
+            </div>
+            <div class="sub">2 online · 1 degraded</div>
+          </div>
+          <div class="actions">
+            <button class="btn primary"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Nowy klaster</button>
+          </div>
+        </div>
+        <div class="tf-screen-body">
+          <div class="card-grid">
+            <div class="card-tile">
+              <div class="ct-title"><span class="pill ok">online</span>prod-eu-west</div>
+              <div class="ct-sub">cluster_7f3a · 4 nody · 12 modeli</div>
+              <div class="ct-stats"><span>🟢 4 online</span><span>📊 84% GPU</span></div>
+            </div>
+            <div class="card-tile">
+              <div class="ct-title"><span class="pill admin" style="background:rgba(245, 158, 11, 0.14); color:#f59e0b;">degraded</span>dev-lab</div>
+              <div class="ct-sub">cluster_a1b2 · 2 nody (1 offline) · 4 modele</div>
+              <div class="ct-stats"><span>🟡 1/2 online</span><span>📊 21% GPU</span></div>
+            </div>
+            <div class="card-tile">
+              <div class="ct-title"><span class="pill ok">online</span>edge-warsaw</div>
+              <div class="ct-sub">cluster_c8d9 · 1 nod · 2 modele</div>
+              <div class="ct-stats"><span>🟢 1 online</span><span>📊 44% GPU</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =================================================================
+       5. Mapowanie: jak migrują obecne ekrany
+       ================================================================= -->
+  <section>
+    <div class="section-title">5. Plan migracji — które ekrany na co się mapują</div>
+    <div class="section-note">
+      Po akceptacji mockupu: zrobimy <code>tf-screen</code> jako custom element w
+      <code>www/js/components/tf-screen.js</code>, a potem migrujemy moduły po kolei.
+      <b>Każdy krok = osobny commit</b>, można zatrzymać się w dowolnym miejscu.
+    </div>
+    <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-lg); overflow:hidden;">
+      <table class="tf-table">
+        <thead>
+          <tr>
+            <th>Moduł</th>
+            <th>Obecny wrapper</th>
+            <th>Typ</th>
+            <th>Co się zmienia</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">users.js</code></td><td>.page .users-screen</td><td>List + embedded detail</td><td>+split body, +breadcrumb dla nested perms</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">mesh.js</code></td><td>.mesh-shell</td><td>List (nodes)</td><td>Przenieść legendę statusów do toolbaru</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">mesh-detail.js</code></td><td>.mesh-detail</td><td>Separate detail screen</td><td>Scalić .mesh-detail-topbar → tf-screen header z back-btn</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">services.js</code></td><td>brak wrappera</td><td>List + modal</td><td>Otoczyć tf-screen, tabs w slocie</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">clusters.js</code></td><td>.clusters-shell</td><td>Card grid</td><td>Card-grid w body, nic nie tracimy</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">cluster-detail.js</code></td><td>.cluster-detail</td><td>Separate detail screen</td><td>Scalić .cluster-detail-topbar → tf-screen</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">addons.js</code></td><td>.addons-screen</td><td>List + toolbar + tabs</td><td>Toolbar + tabs w slotach tf-screen</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">flows.js</code></td><td>brak</td><td>Dwa hosty</td><td>Otoczyć tf-screen, osobny tab dla execs</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">audit.js</code></td><td>.page-header + .card</td><td>List z filtrami</td><td>Filtry → tf-screen-toolbar</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">settings.js</code></td><td>.page-header + tabs</td><td>Tabs + body per tab</td><td>tabs w slocie, body jako slot default</td></tr>
+          <tr><td><code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">apikeys.js</code></td><td>.content-header (!)</td><td>List + modal</td><td>Zunifikować header — teraz odstaje najbardziej</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</div>
+
+<script>
+// Tabs demo
+document.querySelectorAll('.tf-screen-tabs').forEach(bar => {
+  bar.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+      bar.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+    });
+  });
+});
+document.querySelectorAll('.filter-group').forEach(grp => {
+  grp.querySelectorAll('.filter-chip').forEach(c => {
+    c.addEventListener('click', () => {
+      grp.querySelectorAll('.filter-chip').forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+    });
+  });
+});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,2447 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Component Catalog (tf-*)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+/* === Design tokens (from controls.css + style.css) === */
+:root {
+  color-scheme: dark;
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-accent-hover: linear-gradient(135deg, #7277f3 0%, #b69cfb 100%);
+  --gradient-danger: linear-gradient(135deg, #ef4444 0%, #f97316 100%);
+  --gradient-success: linear-gradient(135deg, #22c55e 0%, #10b981 100%);
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 2px 6px rgba(0,0,0,0.4);
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+  --shadow-lg: 0 16px 48px rgba(0,0,0,0.7);
+  --glow-indigo: 0 0 30px rgba(99, 102, 241, 0.3);
+  --spring-snappy: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --spring-smooth: cubic-bezier(0.32, 0.72, 0, 1);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', -apple-system, system-ui, sans-serif;
+  font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+svg.icon { width: 16px; height: 16px; stroke: currentColor; stroke-width: 1.75;
+  stroke-linecap: round; stroke-linejoin: round; fill: none; flex-shrink: 0; }
+svg.icon-sm { width: 13px; height: 13px; }
+svg.icon-lg { width: 20px; height: 20px; }
+
+/* === Page layout === */
+.catalog { max-width: 1200px; margin: 0 auto; padding: 40px 32px; }
+.catalog-title {
+  font-size: 32px; font-weight: 800; margin-bottom: 8px;
+  background: linear-gradient(90deg, #fff 0%, #60a5fa 50%, #a78bfa 100%);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.catalog-sub { color: var(--text-2); font-size: 14px; margin-bottom: 40px; }
+
+.section { margin-bottom: 48px; }
+.section-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em;
+  color: var(--accent-2); margin-bottom: 16px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px;
+}
+.section-title .badge {
+  font-size: 10px; background: var(--accent-glow); color: var(--accent-2);
+  padding: 1px 8px; border-radius: 10px;
+}
+
+.component-row { margin-bottom: 24px; }
+.component-label {
+  font-size: 11px; font-weight: 600; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;
+}
+.component-demo {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 20px 24px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  min-width: 0; overflow: hidden;
+}
+.component-demo.col { flex-direction: column; align-items: stretch; }
+.component-note {
+  font-size: 11px; color: var(--text-3); margin-top: 6px;
+}
+.status-new {
+  display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase;
+  background: rgba(34,197,94,0.15); color: var(--success); padding: 1px 6px;
+  border-radius: 8px; margin-left: 8px; letter-spacing: 0.06em;
+}
+.status-exists {
+  display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase;
+  background: var(--accent-glow); color: var(--accent-2); padding: 1px 6px;
+  border-radius: 8px; margin-left: 8px; letter-spacing: 0.06em;
+}
+.status-redesign {
+  display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase;
+  background: rgba(245,158,11,0.15); color: var(--warning); padding: 1px 6px;
+  border-radius: 8px; margin-left: 8px; letter-spacing: 0.06em;
+}
+
+/* =========================================================================
+   ACTUAL COMPONENT STYLES (from controls.css — real TentaFlow styles)
+   ========================================================================= */
+
+/* --- tf-btn --- */
+.tf-btn {
+  display: inline-flex; align-items: center; gap: 8px; padding: 9px 16px;
+  border: 1px solid transparent; border-radius: var(--radius); font-family: inherit;
+  font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none;
+  min-height: 38px; user-select: none; white-space: nowrap; position: relative;
+  transition: transform 0.15s var(--spring-smooth), box-shadow 0.2s ease, filter 0.15s ease,
+    background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.tf-btn:active { transform: scale(0.97); }
+.tf-btn-primary {
+  background: var(--gradient-accent); color: white;
+  box-shadow: 0 4px 14px rgba(99,102,241,0.35), inset 0 1px 0 rgba(255,255,255,0.18);
+}
+.tf-btn-primary:hover {
+  background: var(--gradient-accent-hover); filter: brightness(1.08);
+  box-shadow: 0 6px 22px rgba(99,102,241,0.55), 0 0 32px rgba(99,102,241,0.3),
+    inset 0 1px 0 rgba(255,255,255,0.25);
+  transform: translateY(-1px);
+}
+.tf-btn-secondary {
+  background: var(--bg-3); color: var(--text); border-color: var(--border);
+}
+.tf-btn-secondary:hover {
+  background: var(--bg-card-hover); border-color: var(--border-hover);
+  transform: translateY(-1px); box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+}
+.tf-btn-ghost { background: transparent; color: var(--text-2); }
+.tf-btn-ghost:hover { background: var(--bg-3); color: var(--text); }
+.tf-btn-outline { background: transparent; color: var(--text-2); border-color: var(--border); }
+.tf-btn-outline:hover { background: var(--bg-3); color: var(--text); border-color: var(--border-hover); }
+.tf-btn-danger { background: transparent; color: var(--danger); border-color: rgba(239,68,68,0.3); }
+.tf-btn-danger:hover {
+  background: rgba(239,68,68,0.1); border-color: var(--danger);
+  box-shadow: 0 0 20px rgba(239,68,68,0.3);
+}
+.tf-btn-danger-solid {
+  background: var(--gradient-danger); color: white;
+  box-shadow: 0 4px 14px rgba(239,68,68,0.35), inset 0 1px 0 rgba(255,255,255,0.15);
+}
+.tf-btn-success {
+  background: var(--gradient-success); color: white;
+  box-shadow: 0 4px 14px rgba(34,197,94,0.35), inset 0 1px 0 rgba(255,255,255,0.15);
+}
+.tf-btn-sm { padding: 6px 12px; font-size: 11px; min-height: 30px; }
+.tf-btn-icon { width: 38px; padding: 0; justify-content: center; }
+.tf-btn-icon.tf-btn-sm { width: 30px; }
+.tf-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.tf-btn .icon { width: 14px; height: 14px; }
+
+/* --- tf-input --- */
+.tf-input-group { display: flex; flex-direction: column; gap: 6px; }
+.tf-input-group .tf-label {
+  font-size: 11px; font-weight: 600; color: var(--text-2);
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.tf-input {
+  width: 100%; padding: 10px 14px; background: var(--bg-input);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); font-size: 13px; font-family: inherit; min-height: 40px; outline: none;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.25s;
+}
+.tf-input::placeholder { color: var(--text-3); }
+.tf-input:hover { border-color: var(--border-hover); }
+.tf-input:focus {
+  border-color: var(--accent-1); background: var(--bg-card);
+  box-shadow: 0 0 14px rgba(99,102,241,0.55), 0 0 28px rgba(99,102,241,0.35),
+    0 0 52px rgba(99,102,241,0.18), 0 0 84px rgba(99,102,241,0.08);
+}
+.tf-input-error { border-color: var(--danger) !important; }
+.tf-input-error:focus {
+  box-shadow: 0 0 14px rgba(239,68,68,0.55), 0 0 28px rgba(239,68,68,0.35),
+    0 0 52px rgba(239,68,68,0.18) !important;
+}
+.tf-hint { font-size: 11px; color: var(--text-3); }
+.tf-error-text { font-size: 11px; color: var(--danger); }
+
+/* --- tf-searchbox --- */
+.tf-searchbox {
+  position: relative; display: flex; align-items: center;
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 0 44px 0 40px; height: 40px;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.25s;
+}
+.tf-searchbox:focus-within {
+  border-color: var(--accent-1); background: var(--bg-card);
+  box-shadow: 0 0 14px rgba(99,102,241,0.55), 0 0 28px rgba(99,102,241,0.35);
+}
+.tf-searchbox-icon {
+  position: absolute; left: 12px; width: 16px; height: 16px; color: var(--text-3);
+  stroke: currentColor; fill: none; stroke-width: 2; pointer-events: none;
+}
+.tf-searchbox:focus-within .tf-searchbox-icon { color: var(--accent-1); }
+.tf-searchbox input {
+  flex: 1; background: transparent; border: 0; outline: none;
+  color: var(--text); font-size: 13px; font-weight: 500; font-family: inherit;
+}
+.tf-searchbox input::placeholder { color: var(--text-3); }
+
+/* --- tf-select --- */
+.tf-select-wrap { position: relative; display: inline-block; width: 100%; }
+.tf-select {
+  width: 100%; appearance: none; padding: 10px 38px 10px 14px;
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); font-size: 13px; font-family: inherit; cursor: pointer;
+  outline: none; min-height: 40px;
+  transition: border-color 0.15s, box-shadow 0.25s;
+}
+.tf-select:hover { border-color: var(--border-hover); }
+.tf-select:focus {
+  border-color: var(--accent-1); background: var(--bg-card);
+  box-shadow: 0 0 14px rgba(99,102,241,0.55), 0 0 28px rgba(99,102,241,0.35);
+}
+.tf-select-wrap::after {
+  content: ''; position: absolute; right: 14px; top: 50%;
+  width: 8px; height: 8px; border-right: 2px solid var(--text-3);
+  border-bottom: 2px solid var(--text-3); transform: translateY(-70%) rotate(45deg);
+  pointer-events: none;
+}
+
+/* --- tf-toggle --- */
+.tf-toggle {
+  position: relative; display: inline-flex; width: 44px; height: 24px;
+  background: var(--bg-3); border-radius: 12px; border: 1px solid var(--border);
+  cursor: pointer; padding: 2px; flex-shrink: 0;
+  transition: all 0.2s var(--spring-smooth);
+}
+.tf-toggle::after {
+  content: ''; width: 18px; height: 18px; background: var(--text);
+  border-radius: 50%; transition: all 0.25s var(--spring-snappy);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+}
+.tf-toggle.on {
+  background: var(--gradient-accent); border-color: var(--accent-1);
+  box-shadow: 0 0 18px rgba(99,102,241,0.35);
+}
+.tf-toggle.on::after { transform: translateX(20px); background: white; }
+
+/* --- tf-chip --- */
+.tf-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px;
+  border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase; white-space: nowrap;
+}
+.tf-chip.ok   { background: rgba(34,197,94,0.15);  color: #22c55e; }
+.tf-chip.warn { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.tf-chip.err  { background: rgba(239,68,68,0.15);  color: #ef4444; }
+.tf-chip.info { background: rgba(96,165,250,0.15); color: #60a5fa; }
+.tf-chip.accent { background: var(--accent-glow); color: var(--accent-2); }
+.tf-chip.online  { background: rgba(16,185,129,0.15); color: #10b981; }
+.tf-chip.offline { background: rgba(106,113,150,0.18); color: #6a7196; }
+.tf-chip.pending { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.tf-chip.recording { background: rgba(239,68,68,0.15); color: #ef4444; }
+.tf-chip-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+  animation: chip-pulse 2s ease-in-out infinite;
+}
+@keyframes chip-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 currentColor; }
+  50%      { box-shadow: 0 0 8px 2px currentColor; }
+}
+
+/* --- tf-tabs (solid variant) --- */
+.tf-tabs {
+  display: inline-flex; gap: 4px; padding: 4px; background: var(--bg-card);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  white-space: nowrap;
+}
+.tf-tab {
+  display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px;
+  background: transparent; color: var(--text-3); border-radius: var(--radius-sm);
+  font-size: 12px; font-weight: 700; letter-spacing: 0.04em; cursor: pointer;
+  border: 0; font-family: inherit; white-space: nowrap;
+  transition: all 0.18s var(--spring-smooth);
+}
+.tf-tab:hover { color: var(--text); background: var(--bg-3); }
+.tf-tab.active {
+  background: var(--gradient-accent); color: white;
+  box-shadow: 0 2px 10px rgba(99,102,241,0.4), inset 0 1px 0 rgba(255,255,255,0.18);
+}
+.tf-tab svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+.tf-tab-count {
+  font-size: 10px; font-weight: 700; background: var(--bg-3); color: var(--text-3);
+  padding: 1px 6px; border-radius: 10px;
+}
+.tf-tab.active .tf-tab-count { background: rgba(255,255,255,0.2); color: white; }
+
+/* tabs underline variant */
+.tf-tabs-underline {
+  display: inline-flex; gap: 4px; padding: 0 4px; white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+.tf-tabs-underline .tf-tab {
+  border-radius: 0; padding: 12px 14px 14px; background: transparent;
+  font-size: 13px; font-weight: 600; letter-spacing: 0; text-transform: none;
+}
+.tf-tabs-underline .tf-tab:hover { color: var(--text); background: transparent; }
+.tf-tabs-underline .tf-tab.active {
+  color: var(--text); background: transparent; box-shadow: none;
+  border-bottom: 2px solid var(--accent-1); margin-bottom: -1px;
+}
+
+/* tabs soft variant */
+.tf-tabs-soft {
+  display: inline-flex; gap: 4px; padding: 4px; background: var(--bg-card);
+  border: 1px solid var(--border); border-radius: var(--radius); white-space: nowrap;
+}
+.tf-tabs-soft .tf-tab.active {
+  background: var(--accent-glow); color: var(--accent-2); box-shadow: 0 0 0 1px var(--accent-1) inset;
+}
+
+/* --- tf-segmented --- */
+.tf-segmented {
+  display: inline-flex; align-items: center; gap: 2px; padding: 3px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 999px;
+}
+.tf-seg-opt {
+  background: transparent; border: 0; padding: 6px 12px; font-family: inherit;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-3); border-radius: 999px; cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.tf-seg-opt:hover:not(.active) { color: var(--text); }
+.tf-seg-opt.active { color: white; }
+.tf-seg-opt.active[data-variant="ok"]     { background: var(--success); }
+.tf-seg-opt.active[data-variant="warn"]   { background: var(--warning); color: #0a0d24; }
+.tf-seg-opt.active[data-variant="err"]    { background: var(--danger); }
+.tf-seg-opt.active[data-variant="accent"] { background: var(--accent-1); }
+.tf-seg-opt.active[data-variant="info"]   { background: var(--info); color: #0a0d24; }
+
+/* --- tf-table --- */
+.tf-table-wrap {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden;
+}
+.tf-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+.tf-table th, .tf-table td { padding: 12px 14px; text-align: left; vertical-align: middle; }
+.tf-table thead th {
+  background: var(--bg-2); color: var(--text-2); font-weight: 700;
+  text-transform: uppercase; font-size: 10px; letter-spacing: 0.08em;
+  border-bottom: 1px solid var(--border);
+}
+.tf-table tbody tr { transition: background 0.12s; }
+.tf-table tbody tr:hover { background: var(--bg-card-hover); }
+.tf-table tbody tr + tr td { border-top: 1px solid var(--border); }
+.tf-table td.num { font-family: 'SF Mono', Menlo, monospace; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* --- tf-menu --- */
+.tf-menu-demo {
+  position: relative; background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow-lg); padding: 6px;
+  min-width: 200px; display: inline-block;
+}
+.tf-menu-item {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+  font-size: 13px; color: var(--text-2); border-radius: var(--radius-sm);
+  cursor: pointer; transition: background 0.1s, color 0.1s;
+}
+.tf-menu-item:hover { background: var(--bg-3); color: var(--text); }
+.tf-menu-item.danger:hover { background: rgba(239,68,68,0.15); color: var(--danger); }
+.tf-menu-divider { height: 1px; background: var(--border); margin: 4px 0; }
+.tf-menu-item svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+
+/* --- tf-window (static preview) --- */
+.tf-window-demo {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg); display: flex; flex-direction: column;
+  width: 420px; overflow: hidden;
+}
+.tf-window-header {
+  display: flex; align-items: center; gap: 10px; padding: 14px 18px;
+  border-bottom: 1px solid var(--border); background: var(--bg-2);
+}
+.tf-window-header .title { flex: 1; font-size: 14px; font-weight: 700; }
+.tf-window-header .controls { display: flex; gap: 6px; }
+.tf-window-header .controls span {
+  width: 12px; height: 12px; border-radius: 50%; cursor: pointer;
+}
+.tf-window-header .controls .close { background: var(--danger); }
+.tf-window-header .controls .min { background: var(--warning); }
+.tf-window-header .controls .max { background: var(--success); }
+.tf-window-body { padding: 18px; flex: 1; color: var(--text-2); font-size: 13px; }
+.tf-window-footer {
+  display: flex; justify-content: flex-end; gap: 10px; padding: 14px 18px;
+  border-top: 1px solid var(--border);
+}
+
+/* =========================================================================
+   NEW COMPONENTS (designed for SDK, matching TF style)
+   ========================================================================= */
+
+/* --- tf-stat-card (KPI tile from mockup) --- */
+.tf-stat-card {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px 20px; display: flex; flex-direction: column; gap: 4px; min-width: 160px;
+}
+.tf-stat-card-label {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 10px; font-weight: 700; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.tf-stat-card-label svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+.tf-stat-card-value {
+  font-size: 28px; font-weight: 800; color: var(--text);
+  font-variant-numeric: tabular-nums; line-height: 1.1;
+}
+.tf-stat-card-value .suffix { font-size: 14px; font-weight: 500; color: var(--text-2); }
+.tf-stat-card-delta { font-size: 11px; color: var(--text-3); display: flex; align-items: center; gap: 4px; }
+.tf-stat-card-delta.warn { color: var(--warning); }
+.tf-stat-card-delta.up { color: var(--success); }
+.tf-stat-card-delta.down { color: var(--danger); }
+.tf-stat-card.accent-success { border-left: 3px solid var(--success); }
+.tf-stat-card.accent-danger  { border-left: 3px solid var(--danger); }
+.tf-stat-card.accent-warning { border-left: 3px solid var(--warning); }
+.tf-stat-card.accent-info    { border-left: 3px solid var(--info); }
+
+/* --- tf-section-card (grouped content panel from mockup) --- */
+.tf-section-card {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 20px; overflow: hidden; min-width: 0;
+}
+.tf-section-card-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 14px; gap: 12px;
+}
+.tf-section-card-head .title {
+  font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 8px;
+}
+.tf-section-card-head .title svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+
+/* --- tf-status-pill --- */
+.tf-status-pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
+  border-radius: 12px; font-size: 10.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.tf-status-pill::before {
+  content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+}
+.tf-status-pill.ok { color: var(--success); background: rgba(34,197,94,0.12); }
+.tf-status-pill.err { color: var(--danger); background: rgba(239,68,68,0.12); }
+.tf-status-pill.warn { color: var(--warning); background: rgba(245,158,11,0.12); }
+
+/* --- tf-alarm-card (from mockup alarm feed) --- */
+.tf-alarm-card {
+  display: flex; align-items: center; gap: 14px; padding: 12px 14px;
+  border-radius: var(--radius); border: 1px solid var(--border);
+  background: var(--bg-card); transition: background 0.12s;
+}
+.tf-alarm-card:hover { background: var(--bg-card-hover); }
+.tf-alarm-card.critical { border-left: 3px solid var(--danger); }
+.tf-alarm-card.warning  { border-left: 3px solid var(--warning); }
+.tf-alarm-card.info     { border-left: 3px solid var(--info); }
+.tf-alarm-thumb {
+  width: 80px; height: 56px; border-radius: var(--radius-sm);
+  background: var(--bg-3); display: flex; align-items: center; justify-content: center;
+  color: var(--text-3); flex-shrink: 0;
+}
+.tf-alarm-thumb svg { width: 24px; height: 24px; stroke: currentColor; fill: none; stroke-width: 1.5; }
+.tf-alarm-body { flex: 1; min-width: 0; }
+.tf-alarm-title { font-size: 13px; font-weight: 700; }
+.tf-alarm-meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px;
+}
+.tf-alarm-meta span { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-3); }
+.tf-alarm-meta svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+
+/* --- tf-key-value (runtime status table from mockup) --- */
+.tf-kv-table { width: 100%; border-collapse: collapse; }
+.tf-kv-table tr + tr td { border-top: 1px solid rgba(31,37,72,0.5); }
+.tf-kv-table td { padding: 8px 0; font-size: 12.5px; }
+.tf-kv-table td:first-child { color: var(--text-2); padding-right: 16px; }
+.tf-kv-table td:last-child { font-weight: 700; }
+
+/* --- tf-heatmap (from mockup) --- */
+.tf-heatmap-wrap { overflow-x: auto; min-width: 0; }
+.tf-heatmap-header {
+  display: grid; grid-template-columns: 80px repeat(24, minmax(0, 1fr));
+  font-size: 10px; color: var(--text-3); margin-bottom: 4px; text-align: center;
+  min-width: 600px;
+}
+.tf-heatmap-grid {
+  display: grid; grid-template-columns: 80px repeat(24, minmax(0, 1fr)); gap: 2px;
+  min-width: 600px;
+}
+.tf-heatmap-grid .row-label {
+  font-size: 11px; color: var(--text-2); display: flex; align-items: center;
+  padding-right: 8px; white-space: nowrap;
+}
+.tf-heatmap-wrap { margin-bottom: 0; }
+.tf-heatmap-cell {
+  aspect-ratio: 1; border-radius: 3px; background: rgba(99,102,241,0.08);
+  transition: background 0.15s;
+}
+.tf-heatmap-cell.lvl-1 { background: rgba(99,102,241,0.2); }
+.tf-heatmap-cell.lvl-2 { background: rgba(99,102,241,0.45); }
+.tf-heatmap-cell.lvl-3 { background: rgba(167,139,250,0.7); }
+.tf-heatmap-cell.lvl-4 { background: rgba(239,68,68,0.85); }
+.tf-heatmap-legend {
+  display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--text-3);
+  justify-content: flex-end; margin-top: 8px;
+}
+.tf-heatmap-legend-swatch { width: 14px; height: 14px; border-radius: 2px; }
+
+/* --- tf-progress-bar --- */
+.tf-progress-bar {
+  width: 100%; height: 6px; background: var(--bg-3); border-radius: 999px; overflow: hidden;
+}
+.tf-progress-bar-fill {
+  height: 100%; border-radius: 999px; transition: width 0.3s var(--spring-smooth);
+}
+.tf-progress-bar-fill.accent { background: var(--gradient-accent); }
+.tf-progress-bar-fill.success { background: var(--success); }
+.tf-progress-bar-fill.warning { background: var(--warning); }
+.tf-progress-bar-fill.danger { background: var(--danger); }
+.tf-progress-bar.lg { height: 10px; }
+.tf-progress-bar.sm { height: 4px; }
+
+/* --- tf-alert --- */
+.tf-alert {
+  display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px;
+  border-radius: var(--radius); border: 1px solid;
+}
+.tf-alert.info { background: rgba(96,165,250,0.08); border-color: rgba(96,165,250,0.2); color: var(--info); }
+.tf-alert.success { background: rgba(34,197,94,0.08); border-color: rgba(34,197,94,0.2); color: var(--success); }
+.tf-alert.warning { background: rgba(245,158,11,0.08); border-color: rgba(245,158,11,0.2); color: var(--warning); }
+.tf-alert.danger { background: rgba(239,68,68,0.08); border-color: rgba(239,68,68,0.2); color: var(--danger); }
+.tf-alert svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.75; flex-shrink: 0; margin-top: 1px; }
+.tf-alert-body { flex: 1; }
+.tf-alert-title { font-size: 13px; font-weight: 700; margin-bottom: 2px; }
+.tf-alert-msg { font-size: 12px; color: var(--text-2); }
+
+/* --- tf-badge --- */
+.tf-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  font-size: 10px; font-weight: 700; line-height: 1;
+}
+.tf-badge.accent { background: var(--accent-glow); color: var(--accent-2); }
+.tf-badge.danger { background: rgba(239,68,68,0.2); color: var(--danger); }
+.tf-badge.success { background: rgba(34,197,94,0.2); color: var(--success); }
+
+/* --- tf-avatar --- */
+.tf-avatar {
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%; font-weight: 700; flex-shrink: 0;
+}
+.tf-avatar.sm { width: 24px; height: 24px; font-size: 9px; }
+.tf-avatar.md { width: 32px; height: 32px; font-size: 11px; }
+.tf-avatar.lg { width: 40px; height: 40px; font-size: 14px; }
+.tf-avatar.accent { background: var(--gradient-accent); color: white; }
+.tf-avatar.success { background: var(--gradient-success); color: white; }
+
+/* --- tf-divider --- */
+.tf-divider { height: 1px; background: var(--border); width: 100%; }
+.tf-divider.subtle { opacity: 0.5; }
+
+/* --- tf-tooltip (shown statically for demo) --- */
+.tf-tooltip-demo {
+  position: relative; display: inline-block; padding: 6px 10px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 11px; color: var(--text); box-shadow: var(--shadow-sm);
+  white-space: nowrap;
+}
+.tf-tooltip-demo::after {
+  content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+  border: 5px solid transparent; border-top-color: var(--border);
+}
+
+/* --- tf-textarea --- */
+.tf-textarea {
+  width: 100%; padding: 10px 14px; background: var(--bg-input);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); font-size: 13px; font-family: inherit; min-height: 80px;
+  resize: vertical; outline: none;
+  transition: border-color 0.15s, box-shadow 0.25s;
+}
+.tf-textarea:focus {
+  border-color: var(--accent-1); background: var(--bg-card);
+  box-shadow: 0 0 14px rgba(99,102,241,0.55), 0 0 28px rgba(99,102,241,0.35);
+}
+
+/* --- tf-radio / tf-checkbox --- */
+.tf-radio-group, .tf-checkbox-group { display: flex; flex-direction: column; gap: 8px; }
+.tf-radio-label, .tf-checkbox-label {
+  display: flex; align-items: center; gap: 10px; font-size: 13px; cursor: pointer;
+  color: var(--text-2); transition: color 0.12s;
+}
+.tf-radio-label:hover, .tf-checkbox-label:hover { color: var(--text); }
+.tf-radio-input, .tf-checkbox-input {
+  appearance: none; width: 18px; height: 18px; border: 2px solid var(--border);
+  background: var(--bg-input); cursor: pointer; flex-shrink: 0;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.25s;
+}
+.tf-radio-input { border-radius: 50%; }
+.tf-checkbox-input { border-radius: 4px; }
+.tf-radio-input:checked {
+  border-color: var(--accent-1); background: var(--accent-1);
+  box-shadow: inset 0 0 0 3px var(--bg-input), 0 0 12px rgba(99,102,241,0.3);
+}
+.tf-checkbox-input:checked {
+  border-color: var(--accent-1); background: var(--accent-1);
+  box-shadow: 0 0 12px rgba(99,102,241,0.3);
+}
+
+/* --- tf-slider (range) --- */
+.tf-slider {
+  appearance: none; width: 100%; height: 6px; background: var(--bg-3);
+  border-radius: 999px; outline: none; cursor: pointer;
+}
+.tf-slider::-webkit-slider-thumb {
+  appearance: none; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--gradient-accent); border: 2px solid var(--bg);
+  box-shadow: 0 2px 8px rgba(99,102,241,0.4); cursor: pointer;
+}
+.tf-slider::-webkit-slider-thumb:hover {
+  box-shadow: 0 2px 16px rgba(99,102,241,0.6);
+}
+
+/* --- tf-spinner --- */
+.tf-spinner {
+  width: 24px; height: 24px; border: 3px solid var(--border);
+  border-top-color: var(--accent-1); border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+.tf-spinner.sm { width: 16px; height: 16px; border-width: 2px; }
+.tf-spinner.lg { width: 36px; height: 36px; border-width: 4px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* --- tf-toast (static preview) --- */
+.tf-toast-demo {
+  display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow); min-width: 280px;
+}
+.tf-toast-demo svg { width: 18px; height: 18px; stroke: currentColor; fill: none; flex-shrink: 0; }
+.tf-toast-demo.success { border-left: 3px solid var(--success); }
+.tf-toast-demo.danger { border-left: 3px solid var(--danger); }
+.tf-toast-demo.info { border-left: 3px solid var(--info); }
+
+/* --- tf-detail-header (addon header from mockup) --- */
+.tf-detail-header {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 20px; display: flex; gap: 18px; align-items: center;
+}
+.tf-detail-header-icon {
+  width: 60px; height: 60px; border-radius: var(--radius);
+  background: var(--gradient-accent); display: flex; align-items: center;
+  justify-content: center; color: white; flex-shrink: 0;
+}
+.tf-detail-header-icon svg {
+  width: 30px; height: 30px; stroke: currentColor; fill: none; stroke-width: 1.75;
+}
+.tf-detail-header-meta { flex: 1; min-width: 0; }
+.tf-detail-header-name { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 10px; }
+.tf-detail-header-sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+.tf-detail-header-badges { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.tf-detail-header-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+/* --- tf-breadcrumb --- */
+.tf-breadcrumb {
+  display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-3);
+}
+.tf-breadcrumb-item { color: var(--text-2); cursor: pointer; transition: color 0.12s; }
+.tf-breadcrumb-item:hover { color: var(--accent-2); }
+.tf-breadcrumb-item.current { color: var(--text); font-weight: 600; cursor: default; }
+.tf-breadcrumb-sep { opacity: 0.5; }
+
+/* --- tf-empty-state --- */
+.tf-empty-state {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 48px 24px; text-align: center;
+}
+.tf-empty-state svg {
+  width: 48px; height: 48px; stroke: var(--text-3); fill: none; stroke-width: 1.25;
+  margin-bottom: 16px;
+}
+.tf-empty-state-title { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+.tf-empty-state-msg { font-size: 13px; color: var(--text-2); max-width: 320px; }
+
+/* utility */
+.flex { display: flex; }
+.gap-sm { gap: 8px; }
+.gap-md { gap: 16px; }
+.gap-lg { gap: 24px; }
+.col { flex-direction: column; }
+.wrap { flex-wrap: wrap; }
+.grow { flex: 1; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.text-sm { font-size: 11px; }
+.text-muted { color: var(--text-2); }
+.text-subtle { color: var(--text-3); }
+.text-mono { font-family: 'SF Mono', Menlo, monospace; font-variant-numeric: tabular-nums; }
+.fw-700 { font-weight: 700; }
+.mt-sm { margin-top: 8px; }
+.mt-md { margin-top: 16px; }
+
+/* =========================================================================
+   NEW COMPONENTS (from CRM mockups)
+   ========================================================================= */
+
+/* --- tf-list (virtualized) --- */
+.tf-list {
+  display: flex; flex-direction: column;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden;
+}
+.tf-list-item {
+  display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+  border-bottom: 1px solid var(--border); cursor: pointer;
+  transition: background 0.12s;
+}
+.tf-list-item:last-child { border-bottom: 0; }
+.tf-list-item:hover { background: var(--bg-card-hover); }
+.tf-list-item.selected { background: var(--accent-glow); }
+.tf-list-item-body { flex: 1; min-width: 0; }
+.tf-list-item-title { font-size: 13px; font-weight: 600; }
+.tf-list-item-sub { font-size: 11px; color: var(--text-3); }
+.tf-list.compact .tf-list-item { padding: 10px 14px; }
+.tf-list-item.severity-danger { border-left: 3px solid var(--danger); }
+.tf-list-item.severity-warning { border-left: 3px solid var(--warning); }
+.tf-list-item.severity-success { border-left: 3px solid var(--success); }
+.tf-list-item.severity-info { border-left: 3px solid var(--info); }
+
+/* --- tf-calendar --- */
+.tf-cal-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+}
+.tf-cal-grid {
+  display: grid; grid-template-columns: 60px repeat(5, 1fr); gap: 1px;
+  background: var(--border); border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden;
+}
+.tf-cal-h {
+  background: var(--bg-3); padding: 8px 10px; font-size: 11px; font-weight: 700;
+  color: var(--text-2); text-align: center;
+}
+.tf-cal-h.today { background: rgba(99,102,241,0.12); color: var(--accent-2); }
+.tf-cal-day { font-size: 14px; color: var(--text); font-weight: 800; }
+.tf-cal-h.today .tf-cal-day { color: var(--accent-2); }
+.tf-cal-time {
+  background: var(--bg-2); padding: 4px 6px; font-size: 10px; color: var(--text-3);
+  text-align: right; display: flex; align-items: flex-start; justify-content: flex-end;
+}
+.tf-cal-cell { background: var(--bg-2); min-height: 56px; padding: 4px; }
+.tf-cal-event {
+  padding: 5px 8px; border-radius: 4px; font-size: 10.5px; line-height: 1.3;
+  cursor: pointer; border-left: 3px solid; transition: filter 0.12s;
+}
+.tf-cal-event:hover { filter: brightness(1.15); }
+.tf-cal-et { font-weight: 700; }
+.tf-cal-es { color: var(--text-3); font-size: 9.5px; }
+.tf-cal-event.ev-blue   { background: rgba(96,165,250,0.12); border-left-color: var(--info); }
+.tf-cal-event.ev-purple { background: rgba(167,139,250,0.12); border-left-color: var(--accent-2); }
+.tf-cal-event.ev-green  { background: rgba(34,197,94,0.12); border-left-color: var(--success); }
+.tf-cal-event.ev-amber  { background: rgba(245,158,11,0.12); border-left-color: var(--warning); }
+
+/* --- tf-timeline --- */
+.tf-timeline { display: flex; flex-direction: column; gap: 0; position: relative; }
+.tf-timeline::before {
+  content: ''; position: absolute; left: 7px; top: 16px; bottom: 16px;
+  width: 2px; background: var(--border);
+}
+.tf-timeline-item { display: flex; gap: 14px; padding: 10px 0; position: relative; }
+.tf-timeline-dot {
+  width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0;
+  margin-top: 2px; z-index: 1; box-shadow: 0 0 0 3px var(--bg-2);
+}
+.tf-timeline-content { flex: 1; min-width: 0; }
+.tf-timeline-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* --- tf-filter-chips --- */
+.tf-filter-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px;
+  border-radius: 14px; background: var(--bg-3); color: var(--text-2);
+  font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid var(--border);
+  font-family: inherit; transition: all 0.12s;
+}
+.tf-filter-chip:hover { color: var(--text); border-color: var(--border-hover); }
+.tf-filter-chip.active {
+  background: var(--accent-glow); color: var(--accent-2); border-color: var(--accent-1);
+}
+.tf-filter-chip .icon { width: 12px; height: 12px; }
+.tf-filter-count {
+  font-size: 10px; font-weight: 700; background: rgba(255,255,255,0.1);
+  padding: 0 5px; border-radius: 8px; margin-left: 2px;
+}
+.tf-filter-chip.active .tf-filter-count {
+  background: rgba(99,102,241,0.3);
+}
+
+/* --- tf-command-palette --- */
+.tf-cmd-palette {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg); width: 520px; overflow: hidden;
+}
+.tf-cmd-search {
+  display: flex; align-items: center; gap: 10px; padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.tf-cmd-search input {
+  flex: 1; background: transparent; border: 0; outline: none;
+  color: var(--text); font-size: 14px; font-family: inherit;
+}
+.tf-cmd-search input::placeholder { color: var(--text-3); }
+.tf-kbd {
+  font-size: 10px; font-weight: 700; color: var(--text-3);
+  background: var(--bg-3); border: 1px solid var(--border);
+  padding: 2px 6px; border-radius: 4px; font-family: inherit;
+}
+.tf-cmd-results { padding: 8px; max-height: 300px; overflow-y: auto; }
+.tf-cmd-group {
+  font-size: 10px; font-weight: 700; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 8px 8px 4px;
+}
+.tf-cmd-item {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+  border-radius: var(--radius-sm); cursor: pointer; transition: background 0.1s;
+}
+.tf-cmd-item:hover, .tf-cmd-item.active {
+  background: var(--accent-glow);
+}
+.tf-cmd-item .icon { color: var(--text-3); }
+
+/* --- tf-contrib-tag --- */
+.tf-contrib-tag {
+  display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.06em; padding: 2px 7px; border-radius: 4px;
+}
+.tf-contrib-tag.crm { background: rgba(167,139,250,0.15); color: var(--accent-2); }
+.tf-contrib-tag.calendar { background: rgba(96,165,250,0.15); color: var(--info); }
+.tf-contrib-tag.contacts { background: rgba(34,197,94,0.15); color: var(--success); }
+.tf-contrib-tag.billing { background: rgba(245,158,11,0.15); color: var(--warning); }
+.tf-contrib-tag.activity { background: rgba(99,102,241,0.15); color: var(--accent-1); }
+.tf-contrib-tag.ai { background: rgba(239,68,68,0.12); color: var(--danger); }
+.tf-contrib-tag.documents { background: rgba(106,113,150,0.2); color: var(--text-2); }
+
+/* --- tf-stage --- */
+.tf-stage {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px;
+  border-radius: 999px; font-size: 11px; font-weight: 700; border-left: 3px solid;
+}
+.tf-stage.lead { background: rgba(106,113,150,0.15); border-left-color: var(--text-3); color: var(--text-2); }
+.tf-stage.qualify { background: rgba(96,165,250,0.12); border-left-color: var(--info); color: var(--info); }
+.tf-stage.offer { background: rgba(167,139,250,0.12); border-left-color: var(--accent-2); color: var(--accent-2); }
+.tf-stage.commit { background: rgba(99,102,241,0.15); border-left-color: var(--accent-1); color: var(--accent-1); }
+.tf-stage.execute { background: rgba(245,158,11,0.12); border-left-color: var(--warning); color: var(--warning); }
+.tf-stage.won { background: rgba(34,197,94,0.12); border-left-color: var(--success); color: var(--success); }
+.tf-stage.lost { background: rgba(239,68,68,0.12); border-left-color: var(--danger); color: var(--danger); }
+
+/* --- tf-datepicker --- */
+.tf-datepicker-demo {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px; width: 280px;
+}
+.tf-dp-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px;
+}
+.tf-dp-grid {
+  display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; text-align: center;
+}
+.tf-dp-wday {
+  font-size: 10px; font-weight: 700; color: var(--text-3);
+  text-transform: uppercase; padding: 4px 0;
+}
+.tf-dp-day {
+  font-size: 12px; padding: 6px 0; border-radius: 6px; cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.tf-dp-day:hover { background: var(--bg-3); color: var(--text); }
+.tf-dp-day.other { color: var(--text-3); opacity: 0.4; }
+.tf-dp-day.today {
+  background: var(--gradient-accent); color: white; font-weight: 700;
+  box-shadow: 0 2px 8px rgba(99,102,241,0.4);
+}
+.tf-dp-day.range-start {
+  background: var(--accent-1); color: white; font-weight: 700;
+  border-radius: 6px 0 0 6px;
+}
+.tf-dp-day.range-end {
+  background: var(--accent-1); color: white; font-weight: 700;
+  border-radius: 0 6px 6px 0;
+}
+.tf-dp-day.range {
+  background: var(--accent-glow); color: var(--accent-2);
+  border-radius: 0;
+}
+
+/* --- Real chat streaming caret (from style.css) --- */
+@keyframes chatCaretBlink { 50% { opacity: 0; } }
+
+/* =========================================================================
+   MICRO-INTERACTIONS — applied to ALL components globally
+   ========================================================================= */
+
+/* --- Buttons: lift + glow halo + spring press --- */
+.tf-btn {
+  transition: transform 0.2s var(--spring-snappy), box-shadow 0.25s ease,
+    filter 0.2s ease, background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.tf-btn:hover { transform: translateY(-2px); }
+.tf-btn-primary:hover {
+  box-shadow: 0 8px 28px rgba(99,102,241,0.5), 0 0 40px rgba(99,102,241,0.25),
+    inset 0 1px 0 rgba(255,255,255,0.25);
+}
+.tf-btn-secondary:hover {
+  box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+}
+.tf-btn-danger:hover {
+  box-shadow: 0 8px 28px rgba(239,68,68,0.4), 0 0 40px rgba(239,68,68,0.2);
+}
+.tf-btn-danger-solid:hover {
+  box-shadow: 0 8px 28px rgba(239,68,68,0.5), 0 0 40px rgba(239,68,68,0.25);
+}
+.tf-btn-success:hover {
+  box-shadow: 0 8px 28px rgba(34,197,94,0.4), 0 0 40px rgba(34,197,94,0.2);
+}
+.tf-btn:active {
+  transform: scale(0.95) translateY(0) !important;
+  transition-duration: 0.08s;
+}
+
+/* --- Inputs: multi-layer glow bloom + pulse on first focus --- */
+.tf-input:focus {
+  box-shadow:
+    0 0 0 1px var(--accent-1),
+    0 0 12px rgba(99,102,241,0.5),
+    0 0 28px rgba(99,102,241,0.3),
+    0 0 56px rgba(99,102,241,0.12),
+    0 0 90px rgba(99,102,241,0.04) !important;
+  animation: inputGlowPulse 2s ease-in-out 1;
+}
+@keyframes inputGlowPulse {
+  0% { box-shadow: 0 0 0 1px var(--accent-1), 0 0 8px rgba(99,102,241,0.3); }
+  50% { box-shadow: 0 0 0 1px var(--accent-1), 0 0 16px rgba(99,102,241,0.6),
+    0 0 36px rgba(99,102,241,0.3), 0 0 64px rgba(99,102,241,0.1); }
+  100% { box-shadow: 0 0 0 1px var(--accent-1), 0 0 12px rgba(99,102,241,0.5),
+    0 0 28px rgba(99,102,241,0.3), 0 0 56px rgba(99,102,241,0.12); }
+}
+.tf-textarea:focus {
+  box-shadow: 0 0 0 1px var(--accent-1), 0 0 12px rgba(99,102,241,0.5),
+    0 0 28px rgba(99,102,241,0.3) !important;
+}
+.tf-searchbox:focus-within {
+  box-shadow: 0 0 0 1px var(--accent-1), 0 0 14px rgba(99,102,241,0.5),
+    0 0 32px rgba(99,102,241,0.25) !important;
+}
+
+/* --- Toggles: spring overshoot already in bezier, add glow --- */
+.tf-toggle.on {
+  box-shadow: 0 0 18px rgba(99,102,241,0.4), 0 0 36px rgba(99,102,241,0.15);
+}
+
+/* --- Chips: hover scale + brightness --- */
+.tf-chip {
+  transition: transform 0.18s var(--spring-smooth), filter 0.15s;
+  cursor: default;
+}
+.tf-chip:hover {
+  transform: scale(1.06);
+  filter: brightness(1.15);
+}
+
+/* --- Stat cards: hover lift + shadow expand --- */
+.tf-stat-card {
+  transition: transform 0.25s var(--spring-smooth), box-shadow 0.3s ease, border-color 0.2s;
+  cursor: pointer;
+}
+.tf-stat-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4), 0 0 20px rgba(99,102,241,0.08);
+  border-color: var(--border-hover);
+}
+.tf-stat-card:active {
+  transform: translateY(-1px) scale(0.98);
+  transition-duration: 0.08s;
+}
+
+/* --- Section cards: subtle lift --- */
+.tf-section-card {
+  transition: transform 0.25s var(--spring-smooth), box-shadow 0.3s ease;
+}
+.tf-section-card:hover {
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+}
+
+/* --- Table rows: glow on hover --- */
+.tf-table tbody tr:hover {
+  box-shadow: inset 0 0 0 1px rgba(99,102,241,0.12);
+}
+
+/* --- List items: lift + border glow --- */
+.tf-list-item {
+  transition: transform 0.15s var(--spring-smooth), background 0.12s, box-shadow 0.2s;
+}
+.tf-list-item:hover {
+  transform: translateX(2px);
+  box-shadow: inset 0 0 0 1px rgba(99,102,241,0.1);
+}
+
+/* --- Alarm cards: lift on hover --- */
+.tf-alarm-card {
+  transition: transform 0.2s var(--spring-smooth), background 0.12s, box-shadow 0.25s;
+}
+.tf-alarm-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+}
+
+/* --- Filter chips: press scale --- */
+.tf-filter-chip {
+  transition: all 0.15s var(--spring-smooth);
+}
+.tf-filter-chip:active {
+  transform: scale(0.94);
+}
+
+/* --- Calendar events: lift + glow --- */
+.tf-cal-event {
+  transition: transform 0.15s var(--spring-smooth), filter 0.12s, box-shadow 0.2s;
+}
+.tf-cal-event:hover {
+  transform: translateY(-1px) scale(1.02);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+
+/* --- Timeline dots: pulse on hover --- */
+.tf-timeline-dot {
+  transition: transform 0.2s var(--spring-snappy), box-shadow 0.2s;
+}
+.tf-timeline-item:hover .tf-timeline-dot {
+  transform: scale(1.3);
+  box-shadow: 0 0 12px currentColor;
+}
+
+/* --- Stage badges: press feedback --- */
+.tf-stage {
+  transition: transform 0.15s var(--spring-smooth), filter 0.12s;
+  cursor: default;
+}
+.tf-stage:hover {
+  filter: brightness(1.2);
+  transform: scale(1.05);
+}
+
+/* --- Menu items: slide-in on hover --- */
+.tf-menu-item {
+  transition: background 0.1s, color 0.1s, transform 0.12s, padding-left 0.12s;
+}
+.tf-menu-item:hover {
+  padding-left: 14px;
+}
+
+/* --- Segmented: press spring --- */
+.tf-seg-opt {
+  transition: background 0.15s, color 0.15s, transform 0.15s var(--spring-snappy);
+}
+.tf-seg-opt:active {
+  transform: scale(0.92);
+}
+
+/* --- Tabs: hover brightness + active glow --- */
+.tf-tab {
+  transition: all 0.18s var(--spring-smooth);
+}
+.tf-tab.active {
+  box-shadow: 0 2px 12px rgba(99,102,241,0.45), inset 0 1px 0 rgba(255,255,255,0.18);
+}
+
+/* --- Breadcrumb: hover underline slide --- */
+.tf-breadcrumb-item {
+  position: relative;
+}
+.tf-breadcrumb-item::after {
+  content: ''; position: absolute; bottom: -1px; left: 0; width: 0; height: 1px;
+  background: var(--accent-2); transition: width 0.2s var(--spring-smooth);
+}
+.tf-breadcrumb-item:hover::after { width: 100%; }
+.tf-breadcrumb-item.current::after { display: none; }
+
+/* --- Datepicker days: hover scale --- */
+.tf-dp-day {
+  transition: transform 0.12s var(--spring-snappy), background 0.1s, color 0.1s;
+}
+.tf-dp-day:hover:not(.other):not(.today):not(.range-start):not(.range-end) {
+  transform: scale(1.15);
+}
+
+/* --- Command palette items: slide indicator --- */
+.tf-cmd-item {
+  transition: background 0.1s, padding-left 0.12s;
+}
+.tf-cmd-item:hover, .tf-cmd-item.active {
+  padding-left: 14px;
+}
+
+/* --- Avatar: hover glow --- */
+.tf-avatar {
+  transition: transform 0.2s var(--spring-smooth), box-shadow 0.2s;
+}
+.tf-avatar:hover {
+  transform: scale(1.1);
+  box-shadow: 0 0 16px rgba(99,102,241,0.35);
+}
+
+/* --- Progress bar fill: animated gradient shimmer --- */
+.tf-progress-bar-fill {
+  position: relative; overflow: hidden;
+}
+.tf-progress-bar-fill::after {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.15) 50%, transparent 100%);
+  animation: progressShimmer 2s ease-in-out infinite;
+}
+@keyframes progressShimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(200%); }
+}
+
+/* --- Spinner: glow trail --- */
+.tf-spinner {
+  box-shadow: 0 0 8px rgba(99,102,241,0.3);
+}
+
+/* --- Contrib tags: hover pop --- */
+.tf-contrib-tag {
+  transition: transform 0.12s var(--spring-snappy), filter 0.12s;
+}
+.tf-contrib-tag:hover {
+  transform: scale(1.1);
+  filter: brightness(1.2);
+}
+
+/* --- Alert: subtle entrance --- */
+.tf-alert {
+  animation: alertSlideIn 0.3s var(--spring-smooth);
+}
+@keyframes alertSlideIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* --- Badge: hover pop --- */
+.tf-badge {
+  transition: transform 0.15s var(--spring-snappy);
+}
+.tf-badge:hover {
+  transform: scale(1.15);
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-5 0A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 5 0 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3A2.5 2.5 0 0 0 22 9.5 2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-luggage" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="14" rx="2"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><line x1="6" y1="12" x2="18" y2="12"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+</defs>
+</svg>
+
+<div class="catalog">
+
+<h1 class="catalog-title">TentaFlow Component Catalog</h1>
+<p class="catalog-sub">Unified design system — every component an addon can render. One style, one set of CSS variables, zero parallel systems.</p>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Buttons <span class="badge">tf-button</span> <span class="status-exists">EXISTS</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Variants</div>
+    <div class="component-demo">
+      <button class="tf-btn tf-btn-primary"><svg class="icon"><use href="#i-eye"/></svg>Primary</button>
+      <button class="tf-btn tf-btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Secondary</button>
+      <button class="tf-btn tf-btn-ghost">Ghost</button>
+      <button class="tf-btn tf-btn-outline">Outline</button>
+      <button class="tf-btn tf-btn-danger">Danger</button>
+      <button class="tf-btn tf-btn-danger-solid">Danger Solid</button>
+      <button class="tf-btn tf-btn-success"><svg class="icon"><use href="#i-check"/></svg>Success</button>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">Sizes + Icon-only</div>
+    <div class="component-demo">
+      <button class="tf-btn tf-btn-primary">Default (md)</button>
+      <button class="tf-btn tf-btn-primary tf-btn-sm">Small</button>
+      <button class="tf-btn tf-btn-secondary tf-btn-icon"><svg class="icon"><use href="#i-plus"/></svg></button>
+      <button class="tf-btn tf-btn-secondary tf-btn-icon tf-btn-sm"><svg class="icon"><use href="#i-settings"/></svg></button>
+      <button class="tf-btn tf-btn-primary" disabled>Disabled</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Chips <span class="badge">tf-chip</span> <span class="status-exists">EXISTS</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Status variants</div>
+    <div class="component-demo">
+      <span class="tf-chip ok"><span class="tf-chip-dot"></span>Online</span>
+      <span class="tf-chip warn"><span class="tf-chip-dot"></span>Warning</span>
+      <span class="tf-chip err"><span class="tf-chip-dot"></span>Error</span>
+      <span class="tf-chip info">Info</span>
+      <span class="tf-chip accent">Accent</span>
+      <span class="tf-chip online"><span class="tf-chip-dot"></span>Online</span>
+      <span class="tf-chip offline">Offline</span>
+      <span class="tf-chip pending"><span class="tf-chip-dot"></span>Pending</span>
+      <span class="tf-chip recording"><span class="tf-chip-dot"></span>Recording</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Form Controls <span class="status-exists">EXISTS</span></div>
+
+  <div class="component-row">
+    <div class="component-label">tf-input — variants</div>
+    <div class="component-demo col" style="max-width:400px">
+      <div class="tf-input-group">
+        <label class="tf-label">Label</label>
+        <input class="tf-input" placeholder="Default input">
+      </div>
+      <div class="tf-input-group">
+        <label class="tf-label">With error</label>
+        <input class="tf-input tf-input-error" value="Invalid value">
+        <span class="tf-error-text">This field is required</span>
+      </div>
+      <div class="tf-input-group">
+        <label class="tf-label">With hint</label>
+        <input class="tf-input" placeholder="Enter email...">
+        <span class="tf-hint">We'll never share your email</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-textarea</div>
+    <div class="component-demo" style="max-width:400px">
+      <textarea class="tf-textarea" rows="3" placeholder="Write a description..."></textarea>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-searchbox</div>
+    <div class="component-demo" style="max-width:360px">
+      <div class="tf-searchbox">
+        <svg class="tf-searchbox-icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="search" placeholder="Search cameras...">
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-select</div>
+    <div class="component-demo" style="max-width:300px">
+      <div class="tf-select-wrap">
+        <select class="tf-select">
+          <option>All cameras</option>
+          <option>C-01 brama</option>
+          <option>C-04 wjazd</option>
+          <option>C-07 peron</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-toggle</div>
+    <div class="component-demo">
+      <div class="tf-toggle"></div>
+      <div class="tf-toggle on"></div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-radio / tf-checkbox <span class="status-new">NEW</span></div>
+    <div class="component-demo">
+      <div class="tf-radio-group">
+        <label class="tf-radio-label"><input type="radio" name="demo-r" class="tf-radio-input" checked> Option A</label>
+        <label class="tf-radio-label"><input type="radio" name="demo-r" class="tf-radio-input"> Option B</label>
+        <label class="tf-radio-label"><input type="radio" name="demo-r" class="tf-radio-input"> Option C</label>
+      </div>
+      <div style="width:40px"></div>
+      <div class="tf-checkbox-group">
+        <label class="tf-checkbox-label"><input type="checkbox" class="tf-checkbox-input" checked> Enable notifications</label>
+        <label class="tf-checkbox-label"><input type="checkbox" class="tf-checkbox-input"> Auto-sync</label>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-slider (range) <span class="status-new">NEW</span></div>
+    <div class="component-demo" style="max-width:400px">
+      <input type="range" class="tf-slider" min="0" max="100" value="68">
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Tabs <span class="badge">tf-tabs</span> <span class="status-exists">EXISTS</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Solid variant (pill)</div>
+    <div class="component-demo">
+      <div class="tf-tabs">
+        <button class="tf-tab active"><svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.75"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>Dashboard</button>
+        <button class="tf-tab"><svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.75"><use href="#i-video"/></svg>Live view</button>
+        <button class="tf-tab"><svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.75"><use href="#i-camera"/></svg>Kamery <span class="tf-tab-count">24</span></button>
+        <button class="tf-tab"><svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.75"><use href="#i-alert"/></svg>Alarmy <span class="tf-tab-count">7</span></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">Underline variant</div>
+    <div class="component-demo">
+      <div class="tf-tabs-underline">
+        <button class="tf-tab active">Dashboard</button>
+        <button class="tf-tab">Live view</button>
+        <button class="tf-tab">Kamery <span class="tf-tab-count">24</span></button>
+        <button class="tf-tab">Alarmy <span class="tf-tab-count">7</span></button>
+        <button class="tf-tab">Ustawienia</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">Soft variant</div>
+    <div class="component-demo">
+      <div class="tf-tabs-soft">
+        <button class="tf-tab active">Dashboard</button>
+        <button class="tf-tab">Analytics</button>
+        <button class="tf-tab">Settings</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Segmented Control <span class="badge">tf-segmented</span> <span class="status-exists">EXISTS</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Time range + permission + status</div>
+    <div class="component-demo">
+      <div class="tf-segmented">
+        <button class="tf-seg-opt">1h</button>
+        <button class="tf-seg-opt">6h</button>
+        <button class="tf-seg-opt active" data-variant="accent">24h</button>
+        <button class="tf-seg-opt">7d</button>
+      </div>
+      <div style="width:16px"></div>
+      <div class="tf-segmented">
+        <button class="tf-seg-opt active" data-variant="ok">Allow</button>
+        <button class="tf-seg-opt">Auto</button>
+        <button class="tf-seg-opt" data-variant="err">Deny</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Table <span class="badge">tf-table</span> <span class="status-exists">EXISTS</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Standard table</div>
+    <div class="component-demo col">
+      <div class="tf-table-wrap">
+        <table class="tf-table">
+          <thead><tr>
+            <th>Camera</th><th>Location</th><th>Status</th><th>FPS</th><th>Detectors</th>
+          </tr></thead>
+          <tbody>
+            <tr><td>C-01</td><td>Brama główna</td><td><span class="tf-chip ok"><span class="tf-chip-dot"></span>Online</span></td><td class="num">30</td><td>D1, D2</td></tr>
+            <tr><td>C-04</td><td>Wjazd północny</td><td><span class="tf-chip ok"><span class="tf-chip-dot"></span>Online</span></td><td class="num">25</td><td>D1, D3, D5</td></tr>
+            <tr><td>C-12</td><td>Magazyn</td><td><span class="tf-chip err">Offline</span></td><td class="num">0</td><td>—</td></tr>
+            <tr><td>C-15</td><td>Parking</td><td><span class="tf-chip ok"><span class="tf-chip-dot"></span>Online</span></td><td class="num">30</td><td>D6</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Menu <span class="badge">tf-menu</span> <span class="status-exists">EXISTS</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Dropdown menu (static)</div>
+    <div class="component-demo">
+      <div class="tf-menu-demo">
+        <div class="tf-menu-item"><svg><use href="#i-edit"/></svg> Edit camera</div>
+        <div class="tf-menu-item"><svg><use href="#i-download"/></svg> Export recording</div>
+        <div class="tf-menu-item"><svg><use href="#i-settings"/></svg> Settings</div>
+        <div class="tf-menu-divider"></div>
+        <div class="tf-menu-item danger"><svg><use href="#i-trash"/></svg> Remove camera</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Window / Modal <span class="badge">tf-window</span> <span class="status-exists">EXISTS</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Window with header, body, footer</div>
+    <div class="component-demo">
+      <div class="tf-window-demo">
+        <div class="tf-window-header">
+          <span class="title">Add Camera</span>
+          <div class="controls"><span class="min"></span><span class="max"></span><span class="close"></span></div>
+        </div>
+        <div class="tf-window-body">Configure the camera stream source and assign detectors to analyze the feed.</div>
+        <div class="tf-window-footer">
+          <button class="tf-btn tf-btn-ghost">Cancel</button>
+          <button class="tf-btn tf-btn-primary">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Stat Card (KPI) <span class="badge">tf-stat-card</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">From mockup m01 — KPI tiles at top of dashboard</div>
+
+  <div class="component-row">
+    <div class="component-label">KPI grid (4 columns)</div>
+    <div class="component-demo col">
+      <div class="grid-4">
+        <div class="tf-stat-card">
+          <div class="tf-stat-card-label"><svg class="icon"><use href="#i-camera"/></svg> Aktywne kamery</div>
+          <div class="tf-stat-card-value">22 <span class="suffix">/ 24</span></div>
+          <div class="tf-stat-card-delta warn"><svg class="icon" style="width:12px;height:12px"><use href="#i-alert"/></svg> 2 offline (C-12, C-19)</div>
+        </div>
+        <div class="tf-stat-card">
+          <div class="tf-stat-card-label"><svg class="icon"><use href="#i-brain"/></svg> Aktywne detektory</div>
+          <div class="tf-stat-card-value">8</div>
+          <div class="tf-stat-card-delta">D1 · D2 · D3 · D5 · D6</div>
+        </div>
+        <div class="tf-stat-card">
+          <div class="tf-stat-card-label"><svg class="icon"><use href="#i-alert"/></svg> Alarmy 24h</div>
+          <div class="tf-stat-card-value">147</div>
+          <div class="tf-stat-card-delta up">▲ 23% vs. wczoraj · 3 critical</div>
+        </div>
+        <div class="tf-stat-card">
+          <div class="tf-stat-card-label"><svg class="icon"><use href="#i-cpu"/></svg> GPU / latencja p95</div>
+          <div class="tf-stat-card-value">68% <span class="suffix">· 1.2s</span></div>
+          <div class="tf-stat-card-delta up">w budżecie SLO</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">With accent borders</div>
+    <div class="component-demo">
+      <div class="tf-stat-card accent-success" style="width:200px">
+        <div class="tf-stat-card-label">Uptime</div>
+        <div class="tf-stat-card-value">99.7%</div>
+      </div>
+      <div class="tf-stat-card accent-danger" style="width:200px">
+        <div class="tf-stat-card-label">Errors</div>
+        <div class="tf-stat-card-value">12</div>
+      </div>
+      <div class="tf-stat-card accent-warning" style="width:200px">
+        <div class="tf-stat-card-label">Queue depth</div>
+        <div class="tf-stat-card-value">347</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Section Card <span class="badge">tf-section-card</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Grouped content container from mockup — alarm feed, runtime status, heatmap</div>
+
+  <div class="component-row">
+    <div class="component-label">With header + action link</div>
+    <div class="component-demo col">
+      <div class="tf-section-card">
+        <div class="tf-section-card-head">
+          <div class="title"><svg class="icon"><use href="#i-alert"/></svg> Ostatnie alarmy</div>
+          <a href="#" style="font-size:12px; color: var(--accent-2)">Wszystkie 147 ›</a>
+        </div>
+        <div style="font-size:13px; color: var(--text-2)">Content goes here — alarm list, charts, tables...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Status Pill <span class="badge">tf-status-pill</span> <span class="status-new">NEW</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Runtime status indicators</div>
+    <div class="component-demo">
+      <span class="tf-status-pill ok">Runtime OK</span>
+      <span class="tf-status-pill err">Runtime Error</span>
+      <span class="tf-status-pill warn">Degraded</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Alarm Card <span class="badge">tf-alarm-card</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">From mockup m01 — alarm feed items with severity border</div>
+
+  <div class="component-row">
+    <div class="component-label">Severity variants</div>
+    <div class="component-demo col" style="max-width:520px">
+      <div class="tf-alarm-card critical">
+        <div class="tf-alarm-thumb"><svg><use href="#i-video"/></svg></div>
+        <div class="tf-alarm-body">
+          <div class="tf-alarm-title">D2 · podejrzenie agresji</div>
+          <div class="tf-alarm-meta">
+            <span><svg><use href="#i-camera"/></svg> C-04 wjazd</span>
+            <span><svg><use href="#i-clock"/></svg> 12:43:21</span>
+            <span class="tf-chip err"><span class="tf-chip-dot"></span>krytyczne</span>
+            <span class="tf-chip" style="background:var(--bg-3);color:var(--text-2)">conf 0.87</span>
+          </div>
+        </div>
+        <button class="tf-btn tf-btn-primary tf-btn-sm">Otwórz</button>
+      </div>
+      <div class="tf-alarm-card warning">
+        <div class="tf-alarm-thumb"><svg><use href="#i-truck"/></svg></div>
+        <div class="tf-alarm-body">
+          <div class="tf-alarm-title">D1 · nieczytelna tablica ADR</div>
+          <div class="tf-alarm-meta">
+            <span><svg><use href="#i-camera"/></svg> C-01 brama</span>
+            <span><svg><use href="#i-clock"/></svg> 12:38:04</span>
+            <span class="tf-chip warn">ostrzeżenie</span>
+          </div>
+        </div>
+        <button class="tf-btn tf-btn-sm">Otwórz</button>
+      </div>
+      <div class="tf-alarm-card info">
+        <div class="tf-alarm-thumb"><svg><use href="#i-camera"/></svg></div>
+        <div class="tf-alarm-body">
+          <div class="tf-alarm-title">D6 · pojazd w strefie zakazu</div>
+          <div class="tf-alarm-meta">
+            <span><svg><use href="#i-camera"/></svg> C-15 magazyn</span>
+            <span><svg><use href="#i-clock"/></svg> 12:22:09</span>
+            <span class="tf-chip info">info</span>
+          </div>
+        </div>
+        <button class="tf-btn tf-btn-sm">Otwórz</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Key-Value Table <span class="badge">tf-key-value</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">From mockup m01 — runtime health status display</div>
+
+  <div class="component-row">
+    <div class="component-label">Runtime health metrics</div>
+    <div class="component-demo col" style="max-width:520px">
+      <div class="tf-section-card">
+        <div class="tf-section-card-head">
+          <div class="title"><svg class="icon"><use href="#i-activity"/></svg> Stan natywnego runtime</div>
+          <span class="tf-status-pill ok">Runtime OK</span>
+        </div>
+        <table class="tf-kv-table">
+          <tr><td>Frame bus throughput</td><td>312 fps łącznie</td></tr>
+          <tr><td>Queue depth (max)</td><td>12 (kam. C-04, tier 0)</td></tr>
+          <tr><td>Drop rate 1h</td><td><span class="tf-chip ok">0.4%</span></td></tr>
+          <tr><td>VRAM użycie</td><td>8.2 / 12 GB <span class="tf-chip warn">tight</span></td></tr>
+          <tr><td>Modele załadowane</td><td>6 (YOLO11m, PP-OCRv5, BoT-SORT...)</td></tr>
+          <tr><td>Clock-sync dryf max</td><td>12 ms (PTP OK)</td></tr>
+          <tr><td>Audit log → WORM</td><td><span class="tf-chip ok"><svg class="icon" style="width:11px;height:11px"><use href="#i-shield"/></svg> synced (5 min temu)</span></td></tr>
+          <tr><td>Eval harness (daily)</td><td><span class="tf-chip ok">P/R w celu</span> · ostatnio 03:00</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Heatmap <span class="badge">tf-heatmap</span> <span class="status-exists">EXISTS</span> <span class="status-redesign">REDESIGN</span></div>
+  <div class="component-note">tf-heatmap web component exists but needs CSS alignment with dashboard theme</div>
+
+  <div class="component-row">
+    <div class="component-label">Activity heatmap (24h × camera)</div>
+    <div class="component-demo col">
+      <div class="tf-section-card">
+        <div class="tf-section-card-head">
+          <div class="title"><svg class="icon"><use href="#i-activity"/></svg> Mapa cieplna aktywności · ostatnie 24h × kamera</div>
+          <div class="tf-heatmap-legend">
+            <span>niska</span>
+            <span class="tf-heatmap-legend-swatch" style="background:rgba(99,102,241,0.2)"></span>
+            <span class="tf-heatmap-legend-swatch" style="background:rgba(99,102,241,0.45)"></span>
+            <span class="tf-heatmap-legend-swatch" style="background:rgba(167,139,250,0.7)"></span>
+            <span class="tf-heatmap-legend-swatch" style="background:rgba(239,68,68,0.85)"></span>
+            <span>wysoka</span>
+          </div>
+        </div>
+        <div class="tf-heatmap-wrap">
+          <div class="tf-heatmap-header">
+            <span></span>
+            <span>0</span><span></span><span>2</span><span></span><span>4</span><span></span><span>6</span><span></span><span>8</span><span></span><span>10</span><span></span><span>12</span><span></span><span>14</span><span></span><span>16</span><span></span><span>18</span><span></span><span>20</span><span></span><span>22</span><span></span>
+          </div>
+          <div class="tf-heatmap-grid" id="hm"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Detail Header <span class="badge">tf-detail-header</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Addon header panel from mockup — icon, name, badges, actions</div>
+
+  <div class="component-row">
+    <div class="component-label">Full addon header</div>
+    <div class="component-demo col">
+      <div class="tf-detail-header">
+        <div class="tf-detail-header-icon"><svg><use href="#i-video"/></svg></div>
+        <div class="tf-detail-header-meta">
+          <div class="tf-detail-header-name">
+            TentaVision
+            <span class="tf-chip ok"><span class="tf-chip-dot"></span>Runtime online</span>
+          </div>
+          <div class="tf-detail-header-sub">Analiza obrazu z kamer · deployment <span class="text-mono">depo-warszawa-pn</span> · v0.4.2</div>
+          <div class="tf-detail-header-badges">
+            <span class="tf-chip accent"><svg class="icon"><use href="#i-camera"/></svg>22 / 24 kamer</span>
+            <span class="tf-chip" style="background:var(--bg-3);color:var(--text-2)"><svg class="icon"><use href="#i-brain"/></svg>8 detektorów aktywnych</span>
+            <span class="tf-chip warn"><svg class="icon"><use href="#i-alert"/></svg>3 critical (24h)</span>
+            <span class="tf-chip" style="background:var(--bg-3);color:var(--text-2)"><svg class="icon"><use href="#i-cpu"/></svg>GPU RTX 4070 · 68%</span>
+          </div>
+        </div>
+        <div class="tf-detail-header-actions">
+          <button class="tf-btn tf-btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież</button>
+          <button class="tf-btn tf-btn-secondary"><svg class="icon"><use href="#i-download"/></svg>Eksport raportu</button>
+          <button class="tf-btn tf-btn-primary"><svg class="icon"><use href="#i-eye"/></svg>Live view</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Breadcrumb <span class="badge">tf-breadcrumb</span> <span class="status-new">NEW</span></div>
+
+  <div class="component-row">
+    <div class="component-label">Navigation breadcrumb</div>
+    <div class="component-demo">
+      <div class="tf-breadcrumb">
+        <span class="tf-breadcrumb-item">Addons</span>
+        <span class="tf-breadcrumb-sep">›</span>
+        <span class="tf-breadcrumb-item">TentaVision</span>
+        <span class="tf-breadcrumb-sep">›</span>
+        <span class="tf-breadcrumb-item current">Dashboard</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Alerts / Feedback <span class="status-new">NEW</span></div>
+
+  <div class="component-row">
+    <div class="component-label">tf-alert — inline notifications</div>
+    <div class="component-demo col" style="max-width:500px">
+      <div class="tf-alert info">
+        <svg><use href="#i-info"/></svg>
+        <div class="tf-alert-body">
+          <div class="tf-alert-title">Sync in progress</div>
+          <div class="tf-alert-msg">Ledger is synchronizing with 3 peers. This may take a few minutes.</div>
+        </div>
+      </div>
+      <div class="tf-alert success">
+        <svg><use href="#i-check"/></svg>
+        <div class="tf-alert-body">
+          <div class="tf-alert-title">Camera added</div>
+          <div class="tf-alert-msg">C-22 wjazd-2 is now streaming at 30 fps.</div>
+        </div>
+      </div>
+      <div class="tf-alert warning">
+        <svg><use href="#i-alert"/></svg>
+        <div class="tf-alert-body">
+          <div class="tf-alert-title">VRAM usage high</div>
+          <div class="tf-alert-msg">8.2 / 12 GB — consider unloading unused models.</div>
+        </div>
+      </div>
+      <div class="tf-alert danger">
+        <svg><use href="#i-x"/></svg>
+        <div class="tf-alert-body">
+          <div class="tf-alert-title">Connection lost</div>
+          <div class="tf-alert-msg">Camera C-12 is offline since 11:42.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-toast — temporary notifications</div>
+    <div class="component-demo">
+      <div class="tf-toast-demo success">
+        <svg><use href="#i-check"/></svg>
+        <div><div style="font-weight:700;font-size:13px">Saved</div><div style="font-size:11px;color:var(--text-2)">Camera config updated</div></div>
+      </div>
+      <div class="tf-toast-demo danger">
+        <svg><use href="#i-x"/></svg>
+        <div><div style="font-weight:700;font-size:13px">Error</div><div style="font-size:11px;color:var(--text-2)">Failed to connect</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Progress &amp; Loading <span class="status-new">NEW</span></div>
+
+  <div class="component-row">
+    <div class="component-label">tf-progress-bar</div>
+    <div class="component-demo col" style="max-width:400px;gap:16px">
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-2);margin-bottom:4px"><span>GPU Usage</span><span>68%</span></div>
+        <div class="tf-progress-bar"><div class="tf-progress-bar-fill accent" style="width:68%"></div></div>
+      </div>
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-2);margin-bottom:4px"><span>Disk</span><span>92%</span></div>
+        <div class="tf-progress-bar"><div class="tf-progress-bar-fill danger" style="width:92%"></div></div>
+      </div>
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-2);margin-bottom:4px"><span>Sync</span><span>45%</span></div>
+        <div class="tf-progress-bar lg"><div class="tf-progress-bar-fill success" style="width:45%"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-spinner</div>
+    <div class="component-demo">
+      <div class="tf-spinner sm"></div>
+      <div class="tf-spinner"></div>
+      <div class="tf-spinner lg"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Badges &amp; Avatars <span class="status-new">NEW</span></div>
+
+  <div class="component-row">
+    <div class="component-label">tf-badge</div>
+    <div class="component-demo">
+      <span class="tf-badge accent">7</span>
+      <span class="tf-badge danger">3</span>
+      <span class="tf-badge success">OK</span>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-avatar</div>
+    <div class="component-demo">
+      <span class="tf-avatar sm accent">PJ</span>
+      <span class="tf-avatar md accent">PJ</span>
+      <span class="tf-avatar lg accent">PJ</span>
+      <span class="tf-avatar md success">MK</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Empty State <span class="badge">tf-empty-state</span> <span class="status-new">NEW</span></div>
+
+  <div class="component-row">
+    <div class="component-label">No data placeholder</div>
+    <div class="component-demo col">
+      <div class="tf-section-card">
+        <div class="tf-empty-state">
+          <svg><use href="#i-inbox"/></svg>
+          <div class="tf-empty-state-title">No alarms yet</div>
+          <div class="tf-empty-state-msg">Alarms will appear here once detectors are running and cameras are streaming.</div>
+          <button class="tf-btn tf-btn-primary tf-btn-sm mt-sm"><svg class="icon"><use href="#i-plus"/></svg>Add camera</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Tooltip &amp; Divider <span class="status-new">NEW</span></div>
+
+  <div class="component-row">
+    <div class="component-label">tf-tooltip (static)</div>
+    <div class="component-demo">
+      <div class="tf-tooltip-demo">Camera C-04 · 30 fps · 2 detectors</div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">tf-divider</div>
+    <div class="component-demo col" style="max-width:400px">
+      <div style="color:var(--text-2);font-size:12px">Section A content</div>
+      <div class="tf-divider"></div>
+      <div style="color:var(--text-2);font-size:12px">Section B content</div>
+      <div class="tf-divider subtle"></div>
+      <div style="color:var(--text-2);font-size:12px">Section C content</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">List (Virtualized) <span class="badge">tf-list</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Scrollable list with selectable rows, icons, actions — virtualizable for 1000+ items. Used in contacts, inbox, pipeline.</div>
+
+  <div class="component-row">
+    <div class="component-label">Standard list with actions</div>
+    <div class="component-demo col" style="max-width:520px">
+      <div class="tf-list">
+        <div class="tf-list-item">
+          <span class="tf-avatar sm accent">AK</span>
+          <div class="tf-list-item-body">
+            <div class="tf-list-item-title">Anna Kowalska</div>
+            <div class="tf-list-item-sub">Handlowiec · sekcja Wschód</div>
+          </div>
+          <span class="tf-chip ok"><span class="tf-chip-dot"></span>Active</span>
+        </div>
+        <div class="tf-list-item">
+          <span class="tf-avatar sm accent">MK</span>
+          <div class="tf-list-item-body">
+            <div class="tf-list-item-title">Marek Kowalczyk</div>
+            <div class="tf-list-item-sub">Director · sekcja Zachód</div>
+          </div>
+          <span class="tf-chip warn">Away</span>
+        </div>
+        <div class="tf-list-item">
+          <span class="tf-avatar sm accent">PJ</span>
+          <div class="tf-list-item-body">
+            <div class="tf-list-item-title">Piotr Jarocki</div>
+            <div class="tf-list-item-sub">Admin · deployment ops</div>
+          </div>
+          <span class="tf-chip ok"><span class="tf-chip-dot"></span>Active</span>
+        </div>
+        <div class="tf-list-item selected">
+          <span class="tf-avatar sm accent">JW</span>
+          <div class="tf-list-item-body">
+            <div class="tf-list-item-title">Jakub Wojtczak</div>
+            <div class="tf-list-item-sub">CIO · Santander Polska</div>
+          </div>
+          <span class="tf-chip accent">VIP</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">Compact / inbox variant</div>
+    <div class="component-demo col" style="max-width:520px">
+      <div class="tf-list compact">
+        <div class="tf-list-item severity-danger">
+          <svg class="icon" style="color:var(--danger)"><use href="#i-alert"/></svg>
+          <div class="tf-list-item-body">
+            <div class="tf-list-item-title">Deal commit bez aktywności 9 dni</div>
+            <div class="tf-list-item-sub">VW Poznań · 380k · Magda Wiśniewska</div>
+          </div>
+          <span style="font-size:11px;color:var(--text-3)">2h temu</span>
+        </div>
+        <div class="tf-list-item severity-warning">
+          <svg class="icon" style="color:var(--warning)"><use href="#i-clock"/></svg>
+          <div class="tf-list-item-body">
+            <div class="tf-list-item-title">Spotkanie za 30 min — brak briefingu</div>
+            <div class="tf-list-item-sub">Santander · prezentacja oferty · 520k</div>
+          </div>
+          <span style="font-size:11px;color:var(--text-3)">10:00</span>
+        </div>
+        <div class="tf-list-item severity-success">
+          <svg class="icon" style="color:var(--success)"><use href="#i-check"/></svg>
+          <div class="tf-list-item-body">
+            <div class="tf-list-item-title">Klient odpowiedział na ofertę</div>
+            <div class="tf-list-item-sub">Castorama · P. Lewandowski</div>
+          </div>
+          <span style="font-size:11px;color:var(--text-3)">wczoraj</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Calendar <span class="badge">tf-calendar</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Week grid with time slots and color-coded events. From CRM mockup L1 — reusable for any scheduling context.</div>
+
+  <div class="component-row">
+    <div class="component-label">Week view with events</div>
+    <div class="component-demo col">
+      <div class="tf-cal-header">
+        <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" style="transform:scaleX(-1)"><svg class="icon"><use href="#i-chevron"/></svg></button>
+        <span style="font-size:14px;font-weight:700">Tydzień 18–22 maja 2026</span>
+        <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg class="icon"><use href="#i-chevron"/></svg></button>
+        <button class="tf-btn tf-btn-sm" style="margin-left:12px">Dziś</button>
+      </div>
+      <div class="tf-cal-grid">
+        <div class="tf-cal-h"></div>
+        <div class="tf-cal-h">Pon<div class="tf-cal-day">18</div></div>
+        <div class="tf-cal-h today">Wt<div class="tf-cal-day">19</div></div>
+        <div class="tf-cal-h">Śr<div class="tf-cal-day">20</div></div>
+        <div class="tf-cal-h">Czw<div class="tf-cal-day">21</div></div>
+        <div class="tf-cal-h">Pt<div class="tf-cal-day">22</div></div>
+
+        <div class="tf-cal-time">09:00</div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"><div class="tf-cal-event ev-amber"><div class="tf-cal-et">Stand-up zespół</div><div class="tf-cal-es">9:00–9:15</div></div></div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"></div>
+
+        <div class="tf-cal-time">10:00</div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"><div class="tf-cal-event ev-purple"><div class="tf-cal-et">Santander · oferta</div><div class="tf-cal-es">10:00–11:00 · 4 os</div></div></div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"><div class="tf-cal-event ev-blue"><div class="tf-cal-et">Demo VW Poznań</div><div class="tf-cal-es">10:00–11:30</div></div></div>
+        <div class="tf-cal-cell"></div>
+
+        <div class="tf-cal-time">11:00</div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"><div class="tf-cal-event ev-blue"><div class="tf-cal-et">1:1 z Markiem</div><div class="tf-cal-es">11:00–11:30</div></div></div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"><div class="tf-cal-event ev-green"><div class="tf-cal-et">Tauron · review</div><div class="tf-cal-es">11:00–12:00</div></div></div>
+
+        <div class="tf-cal-time">14:00</div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"><div class="tf-cal-event ev-purple"><div class="tf-cal-et">VW · obiekcje cenowe</div><div class="tf-cal-es">14:00–15:00</div></div></div>
+        <div class="tf-cal-cell"><div class="tf-cal-event ev-purple"><div class="tf-cal-et">Castorama · prezes</div><div class="tf-cal-es">14:00–15:00</div></div></div>
+        <div class="tf-cal-cell"></div>
+        <div class="tf-cal-cell"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Timeline <span class="badge">tf-timeline</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Vertical activity stream with typed events, timestamps, and addon attribution. From CRM A1 + C3.</div>
+
+  <div class="component-row">
+    <div class="component-label">Activity timeline</div>
+    <div class="component-demo col" style="max-width:520px">
+      <div class="tf-timeline">
+        <div class="tf-timeline-item">
+          <div class="tf-timeline-dot" style="background:var(--info)"></div>
+          <div class="tf-timeline-content">
+            <div class="tf-timeline-head">
+              <span class="fw-700">Email wysłany</span>
+              <span class="tf-chip accent" style="font-size:9px">crm</span>
+              <span class="text-subtle text-sm" style="margin-left:auto">14:32</span>
+            </div>
+            <div class="text-sm text-muted">Oferta handlowa do Santander — "Propozycja wdrożenia Q3 2026"</div>
+          </div>
+        </div>
+        <div class="tf-timeline-item">
+          <div class="tf-timeline-dot" style="background:var(--success)"></div>
+          <div class="tf-timeline-content">
+            <div class="tf-timeline-head">
+              <span class="fw-700">Spotkanie zakończone</span>
+              <span class="tf-chip accent" style="font-size:9px">calendar</span>
+              <span class="text-subtle text-sm" style="margin-left:auto">11:30</span>
+            </div>
+            <div class="text-sm text-muted">Demo z VW Poznań — 45 min, 3 uczestników</div>
+          </div>
+        </div>
+        <div class="tf-timeline-item">
+          <div class="tf-timeline-dot" style="background:var(--accent-2)"></div>
+          <div class="tf-timeline-content">
+            <div class="tf-timeline-head">
+              <span class="fw-700">AI insight</span>
+              <span class="tf-chip warn" style="font-size:9px">ai</span>
+              <span class="text-subtle text-sm" style="margin-left:auto">09:15</span>
+            </div>
+            <div class="text-sm text-muted">Deal VW Poznań — commit bez aktywności 9 dni, ryzyko churn</div>
+          </div>
+        </div>
+        <div class="tf-timeline-item">
+          <div class="tf-timeline-dot" style="background:var(--text-3)"></div>
+          <div class="tf-timeline-content">
+            <div class="tf-timeline-head">
+              <span class="fw-700">Notatka dodana</span>
+              <span class="tf-chip accent" style="font-size:9px">notes</span>
+              <span class="text-subtle text-sm" style="margin-left:auto">wczoraj 16:40</span>
+            </div>
+            <div class="text-sm text-muted">Wewnętrzna notatka nt. budżetu klienta</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Filter Chips <span class="badge">tf-filter-chips</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Inline filter bar with active/inactive chips and optional counts. From CRM C1, K1, C2.</div>
+
+  <div class="component-row">
+    <div class="component-label">Active + inactive filters</div>
+    <div class="component-demo">
+      <button class="tf-filter-chip active"><svg class="icon"><use href="#i-alert"/></svg> Wymaga decyzji <span class="tf-filter-count">7</span></button>
+      <button class="tf-filter-chip">Typ: dowolny</button>
+      <button class="tf-filter-chip">Status: dowolny</button>
+      <button class="tf-filter-chip active">VIP</button>
+      <button class="tf-filter-chip">Przypisany: ja</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Command Palette <span class="badge">tf-command-palette</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Global ⌘K search with grouped results, keyboard nav, prefix filters. From CRM C13.</div>
+
+  <div class="component-row">
+    <div class="component-label">Search overlay (static)</div>
+    <div class="component-demo col">
+      <div class="tf-cmd-palette">
+        <div class="tf-cmd-search">
+          <svg class="icon" style="color:var(--text-3)"><use href="#i-search"/></svg>
+          <input type="text" placeholder="Szukaj dealów, kontaktów, akcji..." value="sant">
+          <kbd class="tf-kbd">ESC</kbd>
+        </div>
+        <div class="tf-cmd-results">
+          <div class="tf-cmd-group">Deale</div>
+          <div class="tf-cmd-item active">
+            <svg class="icon"><use href="#i-activity"/></svg>
+            <div>
+              <div class="fw-700">Santander — wdrożenie Q3</div>
+              <div class="text-sm text-muted">520k · Oferta · Anna Kowalska</div>
+            </div>
+            <kbd class="tf-kbd">↵</kbd>
+          </div>
+          <div class="tf-cmd-item">
+            <svg class="icon"><use href="#i-activity"/></svg>
+            <div>
+              <div class="fw-700">Santander — utrzymanie</div>
+              <div class="text-sm text-muted">120k · Realizacja · Marek K.</div>
+            </div>
+          </div>
+          <div class="tf-cmd-group">Kontakty</div>
+          <div class="tf-cmd-item">
+            <span class="tf-avatar sm accent" style="width:20px;height:20px;font-size:8px">JW</span>
+            <div>
+              <div class="fw-700">Jakub Wojtczak</div>
+              <div class="text-sm text-muted">CIO · Santander Polska</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Contrib Tag <span class="badge">tf-contrib-tag</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Cross-addon attribution marker showing which addon contributed data. Appears in timelines, lists, detail panels.</div>
+
+  <div class="component-row">
+    <div class="component-label">Addon attribution tags</div>
+    <div class="component-demo">
+      <span class="tf-contrib-tag crm">crm</span>
+      <span class="tf-contrib-tag calendar">calendar</span>
+      <span class="tf-contrib-tag contacts">contacts</span>
+      <span class="tf-contrib-tag billing">billing</span>
+      <span class="tf-contrib-tag activity">activity</span>
+      <span class="tf-contrib-tag ai">ai</span>
+      <span class="tf-contrib-tag documents">docs</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Stage Indicator <span class="badge">tf-stage</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Deal/pipeline stage badges with color-coded progression. From CRM C2, C3, C8.</div>
+
+  <div class="component-row">
+    <div class="component-label">Pipeline stages</div>
+    <div class="component-demo">
+      <span class="tf-stage lead">Lead</span>
+      <span class="tf-stage qualify">Kwalifikacja</span>
+      <span class="tf-stage offer">Oferta</span>
+      <span class="tf-stage commit">Commit</span>
+      <span class="tf-stage execute">Realizacja</span>
+      <span class="tf-stage won">Won</span>
+      <span class="tf-stage lost">Lost</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Date Picker <span class="badge">tf-datepicker</span> <span class="status-new">NEW</span></div>
+  <div class="component-note">Calendar date selector — single date, range, month/year navigation.</div>
+
+  <div class="component-row">
+    <div class="component-label">Month grid (static preview)</div>
+    <div class="component-demo">
+      <div class="tf-datepicker-demo">
+        <div class="tf-dp-header">
+          <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" style="transform:scaleX(-1)"><svg class="icon"><use href="#i-chevron"/></svg></button>
+          <span class="fw-700">Maj 2026</span>
+          <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm"><svg class="icon"><use href="#i-chevron"/></svg></button>
+        </div>
+        <div class="tf-dp-grid">
+          <span class="tf-dp-wday">Pn</span><span class="tf-dp-wday">Wt</span><span class="tf-dp-wday">Śr</span><span class="tf-dp-wday">Cz</span><span class="tf-dp-wday">Pt</span><span class="tf-dp-wday">So</span><span class="tf-dp-wday">Nd</span>
+          <span class="tf-dp-day other">27</span><span class="tf-dp-day other">28</span><span class="tf-dp-day other">29</span><span class="tf-dp-day other">30</span><span class="tf-dp-day">1</span><span class="tf-dp-day">2</span><span class="tf-dp-day">3</span>
+          <span class="tf-dp-day">4</span><span class="tf-dp-day">5</span><span class="tf-dp-day">6</span><span class="tf-dp-day">7</span><span class="tf-dp-day">8</span><span class="tf-dp-day">9</span><span class="tf-dp-day">10</span>
+          <span class="tf-dp-day">11</span><span class="tf-dp-day">12</span><span class="tf-dp-day">13</span><span class="tf-dp-day">14</span><span class="tf-dp-day">15</span><span class="tf-dp-day">16</span><span class="tf-dp-day">17</span>
+          <span class="tf-dp-day range-start">18</span><span class="tf-dp-day range">19</span><span class="tf-dp-day range">20</span><span class="tf-dp-day range">21</span><span class="tf-dp-day range-end">22</span><span class="tf-dp-day">23</span><span class="tf-dp-day">24</span>
+          <span class="tf-dp-day today">25</span><span class="tf-dp-day">26</span><span class="tf-dp-day">27</span><span class="tf-dp-day">28</span><span class="tf-dp-day">29</span><span class="tf-dp-day">30</span><span class="tf-dp-day">31</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<!-- ============================================================== -->
+<div style="margin:48px 0 32px;padding:24px 0;border-top:2px solid var(--border);border-bottom:2px solid var(--border)">
+  <h2 style="font-size:22px;font-weight:800;background:linear-gradient(90deg,#fff,#60a5fa,#a78bfa);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;">Chat & AI Components</h2>
+  <p class="text-muted" style="font-size:13px;margin-top:4px">Chat already exists as a full module (chat.js + chat-audio.js + faceBackground.js). These are the real classes from style.css + chat-audio.css. Goal: extract to reusable tf-* web components so any addon can embed chat panel or face.</p>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Chat Message Bubbles <span class="badge">.msg-row .bubble</span> <span class="status-exists">EXISTS</span></div>
+  <div class="component-note">Real classes: <code>.msg-row</code> (grid 36px avatar + 1fr), <code>.bubble</code> (14px/1.6 line-height, 14px radius), <code>.bubble-meta</code>, <code>.msg-actions</code>. User: gradient indigo bg + right-align. Assistant: card bg + left-align. Virtualized via VirtualList.</div>
+
+  <div class="component-row">
+    <div class="component-label">User bubble (gradient, right-aligned, max 680px)</div>
+    <div class="component-demo col" style="max-width:700px">
+      <div class="msg-row user">
+        <div class="bubble-wrap" style="justify-self:end;max-width:min(680px,100%)">
+          <div class="bubble-meta" style="justify-content:flex-end"><span>14:32</span><span class="who">Ty</span></div>
+          <div class="bubble" style="background:linear-gradient(135deg,rgba(99,102,241,0.25),rgba(167,139,250,0.18));border-color:rgba(99,102,241,0.35);border-bottom-right-radius:4px;padding:12px 16px;border-radius:14px;border:1px solid rgba(99,102,241,0.35);font-size:14px;line-height:1.6;color:var(--text)">Pokaż mi pipeline dealów powyżej 500k z ostatnich 30 dni.</div>
+        </div>
+        <div class="avatar user" style="width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#06b6d4,#3b82f6);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700">PJ</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">Assistant bubble (card bg, full width, streaming caret)</div>
+    <div class="component-demo col" style="max-width:700px">
+      <div class="msg-row" style="display:grid;grid-template-columns:36px 1fr;gap:12px;align-items:flex-start">
+        <div class="avatar" style="width:36px;height:36px;border-radius:50%;background:var(--bg-3);border:1px solid var(--border);color:var(--accent-2);display:flex;align-items:center;justify-content:center">
+          <svg style="width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.5"><use href="#i-brain"/></svg>
+        </div>
+        <div class="bubble-wrap" style="display:flex;flex-direction:column;gap:6px">
+          <div class="bubble-meta"><span class="who" style="font-weight:600;color:var(--text-2)">Asystent</span><span style="color:var(--text-3)">·</span><span style="color:var(--text-3)">14:32</span></div>
+          <div class="bubble" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;border-bottom-left-radius:4px;padding:12px 16px;font-size:14px;line-height:1.6;color:var(--text)">
+            Znalazłem <strong>4 deale</strong> powyżej 500k:<br><br>
+            1. Santander — wdrożenie Q3 · 520k · Oferta<br>
+            2. VW Poznań — integracja · 680k · Commit<br>
+            3. Tauron — rozbudowa · 510k · Realizacja
+            <span class="streaming-caret" style="display:inline-block;width:8px;height:1em;vertical-align:-2px;background:var(--accent-2);margin-left:3px;animation:chatCaretBlink 1s steps(1) infinite"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">Thinking block (<code>&lt;details class="thinking"&gt;</code>)</div>
+    <div class="component-demo col" style="max-width:700px">
+      <details class="thinking" open style="border:1px dashed rgba(167,139,250,0.35);border-radius:10px;background:rgba(167,139,250,0.04);overflow:hidden">
+        <summary class="thinking-head" style="display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;list-style:none">
+          <svg style="width:16px;height:16px;color:var(--accent-2);stroke:currentColor;fill:none;stroke-width:1.75"><use href="#i-brain"/></svg>
+          <span style="font-size:12px;font-weight:600;color:var(--accent-2);letter-spacing:0.04em;text-transform:uppercase">Thinking</span>
+          <span style="font-size:11px;color:var(--text-3)">3.2s</span>
+        </summary>
+        <div class="thinking-body" style="padding:10px 12px 12px 38px;font-size:12.5px;line-height:1.6;color:var(--text-2);font-style:italic;border-top:1px dashed rgba(167,139,250,0.18)">Sprawdzam pipeline... filtruję po kwocie > 500k i dacie utworzenia w zakresie 30 dni. Znalazłem 4 pasujące rekordy.</div>
+      </details>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Chat Composer <span class="badge">.composer</span> <span class="status-exists">EXISTS</span></div>
+  <div class="component-note">Real classes: <code>.composer-wrap</code> (border-top, bg-2, padding), <code>.composer</code> (max-width 800px, grid 3-col, bg-input, radius 16px, focus glow). Uses real tf-button (attach, send) + tf-textarea autogrow. Mode toggle: segmented pill "Tekst | Audio" in header.</div>
+
+  <div class="component-row">
+    <div class="component-label">Composer (real layout from chat.js)</div>
+    <div class="component-demo col" style="max-width:700px">
+      <div style="border-top:1px solid var(--border);background:var(--bg-2);padding:14px 24px 18px">
+        <div style="max-width:700px;margin:0 auto;background:var(--bg-input);border:1px solid var(--border);border-radius:16px;padding:6px 6px 6px 8px;display:grid;grid-template-columns:auto 1fr auto;align-items:end;gap:8px">
+          <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" style="border-radius:50%"><svg class="icon"><use href="#i-plus"/></svg></button>
+          <textarea style="background:transparent;border:0;outline:none;color:var(--text);font-size:14px;font-family:inherit;resize:none;min-height:24px;padding:6px 0" rows="1" placeholder="Napisz wiadomość..."></textarea>
+          <button class="tf-btn tf-btn-primary tf-btn-icon tf-btn-sm" style="border-radius:50%"><svg class="icon" style="transform:rotate(-90deg)"><use href="#i-chevron"/></svg></button>
+        </div>
+        <div style="max-width:700px;margin:4px auto 0;display:flex;justify-content:space-between;font-size:10px;color:var(--text-3);padding:0 8px">
+          <span>Enter wysyła · Shift+Enter nowa linia</span>
+          <span>0 / 4096</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Audio Stage <span class="badge">.audio-stage</span> <span class="status-exists">EXISTS</span></div>
+  <div class="component-note">Real classes: <code>.audio-stage</code> (flex column, radial gradient bg), <code>.face-canvas</code> (360×360px circle, glow per state), <code>.amp-dot</code> (8 orbital pulsing dots), <code>.subtitle</code> (partial transcript/TTS), <code>.wave .bar</code> (20 animated bars), <code>.audio-controls</code> (dock). States via <code>[data-state="listen|think|speak|idle"]</code>. Colors: green=listen, amber=think, purple=speak.</div>
+
+  <div class="component-row">
+    <div class="component-label">Live wireframe face (486 vertices, real data from faceBackground.js)</div>
+    <div class="component-demo">
+      <div style="display:flex;gap:24px;align-items:center">
+        <div style="display:flex;flex-direction:column;align-items:center;gap:8px">
+          <canvas id="face-idle" width="200" height="200" style="width:100px;height:100px;border-radius:50%;background:radial-gradient(circle at 50% 45%,#0e1234,#050818);border:1px solid var(--border);box-shadow:inset 0 0 40px rgba(0,0,0,0.6),0 0 60px var(--accent-glow)"></canvas>
+          <span class="text-sm text-subtle">idle</span>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:8px">
+          <canvas id="face-listen" width="200" height="200" style="width:100px;height:100px;border-radius:50%;background:radial-gradient(circle at 50% 45%,#0e1234,#050818);border:1px solid rgba(34,197,94,0.45);box-shadow:inset 0 0 40px rgba(0,0,0,0.6),0 0 80px rgba(34,197,94,0.25)"></canvas>
+          <span class="text-sm" style="color:var(--success)">listen</span>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:8px">
+          <canvas id="face-think" width="200" height="200" style="width:100px;height:100px;border-radius:50%;background:radial-gradient(circle at 50% 45%,#0e1234,#050818);border:1px solid rgba(245,158,11,0.45);box-shadow:inset 0 0 40px rgba(0,0,0,0.6),0 0 80px rgba(245,158,11,0.25)"></canvas>
+          <span class="text-sm" style="color:var(--warning)">think</span>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:8px">
+          <canvas id="face-speak" width="200" height="200" style="width:100px;height:100px;border-radius:50%;background:radial-gradient(circle at 50% 45%,#0e1234,#050818);border:1px solid rgba(167,139,250,0.55);box-shadow:inset 0 0 40px rgba(0,0,0,0.6),0 0 100px rgba(167,139,250,0.3)"></canvas>
+          <span class="text-sm" style="color:var(--accent-2)">speak</span>
+        </div>
+      </div>
+    </div>
+    <div class="component-note">Real Canvas 2D wireframe — 486 vertices, 18 blendshapes, 131 contours + ~970 tessellation edges. Idle: breathing + blinks + micro-expressions. Speak: mouth driven by TTS RMS. Listen: raised eyebrows. Think: frown. Dual-canvas glow compositing (blur layer + sharp core).</div>
+  </div>
+
+  <div class="component-row">
+    <div class="component-label">Audio status pill + waveform (real CSS classes)</div>
+    <div class="component-demo">
+      <div style="display:flex;gap:16px;align-items:center">
+        <div style="padding:8px 16px;background:rgba(20,24,54,0.8);border:1px solid var(--border);border-radius:999px;display:flex;align-items:center;gap:10px;font-size:12px;font-weight:600">
+          <span style="width:8px;height:8px;border-radius:50%;background:var(--success);box-shadow:0 0 10px var(--success);animation:audioDotPulse 1.4s ease-in-out infinite"></span>
+          <span style="color:var(--text)">Listening</span>
+          <span style="padding:2px 8px;font-size:10px;color:var(--text-3);background:var(--bg-3);border-radius:999px;border:1px solid var(--border)">whisper-1</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================== -->
+<div class="section">
+  <div class="section-title">Chat Panel (Addon-Embeddable) <span class="status-new">NEW — to extract</span></div>
+  <div class="component-note">Docelowo: wyciągnąć z chat.js reużywalny <code>&lt;tf-chat-panel&gt;</code> (320px side panel) z kompaktowymi bubblami i composerem, żeby dowolny addon mógł osadzić chat w swoim UI. Klasy bubble/composer pozostają te same, zmniejszone padding i font-size.</div>
+
+  <div class="component-row">
+    <div class="component-label">Target: compact side panel reusing existing bubble/composer CSS</div>
+    <div class="component-demo col">
+      <div style="width:320px;height:400px;display:flex;flex-direction:column;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);overflow:hidden">
+        <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);background:var(--bg-card)">
+          <div style="width:24px;height:24px;border-radius:50%;background:var(--gradient-accent);display:flex;align-items:center;justify-content:center">
+            <svg style="width:14px;height:14px;stroke:white;fill:none;stroke-width:1.75"><use href="#i-brain"/></svg>
+          </div>
+          <span class="fw-700" style="font-size:13px">AI Assistant</span>
+          <span class="tf-chip ok" style="font-size:8px"><span class="tf-chip-dot"></span>Online</span>
+          <button class="tf-btn tf-btn-ghost tf-btn-icon tf-btn-sm" style="margin-left:auto"><svg class="icon"><use href="#i-x"/></svg></button>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px">
+          <div style="padding:8px 12px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;border-bottom-left-radius:3px;font-size:12px;line-height:1.5;color:var(--text)">Cześć! Jak mogę pomóc?</div>
+          <div style="padding:8px 12px;background:linear-gradient(135deg,rgba(99,102,241,0.25),rgba(167,139,250,0.18));border:1px solid rgba(99,102,241,0.35);border-radius:10px;border-bottom-right-radius:3px;font-size:12px;line-height:1.5;color:var(--text);align-self:flex-end;max-width:240px">Pokaż deale Santander</div>
+          <div style="padding:8px 12px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;border-bottom-left-radius:3px;font-size:12px;line-height:1.5;color:var(--text)">Znalazłem 2 aktywne deale Santander:<br>• wdrożenie Q3 — 520k<br>• utrzymanie — 120k</div>
+        </div>
+        <div style="border-top:1px solid var(--border);padding:8px;background:var(--bg-2)">
+          <div style="background:var(--bg-input);border:1px solid var(--border);border-radius:12px;padding:4px 4px 4px 10px;display:flex;align-items:center;gap:6px">
+            <input style="flex:1;background:transparent;border:0;outline:none;color:var(--text);font-size:12px;font-family:inherit" placeholder="Ask...">
+            <button class="tf-btn tf-btn-primary tf-btn-icon tf-btn-sm" style="border-radius:50%;width:28px;min-height:28px"><svg class="icon" style="transform:rotate(-90deg);width:12px;height:12px"><use href="#i-chevron"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+</div><!-- /catalog -->
+
+<script type="module">
+import { NUM_VERTICES, BASE_POSITIONS } from './face-data/face-data.js';
+import { FACEMESH_CONTOURS, FACEMESH_FILL } from './face-data/face-edges.js';
+
+const PITCH_BASE = -0.09;
+const SCALE_MUL = 0.29;
+
+function buildEdges() {
+  const edges = [];
+  for (const [a, b] of FACEMESH_FILL) {
+    if (a < NUM_VERTICES && b < NUM_VERTICES) edges.push([a, b, 0]);
+  }
+  for (const [a, b] of FACEMESH_CONTOURS) {
+    if (a < NUM_VERTICES && b < NUM_VERTICES) edges.push([a, b, 1]);
+  }
+  return edges;
+}
+const EDGES = buildEdges();
+
+function drawFace(canvasId, tintR, tintG, tintB, yaw = 0, pitch = PITCH_BASE) {
+  const c = document.getElementById(canvasId);
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const w = c.width, h = c.height;
+  const cx = w * 0.5;
+  const cy = h * 0.56;
+  const scale = Math.min(w, h) * SCALE_MUL;
+  const scalePersp = scale * 1.8;
+
+  const sinY = Math.sin(yaw), cosY = Math.cos(yaw);
+  const sinP = Math.sin(pitch), cosP = Math.cos(pitch);
+
+  const px = new Float64Array(NUM_VERTICES);
+  const py = new Float64Array(NUM_VERTICES);
+  const pz = new Float64Array(NUM_VERTICES);
+
+  for (let i = 0; i < NUM_VERTICES; i++) {
+    const j = i * 3;
+    const x = BASE_POSITIONS[j];
+    const y = BASE_POSITIONS[j + 1];
+    const z = BASE_POSITIONS[j + 2];
+    const x1 = x * cosY + z * sinY;
+    const z1 = -x * sinY + z * cosY;
+    const y1 = y * cosP - z1 * sinP;
+    const z2 = y * sinP + z1 * cosP;
+    const depth = 1.8 - z2;
+    const invD = depth > 0.1 ? 1.0 / depth : 10.0;
+    px[i] = cx + x1 * invD * scalePersp;
+    py[i] = cy + y1 * invD * scalePersp;
+    pz[i] = z2;
+  }
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.lineCap = 'butt';
+
+  for (const [a, b, isContour] of EDGES) {
+    const avgZ = (pz[a] + pz[b]) * 0.5;
+    let depthT = (avgZ + 0.5) * 1.3;
+    if (depthT < 0) depthT = 0;
+    if (depthT > 1) depthT = 1;
+
+    let alpha = (depthT * 0.55 + 0.45);
+    if (!isContour) alpha *= 0.45;
+    if (alpha < 0.02) continue;
+
+    ctx.strokeStyle = `rgba(${tintR},${tintG},${tintB},${alpha.toFixed(3)})`;
+    ctx.lineWidth = 1.0 + depthT * 0.6;
+    ctx.beginPath();
+    ctx.moveTo(px[a], py[a]);
+    ctx.lineTo(px[b], py[b]);
+    ctx.stroke();
+  }
+}
+
+drawFace('face-idle',   255, 255, 255);
+drawFace('face-listen', 34,  197, 94);
+drawFace('face-think',  245, 158, 11);
+drawFace('face-speak',  167, 139, 250);
+</script>
+
+<script>
+const cams = ['C-01 brama','C-04 wjazd','C-07 peron','C-09 hala','C-12 magazyn','C-15 parking','C-18 dok','C-22 wjazd-2'];
+const hm = document.getElementById('hm');
+cams.forEach((cam, ci) => {
+  const label = document.createElement('div');
+  label.className = 'row-label';
+  label.textContent = cam;
+  hm.appendChild(label);
+  for (let h = 0; h < 24; h++) {
+    const c = document.createElement('div');
+    c.className = 'tf-heatmap-cell';
+    const peak = (h > 7 && h < 18) ? 1 : 0.2;
+    const noise = Math.random();
+    const v = peak * noise * (ci === 1 ? 1.4 : 1);
+    if (v > 0.75) c.classList.add('lvl-4');
+    else if (v > 0.5) c.classList.add('lvl-3');
+    else if (v > 0.3) c.classList.add('lvl-2');
+    else if (v > 0.15) c.classList.add('lvl-1');
+    hm.appendChild(c);
+  }
+});
+</script>
+
+</body>
+</html>

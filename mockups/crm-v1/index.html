@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow CRM — mockupy v1</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<div class="index-page">
+  <h1>TentaFlow CRM v1</h1>
+  <p class="subtitle">
+    Pełny zestaw mockupów UI dla CRMa TentaFlow oraz powiązanych addonów (Contacts, Activity, Documents, Billing, Calendar).
+    Każdy addon jest <strong>aplikacją</strong> w sekcji „Moje aplikacje” lewego menu TentaFlow. Renderuje się w prawej części z własnymi pill-tabs u góry — nie zastępuje globalnego menu.
+    Wzajemna komunikacja idzie przez deklaratywne kontrakty Resource Provider + View Contributions, a AI ma osobny Tool Broker z autoryzacją per-grant i confirm dialogiem dla mutacji.
+  </p>
+
+  <div class="intro" style="margin:0 0 28px;padding:0;">
+    <div class="rules">
+      <div class="rule">
+        <h3>Filozofia</h3>
+        <p>Daily Sales Inbox jako główny ekran handlowca, nie kanban. AI jako cichy administrator (suggest / draft / act), nie chatbot. Ten sam silnik widgetów dla zarządu, dyrektora i handlowca — różne query, nie 3 osobne produkty.</p>
+      </div>
+      <div class="rule">
+        <h3>Addon-as-App</h3>
+        <p>Globalne lewe menu TentaFlow zostaje wspólne dla wszystkich addonów. Addon renderuje się w prawej części z własnymi pill-tabs u góry. Inny addon = inny item w sekcji „Moje aplikacje” TentaFlow. Sekcje z innych addonów wpinają się przez <code>contrib-tag</code> (np. „Faktury” w Contacts pokazane przez Billing).</p>
+      </div>
+      <div class="rule">
+        <h3>Stylistyka</h3>
+        <p>Manrope, paleta indigo/violet, komponenty <code>tf-*</code>, ekrany 1440×820. Bez emoji, bez własnych prymitywów. CRM ma być <em>szybki, żywy, przewidujący</em>.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">CRM — rdzeń sprzedażowy</div>
+  <div class="index-grid">
+    <a class="index-card" href="c01-daily-inbox.html"><div class="id">C1</div><h3>Daily Sales Inbox (handlowiec)</h3><p>Główny ekran: „dziś 7 rzeczy do zrobienia”. Kolejka decyzji + jedno kliknięcie do next-action.</p></a>
+    <a class="index-card" href="c02-pipeline.html"><div class="id">C2</div><h3>Pipeline kanban</h3><p>Drugorzędny widok dealów. Kolumny po fazach, kolory commit/stale, wartości po PLN.</p></a>
+    <a class="index-card" href="c03-deal-detail.html"><div class="id">C3</div><h3>Deal detail</h3><p>Unified timeline (maile + spotkania + notatki + koszty), inline edit, sidebar z contributions z innych addonów.</p></a>
+    <a class="index-card" href="c04-deal-create.html"><div class="id">C4</div><h3>Deal create (AI-assisted)</h3><p>Natural language → confirm z diffem → zapis. Pełnoekranowy formularz jako alternatywa.</p></a>
+    <a class="index-card" href="c05-dashboard-rep.html"><div class="id">C5</div><h3>Dashboard handlowca</h3><p>Mój cel, mój pipeline, moje ryzyko. Widgety + sekcja „Wymaga uwagi” auto-generowana.</p></a>
+    <a class="index-card" href="c06-dashboard-director.html"><div class="id">C6</div><h3>Dashboard dyrektora</h3><p>Sekcja, ranking handlowców, gdzie się sypie, fikcyjne commity, oferty bez follow-upu.</p></a>
+    <a class="index-card" href="c07-dashboard-board.html"><div class="id">C7</div><h3>Dashboard zarządu</h3><p>Pipeline ważony PLN, forecast, marża, ranking sekcji, ryzyka pieniężne. Ten sam silnik widgetów.</p></a>
+    <a class="index-card" href="c08-forecast.html"><div class="id">C8</div><h3>Forecast workbench</h3><p>Commit vs best case, snapshoty w czasie, odchylenie od celu.</p></a>
+    <a class="index-card" href="c09-acceptance-card.html"><div class="id">C9</div><h3>Karta akceptacji budżetu</h3><p>Mail z 3 linkami (accept/decline/view) → status w deal. Migracja z IntrAppa, czystsze UI.</p></a>
+    <a class="index-card" href="c10-cost-refactor.html"><div class="id">C10</div><h3>Refakturowanie kosztów</h3><p>E-dokument kosztowy → rozksięgowanie na deale → workflow akceptacji.</p></a>
+    <a class="index-card" href="c11-ai-chat.html"><div class="id">C11</div><h3>AI chat sidebar + confirm dialog</h3><p>Chat kontekstowy. „Załóż deal dla mBank 50k Q3” → diff → klik → zapis. Audit log per call.</p></a>
+    <a class="index-card" href="c12-smart-inbox.html"><div class="id">C12</div><h3>Smart inbox / „Wymaga uwagi”</h3><p>Adaptacyjna kolejka zdarzeń wymagających decyzji. Reguły + sygnały + AI.</p></a>
+    <a class="index-card" href="c13-command-palette.html"><div class="id">C13</div><h3>Command palette ⌘K</h3><p>Globalna nawigacja + akcje + wyszukiwanie + AI tools. Linear-style, ale tematyczny.</p></a>
+    <a class="index-card" href="c14-stages-settings.html"><div class="id">C14</div><h3>Stages settings</h3><p>Edytor pipeline'u. Fazy, prawdopodobieństwa, wymagane pola, automatyzacje.</p></a>
+  </div>
+
+  <div class="section-title">Contacts — centralna baza encji</div>
+  <div class="index-grid">
+    <a class="index-card" href="k01-contacts-list.html"><div class="id">K1</div><h3>Contacts — lista</h3><p>Firmy + osoby + grupy kapitałowe w jednym widoku. Smart lists, segmenty, masowe akcje.</p></a>
+    <a class="index-card" href="k02-person-detail.html"><div class="id">K2</div><h3>Osoba — detail z contributions</h3><p>Sekcje wpięte przez inne addony: Deale (CRM), Spotkania (Calendar), Maile (Email), Faktury (Billing). Pokazuje pattern.</p></a>
+    <a class="index-card" href="k03-company-detail.html"><div class="id">K3</div><h3>Firma — detail</h3><p>Hierarchia (grupa kapitałowa), osoby kontaktowe, pipeline na firmie, finanse, ryzyko.</p></a>
+    <a class="index-card" href="k04-relationship-map.html"><div class="id">K4</div><h3>Mapa relacji</h3><p>Graf powiązań osób w firmie + decydenci + influencerzy. Single-context widok.</p></a>
+  </div>
+
+  <div class="section-title">Activity / Documents / Billing / Calendar — wspierające</div>
+  <div class="index-grid">
+    <a class="index-card" href="a01-activity-timeline.html"><div class="id">A1</div><h3>Activity timeline</h3><p>Wspólna warstwa zdarzeń: tasks, reminders, calendar events, timeline events. Karmi Daily Inbox.</p></a>
+    <a class="index-card" href="d01-documents.html"><div class="id">D1</div><h3>Documents</h3><p>Pliki + metadane. Bez logiki finansowej (to billing). Renderer PDF kart akceptacji.</p></a>
+    <a class="index-card" href="b01-invoices.html"><div class="id">B1</div><h3>Billing — faktury sprzedaży</h3><p>Wystawione + zapłacone + przeterminowane. Numer faktury jako styk z KSeF.</p></a>
+    <a class="index-card" href="b02-cost-inbox.html"><div class="id">B2</div><h3>Billing — kosztorys (e-dokumenty)</h3><p>Inbox dokumentów kosztowych do rozksięgowania. Workflow akceptacji na deal.</p></a>
+    <a class="index-card" href="l01-calendar.html"><div class="id">L1</div><h3>Calendar — tydzień</h3><p>Sync spotkań + kontekst dealowy w evencie. Meeting assistant w widoku spotkania.</p></a>
+  </div>
+
+  <div class="section-title">Platform — kontrakty addonów + AI</div>
+  <div class="index-grid">
+    <a class="index-card" href="p01-app-switcher.html"><div class="id">P1</div><h3>App switcher (addon-as-app)</h3><p>Globalne przejście między CRM / Contacts / Activity / Billing / itd. Z preview ostatniej aktywności.</p></a>
+    <a class="index-card" href="p02-permissions.html"><div class="id">P2</div><h3>Permissions matrix</h3><p>Per-instance grants między addonami. Kto kogo czyta/pisze. Audit kto kiedy zatwierdzał.</p></a>
+    <a class="index-card" href="p03-ai-tools.html"><div class="id">P3</div><h3>AI Tools registry</h3><p>Globalna pula narzędzi AI z konkretnych addonów. Risk per tool, confirmation, audit.</p></a>
+    <a class="index-card" href="o01-org-structure.html"><div class="id">O1</div><h3>Struktura organizacyjna</h3><p>Edytor drzewa stanowisk firmy. Hierarchia = automatyczna widoczność danych w addonach. Wakaty, podwładni, transitive view.</p></a>
+    <a class="index-card" href="o02-roles-catalog.html"><div class="id">O2</div><h3>Katalog ról</h3><p>CRUD na rolach (Handlowiec/PM/Architekt/Sponsor…). Każda ma kind + flagi (is_manager / can_edit_deal / can_approve) + scope widoczności.</p></a>
+  </div>
+</div>
+
+</body>
+</html>

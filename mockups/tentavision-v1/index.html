@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaVision — Mockupy v1</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<div class="index-page">
+  <h1>TentaVision</h1>
+  <p class="subtitle">Addon TentaFlow do analizy obrazu z kamer — pełny zestaw mockupów UI v1, zgodnie z planem v0.2 (po konsultacji codex).</p>
+
+  <div class="intro" style="margin:0 0 28px;padding:0;">
+    <div class="rules">
+      <div class="rule">
+        <h3>Architektura</h3>
+        <p>Natywny runtime video analytics + addon WASM jako control plane. Wąskie API <code>VideoAnalyticsRuntime</code>, handle-based.</p>
+      </div>
+      <div class="rule">
+        <h3>RODO / AI Act</h3>
+        <p>Twarde bramy DPIA/FRIA dla klasy C (D4). Art. 5 i Annex III egzekwowane na poziomie runtime, nie tylko UI.</p>
+      </div>
+      <div class="rule">
+        <h3>Stylistyka</h3>
+        <p>Komponenty <code>tf-*</code>, paleta TentaFlow (Manrope, dark indigo/violet). Wszystkie ekrany 1440 × 820.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="index-grid">
+    <a class="index-card" href="m01-dashboard.html"><div class="id">M1</div><h3>Dashboard</h3><p>KPI systemu, ostatnie alarmy, heatmapa aktywności 24h × kamera.</p></a>
+    <a class="index-card" href="m02-live-view.html"><div class="id">M2</div><h3>Live view (grid kamer)</h3><p>Grid 1/4/9/16, overlay bbox per detektor, fullscreen z timeline.</p></a>
+    <a class="index-card" href="m03-cameras.html"><div class="id">M3</div><h3>Kamery — lista &amp; wizard</h3><p>tf-table + wizard "dodaj kamerę" (discovery → creds → preview → profil).</p></a>
+    <a class="index-card" href="m04-profiles.html"><div class="id">M4</div><h3>Profile analityczne</h3><p>Builder grafu operatorów, przypisanie do kamer, harmonogram dzień/noc.</p></a>
+    <a class="index-card" href="m05-alarm-center.html"><div class="id">M5</div><h3>Centrum alarmów</h3><p>Feed real-time, karta alarmu z klipem 30s, workflow potwierdzania.</p></a>
+    <a class="index-card" href="m06-search.html"><div class="id">M6</div><h3>Wyszukiwarka historyczna</h3><p>Text / atrybut / podobieństwo / tablica → wyniki + eksport.</p></a>
+    <a class="index-card" href="m07-reid.html"><div class="id">M7</div><h3>Re-ID (D4) — pod legal gate</h3><p>PIN + role + LegalGrant. Galeria z TTL. Audit query.</p></a>
+    <a class="index-card" href="m08-models.html"><div class="id">M8</div><h3>Modele i runtime</h3><p>Lista modeli, benchmark, rollback, ONNX upload, budżet VRAM.</p></a>
+    <a class="index-card" href="m09-zones.html"><div class="id">M9</div><h3>Strefy, harmonogramy, reguły</h3><p>Polygon editor, kalendarz tygodniowy, reguły AND/OR.</p></a>
+    <a class="index-card" href="m10-audit.html"><div class="id">M10</div><h3>Audyt + RODO</h3><p>Hash-chain log, retencja per klasa, generator DPIA/FRIA.</p></a>
+    <a class="index-card" href="m11-evidence.html"><div class="id">M11</div><h3>Eksport dla służb</h3><p>Paczki dowodowe (HSM/TSA signed), uprawnieni odbiorcy, log eksportów.</p></a>
+    <a class="index-card" href="m12-settings.html"><div class="id">M12</div><h3>Ustawienia addona</h3><p>Storage, backendy inference, powiadomienia, licencje, integracje.</p></a>
+    <a class="index-card" href="m13-onboarding.html"><div class="id">M13</div><h3>Onboarding wizard (legal)</h3><p>Rola wdrożenia → profil prawny → pierwsza kamera → presety.</p></a>
+    <a class="index-card" href="m14-bindings.html"><div class="id">M14</div><h3>Bindings &amp; Storage</h3><p>Mapowanie 6 aliasów AI na konkretne services + stan wbudowanych API (KV/SQL/Vector/Recording).</p></a>
+    <a class="index-card" href="m15-install-wizard.html"><div class="id">M15</div><h3>Install wizard</h3><p>6 kroków instalacji: permissions → storage backend → deklaracja aliasów AI → Flow templates → profil prawny → pierwsza kamera.</p></a>
+    <a class="index-card" href="m16-global-aliases.html" style="border-color:rgba(96,165,250,0.4)"><div class="id" style="color:var(--info)">M16 · systemowy</div><h3>Serwisy → Aliasy (globalny UI TentaFlow)</h3><p>Nie należy do TentaVision — to globalne UI w TentaFlow Services. Admin konfiguruje wszystkie aliasy z różnych addonów: target_model, fallback_targets, strategy.</p></a>
+    <a class="index-card" href="m08b-model-detail-access.html" style="border-color:rgba(96,165,250,0.4)"><div class="id" style="color:var(--info)">M8b · systemowy</div><h3>Model detail → Dostęp i konsumenci</h3><p>Drill-down do pojedynczego modelu z M8: visibility (private/restricted/public) + tabela addonów-konsumentów z statusami grantów + statystyki użycia per consumer.</p></a>
+    <a class="index-card" href="m12b-addon-access.html" style="border-color:rgba(96,165,250,0.4)"><div class="id" style="color:var(--info)">M12b · systemowy</div><h3>Ustawienia addona → zakładka „Dostęp”</h3><p>Rozszerzenie M12: aliasy/modele które addon używa (z <code>uses_alias</code>) oraz reverse view zasobów które addon udostępnia innym z linkami do M16b/M8b.</p></a>
+    <a class="index-card" href="m15b-install-wizard-access-step.html" style="border-color:rgba(96,165,250,0.4)"><div class="id" style="color:var(--info)">M15b · systemowy</div><h3>Install wizard → Krok 4 (Zewnętrzny dostęp)</h3><p>Nowy krok wizardu: karty per <code>uses_alias</code>/<code>uses_model</code> — auto-grant dla public, radio Zaakceptuj/Odrzuć dla restricted, blokada dla private.</p></a>
+    <a class="index-card" href="m16b-alias-consumers.html" style="border-color:rgba(96,165,250,0.4)"><div class="id" style="color:var(--info)">M16b · systemowy</div><h3>Aliasy → Konsumenci (rozwinięty wiersz)</h3><p>M16 z rozwiniętym wierszem aliasu: panel visibility (3-stanowy segmented), tabela konsumentów (granted/pending/revoked) + audit log grantów.</p></a>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Aliasy · Konsumenci (M16b)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.alias-tbl-row { display: grid; grid-template-columns: 200px 140px 1fr 110px 120px 80px 36px; gap: 10px; padding: 11px 14px;
+  border-bottom: 1px solid var(--border); align-items: center; }
+.alias-tbl-row:last-child { border-bottom: 0; }
+.alias-tbl-row.h { font-size: 10.5px; text-transform: uppercase; color: var(--text-3); font-weight: 700; letter-spacing: 0.06em; padding: 8px 14px; }
+.alias-name-cell { font-family: ui-monospace,monospace; font-size: 12.5px; font-weight: 700; }
+.owner-pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 700;
+}
+.owner-pill.addon { background: rgba(167,139,250,0.15); color: var(--accent-2); }
+.owner-pill.manual { background: rgba(96,165,250,0.15); color: var(--info); }
+.target-cell { font-size: 12px; }
+.target-cell .primary { font-weight: 700; }
+.target-cell .fallbacks { font-size: 10.5px; color: var(--text-3); margin-top: 3px; font-family: ui-monospace,monospace; }
+.strategy-pill {
+  font-family: ui-monospace,monospace; font-size: 10.5px; padding: 2px 8px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 4px;
+}
+.icon-btn {
+  background: transparent; border: 0; color: var(--text-3); cursor: pointer;
+  width: 28px; height: 28px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center;
+}
+.icon-btn:hover { background: var(--bg-3); color: var(--text); }
+
+.alias-expand {
+  background: var(--bg); border-left: 3px solid var(--accent-1); padding: 16px 18px;
+  margin: 0 14px 8px; border-radius: var(--radius-sm);
+}
+
+.vis-segmented {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 4px;
+}
+.vis-segmented label {
+  cursor: pointer; padding: 10px 12px; border-radius: var(--radius-sm);
+  display: flex; flex-direction: column; gap: 4px; border: 1px solid transparent;
+}
+.vis-segmented label.active { background: var(--accent-glow); border-color: var(--accent-1); }
+.vis-segmented input { display: none; }
+.vis-segmented .vname { font-family: ui-monospace,monospace; font-size: 12.5px; font-weight: 800; display: flex; align-items: center; gap: 6px; }
+.vis-segmented .vdesc { font-size: 10.5px; color: var(--text-3); }
+.vis-segmented label.active .vname { color: var(--accent-2); }
+
+.addon-pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 700; background: rgba(167,139,250,0.15); color: var(--accent-2);
+}
+
+.audit-list { display: flex; flex-direction: column; gap: 6px; }
+.audit-entry {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 8px 12px; font-size: 11.5px; display: flex; gap: 10px; align-items: center;
+}
+.audit-entry .when { font-family: ui-monospace,monospace; color: var(--text-3); font-size: 10.5px; min-width: 130px; }
+.audit-entry .who { color: var(--text-2); font-weight: 700; min-width: 180px; }
+.audit-entry .what { color: var(--text); flex: 1; }
+.audit-entry .badge { font-size: 9.5px; font-weight: 800; padding: 1px 6px; border-radius: 3px; text-transform: uppercase; }
+.audit-entry .badge.grant { background: rgba(34,197,94,0.15); color: var(--success); }
+.audit-entry .badge.revoke { background: rgba(239,68,68,0.15); color: var(--danger); }
+.audit-entry .badge.vis { background: rgba(167,139,250,0.15); color: var(--accent-2); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-users-2" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-network" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><circle cx="12" cy="12" r="2"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M16b</span><h2>TentaFlow → Services → Aliasy · rozwinięty wiersz „Kto może używać”</h2>
+    <div class="desc">M16 z aktywnym panelem konsumentów dla aliasu <code class="mono">tentavision-emotion</code> — visibility + lista grantów + audit log.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Admin Krystian</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">General</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Services</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Aliasy · konsumenci</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><circle cx="12" cy="12" r="2"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Aliasy serwisów <span class="chip success"><span class="dot"></span>18 aktywnych</span></div>
+            <div class="d-sub">Panel <code class="mono">tentavision-emotion</code> rozwinięty — visibility + konsumenci + audit</div>
+          </div>
+          <div class="d-actions">
+            <div class="search-box" style="min-width:260px"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Filtruj po alias / owner..."></div>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg>Nowy alias</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-services"/></svg>Wszystkie serwisy<span class="count">13</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab active"><svg class="icon"><use href="#i-link"/></svg>Aliasy<span class="count">21</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-network"/></svg>Wezly</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Historia</button>
+        </div>
+
+        <!-- Lista aliasów -->
+        <section class="section-card" style="padding:0">
+          <div class="alias-tbl-row h">
+            <div>Alias</div><div>Owner</div><div>Target + fallback chain</div><div>Strategy</div><div>Visibility</div><div>Active</div><div></div>
+          </div>
+
+          <div class="alias-tbl-row">
+            <div class="alias-name-cell">tentavision-yolo</div>
+            <div><span class="owner-pill addon"><svg class="icon"><use href="#i-puzzle"/></svg>tentavision</span></div>
+            <div class="target-cell"><div class="primary">yolo11m-detector</div><div class="fallbacks">→ yolo11s → yolo11n-cpu</div></div>
+            <div><span class="strategy-pill">first_available</span></div>
+            <div><span class="chip" style="background:rgba(34,197,94,0.12);color:var(--success);border-color:rgba(34,197,94,0.3)"><svg class="icon"><use href="#i-unlock"/></svg>public</span></div>
+            <div><span class="toggle on"></span></div>
+            <div><button class="icon-btn"><svg class="icon"><use href="#i-chevron"/></svg></button></div>
+          </div>
+
+          <!-- ROW: tentavision-emotion (rozwinięty) -->
+          <div class="alias-tbl-row" style="background:var(--bg-card)">
+            <div class="alias-name-cell">tentavision-emotion</div>
+            <div><span class="owner-pill addon"><svg class="icon"><use href="#i-puzzle"/></svg>tentavision</span></div>
+            <div class="target-cell"><div class="primary">hsemotion-vit-b</div><div class="fallbacks">→ deepface-emotion</div></div>
+            <div><span class="strategy-pill">first_available</span></div>
+            <div><span class="chip warning"><svg class="icon"><use href="#i-shield"/></svg>restricted</span></div>
+            <div><span class="toggle on"></span></div>
+            <div><button class="icon-btn" style="color:var(--accent-2)"><svg class="icon"><use href="#i-chevron-down"/></svg></button></div>
+          </div>
+
+          <!-- EXPANDED PANEL -->
+          <div class="alias-expand">
+
+            <div class="flex justify-between align-center" style="margin-bottom:14px">
+              <div class="fw-700 flex align-center gap-sm" style="font-size:14px"><svg class="icon"><use href="#i-eye"/></svg>Kto może używać: <code class="mono" style="color:var(--accent-2)">tentavision-emotion</code></div>
+              <button class="icon-btn"><svg class="icon"><use href="#i-x"/></svg></button>
+            </div>
+
+            <!-- Panel widoczność -->
+            <div class="field">
+              <label style="font-size:12px;color:var(--text-2);font-weight:700;margin-bottom:6px">Widoczność aliasu</label>
+              <div class="vis-segmented">
+                <label>
+                  <input type="radio" name="vis-emotion">
+                  <div class="vname"><svg class="icon"><use href="#i-lock"/></svg>private</div>
+                  <div class="vdesc">Tylko owner (tentavision). Inne addony dostają denied.</div>
+                </label>
+                <label class="active">
+                  <input type="radio" name="vis-emotion" checked>
+                  <div class="vname"><svg class="icon"><use href="#i-shield"/></svg>restricted</div>
+                  <div class="vdesc">Whitelist konsumentów — admin manualnie nadaje granty (poniżej).</div>
+                </label>
+                <label>
+                  <input type="radio" name="vis-emotion">
+                  <div class="vname"><svg class="icon"><use href="#i-unlock"/></svg>public</div>
+                  <div class="vdesc">Auto-grant dla każdego addona z deklaracją uses_alias.</div>
+                </label>
+              </div>
+            </div>
+
+            <!-- Panel konsumenci -->
+            <div class="section-card-head" style="margin-top:16px;margin-bottom:10px">
+              <div class="title"><svg class="icon"><use href="#i-users-2"/></svg>Konsumenci aliasu <span class="chip">4 wpisy</span></div>
+              <div class="flex gap-sm align-center">
+                <div class="search-box" style="min-width:180px;padding:5px 8px"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Filtruj..."></div>
+                <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Dodaj konsumenta</button>
+              </div>
+            </div>
+
+            <table class="tf-table">
+              <thead>
+                <tr><th>Addon</th><th>Dodał</th><th>Kiedy</th><th>Status</th><th>Audit</th><th></th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>teams-bot</span></td>
+                  <td class="text-xs">aleksandra.dpo@tentaflow.local</td>
+                  <td class="text-xs text-3"><svg class="icon icon-sm"><use href="#i-clock"/></svg> 2 dni temu</td>
+                  <td><span class="status-pill ok">granted</span></td>
+                  <td><a href="#" class="text-xs"><svg class="icon icon-sm"><use href="#i-external"/></svg> Zobacz log</a></td>
+                  <td><button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button></td>
+                </tr>
+                <tr>
+                  <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>hr-bridge</span></td>
+                  <td class="text-xs">admin.krystian@tentaflow.local</td>
+                  <td class="text-xs text-3"><svg class="icon icon-sm"><use href="#i-clock"/></svg> 11 dni temu</td>
+                  <td><span class="status-pill ok">granted</span></td>
+                  <td><a href="#" class="text-xs"><svg class="icon icon-sm"><use href="#i-external"/></svg> Zobacz log</a></td>
+                  <td><button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button></td>
+                </tr>
+                <tr>
+                  <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>analytics-mood</span></td>
+                  <td class="text-xs">— (zgłoszony przez addon)</td>
+                  <td class="text-xs text-3"><svg class="icon icon-sm"><use href="#i-clock"/></svg> 6 godz. temu</td>
+                  <td><span class="status-pill warn">pending</span></td>
+                  <td><a href="#" class="text-xs"><svg class="icon icon-sm"><use href="#i-external"/></svg> Zobacz log</a></td>
+                  <td class="flex gap-sm" style="border:0">
+                    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-check"/></svg>Zatwierdź</button>
+                    <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-x"/></svg>Odrzuć</button>
+                  </td>
+                </tr>
+                <tr style="opacity:0.6">
+                  <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>marketing-heatmap</span></td>
+                  <td class="text-xs">admin.krystian@tentaflow.local</td>
+                  <td class="text-xs text-3"><svg class="icon icon-sm"><use href="#i-clock"/></svg> 23 dni temu</td>
+                  <td><span class="status-pill err">revoked</span></td>
+                  <td><a href="#" class="text-xs"><svg class="icon icon-sm"><use href="#i-external"/></svg> Zobacz log</a></td>
+                  <td><button class="btn btn-secondary btn-sm">Przywróć</button></td>
+                </tr>
+              </tbody>
+            </table>
+
+            <!-- Panel audit log -->
+            <div class="section-card-head" style="margin-top:16px;margin-bottom:10px">
+              <div class="title"><svg class="icon"><use href="#i-audit"/></svg>Audit log grantów (3 ostatnie wpisy)</div>
+              <a href="#" class="text-xs">Pełny log →</a>
+            </div>
+            <div class="audit-list">
+              <div class="audit-entry">
+                <div class="when">2026-05-13 14:22</div>
+                <div class="who">aleksandra.dpo@tentaflow.local</div>
+                <div class="what">Granted dostęp dla <span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>teams-bot</span> — uzasadnienie: <em>"analiza emocji uczestników spotkania dla raportu zaangażowania, DPIA-2026-091"</em></div>
+                <span class="badge grant">grant</span>
+              </div>
+              <div class="audit-entry">
+                <div class="when">2026-05-12 09:11</div>
+                <div class="who">admin.krystian@tentaflow.local</div>
+                <div class="what">Zmiana visibility: <code class="mono">public</code> → <code class="mono">restricted</code> — powód: <em>"D4 emocje twarzy wymaga DPIA per consumer"</em></div>
+                <span class="badge vis">visibility</span>
+              </div>
+              <div class="audit-entry">
+                <div class="when">2026-04-29 17:04</div>
+                <div class="who">admin.krystian@tentaflow.local</div>
+                <div class="what">Revoked dostęp dla <span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>marketing-heatmap</span> — powód: <em>"cel marketingowy niezgodny z Art. 9 RODO"</em></div>
+                <span class="badge revoke">revoke</span>
+              </div>
+            </div>
+
+            <div class="flex justify-between mt-md" style="margin-top:16px">
+              <button class="btn btn-secondary"><svg class="icon"><use href="#i-x"/></svg>Zwiń panel</button>
+              <button class="btn btn-primary"><svg class="icon"><use href="#i-check"/></svg>Zapisz zmiany</button>
+            </div>
+          </div>
+
+          <!-- KOLEJNE WIERSZE — zwinięte -->
+          <div class="alias-tbl-row">
+            <div class="alias-name-cell">tentavision-face</div>
+            <div><span class="owner-pill addon"><svg class="icon"><use href="#i-puzzle"/></svg>tentavision</span></div>
+            <div class="target-cell"><div class="primary">adaface-r100</div><div class="fallbacks">brak fallbacku</div></div>
+            <div><span class="strategy-pill">first_available</span></div>
+            <div><span class="chip danger"><svg class="icon"><use href="#i-lock"/></svg>private</span></div>
+            <div><span class="toggle"></span></div>
+            <div><button class="icon-btn"><svg class="icon"><use href="#i-chevron"/></svg></button></div>
+          </div>
+
+          <div class="alias-tbl-row">
+            <div class="alias-name-cell">teams-stt</div>
+            <div><span class="owner-pill addon"><svg class="icon"><use href="#i-puzzle"/></svg>teams-bot</span></div>
+            <div class="target-cell"><div class="primary">whisper-stt-large</div><div class="fallbacks">→ stt-cloud-fallback</div></div>
+            <div><span class="strategy-pill">first_available</span></div>
+            <div><span class="chip" style="background:rgba(34,197,94,0.12);color:var(--success);border-color:rgba(34,197,94,0.3)"><svg class="icon"><use href="#i-unlock"/></svg>public</span></div>
+            <div><span class="toggle on"></span></div>
+            <div><button class="icon-btn"><svg class="icon"><use href="#i-chevron"/></svg></button></div>
+          </div>
+
+          <div class="alias-tbl-row">
+            <div class="alias-name-cell">default-llm</div>
+            <div><span class="owner-pill manual"><svg class="icon"><use href="#i-users"/></svg>manual</span></div>
+            <div class="target-cell"><div class="primary">gpt-4o-mini</div><div class="fallbacks">→ llama-3.1-70b-local</div></div>
+            <div><span class="strategy-pill">weighted</span></div>
+            <div><span class="chip warning"><svg class="icon"><use href="#i-shield"/></svg>restricted</span></div>
+            <div><span class="toggle on"></span></div>
+            <div><button class="icon-btn"><svg class="icon"><use href="#i-chevron"/></svg></button></div>
+          </div>
+
+        </section>
+
+        <section class="section-card" style="background:rgba(96,165,250,0.06);border-color:rgba(96,165,250,0.25);margin-top:14px">
+          <h3 style="color:var(--info)"><svg class="icon"><use href="#i-info"/></svg>Visibility + grant — przepływ</h3>
+          <div class="text-xs text-2" style="line-height:1.7">
+            Każdy alias ma <strong>visibility</strong> i listę <strong>konsumentów</strong>. Owner ma zawsze dostęp. Inny addon musi w manifeście zadeklarować <code class="mono">[[uses_alias]] id = "tentavision-emotion"</code>. Co dalej zależy od visibility: <code class="mono">private</code> ⇒ denied bez wyjątków; <code class="mono">restricted</code> ⇒ wpis w stanie <em>pending</em>, admin zatwierdza tutaj; <code class="mono">public</code> ⇒ auto-grant podczas instalacji. Wszystkie operacje są logowane w hash-chain audit logu.
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

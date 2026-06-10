@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Wizard deployu krok GPU</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.22);
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --info: #60a5fa;
+  --nvidia: #76b900;
+  --amd: #ed1c24;
+  --intel: #0068b5;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+  --shadow-lg: 0 24px 64px rgba(0,0,0,0.7), 0 8px 24px rgba(99, 102, 241, 0.15);
+  --glow-indigo: 0 0 30px rgba(99, 102, 241, 0.3);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+.intro { max-width: 1200px; margin: 28px auto 12px; padding: 0 24px; }
+.intro h1 {
+  font-size: 24px; font-weight: 800; margin-bottom: 4px;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.intro .lead { color: var(--text-2); max-width: 820px; font-size: 13px; line-height: 1.6; }
+
+.grid {
+  max-width: 1200px; margin: 16px auto 80px; padding: 0 24px;
+  display: grid; gap: 32px;
+}
+.section-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--accent-2); margin-bottom: 10px;
+}
+
+/* ============ Modal shell ============ */
+.modal-shell {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  width: 100%;
+  max-width: 820px;
+  margin: 0 auto;
+}
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.modal-head .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
+.modal-head h3 { font-size: 15px; font-weight: 700; color: var(--text); }
+.modal-body { padding: 24px 28px; }
+.modal-foot {
+  display: flex; justify-content: flex-end; align-items: center; gap: 10px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.modal-foot .spacer { flex: 1; }
+
+/* ============ Stepper ============ */
+.stepper {
+  display: flex; align-items: center; gap: 10px;
+  justify-content: center; margin-bottom: 22px;
+}
+.stepper .step {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-3); border: 1px solid var(--border);
+  color: var(--text-3); font-weight: 700; font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+}
+.stepper .step.active {
+  background: var(--gradient-accent);
+  color: white; border-color: transparent;
+  box-shadow: 0 0 0 4px var(--accent-glow);
+}
+.stepper .step.done {
+  background: var(--success);
+  color: white; border-color: transparent;
+}
+.stepper .line {
+  flex: 0 0 48px; height: 2px; background: var(--border); border-radius: 2px;
+}
+.stepper .line.done { background: var(--success); }
+.stepper .line.active { background: linear-gradient(90deg, var(--success) 0%, var(--accent-1) 100%); }
+
+/* ============ Step heading ============ */
+.step-heading h2 {
+  font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 4px;
+}
+.step-heading p {
+  color: var(--text-2); font-size: 13px; line-height: 1.55; margin-bottom: 18px;
+}
+
+/* ============ Option cards (replaced radios) ============ */
+.opt-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 20px;
+}
+@media (max-width: 640px) {
+  .opt-cards { grid-template-columns: 1fr; }
+}
+.opt-card {
+  position: relative;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 14px 14px;
+  cursor: pointer;
+  transition: all 0.18s cubic-bezier(0.32, 0.72, 0, 1);
+  display: flex; flex-direction: column; gap: 6px;
+  min-height: 118px;
+}
+.opt-card:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-card-hover);
+  transform: translateY(-1px);
+}
+.opt-card.active {
+  border-color: var(--accent-1);
+  background: rgba(99, 102, 241, 0.08);
+  box-shadow: 0 0 0 1px var(--accent-1), 0 4px 14px rgba(99, 102, 241, 0.25);
+}
+.opt-card.active::before {
+  content: '';
+  position: absolute; top: 10px; right: 10px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--gradient-accent);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+}
+.opt-card .opt-icon {
+  width: 38px; height: 38px;
+  border-radius: 10px;
+  background: rgba(99, 102, 241, 0.12);
+  color: var(--accent-2);
+  display: flex; align-items: center; justify-content: center;
+  margin-bottom: 4px;
+}
+.opt-card .opt-icon svg {
+  width: 18px; height: 18px;
+  stroke: currentColor; fill: none; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.opt-card.active .opt-icon {
+  background: rgba(99, 102, 241, 0.2);
+  color: var(--accent-2);
+}
+.opt-card .opt-title {
+  font-size: 13.5px; font-weight: 700; color: var(--text);
+  display: flex; align-items: center; gap: 6px;
+}
+.opt-card .opt-title .tag {
+  font-size: 10px; font-weight: 700; padding: 2px 6px;
+  background: rgba(99, 102, 241, 0.15); color: var(--accent-2);
+  border-radius: 999px; letter-spacing: 0.04em;
+}
+.opt-card .opt-desc {
+  font-size: 11.5px; color: var(--text-3); line-height: 1.45;
+}
+
+/* CPU card — subtly different accent */
+.opt-card.cpu .opt-icon { background: rgba(96, 165, 250, 0.12); color: var(--info); }
+.opt-card.cpu.active .opt-icon { background: rgba(96, 165, 250, 0.2); color: var(--info); }
+.opt-card.cpu.active {
+  border-color: var(--info);
+  background: rgba(96, 165, 250, 0.06);
+  box-shadow: 0 0 0 1px var(--info), 0 4px 14px rgba(96, 165, 250, 0.2);
+}
+.opt-card.cpu.active::before {
+  background: var(--info);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.2);
+}
+
+/* All GPU card — success accent */
+.opt-card.all .opt-icon { background: rgba(34, 197, 94, 0.12); color: var(--success); }
+.opt-card.all.active .opt-icon { background: rgba(34, 197, 94, 0.2); color: var(--success); }
+.opt-card.all.active {
+  border-color: var(--success);
+  background: rgba(34, 197, 94, 0.06);
+  box-shadow: 0 0 0 1px var(--success), 0 4px 14px rgba(34, 197, 94, 0.2);
+}
+.opt-card.all.active::before {
+  background: var(--success);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2);
+}
+
+/* ============ GPU list (shown when "Wybierz konkretne GPU" active) ============ */
+.gpu-list {
+  display: flex; flex-direction: column; gap: 8px;
+  margin-top: 4px;
+}
+.gpu-list-hint {
+  font-size: 11px; color: var(--text-3); text-transform: uppercase;
+  letter-spacing: 0.08em; font-weight: 700; margin-bottom: 8px;
+}
+.gpu-card {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.gpu-card:hover { border-color: var(--border-hover); background: var(--bg-card-hover); }
+.gpu-card.selected {
+  border-color: var(--accent-1);
+  background: rgba(99, 102, 241, 0.06);
+  box-shadow: 0 0 0 1px var(--accent-1);
+}
+
+/* Custom checkbox */
+.gpu-check {
+  width: 18px; height: 18px; border-radius: 5px;
+  border: 2px solid var(--border-hover); background: var(--bg-3);
+  flex-shrink: 0;
+  position: relative;
+  transition: all 0.15s;
+}
+.gpu-card.selected .gpu-check {
+  background: var(--gradient-accent);
+  border-color: transparent;
+}
+.gpu-card.selected .gpu-check::after {
+  content: '';
+  position: absolute; inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+}
+
+.gpu-info { flex: 1; min-width: 0; }
+.gpu-name {
+  font-size: 13px; font-weight: 700; color: var(--text);
+  display: flex; align-items: baseline; gap: 6px;
+}
+.gpu-name .gpu-idx { color: var(--text-3); font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600; }
+.gpu-meta {
+  font-size: 11px; color: var(--text-3); margin-top: 2px;
+  display: flex; gap: 10px;
+}
+.gpu-meta .sep { opacity: 0.5; }
+
+.gpu-brand {
+  font-size: 10px; font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 999px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.gpu-brand.nvidia {
+  background: rgba(118, 185, 0, 0.14);
+  color: var(--nvidia);
+  border: 1px solid rgba(118, 185, 0, 0.3);
+}
+.gpu-brand.amd {
+  background: rgba(237, 28, 36, 0.14);
+  color: var(--amd);
+  border: 1px solid rgba(237, 28, 36, 0.3);
+}
+.gpu-brand.intel {
+  background: rgba(0, 104, 181, 0.16);
+  color: var(--intel);
+  border: 1px solid rgba(0, 104, 181, 0.3);
+}
+
+.gpu-summary {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: rgba(99, 102, 241, 0.06);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  font-size: 12px;
+  color: var(--accent-2);
+  display: flex; align-items: center; gap: 8px;
+}
+.gpu-summary svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+
+/* ============ Buttons ============ */
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 16px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px; font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  min-height: 38px;
+  white-space: nowrap;
+}
+.btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.btn.secondary {
+  background: var(--bg-3); color: var(--text); border-color: var(--border);
+}
+.btn.secondary:hover { background: var(--bg-card-hover); border-color: var(--border-hover); }
+.btn.primary {
+  background: var(--gradient-accent); color: white;
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+}
+.btn.primary:hover { filter: brightness(1.08); transform: translateY(-1px); box-shadow: 0 6px 22px rgba(99, 102, 241, 0.55); }
+.btn.ghost { color: var(--text-2); }
+.btn.ghost:hover { background: var(--bg-3); color: var(--text); }
+
+/* Single cell hint under options */
+.opt-hint {
+  font-size: 12px; color: var(--text-3); line-height: 1.5;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>Wizard deployu — krok 2 (GPU)</h1>
+  <p class="lead">
+    Stare radio buttony (natywny <code>&lt;input type="radio"&gt;</code>) nie pasowały stylistycznie — wyglądały jak z Windows 98.
+    Nowy design to 3 karty z ikonami, gradient na aktywnej (akcent indygo) i własnymi kolorami (CPU = niebieski, wszystkie GPU = zielony, konkretne = fiolet).
+    Gdy wybierzesz „Konkretne GPU", poniżej rozwija się lista kart GPU z checkboxami w tym samym stylu co aktywna karta.
+  </p>
+</div>
+
+<div class="grid">
+
+  <!-- State A: "Użyj wszystkich GPU" selected -->
+  <section>
+    <div class="section-title">Stan A · Wszystkie GPU</div>
+    <div class="modal-shell">
+      <div class="modal-head">
+        <div class="dot"></div>
+        <h3>Wdrażanie silnika: Teams Bot</h3>
+      </div>
+      <div class="modal-body">
+        <div class="stepper">
+          <div class="step done">1</div>
+          <div class="line done"></div>
+          <div class="step active">2</div>
+          <div class="line"></div>
+          <div class="step">3</div>
+        </div>
+        <div class="step-heading">
+          <h2>Wybierz GPU na węźle <span style="color:var(--accent-2);">mainpc (local)</span></h2>
+          <p>Zdecyduj, z których kart GPU skorzysta ten deployment na wybranym węźle.</p>
+        </div>
+        <div class="opt-cards">
+          <div class="opt-card all active" data-state="all">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><rect x="3" y="8" width="8" height="8" rx="1"/><rect x="13" y="8" width="8" height="8" rx="1"/><line x1="3" y1="3" x2="3" y2="6"/><line x1="21" y1="3" x2="21" y2="6"/><line x1="7" y1="4" x2="7" y2="7"/><line x1="17" y1="4" x2="17" y2="7"/></svg>
+            </div>
+            <div class="opt-title">Użyj wszystkich <span class="tag">1</span></div>
+            <div class="opt-desc">Deployment dostanie pełen dostęp do wszystkich kart GPU na wybranym węźle.</div>
+          </div>
+          <div class="opt-card">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>
+            </div>
+            <div class="opt-title">Wybierz konkretne</div>
+            <div class="opt-desc">Sam wskaż które karty GPU mają być zaalokowane dla tego deployu.</div>
+          </div>
+          <div class="opt-card cpu">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+            </div>
+            <div class="opt-title">Tylko CPU</div>
+            <div class="opt-desc">Deployment nie dotknie GPU — cały inferencja na procesorze.</div>
+          </div>
+        </div>
+        <div class="opt-hint">
+          <svg style="width:14px;height:14px;stroke:var(--accent-2);fill:none;stroke-width:2;vertical-align:-2px;margin-right:6px;" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          Zostaną użyte wszystkie GPU na węźle (1 znalezione).
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost">Anuluj</button>
+        <div class="spacer"></div>
+        <button class="btn secondary"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>Wstecz</button>
+        <button class="btn primary">Dalej <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- State B: "Konkretne GPU" selected, list below -->
+  <section>
+    <div class="section-title">Stan B · Konkretne GPU (lista rozwinięta)</div>
+    <div class="modal-shell">
+      <div class="modal-head">
+        <div class="dot"></div>
+        <h3>Wdrażanie silnika: Teams Bot</h3>
+      </div>
+      <div class="modal-body">
+        <div class="stepper">
+          <div class="step done">1</div>
+          <div class="line done"></div>
+          <div class="step active">2</div>
+          <div class="line"></div>
+          <div class="step">3</div>
+        </div>
+        <div class="step-heading">
+          <h2>Wybierz GPU na węźle <span style="color:var(--accent-2);">mainpc (local)</span></h2>
+          <p>Zdecyduj, z których kart GPU skorzysta ten deployment na wybranym węźle.</p>
+        </div>
+        <div class="opt-cards">
+          <div class="opt-card all">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><rect x="3" y="8" width="8" height="8" rx="1"/><rect x="13" y="8" width="8" height="8" rx="1"/><line x1="3" y1="3" x2="3" y2="6"/><line x1="21" y1="3" x2="21" y2="6"/><line x1="7" y1="4" x2="7" y2="7"/><line x1="17" y1="4" x2="17" y2="7"/></svg>
+            </div>
+            <div class="opt-title">Użyj wszystkich <span class="tag">1</span></div>
+            <div class="opt-desc">Deployment dostanie pełen dostęp do wszystkich kart GPU na wybranym węźle.</div>
+          </div>
+          <div class="opt-card active">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>
+            </div>
+            <div class="opt-title">Wybierz konkretne</div>
+            <div class="opt-desc">Sam wskaż które karty GPU mają być zaalokowane dla tego deployu.</div>
+          </div>
+          <div class="opt-card cpu">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+            </div>
+            <div class="opt-title">Tylko CPU</div>
+            <div class="opt-desc">Deployment nie dotknie GPU — cały inferencja na procesorze.</div>
+          </div>
+        </div>
+
+        <div class="gpu-list">
+          <div class="gpu-list-hint">Dostępne GPU (1)</div>
+          <div class="gpu-card selected">
+            <div class="gpu-check"></div>
+            <div class="gpu-info">
+              <div class="gpu-name"><span class="gpu-idx">GPU 0 ·</span> NVIDIA GeForce RTX 4090</div>
+              <div class="gpu-meta">
+                <span>24 GB VRAM</span>
+                <span class="sep">·</span>
+                <span>util 5 %</span>
+                <span class="sep">·</span>
+                <span>41 °C</span>
+                <span class="sep">·</span>
+                <span>PCIe 4.0 x16</span>
+              </div>
+            </div>
+            <span class="gpu-brand nvidia">NVIDIA</span>
+          </div>
+        </div>
+
+        <div class="gpu-summary">
+          <svg viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          Wybrano 1 GPU · łącznie 24 GB VRAM
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost">Anuluj</button>
+        <div class="spacer"></div>
+        <button class="btn secondary"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>Wstecz</button>
+        <button class="btn primary">Dalej <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- State C: Multi-GPU host (4 GPUs) for demonstration -->
+  <section>
+    <div class="section-title">Stan C · Multi-GPU host (4×, mieszane marki)</div>
+    <div class="modal-shell">
+      <div class="modal-head">
+        <div class="dot"></div>
+        <h3>Wdrażanie silnika: vLLM</h3>
+      </div>
+      <div class="modal-body">
+        <div class="stepper">
+          <div class="step done">1</div>
+          <div class="line done"></div>
+          <div class="step active">2</div>
+          <div class="line"></div>
+          <div class="step">3</div>
+        </div>
+        <div class="step-heading">
+          <h2>Wybierz GPU na węźle <span style="color:var(--accent-2);">spark-001</span></h2>
+          <p>Zdecyduj, z których kart GPU skorzysta ten deployment na wybranym węźle.</p>
+        </div>
+        <div class="opt-cards">
+          <div class="opt-card all">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><rect x="3" y="8" width="8" height="8" rx="1"/><rect x="13" y="8" width="8" height="8" rx="1"/><line x1="3" y1="3" x2="3" y2="6"/><line x1="21" y1="3" x2="21" y2="6"/><line x1="7" y1="4" x2="7" y2="7"/><line x1="17" y1="4" x2="17" y2="7"/></svg>
+            </div>
+            <div class="opt-title">Użyj wszystkich <span class="tag">4</span></div>
+            <div class="opt-desc">Deployment dostanie pełen dostęp do wszystkich kart GPU na wybranym węźle.</div>
+          </div>
+          <div class="opt-card active">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>
+            </div>
+            <div class="opt-title">Wybierz konkretne</div>
+            <div class="opt-desc">Sam wskaż które karty GPU mają być zaalokowane dla tego deployu.</div>
+          </div>
+          <div class="opt-card cpu">
+            <div class="opt-icon">
+              <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+            </div>
+            <div class="opt-title">Tylko CPU</div>
+            <div class="opt-desc">Deployment nie dotknie GPU — cały inferencja na procesorze.</div>
+          </div>
+        </div>
+
+        <div class="gpu-list">
+          <div class="gpu-list-hint">Dostępne GPU (4)</div>
+          <div class="gpu-card selected">
+            <div class="gpu-check"></div>
+            <div class="gpu-info">
+              <div class="gpu-name"><span class="gpu-idx">GPU 0 ·</span> NVIDIA H100 PCIe</div>
+              <div class="gpu-meta"><span>80 GB VRAM</span><span class="sep">·</span><span>util 12 %</span><span class="sep">·</span><span>52 °C</span></div>
+            </div>
+            <span class="gpu-brand nvidia">NVIDIA</span>
+          </div>
+          <div class="gpu-card selected">
+            <div class="gpu-check"></div>
+            <div class="gpu-info">
+              <div class="gpu-name"><span class="gpu-idx">GPU 1 ·</span> NVIDIA H100 PCIe</div>
+              <div class="gpu-meta"><span>80 GB VRAM</span><span class="sep">·</span><span>util 0 %</span><span class="sep">·</span><span>38 °C</span></div>
+            </div>
+            <span class="gpu-brand nvidia">NVIDIA</span>
+          </div>
+          <div class="gpu-card">
+            <div class="gpu-check"></div>
+            <div class="gpu-info">
+              <div class="gpu-name"><span class="gpu-idx">GPU 2 ·</span> AMD Instinct MI300X</div>
+              <div class="gpu-meta"><span>192 GB VRAM</span><span class="sep">·</span><span>util 0 %</span><span class="sep">·</span><span>44 °C</span></div>
+            </div>
+            <span class="gpu-brand amd">AMD</span>
+          </div>
+          <div class="gpu-card">
+            <div class="gpu-check"></div>
+            <div class="gpu-info">
+              <div class="gpu-name"><span class="gpu-idx">GPU 3 ·</span> Intel Data Center GPU Max 1550</div>
+              <div class="gpu-meta"><span>128 GB VRAM</span><span class="sep">·</span><span>util 0 %</span><span class="sep">·</span><span>40 °C</span></div>
+            </div>
+            <span class="gpu-brand intel">INTEL</span>
+          </div>
+        </div>
+
+        <div class="gpu-summary">
+          <svg viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          Wybrano 2 GPU · łącznie 160 GB VRAM (2× NVIDIA H100)
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost">Anuluj</button>
+        <div class="spacer"></div>
+        <button class="btn secondary"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>Wstecz</button>
+        <button class="btn primary">Dalej <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></button>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+// Demo interactivity
+document.querySelectorAll('.opt-cards').forEach(cards => {
+  cards.querySelectorAll('.opt-card').forEach(card => {
+    card.addEventListener('click', () => {
+      cards.querySelectorAll('.opt-card').forEach(c => c.classList.remove('active'));
+      card.classList.add('active');
+    });
+  });
+});
+document.querySelectorAll('.gpu-card').forEach(card => {
+  card.addEventListener('click', () => card.classList.toggle('selected'));
+});
+</script>
+
+</body>
+</html>

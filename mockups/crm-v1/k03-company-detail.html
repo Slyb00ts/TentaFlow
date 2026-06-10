@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>Contacts — firma detail (K3)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css"></head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20"/></symbol>
+<symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-pin" viewBox="0 0 24 24"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.58"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-arrow-right" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><polyline points="12 7 12 12 15 13.5"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/><rect x="10" y="4" width="4" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>Contacts — Firma detail (K3)</h1>
+  <p class="lead">
+    Widok firmy. Hierarchia (grupa kapitałowa), wszystkie osoby kontaktowe z rolami, pipeline na firmie (CRM contribution), finanse (Billing contribution), ryzyko (AI).
+    Strona dla zarządzania <em>account-based selling</em>: relacja z firmą jako całością, nie tylko pojedynczymi dealami.
+  </p>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">K3</span><h2>mBank S.A. — firma z grupy mBank Group</h2><div class="desc">LTV 2.4 mln · 4 wygrane historycznie · 2 aktywne deale · 12 kontaktów.</div></div>
+<div class="screen-frame">
+<div class="tf-shell">
+
+<aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-deal"/></svg>CRM</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av indigo">AK</div><div><div class="nm">Anna Kowalska</div><div class="rl">Handlowiec · Wschód</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+
+<main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>Contacts</strong><span class="sep">›</span><span>mBank S.A.</span></div>
+  <div class="pill-tabs">
+    <button class="pill-tab"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie</button>
+    <button class="pill-tab active"><svg class="icon"><use href="#i-building"/></svg>Firmy</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-users"/></svg>Osoby</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-network"/></svg>Mapy relacji</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-star"/></svg>Smart lists</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy</button>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+<div class="breadcrumb"><span class="crumb">Contacts</span><span class="sep">›</span><span class="crumb">Firmy</span><span class="sep">›</span><span class="crumb">Bankowość</span><span class="sep">›</span><span class="crumb current">mBank S.A.</span></div>
+
+<!-- HEADER -->
+<div class="section-card" style="padding:20px;">
+  <div class="flex align-center gap-md">
+    <div class="av xl company">MB</div>
+    <div style="flex:1;min-width:0">
+      <div class="flex align-center gap-sm">
+        <div style="font-size:24px;font-weight:800;">mBank S.A.</div>
+        <span class="chip success"><svg class="icon"><use href="#i-star"/></svg>VIP</span>
+        <span class="chip">bank</span>
+      </div>
+      <div class="text-sm text-2 mt-sm flex gap-md">
+        <span><svg class="icon icon-sm"><use href="#i-globe"/></svg> mbank.pl · NIP 526-021-50-88</span>
+        <span><svg class="icon icon-sm"><use href="#i-pin"/></svg> Senatorska 18, Warszawa</span>
+        <span><svg class="icon icon-sm"><use href="#i-network"/></svg> część <a>mBank Group</a></span>
+      </div>
+    </div>
+    <div class="text-right" style="text-align:right;border-left:1px solid var(--border);padding-left:18px;">
+      <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.08em;">LTV</div>
+      <div class="num fw-800" style="font-size:22px;color:var(--success)">2 480 000 PLN</div>
+      <div class="text-xs text-3">4 wygrane · 6 lat współpracy</div>
+    </div>
+  </div>
+</div>
+
+<!-- KPI -->
+<div class="kpi-grid">
+  <div class="kpi"><div class="label"><svg class="icon"><use href="#i-deal"/></svg>Aktywne deale</div><div class="value num">2</div><div class="delta">208 000 PLN łącznie</div><div class="kpi-bar crm"></div></div>
+  <div class="kpi"><div class="label"><svg class="icon"><use href="#i-trend"/></svg>Historia</div><div class="value num">4 <span class="small">wygrane</span></div><div class="delta up">+ 2.4 mln LTV</div><div class="kpi-bar success"></div></div>
+  <div class="kpi"><div class="label"><svg class="icon"><use href="#i-users"/></svg>Osób kontaktowych</div><div class="value num">12</div><div class="delta">3 decydenci · 5 wpływ.</div><div class="kpi-bar"></div></div>
+  <div class="kpi"><div class="label"><svg class="icon"><use href="#i-coin"/></svg>Płacze faktury</div><div class="value num">92%</div><div class="delta up">w terminie</div><div class="kpi-bar success"></div></div>
+</div>
+
+<div class="grid-2">
+
+<!-- OSOBY KONTAKTOWE -->
+<div class="section-card">
+  <div class="section-card-head">
+    <div class="title"><svg class="icon"><use href="#i-users"/></svg>Osoby kontaktowe (12)</div>
+    <button class="btn btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Dodaj</button>
+  </div>
+  <table class="tf-table">
+    <thead><tr><th>Osoba</th><th>Rola</th><th>Ost. kontakt</th></tr></thead>
+    <tbody>
+      <tr><td><div class="avatar-cell"><div class="av sm indigo">MW</div><div><strong>Magda Wiśniewska</strong><div class="text-xs text-3">CIO</div></div></div></td><td><span class="chip success">decydent</span> <span class="chip">VIP</span></td><td>9 dni temu</td></tr>
+      <tr><td><div class="avatar-cell"><div class="av sm gray">AK</div><div><strong>Adam Kowal</strong><div class="text-xs text-3">Dyr. IT</div></div></div></td><td><span class="chip">influencer</span></td><td><span class="chip warning">4 mc</span></td></tr>
+      <tr><td><div class="avatar-cell"><div class="av sm teal">JM</div><div><strong>Joanna Maj</strong><div class="text-xs text-3">PMO</div></div></div></td><td><span class="chip">user</span></td><td>2 mc temu</td></tr>
+      <tr><td><div class="avatar-cell"><div class="av sm amber">KS</div><div><strong>Krzysztof Sienicki</strong><div class="text-xs text-3">Architect</div></div></div></td><td><span class="chip">influencer</span></td><td>3 mc temu</td></tr>
+      <tr><td colspan="3" style="text-align:center;font-size:11px;color:var(--text-3)">+ 8 innych ·  <a>pokaż wszystkich</a></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- AKTYWNE DEALE -->
+<div class="section-card">
+  <div class="section-card-head">
+    <div class="title"><svg class="icon"><use href="#i-deal"/></svg>Aktywne deale</div>
+    <span class="contrib-tag crm">crm</span>
+  </div>
+  <div class="flex col gap-sm">
+    <div style="padding:12px;background:var(--bg-3);border-radius:8px;border-left:3px solid var(--accent-2);">
+      <div class="flex justify-between"><div class="fw-700">mBank · CBA migracja</div><div class="num fw-800">120 000 PLN</div></div>
+      <div class="text-xs text-3 mt-sm flex justify-between"><span><span class="stage commit" style="font-size:9px"><span></span>Commit</span> · A. Kowalska</span><span class="chip danger" style="font-size:9px"><span class="dot"></span>9 dni cisza</span></div>
+    </div>
+    <div style="padding:12px;background:var(--bg-3);border-radius:8px;border-left:3px solid var(--accent-2);">
+      <div class="flex justify-between"><div class="fw-700">mBank · platforma analityczna</div><div class="num fw-800">88 000 PLN</div></div>
+      <div class="text-xs text-3 mt-sm flex justify-between"><span><span class="stage offer" style="font-size:9px"><span></span>Oferta</span> · A. Kowalska</span><span>3 dni temu</span></div>
+    </div>
+  </div>
+  <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+    <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px">Historycznie (4 wygrane)</div>
+    <div class="flex col gap-sm" style="font-size:12px;">
+      <div class="flex justify-between"><span>mBank · onboarding API (2025)</span><strong class="num">240k</strong></div>
+      <div class="flex justify-between"><span>mBank · BI platforma (2024)</span><strong class="num">680k</strong></div>
+      <div class="flex justify-between"><span>mBank · CMS migracja (2023)</span><strong class="num">920k</strong></div>
+      <div class="flex justify-between"><span>mBank · pilot AI (2023)</span><strong class="num">640k</strong></div>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<!-- GROUP HIERARCHY (account map) -->
+<div class="section-card mt-md">
+  <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-network"/></svg>Grupa kapitałowa — mBank Group</div><span class="contrib-tag contacts">contacts · relacje</span></div>
+  <div class="text-xs text-3 mb-md">Hierarchia własnościowa i powiązania w grupie. Wpływa na unikanie sprzedaży konkurencyjnej i dzielenie się referencjami.</div>
+  <div class="flex gap-md align-center" style="overflow-x:auto;padding:14px 0;">
+    <div style="background:var(--bg);padding:10px 14px;border-radius:8px;border:1px solid var(--border);min-width:160px;flex-shrink:0;">
+      <div class="text-xs text-3 fw-700" style="text-transform:uppercase">parent</div>
+      <div class="fw-700">Commerzbank AG</div>
+      <div class="text-xs text-3">DE · 69.3% udziałów</div>
+    </div>
+    <svg class="icon text-3"><use href="#i-arrow-right"/></svg>
+    <div style="background:var(--bg-3);padding:10px 14px;border-radius:8px;border:1px solid var(--accent-1);min-width:160px;flex-shrink:0;">
+      <div class="text-xs text-3 fw-700" style="text-transform:uppercase">tu jesteś</div>
+      <div class="fw-700">mBank S.A.</div>
+      <div class="text-xs text-3">parent grupy mBank</div>
+    </div>
+    <svg class="icon text-3"><use href="#i-arrow-right"/></svg>
+    <div class="flex col gap-sm">
+      <div style="background:var(--bg);padding:8px 12px;border-radius:8px;border:1px solid var(--border);min-width:160px;"><div class="text-sm fw-700">mLeasing</div><div class="text-xs text-3">100% · 0 dealów</div></div>
+      <div style="background:var(--bg);padding:8px 12px;border-radius:8px;border:1px solid var(--border);min-width:160px;"><div class="text-sm fw-700">mFaktoring</div><div class="text-xs text-3">100% · 1 deal historyczny</div></div>
+      <div style="background:var(--bg);padding:8px 12px;border-radius:8px;border:1px solid var(--border);min-width:160px;"><div class="text-sm fw-700">mBank Hipoteczny</div><div class="text-xs text-3">100% · 0 dealów</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- AI INSIGHTS -->
+<div class="section-card mt-md" style="background:linear-gradient(135deg,rgba(167,139,250,0.06),rgba(99,102,241,0.04));border-color:rgba(167,139,250,0.25);">
+  <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-sparkles"/></svg>AI · obserwacje o relacji z mBank</div><span class="contrib-tag crm">crm · ai</span></div>
+  <div class="flex col gap-sm" style="font-size:13px;line-height:1.6;">
+    <div>· <strong>Cykl decyzyjny:</strong> 90 dni od pierwszego maila do zakupu (śr. z 4 wygranych). Aktualny CBA już 75 dni — typowo decyzja w ciągu 2-3 tyg.</div>
+    <div>· <strong>Mocna relacja z Magdą</strong> (CIO) — decydent w 3 z 4 wygranych. Słabsza z Adamem (Dyr. IT) — 4 mc bez kontaktu. <em>Warto odświeżyć.</em></div>
+    <div>· <strong>Brak sprzedaży do spółek zależnych</strong> (mLeasing, mFaktoring, mBank Hipoteczny) — potencjał. mFaktoring miał 1 deal w 2022.</div>
+    <div>· <strong>Konkurencja:</strong> Comarch i Asseco w 2 z 4 ostatnich postępowań mBank. Wygrali przez specjalizację (CRM ich kompetencja).</div>
+  </div>
+</div>
+
+</main>
+</div></div>
+</section>
+
+</body>
+</html>

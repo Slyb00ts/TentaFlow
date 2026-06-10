@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Sync &amp; Nodes (M17)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.sync-flow {
+  display: grid;
+  grid-template-columns: 1fr 44px 1fr 44px 1fr;
+  gap: 10px;
+  align-items: center;
+}
+.sync-node-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  min-height: 132px;
+}
+.sync-arrow {
+  color: var(--accent-2);
+  display: flex;
+  justify-content: center;
+}
+.sync-arrow svg {
+  width: 24px;
+  height: 24px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+}
+.metric-stack {
+  display: grid;
+  gap: 8px;
+}
+.bar {
+  height: 8px;
+  border-radius: 6px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+.bar span {
+  display: block;
+  height: 100%;
+  border-radius: 6px;
+  background: var(--gradient-accent);
+}
+.bar.warn span { background: var(--warning); }
+.bar.danger span { background: var(--danger); }
+.node-row {
+  display: grid;
+  grid-template-columns: 210px 110px 130px 1fr 120px 120px;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.node-row.head {
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  background: var(--bg-3);
+}
+.node-row:last-child { border-bottom: 0; }
+.resource-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.resource-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+.timeline {
+  display: grid;
+  grid-template-columns: 130px 1fr 96px;
+  gap: 10px;
+  align-items: center;
+}
+@media (max-width: 980px) {
+  .app { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  .sync-flow, .grid-2, .grid-3, .resource-grid { grid-template-columns: 1fr; }
+  .sync-arrow { display: none; }
+  .node-row { grid-template-columns: 1fr; }
+  .screen-header .desc { max-width: none; text-align: left; margin-left: 0; }
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14"/><polyline points="13 6 19 12 13 18"/></symbol>
+  <symbol id="i-harddrive" viewBox="0 0 24 24"><line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M17</span><h2>Sync &amp; Nodes — globalny ekran TentaFlow</h2>
+    <div class="desc">Miejsce: globalny shell → Management → Sync &amp; Nodes. Ekran zarządza nodami, kolejkami, ledgerem, retencją i awariami synchronizacji dla core + addonów.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">15</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-link"/></svg>Sync &amp; Nodes<span class="badge danger">2</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer"><div class="user-chip"><div class="avatar">KC</div><div><div class="name-t">Krystian C.</div><div class="role">Platform admin</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Management</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Sync &amp; Nodes</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.71"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Sync &amp; Nodes <span class="chip success"><span class="dot"></span>ledger online</span></div>
+            <div class="d-sub">Org: acme-main · local node: <span class="mono">e45a29b1bb965192</span> · UFP/2 binary mesh · Fjall ledger</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-link"/></svg>4 trusted nodes</span>
+              <span class="chip success"><svg class="icon"><use href="#i-database"/></svg>SQL/KV/blob/core active</span>
+              <span class="chip warning"><svg class="icon"><use href="#i-alert"/></svg>2 conflicts</span>
+              <span class="chip"><svg class="icon"><use href="#i-harddrive"/></svg>retention: unlimited</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Rescan peers</button>
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-package"/></svg>Build snapshot</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-link"/></svg>Pair node</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab active"><svg class="icon"><use href="#i-dashboard"/></svg>Overview</button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Nodes<span class="count">4</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Ledger</button>
+          <button class="tab"><svg class="icon"><use href="#i-shield"/></svg>Policies</button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Conflicts<span class="count">2</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-clock"/></svg>Retention</button>
+          <div class="tabs-right">
+            <div class="segmented">
+              <button>1h</button><button class="active">24h</button><button>7d</button><button>30d</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-activity"/></svg>Outbox pending</div><div class="value">18</div><div class="delta warn">2 SQL · 3 blob chunks · 13 core</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-database"/></svg>Ledger size</div><div class="value">1.8 <span class="small">GB</span></div><div class="delta">Fjall · 0.4 GB snapshots</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-clock"/></svg>Oldest unsent</div><div class="value">14<span class="small">m</span></div><div class="delta up">retry scheduled in 25s</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-alert"/></svg>Conflicts</div><div class="value">2</div><div class="delta warn">1 contacts · 1 flow binding</div></div>
+        </div>
+
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-link"/></svg>Jak działa przepływ synchronizacji</div>
+            <span class="hint">Ten ekran nie jest addon's UI — to platformowy control plane</span>
+          </div>
+          <div class="sync-flow">
+            <div class="sync-node-card">
+              <div class="fw-800">Write API</div>
+              <div class="text-xs text-2 mt-sm">Core zapisuje SQL/KV/blob/core write przez jeden capture path. Addon nie wysyła danych samodzielnie.</div>
+              <div class="chip success mt-md"><span class="dot"></span>permission checked before commit</div>
+            </div>
+            <div class="sync-arrow"><svg><use href="#i-arrow"/></svg></div>
+            <div class="sync-node-card">
+              <div class="fw-800">Signed ledger</div>
+              <div class="text-xs text-2 mt-sm">Operacje binary, podpisane node identity. Snapshoty SQL są blob package + tail operations.</div>
+              <div class="chip accent mt-md">Fjall · no JSON protocol</div>
+            </div>
+            <div class="sync-arrow"><svg><use href="#i-arrow"/></svg></div>
+            <div class="sync-node-card">
+              <div class="fw-800">Target nodes</div>
+              <div class="text-xs text-2 mt-sm">Źródło sprawdza czy peer jest targetem zasobu zanim wyśle push, repair albo snapshot.</div>
+              <div class="chip warning mt-md">ACL source-side enforced</div>
+            </div>
+          </div>
+        </section>
+
+        <div class="grid-2">
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-link"/></svg>Nodes</div>
+              <button class="btn btn-secondary btn-sm">Topology map</button>
+            </div>
+            <div style="border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+              <div class="node-row head"><div>Node</div><div>Status</div><div>Owner</div><div>Allowed data</div><div>Lag</div><div>Storage</div></div>
+              <div class="node-row">
+                <div><div class="fw-800">Server Warsaw</div><div class="mono text-xs text-3">e45a29b1bb965192</div></div>
+                <div><span class="status-pill ok">online</span></div>
+                <div>Platform</div>
+                <div><span class="chip success">authority</span><span class="chip">all policies</span></div>
+                <div>0s</div>
+                <div><div class="bar"><span style="width:42%"></span></div><div class="text-xs text-3 mt-sm">42%</div></div>
+              </div>
+              <div class="node-row">
+                <div><div class="fw-800">Laptop Anna</div><div class="mono text-xs text-3">a17f20a91bd342de</div></div>
+                <div><span class="status-pill ok">online</span></div>
+                <div>user: anna</div>
+                <div><span class="chip">own contacts</span><span class="chip">calendar</span></div>
+                <div>9s</div>
+                <div><div class="bar"><span style="width:58%"></span></div><div class="text-xs text-3 mt-sm">58%</div></div>
+              </div>
+              <div class="node-row">
+                <div><div class="fw-800">Phone Marek</div><div class="mono text-xs text-3">b006aa21193caa40</div></div>
+                <div><span class="status-pill warn">relay</span></div>
+                <div>user: marek</div>
+                <div><span class="chip">department sales</span></div>
+                <div>14m</div>
+                <div><div class="bar warn"><span style="width:82%"></span></div><div class="text-xs text-3 mt-sm">82%</div></div>
+              </div>
+              <div class="node-row">
+                <div><div class="fw-800">RAG box</div><div class="mono text-xs text-3">8f10ef77819cdd92</div></div>
+                <div><span class="status-pill info">read-through</span></div>
+                <div>infra</div>
+                <div><span class="chip info">central only</span><span class="chip">no offline</span></div>
+                <div>0s</div>
+                <div><div class="bar danger"><span style="width:91%"></span></div><div class="text-xs text-3 mt-sm">91%</div></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-database"/></svg>Resource pipelines</div>
+              <span class="hint">Core + addony</span>
+            </div>
+            <div class="resource-grid">
+              <div class="resource-card"><div class="chip accent">SQLite</div><div class="value fw-800 mt-sm">12.4k</div><div class="text-xs text-2">row operations</div><div class="bar mt-md"><span style="width:74%"></span></div></div>
+              <div class="resource-card"><div class="chip info">KV</div><div class="value fw-800 mt-sm">8.1k</div><div class="text-xs text-2">key revisions</div><div class="bar mt-md"><span style="width:52%"></span></div></div>
+              <div class="resource-card"><div class="chip warning">Blob</div><div class="value fw-800 mt-sm">318</div><div class="text-xs text-2">chunked payloads</div><div class="bar warn mt-md"><span style="width:68%"></span></div></div>
+              <div class="resource-card"><div class="chip success">Core</div><div class="value fw-800 mt-sm">2.7k</div><div class="text-xs text-2">users, roles, flows</div><div class="bar mt-md"><span style="width:45%"></span></div></div>
+            </div>
+          </section>
+        </div>
+
+        <div class="grid-2">
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-alert"/></svg>Conflicts requiring action</div>
+              <button class="btn btn-secondary btn-sm">Open conflict center</button>
+            </div>
+            <table class="tf-table">
+              <thead><tr><th>Resource</th><th>Source</th><th>Conflict</th><th>Policy</th><th></th></tr></thead>
+              <tbody>
+                <tr><td><span class="mono">contacts/person/person-1</span></td><td>Phone Marek</td><td>SQL UNIQUE id=1</td><td><span class="chip warning">manual</span></td><td><button class="btn btn-primary btn-sm">Resolve</button></td></tr>
+                <tr><td><span class="mono">core/flow/92001</span></td><td>Laptop Anna</td><td>field name</td><td><span class="chip">server wins</span></td><td><button class="btn btn-secondary btn-sm">Review</button></td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-clock"/></svg>Retention &amp; disk guard</div>
+              <span class="hint">Domyślnie bez limitu</span>
+            </div>
+            <div class="metric-stack">
+              <div class="timeline"><div class="text-sm fw-700">Ledger retention</div><div class="bar"><span style="width:100%"></span></div><div class="chip success">unlimited</div></div>
+              <div class="timeline"><div class="text-sm fw-700">Snapshot packages</div><div class="bar"><span style="width:38%"></span></div><div class="text-xs text-2">412 MB</div></div>
+              <div class="timeline"><div class="text-sm fw-700">Blob chunks</div><div class="bar warn"><span style="width:68%"></span></div><div class="text-xs text-2">1.2 GB</div></div>
+              <div class="timeline"><div class="text-sm fw-700">Disk warning</div><div class="bar danger"><span style="width:90%"></span></div><div class="chip danger">10% left</div></div>
+            </div>
+            <div class="form-row mt-md">
+              <label>Retention mode<div class="label-desc">Platform policy, not addon manifest</div></label>
+              <select class="select"><option>Unlimited ledger history</option><option>Keep 6 months after safe compaction</option><option>Keep only latest snapshots + tail</option></select>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

@@ -1,0 +1,1790 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Meeting Bot (final mockup)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --shadow: 0 8px 24px rgba(0,0,0,0.5);
+  --shadow-lg: 0 16px 48px rgba(0,0,0,0.7);
+  --glow: 0 0 30px rgba(99, 102, 241, 0.25);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+.icon { width: 16px; height: 16px; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; fill: none; flex-shrink: 0; }
+.icon-sm { width: 13px; height: 13px; }
+.icon-lg { width: 20px; height: 20px; }
+.icon-xl { width: 24px; height: 24px; }
+
+/* ===== INTRO ===== */
+.intro {
+  max-width: 1480px; margin: 36px auto 0; padding: 0 24px;
+}
+.intro h1 {
+  font-size: 28px; font-weight: 800; margin-bottom: 8px;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.intro .lead { color: var(--text-2); max-width: 940px; font-size: 14px; line-height: 1.7; }
+.intro .rules {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin-top: 16px;
+}
+.intro .rules .pill {
+  font-size: 11px; font-weight: 600;
+  padding: 5px 12px; border-radius: 999px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  color: var(--text-2);
+}
+.intro .rules .pill.accent {
+  background: rgba(99,102,241,0.1); border-color: rgba(99,102,241,0.3); color: var(--accent-2);
+}
+
+.screen-label {
+  max-width: 1480px; margin: 60px auto 14px; padding: 0 24px;
+  display: flex; align-items: baseline; gap: 14px;
+}
+.screen-label .num {
+  width: 32px; height: 32px; border-radius: 8px;
+  background: var(--gradient-accent); color: white;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 800; font-size: 14px;
+  box-shadow: var(--glow);
+}
+.screen-label h2 { font-size: 20px; font-weight: 800; }
+.screen-label .desc { color: var(--text-3); font-size: 13px; }
+
+/* ===== APP SHELL ===== */
+.app-frame {
+  max-width: 1480px; margin: 0 auto 20px; padding: 0 24px;
+}
+.app-frame .frame-inner {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  height: 820px;
+  box-shadow: var(--shadow-lg);
+}
+.sidebar {
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  padding: 14px 10px 10px;
+}
+.sidebar .logo {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.sidebar .logo .octo {
+  width: 28px; height: 28px; border-radius: 8px;
+  background: var(--gradient-accent);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 16px;
+}
+.sidebar .logo .name {
+  font-size: 16px; font-weight: 800;
+  background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.sidebar .nav-section { margin-bottom: 12px; }
+.sidebar .heading {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 10px; font-weight: 700;
+  color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 10px 10px 6px;
+}
+.sidebar .nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: var(--radius-sm);
+  font-size: 13px; color: var(--text-2);
+  cursor: pointer;
+}
+.sidebar .nav-item:hover { background: var(--bg-3); color: var(--text); }
+.sidebar .nav-item.active {
+  background: linear-gradient(135deg, rgba(99,102,241,0.2), rgba(167,139,250,0.1));
+  color: var(--text);
+  border: 1px solid rgba(99,102,241,0.3);
+}
+.sidebar .nav-item .badge {
+  margin-left: auto; font-size: 9px; padding: 2px 6px; border-radius: 6px;
+  background: var(--bg-3); color: var(--text-3); font-weight: 700;
+}
+.sidebar .nav-item .badge.soon { background: rgba(245,158,11,0.15); color: var(--warning); }
+.sidebar .nav-item .badge.live { background: rgba(34,197,94,0.15); color: var(--success); animation: pulse 2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.5; } }
+.sidebar .footer {
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.user-chip {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: var(--radius-sm);
+  background: var(--bg-card);
+}
+.user-chip .avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--gradient-accent);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; color: white;
+}
+.user-chip .name-t { font-size: 12px; font-weight: 600; }
+.user-chip .role { font-size: 10px; color: var(--text-3); }
+
+/* ===== MAIN HEADER (unified across all user apps) ===== */
+.main { display: flex; flex-direction: column; overflow: hidden; }
+.app-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 18px 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  flex-shrink: 0;
+}
+.app-header .title-row {
+  display: flex; align-items: center; gap: 14px;
+}
+.app-header .title-ico {
+  width: 36px; height: 36px; border-radius: 10px;
+  background: linear-gradient(135deg, rgba(167,139,250,0.2), rgba(99,102,241,0.15));
+  border: 1px solid rgba(167,139,250,0.3);
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent-2);
+}
+.app-header h1 {
+  font-size: 17px; font-weight: 700;
+  display: flex; align-items: center; gap: 10px;
+}
+.app-header .sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+.app-header .actions { display: flex; gap: 8px; align-items: center; }
+
+/* ===== BUTTONS (tf-button visual replica) ===== */
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: transparent; color: var(--text);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s ease;
+}
+.btn:hover { border-color: var(--border-hover); background: var(--bg-3); }
+.btn.primary {
+  background: var(--gradient-accent);
+  border-color: transparent; color: white;
+  box-shadow: var(--glow);
+}
+.btn.primary:hover { filter: brightness(1.1); }
+.btn.danger { border-color: rgba(239,68,68,0.4); color: var(--danger); }
+.btn.danger:hover { background: rgba(239,68,68,0.1); }
+.btn.ghost { border-color: transparent; color: var(--text-2); }
+.btn.ghost:hover { background: var(--bg-3); }
+.btn.sm { padding: 6px 10px; font-size: 12px; }
+.btn.lg { padding: 11px 22px; font-size: 14px; }
+
+/* ===== CHIPS ===== */
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 600;
+  background: var(--bg-3); color: var(--text-2);
+  border: 1px solid var(--border);
+}
+.chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.chip.success { background: rgba(34,197,94,0.12); color: var(--success); border-color: rgba(34,197,94,0.3); }
+.chip.warn { background: rgba(245,158,11,0.12); color: var(--warning); border-color: rgba(245,158,11,0.3); }
+.chip.danger { background: rgba(239,68,68,0.12); color: var(--danger); border-color: rgba(239,68,68,0.3); }
+.chip.accent { background: rgba(99,102,241,0.12); color: var(--accent-2); border-color: rgba(99,102,241,0.3); }
+.chip.live { background: rgba(34,197,94,0.12); color: var(--success); border-color: rgba(34,197,94,0.3); }
+.chip.live .dot { animation: pulse 2s ease-in-out infinite; }
+
+/* ===== SCREEN 1: EMPTY / JOIN ===== */
+.empty-hero {
+  flex: 1; overflow-y: auto;
+  padding: 32px 40px 40px;
+  display: grid; grid-template-columns: 1fr 360px;
+  gap: 28px;
+  align-content: start;
+}
+.join-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  padding: 36px 40px;
+  position: relative; overflow: hidden;
+}
+.join-card::before {
+  content: ''; position: absolute; inset: -2px;
+  background: radial-gradient(circle at top left, rgba(167,139,250,0.15), transparent 55%);
+  pointer-events: none;
+}
+.join-card .hero-ico {
+  width: 64px; height: 64px; border-radius: 16px;
+  background: linear-gradient(135deg, rgba(167,139,250,0.25), rgba(99,102,241,0.15));
+  border: 1px solid rgba(167,139,250,0.3);
+  color: var(--accent-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  margin-bottom: 20px;
+  box-shadow: var(--glow);
+}
+.join-card h2 {
+  font-size: 22px; font-weight: 800;
+  margin-bottom: 6px;
+}
+.join-card .hero-sub {
+  color: var(--text-2); font-size: 14px; line-height: 1.7;
+  max-width: 520px; margin-bottom: 28px;
+}
+.join-input-wrap {
+  display: flex; gap: 10px;
+  margin-bottom: 12px;
+  position: relative;
+}
+.tf-input-box {
+  flex: 1; position: relative;
+}
+.tf-input-box input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px 14px 44px;
+  color: var(--text);
+  font-family: inherit; font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.tf-input-box input::placeholder { color: var(--text-3); }
+.tf-input-box input:focus {
+  border-color: var(--accent-1);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.tf-input-box .ico-left {
+  position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+  color: var(--text-3);
+}
+.join-hint {
+  font-size: 12px; color: var(--text-3);
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 20px;
+}
+.supported-platforms {
+  display: flex; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.platform-badge {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  font-size: 12px; color: var(--text-2);
+}
+.platform-badge.active { border-color: rgba(99,102,241,0.4); background: rgba(99,102,241,0.08); color: var(--text); }
+.platform-badge .ico { width: 14px; height: 14px; border-radius: 4px; display: inline-block; }
+
+.side-panel {
+  display: flex; flex-direction: column; gap: 20px;
+}
+.info-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+}
+.info-card h3 {
+  font-size: 13px; font-weight: 700;
+  color: var(--text-2);
+  margin-bottom: 14px;
+  display: flex; align-items: center; gap: 8px;
+}
+.info-card .kv {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; color: var(--text-2);
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(31,37,72,0.5);
+}
+.info-card .kv:last-child { border-bottom: none; }
+.info-card .kv .k { color: var(--text-3); }
+.info-card .kv .v { color: var(--text); font-weight: 600; }
+.info-card .kv .v code { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent-2); }
+
+/* Recent meetings */
+.recent-list {
+  display: flex; flex-direction: column; gap: 8px;
+}
+.recent-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; border-radius: var(--radius);
+  background: var(--bg-input);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.recent-item:hover { border-color: var(--border-hover); background: var(--bg-3); }
+.recent-item .ri-ico {
+  width: 32px; height: 32px; border-radius: 8px;
+  background: rgba(99,102,241,0.12); color: var(--accent-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.recent-item .ri-body { flex: 1; min-width: 0; }
+.recent-item .ri-title { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-item .ri-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+
+/* ===== SCREEN 2: JOINING ===== */
+.joining-hero {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  padding: 40px;
+}
+.joining-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  padding: 40px 48px;
+  width: 560px; max-width: 100%;
+  text-align: center;
+}
+.joining-spinner {
+  width: 72px; height: 72px; border-radius: 50%;
+  border: 3px solid rgba(99,102,241,0.15);
+  border-top-color: var(--accent-2);
+  margin: 0 auto 24px;
+  animation: spin 1.2s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.joining-card h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+.joining-card .sub { color: var(--text-2); font-size: 13px; margin-bottom: 28px; }
+.joining-steps {
+  display: flex; flex-direction: column; gap: 10px;
+  text-align: left;
+}
+.joining-step {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 16px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.joining-step .step-ico {
+  width: 28px; height: 28px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  font-weight: 700; font-size: 12px;
+}
+.joining-step.done .step-ico {
+  background: rgba(34,197,94,0.15); color: var(--success);
+  border: 1.5px solid rgba(34,197,94,0.4);
+}
+.joining-step.active .step-ico {
+  background: rgba(99,102,241,0.15); color: var(--accent-2);
+  border: 1.5px solid var(--accent-1);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+.joining-step.pending .step-ico {
+  background: var(--bg-3); color: var(--text-3);
+  border: 1.5px solid var(--border);
+}
+.joining-step .step-body { flex: 1; }
+.joining-step .step-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.joining-step .step-desc { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.joining-step.pending .step-title { color: var(--text-3); }
+
+/* ===== SCREEN 3: ACTIVE MEETING ===== */
+.meeting-body {
+  flex: 1; display: grid;
+  grid-template-columns: 1fr 340px;
+  overflow: hidden;
+}
+.transcript-col {
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-2);
+}
+.transcript-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 28px;
+  border-bottom: 1px solid var(--border);
+  gap: 10px;
+}
+.transcript-toolbar .tabs {
+  display: flex; gap: 2px;
+  background: var(--bg-input);
+  border-radius: var(--radius);
+  padding: 3px;
+}
+.transcript-toolbar .tab {
+  padding: 6px 14px;
+  font-size: 12px; font-weight: 600;
+  color: var(--text-3); border-radius: 7px;
+  cursor: pointer;
+}
+.transcript-toolbar .tab.active {
+  background: var(--bg-card); color: var(--text);
+  box-shadow: var(--shadow);
+}
+.transcript-toolbar .count-chip {
+  font-size: 11px; color: var(--text-3);
+  padding: 3px 8px; border-radius: 6px;
+  background: var(--bg-input);
+}
+
+.transcript-list {
+  flex: 1; overflow-y: auto;
+  padding: 20px 28px 24px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.t-row {
+  display: flex; gap: 14px;
+  animation: slideIn 0.3s ease;
+}
+@keyframes slideIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.t-avatar {
+  width: 36px; height: 36px; border-radius: 10px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 12px; color: white;
+  flex-shrink: 0;
+  border: 1px solid rgba(255,255,255,0.05);
+}
+.t-avatar.sp-1 { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
+.t-avatar.sp-2 { background: linear-gradient(135deg, #14b8a6, #22c55e); }
+.t-avatar.sp-3 { background: linear-gradient(135deg, #f59e0b, #ef4444); }
+.t-avatar.sp-4 { background: linear-gradient(135deg, #06b6d4, #3b82f6); }
+.t-avatar.ai {
+  background: linear-gradient(135deg, rgba(167,139,250,0.3), rgba(99,102,241,0.2));
+  border: 1px solid rgba(167,139,250,0.4);
+  color: var(--accent-2);
+}
+.t-body { flex: 1; min-width: 0; }
+.t-meta {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.t-meta .name { font-weight: 700; color: var(--text); }
+.t-meta .time { color: var(--text-3); font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.t-meta .conf { color: var(--text-3); font-size: 10px; }
+.t-meta .badge-enrolled {
+  font-size: 10px; padding: 2px 7px; border-radius: 6px;
+  background: rgba(34,197,94,0.15); color: var(--success);
+  border: 1px solid rgba(34,197,94,0.3);
+}
+.t-meta .badge-temp {
+  font-size: 10px; padding: 2px 7px; border-radius: 6px;
+  background: var(--bg-3); color: var(--text-3);
+  border: 1px solid var(--border);
+}
+.t-text {
+  color: var(--text-2); font-size: 14px; line-height: 1.65;
+}
+.t-text strong { color: var(--text); }
+.t-row.ai .t-text {
+  background: rgba(167,139,250,0.06);
+  border: 1px dashed rgba(167,139,250,0.3);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  color: var(--text);
+}
+.t-row.ai .t-text .label {
+  font-size: 10px; font-weight: 700;
+  color: var(--accent-2); text-transform: uppercase; letter-spacing: 0.08em;
+  margin-bottom: 4px; display: block;
+}
+
+/* Active speaker live indicator */
+.t-row.speaking .t-avatar::after {
+  content: ''; position: absolute;
+  inset: -3px; border-radius: 13px;
+  border: 2px solid var(--success);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.t-row.speaking .t-avatar { position: relative; }
+
+/* Live tail indicator */
+.live-bar {
+  position: sticky; bottom: 0;
+  padding: 10px 28px 14px;
+  background: linear-gradient(to top, var(--bg-2) 0%, var(--bg-2) 60%, transparent 100%);
+  display: flex; align-items: center; gap: 10px;
+  color: var(--text-3); font-size: 12px;
+}
+.live-bar .pulse-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--success);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+/* Right column */
+.side-col {
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  overflow-y: auto;
+  padding: 20px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+.panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.panel-head {
+  padding: 12px 16px;
+  font-size: 11px; font-weight: 700;
+  color: var(--text-2);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.panel-head .count { color: var(--text-3); }
+.panel-body { padding: 12px 14px; }
+
+.participant {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 4px;
+  position: relative;
+}
+.participant + .participant { border-top: 1px dashed var(--border); }
+.participant .p-avatar {
+  width: 30px; height: 30px; border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 11px; color: white;
+  flex-shrink: 0;
+}
+.participant .p-body { flex: 1; min-width: 0; }
+.participant .p-name { font-size: 12px; font-weight: 600; color: var(--text); }
+.participant .p-sub { font-size: 10px; color: var(--text-3); }
+.participant.speaking .p-avatar {
+  box-shadow: 0 0 0 2px var(--success);
+  animation: pulse-ring 1.4s ease-in-out infinite;
+}
+@keyframes pulse-ring {
+  0%, 100% { box-shadow: 0 0 0 2px var(--success); }
+  50% { box-shadow: 0 0 0 4px rgba(34,197,94,0.4); }
+}
+
+/* AI summary card */
+.summary-block {
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed var(--border);
+}
+.summary-block:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+.summary-block .sb-title {
+  font-size: 11px; font-weight: 700;
+  color: var(--accent-2); text-transform: uppercase; letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+.summary-block .sb-body { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+.action-item {
+  display: flex; gap: 8px; margin-top: 5px;
+  font-size: 12px; color: var(--text);
+}
+.action-item::before {
+  content: '✓'; color: var(--success); font-weight: 700;
+}
+.action-item .when { color: var(--warning); font-weight: 600; }
+
+/* Config card */
+.cfg-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 0;
+  font-size: 12px;
+}
+.cfg-row .k { color: var(--text-3); }
+.cfg-row .v { color: var(--text); font-weight: 600; }
+.cfg-row .v code { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent-2); }
+
+/* ===== SCREEN 4: VNC PREVIEW ===== */
+.vnc-window {
+  flex: 1; overflow-y: auto;
+  padding: 24px 40px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+.vnc-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+.vnc-toolbar .left { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-2); }
+.vnc-screen {
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  aspect-ratio: 16 / 10;
+  position: relative;
+  overflow: hidden;
+}
+.vnc-mock-ui {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse at 20% 30%, rgba(99,102,241,0.08), transparent 40%),
+    radial-gradient(ellipse at 80% 70%, rgba(167,139,250,0.06), transparent 40%),
+    #181c35;
+  padding: 24px;
+  display: flex; flex-direction: column;
+  color: white;
+}
+.vnc-teams-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 16px;
+  background: rgba(10,13,36,0.8);
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+.vnc-teams-head .ico-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  color: #6264a7; font-weight: 700; font-size: 14px;
+}
+.vnc-teams-head .ico-pill .tpill { width: 20px; height: 20px; background: #6264a7; border-radius: 5px; display: inline-block; }
+.vnc-participants-grid {
+  flex: 1;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+}
+.vnc-cam {
+  background: #2a2d52; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; font-weight: 800; color: rgba(255,255,255,0.7);
+  position: relative;
+}
+.vnc-cam .name-tag {
+  position: absolute; left: 8px; bottom: 8px;
+  font-size: 10px; font-weight: 600; color: white;
+  background: rgba(0,0,0,0.6); padding: 3px 8px; border-radius: 4px;
+}
+.vnc-cam.bot { background: linear-gradient(135deg, rgba(99,102,241,0.3), rgba(167,139,250,0.2)); border: 2px solid rgba(167,139,250,0.4); }
+.vnc-cam.bot .name-tag { background: rgba(167,139,250,0.3); }
+
+/* ===== SCREEN 5: HISTORY ===== */
+.history-layout {
+  flex: 1; display: grid;
+  grid-template-columns: 320px 1fr;
+  overflow: hidden;
+}
+.history-sidebar {
+  border-right: 1px solid var(--border);
+  background: var(--bg-2);
+  overflow-y: auto;
+  padding: 16px;
+}
+.history-search {
+  position: relative; margin-bottom: 14px;
+}
+.history-search input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px 10px 38px;
+  color: var(--text); font-family: inherit; font-size: 13px;
+  outline: none;
+}
+.history-search .ico-left {
+  position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+  color: var(--text-3);
+}
+.history-group-label {
+  font-size: 10px; font-weight: 700;
+  color: var(--text-3); text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 12px 4px 8px;
+}
+.history-item {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.history-item:hover { border-color: var(--border-hover); background: var(--bg-card-hover); }
+.history-item.active { border-color: var(--accent-1); background: rgba(99,102,241,0.08); }
+.history-item .hi-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.history-item .hi-meta { font-size: 11px; color: var(--text-3); display: flex; gap: 8px; }
+.history-item .hi-meta .sep::before { content: '·'; margin: 0 3px; }
+.history-item .hi-summary { font-size: 12px; color: var(--text-2); margin-top: 6px; line-height: 1.5; }
+
+.history-detail {
+  overflow-y: auto; padding: 24px 32px;
+  background: var(--bg-2);
+}
+.history-detail .hd-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  margin-bottom: 20px;
+  padding-bottom: 16px; border-bottom: 1px solid var(--border);
+}
+.history-detail h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+.history-detail .hd-meta { font-size: 12px; color: var(--text-3); display: flex; gap: 10px; }
+
+.hd-tabs { display: flex; gap: 4px; margin-bottom: 18px; }
+.hd-tab {
+  padding: 7px 14px;
+  font-size: 12px; font-weight: 600; color: var(--text-3);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.hd-tab.active {
+  background: var(--bg-card); color: var(--text);
+  border-color: var(--border);
+}
+
+/* ===== SCREEN 6: ERROR (addon not deployed) ===== */
+.error-hero {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  padding: 40px;
+}
+.error-card {
+  background: var(--bg-card);
+  border: 1px solid rgba(239,68,68,0.3);
+  border-radius: var(--radius-xl);
+  padding: 36px 40px;
+  max-width: 560px;
+  text-align: center;
+  position: relative;
+}
+.error-card .err-ico {
+  width: 72px; height: 72px; border-radius: 20px;
+  background: rgba(239,68,68,0.12);
+  color: var(--danger);
+  border: 1px solid rgba(239,68,68,0.3);
+  display: inline-flex; align-items: center; justify-content: center;
+  margin-bottom: 20px;
+}
+.error-card h2 { font-size: 19px; font-weight: 700; margin-bottom: 8px; }
+.error-card .err-desc { color: var(--text-2); font-size: 13px; line-height: 1.7; margin-bottom: 24px; }
+.error-card .err-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+
+/* ===== SCREEN 7: SETTINGS ===== */
+.settings-body {
+  flex: 1; overflow-y: auto;
+  padding: 28px 40px;
+  display: flex; flex-direction: column; gap: 20px;
+  max-width: 820px; margin: 0 auto; width: 100%;
+}
+.settings-section {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 22px 24px;
+}
+.settings-section h3 {
+  font-size: 14px; font-weight: 700;
+  margin-bottom: 4px;
+}
+.settings-section .section-sub {
+  font-size: 12px; color: var(--text-3); margin-bottom: 18px;
+}
+.settings-field {
+  display: grid; grid-template-columns: 1fr 320px;
+  gap: 18px; align-items: center;
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+}
+.settings-field:first-child { border-top: none; padding-top: 0; }
+.settings-field .field-label { font-size: 13px; font-weight: 600; }
+.settings-field .field-hint { font-size: 11px; color: var(--text-3); margin-top: 3px; }
+.settings-field select, .settings-field input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 9px 12px;
+  color: var(--text); font-family: inherit; font-size: 13px;
+  outline: none;
+}
+
+/* SVG defs */
+.hidden { display: none; }
+
+/* Responsive */
+@media (max-width: 1200px) {
+  .app-frame .frame-inner { height: auto; }
+  .empty-hero { grid-template-columns: 1fr; }
+  .meeting-body { grid-template-columns: 1fr; }
+  .side-col { border-left: none; border-top: 1px solid var(--border); }
+  .history-layout { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- SVG defs (icons) -->
+<svg class="hidden">
+<defs>
+<symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+<symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></symbol>
+<symbol id="i-meeting" viewBox="0 0 24 24"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M22 8l-6 4 6 4V8z"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></symbol>
+<symbol id="i-workflow-app" viewBox="0 0 24 24"><rect x="2" y="3" width="7" height="7" rx="1"/><rect x="15" y="3" width="7" height="7" rx="1"/><rect x="2" y="14" width="7" height="7" rx="1"/><rect x="15" y="14" width="7" height="7" rx="1"/><path d="M9 6h6M9 17h6M6 10v4M18 10v4"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></symbol>
+<symbol id="i-speaker" viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 4 10 15 15 0 0 1-4 10 15 15 0 0 1-4-10 15 15 0 0 1 4-10z"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/><path d="M5.4 5.4L10.6 10.6M18.6 5.4l-5.2 5.2M5.4 18.6l5.2-5.2M18.6 18.6l-5.2-5.2"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 4v4M8 2v2M16 2v2M9 14h.01M15 14h.01"/></symbol>
+<symbol id="i-log-out" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 2l2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7zM19 14l.75 2.5L22 17l-2.25.5L19 20l-.75-2.5L16 17l2.25-.5z"/></symbol>
+<symbol id="i-maximize" viewBox="0 0 24 24"><path d="M3 3h7v2H5v5H3V3zM14 3h7v7h-2V5h-5V3zM3 14h2v5h5v2H3v-7zM21 14v7h-7v-2h5v-5h2z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="M5 3l14 9-14 9V3z"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+<symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>Meeting Bot — final mockup</h1>
+  <p class="lead">
+    Kompletny re-design aplikacji Meeting Bot jako user-app w nowym języku projektowym. Jednolity header (żadnego REC/Stop — bot dołącza wklejeniem linka), czytelna typografia, natywne web-components z systemu (tf-button, tf-chip, tf-input). Pokazane 7 ekranów pokrywających pełny flow: pusty stan → dołączanie → aktywne spotkanie → podgląd ekranu bota → historia sesji → błąd braku addona → ustawienia.
+  </p>
+  <div class="rules">
+    <span class="pill accent">User app · prawy dolny avatar</span>
+    <span class="pill">Join by URL (Teams/Meet/Zoom)</span>
+    <span class="pill">Live transcript · speaker diarization</span>
+    <span class="pill">AI summary inline</span>
+    <span class="pill">Session history + download .txt</span>
+    <span class="pill">VNC preview w iframe (nie popup)</span>
+    <span class="pill">Spójny header z Chat/Notes/Tłumacz</span>
+  </div>
+</div>
+
+<!-- ============================================================
+     SCREEN 1 — EMPTY / JOIN
+     ============================================================ -->
+<div class="screen-label">
+  <span class="num">1</span>
+  <div>
+    <h2>Pusty stan — wklej link spotkania</h2>
+    <div class="desc">Domyślny widok gdy bot nie jest w spotkaniu. Centralny input URL, lista ostatnich sesji, status konfiguracji bota.</div>
+  </div>
+</div>
+<div class="app-frame">
+<div class="frame-inner">
+  <!-- sidebar -->
+  <aside class="sidebar">
+    <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Moje aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Wszystkie aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-chat"/></svg>Chat</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-image"/></svg>Obrazy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-mic"/></svg>Notatki</div>
+      <div class="nav-item active"><svg class="icon"><use href="#i-meeting"/></svg>Meeting Bot</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-workflow-app"/></svg>Przepływy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-star"/></svg>Prompty</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-speaker"/></svg>TTS</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    </div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-network"/></svg>Sieć</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-network"/></svg>Mesh (podgląd)</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-zap"/></svg>Tailscale</div>
+    </div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-user"/></svg>Konto</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-user"/></svg>Profil</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</div>
+    </div>
+    <div class="footer">
+      <div class="user-chip"><div class="avatar">MK</div><div><div class="name-t">Maja K.</div><div class="role">Użytkownik</div></div></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="app-header">
+      <div class="title-row">
+        <div class="title-ico"><svg class="icon icon-lg"><use href="#i-meeting"/></svg></div>
+        <div>
+          <h1>Meeting Bot</h1>
+          <div class="sub">Bot dołącza do spotkań Teams/Meet/Zoom i robi live transcript</div>
+        </div>
+      </div>
+      <div class="actions">
+        <span class="chip"><span class="dot"></span>Bot idle</span>
+        <button class="btn ghost sm"><svg class="icon"><use href="#i-clock"/></svg>Historia</button>
+        <button class="btn ghost sm"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+      </div>
+    </header>
+
+    <div class="empty-hero">
+      <div class="join-card">
+        <div class="hero-ico"><svg class="icon icon-xl"><use href="#i-link"/></svg></div>
+        <h2>Wklej link spotkania</h2>
+        <p class="hero-sub">Bot dołączy pod podanym URL, włączy mikrofon "listen-only" i zacznie transkrybować. Zostaje w spotkaniu aż do opuszczenia lub końca sesji. Żadnego rec/stop — uczestnicy widzą go jak zwykłego gościa z etykietą "AI transcription".</p>
+
+        <div class="join-input-wrap">
+          <div class="tf-input-box">
+            <span class="ico-left"><svg class="icon"><use href="#i-link"/></svg></span>
+            <input type="text" placeholder="https://teams.microsoft.com/l/meetup-join/..." value="">
+          </div>
+          <button class="btn primary lg"><svg class="icon"><use href="#i-play"/></svg>Dołącz</button>
+        </div>
+        <div class="join-hint"><svg class="icon icon-sm"><use href="#i-info"/></svg>Enter aby dołączyć · bot uruchamia się w ~12-20s</div>
+
+        <div class="supported-platforms">
+          <div class="platform-badge active"><span class="ico" style="background:#6264a7"></span>Microsoft Teams</div>
+          <div class="platform-badge"><span class="ico" style="background:#0f9d58"></span>Google Meet</div>
+          <div class="platform-badge"><span class="ico" style="background:#2d8cff"></span>Zoom</div>
+          <div class="platform-badge"><span class="ico" style="background:#f2584c"></span>Discord<small style="color:var(--text-3);font-size:10px;margin-left:4px;">beta</small></div>
+        </div>
+      </div>
+
+      <div class="side-panel">
+        <div class="info-card">
+          <h3><svg class="icon"><use href="#i-bot"/></svg>Konfiguracja bota</h3>
+          <div class="kv"><span class="k">Nazwa wyświetlana</span><span class="v">TentaFlow Bot</span></div>
+          <div class="kv"><span class="k">Model STT</span><span class="v"><code>whisper-large-v3</code></span></div>
+          <div class="kv"><span class="k">Diaryzacja</span><span class="v"><code>pyannote-3.1</code></span></div>
+          <div class="kv"><span class="k">AI summary</span><span class="v"><code>qwen-3.5-0.8b</code></span></div>
+          <div class="kv"><span class="k">Węzeł</span><span class="v">spark-002 · local</span></div>
+        </div>
+
+        <div class="info-card">
+          <h3><svg class="icon"><use href="#i-clock"/></svg>Ostatnie spotkania</h3>
+          <div class="recent-list">
+            <div class="recent-item">
+              <div class="ri-ico"><svg class="icon"><use href="#i-meeting"/></svg></div>
+              <div class="ri-body">
+                <div class="ri-title">Stand-up 21.04</div>
+                <div class="ri-meta">wczoraj · 22 min · 4 mówców</div>
+              </div>
+              <svg class="icon" style="color:var(--text-3);"><use href="#i-chevron-right"/></svg>
+            </div>
+            <div class="recent-item">
+              <div class="ri-ico"><svg class="icon"><use href="#i-meeting"/></svg></div>
+              <div class="ri-body">
+                <div class="ri-title">Review architektury v3</div>
+                <div class="ri-meta">pn 14:00 · 58 min · 6 mówców</div>
+              </div>
+              <svg class="icon" style="color:var(--text-3);"><use href="#i-chevron-right"/></svg>
+            </div>
+            <div class="recent-item">
+              <div class="ri-ico"><svg class="icon"><use href="#i-meeting"/></svg></div>
+              <div class="ri-body">
+                <div class="ri-title">Klient — demo TentaFlow</div>
+                <div class="ri-meta">pt 10:30 · 41 min · 3 mówców</div>
+              </div>
+              <svg class="icon" style="color:var(--text-3);"><use href="#i-chevron-right"/></svg>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</div>
+
+<!-- ============================================================
+     SCREEN 2 — JOINING (progress)
+     ============================================================ -->
+<div class="screen-label">
+  <span class="num">2</span>
+  <div>
+    <h2>Dołączanie — progress 3-etapowy</h2>
+    <div class="desc">Po kliknięciu "Dołącz": bot container startuje → uruchamia przeglądarkę Teams → wchodzi do spotkania i czeka na akceptację hosta.</div>
+  </div>
+</div>
+<div class="app-frame">
+<div class="frame-inner">
+  <aside class="sidebar">
+    <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Moje aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Wszystkie aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-chat"/></svg>Chat</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-image"/></svg>Obrazy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-mic"/></svg>Notatki</div>
+      <div class="nav-item active"><svg class="icon"><use href="#i-meeting"/></svg>Meeting Bot<span class="badge live">live</span></div>
+      <div class="nav-item"><svg class="icon"><use href="#i-workflow-app"/></svg>Przepływy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-star"/></svg>Prompty</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-speaker"/></svg>TTS</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    </div>
+    <div class="footer">
+      <div class="user-chip"><div class="avatar">MK</div><div><div class="name-t">Maja K.</div><div class="role">Użytkownik</div></div></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="app-header">
+      <div class="title-row">
+        <div class="title-ico"><svg class="icon icon-lg"><use href="#i-meeting"/></svg></div>
+        <div>
+          <h1>Meeting Bot</h1>
+          <div class="sub">Łączenie ze spotkaniem Teams...</div>
+        </div>
+      </div>
+      <div class="actions">
+        <span class="chip warn"><span class="dot"></span>Joining...</span>
+        <button class="btn danger sm"><svg class="icon"><use href="#i-x"/></svg>Anuluj</button>
+      </div>
+    </header>
+
+    <div class="joining-hero">
+      <div class="joining-card">
+        <div class="joining-spinner"></div>
+        <h2>Bot dołącza do spotkania</h2>
+        <p class="sub">teams.microsoft.com/l/meetup-join/19:meeting_NDc4...</p>
+
+        <div class="joining-steps">
+          <div class="joining-step done">
+            <div class="step-ico"><svg class="icon icon-sm"><use href="#i-check"/></svg></div>
+            <div class="step-body">
+              <div class="step-title">Kontener bota uruchomiony</div>
+              <div class="step-desc">teams-bot@0.3.1 · headless Chromium gotowy · 2.1s</div>
+            </div>
+          </div>
+          <div class="joining-step done">
+            <div class="step-ico"><svg class="icon icon-sm"><use href="#i-check"/></svg></div>
+            <div class="step-body">
+              <div class="step-title">Wczytano stronę Teams</div>
+              <div class="step-desc">Kliknięto "Dołącz jako gość" · 4.8s</div>
+            </div>
+          </div>
+          <div class="joining-step active">
+            <div class="step-ico">3</div>
+            <div class="step-body">
+              <div class="step-title">Oczekiwanie na akceptację hosta</div>
+              <div class="step-desc">Bot jest w lobby · host widzi prośbę o dołączenie</div>
+            </div>
+          </div>
+          <div class="joining-step pending">
+            <div class="step-ico">4</div>
+            <div class="step-body">
+              <div class="step-title">Start transkrypcji</div>
+              <div class="step-desc">Audio pipeline + diaryzacja uruchomią się po wejściu</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</div>
+
+<!-- ============================================================
+     SCREEN 3 — ACTIVE MEETING
+     ============================================================ -->
+<div class="screen-label">
+  <span class="num">3</span>
+  <div>
+    <h2>Aktywne spotkanie — live transcript + AI summary</h2>
+    <div class="desc">Główny widok podczas spotkania. Lewa: streaming transkrypt z diaryzacją i inline AI wstawkami. Prawa: uczestnicy, action items, stan STT/LLM.</div>
+  </div>
+</div>
+<div class="app-frame">
+<div class="frame-inner">
+  <aside class="sidebar">
+    <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Moje aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Wszystkie aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-chat"/></svg>Chat</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-image"/></svg>Obrazy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-mic"/></svg>Notatki</div>
+      <div class="nav-item active"><svg class="icon"><use href="#i-meeting"/></svg>Meeting Bot<span class="badge live">live</span></div>
+      <div class="nav-item"><svg class="icon"><use href="#i-workflow-app"/></svg>Przepływy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-star"/></svg>Prompty</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-speaker"/></svg>TTS</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    </div>
+    <div class="footer">
+      <div class="user-chip"><div class="avatar">MK</div><div><div class="name-t">Maja K.</div><div class="role">Użytkownik</div></div></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="app-header">
+      <div class="title-row">
+        <div class="title-ico"><svg class="icon icon-lg"><use href="#i-meeting"/></svg></div>
+        <div>
+          <h1>Stand-up 22.04 <span class="chip live"><span class="dot"></span>Live</span></h1>
+          <div class="sub">4 uczestników · 14 min 32s · Microsoft Teams</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn ghost sm"><svg class="icon"><use href="#i-maximize"/></svg>Podgląd ekranu</button>
+        <button class="btn ghost sm"><svg class="icon"><use href="#i-download"/></svg>Pobierz .txt</button>
+        <button class="btn danger sm"><svg class="icon"><use href="#i-log-out"/></svg>Opuść</button>
+      </div>
+    </header>
+
+    <div class="meeting-body">
+      <div class="transcript-col">
+        <div class="transcript-toolbar">
+          <div class="tabs">
+            <div class="tab active">Transkrypt</div>
+            <div class="tab">Działania <span class="count-chip" style="margin-left:4px;">4</span></div>
+            <div class="tab">Podsumowanie</div>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="chip accent"><svg class="icon icon-sm"><use href="#i-sparkles"/></svg>AI insights ON</span>
+            <span class="count-chip">87 wpisów</span>
+          </div>
+        </div>
+
+        <div class="transcript-list">
+          <div class="t-row">
+            <div class="t-avatar sp-1">MK</div>
+            <div class="t-body">
+              <div class="t-meta"><span class="name">Maja K.</span><span class="time">14:22:03</span><span class="badge-enrolled">✓ known</span><span class="conf">94%</span></div>
+              <div class="t-text">Cześć wszystkim. Zaczynamy stand-up. Tomek, co u ciebie?</div>
+            </div>
+          </div>
+
+          <div class="t-row">
+            <div class="t-avatar sp-2">TP</div>
+            <div class="t-body">
+              <div class="t-meta"><span class="name">Tomek P.</span><span class="time">14:22:14</span><span class="badge-enrolled">✓ known</span><span class="conf">96%</span></div>
+              <div class="t-text">Skończyłem migrację users-admin API. Testy przechodzą. Blocker: czekam na review od Krystiana — PR numer 142.</div>
+            </div>
+          </div>
+
+          <div class="t-row">
+            <div class="t-avatar sp-3">AK</div>
+            <div class="t-body">
+              <div class="t-meta"><span class="name">Admin Krystian</span><span class="time">14:22:38</span><span class="badge-enrolled">✓ known</span><span class="conf">92%</span></div>
+              <div class="t-text">Review zrobię dziś po 16. Następne zadanie dla Tomka — Audit Log backend.</div>
+            </div>
+          </div>
+
+          <div class="t-row ai">
+            <div class="t-avatar ai"><svg class="icon"><use href="#i-sparkles"/></svg></div>
+            <div class="t-body">
+              <div class="t-meta"><span class="name" style="color:var(--accent-2);">TentaFlow AI</span><span class="time">14:22:40</span></div>
+              <div class="t-text">
+                <span class="label">Wykryto action item</span>
+                <strong>Krystian</strong> → review PR #142 <strong style="color:var(--warning);">dziś 16:00</strong><br>
+                <strong>Tomek</strong> → Audit Log backend po merge
+              </div>
+            </div>
+          </div>
+
+          <div class="t-row speaking">
+            <div class="t-avatar sp-1">MK</div>
+            <div class="t-body">
+              <div class="t-meta"><span class="name">Maja K.</span><span class="time">14:23:02</span><span class="badge-enrolled">✓ known</span><span class="conf">91%</span></div>
+              <div class="t-text">Super. U mnie — przeniosłam Meeting Bot do user apps w mockupach. Feedback od Krystiana pozytywny. Muszę jeszcze dopracować VNC preview i error states...</div>
+            </div>
+          </div>
+
+          <div class="t-row">
+            <div class="t-avatar sp-4">?</div>
+            <div class="t-body">
+              <div class="t-meta"><span class="name" style="color:var(--text-3);">SPEAKER_04</span><span class="time">14:23:48</span><span class="badge-temp">tymczasowy</span><span class="conf">78%</span></div>
+              <div class="t-text">A jeszcze jedna rzecz — w Zoomie mamy problem z dołączaniem, bot wchodzi ale od razu dostaje booted. Sprawdzę konfig.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="live-bar">
+          <span class="pulse-dot"></span>
+          <span>Słucha · ostatni wpis 2s temu · ~220ms latency</span>
+          <span style="margin-left:auto; font-family:'JetBrains Mono',monospace; font-size:11px;">whisper-large-v3 · pyannote-3.1</span>
+        </div>
+      </div>
+
+      <div class="side-col">
+        <div class="panel">
+          <div class="panel-head">Uczestnicy <span class="count">4</span></div>
+          <div class="panel-body">
+            <div class="participant speaking">
+              <div class="p-avatar sp-1">MK</div>
+              <div class="p-body">
+                <div class="p-name">Maja K.</div>
+                <div class="p-sub">Enrolled · mówi teraz</div>
+              </div>
+            </div>
+            <div class="participant">
+              <div class="p-avatar sp-2">TP</div>
+              <div class="p-body">
+                <div class="p-name">Tomek P.</div>
+                <div class="p-sub">Enrolled · 42s temu</div>
+              </div>
+            </div>
+            <div class="participant">
+              <div class="p-avatar sp-3">AK</div>
+              <div class="p-body">
+                <div class="p-name">Admin Krystian</div>
+                <div class="p-sub">Enrolled · 30s temu</div>
+              </div>
+            </div>
+            <div class="participant">
+              <div class="p-avatar sp-4">?</div>
+              <div class="p-body">
+                <div class="p-name" style="color:var(--text-3);">SPEAKER_04</div>
+                <div class="p-sub">Nieznany głos · <a href="#" style="color:var(--accent-2);text-decoration:none;">przypisz profil</a></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">AI Summary (live)</div>
+          <div class="panel-body">
+            <div class="summary-block">
+              <div class="sb-title">Kluczowe decyzje</div>
+              <div class="sb-body">Krystian review PR #142 dziś. Tomek → Audit Log backend po merge.</div>
+            </div>
+            <div class="summary-block">
+              <div class="sb-title">Action items (4)</div>
+              <div class="action-item">Krystian → review #142 · <span class="when">dziś 16:00</span></div>
+              <div class="action-item">Tomek → Audit Log impl · <span class="when">po merge</span></div>
+              <div class="action-item">Maja → VNC preview + error states · <span class="when">dziś</span></div>
+              <div class="action-item">SPEAKER_04 → fix Zoom booted · <span class="when">brak daty</span></div>
+            </div>
+            <div class="summary-block">
+              <div class="sb-title">Otwarte pytania</div>
+              <div class="sb-body">Brak · spotkanie w toku</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">Backend</div>
+          <div class="panel-body">
+            <div class="cfg-row"><span class="k">STT</span><span class="v"><code>whisper-large-v3</code></span></div>
+            <div class="cfg-row"><span class="k">Diaryzacja</span><span class="v"><code>pyannote-3.1</code></span></div>
+            <div class="cfg-row"><span class="k">LLM summary</span><span class="v"><code>qwen-3.5-0.8b</code></span></div>
+            <div class="cfg-row"><span class="k">Streaming latency</span><span class="v" style="color:var(--success);">220ms</span></div>
+            <div class="cfg-row"><span class="k">Enrolled speakers</span><span class="v">3 / 4</span></div>
+            <div class="cfg-row"><span class="k">Węzeł</span><span class="v">spark-002</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</div>
+
+<!-- ============================================================
+     SCREEN 4 — VNC PREVIEW (inline)
+     ============================================================ -->
+<div class="screen-label">
+  <span class="num">4</span>
+  <div>
+    <h2>Podgląd ekranu bota — VNC inline</h2>
+    <div class="desc">Zamiast popup window: iframe z noVNC osadzony w app. Widać na bieżąco co bot "widzi" w Teams (UI do debuggowania / certyfikacji że bot jest faktycznie w spotkaniu).</div>
+  </div>
+</div>
+<div class="app-frame">
+<div class="frame-inner">
+  <aside class="sidebar">
+    <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Moje aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-chat"/></svg>Chat</div>
+      <div class="nav-item active"><svg class="icon"><use href="#i-meeting"/></svg>Meeting Bot<span class="badge live">live</span></div>
+      <div class="nav-item"><svg class="icon"><use href="#i-mic"/></svg>Notatki</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-workflow-app"/></svg>Przepływy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-star"/></svg>Prompty</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-speaker"/></svg>TTS</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    </div>
+    <div class="footer">
+      <div class="user-chip"><div class="avatar">MK</div><div><div class="name-t">Maja K.</div><div class="role">Użytkownik</div></div></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="app-header">
+      <div class="title-row">
+        <div class="title-ico"><svg class="icon icon-lg"><use href="#i-meeting"/></svg></div>
+        <div>
+          <h1>Podgląd ekranu bota <span class="chip live"><span class="dot"></span>VNC 6080</span></h1>
+          <div class="sub">Stand-up 22.04 · 14:22 · bot @ spark-002:6080</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn ghost sm">← Powrót do transkryptu</button>
+        <button class="btn ghost sm"><svg class="icon"><use href="#i-refresh"/></svg></button>
+        <button class="btn danger sm"><svg class="icon"><use href="#i-log-out"/></svg>Opuść</button>
+      </div>
+    </header>
+
+    <div class="vnc-window">
+      <div class="vnc-toolbar">
+        <div class="left">
+          <span class="chip success"><span class="dot"></span>Connected</span>
+          <span style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-3);">wss://spark-002.mesh:6080/vnc</span>
+        </div>
+        <div style="display:flex; gap:6px;">
+          <button class="btn ghost sm">Full screen</button>
+          <button class="btn ghost sm">1:1</button>
+          <button class="btn ghost sm">Fit</button>
+        </div>
+      </div>
+      <div class="vnc-screen">
+        <div class="vnc-mock-ui">
+          <div class="vnc-teams-head">
+            <div class="ico-pill"><span class="tpill"></span>Microsoft Teams — Stand-up 22.04</div>
+            <div style="font-size:11px; color:rgba(255,255,255,0.5);">14 min 32s · 4 uczestników</div>
+          </div>
+          <div class="vnc-participants-grid">
+            <div class="vnc-cam"><span>MK</span><span class="name-tag">Maja K.</span></div>
+            <div class="vnc-cam"><span>TP</span><span class="name-tag">Tomek P.</span></div>
+            <div class="vnc-cam"><span>AK</span><span class="name-tag">Admin Krystian</span></div>
+            <div class="vnc-cam"><span>?</span><span class="name-tag">SPEAKER_04</span></div>
+            <div class="vnc-cam bot"><span style="font-size:12px;">🐙</span><span class="name-tag">TentaFlow Bot · AI transcription</span></div>
+            <div class="vnc-cam" style="background:#2a2d52;"><span style="font-size:30px;color:rgba(255,255,255,0.2);">+</span></div>
+          </div>
+        </div>
+      </div>
+      <div style="font-size:11px; color:var(--text-3); text-align:center;">
+        VNC stream idzie przez mesh QUIC — bez ekspozycji portu na zewnątrz. Klawiatura/mysz zablokowane (read-only view).
+      </div>
+    </div>
+  </main>
+</div>
+</div>
+
+<!-- ============================================================
+     SCREEN 5 — HISTORY
+     ============================================================ -->
+<div class="screen-label">
+  <span class="num">5</span>
+  <div>
+    <h2>Historia sesji — archiwum z pełnym transkryptem</h2>
+    <div class="desc">Lista wszystkich poprzednich spotkań. Kliknij → pełny transkrypt, AI summary, uczestnicy, download .txt/.json.</div>
+  </div>
+</div>
+<div class="app-frame">
+<div class="frame-inner">
+  <aside class="sidebar">
+    <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Moje aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-chat"/></svg>Chat</div>
+      <div class="nav-item active"><svg class="icon"><use href="#i-meeting"/></svg>Meeting Bot</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-mic"/></svg>Notatki</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-workflow-app"/></svg>Przepływy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-star"/></svg>Prompty</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-speaker"/></svg>TTS</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    </div>
+    <div class="footer">
+      <div class="user-chip"><div class="avatar">MK</div><div><div class="name-t">Maja K.</div><div class="role">Użytkownik</div></div></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="app-header">
+      <div class="title-row">
+        <div class="title-ico"><svg class="icon icon-lg"><use href="#i-meeting"/></svg></div>
+        <div>
+          <h1>Historia spotkań</h1>
+          <div class="sub">Wszystkie poprzednie sesje z transkryptami · 23 spotkania · 8h 42min łącznie</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn primary sm"><svg class="icon"><use href="#i-plus"/></svg>Nowe spotkanie</button>
+      </div>
+    </header>
+
+    <div class="history-layout">
+      <aside class="history-sidebar">
+        <div class="history-search">
+          <span class="ico-left"><svg class="icon"><use href="#i-search"/></svg></span>
+          <input type="text" placeholder="Szukaj w transkryptach...">
+        </div>
+
+        <div class="history-group-label">Dziś</div>
+        <div class="history-item active">
+          <div class="hi-title">Stand-up 22.04</div>
+          <div class="hi-meta">14:22 · <span class="sep"></span>14 min<span class="sep"></span>4 mówców<span class="sep"></span><span class="chip live" style="padding:1px 6px;"><span class="dot"></span>live</span></div>
+        </div>
+
+        <div class="history-group-label">Wczoraj</div>
+        <div class="history-item">
+          <div class="hi-title">Stand-up 21.04</div>
+          <div class="hi-meta">09:00 · <span class="sep"></span>22 min<span class="sep"></span>4 mówców</div>
+          <div class="hi-summary">PR #142 mergnięty. Tomek zaczyna Audit Log backend.</div>
+        </div>
+
+        <div class="history-group-label">Ten tydzień</div>
+        <div class="history-item">
+          <div class="hi-title">Review architektury v3</div>
+          <div class="hi-meta">pn 14:00 · <span class="sep"></span>58 min<span class="sep"></span>6 mówców</div>
+          <div class="hi-summary">Zaakceptowano propozycję mesh pairing przez PIN.</div>
+        </div>
+        <div class="history-item">
+          <div class="hi-title">Klient — demo TentaFlow</div>
+          <div class="hi-meta">pt 10:30 · <span class="sep"></span>41 min<span class="sep"></span>3 mówców</div>
+          <div class="hi-summary">Pozytywny feedback, pytania o compliance i deployment.</div>
+        </div>
+
+        <div class="history-group-label">Poprzedni tydzień</div>
+        <div class="history-item">
+          <div class="hi-title">1:1 Maja / Krystian</div>
+          <div class="hi-meta">15.04 16:00 · <span class="sep"></span>30 min<span class="sep"></span>2 mówców</div>
+        </div>
+        <div class="history-item">
+          <div class="hi-title">Planowanie Q2</div>
+          <div class="hi-meta">14.04 10:00 · <span class="sep"></span>75 min<span class="sep"></span>5 mówców</div>
+        </div>
+      </aside>
+
+      <div class="history-detail">
+        <div class="hd-head">
+          <div>
+            <h2>Stand-up 22.04</h2>
+            <div class="hd-meta">
+              <span><svg class="icon icon-sm" style="vertical-align:-2px;"><use href="#i-clock"/></svg> 14:22 · 14 min 32s</span>
+              <span>·</span>
+              <span>4 mówców</span>
+              <span>·</span>
+              <span class="chip live"><span class="dot"></span>Live — w toku</span>
+            </div>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn sm"><svg class="icon"><use href="#i-download"/></svg>.txt</button>
+            <button class="btn sm"><svg class="icon"><use href="#i-download"/></svg>.json</button>
+            <button class="btn primary sm">Otwórz live view →</button>
+          </div>
+        </div>
+
+        <div class="hd-tabs">
+          <div class="hd-tab active">Podsumowanie</div>
+          <div class="hd-tab">Transkrypt</div>
+          <div class="hd-tab">Działania (4)</div>
+          <div class="hd-tab">Uczestnicy (4)</div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-head"><svg class="icon icon-sm"><use href="#i-sparkles"/></svg> TL;DR · wygenerowane przez qwen-3.5-0.8b</div>
+          <div class="panel-body" style="font-size:13px; line-height:1.75; color:var(--text-2);">
+            Zespół przegląda progres stand-upu. <strong style="color:var(--text);">Tomek</strong> zakończył migrację users-admin API, czeka na review PR #142 od Krystiana. <strong style="color:var(--text);">Krystian</strong> zobowiązał się zrobić review dziś po 16:00 i dał Tomkowi kolejne zadanie — Audit Log backend. <strong style="color:var(--text);">Maja</strong> przeniosła Meeting Bot do user apps, dopracowuje VNC preview i error states. Nieznany mówca (SPEAKER_04) zgłosił problem z dołączaniem bota do Zoom.
+          </div>
+        </div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+          <div class="panel">
+            <div class="panel-head">Kluczowe decyzje</div>
+            <div class="panel-body" style="font-size:13px; color:var(--text-2); line-height:1.7;">
+              · PR #142 mergowany dziś wieczorem<br>
+              · Audit Log backend jako następne zadanie dla Tomka<br>
+              · Meeting Bot refactor kontynuowany — VNC jako priorytet
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">Statystyki</div>
+            <div class="panel-body">
+              <div class="cfg-row"><span class="k">Słów łącznie</span><span class="v">2 847</span></div>
+              <div class="cfg-row"><span class="k">Czas mówienia</span><span class="v">Maja 41% · Tomek 28%</span></div>
+              <div class="cfg-row"><span class="k">Śr. confidence</span><span class="v" style="color:var(--success);">92%</span></div>
+              <div class="cfg-row"><span class="k">Enrolled speakers</span><span class="v">3 / 4</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</div>
+
+<!-- ============================================================
+     SCREEN 6 — ERROR (addon not deployed)
+     ============================================================ -->
+<div class="screen-label">
+  <span class="num">6</span>
+  <div>
+    <h2>Błąd — teams-bot addon nie jest wdrożony</h2>
+    <div class="desc">Gdy user klika Meeting Bot a kontener nie działa lub addon nie jest zdeployowany. Jasna CTA jak to naprawić + fallback do admin.</div>
+  </div>
+</div>
+<div class="app-frame">
+<div class="frame-inner">
+  <aside class="sidebar">
+    <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Moje aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-chat"/></svg>Chat</div>
+      <div class="nav-item active"><svg class="icon"><use href="#i-meeting"/></svg>Meeting Bot</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-mic"/></svg>Notatki</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-workflow-app"/></svg>Przepływy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-star"/></svg>Prompty</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-speaker"/></svg>TTS</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    </div>
+    <div class="footer">
+      <div class="user-chip"><div class="avatar">MK</div><div><div class="name-t">Maja K.</div><div class="role">Użytkownik</div></div></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="app-header">
+      <div class="title-row">
+        <div class="title-ico"><svg class="icon icon-lg"><use href="#i-meeting"/></svg></div>
+        <div>
+          <h1>Meeting Bot</h1>
+          <div class="sub">Bot niedostępny</div>
+        </div>
+      </div>
+      <div class="actions">
+        <span class="chip danger"><span class="dot"></span>Kontener offline</span>
+      </div>
+    </header>
+
+    <div class="error-hero">
+      <div class="error-card">
+        <div class="err-ico"><svg class="icon icon-xl"><use href="#i-alert"/></svg></div>
+        <h2>Bot nie jest wdrożony</h2>
+        <p class="err-desc">
+          Kontener <code style="font-family:'JetBrains Mono',monospace; color:var(--accent-2);">teams-bot@0.3.1</code> nie został uruchomiony na żadnym nodzie w mesh. Aby dołączać do spotkań, administrator musi zdeployować silnik z Services → Agents.
+        </p>
+        <div class="err-actions">
+          <button class="btn primary"><svg class="icon"><use href="#i-zap"/></svg>Przejdź do Services</button>
+          <button class="btn">Poproś administratora</button>
+          <button class="btn ghost"><svg class="icon"><use href="#i-refresh"/></svg>Sprawdź ponownie</button>
+        </div>
+        <div style="margin-top:24px; padding-top:20px; border-top:1px solid var(--border); font-size:12px; color:var(--text-3); line-height:1.7;">
+          <strong style="color:var(--text-2);">Szczegóły techniczne:</strong><br>
+          Brak engine'u <code style="font-family:'JetBrains Mono',monospace;">agents/teams-bot</code> w rejestrze zdeployowanych silników.<br>
+          Sprawdź: <code style="font-family:'JetBrains Mono',monospace;">GET /api/services/deployed</code> — odpowiedź pusta dla tego engine_id.
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</div>
+
+<!-- ============================================================
+     SCREEN 7 — SETTINGS
+     ============================================================ -->
+<div class="screen-label">
+  <span class="num">7</span>
+  <div>
+    <h2>Ustawienia bota — nazwa, STT/LLM, auto-join</h2>
+    <div class="desc">Konfiguracja per-user: jak bot się nazywa w spotkaniu, który backend STT/LLM używa, czy auto-enrollment nowych głosów, lokalizacja logów.</div>
+  </div>
+</div>
+<div class="app-frame">
+<div class="frame-inner">
+  <aside class="sidebar">
+    <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Moje aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-chat"/></svg>Chat</div>
+      <div class="nav-item active"><svg class="icon"><use href="#i-meeting"/></svg>Meeting Bot</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-mic"/></svg>Notatki</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-workflow-app"/></svg>Przepływy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-star"/></svg>Prompty</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-speaker"/></svg>TTS</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    </div>
+    <div class="footer">
+      <div class="user-chip"><div class="avatar">MK</div><div><div class="name-t">Maja K.</div><div class="role">Użytkownik</div></div></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="app-header">
+      <div class="title-row">
+        <div class="title-ico"><svg class="icon icon-lg"><use href="#i-settings"/></svg></div>
+        <div>
+          <h1>Ustawienia Meeting Bot</h1>
+          <div class="sub">Konfiguracja per-user · zapisywana lokalnie + sync przez mesh</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn ghost sm">← Powrót</button>
+        <button class="btn primary sm"><svg class="icon"><use href="#i-check"/></svg>Zapisz</button>
+      </div>
+    </header>
+
+    <div class="settings-body">
+      <div class="settings-section">
+        <h3>Tożsamość bota</h3>
+        <div class="section-sub">Co widzą uczestnicy spotkania gdy bot dołącza.</div>
+
+        <div class="settings-field">
+          <div>
+            <div class="field-label">Nazwa wyświetlana</div>
+            <div class="field-hint">Pokazywana w liście uczestników spotkania</div>
+          </div>
+          <input type="text" value="TentaFlow Bot (AI transcription)">
+        </div>
+
+        <div class="settings-field">
+          <div>
+            <div class="field-label">Etykieta "AI transcription"</div>
+            <div class="field-hint">Informuje uczestników że obecny jest bot transkrybujący (wymogi prawne)</div>
+          </div>
+          <select>
+            <option>Zawsze pokazuj</option>
+            <option>Tylko w Polsce/UE</option>
+            <option>Wyłączone (na własną odpowiedzialność)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>Pipeline audio</h3>
+        <div class="section-sub">Który silnik STT i model diaryzacji użyć. Zmiany wchodzą dla następnego spotkania.</div>
+
+        <div class="settings-field">
+          <div>
+            <div class="field-label">STT (speech-to-text)</div>
+            <div class="field-hint">whisper-large-v3 rekomendowany · szybszy: distil-whisper</div>
+          </div>
+          <select>
+            <option>whisper-large-v3 (local, spark-002)</option>
+            <option>whisper-medium</option>
+            <option>distil-whisper-en</option>
+            <option>parakeet-tdt (NVIDIA)</option>
+          </select>
+        </div>
+
+        <div class="settings-field">
+          <div>
+            <div class="field-label">Diaryzacja</div>
+            <div class="field-hint">Rozpoznawanie kto mówi — przypisuje SPEAKER_XX do wypowiedzi</div>
+          </div>
+          <select>
+            <option>pyannote-3.1 (rekomendowane)</option>
+            <option>pyannote-2.1</option>
+            <option>Wyłączone (wszystko jako jeden mówca)</option>
+          </select>
+        </div>
+
+        <div class="settings-field">
+          <div>
+            <div class="field-label">Auto-enrollment głosów</div>
+            <div class="field-hint">Gdy bot słyszy nowy głos — automatycznie poprosi o przypisanie osoby po spotkaniu</div>
+          </div>
+          <select>
+            <option>Tylko enrolled użytkownicy firmy</option>
+            <option>Wszyscy uczestnicy spotkania</option>
+            <option>Wyłączone</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>AI Summary</h3>
+        <div class="section-sub">Model LLM który generuje podsumowanie na żywo + TL;DR po spotkaniu.</div>
+
+        <div class="settings-field">
+          <div>
+            <div class="field-label">LLM backend</div>
+            <div class="field-hint">Mały lokalny model wystarczy — nie wysyła danych na zewnątrz</div>
+          </div>
+          <select>
+            <option>qwen-3.5-0.8b (local, spark-002)</option>
+            <option>qwen-3.5-7b</option>
+            <option>gpt-oss-20b (mesh)</option>
+          </select>
+        </div>
+
+        <div class="settings-field">
+          <div>
+            <div class="field-label">Częstotliwość AI insights</div>
+            <div class="field-hint">Jak często bot wstawia AI komentarze w transkrypcie (action items itd)</div>
+          </div>
+          <select>
+            <option>Co 30s lub gdy wykryje action item</option>
+            <option>Tylko gdy wykryje action item</option>
+            <option>Co 2 min (oszczędnie)</option>
+            <option>Wyłączone (tylko TL;DR na końcu)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>Przechowywanie</h3>
+        <div class="settings-field">
+          <div>
+            <div class="field-label">Retencja transkryptów</div>
+            <div class="field-hint">Po tym czasie sesje są automatycznie usuwane z bazy</div>
+          </div>
+          <select>
+            <option>30 dni (domyślne)</option>
+            <option>90 dni</option>
+            <option>1 rok</option>
+            <option>Bez limitu</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <div>
+            <div class="field-label">Format eksportu</div>
+            <div class="field-hint">Domyślny format pobierania .txt/.json/.srt</div>
+          </div>
+          <select>
+            <option>.txt (human readable)</option>
+            <option>.json (z timestampami)</option>
+            <option>.srt (napisy)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</div>
+
+<div style="max-width:1480px; margin:80px auto 60px; padding:0 24px;">
+  <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-xl); padding:28px 32px;">
+    <h3 style="font-size:16px; font-weight:800; margin-bottom:10px;">📐 Uwagi implementacyjne</h3>
+    <ul style="color:var(--text-2); font-size:13px; line-height:1.9; padding-left:18px;">
+      <li><strong style="color:var(--text);">Header:</strong> ten sam wzorzec co Chat/Notes — <code style="font-family:'JetBrains Mono',monospace;color:var(--accent-2);">title-ico</code> + <code style="font-family:'JetBrains Mono',monospace;color:var(--accent-2);">h1</code> + <code style="font-family:'JetBrains Mono',monospace;color:var(--accent-2);">sub</code> po lewej, akcje po prawej. Zero custom REC/Stop.</li>
+      <li><strong style="color:var(--text);">Komponenty:</strong> przyciski = <code>tf-button</code> (variants: primary/ghost/danger + size sm/lg), chipy = <code>tf-chip</code> (status: success/warn/danger/accent/live), URL input = <code>tf-input</code> z <code>icon="link"</code>, selecty w ustawieniach = <code>tf-select</code>, tabs = <code>tf-tabs</code>.</li>
+      <li><strong style="color:var(--text);">Backend (bez zmian):</strong> używa istniejących endpointów <code>POST /api/addons/teams-bot/tools/join_meeting</code>, <code>GET /api/meeting-bot/transcripts</code>, <code>GET /api/meeting-bot/sessions/:id/download</code>. Nowe do dodania: <code>GET /api/meeting-bot/sessions</code> (lista dla historii) + <code>GET /api/meeting-bot/sessions/:id/summary</code> (TL;DR z LLM).</li>
+      <li><strong style="color:var(--text);">VNC inline:</strong> <code>&lt;iframe src="wss://..."&gt;</code> w ekranie 4 zamiast <code>window.open()</code> — bez problemu mixed-content bo cały trafik przez mesh QUIC.</li>
+      <li><strong style="color:var(--text);">Scroll-preserve:</strong> logika z obecnego <code>MeetingBot.js</code> (<code>wasAtTop</code> + <code>prevScrollHeight</code> delta) zostaje. Działa dobrze, nie trzeba ruszać.</li>
+      <li><strong style="color:var(--text);">Speaker diarization:</strong> kolor = hash(nazwa) → HSL (już działa). Avatar 36×36 z gradientem per-speaker. Badge <code>enrolled</code>/<code>temp</code> przy meta.</li>
+      <li><strong style="color:var(--text);">AI insights row:</strong> inline w transcript feed (nie osobny panel) — wizualnie wyróżniony dashed border + gradient tło, żeby było jasne że to AI a nie człowiek.</li>
+      <li><strong style="color:var(--text);">Error state (screen 6):</strong> pokazuje się gdy <code>/api/services/deployed</code> nie zawiera <code>agents/teams-bot</code>. CTA do Services kieruje do deploy wizard.</li>
+      <li><strong style="color:var(--text);">Mobile/responsive:</strong> @ &lt;1200px side panel przechodzi pod transcript (stack), historia zostaje single-column z list → detail toggle.</li>
+      <li><strong style="color:var(--text);">Brak REC/Stop:</strong> dołączenie = wklejenie linka + Enter. Opuszczenie = przycisk "Opuść" w headerze lub user wychodzi z aplikacji (bot i tak zostaje w meetingu aż do timeoutu sesji lub eksplicit leave).</li>
+    </ul>
+  </div>
+</div>
+
+</body>
+</html>

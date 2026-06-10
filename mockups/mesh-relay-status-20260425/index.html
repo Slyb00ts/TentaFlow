@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Mesh page with relay status (mockup)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+/* Skopiowane z tentaflow-core/www/css/style.css. Naglowek w stylu Uzytkownikow
+   (tf-screen + tf-detail-header), tabs jako tf-tabs underline. Karty mesh-card
+   ze stat-cell + ring-gauge (paired online dostaja taki sam 4-ring grid co
+   local). Nowe klasy: .net-conn-row, .net-conn-pill, .relay-pill, .bind-pill. */
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.22);
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --radius-lg: 14px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', system-ui, sans-serif;
+  font-size: 14px; line-height: 1.5;
+  min-height: 100vh; -webkit-font-smoothing: antialiased;
+}
+
+/* ===== tf-screen shell + breadcrumb (1:1 z users.js) ===== */
+.tf-screen { display: flex; flex-direction: column; min-height: 100vh; max-width: 1500px; margin: 0 auto; }
+.tf-screen-head { padding: 22px 26px 0; flex-shrink: 0; }
+.tf-screen-head__crumbs { margin-bottom: 12px; }
+.tf-screen-head__header { margin-bottom: 16px; }
+.tf-screen-head__tabs:empty,
+.tf-screen-head__tabs[hidden] { display: none; }
+
+.tf-breadcrumb { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-3); }
+.tf-breadcrumb .crumb { color: var(--text-2); cursor: pointer; transition: color 0.12s; }
+.tf-breadcrumb .crumb:hover { color: var(--accent-2); }
+.tf-breadcrumb .crumb.current { color: var(--text); font-weight: 600; cursor: default; }
+.tf-breadcrumb .sep { opacity: 0.5; display: inline-flex; align-items: center; }
+.tf-breadcrumb .sep svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+/* tf-detail-header (jak w users.js — bg-2, big-ico gradient, d-meta, d-actions) */
+.tf-detail-header {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 20px; display: flex; align-items: center; gap: 18px;
+}
+.tf-detail-header .big-ico {
+  width: 60px; height: 60px; border-radius: var(--radius);
+  background: var(--gradient-accent); color: white;
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+  font-weight: 800; font-size: 22px;
+}
+.tf-detail-header .big-ico svg { width: 26px; height: 26px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-detail-header .d-meta { flex: 1; min-width: 0; }
+.tf-detail-header .d-name { font-size: 20px; font-weight: 800; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.tf-detail-header .d-name .count { font-size: 15px; color: var(--text-3); font-weight: 600; }
+.tf-detail-header .d-sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+.tf-detail-header .d-badges { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.tf-detail-header .d-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+/* tf-tabs underline (jak users) */
+.tf-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-top: 14px; align-items: center; }
+.tf-tab {
+  padding: 10px 16px; background: transparent; border: 0;
+  color: var(--text-3); font-size: 13px; font-weight: 600;
+  cursor: pointer; position: relative; font-family: inherit;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.tf-tab svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-tab:hover { color: var(--text-2); }
+.tf-tab.active { color: var(--accent-2); }
+.tf-tab.active::after {
+  content: ''; position: absolute; bottom: -1px; left: 0; right: 0; height: 2px;
+  background: var(--gradient-accent); border-radius: 2px 2px 0 0;
+}
+.tf-tab .count { background: var(--bg-3); padding: 1px 7px; border-radius: 999px; font-size: 11px; color: var(--text-3); margin-left: 2px; }
+.tf-tab.active .count { background: var(--accent-glow); color: var(--accent-2); }
+.tf-tabs-spacer { flex: 1; }
+.tf-tabs-legend { display: flex; gap: 12px; padding: 0 12px; font-size: 11px; color: var(--text-3); }
+.tf-tabs-legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+
+.tf-screen-body { padding: 20px 26px 26px; }
+
+/* tf-button */
+.tf-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 9px 16px; height: 38px;
+  border-radius: var(--radius); border: 1px solid transparent;
+  background: transparent; color: var(--text);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s;
+}
+.tf-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tf-btn.primary { background: var(--gradient-accent); color: white; box-shadow: 0 4px 14px rgba(99,102,241,0.35); }
+.tf-btn.primary:hover { filter: brightness(1.08); }
+.tf-btn.ghost { color: var(--text-2); }
+.tf-btn.ghost:hover { background: var(--bg-3); color: var(--text); }
+
+/* relay/bind pill w d-badges */
+.relay-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px;
+  background: rgba(34, 197, 94, 0.10);
+  border: 1px solid rgba(34, 197, 94, 0.28);
+  font-size: 11px; color: var(--success); font-weight: 600;
+}
+.relay-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 6px var(--success); animation: pulse 2s ease-in-out infinite; }
+.relay-pill code { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-2); }
+.relay-pill .rtt { color: var(--text-3); font-weight: 500; }
+.relay-pill.warn { background: rgba(245, 158, 11, 0.10); border-color: rgba(245, 158, 11, 0.28); color: var(--warning); }
+.relay-pill.warn .dot { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+.relay-pill.error { background: rgba(239, 68, 68, 0.10); border-color: rgba(239, 68, 68, 0.28); color: var(--danger); }
+.relay-pill.error .dot { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+.bind-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 999px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  font-size: 11px; color: var(--text-2);
+}
+.bind-pill code { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent-2); }
+.bind-pill .iface { color: var(--text-3); }
+.bind-pill svg { width: 11px; height: 11px; stroke: currentColor; fill: none; stroke-width: 2; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* ===== mesh-section-title ===== */
+.mesh-section-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; font-weight: 700; color: var(--text-2);
+  text-transform: uppercase; letter-spacing: 0.1em;
+  margin: 24px 0 10px;
+}
+.mesh-section-title:first-of-type { margin-top: 4px; }
+.mesh-section-title .section-count {
+  background: var(--bg-3); color: var(--text-3); padding: 2px 8px;
+  border-radius: 10px; font-size: 10px; font-weight: 700;
+  text-transform: none; letter-spacing: 0;
+}
+
+/* ===== mesh cards (z mesh.js wzorca) ===== */
+.mesh-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 12px; }
+.mesh-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px;
+  transition: border-color 0.15s;
+}
+.mesh-card:hover { border-color: var(--border-hover); }
+.mesh-card.local { border-color: rgba(34, 197, 94, 0.35); box-shadow: 0 0 0 1px rgba(34,197,94,0.1) inset; }
+.mesh-card.offline { opacity: 0.7; }
+.mesh-card.pending { border-style: dashed; border-color: var(--warning); }
+
+.mesh-card-head { display: flex; align-items: flex-start; gap: 12px; padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+.mesh-card.offline .mesh-card-head, .mesh-card.pending .mesh-card-head { padding-bottom: 0; margin-bottom: 0; border-bottom: none; }
+.mesh-card-ico {
+  width: 36px; height: 36px; border-radius: 9px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent-2); flex-shrink: 0;
+}
+.mesh-card.local .mesh-card-ico { background: rgba(34, 197, 94, 0.10); border-color: rgba(34, 197, 94, 0.3); color: var(--success); }
+.mesh-card.pending .mesh-card-ico { background: rgba(245,158,11,0.08); border-color: rgba(245,158,11,0.3); color: var(--warning); }
+.mesh-card-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; }
+.mesh-card-meta { flex: 1; min-width: 0; }
+.mesh-card-name { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mesh-card-sub { font-size: 11px; color: var(--text-3); font-family: 'JetBrains Mono', monospace; margin-top: 2px; }
+.mesh-card-actions { display: flex; gap: 6px; }
+
+.icon-btn {
+  width: 30px; height: 30px; border-radius: 8px;
+  background: transparent; border: 1px solid var(--border); color: var(--text-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all 0.15s;
+}
+.icon-btn:hover { background: var(--bg-card-hover); color: var(--text); }
+.icon-btn.danger:hover { background: rgba(239, 68, 68, 0.1); color: var(--danger); border-color: rgba(239, 68, 68, 0.3); }
+.icon-btn.add:hover { background: var(--accent-glow); color: var(--accent-2); border-color: rgba(99,102,241,0.3); }
+.icon-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+/* status pill */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+}
+.status-pill .dot { width: 6px; height: 6px; border-radius: 50%; }
+.status-pill.online { background: rgba(34, 197, 94, 0.14); color: var(--success); }
+.status-pill.online .dot { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.status-pill.offline { background: var(--bg-3); color: var(--text-3); }
+.status-pill.offline .dot { background: var(--text-3); }
+.status-pill.pending { background: rgba(245, 158, 11, 0.14); color: var(--warning); }
+.status-pill.pending .dot { background: var(--warning); }
+
+/* gauges grid (jak w mesh.js — 4 ringi: CPU/RAM/VRAM/GPU) */
+.gauges { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.stat-cell {
+  background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 14px; text-align: center;
+}
+.ring-gauge {
+  width: 64px; height: 64px; border-radius: 50%; margin: 0 auto 8px;
+  background: conic-gradient(var(--success) calc(var(--pct, 50) * 1%), var(--bg-2) 0);
+  display: flex; align-items: center; justify-content: center; position: relative;
+}
+.ring-gauge.warn { background: conic-gradient(var(--warning) calc(var(--pct, 50) * 1%), var(--bg-2) 0); }
+.ring-gauge.danger { background: conic-gradient(var(--danger) calc(var(--pct, 50) * 1%), var(--bg-2) 0); }
+.ring-gauge::before { content: ""; position: absolute; inset: 6px; border-radius: 50%; background: var(--bg-3); }
+.ring-gauge .ring-val { position: relative; font-size: 14px; font-weight: 700; }
+.ring-gauge .ring-val small { font-size: 10px; font-weight: 600; color: var(--text-3); }
+.stat-cell .stat-label { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--text-3); margin-top: 4px; letter-spacing: 0.06em; }
+.stat-cell .stat-detail { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+
+/* connectivity panel inside THIS NODE — pod gauges */
+.local-connectivity {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  margin-top: 12px;
+}
+.local-conn-card {
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 12px 14px;
+}
+.local-conn-card .lc-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.local-conn-card .lc-head svg { width: 14px; height: 14px; color: var(--accent-2); fill: none; stroke: currentColor; stroke-width: 2; }
+.local-conn-card .lc-title { font-size: 10px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.08em; }
+.local-conn-card .lc-status { margin-left: auto; }
+.local-conn-card .lc-body { font-size: 12.5px; color: var(--text); line-height: 1.55; }
+.local-conn-card .lc-body code { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--accent-2); background: var(--bg-input); padding: 1px 5px; border-radius: 4px; }
+.local-conn-card .lc-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
+.lc-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.lc-dot.ok { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.lc-dot.warn { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+.lc-dot.err { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+.lc-status-text { color: var(--success); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; margin-left: 5px; }
+.lc-status-text.warn { color: var(--warning); }
+.lc-status-text.err { color: var(--danger); }
+
+/* meta row (Models/Active/Containers itp.) */
+.local-info-row, .paired-info-row {
+  display: flex; gap: 24px; flex-wrap: wrap;
+  font-size: 12px; color: var(--text-2);
+  margin-top: 12px; padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+.local-info-row b, .paired-info-row b { color: var(--text); font-weight: 600; margin-right: 6px; }
+
+/* ===== net-conn-row (transport per node) ===== */
+.net-conn-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-top: 12px;
+  font-size: 11.5px;
+}
+.net-conn-row .label { font-size: 10px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-right: 4px; }
+.net-conn-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 999px; font-weight: 600; font-size: 11px;
+}
+.net-conn-pill.p2p { background: rgba(34, 197, 94, 0.12); color: var(--success); }
+.net-conn-pill.relay { background: rgba(96, 165, 250, 0.12); color: var(--info); }
+.net-conn-pill.relay-bad { background: rgba(239, 68, 68, 0.12); color: var(--danger); }
+.net-conn-pill svg { width: 10px; height: 10px; stroke: currentColor; fill: none; stroke-width: 2; }
+.net-conn-row .addr { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-2); }
+.net-conn-row .rtt { color: var(--text-3); margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<main class="tf-screen">
+
+  <!-- ===== HEADER (1:1 z users.js) ===== -->
+  <header class="tf-screen-head">
+
+    <!-- breadcrumb -->
+    <nav class="tf-screen-head__crumbs">
+      <div class="tf-breadcrumb">
+        <span class="crumb current">Mesh</span>
+      </div>
+    </nav>
+
+    <!-- detail header -->
+    <div class="tf-screen-head__header">
+      <div class="tf-detail-header">
+        <div class="big-ico">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="1.5"/><circle cx="20" cy="4" r="1.5"/><circle cx="4" cy="20" r="1.5"/><circle cx="20" cy="20" r="1.5"/><path d="M12 9V6M12 15v3M9 12H6M15 12h3M6.5 6.5l3 3M17.5 6.5l-3 3M6.5 17.5l3-3M17.5 17.5l-3-3"/></svg>
+        </div>
+        <div class="d-meta">
+          <div class="d-name">Mesh <span class="count">· 7</span></div>
+          <div class="d-sub">7 nodów · 2 online · 4 offline · 2 oczekujące pairing</div>
+          <div class="d-badges">
+            <span class="relay-pill" title="Status połączenia z serwerem relay">
+              <span class="dot"></span>
+              Relay
+              <code>relay.nextapp.pl</code>
+              <span class="rtt">12 ms</span>
+            </span>
+            <span class="bind-pill" title="Interfejs wybrany w Settings → Mesh & Network">
+              <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4"/></svg>
+              Bind
+              <code>192.168.0.93</code>
+              <span class="iface">enp1s0np0</span>
+            </span>
+          </div>
+        </div>
+        <div class="d-actions">
+          <button class="tf-btn primary">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Pair
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- tabs (tf-tabs underline) -->
+    <div class="tf-screen-head__tabs">
+      <div class="tf-tabs">
+        <div class="tf-tab active">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          Node list <span class="count">7</span>
+        </div>
+        <div class="tf-tab">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/></svg>
+          Connection diagram
+        </div>
+        <div class="tf-tabs-spacer"></div>
+        <div class="tf-tabs-legend">
+          <span><span class="dot" style="background:var(--success);"></span>Local</span>
+          <span><span class="dot" style="background:var(--accent-1);"></span>Paired</span>
+          <span><span class="dot" style="background:var(--warning);"></span>Pending</span>
+          <span><span class="dot" style="background:var(--text-3);"></span>Offline</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===== BODY ===== -->
+  <div class="tf-screen-body">
+
+    <!-- ===== THIS NODE ===== -->
+    <div class="mesh-section-title">This node</div>
+    <div class="mesh-card local" style="grid-column: span 2;">
+      <div class="mesh-card-head">
+        <div class="mesh-card-ico">
+          <svg viewBox="0 0 24 24"><path d="M3 12l9-9 9 9"/><path d="M5 10v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V10"/></svg>
+        </div>
+        <div class="mesh-card-meta">
+          <div class="mesh-card-name">mainpc <span class="status-pill online"><span class="dot"></span>Online</span></div>
+          <div class="mesh-card-sub">192.168.0.93 · Linux 6.16 · Docker 27.5</div>
+        </div>
+      </div>
+
+      <div class="gauges">
+        <div class="stat-cell"><div class="ring-gauge" style="--pct: 1;"><span class="ring-val">1<small>%</small></span></div><div class="stat-label">CPU</div><div class="stat-detail">32 cores</div></div>
+        <div class="stat-cell"><div class="ring-gauge" style="--pct: 26;"><span class="ring-val">16.2<small> GB</small></span></div><div class="stat-label">RAM</div><div class="stat-detail">16.2 GB / 62.4 GB</div></div>
+        <div class="stat-cell"><div class="ring-gauge" style="--pct: 28;"><span class="ring-val">6.8<small> GB</small></span></div><div class="stat-label">VRAM</div><div class="stat-detail">NVIDIA RTX 4090</div></div>
+        <div class="stat-cell"><div class="ring-gauge" style="--pct: 15;"><span class="ring-val">15<small>%</small></span></div><div class="stat-label">GPU</div><div class="stat-detail">RTX 4090</div></div>
+      </div>
+
+      <!-- connectivity 2-pane: Bind / Relay (TYLKO dla local) -->
+      <div class="local-connectivity">
+        <div class="local-conn-card">
+          <div class="lc-head">
+            <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4"/></svg>
+            <span class="lc-title">Mesh bind</span>
+            <span class="lc-status status-pill online"><span class="dot"></span>Listening</span>
+          </div>
+          <div class="lc-body"><code>192.168.0.93:8090</code> · <span style="color: var(--text-3);">enp1s0np0</span></div>
+          <div class="lc-meta">advertise: 1 IPv4 (po filtrach), Docker/loopback ukryte</div>
+        </div>
+        <div class="local-conn-card">
+          <div class="lc-head">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h4M18 12h4M12 2v4M12 18v4"/></svg>
+            <span class="lc-title">Relay</span>
+            <span class="lc-status">
+              <span class="lc-dot ok"></span>
+              <span class="lc-status-text">Connected</span>
+            </span>
+          </div>
+          <div class="lc-body"><code>https://relay.nextapp.pl</code></div>
+          <div class="lc-meta">RTT 12 ms · last reachable 3 s ago · self-hosted</div>
+        </div>
+      </div>
+
+      <div class="local-info-row">
+        <span><b>Models:</b> whisper-large-v3-turbo</span>
+        <span><b>Active:</b> 0 requests</span>
+        <span><b>Containers:</b> 2 / 2</span>
+      </div>
+    </div>
+
+    <!-- ===== PAIRED NODES ===== -->
+    <div class="mesh-section-title">Paired nodes <span class="section-count">4</span></div>
+    <div class="mesh-grid">
+
+      <!-- spark-002 — paired ONLINE z pełnymi gauges (CPU/RAM/VRAM/GPU) -->
+      <div class="mesh-card">
+        <div class="mesh-card-head">
+          <div class="mesh-card-ico">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="1.5"/><circle cx="20" cy="4" r="1.5"/><circle cx="4" cy="20" r="1.5"/><circle cx="20" cy="20" r="1.5"/></svg>
+          </div>
+          <div class="mesh-card-meta">
+            <div class="mesh-card-name">spark-002 <span class="status-pill online"><span class="dot"></span>Online</span></div>
+            <div class="mesh-card-sub">192.168.11.25 · Linux 6.12</div>
+          </div>
+          <div class="mesh-card-actions">
+            <button class="icon-btn danger" title="Revoke trust"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg></button>
+          </div>
+        </div>
+        <div class="gauges">
+          <div class="stat-cell"><div class="ring-gauge" style="--pct: 23;"><span class="ring-val">23<small>%</small></span></div><div class="stat-label">CPU</div><div class="stat-detail">16 cores</div></div>
+          <div class="stat-cell"><div class="ring-gauge" style="--pct: 41;"><span class="ring-val">12.8<small> GB</small></span></div><div class="stat-label">RAM</div><div class="stat-detail">12.8 GB / 31.4 GB</div></div>
+          <div class="stat-cell"><div class="ring-gauge warn" style="--pct: 67;"><span class="ring-val">10.7<small> GB</small></span></div><div class="stat-label">VRAM</div><div class="stat-detail">RTX 4070</div></div>
+          <div class="stat-cell"><div class="ring-gauge" style="--pct: 42;"><span class="ring-val">42<small>%</small></span></div><div class="stat-label">GPU</div><div class="stat-detail">RTX 4070</div></div>
+        </div>
+        <div class="net-conn-row">
+          <span class="label">Transport:</span>
+          <span class="net-conn-pill p2p">
+            <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            Direct p2p
+          </span>
+          <span class="addr">192.168.11.25:8090</span>
+          <span class="rtt">RTT 4 ms</span>
+        </div>
+        <div class="paired-info-row">
+          <span><b>Models:</b> qwen3-30b · phi-4</span>
+          <span><b>Active:</b> 1 req · 2.3 tok/s</span>
+          <span><b>Last heartbeat:</b> 0.5 s ago</span>
+        </div>
+      </div>
+
+      <!-- iPhone — paired ONLINE via relay (z gauges) -->
+      <div class="mesh-card">
+        <div class="mesh-card-head">
+          <div class="mesh-card-ico">
+            <svg viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="2"/><line x1="11" y1="18" x2="13" y2="18"/></svg>
+          </div>
+          <div class="mesh-card-meta">
+            <div class="mesh-card-name">iPhone <span class="status-pill online"><span class="dot"></span>Online</span></div>
+            <div class="mesh-card-sub">100.86.42.17 · iOS 18.5</div>
+          </div>
+          <div class="mesh-card-actions">
+            <button class="icon-btn danger" title="Revoke trust"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg></button>
+          </div>
+        </div>
+        <div class="gauges">
+          <div class="stat-cell"><div class="ring-gauge" style="--pct: 8;"><span class="ring-val">8<small>%</small></span></div><div class="stat-label">CPU</div><div class="stat-detail">6 cores</div></div>
+          <div class="stat-cell"><div class="ring-gauge" style="--pct: 52;"><span class="ring-val">3.1<small> GB</small></span></div><div class="stat-label">RAM</div><div class="stat-detail">3.1 GB / 6.0 GB</div></div>
+          <div class="stat-cell"><div class="ring-gauge" style="--pct: 0;"><span class="ring-val" style="color: var(--text-3);">—</span></div><div class="stat-label">VRAM</div><div class="stat-detail">unified mem</div></div>
+          <div class="stat-cell"><div class="ring-gauge" style="--pct: 12;"><span class="ring-val">12<small>%</small></span></div><div class="stat-label">GPU</div><div class="stat-detail">A17 Pro</div></div>
+        </div>
+        <div class="net-conn-row">
+          <span class="label">Transport:</span>
+          <span class="net-conn-pill relay">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h4M18 12h4"/></svg>
+            via relay
+          </span>
+          <span class="addr">relay.nextapp.pl</span>
+          <span class="rtt">RTT 38 ms</span>
+        </div>
+        <div class="paired-info-row">
+          <span><b>Models:</b> —</span>
+          <span><b>Active:</b> 0 req</span>
+          <span><b>Last heartbeat:</b> 1.1 s ago</span>
+        </div>
+      </div>
+
+      <!-- spark-001 — offline, bez gauges -->
+      <div class="mesh-card offline">
+        <div class="mesh-card-head">
+          <div class="mesh-card-ico">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="1.5"/><circle cx="20" cy="4" r="1.5"/><circle cx="4" cy="20" r="1.5"/><circle cx="20" cy="20" r="1.5"/></svg>
+          </div>
+          <div class="mesh-card-meta">
+            <div class="mesh-card-name">spark-001 <span class="status-pill offline"><span class="dot"></span>Offline</span></div>
+            <div class="mesh-card-sub">172.17.0.1 · last seen 17 min ago</div>
+          </div>
+          <div class="mesh-card-actions">
+            <button class="icon-btn danger" title="Revoke trust"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg></button>
+          </div>
+        </div>
+        <div class="net-conn-row">
+          <span class="label">Last seen:</span>
+          <span class="net-conn-pill relay-bad">
+            <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            unreachable
+          </span>
+          <span class="addr" style="color: var(--text-3);">via relay (last try 3 min ago)</span>
+          <span class="rtt">timeout</span>
+        </div>
+      </div>
+
+      <!-- 1ccc5d8e5ae3 — offline, no path -->
+      <div class="mesh-card offline">
+        <div class="mesh-card-head">
+          <div class="mesh-card-ico">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="1.5"/><circle cx="20" cy="4" r="1.5"/><circle cx="4" cy="20" r="1.5"/><circle cx="20" cy="20" r="1.5"/></svg>
+          </div>
+          <div class="mesh-card-meta">
+            <div class="mesh-card-name">1ccc5d8e5ae3 <span class="status-pill offline"><span class="dot"></span>Offline</span></div>
+            <div class="mesh-card-sub">— · last seen never</div>
+          </div>
+          <div class="mesh-card-actions">
+            <button class="icon-btn danger" title="Revoke trust"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg></button>
+          </div>
+        </div>
+        <div class="net-conn-row">
+          <span class="label">Path:</span>
+          <span class="net-conn-pill relay-bad">
+            <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            no path
+          </span>
+          <span class="addr" style="color: var(--text-3);">no direct addr · no relay echo</span>
+          <span class="rtt">17 min ago</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ===== DISCOVERED ===== -->
+    <div class="mesh-section-title">Discovered (awaiting pairing) <span class="section-count">2</span></div>
+    <div class="mesh-grid">
+      <div class="mesh-card pending">
+        <div class="mesh-card-head">
+          <div class="mesh-card-ico">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          </div>
+          <div class="mesh-card-meta">
+            <div class="mesh-card-name">MacBookPro.nextapp.pl <span class="status-pill pending"><span class="dot"></span>Pending</span></div>
+            <div class="mesh-card-sub">192.168.0.96 · discovered via mDNS · fingerprint 9b:58:8b:6c:37:40…</div>
+          </div>
+          <div class="mesh-card-actions">
+            <button class="icon-btn add" title="Pair"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+          </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:6px; margin-top:8px; font-size: 12px; color: var(--text-3);">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+          Advertises as TentaFlow · broadcasts Ed25519 public key · requires PIN to pair
+        </div>
+      </div>
+
+      <div class="mesh-card pending">
+        <div class="mesh-card-head">
+          <div class="mesh-card-ico">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          </div>
+          <div class="mesh-card-meta">
+            <div class="mesh-card-name">hazai <span class="status-pill pending"><span class="dot"></span>Pending</span></div>
+            <div class="mesh-card-sub">192.168.11.26 · discovered via mDNS · fingerprint cb:19:1b:b2:-2:aa…</div>
+          </div>
+          <div class="mesh-card-actions">
+            <button class="icon-btn add" title="Pair"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+          </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:6px; margin-top:8px; font-size: 12px; color: var(--text-3);">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+          Advertises as TentaFlow · broadcasts Ed25519 public key · requires PIN to pair
+        </div>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+</body>
+</html>

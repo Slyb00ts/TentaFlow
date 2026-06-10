@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — tf-screen v2 — meeting-bot style</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99, 102, 241, 0.22);
+  --success: #22c55e;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --shadow-lg: 0 16px 48px rgba(0,0,0,0.7);
+  --glow: 0 0 30px rgba(99, 102, 241, 0.25);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--bg); color: var(--text); font-family: 'Manrope', system-ui, sans-serif; font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+
+.intro { max-width: 1480px; margin: 28px auto 10px; padding: 0 24px; }
+.intro h1 { font-size: 26px; font-weight: 800; margin-bottom: 6px; background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+.intro .lead { color: var(--text-2); max-width: 960px; font-size: 13px; line-height: 1.6; }
+.intro .rules { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.intro .rules .tag { font-size: 11px; font-weight: 600; padding: 5px 12px; border-radius: 999px; background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.3); color: var(--accent-2); }
+
+.screen-label { max-width: 1480px; margin: 40px auto 14px; padding: 0 24px; display: flex; align-items: baseline; gap: 14px; }
+.screen-label .num { width: 32px; height: 32px; border-radius: 8px; background: var(--gradient-accent); color: white; display: inline-flex; align-items: center; justify-content: center; font-weight: 800; font-size: 14px; box-shadow: var(--glow); }
+.screen-label h2 { font-size: 18px; font-weight: 800; }
+.screen-label .desc { color: var(--text-3); font-size: 13px; }
+
+/* ==================== APP SHELL (jak w meeting-bot) ==================== */
+.app-frame { max-width: 1480px; margin: 0 auto 20px; padding: 0 24px; }
+.app-frame .frame-inner {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  height: 760px;
+  box-shadow: var(--shadow-lg);
+}
+.sidebar {
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  padding: 14px 10px 10px;
+}
+.sidebar .logo { display: flex; align-items: center; gap: 10px; padding: 8px 10px 16px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.sidebar .logo .octo { width: 28px; height: 28px; border-radius: 8px; background: var(--gradient-accent); display: inline-flex; align-items: center; justify-content: center; font-size: 16px; }
+.sidebar .logo .name { font-size: 16px; font-weight: 800; background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+.sidebar .heading { font-size: 10px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.08em; padding: 10px 10px 6px; }
+.sidebar .nav-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--radius-sm); font-size: 13px; color: var(--text-2); cursor: pointer; }
+.sidebar .nav-item:hover { background: var(--bg-3); color: var(--text); }
+.sidebar .nav-item.active { background: linear-gradient(135deg, rgba(99,102,241,0.2), rgba(167,139,250,0.1)); color: var(--text); border: 1px solid rgba(99,102,241,0.3); }
+.sidebar .nav-item svg { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+
+/* ==================== .main + tf-screen ==================== */
+/* .main = flex column, overflow hidden — wypełnia całą prawą stronę */
+.main { display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+
+/* tf-screen — NIE JEST kartą w karcie. To po prostu layout headera + body
+   wypełniający .main. Tło .bg, header sticky-like przez flex-shrink:0. */
+.tf-screen { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+
+/* Header — jeden pas bg-2, dokładnie jak .app-header w meeting-bot.
+   Układ: [icon-tile] [title-block (breadcrumb + h1 + sub)] [actions] */
+.tf-screen-header {
+  display: flex; align-items: center; gap: 14px;
+  padding: 18px 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  flex-shrink: 0;
+}
+.tf-screen-header .ico-tile {
+  width: 36px; height: 36px; border-radius: 10px;
+  background: linear-gradient(135deg, rgba(167,139,250,0.2), rgba(99,102,241,0.15));
+  border: 1px solid rgba(167,139,250,0.3);
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+.tf-screen-header .ico-tile svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+.tf-screen-header .title-block { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+
+/* Breadcrumb — CZĘŚĆ headera, mała linia nad h1. Zawsze widoczna gdy jest.
+   Na top-level screens (Users list) pokazuje tylko bieżącą sekcję bez klikalności.
+   Na detail — pokazuje ścieżkę, każdy poziom klikalny. */
+.tf-screen-header .crumbs {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.06em;
+  min-height: 14px;
+}
+.tf-screen-header .crumbs a { color: var(--text-3); text-decoration: none; cursor: pointer; transition: color 0.12s; }
+.tf-screen-header .crumbs a:hover { color: var(--accent-2); }
+.tf-screen-header .crumbs .sep { color: var(--text-3); opacity: 0.5; font-size: 10px; }
+.tf-screen-header .crumbs .current { color: var(--text-2); }
+
+.tf-screen-header .title-block h1 {
+  font-size: 17px; font-weight: 700; color: var(--text);
+  display: flex; align-items: center; gap: 10px;
+  margin: 0;
+}
+.tf-screen-header .title-block h1 .count-badge { font-size: 13px; font-weight: 600; color: var(--text-3); }
+.tf-screen-header .title-block h1 .accent { color: var(--accent-2); }
+.tf-screen-header .title-block .sub { font-size: 12px; color: var(--text-3); }
+
+.tf-screen-header .actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+/* Tabs bar — opcjonalny pas pod headerem */
+.tf-screen-tabs {
+  display: flex; align-items: center;
+  padding: 0 28px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  gap: 4px;
+}
+.tab-btn {
+  padding: 12px 14px;
+  background: transparent; border: 0;
+  color: var(--text-3); font-size: 13px; font-weight: 600;
+  cursor: pointer; position: relative;
+  font-family: inherit;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.tab-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tab-btn:hover { color: var(--text-2); }
+.tab-btn.active { color: var(--text); }
+.tab-btn.active::after { content: ''; position: absolute; bottom: -1px; left: 6px; right: 6px; height: 2px; background: var(--gradient-accent); border-radius: 2px 2px 0 0; }
+.tab-btn .count { background: var(--bg-3); padding: 1px 7px; border-radius: 999px; font-size: 11px; color: var(--text-3); }
+.tab-btn.active .count { background: var(--accent-glow); color: var(--accent-2); }
+
+/* Toolbar pod tabami (search + filtry) — opcjonalny */
+.tf-screen-toolbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 28px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+/* Body — wypełnia resztę, SAM scrolluje. Header/tabs/toolbar nie scrollują. */
+.tf-screen-body {
+  flex: 1; min-height: 0;
+  overflow-y: auto;
+  background: var(--bg);
+}
+.tf-screen-body.padded { padding: 24px 28px; }
+
+/* Split layout dla detail (aside + main) */
+.tf-screen-body.split {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  overflow: hidden;
+  padding: 0;
+}
+.tf-screen-body.split .aside {
+  padding: 24px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-2);
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.tf-screen-body.split .main-col {
+  padding: 24px 28px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+/* ==================== Elementy UI w contencie ==================== */
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: transparent; color: var(--text);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s ease;
+}
+.btn:hover { border-color: var(--border-hover); background: var(--bg-3); }
+.btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.btn.primary { background: var(--gradient-accent); border-color: transparent; color: white; box-shadow: var(--glow); }
+.btn.primary:hover { filter: brightness(1.1); }
+.btn.danger { border-color: rgba(239,68,68,0.4); color: var(--danger); }
+.btn.danger:hover { background: rgba(239,68,68,0.1); }
+.btn.ghost { border-color: transparent; color: var(--text-2); }
+.btn.ghost:hover { background: var(--bg-3); }
+.btn.sm { padding: 6px 10px; font-size: 12px; }
+
+.search-box { flex: 1; max-width: 360px; position: relative; display: flex; align-items: center; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius); padding: 0 12px 0 36px; height: 36px; }
+.search-box svg { position: absolute; left: 12px; width: 16px; height: 16px; color: var(--text-3); stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.search-box input { flex: 1; background: transparent; border: 0; outline: none; color: var(--text); font-family: inherit; font-size: 13px; }
+.search-box input::placeholder { color: var(--text-3); }
+
+.filter-group { display: inline-flex; align-items: center; gap: 2px; padding: 3px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 999px; }
+.filter-chip { padding: 5px 12px; border-radius: 999px; background: transparent; color: var(--text-2); border: 0; font-size: 11px; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+.filter-chip:hover { background: var(--bg-card-hover); color: var(--text); }
+.filter-chip.active { background: var(--accent-glow); color: var(--accent-2); }
+
+.tf-table { width: 100%; border-collapse: collapse; }
+.tf-table th, .tf-table td { padding: 12px 28px; text-align: left; border-bottom: 1px solid var(--border); }
+.tf-table th { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); background: var(--bg-2); padding-top: 10px; padding-bottom: 10px; position: sticky; top: 0; z-index: 1; }
+.tf-table tbody tr { transition: background 0.12s; cursor: pointer; }
+.tf-table tbody tr:hover { background: rgba(99,102,241,0.04); }
+.tf-table tbody tr:last-child td { border-bottom: 0; }
+
+.avatar { width: 34px; height: 34px; border-radius: 10px; background: var(--gradient-accent); color: white; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.user-cell { display: flex; align-items: center; gap: 12px; }
+.user-name { font-weight: 700; color: var(--text); font-size: 13px; }
+.user-sub { font-size: 11px; color: var(--text-3); font-family: 'JetBrains Mono', monospace; }
+.pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+.pill.ok { background: rgba(34,197,94,0.14); color: var(--success); }
+.pill.admin { background: rgba(239,68,68,0.14); color: var(--danger); }
+.pill.info { background: rgba(96,165,250,0.14); color: var(--info); }
+
+.stat-line { display: flex; align-items: baseline; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed rgba(99,102,241,0.12); font-size: 12px; }
+.stat-line:last-child { border-bottom: 0; }
+.stat-line .k { color: var(--text-3); text-transform: uppercase; font-size: 10px; letter-spacing: 0.06em; font-weight: 700; }
+.stat-line .v { color: var(--text); font-weight: 600; }
+.big-avatar { width: 72px; height: 72px; border-radius: 18px; background: var(--gradient-accent); color: white; font-size: 26px; font-weight: 800; display: flex; align-items: center; justify-content: center; }
+
+.anatomy { background: var(--bg-2); border: 1px dashed var(--border); border-radius: var(--radius); padding: 14px 18px; margin-top: 12px; max-width: 1480px; margin-left: auto; margin-right: auto; box-sizing: border-box; }
+.anatomy h4 { font-size: 11px; font-weight: 700; color: var(--accent-2); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.08em; }
+.anatomy ul { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.anatomy ul li { font-size: 12px; color: var(--text-2); display: flex; gap: 8px; align-items: baseline; }
+.anatomy ul li code { background: var(--bg-3); padding: 1px 6px; border-radius: 3px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent-2); flex-shrink: 0; }
+.anatomy ul li span { color: var(--text-3); }
+
+/* nav helper for sidebar demo */
+.nav-svg { width:15px; height:15px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>tf-screen v2 — styl meeting-bot</h1>
+  <p class="lead">
+    Poprawka v1. Shell <b>nie jest kartą</b> — wypełnia całą prawą stronę <code>.main</code> jak w meeting-bot.
+    Jeden pas headera (bg-2, 36px icon-tile + breadcrumb + h1 17px + sub + actions). Breadcrumb
+    <b>zawsze widoczny</b> jako mała linia nad h1 — na top-level pokazuje tylko nazwę sekcji
+    (niekliklikalną), na detail pokazuje ścieżkę (każdy poziom klikalny — zastępuje back-btn).
+    Body <code>flex:1 overflow-y:auto</code>, header/tabs/toolbar <code>flex-shrink:0</code>.
+  </p>
+  <div class="rules">
+    <span class="tag">Brak back-btn</span>
+    <span class="tag">Breadcrumb = nawigacja</span>
+    <span class="tag">Header 17px, bg-2</span>
+    <span class="tag">Icon-tile 36px</span>
+    <span class="tag">Body wypełnia resztę</span>
+  </div>
+</div>
+
+<!-- ============ SCREEN 1: TOP-LEVEL LIST (Users) ============ -->
+<div class="screen-label"><div class="num">1</div><h2>Top-level list — Users</h2><span class="desc">Breadcrumb pokazuje tylko „Użytkownicy" (niekliklikalne — jesteśmy tu)</span></div>
+<div class="app-frame">
+  <div class="frame-inner">
+    <aside class="sidebar">
+      <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+      <div class="heading">Main</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Dashboard</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a15.3 15.3 0 0 1 0 20M12 2a15.3 15.3 0 0 0 0 20M2 12h20"/></svg>Mesh</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>Klastry</div>
+      <div class="heading" style="margin-top:12px;">Administracja</div>
+      <div class="nav-item active"><svg class="nav-svg" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg>Użytkownicy</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>API Keys</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Ustawienia</div>
+    </aside>
+    <div class="main">
+      <div class="tf-screen">
+        <div class="tf-screen-header">
+          <div class="ico-tile">
+            <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg>
+          </div>
+          <div class="title-block">
+            <div class="crumbs">
+              <span class="current">Użytkownicy</span>
+            </div>
+            <h1>Użytkownicy <span class="count-badge">· 8</span></h1>
+            <div class="sub">7 aktywnych · 1 nieaktywny · 3 admin</div>
+          </div>
+          <div class="actions">
+            <button class="btn"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Eksport</button>
+            <button class="btn primary"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Nowy user</button>
+          </div>
+        </div>
+        <div class="tf-screen-tabs">
+          <button class="tab-btn active">Użytkownicy <span class="count">8</span></button>
+          <button class="tab-btn">Grupy <span class="count">3</span></button>
+        </div>
+        <div class="tf-screen-toolbar">
+          <div class="search-box"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input placeholder="Szukaj po nazwie, email..."></div>
+          <div class="filter-group">
+            <button class="filter-chip active">Wszyscy</button>
+            <button class="filter-chip">Aktywni</button>
+            <button class="filter-chip">Administratorzy</button>
+            <button class="filter-chip">SSO</button>
+          </div>
+        </div>
+        <div class="tf-screen-body">
+          <table class="tf-table">
+            <thead><tr><th>User</th><th>Rola</th><th>Źródło</th><th>Ostatnie logowanie</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><div class="user-cell"><div class="avatar">AS</div><div><div class="user-name">Adam Surowski <span class="pill ok">aktywny</span></div><div class="user-sub">adam@tentaflow.ai</div></div></div></td>
+                <td><span class="pill admin">Admin</span></td>
+                <td><span class="pill info">Local</span></td>
+                <td style="color:var(--text-3); font-size:12px;">2 min temu</td>
+              </tr>
+              <tr>
+                <td><div class="user-cell"><div class="avatar" style="background:linear-gradient(135deg,#22c55e,#10b981);">MK</div><div><div class="user-name">Maria Kowalska</div><div class="user-sub">maria@tentaflow.ai</div></div></div></td>
+                <td style="color:var(--text-3);">User</td>
+                <td><span class="pill info">SSO · Google</span></td>
+                <td style="color:var(--text-3); font-size:12px;">1 godz. temu</td>
+              </tr>
+              <tr>
+                <td><div class="user-cell"><div class="avatar" style="background:linear-gradient(135deg,#60a5fa,#0ea5e9);">TN</div><div><div class="user-name">Tomasz Nowak</div><div class="user-sub">tomasz@tentaflow.ai</div></div></div></td>
+                <td style="color:var(--text-3);">User</td>
+                <td><span class="pill info">SSO · Azure</span></td>
+                <td style="color:var(--text-3); font-size:12px;">wczoraj</td>
+              </tr>
+              <tr>
+                <td><div class="user-cell"><div class="avatar" style="background:linear-gradient(135deg,#a78bfa,#6366f1);">JK</div><div><div class="user-name">Jan Kowalski</div><div class="user-sub">jan@tentaflow.ai</div></div></div></td>
+                <td style="color:var(--text-3);">Power User</td>
+                <td><span class="pill info">Local</span></td>
+                <td style="color:var(--text-3); font-size:12px;">3 dni temu</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="anatomy">
+  <h4>Top-level list — zasady</h4>
+  <ul>
+    <li><code>crumbs</code> <span>— tylko jeden element, klasa <code>.current</code>, niekliklikalny (jesteśmy tu)</span></li>
+    <li><code>BRAK back-btn</code> <span>— nie pokazujemy, bo nie ma dokąd wracać (sidebar to home)</span></li>
+    <li><code>ico-tile</code> <span>— 36px rounded square z ikoną sekcji</span></li>
+    <li><code>tabs + toolbar</code> <span>— mogą być razem (jak tu: Users/Groups tabs + search+filters)</span></li>
+  </ul>
+</div>
+
+<!-- ============ SCREEN 2: DETAIL (User) — breadcrumb klikalny ============ -->
+<div class="screen-label"><div class="num">2</div><h2>Detail — User</h2><span class="desc">Breadcrumb: „Użytkownicy / Maria Kowalska" — „Użytkownicy" klikalne wraca do listy</span></div>
+<div class="app-frame">
+  <div class="frame-inner">
+    <aside class="sidebar">
+      <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+      <div class="heading">Main</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Dashboard</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>Mesh</div>
+      <div class="heading" style="margin-top:12px;">Administracja</div>
+      <div class="nav-item active"><svg class="nav-svg" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Użytkownicy</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>API Keys</div>
+    </aside>
+    <div class="main">
+      <div class="tf-screen">
+        <div class="tf-screen-header">
+          <div class="ico-tile" style="background:linear-gradient(135deg,rgba(34,197,94,0.25),rgba(16,185,129,0.15));border-color:rgba(34,197,94,0.3);color:var(--success);">
+            <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          </div>
+          <div class="title-block">
+            <div class="crumbs">
+              <a>Użytkownicy</a>
+              <span class="sep">/</span>
+              <span class="current">Maria Kowalska</span>
+            </div>
+            <h1>Maria Kowalska</h1>
+            <div class="sub">maria@tentaflow.ai · SSO · Google · aktywny</div>
+          </div>
+          <div class="actions">
+            <button class="btn ghost">Wymuś logout</button>
+            <button class="btn danger">Usuń konto</button>
+          </div>
+        </div>
+        <div class="tf-screen-tabs">
+          <button class="tab-btn active"><svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Profil</button>
+          <button class="tab-btn"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Członkostwa <span class="count">2</span></button>
+          <button class="tab-btn"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Uprawnienia</button>
+          <button class="tab-btn">Aktywność</button>
+        </div>
+        <div class="tf-screen-body split">
+          <aside class="aside">
+            <div class="big-avatar" style="background:linear-gradient(135deg,#22c55e,#10b981);">MK</div>
+            <div>
+              <div style="font-size:17px; font-weight:800;">Maria Kowalska</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-3);">user_123e4567-e89b</div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:2px; margin-top:4px;">
+              <div class="stat-line"><span class="k">Status</span><span class="v" style="color:var(--success);">Aktywny</span></div>
+              <div class="stat-line"><span class="k">Źródło</span><span class="v">SSO · Google</span></div>
+              <div class="stat-line"><span class="k">Grupy</span><span class="v">2</span></div>
+              <div class="stat-line"><span class="k">Zalogowany</span><span class="v">1 godz. temu</span></div>
+              <div class="stat-line"><span class="k">Utworzony</span><span class="v">2026-01-15</span></div>
+            </div>
+            <button class="btn" style="margin-top:auto; justify-content:center;"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Resetuj hasło</button>
+          </aside>
+          <div class="main-col">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:14px;">
+              <div>
+                <label style="font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:var(--text-2); display:block; margin-bottom:6px;">Username</label>
+                <input value="maria.kowalska" disabled style="width:100%; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; color:var(--text); font-family:inherit; font-size:13px; opacity:0.7;">
+              </div>
+              <div>
+                <label style="font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:var(--text-2); display:block; margin-bottom:6px;">Display name</label>
+                <input value="Maria Kowalska" style="width:100%; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; color:var(--text); font-family:inherit; font-size:13px;">
+              </div>
+            </div>
+            <div style="margin-bottom:14px;">
+              <label style="font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:var(--text-2); display:block; margin-bottom:6px;">Email</label>
+              <input value="maria@tentaflow.ai" style="width:100%; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; color:var(--text); font-family:inherit; font-size:13px;">
+            </div>
+            <div style="margin-bottom:14px;">
+              <label style="font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:var(--text-2); display:block; margin-bottom:6px;">Rola</label>
+              <select style="width:100%; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; color:var(--text); font-family:inherit; font-size:13px;">
+                <option>User — czat, flowy, serwisy (consume)</option>
+                <option>Power User — User + Flow Builder, reguły, prompty</option>
+                <option>Admin — pełne zarządzanie: userzy, nody, deploye</option>
+              </select>
+            </div>
+            <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
+              <button class="btn ghost">Anuluj</button>
+              <button class="btn primary">Zapisz zmiany</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="anatomy">
+  <h4>Detail — zasady</h4>
+  <ul>
+    <li><code>crumbs: 2 poziomy</code> <span>— pierwszy (Użytkownicy) jako <code>&lt;a&gt;</code> klikalny, drugi <code>.current</code></span></li>
+    <li><code>tytuł h1</code> <span>— nazwa konkretnego obiektu (Maria Kowalska), bez count-badge</span></li>
+    <li><code>ico-tile</code> <span>— może zmieniać kolor per kontekst (tu: zielony dla aktywnego usera)</span></li>
+    <li><code>body split</code> <span>— aside (bg-2, 320px, avatar+staty+reset-pw) + main-col (form)</span></li>
+    <li><code>BRAK back-btn</code> <span>— breadcrumb „Użytkownicy" pełni tę rolę (krótsza droga, więcej kontekstu)</span></li>
+  </ul>
+</div>
+
+<!-- ============ SCREEN 3: NESTED (3 poziomy) ============ -->
+<div class="screen-label"><div class="num">3</div><h2>Nested detail — 3 poziomy</h2><span class="desc">Mesh / node-alpha / qwen3.5-0.8b — każdy poziom klikalny</span></div>
+<div class="app-frame">
+  <div class="frame-inner">
+    <aside class="sidebar">
+      <div class="logo"><span class="octo">🐙</span><span class="name">TentaFlow</span></div>
+      <div class="heading">Main</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Dashboard</div>
+      <div class="nav-item active"><svg class="nav-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/></svg>Mesh</div>
+      <div class="nav-item"><svg class="nav-svg" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>Klastry</div>
+    </aside>
+    <div class="main">
+      <div class="tf-screen">
+        <div class="tf-screen-header">
+          <div class="ico-tile">
+            <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+          </div>
+          <div class="title-block">
+            <div class="crumbs">
+              <a>Mesh</a>
+              <span class="sep">/</span>
+              <a>node-alpha</a>
+              <span class="sep">/</span>
+              <span class="current">qwen3.5-0.8b</span>
+            </div>
+            <h1>Model: <span class="accent">qwen3.5-0.8b</span></h1>
+            <div class="sub">LLM · llama-cpp · 4.2 GB VRAM · node-alpha</div>
+          </div>
+          <div class="actions">
+            <button class="btn">Restart</button>
+            <button class="btn danger">Unload</button>
+          </div>
+        </div>
+        <div class="tf-screen-tabs">
+          <button class="tab-btn active">Overview</button>
+          <button class="tab-btn">Metryki <span class="count">live</span></button>
+          <button class="tab-btn">Logi</button>
+          <button class="tab-btn">Uprawnienia <span class="count">3</span></button>
+        </div>
+        <div class="tf-screen-body padded">
+          <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px;">
+            <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">
+              <div style="font-size:10px; text-transform:uppercase; color:var(--text-3); letter-spacing:0.06em; font-weight:700;">Tokens/s</div>
+              <div style="font-size:22px; font-weight:800; margin-top:4px;">84.2</div>
+            </div>
+            <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">
+              <div style="font-size:10px; text-transform:uppercase; color:var(--text-3); letter-spacing:0.06em; font-weight:700;">Active requests</div>
+              <div style="font-size:22px; font-weight:800; margin-top:4px;">3</div>
+            </div>
+            <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">
+              <div style="font-size:10px; text-transform:uppercase; color:var(--text-3); letter-spacing:0.06em; font-weight:700;">Uptime</div>
+              <div style="font-size:22px; font-weight:800; margin-top:4px;">2d 14h</div>
+            </div>
+          </div>
+          <div style="font-size:12px; color:var(--text-3); line-height:1.6;">
+            Body SAM scrolluje. Header (z breadcrumbem) + tabs są sticky bo są flex-shrink:0, a body ma overflow-y:auto.
+            Żadna „karta w karcie" — tf-screen to po prostu layout wypełniający .main całej prawej strony.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="anatomy">
+  <h4>Nested — zasady</h4>
+  <ul>
+    <li><code>crumbs: N poziomów</code> <span>— wszystkie poza ostatnim klikalne; ostatni <code>.current</code></span></li>
+    <li><code>brak toolbaru</code> <span>— na detail zwykle toolbar nie jest potrzebny; tabs wystarczają</span></li>
+    <li><code>padded body</code> <span>— dla contentu innego niż table (dashboardy, forms, logi)</span></li>
+  </ul>
+</div>
+
+<div class="intro" style="margin-top:60px;">
+  <h1 style="font-size:18px;">Zmiany vs v1</h1>
+  <ul style="color:var(--text-2); line-height:1.9; padding-left:20px;">
+    <li><b>Shell nie jest kartą</b> — wypełnia całą prawą stronę .main (flex column overflow:hidden), bez border-radius, bez ramki</li>
+    <li><b>Breadcrumb w headerze</b> (nad h1, małe uppercase litery) — zastępuje back-btn jako główny mechanizm nawigacji wgłąb</li>
+    <li><b>Brak back-btn</b> — breadcrumb daje więcej kontekstu i pozwala skakać o N poziomów, nie tylko o 1</li>
+    <li><b>Header jako jeden pas bg-2</b> — z ico-tile 36px, h1 17px, sub 12px. Zgodnie z meeting-bot</li>
+    <li><b>Body scrolluje się samo</b> — header/tabs/toolbar to flex-shrink:0, body to flex:1 overflow-y:auto. Scrollbar jest TYLKO w body, nie w całym .main</li>
+    <li><b>Split ma overflow:hidden</b> + aside i main-col mają własne overflow-y:auto — dwa niezależne scrolle dla stron z długim aside (np. lista członków grupy)</li>
+  </ul>
+</div>
+
+<script>
+document.querySelectorAll('.tf-screen-tabs').forEach(bar => {
+  bar.querySelectorAll('.tab-btn').forEach(t => {
+    t.addEventListener('click', () => {
+      bar.querySelectorAll('.tab-btn').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+    });
+  });
+});
+document.querySelectorAll('.filter-group').forEach(grp => {
+  grp.querySelectorAll('.filter-chip').forEach(c => {
+    c.addEventListener('click', () => {
+      grp.querySelectorAll('.filter-chip').forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+    });
+  });
+});
+</script>
+
+</body>
+</html>

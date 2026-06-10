@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Modele (M8)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.vram-bar { display: flex; gap: 2px; height: 28px; background: var(--bg-input); border-radius: var(--radius-sm); overflow: hidden; }
+.vram-seg { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; color: white; }
+.benchmark-bar { display: flex; align-items: center; gap: 8px; }
+.benchmark-bar .bar { flex: 1; height: 8px; background: var(--bg-input); border-radius: 4px; overflow: hidden; }
+.benchmark-bar .fill { height: 100%; background: var(--gradient-accent); border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-rollback" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M8</span><h2>Modele i runtime</h2>
+    <div class="desc">Lista załadowanych modeli, benchmark, rollback &lt; 60s, upload ONNX, budżet VRAM.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Analyst</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Modele i runtime</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Modele i runtime <span class="chip success"><span class="dot"></span>6 załadowanych</span></div>
+            <div class="d-sub">Inference backend: TensorRT 9.x · GPU: RTX 4070 12GB · CUDA 12.4 · sterownik 555.x</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-zap"/></svg>Uruchom benchmark</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-upload"/></svg>Upload ONNX</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab active"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+        </div>
+
+        <!-- VRAM budget -->
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-cpu"/></svg>Budżet VRAM · 12 GB (RTX 4070)</div>
+            <span class="chip warning">8.2 / 12 GB · tight</span>
+          </div>
+          <div class="vram-bar">
+            <div class="vram-seg" style="width:18%;background:#6366f1">decode 2.1 GB</div>
+            <div class="vram-seg" style="width:14%;background:#a78bfa">YOLO11m 1.7 GB</div>
+            <div class="vram-seg" style="width:11%;background:#60a5fa">PP-OCRv5 1.3 GB</div>
+            <div class="vram-seg" style="width:9%;background:#22c55e">BoT-SORT 1.1 GB</div>
+            <div class="vram-seg" style="width:8%;background:#f59e0b">ResNet50 0.9 GB</div>
+            <div class="vram-seg" style="width:8%;background:#ef4444">SigLIP2 1.1 GB</div>
+            <div class="vram-seg" style="width:32%;background:var(--bg-3);color:var(--text-3)">wolne 3.8 GB</div>
+          </div>
+          <p class="text-xs text-3 mt-md">Heavy combo D2 (VideoMAE V2) + D4 (AdaFace + TransReID) razem przekroczyłoby budżet. Runtime stosuje time-slicing automatycznie.</p>
+        </section>
+
+        <!-- Models table -->
+        <table class="tf-table">
+          <thead>
+            <tr><th>Model</th><th>Domena</th><th>Wersja / hash</th><th>Licencja</th><th>VRAM</th><th>Throughput</th><th>Status</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="fw-700">YOLO11m</td>
+              <td><span class="chip accent">D1, D6</span></td>
+              <td class="mono"><div>yolo11m-truck-2026.04</div><div class="text-xs text-3">sha256 b4a2...e91f</div></td>
+              <td>AGPL-3.0</td>
+              <td>1.7 GB</td>
+              <td>180 fps batch=4</td>
+              <td><span class="status-pill ok">live</span></td>
+              <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-rollback"/></svg></button></td>
+            </tr>
+            <tr>
+              <td class="fw-700">PP-OCRv5</td>
+              <td><span class="chip accent">D1 OCR</span></td>
+              <td class="mono"><div>ppocrv5-adr-2026.03</div><div class="text-xs text-3">sha256 7c11...d2a4</div></td>
+              <td>Apache 2.0</td>
+              <td>1.3 GB</td>
+              <td>40 inf/s</td>
+              <td><span class="status-pill ok">live</span></td>
+              <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-rollback"/></svg></button></td>
+            </tr>
+            <tr>
+              <td class="fw-700">BoT-SORT</td>
+              <td><span class="chip accent">tracker shared</span></td>
+              <td class="mono"><div>botsort-osnet-2025.12</div><div class="text-xs text-3">sha256 ee93...12bb</div></td>
+              <td>MIT</td>
+              <td>1.1 GB</td>
+              <td>30 fps</td>
+              <td><span class="status-pill ok">live</span></td>
+              <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-rollback"/></svg></button></td>
+            </tr>
+            <tr>
+              <td class="fw-700">ResNet50 legibility</td>
+              <td><span class="chip accent">D1 score</span></td>
+              <td class="mono"><div>resnet50-adr-legib-2026.04</div><div class="text-xs text-3">sha256 4ad1...8c01</div></td>
+              <td>Custom (proprietary)</td>
+              <td>0.9 GB</td>
+              <td>120 inf/s</td>
+              <td><span class="status-pill ok">live</span></td>
+              <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-rollback"/></svg></button></td>
+            </tr>
+            <tr>
+              <td class="fw-700">SigLIP2 ViT-L/14</td>
+              <td><span class="chip accent">D5 search</span></td>
+              <td class="mono"><div>siglip2-vit-l14-2026.02</div><div class="text-xs text-3">sha256 1f72...90ee</div></td>
+              <td>Apache 2.0</td>
+              <td>1.1 GB</td>
+              <td>indeksuje 5 fps × 22 cams</td>
+              <td><span class="status-pill ok">live</span></td>
+              <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-rollback"/></svg></button></td>
+            </tr>
+            <tr>
+              <td class="fw-700">VideoMAE V2 small</td>
+              <td><span class="chip accent">D2 action</span></td>
+              <td class="mono"><div>videomae-v2-rwf2k-2026.03</div><div class="text-xs text-3">sha256 2c8e...4471</div></td>
+              <td>CC BY-NC 4.0</td>
+              <td>shadow</td>
+              <td>2 clips/s (time-sliced)</td>
+              <td><span class="status-pill warn">shadow A/B</span></td>
+              <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-rollback"/></svg></button></td>
+            </tr>
+            <tr style="opacity:0.55">
+              <td class="fw-700">AdaFace + TransReID</td>
+              <td><span class="chip danger">D4 re-id</span></td>
+              <td class="mono"><div>adaface-r100-2026.01 / transreid-2026.04</div></td>
+              <td>Research only</td>
+              <td>3.4 GB (gdy aktywne)</td>
+              <td>—</td>
+              <td><span class="status-pill err">blocked (no grant)</span></td>
+              <td><button class="btn btn-ghost btn-sm" disabled><svg class="icon"><use href="#i-play"/></svg></button></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- Benchmark per camera -->
+        <section class="section-card mt-md">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-activity"/></svg>Benchmark per kamera (ostatni: 14 min temu)</div>
+            <a href="#" class="text-sm">Szczegóły →</a>
+          </div>
+          <table class="tf-table" style="border:0">
+            <thead><tr><th>Kamera</th><th>Profil</th><th>FPS (osiągany / target)</th><th>Latencja p95</th><th>GPU share</th></tr></thead>
+            <tbody>
+              <tr><td class="fw-700">C-01 brama</td><td><span class="chip accent">ADR-brama</span></td><td>5/5 <div class="benchmark-bar mt-sm"><div class="bar"><div class="fill" style="width:100%"></div></div></div></td><td class="fw-700">820 ms</td><td>7%</td></tr>
+              <tr><td class="fw-700">C-04 wjazd-2</td><td><span class="chip accent">Bezpieczeństwo-noc</span></td><td>12/15 <div class="benchmark-bar mt-sm"><div class="bar"><div class="fill" style="width:80%;background:var(--warning)"></div></div></div></td><td class="fw-700">1.4 s</td><td>22%</td></tr>
+              <tr><td class="fw-700">C-07 peron</td><td><span class="chip accent">Peron-publiczny</span></td><td>10/10 <div class="benchmark-bar mt-sm"><div class="bar"><div class="fill" style="width:100%"></div></div></div></td><td class="fw-700">1.1 s</td><td>14%</td></tr>
+              <tr><td class="fw-700">C-22 wjazd ADR</td><td><span class="chip accent">ADR-brama</span></td><td>3/5 <div class="benchmark-bar mt-sm"><div class="bar"><div class="fill" style="width:60%;background:var(--danger)"></div></div></div></td><td class="fw-700">2.8 s</td><td>5%</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

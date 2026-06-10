@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>TentaFlow — Struktura organizacyjna (O1) — FlowBuilder-style</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+/* ======================================================
+   Org Builder — FlowBuilder-style 3-kolumnowy edytor
+   ====================================================== */
+.ob-shell {
+  display: grid;
+  grid-template-rows: 52px 1fr;
+  height: 820px;
+}
+.ob-topbar {
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 14px;
+}
+.ob-topbar .sep {
+  width: 1px; height: 24px; background: var(--border);
+}
+.ob-topbar .crumb {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px;
+}
+.ob-topbar .crumb strong { color: var(--text); font-weight: 800; }
+.ob-topbar .crumb .text-3 { color: var(--text-3); }
+.ob-topbar .autosave {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--success);
+}
+.ob-topbar .spacer { flex: 1; }
+.ob-topbar .zoom-ctrl {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: 6px; padding: 2px;
+}
+.ob-topbar .zoom-ctrl button {
+  background: transparent; border: 0; color: var(--text-2);
+  padding: 4px 8px; cursor: pointer; font-family: inherit;
+  display: inline-flex; align-items: center; border-radius: 4px;
+}
+.ob-topbar .zoom-ctrl button:hover { background: var(--bg-2); color: var(--text); }
+.ob-topbar .zoom-ctrl .zoom-level {
+  font-size: 11px; color: var(--text-2); min-width: 44px; text-align: center; font-variant-numeric: tabular-nums;
+}
+
+.ob-body {
+  display: grid;
+  grid-template-columns: 240px 1fr 320px;
+  min-height: 0;
+}
+
+/* ====== PALETTE (lewa) ====== */
+.ob-palette {
+  background: var(--bg-2);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.ob-palette-head {
+  padding: 14px 16px 10px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+.ob-palette-head .title { font-size: 13px; font-weight: 800; }
+.ob-palette-search { padding: 10px 14px; }
+.ob-palette-list { flex: 1; overflow-y: auto; padding: 4px 8px 12px; }
+.ob-palette-cat {
+  margin-bottom: 4px;
+}
+.ob-palette-cat-h {
+  padding: 8px 10px;
+  font-size: 10px; font-weight: 800; text-transform: uppercase;
+  letter-spacing: 0.1em; color: var(--text-3);
+  display: flex; align-items: center; gap: 6px;
+  cursor: pointer;
+}
+.ob-palette-cat-h:hover { color: var(--text-2); }
+.ob-palette-cat-h .chev { transition: transform 0.2s; }
+.ob-palette-cat.collapsed .chev { transform: rotate(-90deg); }
+.ob-palette-cat.collapsed .ob-palette-items { display: none; }
+.ob-palette-items {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 2px 0 6px;
+}
+.ob-palette-node {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  border-left: 3px solid var(--node-color);
+  border-radius: 6px;
+  cursor: grab;
+  transition: background 0.12s, border-color 0.12s, transform 0.12s;
+}
+.ob-palette-node:hover {
+  background: var(--bg-card);
+  border-color: var(--border-hover);
+  transform: translateX(2px);
+}
+.ob-palette-node:active { cursor: grabbing; }
+.ob-palette-node .badge {
+  width: 28px; height: 28px; border-radius: 7px;
+  background: color-mix(in srgb, var(--node-color) 18%, transparent);
+  color: var(--node-color);
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--node-color) 35%, transparent);
+}
+.ob-palette-node .badge svg { width: 14px; height: 14px; }
+.ob-palette-node .info { flex: 1; min-width: 0; }
+.ob-palette-node .nm { font-size: 12.5px; font-weight: 700; color: var(--text); }
+.ob-palette-node .ds { font-size: 10.5px; color: var(--text-3); line-height: 1.3; margin-top: 1px; }
+.ob-palette-node .grip { opacity: 0.5; }
+.ob-palette-node .grip svg { width: 12px; height: 12px; color: var(--text-3); }
+
+/* ====== CANVAS (środek) ====== */
+.ob-canvas-wrap {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(1200px 800px at 50% 40%, rgba(99,102,241,0.06), transparent 70%),
+    var(--bg);
+}
+.ob-canvas {
+  position: absolute; inset: 0;
+  background-image:
+    radial-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
+    radial-gradient(rgba(129,140,248,0.03) 1px, transparent 1px);
+  background-size: 24px 24px, 96px 96px;
+  background-position: 0 0, 12px 12px;
+}
+.ob-canvas-edges {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+.ob-canvas-edges .edge {
+  fill: none;
+  stroke: var(--accent-1);
+  stroke-width: 2;
+  filter: drop-shadow(0 0 6px rgba(99,102,241,0.4));
+}
+.ob-canvas-edges .edge.matrix {
+  stroke: var(--accent-2);
+  stroke-dasharray: 6 4;
+  opacity: 0.7;
+}
+.ob-canvas-edges .edge.preview {
+  stroke: var(--success);
+  stroke-dasharray: 4 4;
+  filter: drop-shadow(0 0 8px rgba(34,197,94,0.5));
+}
+.ob-canvas-edges .flow-dot {
+  fill: #a78bfa;
+  filter: drop-shadow(0 0 4px rgba(167,139,250,0.8));
+}
+
+/* Node na canvas */
+.ob-node {
+  position: absolute;
+  width: 220px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--node-color);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  transition: box-shadow 0.2s, border-color 0.15s;
+  user-select: none;
+  cursor: grab;
+}
+.ob-node:hover {
+  border-color: var(--border-hover);
+  box-shadow: var(--shadow), 0 0 0 1px color-mix(in srgb, var(--node-color) 40%, transparent);
+}
+.ob-node.selected {
+  border-color: var(--node-color);
+  box-shadow: var(--shadow), 0 0 0 2px var(--node-color), 0 0 32px color-mix(in srgb, var(--node-color) 40%, transparent);
+}
+.ob-node.vacant {
+  border-style: dashed;
+  background: linear-gradient(180deg, var(--bg-card) 0%, transparent 100%);
+}
+.ob-node-header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 12px 10px;
+}
+.ob-node-badge {
+  width: 28px; height: 28px; border-radius: 7px;
+  background: color-mix(in srgb, var(--node-color) 18%, transparent);
+  color: var(--node-color);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  font-weight: 800; font-size: 10px;
+  border: 1px solid color-mix(in srgb, var(--node-color) 35%, transparent);
+}
+.ob-node-info { flex: 1; min-width: 0; }
+.ob-node-type {
+  font-size: 9px; font-weight: 800;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-3);
+}
+.ob-node-title {
+  font-size: 13px; font-weight: 700; color: var(--text);
+  margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ob-node-title.empty { color: var(--text-3); font-style: italic; font-weight: 500; }
+.ob-node-body {
+  padding: 0 12px 10px;
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 11px;
+}
+.ob-node-row {
+  display: flex; justify-content: space-between; gap: 8px;
+}
+.ob-node-row .k { color: var(--text-3); }
+.ob-node-row .v { color: var(--text-2); font-weight: 600; }
+.ob-node-foot {
+  padding: 6px 12px;
+  border-top: 1px dashed var(--border);
+  display: flex; justify-content: space-between;
+  font-size: 10px; color: var(--text-3);
+}
+
+/* Porty (input/output) */
+.ob-port {
+  position: absolute;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--bg);
+  border: 2px solid var(--node-color);
+  left: 50%;
+  transform: translateX(-50%);
+  cursor: crosshair;
+  transition: transform 0.15s, background 0.15s, box-shadow 0.15s;
+}
+.ob-port:hover {
+  background: var(--node-color);
+  transform: translateX(-50%) scale(1.3);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--node-color) 25%, transparent), 0 0 12px var(--node-color);
+}
+.ob-port.input { top: -8px; }
+.ob-port.output { bottom: -8px; }
+
+/* Toolbar (góra canvasu — floating) */
+.ob-canvas-toolbar {
+  position: absolute;
+  top: 14px; left: 14px;
+  display: flex; gap: 6px; align-items: center;
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  box-shadow: var(--shadow);
+  z-index: 5;
+}
+.ob-canvas-toolbar button {
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text-2); padding: 4px 9px; font-size: 11px; font-weight: 600; cursor: pointer;
+  font-family: inherit; display: inline-flex; align-items: center; gap: 5px;
+}
+.ob-canvas-toolbar button:hover { color: var(--text); border-color: var(--border-hover); }
+.ob-canvas-toolbar button.active { background: var(--accent-glow); color: var(--accent-2); border-color: var(--accent-1); }
+.ob-canvas-toolbar .sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+.ob-canvas-toolbar .icon { width: 12px; height: 12px; }
+
+/* Hint */
+.ob-canvas-hint {
+  position: absolute;
+  bottom: 14px; left: 14px;
+  background: rgba(10,13,36,0.9); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px 10px;
+  font-size: 10.5px; color: var(--text-3);
+  display: flex; align-items: center; gap: 8px;
+  z-index: 5;
+}
+.ob-canvas-hint kbd {
+  background: var(--bg-3); padding: 1px 5px; border-radius: 3px;
+  font-size: 9.5px; color: var(--text-2); font-family: ui-monospace,monospace;
+  border: 1px solid var(--border);
+}
+
+/* Minimap */
+.ob-minimap {
+  position: absolute;
+  bottom: 14px; right: 14px;
+  width: 200px; height: 130px;
+  background: var(--bg-2); border: 1px solid var(--border-hover);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow);
+  z-index: 5;
+}
+.ob-minimap svg { width: 100%; height: 100%; display: block; }
+.ob-minimap .label {
+  position: absolute; top: 4px; left: 6px;
+  font-size: 9px; color: var(--text-3); font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  pointer-events: none;
+}
+.ob-minimap .viewport {
+  fill: rgba(99,102,241,0.1);
+  stroke: var(--accent-1); stroke-width: 2; rx: 4;
+}
+
+/* ====== INSPECTOR (prawa) ====== */
+.ob-inspector {
+  background: var(--bg-2);
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.ob-insp-head {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+}
+.ob-insp-head .av { flex-shrink: 0; }
+.ob-insp-head .nm { font-size: 13px; font-weight: 800; color: var(--text); }
+.ob-insp-head .rl { font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
+.ob-insp-tabs {
+  display: flex; border-bottom: 1px solid var(--border);
+}
+.ob-insp-tab {
+  flex: 1; padding: 8px 6px; font-size: 11px; font-weight: 600;
+  color: var(--text-3); cursor: pointer; text-align: center;
+  background: transparent; border: 0; font-family: inherit;
+  border-bottom: 2px solid transparent;
+}
+.ob-insp-tab:hover { color: var(--text-2); }
+.ob-insp-tab.active { color: var(--text); border-bottom-color: var(--accent-1); }
+.ob-insp-body { flex: 1; overflow-y: auto; padding: 14px; }
+.ob-insp-section { margin-bottom: 16px; }
+.ob-insp-section h4 {
+  font-size: 10px; font-weight: 800; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--text-3);
+  margin-bottom: 8px;
+}
+.ob-insp-row {
+  display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px;
+}
+.ob-insp-row label { font-size: 11px; color: var(--text-3); }
+.ob-insp-row .input,
+.ob-insp-row .select { padding: 6px 9px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-minus" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8z"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2"/></symbol>
+<symbol id="i-briefcase" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></symbol>
+<symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-fit" viewBox="0 0 24 24"><polyline points="4 4 4 10 10 10"/><polyline points="20 4 20 10 14 10"/><polyline points="4 20 4 14 10 14"/><polyline points="20 20 20 14 14 14"/></symbol>
+<symbol id="i-grip" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1" fill="currentColor"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="9" cy="18" r="1" fill="currentColor"/><circle cx="15" cy="6" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="18" r="1" fill="currentColor"/></symbol>
+<symbol id="i-undo" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+<symbol id="i-redo" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>TentaFlow — Struktura organizacyjna (O1) · FlowBuilder-style</h1>
+  <p class="lead">
+    Edytor inspirowany <strong>FlowBuilderem</strong>: paleta ról po lewej, free-form canvas pośrodku, inspector po prawej.
+    <strong>Buduj zależności jak w Flow:</strong> przeciągnij rolę z palety na canvas (powstaje stanowisko), połącz <em>port dolny przełożonego</em> z <em>portem górnym podwładnego</em> = relacja raportowania.
+    Linie ciągłe = główny przełożony, kropkowane = drugi (matrix-parent). Sam edytor jest agnostyczny — addony (CRM/Billing/Activity/Calendar) konsumują strukturę przez host fn <code>org.*</code>.
+  </p>
+  <div class="rules">
+    <div class="rule"><h3>Paleta = role z katalogu</h3><p>Po lewej kategorie z <a href="o02-roles-catalog.html">O2 Katalogu ról</a> (Management/Sales/Technical/External). Drag-drop tworzy nowe stanowisko z tą rolą.</p></div>
+    <div class="rule"><h3>Porty = zależności</h3><p>Każdy węzeł ma <em>input port</em> (góra) i <em>output port</em> (dół). Drag z output A → input B = B raportuje do A. <kbd>⌘+drag</kbd> = matrix-parent (drugi szef).</p></div>
+    <div class="rule"><h3>Zoom / pan / minimap</h3><p>Scroll = zoom (30%-200%), drag tła = pan, minimapa pokazuje gdzie jesteś. Autosave w topbar. Undo/redo. Wszystko jak w FlowBuilder.</p></div>
+  </div>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">O1</span><h2>Struktura organizacyjna — Org Builder</h2><div class="desc">Smart-In sp. z o.o. · 14 stanowisk · 12 obsadzonych · 2 wakaty · 1 matrix.</div></div>
+
+<div class="screen-frame">
+<div class="tf-shell">
+
+<aside class="tf-side">
+  <div class="tf-logo"><div class="tf-octo">tf</div><span>TentaFlow</span></div>
+  <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+  <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+  <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+  <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">14</span></div>
+  <div class="tf-item active"><svg class="icon"><use href="#i-network"/></svg>Struktura organizacyjna</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-key"/></svg>Uprawnienia (RBAC)</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+  <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-deal"/></svg>CRM</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+  <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+  <div class="tf-bottom">
+    <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+    <div class="tf-user"><div class="av amber">TW</div><div><div class="nm">Tomasz Wójcik</div><div class="rl">Admin</div></div></div>
+    <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+  </div>
+</aside>
+
+<!-- ====== ORG BUILDER (zajmuje całe main) ====== -->
+<main class="addon-main" style="padding:0;display:flex;flex-direction:column;">
+<div class="ob-shell">
+
+  <!-- TOPBAR -->
+  <header class="ob-topbar">
+    <div class="crumb">
+      <strong>Struktura organizacyjna</strong>
+      <span class="text-3">·</span>
+      <span class="text-3">Smart-In sp. z o.o.</span>
+    </div>
+    <span class="autosave">
+      <svg class="icon icon-sm"><use href="#i-check"/></svg>
+      zapisano przed chwilą
+    </span>
+    <div class="sep"></div>
+    <button class="btn btn-ghost btn-sm" title="Undo (⌘Z)"><svg class="icon"><use href="#i-undo"/></svg></button>
+    <button class="btn btn-ghost btn-sm" title="Redo (⌘⇧Z)"><svg class="icon"><use href="#i-redo"/></svg></button>
+    <div class="sep"></div>
+    <div class="pill-tabs" style="margin-bottom:0;padding:2px;">
+      <button class="pill-tab active">Drzewo</button>
+      <button class="pill-tab">Lista</button>
+      <button class="pill-tab"><a href="o02-roles-catalog.html" style="color:inherit;text-decoration:none;">Katalog ról</a></button>
+      <button class="pill-tab">Historia</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="zoom-ctrl">
+      <button title="Oddal"><svg class="icon"><use href="#i-zoom-out"/></svg></button>
+      <span class="zoom-level">82%</span>
+      <button title="Przybliż"><svg class="icon"><use href="#i-zoom-in"/></svg></button>
+      <button title="Dopasuj (F)"><svg class="icon"><use href="#i-fit"/></svg></button>
+    </div>
+    <div class="sep"></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-save"/></svg>Zapisz</button>
+  </header>
+
+  <!-- BODY -->
+  <div class="ob-body">
+
+    <!-- ============ PALETA ============ -->
+    <aside class="ob-palette">
+      <div class="ob-palette-head">
+        <span class="title">Paleta ról</span>
+        <span class="chip" style="font-size:9px">14</span>
+      </div>
+      <div class="ob-palette-search">
+        <div class="search-box"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj roli…"></div>
+      </div>
+      <div class="ob-palette-list">
+
+        <div class="ob-palette-cat">
+          <div class="ob-palette-cat-h"><svg class="icon chev"><use href="#i-chevron-down"/></svg>Management <span style="margin-left:auto;font-size:9px;opacity:0.6">3</span></div>
+          <div class="ob-palette-items">
+            <div class="ob-palette-node" style="--node-color:#a78bfa">
+              <div class="badge"><svg><use href="#i-shield"/></svg></div>
+              <div class="info"><div class="nm">CEO / Prezes</div><div class="ds">najwyższe stanowisko · is_manager</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+            <div class="ob-palette-node" style="--node-color:#a78bfa">
+              <div class="badge"><svg><use href="#i-shield"/></svg></div>
+              <div class="info"><div class="nm">Dyrektor handlowy</div><div class="ds">szef działu sprzedaży · is_manager</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+            <div class="ob-palette-node" style="--node-color:#a78bfa">
+              <div class="badge"><svg><use href="#i-shield"/></svg></div>
+              <div class="info"><div class="nm">Dyrektor sekcji</div><div class="ds">lider sekcji sprzedażowej · is_manager</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ob-palette-cat">
+          <div class="ob-palette-cat-h"><svg class="icon chev"><use href="#i-chevron-down"/></svg>Sales <span style="margin-left:auto;font-size:9px;opacity:0.6">3</span></div>
+          <div class="ob-palette-items">
+            <div class="ob-palette-node" style="--node-color:#6366f1">
+              <div class="badge"><svg><use href="#i-briefcase"/></svg></div>
+              <div class="info"><div class="nm">Sales Lead</div><div class="ds">lider zespołu sprzedaży · is_manager</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+            <div class="ob-palette-node" style="--node-color:#6366f1">
+              <div class="badge"><svg><use href="#i-briefcase"/></svg></div>
+              <div class="info"><div class="nm">Handlowiec L2</div><div class="ds">senior, samodzielny</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+            <div class="ob-palette-node" style="--node-color:#6366f1">
+              <div class="badge"><svg><use href="#i-briefcase"/></svg></div>
+              <div class="info"><div class="nm">Handlowiec L1</div><div class="ds">junior, podstawowa rola sprzedażowa</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ob-palette-cat">
+          <div class="ob-palette-cat-h"><svg class="icon chev"><use href="#i-chevron-down"/></svg>Technical <span style="margin-left:auto;font-size:9px;opacity:0.6">5</span></div>
+          <div class="ob-palette-items">
+            <div class="ob-palette-node" style="--node-color:#f59e0b">
+              <div class="badge"><svg><use href="#i-briefcase"/></svg></div>
+              <div class="info"><div class="nm">PM techniczny</div><div class="ds">kierownik wdrożenia</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+            <div class="ob-palette-node" style="--node-color:#f59e0b">
+              <div class="badge"><svg><use href="#i-briefcase"/></svg></div>
+              <div class="info"><div class="nm">Senior Architekt</div><div class="ds">wsparcie techniczne presales</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+            <div class="ob-palette-node" style="--node-color:#f59e0b">
+              <div class="badge"><svg><use href="#i-briefcase"/></svg></div>
+              <div class="info"><div class="nm">Konsultant techn.</div><div class="ds">doradca techniczny</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+            <div class="ob-palette-node" style="--node-color:#f59e0b">
+              <div class="badge"><svg><use href="#i-briefcase"/></svg></div>
+              <div class="info"><div class="nm">Programista</div><div class="ds">developer realizacji</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+            <div class="ob-palette-node" style="--node-color:#f59e0b">
+              <div class="badge"><svg><use href="#i-briefcase"/></svg></div>
+              <div class="info"><div class="nm">Tester / QA</div><div class="ds">weryfikacja realizacji</div></div>
+              <div class="grip"><svg><use href="#i-grip"/></svg></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ob-palette-cat collapsed">
+          <div class="ob-palette-cat-h"><svg class="icon chev"><use href="#i-chevron-down"/></svg>Finance / Admin <span style="margin-left:auto;font-size:9px;opacity:0.6">3</span></div>
+        </div>
+
+        <div class="ob-palette-cat collapsed">
+          <div class="ob-palette-cat-h"><svg class="icon chev"><use href="#i-chevron-down"/></svg>Custom <span style="margin-left:auto;font-size:9px;opacity:0.6">0</span></div>
+        </div>
+
+        <div style="text-align:center;margin-top:10px;">
+          <a href="o02-roles-catalog.html" class="btn btn-ghost btn-sm" style="font-size:11px;"><svg class="icon"><use href="#i-edit"/></svg>Edytuj katalog ról</a>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ============ CANVAS ============ -->
+    <div class="ob-canvas-wrap">
+
+      <!-- Toolbar floating -->
+      <div class="ob-canvas-toolbar">
+        <button class="active" title="Tryb: Tree"><svg class="icon"><use href="#i-network"/></svg>Tree</button>
+        <button title="Tryb: Free-form (manual layout)">Free</button>
+        <button title="Tryb: Radial">Radial</button>
+        <div class="sep"></div>
+        <button title="Auto-layout"><svg class="icon"><use href="#i-fit"/></svg>Auto-układ</button>
+        <button title="Pokaż tylko obsadzone"><svg class="icon"><use href="#i-user"/></svg>Obsadzone</button>
+        <button title="Tylko wakaty">Wakaty</button>
+      </div>
+
+      <!-- Canvas with edges + nodes -->
+      <div class="ob-canvas">
+        <!-- EDGES (SVG) -->
+        <svg class="ob-canvas-edges" viewBox="0 0 1100 620" preserveAspectRatio="none">
+          <!-- CEO (cx=400, bottom=140) → trzy dyrektorów (cx=130/420/710, top=200) -->
+          <path class="edge" d="M 400 140 C 400 170, 130 170, 130 200" />
+          <path class="edge" d="M 400 140 C 400 170, 420 170, 420 200" />
+          <path class="edge" d="M 400 140 C 400 170, 710 170, 710 200" />
+
+          <!-- Dyr. Sprzedaży (130, 290) → 2 widoczne sekcje (40/220, 380) -->
+          <path class="edge" d="M 130 290 C 130 330, 40 340, 40 380" />
+          <path class="edge" d="M 130 290 C 130 330, 220 340, 220 380" />
+
+          <!-- Dyr. Realizacji (420, 290) → 2 osoby (340/500, 380) -->
+          <path class="edge" d="M 420 290 C 420 330, 340 340, 340 380" />
+          <path class="edge" d="M 420 290 C 420 330, 500 340, 500 380" />
+
+          <!-- Dyr. Finansowy (710, 290) → 2 osoby (620/800, 380) -->
+          <path class="edge" d="M 710 290 C 710 330, 620 340, 620 380" />
+          <path class="edge" d="M 710 290 C 710 330, 800 340, 800 380" />
+
+          <!-- Sekcja Wschód (220, 470) → 2 handlowcy (130/310, 540) -->
+          <path class="edge" d="M 220 470 C 220 500, 130 510, 130 540" />
+          <path class="edge" d="M 220 470 C 220 500, 310 510, 310 540" />
+
+          <!-- MATRIX: Sales Lead (40, 470) → Handlowiec (130, 540) jako drugi przełożony -->
+          <path class="edge matrix" d="M 40 470 C 40 510, 100 525, 130 540" />
+
+          <!-- animated dots na głównej linii (CEO → Dyr. Sprzedaży) -->
+          <circle class="flow-dot" cx="0" cy="0" r="3.5">
+            <animateMotion dur="2.5s" repeatCount="indefinite" path="M 400 140 C 400 170, 130 170, 130 200"/>
+          </circle>
+          <circle class="flow-dot" cx="0" cy="0" r="3.5">
+            <animateMotion dur="2.5s" repeatCount="indefinite" begin="0.6s" path="M 130 290 C 130 330, 220 340, 220 380"/>
+          </circle>
+        </svg>
+
+        <!-- NODES (absolute) -->
+
+        <!-- CEO -->
+        <div class="ob-node" style="left:316px;top:30px;--node-color:#a78bfa;">
+          <span class="ob-port input" style="opacity:0.3"></span>
+          <div class="ob-node-header">
+            <div class="ob-node-badge">TW</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: CEO</div>
+              <div class="ob-node-title">Tomasz Wójcik</div>
+            </div>
+          </div>
+          <div class="ob-node-body">
+            <div class="ob-node-row"><span class="k">Stanowisko</span><span class="v">CEO / Prezes</span></div>
+            <div class="ob-node-row"><span class="k">Dział</span><span class="v">—</span></div>
+          </div>
+          <div class="ob-node-foot">
+            <span>od 2018</span>
+            <span style="color:var(--success)">● aktywne</span>
+          </div>
+          <span class="ob-port output"></span>
+        </div>
+
+        <!-- Dyrektorzy (level 1) -->
+        <div class="ob-node selected" style="left:46px;top:200px;--node-color:#a78bfa;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header">
+            <div class="ob-node-badge">MW</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: dyr handlowy</div>
+              <div class="ob-node-title">Marian Wilk</div>
+            </div>
+          </div>
+          <div class="ob-node-body">
+            <div class="ob-node-row"><span class="k">Stanowisko</span><span class="v">Dyrektor Sprzedaży</span></div>
+            <div class="ob-node-row"><span class="k">Dział</span><span class="v">Sprzedaż</span></div>
+          </div>
+          <div class="ob-node-foot"><span>3 podwładnych · 13 transitive</span></div>
+          <span class="ob-port output"></span>
+        </div>
+
+        <div class="ob-node" style="left:336px;top:200px;--node-color:#14b8a6;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header">
+            <div class="ob-node-badge">EM</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: dyr realizacji</div>
+              <div class="ob-node-title">Ewa Maj</div>
+            </div>
+          </div>
+          <div class="ob-node-body">
+            <div class="ob-node-row"><span class="k">Stanowisko</span><span class="v">Dyrektor Realizacji</span></div>
+            <div class="ob-node-row"><span class="k">Dział</span><span class="v">Realizacja</span></div>
+          </div>
+          <div class="ob-node-foot"><span>3 podwładnych · 1 wakat</span></div>
+          <span class="ob-port output"></span>
+        </div>
+
+        <div class="ob-node" style="left:626px;top:200px;--node-color:#f59e0b;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header">
+            <div class="ob-node-badge">DW</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: COO/CFO</div>
+              <div class="ob-node-title">Dorota Wąs</div>
+            </div>
+          </div>
+          <div class="ob-node-body">
+            <div class="ob-node-row"><span class="k">Stanowisko</span><span class="v">Dyrektor Finansowy / COO</span></div>
+            <div class="ob-node-row"><span class="k">Dział</span><span class="v">Administracja</span></div>
+          </div>
+          <div class="ob-node-foot"><span>2 podwładnych</span></div>
+          <span class="ob-port output"></span>
+        </div>
+
+        <!-- Level 2 — sekcje sprzedaży -->
+        <div class="ob-node" style="left:-44px;top:380px;width:180px;--node-color:#6366f1;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header" style="padding:10px 12px 8px;">
+            <div class="ob-node-badge" style="width:24px;height:24px;">MW</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: sales lead</div>
+              <div class="ob-node-title" style="font-size:12px;">Maciej Wiśniewski</div>
+            </div>
+          </div>
+          <div class="ob-node-foot"><span>Dyr. Centrala · 5 podw.</span></div>
+          <span class="ob-port output"></span>
+        </div>
+
+        <div class="ob-node" style="left:136px;top:380px;width:180px;--node-color:#6366f1;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header" style="padding:10px 12px 8px;">
+            <div class="ob-node-badge" style="width:24px;height:24px;">MP</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: sales lead</div>
+              <div class="ob-node-title" style="font-size:12px;">Marek Pawlak</div>
+            </div>
+          </div>
+          <div class="ob-node-foot"><span>Dyr. Wschód · 5 podw.</span></div>
+          <span class="ob-port output"></span>
+        </div>
+
+        <!-- Level 2 — pod Dyr. Realizacji -->
+        <div class="ob-node" style="left:256px;top:380px;width:180px;--node-color:#f59e0b;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header" style="padding:10px 12px 8px;">
+            <div class="ob-node-badge" style="width:24px;height:24px;">PT</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: pm techniczny</div>
+              <div class="ob-node-title" style="font-size:12px;">Piotr Tracz</div>
+            </div>
+          </div>
+          <span class="ob-port output"></span>
+        </div>
+
+        <div class="ob-node vacant" style="left:416px;top:380px;width:180px;--node-color:#f59e0b;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header" style="padding:10px 12px 8px;">
+            <div class="ob-node-badge" style="width:24px;height:24px;opacity:0.5;">??</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: konsultant techn.</div>
+              <div class="ob-node-title empty" style="font-size:12px;">— wakat —</div>
+            </div>
+          </div>
+          <span class="ob-port output" style="opacity:0.4"></span>
+        </div>
+
+        <!-- Level 2 — pod Finanse -->
+        <div class="ob-node" style="left:536px;top:380px;width:180px;--node-color:#14b8a6;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header" style="padding:10px 12px 8px;">
+            <div class="ob-node-badge" style="width:24px;height:24px;">JM</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: księgowość</div>
+              <div class="ob-node-title" style="font-size:12px;">Joanna Maj</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ob-node" style="left:716px;top:380px;width:180px;--node-color:#14b8a6;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header" style="padding:10px 12px 8px;">
+            <div class="ob-node-badge" style="width:24px;height:24px;">AB</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: RODO</div>
+              <div class="ob-node-title" style="font-size:12px;">Anna Bobrowska</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Level 3 — handlowcy Wschód -->
+        <div class="ob-node" style="left:46px;top:540px;width:170px;--node-color:#6366f1;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header" style="padding:8px 10px 6px;">
+            <div class="ob-node-badge" style="width:22px;height:22px;font-size:9px;">AK</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: handlowiec L2</div>
+              <div class="ob-node-title" style="font-size:11px;">Anna Kowalska</div>
+            </div>
+          </div>
+          <div class="ob-node-foot" style="padding:4px 10px;font-size:9px;">
+            <span>matrix: + Sales Lead</span>
+          </div>
+        </div>
+
+        <div class="ob-node" style="left:226px;top:540px;width:170px;--node-color:#6366f1;">
+          <span class="ob-port input"></span>
+          <div class="ob-node-header" style="padding:8px 10px 6px;">
+            <div class="ob-node-badge" style="width:22px;height:22px;font-size:9px;">MK</div>
+            <div class="ob-node-info">
+              <div class="ob-node-type">role: handlowiec L2</div>
+              <div class="ob-node-title" style="font-size:11px;">Marta Kowal</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Hint -->
+      <div class="ob-canvas-hint">
+        <kbd>drag</kbd> z palety = nowe stanowisko ·
+        <kbd>drag port → port</kbd> = relacja raportowania ·
+        <kbd>scroll</kbd> zoom · <kbd>drag tła</kbd> pan ·
+        <kbd>⌘+drag port</kbd> matrix-parent
+      </div>
+
+      <!-- Minimap -->
+      <div class="ob-minimap">
+        <span class="label">Minimapa</span>
+        <svg viewBox="0 0 1100 700">
+          <!-- CEO -->
+          <rect x="316" y="30" width="218" height="110" rx="6" fill="#a78bfa" opacity="0.4"/>
+          <!-- Dyrektorzy -->
+          <rect x="46" y="200" width="218" height="90" rx="6" fill="#a78bfa" opacity="0.35"/>
+          <rect x="336" y="200" width="218" height="90" rx="6" fill="#14b8a6" opacity="0.35"/>
+          <rect x="626" y="200" width="218" height="90" rx="6" fill="#f59e0b" opacity="0.35"/>
+          <!-- Sekcje -->
+          <rect x="-44" y="380" width="180" height="80" rx="4" fill="#6366f1" opacity="0.3"/>
+          <rect x="136" y="380" width="180" height="80" rx="4" fill="#6366f1" opacity="0.3"/>
+          <rect x="256" y="380" width="180" height="80" rx="4" fill="#f59e0b" opacity="0.3"/>
+          <rect x="416" y="380" width="180" height="80" rx="4" fill="#f59e0b" opacity="0.2" stroke="#f59e0b" stroke-dasharray="6 4"/>
+          <rect x="536" y="380" width="180" height="80" rx="4" fill="#14b8a6" opacity="0.3"/>
+          <rect x="716" y="380" width="180" height="80" rx="4" fill="#14b8a6" opacity="0.3"/>
+          <!-- Handlowcy -->
+          <rect x="46" y="540" width="170" height="70" rx="4" fill="#6366f1" opacity="0.25"/>
+          <rect x="226" y="540" width="170" height="70" rx="4" fill="#6366f1" opacity="0.25"/>
+          <!-- viewport -->
+          <rect class="viewport" x="0" y="0" width="900" height="700"/>
+        </svg>
+      </div>
+    </div>
+
+    <!-- ============ INSPECTOR ============ -->
+    <aside class="ob-inspector">
+      <div class="ob-insp-head">
+        <div class="av indigo">MW</div>
+        <div style="flex:1;min-width:0;">
+          <div class="nm">Marian Wilk</div>
+          <div class="rl">Dyrektor Sprzedaży</div>
+        </div>
+        <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-edit"/></svg></button>
+      </div>
+
+      <div class="ob-insp-tabs">
+        <button class="ob-insp-tab active">Stanowisko</button>
+        <button class="ob-insp-tab">Zależności</button>
+        <button class="ob-insp-tab">Historia</button>
+      </div>
+
+      <div class="ob-insp-body">
+
+        <div class="ob-insp-section">
+          <h4>Rola (z katalogu)</h4>
+          <select class="select">
+            <option>Dyrektor handlowy</option>
+            <option>Dyrektor sekcji</option>
+            <option>Sales Lead</option>
+            <option>… (więcej w katalogu)</option>
+          </select>
+        </div>
+
+        <div class="ob-insp-section">
+          <h4>Stanowisko</h4>
+          <div class="ob-insp-row">
+            <label>Nazwa (UI)</label>
+            <input class="input" value="Dyrektor Sprzedaży">
+          </div>
+          <div class="ob-insp-row">
+            <label>Dział</label>
+            <select class="select"><option>Sprzedaż</option><option>Realizacja</option><option>Administracja</option></select>
+          </div>
+          <div class="ob-insp-row">
+            <label>Sekcja</label>
+            <select class="select"><option>—</option></select>
+          </div>
+        </div>
+
+        <div class="ob-insp-section">
+          <h4>Osoba przypisana</h4>
+          <div class="flex align-center gap-sm" style="padding:8px;background:var(--bg-3);border-radius:6px;">
+            <div class="av sm indigo">MW</div>
+            <div style="flex:1;min-width:0;">
+              <div class="text-sm fw-700">Marian Wilk</div>
+              <div class="text-xs text-3">od 2020-03-15 · share 100%</div>
+            </div>
+            <button class="btn btn-ghost btn-sm">Zmień</button>
+          </div>
+        </div>
+
+        <div class="ob-insp-section">
+          <h4>Raportuje do</h4>
+          <div class="flex align-center gap-sm" style="padding:8px;background:var(--bg-3);border-radius:6px;">
+            <div class="av sm amber">TW</div>
+            <div style="flex:1;min-width:0;">
+              <div class="text-sm fw-700">Tomasz Wójcik</div>
+              <div class="text-xs text-3">CEO · priority=1 (główny)</div>
+            </div>
+          </div>
+          <button class="btn btn-ghost btn-sm" style="width:100%;justify-content:center;margin-top:6px;font-size:11px;">
+            <svg class="icon"><use href="#i-plus"/></svg>+ Drugi przełożony (matrix)
+          </button>
+        </div>
+
+        <div class="ob-insp-section">
+          <h4>Bezpośredni podwładni (3)</h4>
+          <div class="flex col gap-sm">
+            <div class="flex align-center gap-sm"><div class="av sm indigo">MW</div><span class="text-sm">Maciej Wiśniewski · Centrala</span></div>
+            <div class="flex align-center gap-sm"><div class="av sm amber">MP</div><span class="text-sm">Marek Pawlak · Wschód</span></div>
+            <div class="flex align-center gap-sm"><div class="av sm gray">KS</div><span class="text-sm">Krzysztof Sokół · Zachód</span></div>
+          </div>
+        </div>
+
+        <div class="ob-insp-section">
+          <h4>Korzystają z hierarchii</h4>
+          <div class="text-xs text-3" style="margin-bottom:8px;line-height:1.5;">Addony konsumujące tę pozycję przez <code>org.*</code>:</div>
+          <div class="flex col gap-sm text-sm">
+            <div class="flex align-center gap-sm">
+              <svg class="icon" style="color:var(--accent-2)"><use href="#i-deal"/></svg>
+              <a href="#" style="flex:1">CRM</a>
+              <span class="chip" style="font-size:9px">subordinates</span>
+            </div>
+            <div class="flex align-center gap-sm">
+              <svg class="icon" style="color:var(--warning)"><use href="#i-receipt"/></svg>
+              <a href="#" style="flex:1">Billing</a>
+              <span class="chip" style="font-size:9px">dept_aggregate</span>
+            </div>
+          </div>
+          <div class="text-xs text-3 mt-md" style="font-style:italic;line-height:1.4;">
+            Konkretne reguły uprawnień w <a href="p02-permissions.html">P2 RBAC</a>.
+          </div>
+        </div>
+
+        <div class="ob-insp-section">
+          <button class="btn btn-danger btn-sm" style="width:100%;justify-content:center;">
+            <svg class="icon"><use href="#i-trash"/></svg>Usuń stanowisko
+          </button>
+        </div>
+
+      </div>
+    </aside>
+
+  </div>
+</div>
+</main>
+
+</div></div>
+</section>
+
+</body>
+</html>

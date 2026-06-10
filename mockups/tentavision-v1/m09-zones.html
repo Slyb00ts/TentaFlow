@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Strefy &amp; reguły (M9)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.zones-layout { display: grid; grid-template-columns: 1fr 380px; gap: 16px; }
+.camera-view { aspect-ratio: 16/9; background: linear-gradient(135deg,#1a1f45,#050818); border-radius: var(--radius); position: relative; border: 1px solid var(--border); overflow: hidden; }
+.zone-poly {
+  position: absolute; border: 2px solid var(--accent-2); background: rgba(167,139,250,0.15); border-radius: 4px;
+}
+.zone-poly.exclude { border-color: var(--danger); background: rgba(239,68,68,0.15); border-style: dashed; }
+.zone-poly.line { background: transparent; border: 0; border-top: 3px dashed var(--info); height: 0; }
+.zone-poly label {
+  position: absolute; top: -22px; left: 0; background: var(--accent-2); color: var(--bg);
+  padding: 1px 8px; font-size: 10px; font-weight: 700; border-radius: 3px;
+}
+.zone-poly.exclude label { background: var(--danger); color: white; }
+.zone-poly.line label { background: var(--info); color: var(--bg); position: static; }
+.zone-poly .vertex { position: absolute; width: 10px; height: 10px; background: white; border: 2px solid var(--accent-2);
+  border-radius: 50%; margin: -5px; cursor: move; }
+.day-grid { display: grid; grid-template-columns: 60px repeat(7, 1fr); gap: 2px; font-size: 10px; }
+.day-grid .h-label { padding: 4px; color: var(--text-3); }
+.day-grid .h-cell { padding: 4px; background: var(--bg-3); border-radius: 2px; min-height: 18px; }
+.day-grid .h-cell.profile-day { background: rgba(99,102,241,0.4); }
+.day-grid .h-cell.profile-night { background: rgba(239,68,68,0.4); }
+.day-grid .h-cell.profile-adr { background: rgba(34,197,94,0.4); }
+.day-grid .day-header { text-align: center; color: var(--text-2); font-weight: 700; padding: 4px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/></symbol>
+  <symbol id="i-zone" viewBox="0 0 24 24"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21 3 6"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M9</span><h2>Strefy, harmonogramy, reguły</h2>
+    <div class="desc">Polygon editor na kadrze, kalendarz tygodniowy profili, reguły AND/OR detektorów.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Analyst</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Strefy &amp; reguły</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21 3 6"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Strefy &amp; reguły</div>
+            <div class="d-sub">Edytor stref na kamerze C-07 peron · 4 strefy zdefiniowane · 2 linie przekroczenia · 1 zone exclude</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-calendar"/></svg>Harmonogram</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg>Nowa strefa</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab active"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+        </div>
+
+        <div class="zones-layout">
+          <section class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-camera"/></svg>C-07 peron · widok kamery</div>
+              <div class="segmented">
+                <button class="active">Polygon</button>
+                <button>Linia</button>
+                <button>Exclude</button>
+              </div>
+            </div>
+            <div class="camera-view">
+              <div class="zone-poly" style="left:8%;top:55%;width:42%;height:36%">
+                <label>Strefa peron główny</label>
+                <span class="vertex" style="left:0;top:0"></span>
+                <span class="vertex" style="right:0;top:0"></span>
+                <span class="vertex" style="left:0;bottom:0"></span>
+                <span class="vertex" style="right:0;bottom:0"></span>
+              </div>
+              <div class="zone-poly exclude" style="left:55%;top:65%;width:18%;height:20%">
+                <label>Ławka (ignore D3)</label>
+              </div>
+              <div class="zone-poly line" style="left:8%;top:55%;width:42%">
+                <label>Linia przekroczenia żółta</label>
+              </div>
+            </div>
+            <div class="flex gap-sm mt-md">
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Dodaj punkt</button>
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-edit"/></svg>Edycja</button>
+              <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button>
+              <span class="ml-auto text-xs text-3">Kliknij na obrazie aby dodać wierzchołek polygonu</span>
+            </div>
+          </section>
+
+          <section class="section-card">
+            <div class="section-card-head"><div class="title">Strefy na tej kamerze</div></div>
+            <div class="flex col gap-sm">
+              <div style="padding:10px;background:var(--bg);border:1px solid var(--accent-1);border-radius:var(--radius-sm)">
+                <div class="fw-700 text-sm flex align-center gap-sm"><span style="width:10px;height:10px;background:var(--accent-2);border-radius:2px"></span>Peron główny</div>
+                <div class="text-xs text-3 mt-sm">Polygon · 4 wierzchołki · stosowany w: D2, D3, D6</div>
+              </div>
+              <div style="padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm)">
+                <div class="fw-700 text-sm flex align-center gap-sm"><span style="width:10px;height:10px;background:var(--danger);border-radius:2px"></span>Ławka (ignore D3)</div>
+                <div class="text-xs text-3 mt-sm">Exclude · 4 wierzchołki · stosowany w: D3</div>
+              </div>
+              <div style="padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm)">
+                <div class="fw-700 text-sm flex align-center gap-sm"><span style="width:10px;height:10px;background:var(--info);border-radius:2px"></span>Linia żółta</div>
+                <div class="text-xs text-3 mt-sm">Line crossing · alarm gdy przekroczenie</div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- Schedule -->
+        <section class="section-card mt-md">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-calendar"/></svg>Harmonogram tygodniowy profili · C-07 peron</div>
+            <div class="flex gap-sm">
+              <span class="chip"><span class="dot" style="background:var(--accent-2)"></span>Peron-publiczny (dzień)</span>
+              <span class="chip"><span class="dot" style="background:var(--danger)"></span>Bezpieczeństwo-noc</span>
+              <span class="chip"><span class="dot" style="background:var(--success)"></span>Wyłączone</span>
+            </div>
+          </div>
+          <div class="day-grid">
+            <div></div>
+            <div class="day-header">Pon</div><div class="day-header">Wt</div><div class="day-header">Śr</div>
+            <div class="day-header">Czw</div><div class="day-header">Pt</div><div class="day-header">Sob</div><div class="day-header">Nd</div>
+            <div class="h-label">04–06</div>
+            <div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div>
+            <div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell"></div><div class="h-cell"></div>
+            <div class="h-label">06–12</div>
+            <div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div>
+            <div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div>
+            <div class="h-label">12–18</div>
+            <div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div>
+            <div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div>
+            <div class="h-label">18–22</div>
+            <div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div>
+            <div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div><div class="h-cell profile-day"></div>
+            <div class="h-label">22–04</div>
+            <div class="h-cell profile-night"></div><div class="h-cell profile-night"></div><div class="h-cell profile-night"></div>
+            <div class="h-cell profile-night"></div><div class="h-cell profile-night"></div><div class="h-cell profile-night"></div><div class="h-cell profile-night"></div>
+          </div>
+        </section>
+
+        <!-- Composite rules -->
+        <section class="section-card mt-md">
+          <div class="section-card-head">
+            <div class="title">Reguły kompozytowe (AND/OR detektorów)</div>
+            <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowa reguła</button>
+          </div>
+          <table class="tf-table" style="border:0">
+            <thead><tr><th>Nazwa</th><th>Wyrażenie</th><th>Akcja</th><th>Aktywna</th></tr></thead>
+            <tbody>
+              <tr><td class="fw-700">Bagaż + pusta strefa</td><td class="mono">D3.luggage(unowned&gt;90s) AND zone.peron AND not zone.lawka</td><td>Alarm krytyczny + SMS</td><td><span class="toggle on"></span></td></tr>
+              <tr><td class="fw-700">Pojazd ADR + tablica nieczytelna</td><td class="mono">D1.tanker AND D1.legibility&lt;0.65</td><td>Alarm warning + zatrzymaj szlaban</td><td><span class="toggle on"></span></td></tr>
+              <tr><td class="fw-700">Agresja w nocy</td><td class="mono">D2.aggression(conf&gt;0.75) AND time.between(22,06)</td><td>Alarm krytyczny + 112 jeśli &gt;0.9</td><td><span class="toggle on"></span></td></tr>
+              <tr><td class="fw-700">Wjazd po godzinach</td><td class="mono">D6.vehicle AND zone.brama AND not schedule.business</td><td>Alarm info + log</td><td><span class="toggle on"></span></td></tr>
+            </tbody>
+          </table>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

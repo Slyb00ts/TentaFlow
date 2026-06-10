@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head><meta charset="UTF-8"><title>CRM — Karta akceptacji (C9)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css"></head>
+<body>
+
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+<symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5"/></symbol>
+<symbol id="i-deal" viewBox="0 0 24 24"><path d="M12 2v20"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-arrow-right" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20l3-2 3 2 3-2 3 2 3-2 1 2V2l-3 2-3-2-3 2-3-2-3 2-1-2z"/><path d="M16 8H8"/><path d="M16 12H8"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="2"/><circle cx="20" cy="4" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9 14a2 2 0 0 0 2 2h2a2 2 0 0 0 0-4h-2a2 2 0 0 1 0-4h2a2 2 0 0 1 2 2"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="4" width="4" height="16" rx="1"/><rect x="10" y="4" width="4" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+<symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.91 5.18L4.92 10l5.17 1.82L12 17l1.91-5.18L19.08 10l-5.17-1.82L12 3z"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>CRM — Karta akceptacji budżetu (C9)</h1>
+  <p class="lead">
+    Migracja z IntrAppa, czystsze UI. Workflow: handlowiec klika <em>Wyślij kartę</em> → renderer (Typst / HTML→PDF) generuje PDF → mail do zatwierdzającego z 3 linkami (<strong>accept</strong> / <strong>decline</strong> / <strong>view</strong>) → kliknięcie zwrotne ustawia flagi w bazie i odblokowuje przejście do realizacji.
+  </p>
+</div>
+
+<section class="screen">
+<div class="screen-header"><span class="num">C9</span><h2>Karta akceptacji — wysyłka i status</h2><div class="desc">Deal Acme · Cyfryzacja CRO · wartość 420k · Anna chce wysłać do dyrektora Marka Pawlaka.</div></div>
+<div class="screen-frame">
+<div class="tf-shell">
+<aside class="tf-side">
+    <div class="tf-logo">
+      <div class="tf-octo">tf</div>
+      <span>TentaFlow</span>
+    </div>
+
+    <div class="tf-item"><svg class="icon"><use href="#i-clock"/></svg>Scheduler</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield"/></svg>Reguły</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-puzzle"/></svg>Integracje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Katalog serwisów</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-shield"/></svg>Zarządzanie</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addons<span class="badge muted">12</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="badge muted">1</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-history"/></svg>Dziennik audytu</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-shield-check"/></svg>Dokumenty RODO</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-trend"/></svg>Profilowanie</div>
+
+    <div class="tf-section"><svg class="icon"><use href="#i-grid"/></svg>Moje aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie aplikacje</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-message"/></svg>Chat</div>
+    <div class="tf-item muted"><svg class="icon"><use href="#i-eye"/></svg>Obrazy<span class="badge soon">soon</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-file"/></svg>Notatki</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-mic"/></svg>Meeting Bot</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-user"/></svg>Pozy</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-globe"/></svg>Tłumacz</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-eye"/></svg>TentaVision</div>
+    <div class="tf-item active"><svg class="icon"><use href="#i-deal"/></svg>CRM<span class="badge danger">7</span></div>
+    <div class="tf-item"><svg class="icon"><use href="#i-users"/></svg>Contacts</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-activity"/></svg>Activity</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-calendar"/></svg>Calendar</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-folder"/></svg>Documents</div>
+    <div class="tf-item"><svg class="icon"><use href="#i-receipt"/></svg>Billing</div>
+
+    <div class="tf-bottom">
+      <div class="tf-lang"><span class="flag">🇵🇱</span>Polski<svg class="icon chev"><use href="#i-chevron-down"/></svg></div>
+      <div class="tf-user"><div class="av indigo">AK</div><div><div class="nm">Anna Kowalska</div><div class="rl">Handlowiec · Wschód</div></div></div>
+      <div class="tf-logout"><svg class="icon"><use href="#i-external"/></svg>Wyloguj</div>
+    </div>
+  </aside>
+
+<main class="addon-main">
+
+<div class="addon-topbar">
+  <div class="addon-crumb"><strong>CRM</strong><span class="sep">›</span><span>Karta: Acme CRO</span></div>
+  <div class="pill-tabs">
+    <button class="pill-tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-inbox"/></svg>Inbox</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-pipeline"/></svg>Pipeline</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-trend"/></svg>Forecast</button>
+    <button class="pill-tab active"><svg class="icon"><use href="#i-shield-check"/></svg>Akceptacje</button>
+    <button class="pill-tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+  </div>
+  <div class="addon-actions">
+    <div class="addon-search"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj w addonie…"><span class="kbd">⌘K</span></div>
+    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy</button>
+    <button class="btn btn-icon"><svg class="icon"><use href="#i-sparkles"/></svg></button>
+  </div>
+</div>
+
+<div class="page-head">
+<div class="title">Karta akceptacji budżetu<div class="sub">Deal: Acme · Cyfryzacja CRO · 420 000 PLN</div></div>
+<div class="actions">
+  <span class="chip success"><span class="dot"></span>Zaakceptowana 19.05 · 8:42</span>
+</div>
+</div>
+
+<div class="grid-2">
+
+<!-- LEWA — workflow status -->
+<div>
+  <div class="section-card">
+    <h3><svg class="icon"><use href="#i-shield-check"/></svg>Status workflow</h3>
+
+    <div class="timeline">
+      <div class="tl-item">
+        <div class="tl-dot success"><svg class="icon"><use href="#i-check"/></svg></div>
+        <div class="tl-body">
+          <div class="tl-head"><span class="who">Anna Kowalska</span><span class="action">wygenerowała kartę z szablonu „Budget Acceptance Card v3”</span><span class="when">17.05 14:22</span></div>
+          <div class="tl-content">PDF 4 strony · rendered przez Typst · podpięty jako <code>acceptance_card_OrlenCRO_v1.pdf</code></div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot success"><svg class="icon"><use href="#i-mail"/></svg></div>
+        <div class="tl-body">
+          <div class="tl-head"><span class="who">System</span><span class="action">wysłał mail do Marka Pawlaka (dyr. sekcji Wschód)</span><span class="when">17.05 14:23</span></div>
+          <div class="tl-content text-sm">Mail z 3 linkami: <code>Accept</code>, <code>Decline</code>, <code>View deal</code>. Każdy link ma jednorazowy token HMAC z TTL 7 dni.</div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot info"><svg class="icon"><use href="#i-eye"/></svg></div>
+        <div class="tl-body">
+          <div class="tl-head"><span class="who">Marek Pawlak</span><span class="action">otworzył PDF (mobile, Outlook)</span><span class="when">18.05 19:14</span></div>
+          <div class="tl-content text-sm">Tracking via documents addon · IP 89.0.42.x · device: iOS</div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot success"><svg class="icon"><use href="#i-check"/></svg></div>
+        <div class="tl-body">
+          <div class="tl-head"><span class="who">Marek Pawlak</span><span class="action">kliknął <strong style="color:var(--success)">Accept</strong> w mailu</span><span class="when">19.05 8:42</span></div>
+          <div class="tl-content">Token zużyty · pozostałe linki (decline/view) zostają ważne 5 dni. Flaga <code>acceptance_card_accepted = true</code> ustawiona.</div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot pink"><svg class="icon"><use href="#i-rocket"/></svg></div>
+        <div class="tl-body">
+          <div class="tl-head"><span class="who">CRM</span><span class="action">deal może przejść do <strong>Realizacja</strong> — wymaga ostatniego kliknięcia handlowca</span><span class="when">teraz</span></div>
+          <div class="flex gap-sm" style="margin-top:8px;">
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-arrow-right"/></svg>Promuj do realizacji</button>
+            <button class="btn btn-ghost btn-sm">Otwórz deal</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-card" style="background:rgba(34,197,94,0.04);border-color:rgba(34,197,94,0.25);">
+    <h3 style="color:var(--success)"><svg class="icon"><use href="#i-info"/></svg>Co się stanie po promocji</h3>
+    <div class="flex col gap-sm" style="font-size:12.5px;">
+      <div>· <code>trade_costs</code> (plan) → klon do <code>trade_realization_costs</code> z nowymi kodami</div>
+      <div>· <code>project_incomes</code> (plan) → klon do <code>project_realization_incomes</code> z remapem <code>linked_costs</code></div>
+      <div>· <code>deal.stage</code> = <code>realization</code> (z magic-number 100 jak w IntrAppie — ale teraz to enum, nie liczba)</div>
+      <div>· Eventy: <code>deal.promoted_to_realization</code>, <code>acceptance_card.accepted</code></div>
+      <div>· Realizacja widoczna w forecast jako <strong>real</strong> nie <em>planowane</em>.</div>
+    </div>
+  </div>
+</div>
+
+<!-- PRAWA — preview maila i karty -->
+<div>
+  <!-- Email preview -->
+  <div class="section-card">
+    <div class="section-card-head">
+      <div class="title"><svg class="icon"><use href="#i-mail"/></svg>Preview wiadomości wysłanej</div>
+      <span class="contrib-tag email">email</span>
+    </div>
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-size:12px;line-height:1.6;">
+      <div class="text-xs text-3" style="margin-bottom:6px;">Do: <strong style="color:var(--text-2)">m.pawlak@nasza-firma.pl</strong></div>
+      <div class="text-xs text-3" style="margin-bottom:6px;">Od: <strong style="color:var(--text-2)">Anna Kowalska &lt;a.kowalska@nasza-firma.pl&gt;</strong></div>
+      <div class="text-xs text-3" style="margin-bottom:10px;">Temat: <strong style="color:var(--text-2)">Karta akceptacji budżetu — Acme · Cyfryzacja CRO (420 000 PLN)</strong></div>
+      <div class="text-2">
+        Cześć Marek,<br><br>
+        Proszę o akceptację budżetu dla deala <strong style="color:var(--text)">Acme · Cyfryzacja CRO</strong> o wartości <strong style="color:var(--text)">420 000 PLN</strong>.
+        Karta z podziałem kosztów i marży w załączniku.
+        <br><br>
+        <div style="background:var(--bg-3);padding:10px;border-radius:6px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:8px 0;">
+          <a href="#" style="background:var(--success);color:white;padding:7px 16px;border-radius:6px;font-weight:700;font-size:12px;">✓ Akceptuję</a>
+          <a href="#" style="background:var(--danger);color:white;padding:7px 16px;border-radius:6px;font-weight:700;font-size:12px;">✗ Odrzucam</a>
+          <a href="#" style="background:var(--bg);color:var(--text-2);padding:7px 16px;border-radius:6px;font-weight:600;font-size:12px;border:1px solid var(--border);">Otwórz w TentaFlow</a>
+        </div>
+        Pozdrawiam,<br>Anna
+        <br><br>
+        <div class="text-xs text-3" style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">📎 acceptance_card_OrlenCRO_v1.pdf · 240 KB</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PDF preview -->
+  <div class="section-card">
+    <div class="section-card-head">
+      <div class="title"><svg class="icon"><use href="#i-file"/></svg>Karta budżetowa — preview PDF</div>
+      <span class="contrib-tag documents">documents</span>
+    </div>
+    <div style="background:white;color:#111;border-radius:6px;padding:20px;font-size:11px;line-height:1.5;min-height:340px;">
+      <div style="border-bottom:2px solid #333;padding-bottom:8px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">
+        <strong style="font-size:14px;">KARTA AKCEPTACJI BUDŻETU</strong>
+        <div style="text-align:right;font-size:9px;color:#666;">DEAL-2026-0211<br>17.05.2026</div>
+      </div>
+      <div style="font-weight:800;font-size:13px;">Acme · Cyfryzacja CRO</div>
+      <div style="color:#666;font-size:10px;margin-bottom:14px;">Klient: Acme S.A. · Owner: Anna Kowalska · Sekcja: Wschód</div>
+
+      <table style="width:100%;font-size:10px;border-collapse:collapse;margin-bottom:12px;">
+        <thead><tr style="background:#f0f0f0;"><th style="text-align:left;padding:4px 6px;border:1px solid #ccc;">Pozycja</th><th style="text-align:right;padding:4px 6px;border:1px solid #ccc;">Kwota netto</th></tr></thead>
+        <tbody>
+          <tr><td style="padding:4px 6px;border:1px solid #ccc;">Wartość kontraktu</td><td style="padding:4px 6px;border:1px solid #ccc;text-align:right;font-weight:700">420 000,00 PLN</td></tr>
+          <tr><td style="padding:4px 6px;border:1px solid #ccc;">Koszty planowe — łącznie</td><td style="padding:4px 6px;border:1px solid #ccc;text-align:right;">340 200,00 PLN</td></tr>
+          <tr><td style="padding:4px 6px;border:1px solid #ccc;padding-left:14px;">· Materiały (4)</td><td style="padding:4px 6px;border:1px solid #ccc;text-align:right;">158 000</td></tr>
+          <tr><td style="padding:4px 6px;border:1px solid #ccc;padding-left:14px;">· Usługi zewn. (3)</td><td style="padding:4px 6px;border:1px solid #ccc;text-align:right;">94 200</td></tr>
+          <tr><td style="padding:4px 6px;border:1px solid #ccc;padding-left:14px;">· Usługi wewn. (5)</td><td style="padding:4px 6px;border:1px solid #ccc;text-align:right;">68 000</td></tr>
+          <tr><td style="padding:4px 6px;border:1px solid #ccc;padding-left:14px;">· Dodatki (2)</td><td style="padding:4px 6px;border:1px solid #ccc;text-align:right;">20 000</td></tr>
+          <tr style="background:#e8f5e9;font-weight:800;"><td style="padding:4px 6px;border:1px solid #ccc;">Marża planowana</td><td style="padding:4px 6px;border:1px solid #ccc;text-align:right;">79 800 PLN · 19.0%</td></tr>
+        </tbody>
+      </table>
+
+      <div style="margin-top:14px;font-size:10px;">
+        <div style="font-weight:700;margin-bottom:4px;">Akceptujący: Marek Pawlak · Dyrektor sekcji Wschód</div>
+        <div style="border:1px dashed #999;padding:30px 10px;text-align:center;color:#999;">[ podpis cyfrowy / akceptacja przez link mail]</div>
+      </div>
+
+      <div style="margin-top:12px;font-size:9px;color:#999;">Ważność karty: 7 dni · ID karty: AC-2026-0118 · TentaFlow CRM</div>
+    </div>
+  </div>
+</div>
+
+</div>
+</main>
+</div>
+</div>
+</section>
+
+</body>
+</html>

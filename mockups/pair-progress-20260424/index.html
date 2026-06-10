@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Pair progress dialog (mockup)</title>
+<style>
+/* =============================================================================
+   Pair progress dialog — zastepuje okienko "wpisz node_id / zeskanuj QR" po
+   kliknieciu "Sparuj". Pokazuje animowana timeline statusu handshake-u pairingu
+   i auto-zamyka sie po 1.5s gdy dojdziemy do "Connected".
+   Kroki:
+     1) preparing          — generowanie PIN, przygotowanie requestu
+     2) reach              — szukamy peera (relay/direct)
+     3) handshake          — PairingRequest -> PairingResponse
+     4) exchanging_keys    — TrustedKeysSync, NodeInfo
+     5) connected          — zielony check, auto-close za 1.5s
+   Stany alternatywne:
+     * error               — dowolny krok moze spasc (pokazane na kolejnym kafelku)
+   ============================================================================= */
+
+:root {
+  color-scheme: dark;
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --bg-card: #141836;
+  --bg-card-hover: #1a1f45;
+  --bg-input: #0b0e22;
+  --border: #1f2548;
+  --border-hover: #2f3668;
+  --text: #e8ebf5;
+  --text-2: #a0a8c8;
+  --text-3: #6a7196;
+  --accent-1: #6366f1;
+  --accent-2: #a78bfa;
+  --accent-glow: rgba(99,102,241,0.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #60a5fa;
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-lg: 0 20px 60px rgba(0,0,0,0.6), 0 4px 16px rgba(0,0,0,0.4);
+  --gradient-accent: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Manrope', -apple-system, system-ui, sans-serif;
+  font-size: 14px; line-height: 1.5;
+  min-height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+body {
+  min-height: 100vh;
+  display: flex; flex-direction: column; align-items: center; gap: 40px;
+  padding: 60px 24px;
+  background:
+    radial-gradient(ellipse at top, rgba(99,102,241,0.08), transparent 60%),
+    radial-gradient(ellipse at bottom, rgba(167,139,250,0.05), transparent 60%),
+    var(--bg);
+}
+.stage-label {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.14em;
+  color: var(--accent-2); text-transform: uppercase;
+  margin-bottom: -20px;
+}
+
+/* -------- tf-window shell -------- */
+.tf-window {
+  position: relative;
+  width: min(520px, calc(100vw - 32px));
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.tf-window-head {
+  padding: 14px 18px;
+  display: flex; align-items: center; gap: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.tf-window-head .head-ico {
+  width: 32px; height: 32px; border-radius: var(--radius-sm);
+  background: rgba(99,102,241,0.14);
+  border: 1px solid rgba(99,102,241,0.3);
+  color: var(--accent-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.tf-window-head .head-ico svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-window-head .head-title {
+  flex: 1;
+  font-size: 14px; font-weight: 700; color: var(--text);
+}
+.tf-window-head .close-btn {
+  width: 28px; height: 28px; border-radius: var(--radius-sm);
+  background: transparent; border: 1px solid transparent;
+  color: var(--text-3); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.tf-window-head .close-btn:hover { background: var(--bg-3); color: var(--text); border-color: var(--border); }
+.tf-window-head .close-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-window-body { padding: 18px 20px 6px; }
+
+/* -------- Peer chip nad krokami -------- */
+.pair-target {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 16px;
+}
+.pair-target .p-ico {
+  width: 38px; height: 38px; border-radius: var(--radius-sm);
+  background: rgba(99,102,241,0.14);
+  border: 1px solid rgba(99,102,241,0.3);
+  color: var(--accent-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.pair-target .p-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; }
+.pair-target .p-meta { flex: 1; min-width: 0; }
+.pair-target .p-name { font-size: 13px; font-weight: 700; color: var(--text); }
+.pair-target .p-id {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10.5px; color: var(--text-3);
+  margin-top: 3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* =============================================================================
+   Timeline krokow
+   - step-dot: okrag z ikona stanu (pending/active/done/error)
+   - vertical line laczaca dots (kolor zalezy od stanu "done")
+   ============================================================================= */
+
+.pair-steps {
+  position: relative;
+  padding: 6px 2px 4px 2px;
+}
+.pair-step {
+  position: relative;
+  display: flex; align-items: flex-start; gap: 14px;
+  padding: 8px 0 14px 0;
+}
+.pair-step:last-child { padding-bottom: 2px; }
+
+/* Linia pionowa od kropki do nastepnej — kolor zalezy od stanu "done" */
+.pair-step::before {
+  content: "";
+  position: absolute;
+  left: 15px;          /* srodek 32px dot - 1px */
+  top: 40px;           /* dol kropki + 2px */
+  width: 2px;
+  bottom: -4px;
+  background: var(--border);
+  border-radius: 1px;
+  transition: background 0.3s;
+}
+.pair-step:last-child::before { display: none; }
+.pair-step.done::before,
+.pair-step.active::before { background: linear-gradient(to bottom, var(--accent-1), var(--border)); }
+.pair-step.done + .pair-step.done::before { background: var(--accent-1); }
+
+.step-dot {
+  width: 32px; height: 32px; border-radius: 50%;
+  background: var(--bg-3);
+  border: 1.5px solid var(--border);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-3);
+  transition: all 0.25s;
+  position: relative;
+  z-index: 1;
+}
+.step-dot svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2.4; }
+
+/* pending — nic poza domyslnym */
+.pair-step.pending .step-dot {
+  color: var(--text-3);
+}
+.pair-step.pending .step-dot svg { display: none; }
+.pair-step.pending .step-dot::after {
+  content: "";
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-3);
+  opacity: 0.5;
+}
+
+/* active — gradient + pulsujaca obwodka */
+.pair-step.active .step-dot {
+  background: var(--gradient-accent);
+  color: white;
+  border-color: var(--accent-1);
+  box-shadow: 0 0 0 0 var(--accent-glow);
+  animation: step-pulse 1.6s ease-in-out infinite;
+}
+@keyframes step-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(99,102,241,0.4); }
+  50%      { box-shadow: 0 0 0 10px rgba(99,102,241,0); }
+}
+.pair-step.active .step-dot svg { animation: step-spin 1s linear infinite; }
+@keyframes step-spin { to { transform: rotate(360deg); } }
+
+/* done — zielony check */
+.pair-step.done .step-dot {
+  background: rgba(34, 197, 94, 0.18);
+  border-color: rgba(34, 197, 94, 0.55);
+  color: var(--success);
+}
+
+/* error — czerwony krzyzyk */
+.pair-step.error .step-dot {
+  background: rgba(239, 68, 68, 0.18);
+  border-color: rgba(239, 68, 68, 0.55);
+  color: var(--danger);
+  animation: step-shake 0.4s ease-in-out;
+}
+@keyframes step-shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  75% { transform: translateX(3px); }
+}
+
+/* Tresc kroku */
+.step-body { flex: 1; min-width: 0; padding-top: 5px; }
+.step-label {
+  font-size: 13px; font-weight: 600; color: var(--text-2);
+  transition: color 0.25s;
+}
+.pair-step.active .step-label { color: var(--text); font-weight: 700; }
+.pair-step.done .step-label { color: var(--text); }
+.pair-step.error .step-label { color: var(--text); }
+.step-detail {
+  font-size: 11.5px; color: var(--text-3);
+  margin-top: 3px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+.pair-step.error .step-detail { color: var(--danger); }
+
+/* -------- Banner na dole (success / error) -------- */
+.pair-banner {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  display: flex; align-items: center; gap: 10px;
+}
+.pair-banner svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; flex-shrink: 0; }
+.pair-banner.success {
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  color: var(--success);
+}
+.pair-banner.error {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: var(--danger);
+}
+.pair-banner.info {
+  background: rgba(96, 165, 250, 0.08);
+  border: 1px solid rgba(96, 165, 250, 0.3);
+  color: var(--info);
+}
+.pair-banner .bar-inner { flex: 1; }
+.pair-banner .bar-inner b { display: block; color: currentColor; margin-bottom: 2px; font-weight: 700; font-size: 12.5px; }
+.pair-banner .bar-inner span { color: var(--text-2); font-weight: 500; }
+
+/* Auto-close countdown */
+.pair-banner.success .countdown {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* -------- Footer -------- */
+.tf-window-foot {
+  padding: 12px 18px 14px;
+  display: flex; justify-content: flex-end; gap: 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.tf-button {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 9px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px; font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-family: inherit;
+  background: transparent; color: var(--text);
+  white-space: nowrap; min-height: 36px;
+  transition: all 0.12s;
+}
+.tf-button svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-button.ghost { background: var(--bg-3); color: var(--text-2); border-color: var(--border); }
+.tf-button.ghost:hover { background: var(--bg-card-hover); color: var(--text); border-color: var(--border-hover); }
+.tf-button.primary {
+  background: var(--gradient-accent); color: white;
+  box-shadow: 0 2px 10px var(--accent-glow);
+}
+.tf-button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+@media (max-width: 520px) {
+  .tf-window { width: 100%; margin: 0 12px; border-radius: var(--radius); }
+  .tf-window-foot { flex-direction: column-reverse; gap: 8px; }
+  .tf-window-foot .tf-button { width: 100%; justify-content: center; padding: 12px 16px; min-height: 44px; }
+}
+</style>
+</head>
+<body>
+
+<!-- =============================================================================
+     TRZY STANY TEGO SAMEGO OKNA:
+     1) W trakcie (active na kroku handshake)
+     2) Sukces (connected + countdown auto-close)
+     3) Blad (np. read response: connection lost)
+     ============================================================================= -->
+
+<!-- ========== 1) IN PROGRESS ========== -->
+<div class="stage-label">1 / W trakcie parowania</div>
+<div class="tf-window" role="dialog" aria-modal="true">
+  <div class="tf-window-head">
+    <div class="head-ico">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>
+    </div>
+    <div class="head-title">Parowanie z nodem</div>
+    <button class="close-btn" type="button" aria-label="Zamknij">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+
+  <div class="tf-window-body">
+    <div class="pair-target">
+      <div class="p-ico">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="2" x2="9" y2="4"/><line x1="15" y1="2" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="22"/><line x1="15" y1="20" x2="15" y2="22"/><line x1="20" y1="9" x2="22" y2="9"/><line x1="20" y1="14" x2="22" y2="14"/><line x1="2" y1="9" x2="4" y2="9"/><line x1="2" y1="14" x2="4" y2="14"/></svg>
+      </div>
+      <div class="p-meta">
+        <div class="p-name">tenta-flow-testbench-0-7</div>
+        <div class="p-id">a2e5b28a4e467f3cb303c08a0645d30ac31c939167e51ab6adc90afde6e259b8</div>
+      </div>
+    </div>
+
+    <div class="pair-steps">
+      <!-- 1 — done -->
+      <div class="pair-step done">
+        <div class="step-dot">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        </div>
+        <div class="step-body">
+          <div class="step-label">Przygotowanie</div>
+          <div class="step-detail">PIN wygenerowany · request podpisany Ed25519</div>
+        </div>
+      </div>
+
+      <!-- 2 — done -->
+      <div class="pair-step done">
+        <div class="step-dot">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        </div>
+        <div class="step-body">
+          <div class="step-label">Nawiązywanie łączności</div>
+          <div class="step-detail">Relay iroh — use.iroh.network · kanał ALPN tentaflow-pairing/v1</div>
+        </div>
+      </div>
+
+      <!-- 3 — active -->
+      <div class="pair-step active">
+        <div class="step-dot">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>
+        </div>
+        <div class="step-body">
+          <div class="step-label">Wymiana handshake</div>
+          <div class="step-detail">PairingRequest wysłany · oczekuje na PairingResponse…</div>
+        </div>
+      </div>
+
+      <!-- 4 — pending -->
+      <div class="pair-step pending">
+        <div class="step-dot"></div>
+        <div class="step-body">
+          <div class="step-label">Synchronizacja kluczy zaufania</div>
+          <div class="step-detail">TrustedKeysSync + NodeInfo</div>
+        </div>
+      </div>
+
+      <!-- 5 — pending -->
+      <div class="pair-step pending">
+        <div class="step-dot"></div>
+        <div class="step-body">
+          <div class="step-label">Połączono</div>
+          <div class="step-detail">mesh session gotowa</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tf-window-foot">
+    <button class="tf-button ghost" type="button">Przerwij</button>
+    <button class="tf-button primary" type="button" disabled>
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>
+      Parowanie…
+    </button>
+  </div>
+</div>
+
+<!-- ========== 2) SUCCESS ========== -->
+<div class="stage-label">2 / Sukces — auto-close za 1.5s</div>
+<div class="tf-window" role="dialog" aria-modal="true">
+  <div class="tf-window-head">
+    <div class="head-ico" style="background: rgba(34,197,94,0.14); border-color: rgba(34,197,94,0.35); color: var(--success);">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+    </div>
+    <div class="head-title">Sparowano</div>
+    <button class="close-btn" type="button" aria-label="Zamknij">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+
+  <div class="tf-window-body">
+    <div class="pair-target">
+      <div class="p-ico" style="background: rgba(34,197,94,0.14); border-color: rgba(34,197,94,0.35); color: var(--success);">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      </div>
+      <div class="p-meta">
+        <div class="p-name">tenta-flow-testbench-0-7</div>
+        <div class="p-id">a2e5b28a4e467f3cb303c08a0645d30ac31c939167e51ab6adc90afde6e259b8</div>
+      </div>
+    </div>
+
+    <div class="pair-steps">
+      <div class="pair-step done">
+        <div class="step-dot"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        <div class="step-body"><div class="step-label">Przygotowanie</div><div class="step-detail">120 ms</div></div>
+      </div>
+      <div class="pair-step done">
+        <div class="step-dot"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        <div class="step-body"><div class="step-label">Nawiązywanie łączności</div><div class="step-detail">240 ms · relay</div></div>
+      </div>
+      <div class="pair-step done">
+        <div class="step-dot"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        <div class="step-body"><div class="step-label">Wymiana handshake</div><div class="step-detail">PIN OK · podpis zweryfikowany</div></div>
+      </div>
+      <div class="pair-step done">
+        <div class="step-dot"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        <div class="step-body"><div class="step-label">Synchronizacja kluczy zaufania</div><div class="step-detail">3 klucze dodane</div></div>
+      </div>
+      <div class="pair-step done">
+        <div class="step-dot"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        <div class="step-body"><div class="step-label">Połączono</div><div class="step-detail">mesh session · 1.2 s total</div></div>
+      </div>
+    </div>
+
+    <div class="pair-banner success" style="margin-top: 16px;">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+      <div class="bar-inner">
+        <b>Node zaufany</b>
+        <span>Sesja mesh QUIC nawiązana, możesz korzystać z usług zdalnego noda.</span>
+      </div>
+      <span class="countdown">1.5s</span>
+    </div>
+  </div>
+
+  <div class="tf-window-foot">
+    <button class="tf-button primary" type="button">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+      Gotowe
+    </button>
+  </div>
+</div>
+
+<!-- ========== 3) ERROR ========== -->
+<div class="stage-label">3 / Błąd na kroku</div>
+<div class="tf-window" role="dialog" aria-modal="true">
+  <div class="tf-window-head">
+    <div class="head-ico" style="background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.35); color: var(--danger);">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+    </div>
+    <div class="head-title">Parowanie nieudane</div>
+    <button class="close-btn" type="button" aria-label="Zamknij">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+
+  <div class="tf-window-body">
+    <div class="pair-target">
+      <div class="p-ico">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></svg>
+      </div>
+      <div class="p-meta">
+        <div class="p-name">tenta-flow-testbench-0-7</div>
+        <div class="p-id">a2e5b28a4e467f3cb303c08a0645d30ac31c939167e51ab6adc90afde6e259b8</div>
+      </div>
+    </div>
+
+    <div class="pair-steps">
+      <div class="pair-step done">
+        <div class="step-dot"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        <div class="step-body"><div class="step-label">Przygotowanie</div><div class="step-detail">120 ms</div></div>
+      </div>
+      <div class="pair-step done">
+        <div class="step-dot"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        <div class="step-body"><div class="step-label">Nawiązywanie łączności</div><div class="step-detail">240 ms · relay</div></div>
+      </div>
+
+      <!-- error -->
+      <div class="pair-step error">
+        <div class="step-dot">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </div>
+        <div class="step-body">
+          <div class="step-label">Wymiana handshake</div>
+          <div class="step-detail">read response len: connection lost — odbiorca zamknął strumień</div>
+        </div>
+      </div>
+
+      <div class="pair-step pending">
+        <div class="step-dot"></div>
+        <div class="step-body"><div class="step-label">Synchronizacja kluczy zaufania</div><div class="step-detail">—</div></div>
+      </div>
+      <div class="pair-step pending">
+        <div class="step-dot"></div>
+        <div class="step-body"><div class="step-label">Połączono</div><div class="step-detail">—</div></div>
+      </div>
+    </div>
+
+    <div class="pair-banner error" style="margin-top: 16px;">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <div class="bar-inner">
+        <b>Strumień zamknięty przed odpowiedzią</b>
+        <span>Peer otrzymał PairingRequest, ale nie dostarczył odpowiedzi. Upewnij się że obie strony mają aktualną wersję TentaFlow.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="tf-window-foot">
+    <button class="tf-button ghost" type="button">Anuluj</button>
+    <button class="tf-button primary" type="button">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>
+      Spróbuj ponownie
+    </button>
+  </div>
+</div>
+
+</body>
+</html>

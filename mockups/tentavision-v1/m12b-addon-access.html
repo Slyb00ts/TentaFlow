@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — TentaVision · Dostęp (M12b)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+.addon-pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 700; background: rgba(167,139,250,0.15); color: var(--accent-2);
+}
+.code-block {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 12px 14px; font-family: ui-monospace,monospace; font-size: 11.5px;
+  color: var(--text-2); white-space: pre; overflow-x: auto; line-height: 1.6;
+}
+.code-block .k { color: var(--accent-2); }
+.code-block .s { color: var(--success); }
+.code-block .c { color: var(--text-3); font-style: italic; }
+.req-badge {
+  font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+.req-badge.required { background: rgba(239,68,68,0.15); color: var(--danger); }
+.req-badge.optional { background: var(--bg-3); color: var(--text-3); }
+.vis-pill {
+  font-size: 10px; font-weight: 800; padding: 2px 8px; border-radius: 12px;
+  text-transform: uppercase; letter-spacing: 0.04em; display: inline-flex; align-items: center; gap: 4px;
+}
+.vis-pill.private { background: rgba(239,68,68,0.15); color: var(--danger); }
+.vis-pill.restricted { background: rgba(245,158,11,0.15); color: var(--warning); }
+.vis-pill.public { background: rgba(34,197,94,0.15); color: var(--success); }
+.vis-pill .icon { width: 11px; height: 11px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7" cy="14" r="4"/><path d="m10 11 10-5"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/></symbol>
+  <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M12b</span><h2>Ustawienia TentaVision · zakładka „Dostęp”</h2>
+    <div class="desc">Nowa zakładka w M12: aliasy/modele które TentaVision <em>używa</em> (od innych) oraz które <em>udostępnia</em> innym addonom.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">7</span></div></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div></div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Analyst</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">TentaVision</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Ustawienia</span><span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Dostęp</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Dostęp do zasobów innych addonów</div>
+            <div class="d-sub">Deployment: depo-warszawa-pn · konfiguracja grantów na zewnątrz i widoczności zasobów własnych</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary">Anuluj</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-check"/></svg>Zapisz zmiany</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</button>
+          <button class="tab"><svg class="icon"><use href="#i-video"/></svg>Live view</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamery<span class="count">24</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-brain"/></svg>Profile<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-alert"/></svg>Alarmy<span class="count">7</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-search"/></svg>Wyszukiwarka</button>
+          <button class="tab"><svg class="icon"><use href="#i-fingerprint"/></svg>Re-ID<svg class="icon icon-sm" style="color:var(--text-3)"><use href="#i-lock"/></svg></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Modele</button>
+          <button class="tab"><svg class="icon"><use href="#i-map"/></svg>Strefy</button>
+          <button class="tab"><svg class="icon"><use href="#i-audit"/></svg>Audyt</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          <button class="tab active"><svg class="icon"><use href="#i-shield"/></svg>Dostęp<span class="count">11</span></button>
+        </div>
+
+        <!-- Info-box z fragmentem manifestu -->
+        <section class="section-card" style="background:rgba(96,165,250,0.06);border-color:rgba(96,165,250,0.25)">
+          <h3 style="color:var(--info)"><svg class="icon"><use href="#i-info"/></svg>Skąd biorą się te wpisy</h3>
+          <p class="text-xs text-2" style="margin-bottom:10px;line-height:1.7">
+            Sekcje poniżej są generowane z deklaracji <code class="mono">[[uses_alias]]</code> i <code class="mono">[[uses_model]]</code> w manifeście TentaVision. <strong>Required</strong> oznacza że addon nie wystartuje bez grantu (blokada w wizardzie instalacji). <strong>Optional</strong> ⇒ addon sam radzi sobie z brakiem (np. fallback do alternatywnego modelu).
+          </p>
+          <div class="code-block"><span class="c"># tentavision.manifest.toml (fragment)</span>
+
+<span class="k">[[uses_alias]]</span>
+id = <span class="s">"global-stt"</span>
+required = true
+reason = <span class="s">"Transkrypcja audio z mikrofonów kamer do logów BHP"</span>
+
+<span class="k">[[uses_model]]</span>
+id = <span class="s">"yolov8-pose-v3"</span>
+required = false
+reason = <span class="s">"Wykrywanie upadków, fallback od D2"</span></div>
+        </section>
+
+        <!-- Sekcja 1: Aliasy które TentaVision używa -->
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-link"/></svg>Aliasy które TentaVision używa <span class="chip">4 deklaracje</span></div>
+            <span class="hint">Z manifestu <code class="mono">[[uses_alias]]</code></span>
+          </div>
+
+          <table class="tf-table">
+            <thead>
+              <tr><th>Alias ID</th><th>Owner</th><th>Required</th><th>Reason (z manifestu)</th><th>Status grantu</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono fw-700">teams-stt</td>
+                <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>teams-bot</span><span class="vis-pill public" style="margin-left:6px"><svg class="icon"><use href="#i-unlock"/></svg>public</span></td>
+                <td><span class="req-badge required">required</span></td>
+                <td class="text-xs text-2">Transkrypcja audio rozmów telefonicznych operatorów</td>
+                <td><span class="status-pill ok">granted</span><div class="text-xs text-3" style="margin-top:3px">auto-grant (public)</div></td>
+                <td><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Zobacz alias</button></td>
+              </tr>
+              <tr>
+                <td class="mono fw-700">teams-summary</td>
+                <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>teams-bot</span><span class="vis-pill restricted" style="margin-left:6px"><svg class="icon"><use href="#i-shield"/></svg>restricted</span></td>
+                <td><span class="req-badge optional">optional</span></td>
+                <td class="text-xs text-2">Podsumowanie incydentu z transkryptu dla raportu DPIA</td>
+                <td><span class="status-pill ok">granted</span><div class="text-xs text-3" style="margin-top:3px">admin teams-bot · 2026-05-10</div></td>
+                <td><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Zobacz alias</button></td>
+              </tr>
+              <tr>
+                <td class="mono fw-700">default-llm</td>
+                <td><span class="addon-pill" style="background:rgba(96,165,250,0.15);color:var(--info)"><svg class="icon"><use href="#i-users"/></svg>manual</span><span class="vis-pill restricted" style="margin-left:6px"><svg class="icon"><use href="#i-shield"/></svg>restricted</span></td>
+                <td><span class="req-badge optional">optional</span></td>
+                <td class="text-xs text-2">Klasyfikacja kontekstu alarmu (skąd, kto, co) dla operatora</td>
+                <td><span class="status-pill warn">pending</span><div class="text-xs text-3" style="margin-top:3px">prośba: 4 godz. temu</div></td>
+                <td><button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-key"/></svg>Poproś ponownie</button></td>
+              </tr>
+              <tr style="opacity:0.65">
+                <td class="mono fw-700">erp-employee-lookup</td>
+                <td><span class="addon-pill"><svg class="icon"><use href="#i-puzzle"/></svg>hr-bridge</span><span class="vis-pill restricted" style="margin-left:6px"><svg class="icon"><use href="#i-shield"/></svg>restricted</span></td>
+                <td><span class="req-badge optional">optional</span></td>
+                <td class="text-xs text-2">Identyfikacja pracownika na podstawie ID karty (D4 — alternatywa do face)</td>
+                <td><span class="status-pill err">denied</span><div class="text-xs text-3" style="margin-top:3px">admin hr-bridge: brak DPIA</div></td>
+                <td><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-info"/></svg>Powód odmowy</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <!-- Sekcja 2: Modele które TentaVision używa -->
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-cpu"/></svg>Modele które TentaVision używa <span class="chip">2 deklaracje</span></div>
+            <span class="hint">Z manifestu <code class="mono">[[uses_model]]</code></span>
+          </div>
+
+          <table class="tf-table">
+            <thead>
+              <tr><th>Model ID</th><th>Owner</th><th>Required</th><th>Reason</th><th>Status grantu</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono fw-700">yolov8-pose-v3</td>
+                <td><span class="addon-pill" style="background:rgba(96,165,250,0.15);color:var(--info)"><svg class="icon"><use href="#i-users"/></svg>manual:admin.krystian</span><span class="vis-pill restricted" style="margin-left:6px"><svg class="icon"><use href="#i-shield"/></svg>restricted</span></td>
+                <td><span class="req-badge optional">optional</span></td>
+                <td class="text-xs text-2">Wykrywanie upadków u pacjentów geriatrycznych, fallback od D2</td>
+                <td><span class="status-pill ok">granted</span><div class="text-xs text-3" style="margin-top:3px">admin Krystian · 14 dni temu</div></td>
+                <td><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Szczegóły</button></td>
+              </tr>
+              <tr>
+                <td class="mono fw-700">whisper-stt-large</td>
+                <td><span class="addon-pill" style="background:rgba(96,165,250,0.15);color:var(--info)"><svg class="icon"><use href="#i-users"/></svg>system</span><span class="vis-pill public" style="margin-left:6px"><svg class="icon"><use href="#i-unlock"/></svg>public</span></td>
+                <td><span class="req-badge required">required</span></td>
+                <td class="text-xs text-2">STT na bezpośrednim modelu (z pominięciem aliasu) dla niskiej latencji</td>
+                <td><span class="status-pill ok">granted</span><div class="text-xs text-3" style="margin-top:3px">auto-grant (public)</div></td>
+                <td><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Szczegóły</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <!-- Sekcja 3: Aliasy TentaVision udostępnia -->
+        <section class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-eye"/></svg>Aliasy które TentaVision udostępnia innym <span class="chip">3 aliasy</span></div>
+            <span class="hint">Reverse view — własne aliasy z M16 (addon nie może udostępniać modeli)</span>
+          </div>
+
+          <table class="tf-table">
+            <thead>
+              <tr><th>Alias</th><th>Visibility</th><th>Konsumenci</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono fw-700">tentavision-face</td>
+                <td><span class="vis-pill private"><svg class="icon"><use href="#i-lock"/></svg>private</span></td>
+                <td class="text-xs">0 addonów — nikt poza ownerem</td>
+                <td><a href="m16b-alias-consumers.html" class="btn btn-secondary btn-sm">Zarządzaj <svg class="icon"><use href="#i-external"/></svg></a></td>
+              </tr>
+              <tr>
+                <td class="mono fw-700">tentavision-emotion</td>
+                <td><span class="vis-pill restricted"><svg class="icon"><use href="#i-shield"/></svg>restricted</span></td>
+                <td class="text-xs">2 addony (teams-bot, hr-bridge)</td>
+                <td><a href="m16b-alias-consumers.html" class="btn btn-secondary btn-sm">Zarządzaj <svg class="icon"><use href="#i-external"/></svg></a></td>
+              </tr>
+              <tr>
+                <td class="mono fw-700">tentavision-yolo</td>
+                <td><span class="vis-pill public"><svg class="icon"><use href="#i-unlock"/></svg>public</span></td>
+                <td class="text-xs">4 addony · auto-grant</td>
+                <td><a href="m16b-alias-consumers.html" class="btn btn-secondary btn-sm">Zarządzaj <svg class="icon"><use href="#i-external"/></svg></a></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>
