@@ -110,6 +110,9 @@ export async function openDeployWizard(engineId, opts = {}) {
     apiKey: '',
     baseUrl: '',
     apiVersion: '',
+    // 'api' = pay-per-token API key; 'subscription' = OAuth/ChatGPT-or-Google
+    // subscription token (OpenAI Codex / Gemini Code Assist). Only OpenAI+Gemini.
+    externalAuthMode: 'api',
     // Advanced (vLLM Auto-tuned) - wartosci uzywane do build vllm_args.
     // `lockedParam` = ostatnio dotkniety przez usera slider/chip — backend
     // dostaje `lock_<param>: true` tylko dla niego, reszte parametrow
@@ -406,6 +409,31 @@ function renderFooter() {
 
 // ---- Step 1: deploy method ------------------------------------------------
 
+// OpenAI (ChatGPT plan via Codex OAuth) and Google Gemini (Google AI via the
+// Gemini CLI / Code Assist OAuth) can be driven by a personal subscription, not
+// only a pay-per-token API key. Anthropic deliberately blocks this for third
+// parties, so Claude is API-key only.
+function subscriptionSupportedEngine() {
+  return ['openai', 'gemini'].includes(String(engineEntry?.engine?.id || '').toLowerCase());
+}
+
+function renderMethodCard(m, auth) {
+  const splitExternal = m === 'external' && auth;
+  const active = splitExternal
+    ? (selection.deployMethod === 'external' && selection.externalAuthMode === auth)
+    : (selection.deployMethod === m);
+  const sel = active ? ' selected' : '';
+  const key = splitExternal ? `external_${auth}` : m;
+  const authAttr = auth ? ` data-auth="${escapeAttr(auth)}"` : '';
+  return `
+    <button type="button" class="deploy-method-card${sel}" data-method="${escapeAttr(m)}"${authAttr}>
+      <div class="dm-ico">${deployIcon(m, 32)}</div>
+      <div class="dm-name">${escapeHtml(I18n.t(`wizard.method.${key}`))}</div>
+      <div class="dm-desc">${escapeHtml(I18n.t(`wizard.method.${key}Desc`))}</div>
+    </button>
+  `;
+}
+
 function renderStepMethod() {
   if (availableMethods.length === 0) {
     const msg = I18n.t('wizard.noMethodsAvailable').replace('{os}', escapeHtml(hostOs));
@@ -415,17 +443,14 @@ function renderStepMethod() {
     `;
   }
 
-  const cards = availableMethods.map((m) => {
-    const sel = selection.deployMethod === m ? ' selected' : '';
-    const name = I18n.t(`wizard.method.${m}`);
-    const desc = I18n.t(`wizard.method.${m}Desc`);
-    return `
-      <button type="button" class="deploy-method-card${sel}" data-method="${escapeAttr(m)}">
-        <div class="dm-ico">${deployIcon(m, 32)}</div>
-        <div class="dm-name">${escapeHtml(name)}</div>
-        <div class="dm-desc">${escapeHtml(desc)}</div>
-      </button>
-    `;
+  // OpenAI / Gemini support BOTH a pay-per-token API key and an OAuth
+  // subscription (ChatGPT plan / Google AI), so their single "external" method
+  // splits into two tiles — like Docker/Native are separate tiles.
+  const cards = availableMethods.flatMap((m) => {
+    if (m === 'external' && subscriptionSupportedEngine()) {
+      return [renderMethodCard('external', 'api'), renderMethodCard('external', 'subscription')];
+    }
+    return [renderMethodCard(m, null)];
   }).join('');
 
   // Node selector (jeśli są inne node'y)
@@ -1568,10 +1593,16 @@ function externalCredsConfig() {
   const requiresApiKey = selection.deployMethod === 'external' && !!ext?.requires_api_key;
   const api = String(eng.api || '').toLowerCase();
   const isGeneric = String(eng.id || '').toLowerCase() === 'openai-compatible';
+  // Subscription mode (OpenAI/Gemini) takes an OAuth token, not an API key —
+  // base URL / api-version overrides don't apply there.
+  const subscription = requiresApiKey
+    && subscriptionSupportedEngine()
+    && selection.externalAuthMode === 'subscription';
   return {
     requiresApiKey,
-    showBaseUrl: requiresApiKey && (api === 'azure-openai' || isGeneric),
-    showApiVersion: requiresApiKey && api === 'azure-openai',
+    subscription,
+    showBaseUrl: requiresApiKey && !subscription && (api === 'azure-openai' || isGeneric),
+    showApiVersion: requiresApiKey && !subscription && api === 'azure-openai',
     defaultBaseUrl: ext?.detection_endpoint || '',
     defaultApiVersion: '2024-10-21',
   };
@@ -1599,13 +1630,20 @@ function renderExternalCredsFields() {
           value="${escapeAttr(selection.apiVersion || '')}"></tf-input>
       </div>`
     : '';
+  const engId = String(engineEntry?.engine?.id || '').toLowerCase();
+  const keyLabel = c.subscription ? I18n.t('external.subscription_token') : I18n.t('external.api_key');
+  const keyPlaceholder = c.subscription
+    ? I18n.t('external.subscription_token_placeholder')
+    : I18n.t('external.api_key_placeholder');
+  const subHintKey = engId === 'gemini' ? 'external.subscription_hint_gemini' : 'external.subscription_hint_openai';
+  const keyHint = c.subscription ? I18n.t(subHintKey) : I18n.t('external.api_key_hint');
   return `
     <div class="form-group">
       <tf-input type="password" id="edw-api-key"
-        label="${escapeAttr(I18n.t('external.api_key'))}"
-        placeholder="${escapeAttr(I18n.t('external.api_key_placeholder'))}"
+        label="${escapeAttr(keyLabel)}"
+        placeholder="${escapeAttr(keyPlaceholder)}"
         value="${escapeAttr(selection.apiKey || '')}"></tf-input>
-      <span class="form-hint">${escapeHtml(I18n.t('external.api_key_hint'))}</span>
+      <span class="form-hint">${escapeHtml(keyHint)}</span>
     </div>
     ${baseUrl}
     ${apiVersion}
@@ -1813,9 +1851,8 @@ function bindStepInputs() {
 function bindStepMethodInputs() {
   document.querySelectorAll('.deploy-method-card[data-method]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      console.log('[wizard][method-click] dataset.method=', btn.dataset.method, 'before:', selection.deployMethod);
       selection.deployMethod = btn.dataset.method;
-      console.log('[wizard][method-click] after:', selection.deployMethod);
+      if (btn.dataset.auth) selection.externalAuthMode = btn.dataset.auth;
       refreshModal();
     });
   });
@@ -2217,6 +2254,7 @@ async function startDeploy() {
     api_key: creds.requiresApiKey ? selection.apiKey.trim() : undefined,
     base_url: (creds.showBaseUrl && selection.baseUrl) ? selection.baseUrl : undefined,
     api_version: (creds.showApiVersion && selection.apiVersion) ? selection.apiVersion : undefined,
+    auth_mode: creds.requiresApiKey ? (creds.subscription ? 'subscription' : 'api') : undefined,
   });
 
   console.log('[wizard][startDeploy] payload:', {
