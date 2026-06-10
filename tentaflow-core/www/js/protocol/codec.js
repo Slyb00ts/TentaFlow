@@ -1168,6 +1168,24 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ServiceBody(ServicePayload::ReqOauthStart) */
+  serviceOauthStartRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceOauthStartRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqOauthPoll) */
+  serviceOauthPollRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceOauthPollRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
   /** MessageBody::ServiceQuicStatusRequest (unit) */
   serviceQuicStatusRequest(correlationId, sequence = 1) {
     assertReady();

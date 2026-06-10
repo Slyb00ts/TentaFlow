@@ -3933,6 +3933,42 @@ export function encodeServiceModelSelectionRequest(payload_json) {
 }
 
 /**
+ * MessageBody::ServiceBody(ServicePayload::ReqOauthPoll) — poll a login
+ * flow's status.
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeServiceOauthPollRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceOauthPollRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ServiceBody(ServicePayload::ReqOauthStart) — begin a
+ * subscription OAuth login (browser PKCE) on the named node.
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeServiceOauthStartRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceOauthStartRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::ServiceBody(ServicePayload::ReqPause) — supervisor leaves a
  * paused service untouched.
  * @param {number} service_id

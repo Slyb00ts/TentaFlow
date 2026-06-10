@@ -1921,6 +1921,32 @@ pub fn encode_service_model_selection_request(payload_json: String) -> Result<Ve
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::ServiceBody(ServicePayload::ReqOauthStart) — begin a
+/// subscription OAuth login (browser PKCE) on the named node.
+#[wasm_bindgen(js_name = encodeServiceOauthStartRequest)]
+pub fn encode_service_oauth_start_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceOauthStartRequest, ServicePayload};
+    let payload: ServiceOauthStartRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("ServiceOauthStartRequest JSON: {e}")))?;
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqOauthStart(
+        payload,
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceBody(ServicePayload::ReqOauthPoll) — poll a login
+/// flow's status.
+#[wasm_bindgen(js_name = encodeServiceOauthPollRequest)]
+pub fn encode_service_oauth_poll_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceOauthPollRequest, ServicePayload};
+    let payload: ServiceOauthPollRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("ServiceOauthPollRequest JSON: {e}")))?;
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqOauthPoll(
+        payload,
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
 // --- Prompts --------------------------------------------------------------
 
 /// MessageBody::PromptListRequest (unit).
@@ -2674,6 +2700,36 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
         SP::ResModelSelection(r) => {
             set(obj, "variant", "ServiceModelSelectionResponse".into());
             set(obj, "success", r.success.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqOauthStart(r) => {
+            set(obj, "variant", "ServiceOauthStartRequest".into());
+            set(obj, "provider", r.provider.into());
+        }
+        SP::ResOauthStart(r) => {
+            set(obj, "variant", "ServiceOauthStartResponse".into());
+            set(obj, "flowId", r.flow_id.clone().into());
+            set(obj, "flow_id", r.flow_id.into());
+            set(obj, "authorizeUrl", r.authorize_url.clone().into());
+            set(obj, "authorize_url", r.authorize_url.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqOauthPoll(r) => {
+            set(obj, "variant", "ServiceOauthPollRequest".into());
+            set(obj, "flowId", r.flow_id.clone().into());
+            set(obj, "flow_id", r.flow_id.into());
+        }
+        SP::ResOauthPoll(r) => {
+            set(obj, "variant", "ServiceOauthPollResponse".into());
+            set(obj, "status", r.status.into());
+            if let Some(a) = r.account_label {
+                set(obj, "accountLabel", a.clone().into());
+                set(obj, "account_label", a.into());
+            }
             if let Some(e) = r.error {
                 set(obj, "error", e.into());
             }

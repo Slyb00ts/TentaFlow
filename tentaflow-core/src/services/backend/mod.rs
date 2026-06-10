@@ -7,5 +7,6 @@
 
 pub mod client;
 pub mod codex;
+pub mod codex_oauth;
 
 pub use client::BackendClient;
