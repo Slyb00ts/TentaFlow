@@ -11,6 +11,7 @@ enum TargetOs {
     Macos,
     Ios,
     Windows,
+    Android,
 }
 
 fn main() {
@@ -81,6 +82,9 @@ fn platform_name(target: &str) -> &'static str {
         "aarch64-apple-darwin" => "macos-arm64",
         "aarch64-apple-ios" => "ios-arm64",
         "aarch64-apple-ios-sim" => "ios-sim-arm64",
+        "aarch64-linux-android" => "android-arm64",
+        "armv7-linux-androideabi" => "android-armv7",
+        "x86_64-linux-android" => "android-x86_64",
         "x86_64-pc-windows-msvc" => "windows-x86_64",
         other => panic!("llama-cpp-sys-2: brak native-libs dla targetu {other}"),
     }
@@ -93,6 +97,8 @@ fn target_os(target: &str) -> TargetOs {
         TargetOs::Ios
     } else if target.contains("apple-darwin") {
         TargetOs::Macos
+    } else if target.contains("android") {
+        TargetOs::Android
     } else if target.contains("linux") {
         TargetOs::Linux
     } else {
@@ -193,6 +199,11 @@ fn link_native(lib_dir: &Path, target: &str, target_os: &TargetOs) {
         TargetOs::Linux => {
             println!("cargo:rustc-link-lib=dylib=stdc++");
             println!("cargo:rustc-link-lib=dylib=gomp");
+        }
+        TargetOs::Android => {
+            println!("cargo:rustc-link-lib=dylib=c++_shared");
+            println!("cargo:rustc-link-lib=dylib=log");
+            println!("cargo:rustc-link-lib=dylib=android");
         }
         TargetOs::Macos | TargetOs::Ios => {
             println!("cargo:rustc-link-lib=c++");

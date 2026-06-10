@@ -249,9 +249,57 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
         let _writer_handle = writer.spawn();
     }
 
+    {
+        let local_node_info = tentaflow_core::mesh::node_info_collector::collect_node_info(&node_id);
+        let local_metrics = tentaflow_core::mesh::node_info_collector::collect_fast_metrics();
+        let local_os_distro = tentaflow_core::mesh::node_info_collector::collect_os_distro();
+        let local_addresses = tentaflow_core::mesh::node_info_collector::collect_local_addresses()
+            .into_iter()
+            .filter(|ip| ip.is_ipv4())
+            .collect();
+        let (docker_available, docker_version) =
+            tentaflow_core::mesh::node_info_collector::collect_docker_info();
+        let local_heartbeat = tentaflow_core::mesh::peer_store::HeartbeatMetrics {
+            cpu_usage_percent: local_metrics.cpu_usage_percent,
+            ram_used_mb: local_metrics.ram_used_mb,
+            gpus: local_metrics.gpus,
+            containers: local_metrics.containers,
+            networks: local_metrics.networks,
+            platform: tentaflow_core::mesh::node_info_collector::detect_platform(),
+            cpu_temperature_c: local_metrics.cpu_temperature_c,
+            swap_total_mb: local_metrics.swap_total_mb,
+            swap_used_mb: local_metrics.swap_used_mb,
+            connected_peers: Vec::new(),
+            active_requests: 0,
+            tokens_per_sec: 0.0,
+            nsys_available: false,
+            nsys_version: String::new(),
+            profiling_collectors_available: Vec::new(),
+        };
+
+        mesh_peer_store.seed_local(
+            &node_id,
+            local_node_info.hostname,
+            if local_os_distro.is_empty() {
+                local_node_info.os_info
+            } else {
+                local_os_distro
+            },
+            tentaflow_core::mesh::node_info_collector::detect_platform(),
+            local_node_info.cpu_count,
+            local_node_info.ram_total_mb,
+            local_node_info.gpu_info,
+            local_addresses,
+            docker_available,
+            docker_version,
+        );
+        mesh_peer_store.update_metrics(&node_id, &local_heartbeat);
+    }
+
     // Mesh networking — mDNS discovery + QUIC mesh (wspoldzielony pipeline z Core)
     let mesh_handles: Option<MeshPipelineHandles>;
-    let mesh_enabled = config.mesh.as_ref().map_or(false, |m| m.enabled);
+    let mesh_enabled =
+        config.mesh.as_ref().map_or(false, |m| m.enabled) && cfg!(not(target_os = "android"));
 
     if mesh_enabled {
         let pipeline_config = MeshPipelineConfig {
@@ -260,17 +308,20 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
             mesh_config: config.mesh.as_ref().unwrap().clone(),
         };
 
-        match start_mesh_pipeline(
-            pipeline_config,
-            &mesh_peer_store,
-            Some(db.clone()),
-            settings_cipher.clone(),
-            mesh_security.clone(),
-            mesh_services_registry.clone(),
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            start_mesh_pipeline(
+                pipeline_config,
+                &mesh_peer_store,
+                Some(db.clone()),
+                settings_cipher.clone(),
+                mesh_security.clone(),
+                mesh_services_registry.clone(),
+            ),
         )
         .await
         {
-            Ok(handles) => {
+            Ok(Ok(handles)) => {
                 info!("Mesh pipeline uruchomiony");
 
                 // Eksponuj IrohMeshManager + tokio runtime handle do FFI — Swift
@@ -282,8 +333,12 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
 
                 mesh_handles = Some(handles);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Blad uruchomienia mesh pipeline: {}", e);
+                mesh_handles = None;
+            }
+            Err(_) => {
+                warn!("Timeout uruchamiania mesh pipeline; dashboard startuje bez mesh handle");
                 mesh_handles = None;
             }
         }
@@ -303,6 +358,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
     // AppState, inaczej handlery deploy/start/stop rzucaja "port allocator not
     // initialized". Brak Dockera nie przeszkadza — embedded deploymenty (np.
     // yolo8n-pose, MLX modele) i tak nie alokuja portow zewnetrznych.
+    info!("Uruchamianie unified HTTPS server...");
     tentaflow_core::api::unified_server::start_unified_server(
         &config,
         &db,
@@ -317,6 +373,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
         services_port_allocator.clone(),
         mesh_services_registry.clone(),
     )?;
+    info!("Unified HTTPS server spawn zakonczony");
 
     info!("Wszystkie serwisy uruchomione (tryb mobilny)");
 

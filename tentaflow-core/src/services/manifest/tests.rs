@@ -30,6 +30,7 @@ fn make_engine(id: &str, category: Category) -> Engine {
         api: ApiKind::OpenaiCompatible,
         version: "1.0.0".to_string(),
         resource_kind: None,
+        provider: None,
         requires_model: None,
         gpu_supported: None,
         dgx_spark: None,

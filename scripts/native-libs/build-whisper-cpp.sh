@@ -29,10 +29,41 @@ detect_backends() {
     macos-*)
       printf '%s\n' "metal"
       ;;
+    android-*)
+      true
+      ;;
     *)
       true
       ;;
   esac
+}
+
+android_abi_for_platform() {
+  case "$1" in
+    android-arm64) printf '%s\n' "arm64-v8a" ;;
+    android-armv7) printf '%s\n' "armeabi-v7a" ;;
+    android-x86_64) printf '%s\n' "x86_64" ;;
+    *) return 1 ;;
+  esac
+}
+
+android_triple_for_platform() {
+  case "$1" in
+    android-arm64) printf '%s\n' "aarch64-linux-android" ;;
+    android-armv7) printf '%s\n' "armv7a-linux-androideabi" ;;
+    android-x86_64) printf '%s\n' "x86_64-linux-android" ;;
+    *) return 1 ;;
+  esac
+}
+
+android_cxx_for_platform() {
+  local ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/opt/android-ndk}}"
+  local triple
+  triple="$(android_triple_for_platform "$1")"
+  printf '%s/bin/%s%s-clang++\n' \
+    "$ndk_root/toolchains/llvm/prebuilt/linux-x86_64" \
+    "$triple" \
+    "${ANDROID_API_LEVEL:-26}"
 }
 
 if [ "$BACKENDS" = "auto" ]; then
@@ -110,6 +141,22 @@ build_isolated_dylib() {
       echo "[whisper.cpp] izolowany dylib na Windows: uzyj build-all.ps1 (.def/__declspec)" >&2
       return 0
       ;;
+    android-*)
+      local map="$build/whisper_exports.map"
+      local android_cxx
+      printf '{ global: whisper_*; local: *; };\n' > "$map"
+      android_cxx="$(android_cxx_for_platform "$PLATFORM")"
+      [ -x "$android_cxx" ] || {
+        echo "[whisper.cpp] brak Android NDK clang++: $android_cxx" >&2
+        exit 1
+      }
+      "$android_cxx" -shared -fPIC \
+        -o "$out_dir/libwhisper_tf.so" \
+        -Wl,--version-script="$map" \
+        -Wl,--whole-archive "${archives[@]}" -Wl,--no-whole-archive \
+        -Wl,--no-undefined \
+        -lm -ldl -llog -landroid -lc++_shared
+      ;;
     *)
       # Linux: version-script localizuje WSZYSTKO poza whisper_* — prywatny ggml
       # nie trafia do dynamicznej tablicy symboli, wiec nie koliduje z ggml llamy
@@ -178,6 +225,25 @@ build_backend() {
   case "$backend" in
     multi|cuda|metal|vulkan|rocm|cpu) ;;
     *) echo "Nieobsługiwany backend whisper.cpp: $backend" >&2; exit 1 ;;
+  esac
+
+  case "$PLATFORM" in
+    android-*)
+      local ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/opt/android-ndk}}"
+      local android_abi
+      android_abi="$(android_abi_for_platform "$PLATFORM")"
+      [ -f "$ndk_root/build/cmake/android.toolchain.cmake" ] || {
+        echo "Build Android whisper wymaga Android NDK (ustaw ANDROID_NDK_HOME)." >&2
+        exit 1
+      }
+      cmake_args+=(
+        -DCMAKE_TOOLCHAIN_FILE="$ndk_root/build/cmake/android.toolchain.cmake"
+        -DANDROID_ABI="$android_abi"
+        -DANDROID_NATIVE_API_LEVEL="${ANDROID_API_LEVEL:-26}"
+        -DANDROID_STL=c++_shared
+        -DGGML_OPENMP=OFF
+      )
+      ;;
   esac
 
   if backend_enabled cuda "${enabled_backends[@]}"; then

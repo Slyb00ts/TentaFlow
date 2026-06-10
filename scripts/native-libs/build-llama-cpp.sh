@@ -50,9 +50,21 @@ detect_backends() {
     macos-*|ios-*)
       printf '%s\n' "metal"
       ;;
+    android-*)
+      true
+      ;;
     *)
       true
       ;;
+  esac
+}
+
+android_abi_for_platform() {
+  case "$1" in
+    android-arm64) printf '%s\n' "arm64-v8a" ;;
+    android-armv7) printf '%s\n' "armeabi-v7a" ;;
+    android-x86_64) printf '%s\n' "x86_64" ;;
+    *) return 1 ;;
   esac
 }
 
@@ -126,6 +138,22 @@ build_backend() {
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk "$ios_sdk" --show-sdk-path)"
         -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
         -DGGML_METAL_EMBED_LIBRARY=ON
+      )
+      ;;
+    android-*)
+      local ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/opt/android-ndk}}"
+      local android_abi
+      android_abi="$(android_abi_for_platform "$PLATFORM")"
+      [ -f "$ndk_root/build/cmake/android.toolchain.cmake" ] || {
+        echo "Build Android llama wymaga Android NDK (ustaw ANDROID_NDK_HOME)." >&2
+        exit 1
+      }
+      cmake_args+=(
+        -DCMAKE_TOOLCHAIN_FILE="$ndk_root/build/cmake/android.toolchain.cmake"
+        -DANDROID_ABI="$android_abi"
+        -DANDROID_NATIVE_API_LEVEL="${ANDROID_API_LEVEL:-26}"
+        -DANDROID_STL=c++_shared
+        -DGGML_OPENMP=OFF
       )
       ;;
   esac

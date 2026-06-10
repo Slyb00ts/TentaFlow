@@ -177,6 +177,9 @@ pub fn master_key_path(custom_dir: Option<&std::path::Path>) -> anyhow::Result<s
     if let Some(dir) = custom_dir {
         return Ok(dir.join("master.key"));
     }
+    if let Ok(home) = std::env::var("TENTAFLOW_HOME") {
+        return Ok(std::path::PathBuf::from(home).join("master.key"));
+    }
     // Na iOS home_dir wskazuje na root sandboxa, ale zapis dozwolony jest tylko
     // wewnatrz Documents/ — uzywamy document_dir zeby uniknac "Operation not permitted".
     if let Some(docs) = dirs::document_dir() {

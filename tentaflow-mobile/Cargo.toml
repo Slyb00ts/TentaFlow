@@ -2,10 +2,11 @@
 members = ["core"]
 resolver = "2"
 
-# Mobile to osobny workspace, więc patche z głównego workspace'u (tentaflow-core)
-# tu nie obowiązują. Bez tego cargo bierze upstreamowe -sys z crates.io i kompiluje
-# llama.cpp / sherpa-onnx OD ZERA dla iOS. Przekierowanie na vendored sprawia, że
-# build linkuje gotowe biblioteki z native-libs/ios-* zamiast budować ze źródeł.
+# Mobile to osobny workspace, więc patche z głównego workspace'u tu nie obowiązują.
+# Bez tego cargo bierze upstreamowe -sys z crates.io i kompiluje natywne biblioteki
+# OD ZERA. Przekierowanie na vendored sprawia, że build linkuje gotowe biblioteki
+# z native-libs/* zamiast budować ze źródeł.
 [patch.crates-io]
 llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
 sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
+whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }
