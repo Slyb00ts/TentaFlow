@@ -3209,6 +3209,10 @@ export function validateFrame(bytes) {
  * obiektu (rekursja niepotrzebna dla naszych payloadów które są płaskie).
  */
 function camelToSnakePayload(obj) {
+  // i64 fields (e.g. service_id) decode to JS BigInt, which JSON.stringify
+  // cannot serialize. Coerce to Number — these ids are well within the safe
+  // integer range, and the wasm decoder parses them back into i64.
+  if (typeof obj === 'bigint') return Number(obj);
   if (obj == null || typeof obj !== 'object') return obj;
   if (Array.isArray(obj)) return obj.map(camelToSnakePayload);
   const out = {};

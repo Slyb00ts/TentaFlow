@@ -348,6 +348,84 @@ fn build_chat_response(model: &str, text: &str) -> ChatCompletionResponse {
     }
 }
 
+const CHATGPT_CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+
+/// List the models available to this ChatGPT plan via the Codex backend (the
+/// subscription token is rejected by the standard `/v1/models`). Returns the
+/// normalized `ProviderModel` shape the model picker consumes.
+pub async fn list_models(blob: &str) -> Result<Vec<crate::services::providers::ProviderModel>> {
+    let client = reqwest::Client::new();
+    let mut creds = parse_creds(blob);
+    if creds.access_token.is_empty() {
+        return Err(CoreError::BackendError {
+            backend_url: CHATGPT_CODEX_MODELS_URL.to_string(),
+            message: "no subscription access token — sign in again".to_string(),
+            source: None,
+        }
+        .into());
+    }
+    if token_needs_refresh(&creds.access_token) {
+        refresh(&client, &mut creds).await?;
+    }
+
+    let send = |creds: &CodexCreds| {
+        let mut req = client
+            .get(CHATGPT_CODEX_MODELS_URL)
+            .header("Authorization", format!("Bearer {}", creds.access_token))
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "codex_cli_rs")
+            .header("Accept", "application/json");
+        if let Some(acc) = creds.account_id.as_ref().filter(|s| !s.is_empty()) {
+            req = req.header("ChatGPT-Account-ID", acc.clone());
+        }
+        req.send()
+    };
+
+    let mut resp = send(&creds).await.map_err(|e| CoreError::NetworkError {
+        message: format!("Codex models request: {e}"),
+        source: e.into(),
+    })?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        refresh(&client, &mut creds).await?;
+        resp = send(&creds).await.map_err(|e| CoreError::NetworkError {
+            message: format!("Codex models request (retry): {e}"),
+            source: e.into(),
+        })?;
+    }
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CoreError::BackendError {
+            backend_url: CHATGPT_CODEX_MODELS_URL.to_string(),
+            message: format!("Codex models returned {status}: {body}"),
+            source: None,
+        }
+        .into());
+    }
+    let v: Value = resp.json().await.map_err(|e| CoreError::BackendError {
+        backend_url: CHATGPT_CODEX_MODELS_URL.to_string(),
+        message: format!("Codex models bad response: {e}"),
+        source: Some(e.into()),
+    })?;
+    let arr = v
+        .get("models")
+        .or_else(|| v.get("data"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let models = arr
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .map(|id| crate::services::providers::ProviderModel {
+            id: id.to_string(),
+            display_name: None,
+            modality: "chat".to_string(),
+            context_length: None,
+        })
+        .collect();
+    Ok(models)
+}
+
 /// Blocking (non-streaming) chat completion against the Codex backend. The
 /// backend always streams, so we buffer the SSE body and fold the text deltas.
 pub async fn chat_completion(
