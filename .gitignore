@@ -217,3 +217,7 @@ notes/
 # npm lockfiles — repo nie używa Node poza tests/e2e (Playwright)
 package-lock.json
 tests/e2e/package-lock.json
+
+# Reference checkouts for harness analysis (not part of the project)
+hermes-agent/
+thirparty/
