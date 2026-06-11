@@ -1789,7 +1789,7 @@ impl ModelRuntimeExecutor {
     ///   zeby request padal czytelnie zamiast cicho lokalnym whisperem.
     /// * `Flow` → wracamy clean failure (flow STT idzie przez flow_engine
     ///   adapter, nie executor).
-    /// Resolver error (UnknownModel/CapabilityUnsupported) padamy
+    /// Resolver error (UnknownModel/CapabilityUnsupported/NoLiveInstance) padamy
     /// `SttBackend(error)` zeby user zobaczyl klarowny blad.
     /// Gdy `model` jest pusty / brak kandydatow → fallback do default
     /// local whisper (zachowuje pre-existing UX dla single-engine node'u).
@@ -1823,7 +1823,8 @@ impl ModelRuntimeExecutor {
             Err(crate::services::runtime::resolver::ResolveError::UnknownModel(_))
             | Err(crate::services::runtime::resolver::ResolveError::CapabilityUnsupported {
                 ..
-            }) => {
+            })
+            | Err(crate::services::runtime::resolver::ResolveError::NoLiveInstance(_)) => {
                 // Model nie zmatchował żadnej usługi STT w katalogu → fallback
                 // do default local whisper (legacy single-node z "whisper-1").
                 // Gdy lokalnego też nie ma — błąd musi nazwać model, żeby user
