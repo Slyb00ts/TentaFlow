@@ -3574,6 +3574,29 @@ tf-face { display: inline-block; }
   opacity: 0.55;
 }
 
+/* fullscreen variant: fills the host, no circular clipping; the glow blur is
+   GPU-composited (mix-blend-mode plus-lighter = Canvas 2D 'lighter'). */
+.tf-face-fullscreen {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+.tf-face-fullscreen canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  image-rendering: auto;
+}
+.tf-face-fullscreen .tf-face-glow-layer {
+  filter: blur(8px);
+  opacity: 0.85;
+  mix-blend-mode: plus-lighter;
+  will-change: filter;
+}
+
 /* mini variant: CSS-only gradient circle with eye dots */
 .tf-face-mini {
   border-radius: 50%;
