@@ -53,6 +53,21 @@ pub struct ModelSpec {
     /// zalezy od group_size, np. 4-bit g64 = 0.5625, g32 = 0.625). Gdy `Some`,
     /// ma pierwszenstwo przed `quantization`/`dtype` w `bytes_per_param`.
     pub bytes_per_param_override: Option<f64>,
+    /// Sliding-window attention size in tokens. 0 = model has no SWA layers.
+    #[serde(default)]
+    pub sliding_window: u64,
+    /// Per-token K cache elements summed over GLOBAL (full-attention) layers.
+    #[serde(default)]
+    pub kv_k_elems_global: u64,
+    /// Per-token V cache elements summed over GLOBAL (full-attention) layers.
+    #[serde(default)]
+    pub kv_v_elems_global: u64,
+    /// Per-token K cache elements summed over SWA layers (window-capped cache).
+    #[serde(default)]
+    pub kv_k_elems_swa: u64,
+    /// Per-token V cache elements summed over SWA layers (window-capped cache).
+    #[serde(default)]
+    pub kv_v_elems_swa: u64,
 }
 
 impl ModelSpec {
@@ -102,6 +117,62 @@ impl ModelSpec {
         } else {
             0
         }
+    }
+
+    /// Effective per-token K/V element sums split into global vs SWA layer
+    /// buckets. When the parser did not provide the SWA-aware aggregates (all
+    /// four are 0), derives the global sums from the legacy uniform fields
+    /// (layers × kv_heads × head_dim for both K and V) with zero SWA sums.
+    fn kv_layer_elem_sums(&self) -> (u64, u64, u64, u64) {
+        let total = self.kv_k_elems_global
+            + self.kv_v_elems_global
+            + self.kv_k_elems_swa
+            + self.kv_v_elems_swa;
+        if total > 0 {
+            return (
+                self.kv_k_elems_global,
+                self.kv_v_elems_global,
+                self.kv_k_elems_swa,
+                self.kv_v_elems_swa,
+            );
+        }
+        let head_dim = if self.head_dim > 0 {
+            self.head_dim
+        } else if self.num_attention_heads > 0 {
+            self.hidden_size / self.num_attention_heads
+        } else {
+            128
+        };
+        let kv_heads = if self.num_key_value_heads > 0 {
+            self.num_key_value_heads
+        } else {
+            self.num_attention_heads.max(1)
+        };
+        let per = self.num_hidden_layers * kv_heads * head_dim;
+        (per, per, 0, 0)
+    }
+
+    /// KV cache bytes for ONE sequence of `ctx_tokens`, with separate K/V cache
+    /// dtypes. Global layers grow linearly with the context; SWA layers are
+    /// capped at the sliding window plus ~one ubatch (512) of llama.cpp padding.
+    /// Invalid dtype labels fall back to 2.0 B/elem (fp16).
+    pub fn kv_bytes_for_ctx(
+        &self,
+        engine: DeployEngine,
+        k_label: &str,
+        v_label: &str,
+        ctx_tokens: u64,
+    ) -> f64 {
+        let bytes_k = kv_bytes_per_element(engine, k_label).unwrap_or(2.0);
+        let bytes_v = kv_bytes_per_element(engine, v_label).unwrap_or(2.0);
+        let (k_g, v_g, k_swa, v_swa) = self.kv_layer_elem_sums();
+        let swa_tokens = if self.sliding_window > 0 {
+            ctx_tokens.min(self.sliding_window + 512)
+        } else {
+            ctx_tokens
+        };
+        (k_g as f64 * bytes_k + v_g as f64 * bytes_v) * ctx_tokens as f64
+            + (k_swa as f64 * bytes_k + v_swa as f64 * bytes_v) * swa_tokens as f64
     }
 
     /// Wymiar posredni eksperta MoE. Czesc configow trzyma rozmiar per-ekspert
@@ -414,33 +485,6 @@ pub fn kv_bytes_per_element(engine: DeployEngine, label: &str) -> Option<f64> {
     }
 }
 
-/// KV cache w bajtach na 1 token, z OSOBNYMI typami K i V. Pozwala na rozne
-/// szerokosci (np. K=q8_0, V=q4_0 w llama.cpp). Nieprawidlowa etykieta
-/// fallbackuje do 2.0 (fp16). Dla k==v wynik jest identyczny ze stara formula
-/// `2.0 * ... * bytes_kv` (suma bytes_k + bytes_v = 2 * bytes_kv).
-pub fn kv_per_token_bytes(
-    model: &ModelSpec,
-    engine: DeployEngine,
-    k_label: &str,
-    v_label: &str,
-) -> f64 {
-    let head_dim = if model.head_dim > 0 {
-        model.head_dim
-    } else if model.num_attention_heads > 0 {
-        model.hidden_size / model.num_attention_heads
-    } else {
-        128
-    };
-    let kv_heads = if model.num_key_value_heads > 0 {
-        model.num_key_value_heads
-    } else {
-        model.num_attention_heads.max(1)
-    };
-    let bytes_k = kv_bytes_per_element(engine, k_label).unwrap_or(2.0);
-    let bytes_v = kv_bytes_per_element(engine, v_label).unwrap_or(2.0);
-    model.num_hidden_layers as f64 * kv_heads as f64 * head_dim as f64 * (bytes_k + bytes_v)
-}
-
 /// Konfiguracja runtime do estymacji.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VramEstimateInput {
@@ -595,8 +639,19 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
         model.num_attention_heads.max(1)
     };
     let kv_tp_shards = (input.tensor_parallel as u64).min(kv_heads).max(1) as f64;
-    let kv_per_token_total =
-        kv_per_token_bytes(model, input.engine, &input.kv_cache_dtype, &input.kv_cache_dtype);
+    // Effective per-token KV width: SWA layers stop growing past the window, so
+    // the width depends on the context being budgeted (one full sequence).
+    let kv_one_seq_bytes = model.kv_bytes_for_ctx(
+        input.engine,
+        &input.kv_cache_dtype,
+        &input.kv_cache_dtype,
+        input.max_model_len,
+    );
+    let kv_per_token_total = if input.max_model_len > 0 {
+        kv_one_seq_bytes / input.max_model_len as f64
+    } else {
+        0.0
+    };
     let kv_per_token_per_gpu = kv_per_token_total / (kv_tp_shards * pp);
 
     let usable_per_gpu = input.gpu_memory_gb_each * input.gpu_memory_utilization;
@@ -743,8 +798,14 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
     // KV rosnie liniowo z liczba slotow (inaczej niz w vLLM page-cache).
     let seqs = input.max_num_seqs.max(1);
     let n_ctx = input.max_model_len * seqs;
-    let kv_per_token = kv_per_token_bytes(model, input.engine, input.k_label(), input.v_label());
-    let kv_cache_gb = bytes_to_gib(kv_per_token * n_ctx as f64);
+    // Per-slot KV (SWA-aware: window-capped layers don't grow with ctx) × slots.
+    let kv_one_seq_bytes = model.kv_bytes_for_ctx(
+        input.engine,
+        input.k_label(),
+        input.v_label(),
+        input.max_model_len,
+    );
+    let kv_cache_gb = bytes_to_gib(kv_one_seq_bytes * seqs as f64);
 
     let compute_buffer_gb = llamacpp_compute_buffer_gb(model, seqs);
 
@@ -872,10 +933,15 @@ pub fn estimate_mlx_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEs
     let weights_gb = bytes_to_gib(model_weights_bytes);
 
     // KV per-request × liczba sekwencji (mlx-lm batchuje). Single device, wiec
-    // bez shardingu — pelna szerokosc tokena.
+    // bez shardingu — pelna szerokosc tokena (SWA-aware per sequence).
     let seqs = input.max_num_seqs.max(1);
-    let kv_per_token = kv_per_token_bytes(model, input.engine, input.k_label(), input.v_label());
-    let kv_cache_gb = bytes_to_gib(kv_per_token * input.max_model_len as f64 * seqs as f64);
+    let kv_one_seq_bytes = model.kv_bytes_for_ctx(
+        input.engine,
+        input.k_label(),
+        input.v_label(),
+        input.max_model_len,
+    );
+    let kv_cache_gb = bytes_to_gib(kv_one_seq_bytes * seqs as f64);
 
     // Graf MLX: residual + bufor MLP na tokeny batcha; brak osobnego CUDA-graph
     // const, ale 0.5 GB na bufory frameworka/Metal heap.
@@ -888,7 +954,11 @@ pub fn estimate_mlx_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEs
 
     let kv_pool_gb = (budget_gb - required_gb).max(0.0);
     // Pula tokenow liczona per-request KV (single device, brak shardingu).
-    let kv_per_token_per_request = kv_per_token.max(1.0);
+    let kv_per_token_per_request = if input.max_model_len > 0 {
+        (kv_one_seq_bytes / input.max_model_len as f64).max(1.0)
+    } else {
+        1.0
+    };
     let pool_tokens = if kv_pool_gb > 0.0 {
         ((kv_pool_gb * 1024.0 * 1024.0 * 1024.0) / kv_per_token_per_request).floor() as u64
     } else {
@@ -1200,17 +1270,23 @@ pub struct AutoFitOutcome {
     pub error: Option<String>,
 }
 
-/// Auto-fit: dopasuj konfiguracje vLLM tak zeby na pewno miescila sie w VRAM.
+/// Auto-fit: pick a configuration guaranteed to fit in VRAM.
 ///
-/// Algorytm:
-/// 1. TP/PP: gdy locked - bierzemy wartosc usera. Inaczej probujemy
-///    `recommend_parallelism_vram_aware` zaczynajac od najmniejszego TP.
-/// 2. KV budget per GPU = `capacity * util - weights/parallel - activations/GPU`.
-/// 3. Iterujemy lock_*: gdy `max_model_len` locked a `max_num_seqs` not -
-///    obliczamy max_num_seqs = budget / (kv_per_seq_token * ctx). I vice versa.
-/// 4. Gdy oba locked i nie miesci sie - zwracamy `error`.
-/// 5. Gdy nic nie locked - heurystyka defaults: ctx = min(8k, max_position),
-///    seqs = 16, oba auto-skalowane do KV budget.
+/// Policy:
+/// 1. TP/PP: locked/explicit user values win, otherwise engine-specific
+///    recommendation (vLLM: VRAM-aware divisors; llama.cpp: layer-split on all
+///    cards; MLX: single device).
+/// 2. vLLM (KV pool model): `max_num_seqs` is a scheduler cap, not memory — the
+///    fit checks ONE full sequence in the pool. The recommended seqs derives
+///    from achievable pool concurrency (`floor(pool_tokens / ctx)`, clamped to
+///    1..=256) instead of a blind 256, unless the user supplied a value.
+/// 3. llama.cpp / MLX (KV scales linearly with slots): FULL CONTEXT FIRST, then
+///    concurrency. Default seqs = 1; ctx is binary-searched to the largest
+///    fitting value, and only when the model's full window fits at the current
+///    slot count (and the user did not request/lock seqs) concurrency is scaled
+///    up (2, 4, ..., 64).
+/// 4. Locked params are never lowered; an impossible locked combination
+///    returns `error`.
 pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcome {
     // 1. Wybor TP/PP. llama.cpp nie ma ograniczenia podzielnosci heads/layers
     // (split-mode row/layer dzieli dowolnie), wiec domyslnie uzywamy wszystkich
@@ -1245,218 +1321,235 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
         .as_deref()
         .unwrap_or(&req.kv_cache_dtype);
 
-    // 2. KV budget per GPU. Wagi z override (GGUF) lub z params×bytes_per_param.
+    // 2. Weights from override (GGUF exact file size) or params × bytes_per_param.
     let weights_bytes = match req.weights_bytes_override {
         Some(bytes) => bytes as f64,
         None => model.estimated_params() as f64 * model.bytes_per_param(),
     };
     let weights_gb = bytes_to_gib(weights_bytes);
     let weights_per_gpu = weights_gb / parallel;
-    // Activations roznia sie fizyka per silnik: vLLM = szczyt aktywacji f(tokeny
-    // batcha, hidden, intermediate) + staly CUDA-graph + NCCL (DRUG-2); llama.cpp =
-    // jeden compute buffer (setki MB) + primary CUDA context na karte. Bez override
-    // batcha uzywamy domyslnych 8192 tokenow (jak VramEstimateInput::default), zeby
-    // budzet auto_fit zgadzal sie z estymacja puli.
-    // Liczba sekwencji (cap schedulera). Driver logitow llama.cpp i wielkosci KV
-    // MLX; potrzebny juz tu, bo wchodzi w activations llama (logits per slot).
-    let budget_seqs = req.requested_max_num_seqs.unwrap_or(256).max(1);
-    let activations_per_gpu = match req.engine {
-        DeployEngine::Vllm => {
-            let act_dtype_bytes = 2.0;
-            let activation_peak = bytes_to_gib(
-                8192.0
-                    * (2.0 * model.hidden_size as f64 + model.intermediate_size.max(1) as f64)
-                    * act_dtype_bytes,
-            );
-            let nccl = if chosen_tp.max(1) > 1 {
-                0.3 * chosen_tp.max(1) as f64
-            } else {
-                0.0
-            };
-            activation_peak + 1.5 + nccl
-        }
-        DeployEngine::LlamaCpp => {
-            // Gdy metadane GGUF nie podaja vocab/hidden, compute buffer wychodzi ~0
-            // i over-credituje budzet KV. Floor ~0.5 GB chroni przed wyborem ctx,
-            // ktory potem realnie OOM-uje na compute bufferze.
-            let compute = if model.vocab_size == 0 || model.hidden_size == 0 {
-                0.5
-            } else {
-                llamacpp_compute_buffer_gb(model, budget_seqs)
-            };
-            compute + LLAMACPP_CUDA_CTX_PER_GPU
-        }
-        // MLX: graf (residual + bufor MLP na tokeny batcha) + heap Metala. Bez
-        // 5 GB workspace vLLM i bez CUDA-graph const.
-        DeployEngine::Mlx => {
-            0.5 + bytes_to_gib(8192.0 * model.hidden_size as f64 * 2.0 * 4.0)
+    let usable_per_gpu = req.gpu_memory_gb_each * req.gpu_memory_utilization;
+    let engine = req.engine;
+
+    // Default concurrency policy per engine: vLLM seqs is a scheduler cap (pool
+    // model, no memory), llama.cpp/MLX KV scales with slots so default is 1 and
+    // the full context wins over concurrency.
+    let default_seqs: u64 = match engine {
+        DeployEngine::Vllm => 256,
+        DeployEngine::LlamaCpp | DeployEngine::Mlx => 1,
+    };
+    let seqs_requested = req.requested_max_num_seqs.is_some();
+    let req_seqs = req.requested_max_num_seqs.unwrap_or(default_seqs).max(1);
+
+    // Engine-specific per-GPU activations. vLLM: scheduler-step activation peak
+    // (8192 tokens, same default as VramEstimateInput) + CUDA-graph const + NCCL.
+    // llama.cpp: one compute buffer (logits scale with the slot count) + primary
+    // CUDA context. MLX: graph scratch + Metal heap.
+    let activations_per_gpu_for = |seqs: u64| -> f64 {
+        match engine {
+            DeployEngine::Vllm => {
+                let act_dtype_bytes = 2.0;
+                let activation_peak = bytes_to_gib(
+                    8192.0
+                        * (2.0 * model.hidden_size as f64 + model.intermediate_size.max(1) as f64)
+                        * act_dtype_bytes,
+                );
+                let nccl = if chosen_tp.max(1) > 1 {
+                    0.3 * chosen_tp.max(1) as f64
+                } else {
+                    0.0
+                };
+                activation_peak + 1.5 + nccl
+            }
+            DeployEngine::LlamaCpp => {
+                // Missing GGUF vocab/hidden would make the compute buffer ~0 and
+                // over-credit the KV budget; floor it to protect against an OOM
+                // on the real compute buffer.
+                let compute = if model.vocab_size == 0 || model.hidden_size == 0 {
+                    0.5
+                } else {
+                    llamacpp_compute_buffer_gb(model, seqs)
+                };
+                compute + LLAMACPP_CUDA_CTX_PER_GPU
+            }
+            DeployEngine::Mlx => 0.5 + bytes_to_gib(8192.0 * model.hidden_size as f64 * 2.0 * 4.0),
         }
     };
-    let usable_per_gpu = req.gpu_memory_gb_each * req.gpu_memory_utilization;
-    let kv_budget_per_gpu = (usable_per_gpu - weights_per_gpu - activations_per_gpu).max(0.0);
-    // llama.cpp trzyma JEDEN proces dzielacy `-c` na wszystkie karty, wiec calkowity
-    // budzet KV rosnie liniowo z liczba kart. vLLM liczy budzet per GPU (pula KV
-    // zyje osobno na kazdej GPU).
-    let kv_budget_gb = match req.engine {
-        DeployEngine::Vllm => kv_budget_per_gpu,
-        // Row-split llama.cpp (tp>1): KV siedzi na MAIN GPU, wiec budzet to JEDNA
-        // karta (per_gpu), nie suma. Layer-split (pp>1, tp==1): KV dzieli sie rowno,
-        // wiec budzet rosnie liniowo z liczba kart.
-        DeployEngine::LlamaCpp => {
-            if chosen_tp.max(1) > 1 {
-                kv_budget_per_gpu
-            } else {
-                kv_budget_per_gpu * parallel
+
+    // KV budget in bytes. vLLM: per-GPU pool. llama.cpp layer-split: KV spreads
+    // evenly over all cards (budget × parallel); row-split keeps KV on the main
+    // GPU (single-card budget). MLX: single device.
+    let kv_budget_bytes_for = |seqs: u64| -> f64 {
+        let per_gpu = (usable_per_gpu - weights_per_gpu - activations_per_gpu_for(seqs)).max(0.0);
+        let gb = match engine {
+            DeployEngine::Vllm | DeployEngine::Mlx => per_gpu,
+            DeployEngine::LlamaCpp => {
+                if chosen_tp.max(1) > 1 {
+                    per_gpu
+                } else {
+                    per_gpu * parallel
+                }
+            }
+        };
+        gb * 1024.0 * 1024.0 * 1024.0
+    };
+
+    // Demand side: vLLM needs ONE full sequence in the pool, sharded across
+    // min(tp, kv_heads) × pp (above kv_heads vLLM replicates heads); llama.cpp
+    // and MLX allocate the full window per slot (× seqs).
+    let kv_heads = if model.num_key_value_heads > 0 {
+        model.num_key_value_heads
+    } else {
+        model.num_attention_heads.max(1)
+    };
+    let kv_tp_shards = (chosen_tp.max(1) as u64).min(kv_heads).max(1) as f64;
+    let chosen_pp_f = chosen_pp.max(1) as f64;
+    let kv_one_seq_bytes = |ctx: u64| -> f64 {
+        match engine {
+            // vLLM has a single --kv-cache-dtype (no separate V type).
+            DeployEngine::Vllm => {
+                model.kv_bytes_for_ctx(engine, &req.kv_cache_dtype, &req.kv_cache_dtype, ctx)
+            }
+            DeployEngine::LlamaCpp | DeployEngine::Mlx => {
+                model.kv_bytes_for_ctx(engine, &req.kv_cache_dtype, v_dtype, ctx)
             }
         }
-        // MLX: jedno urzadzenie, budzet = pula per-device (parallel=1).
-        DeployEngine::Mlx => kv_budget_per_gpu,
     };
-    let kv_budget_bytes = kv_budget_gb * 1024.0 * 1024.0 * 1024.0;
-    // Szerokosc KV na token PO shardingu per GPU: dla vLLM dzieli sie przez
-    // min(tp, kv_heads)*pp (powyzej kv_heads vLLM replikuje glowy, brak dalszej
-    // oszczednosci). llama.cpp trzyma KV per token bez shardingu w tej ksiegowosci
-    // (budzet zsumowany powyzej × parallel), wiec dzielnik = 1.
-    let kv_per_seq_token = match req.engine {
-        DeployEngine::Vllm => {
-            let kv_heads = if model.num_key_value_heads > 0 {
-                model.num_key_value_heads
-            } else {
-                model.num_attention_heads.max(1)
-            };
-            let kv_tp_shards = (chosen_tp.max(1) as u64).min(kv_heads).max(1) as f64;
-            kv_per_token_bytes(model, req.engine, &req.kv_cache_dtype, v_dtype)
-                / (kv_tp_shards * chosen_pp.max(1) as f64)
+    let kv_demand_bytes = |ctx: u64, seqs: u64| -> f64 {
+        match engine {
+            DeployEngine::Vllm => kv_one_seq_bytes(ctx) / (kv_tp_shards * chosen_pp_f),
+            DeployEngine::LlamaCpp | DeployEngine::Mlx => {
+                kv_one_seq_bytes(ctx) * seqs.max(1) as f64
+            }
         }
-        // llama.cpp / MLX: brak shardingu KV w tej ksiegowosci, osobne K/V.
-        DeployEngine::LlamaCpp | DeployEngine::Mlx => {
-            kv_per_token_bytes(model, req.engine, &req.kv_cache_dtype, v_dtype)
-        }
-    }
-    .max(1.0);
+    };
+    let fits = |ctx: u64, seqs: u64| -> bool {
+        kv_demand_bytes(ctx, seqs) <= kv_budget_bytes_for(seqs)
+    };
 
-    if kv_budget_gb <= 0.0 {
+    let make_applied = |ctx: u64, seqs: u64| -> VramEstimateInput {
+        VramEstimateInput {
+            engine: req.engine,
+            gpu_count: req.gpu_count,
+            gpu_memory_gb_each: req.gpu_memory_gb_each,
+            tensor_parallel: chosen_tp,
+            pipeline_parallel: chosen_pp,
+            max_model_len: ctx,
+            max_num_seqs: seqs,
+            max_num_batched_tokens: 8192,
+            kv_cache_dtype: req.kv_cache_dtype.clone(),
+            kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
+            gpu_memory_utilization: req.gpu_memory_utilization,
+            activation_overhead_pct: 10.0,
+            weights_bytes_override: req.weights_bytes_override,
+        }
+    };
+
+    if kv_budget_bytes_for(req_seqs) <= 0.0 {
         return AutoFitOutcome {
-            applied: VramEstimateInput {
-                engine: req.engine,
-                gpu_count: req.gpu_count,
-                gpu_memory_gb_each: req.gpu_memory_gb_each,
-                tensor_parallel: chosen_tp,
-                pipeline_parallel: chosen_pp,
-                max_model_len: req.requested_max_model_len.unwrap_or(2048),
-                max_num_seqs: req.requested_max_num_seqs.unwrap_or(256),
-                max_num_batched_tokens: 8192,
-                kv_cache_dtype: req.kv_cache_dtype.clone(),
-                kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
-                gpu_memory_utilization: req.gpu_memory_utilization,
-                activation_overhead_pct: 10.0,
-                weights_bytes_override: req.weights_bytes_override,
-            },
+            applied: make_applied(req.requested_max_model_len.unwrap_or(2048), req_seqs),
             auto_adjusted: Vec::new(),
             at_limit: true,
             error: Some(format!(
                 "Wagi modelu ({:.1} GB / GPU) + activations ({:.1} GB) przekraczaja \
                  dostepne {:.1} GB - zwieksz liczbe GPU lub uzyj quantization",
-                weights_per_gpu, activations_per_gpu, usable_per_gpu
+                weights_per_gpu,
+                activations_per_gpu_for(req_seqs),
+                usable_per_gpu
             )),
         };
     }
 
-    // 3. Heurystyka domyslnych wartosci.
-    // Default policy gdy user nic nie lockuje: prefer maksymalny kontekst dla
-    // single-user dev setup (long system prompts, code analysis). Throughput
-    // (batchowanie wielu requestow) traktujemy jako wybor manualny - zeby zwiekszyc
-    // num_seqs user musi go ustawic explicit albo zlockowac.
     let absolute_ctx_ceiling: u64 = 1_048_576;
     let model_ctx_ceiling = if model.max_position_embeddings > 0 {
         model.max_position_embeddings.min(absolute_ctx_ceiling)
     } else {
         absolute_ctx_ceiling
     };
-    // Domyslna wspolbieznosc to wartosc serwerowa (vLLM/sglang batchuja setki
-    // requestow), nie REPL jednoosobowy. max_num_seqs to wylacznie cap admisji
-    // schedulera — nie zabiera dedykowanej pamieci w modelu puli.
-    let default_seqs: u64 = 256;
-    let default_ctx = model_ctx_ceiling.max(2048);
+    let req_ctx = req
+        .requested_max_model_len
+        .unwrap_or(model_ctx_ceiling.max(2048))
+        .max(512);
 
-    let req_ctx = req.requested_max_model_len.unwrap_or(default_ctx).max(512);
-    let req_seqs = req.requested_max_num_seqs.unwrap_or(default_seqs).max(1);
-
-    // KV-volume mnoznik per seq dla strony POPYTU fitu. vLLM: model puli, demand =
-    // JEDNA sekwencja max_model_len (PagedAttention dzieli pule miedzy sekwencje,
-    // max_num_seqs to cap schedulera) — mnoznik 1. llama.cpp / MLX: n_ctx =
-    // max_model_len × max_num_seqs (kazdy slot dostaje pelne okno), wiec KV rosnie
-    // z liczba sekwencji — mnoznik = seqs (spojne z estimate_*_vram).
-    let engine_for_factor = req.engine;
-    let kv_seq_factor = move |seqs: u64| -> f64 {
-        match engine_for_factor {
-            DeployEngine::Vllm => 1.0,
-            DeployEngine::LlamaCpp | DeployEngine::Mlx => seqs.max(1) as f64,
+    // Largest fitting ctx in [512, ceiling] for a fixed slot count. Valid binary
+    // search: kv_bytes_for_ctx is monotonic piecewise-linear in ctx.
+    let largest_fitting_ctx = |seqs: u64, ceiling: u64| -> u64 {
+        let ceiling = ceiling.max(512);
+        if fits(ceiling, seqs) {
+            return ceiling;
         }
+        let mut lo: u64 = 512;
+        let mut hi = ceiling;
+        while lo + 256 < hi {
+            let mid = (lo + hi) / 2;
+            if fits(mid, seqs) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    // Round DOWN to a multiple of 1024, but never below 512 and never above the
+    // fitted value (rounding up past the VRAM limit would break the fit).
+    let round_ctx = |fit: u64| -> u64 { ((fit / 1024) * 1024).max(512).min(fit.max(512)) };
+
+    // Achievable vLLM pool concurrency at the chosen ctx — the recommendation
+    // shown/applied when the user did not pick a seqs value themselves.
+    let vllm_pool_seqs = |ctx: u64| -> u64 {
+        if ctx == 0 {
+            return 1;
+        }
+        let per_token = kv_one_seq_bytes(ctx) / ctx as f64 / (kv_tp_shards * chosen_pp_f);
+        if per_token <= 0.0 {
+            return 1;
+        }
+        let pool_tokens = (kv_budget_bytes_for(1) / per_token).floor() as u64;
+        (pool_tokens / ctx).clamp(1, 256)
+    };
+    // llama.cpp/MLX concurrency scale-up: largest slot count keeping ctx fitting.
+    let scale_up_seqs = |ctx: u64, start: u64| -> u64 {
+        let mut best = start;
+        for cand in [2u64, 4, 8, 16, 32, 64] {
+            if cand <= start {
+                continue;
+            }
+            if fits(ctx, cand) {
+                best = cand;
+            } else {
+                break;
+            }
+        }
+        best
     };
 
-    // 4. Auto-cap pozostalych params zgodnie z lockami.
     let mut auto_adjusted: Vec<String> = Vec::new();
     let (final_ctx, final_seqs) = match (req.lock_max_model_len, req.lock_max_num_seqs) {
         (true, true) => {
-            // Oba locked. W modelu puli vLLM max_num_seqs nie zajmuje pamieci, wiec
-            // popyt to JEDNA sekwencja max_model_len (kv_seq_factor==1) — overflow
-            // oznacza, ze pojedyncza pelna sekwencja nie miesci sie w puli KV.
-            let needed = kv_per_seq_token * req_ctx as f64 * kv_seq_factor(req_seqs);
-            if needed > kv_budget_bytes {
+            // Both locked: overflow means the locked combination cannot fit.
+            if !fits(req_ctx, req_seqs) {
                 return AutoFitOutcome {
-                    applied: VramEstimateInput {
-                        engine: req.engine,
-                        gpu_count: req.gpu_count,
-                        gpu_memory_gb_each: req.gpu_memory_gb_each,
-                        tensor_parallel: chosen_tp,
-                        pipeline_parallel: chosen_pp,
-                        max_model_len: req_ctx,
-                        max_num_seqs: req_seqs,
-                        max_num_batched_tokens: 8192,
-                        kv_cache_dtype: req.kv_cache_dtype.clone(),
-                        kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
-                        gpu_memory_utilization: req.gpu_memory_utilization,
-                        activation_overhead_pct: 10.0,
-                        weights_bytes_override: req.weights_bytes_override,
-                    },
+                    applied: make_applied(req_ctx, req_seqs),
                     auto_adjusted: Vec::new(),
                     at_limit: true,
                     error: Some(format!(
-                        "Locked max_model_len={} wymaga {:.1} GB puli KV na jedna sekwencje \
+                        "Locked max_model_len={} wymaga {:.1} GB puli KV \
                          ale budget per GPU to {:.1} GB. Zmniejsz max_model_len, zwieksz \
                          liczbe GPU albo uzyj fp8 KV.",
                         req_ctx,
-                        needed / (1024.0 * 1024.0 * 1024.0),
-                        kv_budget_gb
+                        bytes_to_gib(kv_demand_bytes(req_ctx, req_seqs)),
+                        bytes_to_gib(kv_budget_bytes_for(req_seqs))
                     )),
                 };
             }
             (req_ctx, req_seqs)
         }
         (true, false) => {
-            // ctx locked, seqs swobodne. W modelu puli vLLM max_num_seqs to cap
-            // schedulera (nie zabiera pamieci), wiec zachowujemy req_seqs jako cap.
-            // Gdy sama pojedyncza sekwencja max_model_len NIE miesci sie w puli, to
-            // problem zalockowanego ctx (seqs nic nie zmieni) — zwracamy error.
-            let needed = kv_per_seq_token * req_ctx as f64;
-            if needed > kv_budget_bytes {
+            // ctx locked, seqs free. If the locked ctx alone (one slot) does not
+            // fit, seqs cannot help — return error.
+            if !fits(req_ctx, 1) {
                 return AutoFitOutcome {
-                    applied: VramEstimateInput {
-                        engine: req.engine,
-                        gpu_count: req.gpu_count,
-                        gpu_memory_gb_each: req.gpu_memory_gb_each,
-                        tensor_parallel: chosen_tp,
-                        pipeline_parallel: chosen_pp,
-                        max_model_len: req_ctx,
-                        max_num_seqs: req_seqs,
-                        max_num_batched_tokens: 8192,
-                        kv_cache_dtype: req.kv_cache_dtype.clone(),
-                        kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
-                        gpu_memory_utilization: req.gpu_memory_utilization,
-                        activation_overhead_pct: 10.0,
-                        weights_bytes_override: req.weights_bytes_override,
-                    },
+                    applied: make_applied(req_ctx, req_seqs),
                     auto_adjusted: Vec::new(),
                     at_limit: true,
                     error: Some(format!(
@@ -1464,80 +1557,97 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
                          ale budget per GPU to {:.1} GB. Odblokuj max_model_len albo zwieksz \
                          liczbe GPU/uzyj fp8 KV.",
                         req_ctx,
-                        needed / (1024.0 * 1024.0 * 1024.0),
-                        kv_budget_gb
+                        bytes_to_gib(kv_demand_bytes(req_ctx, 1)),
+                        bytes_to_gib(kv_budget_bytes_for(1))
                     )),
                 };
             }
-            (req_ctx, req_seqs)
+            match engine {
+                // vLLM: seqs is a scheduler cap — keep the user value, otherwise
+                // recommend the achievable pool concurrency.
+                DeployEngine::Vllm => {
+                    let seqs = if seqs_requested {
+                        req_seqs
+                    } else {
+                        vllm_pool_seqs(req_ctx)
+                    };
+                    (req_ctx, seqs)
+                }
+                DeployEngine::LlamaCpp | DeployEngine::Mlx => {
+                    let mut seqs = req_seqs;
+                    while seqs > 1 && !fits(req_ctx, seqs) {
+                        seqs /= 2;
+                    }
+                    if seqs < req_seqs {
+                        auto_adjusted.push("max_num_seqs".into());
+                    }
+                    if !seqs_requested {
+                        seqs = scale_up_seqs(req_ctx, seqs);
+                    }
+                    (req_ctx, seqs)
+                }
+            }
         }
         (false, true) => {
-            // seqs locked - skaluj ctx. Dla llama.cpp ctx liczony z calego budzetu
-            // (seqs nie wchodza w KV), wiec kv_seq_factor==1.
-            let max_ctx =
-                (kv_budget_bytes / (kv_per_seq_token * kv_seq_factor(req_seqs))).floor() as u64;
-            let capped = max_ctx.max(512).min(req_ctx);
+            // seqs locked — scale ctx down to fit (never above the request).
+            let fit = largest_fitting_ctx(req_seqs, req_ctx);
+            let capped = round_ctx(fit).min(req_ctx);
             if capped < req_ctx {
                 auto_adjusted.push("max_model_len".into());
             }
             (capped, req_seqs)
         }
         (false, false) => {
-            // Brak lockow. Polityka serwujaca: trzymaj max_num_seqs jako cap
-            // schedulera (default 256 lub wartosc usera) — w modelu puli nie zabiera
-            // dedykowanej pamieci — a max_model_len pcham do maksimum mieszczacego
-            // JEDNA pelna sekwencje w puli, capped przez model.max_position_embeddings
-            // i absolutny ceiling. Suwak seqs nie zjeżdża juz ctx (kv_seq_factor==1).
-            let new_seqs = req_seqs.max(1);
-            let max_ctx_from_vram =
-                (kv_budget_bytes / (kv_per_seq_token * kv_seq_factor(new_seqs))).floor() as u64;
-            let max_ctx_capped = max_ctx_from_vram.min(model_ctx_ceiling);
-            let final_ctx_unlocked = req_ctx.max(max_ctx_capped).min(max_ctx_from_vram).max(512);
-            // Round down do wielokrotnosci 1024 zeby konfiguracja wygladala czysto.
-            let final_ctx_unlocked = (final_ctx_unlocked / 1024).max(1) * 1024;
-            if final_ctx_unlocked < req_ctx {
+            // No locks: full context first. Shrink slots only when even ctx=512
+            // does not fit at the requested slot count.
+            let mut seqs = req_seqs;
+            if !matches!(engine, DeployEngine::Vllm) {
+                while seqs > 1 && !fits(512, seqs) {
+                    seqs /= 2;
+                }
+                if seqs < req_seqs && seqs_requested {
+                    auto_adjusted.push("max_num_seqs".into());
+                }
+            }
+            let fit = largest_fitting_ctx(seqs, model_ctx_ceiling);
+            let ctx = round_ctx(fit);
+            if ctx < req_ctx {
                 auto_adjusted.push("max_model_len".into());
             }
-            (final_ctx_unlocked, new_seqs)
+            match engine {
+                DeployEngine::Vllm => {
+                    let s = if seqs_requested {
+                        req_seqs
+                    } else {
+                        vllm_pool_seqs(ctx)
+                    };
+                    (ctx, s)
+                }
+                DeployEngine::LlamaCpp | DeployEngine::Mlx => {
+                    // Scale concurrency only once the model's FULL window fits.
+                    let s = if !seqs_requested && fit >= model_ctx_ceiling {
+                        scale_up_seqs(ctx, seqs)
+                    } else {
+                        seqs
+                    };
+                    (ctx, s)
+                }
+            }
         }
     };
 
-    // 5. at_limit: cokolwiek dopasowane albo headroom < 5%.
-    let used_kv_bytes = kv_per_seq_token * final_ctx as f64 * kv_seq_factor(final_seqs);
+    // at_limit: anything auto-adjusted or KV headroom below 5%.
+    let used_kv_bytes = kv_demand_bytes(final_ctx, final_seqs);
+    let kv_budget_bytes = kv_budget_bytes_for(final_seqs);
     let headroom = (kv_budget_bytes - used_kv_bytes) / kv_budget_bytes.max(1.0);
     let at_limit = !auto_adjusted.is_empty() || headroom < 0.05;
 
     AutoFitOutcome {
-        applied: VramEstimateInput {
-            engine: req.engine,
-            gpu_count: req.gpu_count,
-            gpu_memory_gb_each: req.gpu_memory_gb_each,
-            tensor_parallel: chosen_tp,
-            pipeline_parallel: chosen_pp,
-            max_model_len: final_ctx,
-            max_num_seqs: final_seqs,
-            max_num_batched_tokens: 8192,
-            kv_cache_dtype: req.kv_cache_dtype.clone(),
-            kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
-            gpu_memory_utilization: req.gpu_memory_utilization,
-            activation_overhead_pct: 10.0,
-            weights_bytes_override: req.weights_bytes_override,
-        },
+        applied: make_applied(final_ctx, final_seqs),
         auto_adjusted,
         at_limit,
         error: None,
     }
-}
-
-/// KV cache w bajtach na 1 sekwencje × 1 token dla danej konfiguracji. Cienki
-/// wrapper nad `kv_per_token_bytes` z jednym typem cache dla K i V — pozostaje
-/// dla estymacji i auto_fit, ktore (na razie) wymuszaja rowne K/V.
-pub fn kv_bytes_per_seq_per_token(
-    model: &ModelSpec,
-    engine: DeployEngine,
-    kv_cache_dtype: &str,
-) -> f64 {
-    kv_per_token_bytes(model, engine, kv_cache_dtype, kv_cache_dtype)
 }
 
 /// Maksymalny `max_model_len` ktory zmiesci sie przy danej konfiguracji + batch.
@@ -1725,6 +1835,66 @@ pub fn parse_hf_config_with_override(
         num_attention_heads
     };
 
+    let num_hidden_layers = pick_u64_either("num_hidden_layers");
+
+    // Sliding-window attention layout. `use_sliding_window: false` (Qwen2-style)
+    // disables a declared window. Layer layout comes from `layer_types`
+    // ("sliding_attention"/"full_attention") or an integer
+    // `sliding_window_pattern` (gemma3: 6 -> every 6th layer is global). A window
+    // with no layer info is resolved per architecture below.
+    let use_sliding_window = text_cfg
+        .get("use_sliding_window")
+        .and_then(|v| v.as_bool())
+        .or_else(|| cfg.get("use_sliding_window").and_then(|v| v.as_bool()))
+        .unwrap_or(true);
+    let sliding_window = if use_sliding_window {
+        pick_u64_either("sliding_window")
+    } else {
+        0
+    };
+    let layer_types: Option<Vec<bool>> = text_cfg
+        .get("layer_types")
+        .or_else(|| cfg.get("layer_types"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|v| v.as_str() == Some("sliding_attention"))
+                .collect()
+        });
+    let swa_pattern = pick_u64_either("sliding_window_pattern");
+    let model_type = pick_str(cfg, "model_type");
+    let mut kv_k_elems_global: u64 = 0;
+    let mut kv_v_elems_global: u64 = 0;
+    let mut kv_k_elems_swa: u64 = 0;
+    let mut kv_v_elems_swa: u64 = 0;
+    if sliding_window > 0 && num_hidden_layers > 0 {
+        // HF configs have uniform per-layer kv heads and head dim.
+        let per_layer = kv_heads_final * head_dim;
+        for i in 0..num_hidden_layers {
+            let is_swa = match (&layer_types, swa_pattern) {
+                (Some(t), _) => t.get(i as usize).copied().unwrap_or(true),
+                (None, n) if n > 0 => (i + 1) % n != 0,
+                // No layer layout declared: gemma2 configs omit it but the
+                // architecture alternates SWA/global (even layers sliding);
+                // mistral/mixtral are genuinely uniform SWA. For unknown
+                // architectures treat every layer as global — overcounting KV
+                // only loses headroom, undercounting recommends OOM deploys.
+                _ => match model_type.as_str() {
+                    "gemma2" => i % 2 == 0,
+                    "mistral" | "mixtral" => true,
+                    _ => false,
+                },
+            };
+            if is_swa {
+                kv_k_elems_swa += per_layer;
+                kv_v_elems_swa += per_layer;
+            } else {
+                kv_k_elems_global += per_layer;
+                kv_v_elems_global += per_layer;
+            }
+        }
+    }
+
     let num_experts = pick_u64_aliases(&["num_experts", "num_local_experts", "n_routed_experts"]);
     let num_experts_per_tok = pick_u64_aliases(&[
         "num_experts_per_tok",
@@ -1736,7 +1906,7 @@ pub fn parse_hf_config_with_override(
     let tie_word_embeddings = pick_bool_either("tie_word_embeddings");
 
     let mut spec = ModelSpec {
-        model_type: pick_str(cfg, "model_type"),
+        model_type,
         architectures,
         dtype: if dtype.is_empty() {
             "bfloat16".into()
@@ -1746,7 +1916,7 @@ pub fn parse_hf_config_with_override(
         hidden_size,
         num_attention_heads,
         num_key_value_heads: kv_heads_final,
-        num_hidden_layers: pick_u64_either("num_hidden_layers"),
+        num_hidden_layers,
         vocab_size: pick_u64_either("vocab_size"),
         head_dim,
         intermediate_size: pick_u64_either("intermediate_size"),
@@ -1766,6 +1936,11 @@ pub fn parse_hf_config_with_override(
         num_active_parameters: 0,
         quantization,
         bytes_per_param_override,
+        sliding_window,
+        kv_k_elems_global,
+        kv_v_elems_global,
+        kv_k_elems_swa,
+        kv_v_elems_swa,
     };
     if spec.num_experts > 0 {
         spec.num_active_parameters = spec.active_params();
@@ -2039,6 +2214,10 @@ enum GgufValue {
     /// Tablica - przechowujemy tylko liczbe elementow (potrzebna dla vocab_size
     /// liczonego z dlugosci `tokenizer.ggml.tokens`).
     ArrayLen(u64),
+    /// Small numeric array (int/bool, len <= 4096) materialized in full — needed
+    /// for per-layer metadata like `attention.head_count_kv` and the SWA layer
+    /// pattern. Tokenizer-sized arrays keep the ArrayLen/ArrayTruncated path.
+    U64Array(Vec<u64>),
     /// Tablica, ktorej elementy urwaly sie na granicy bufora. Count jest znany
     /// (stoi przed elementami), wiec vocab_size dalej da sie odczytac; sygnalizuje
     /// callerowi ze parsowanie kolejnych KV nie ma sensu (early-stop).
@@ -2120,6 +2299,26 @@ impl<'a> GgufReader<'a> {
         })
     }
 
+    /// Reads one integer/bool scalar of the given GGUF type widened to u64
+    /// (signed values go through sign-extension, bools become 0/1).
+    fn scalar_u64(&mut self, value_type: u32) -> Result<u64> {
+        Ok(match value_type {
+            0 | 7 => self.u8()? as u64,
+            1 => self.u8()? as i8 as i64 as u64,
+            2 => self.u16()? as u64,
+            3 => self.u16()? as i16 as i64 as u64,
+            4 => self.u32()? as u64,
+            5 => self.u32()? as i32 as i64 as u64,
+            10 => self.u64()?,
+            11 => self.u64()? as i64 as u64,
+            other => {
+                return Err(anyhow!(
+                    "GGUF: typ {other} nie jest skalarem calkowitym"
+                ))
+            }
+        })
+    }
+
     /// Czyta wartosc dla podanego value_type. MUSI poprawnie przejsc przez KAZDY
     /// typ (takze tablice i typy ktorych nie uzywamy) inaczej kursor sie rozjedzie.
     fn read_value(&mut self, value_type: u32) -> Result<GgufValue> {
@@ -2147,6 +2346,20 @@ impl<'a> GgufReader<'a> {
                 let count = self.u64()?;
                 if elem_type == 9 {
                     return Err(anyhow!("GGUF: zagniezdzona tablica nieobslugiwana"));
+                }
+                // Small integer/bool arrays are materialized — per-layer kv-head
+                // counts and SWA patterns live here. Anything bigger (tokenizer
+                // tables) is skipped as before.
+                let is_int = matches!(elem_type, 0 | 1 | 2 | 3 | 4 | 5 | 7 | 10 | 11);
+                if is_int && count <= 4096 {
+                    let mut vals: Vec<u64> = Vec::with_capacity(count as usize);
+                    for _ in 0..count {
+                        match self.scalar_u64(elem_type) {
+                            Ok(v) => vals.push(v),
+                            Err(_) => return Ok(GgufValue::ArrayTruncated(count)),
+                        }
+                    }
+                    return Ok(GgufValue::U64Array(vals));
                 }
                 for _ in 0..count {
                     if elem_type == 8 {
@@ -2214,6 +2427,14 @@ pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
         |kv: &std::collections::HashMap<String, GgufValue>, key: &str| -> Option<u64> {
             match kv.get(key) {
                 Some(GgufValue::ArrayLen(n)) | Some(GgufValue::ArrayTruncated(n)) => Some(*n),
+                Some(GgufValue::U64Array(a)) => Some(a.len() as u64),
+                _ => None,
+            }
+        };
+    let get_u64_array =
+        |kv: &std::collections::HashMap<String, GgufValue>, key: &str| -> Option<Vec<u64>> {
+            match kv.get(key) {
+                Some(GgufValue::U64Array(a)) => Some(a.clone()),
                 _ => None,
             }
         };
@@ -2286,22 +2507,80 @@ pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
     let num_hidden_layers = get_u64(&kv, &key("block_count")).unwrap_or(0);
     let hidden_size = get_u64(&kv, &key("embedding_length")).unwrap_or(0);
     let num_attention_heads = get_u64(&kv, &key("attention.head_count")).unwrap_or(0);
-    let num_key_value_heads =
-        get_u64(&kv, &key("attention.head_count_kv")).unwrap_or(num_attention_heads);
+    // head_count_kv is a scalar OR a per-layer array (e.g. gemma3/gemma4 mix SWA
+    // and global layers with different kv-head counts). The scalar spec field
+    // carries the max (display / TP heuristics); the per-layer values feed the
+    // SWA-aware KV aggregates below.
+    let kv_heads_arr = get_u64_array(&kv, &key("attention.head_count_kv"));
+    let num_key_value_heads = match (&kv_heads_arr, get_u64(&kv, &key("attention.head_count_kv")))
+    {
+        (Some(a), _) => a.iter().copied().max().unwrap_or(num_attention_heads),
+        (None, Some(v)) => v,
+        (None, None) => num_attention_heads,
+    };
     let intermediate_size = get_u64(&kv, &key("feed_forward_length")).unwrap_or(0);
     let max_position_embeddings = get_u64(&kv, &key("context_length")).unwrap_or(0);
 
-    let head_dim = get_u64(&kv, &key("attention.key_length")).unwrap_or_else(|| {
+    // Per-layer K/V head widths. Fallbacks: _swa -> non-swa, value -> key,
+    // key -> hidden/heads.
+    let k_len = get_u64(&kv, &key("attention.key_length")).unwrap_or_else(|| {
         if num_attention_heads > 0 {
             hidden_size / num_attention_heads
         } else {
             0
         }
     });
+    let v_len = get_u64(&kv, &key("attention.value_length")).unwrap_or(k_len);
+    let k_len_swa = get_u64(&kv, &key("attention.key_length_swa")).unwrap_or(k_len);
+    let v_len_swa = get_u64(&kv, &key("attention.value_length_swa")).unwrap_or(v_len);
+    let head_dim = k_len;
+
+    let sliding_window = get_u64(&kv, &key("attention.sliding_window")).unwrap_or(0);
+    // SWA layer layout: per-layer 0/1 array (1 = SWA), or a scalar N meaning
+    // "every Nth layer is global, the rest SWA" (gemma3 convention). A declared
+    // window without any pattern means uniform SWA (mistral-style), except
+    // gemma2: its GGUF files carry no pattern and llama.cpp hardcodes the
+    // even-SWA/odd-global alternation.
+    let swa_pattern_arr = get_u64_array(&kv, &key("attention.sliding_window_pattern"));
+    let swa_pattern_scalar = get_u64(&kv, &key("attention.sliding_window_pattern")).unwrap_or(0);
+    let mut kv_k_elems_global: u64 = 0;
+    let mut kv_v_elems_global: u64 = 0;
+    let mut kv_k_elems_swa: u64 = 0;
+    let mut kv_v_elems_swa: u64 = 0;
+    for i in 0..num_hidden_layers {
+        let kvh = kv_heads_arr
+            .as_ref()
+            .and_then(|a| a.get(i as usize).copied())
+            .unwrap_or(num_key_value_heads);
+        let is_swa = if sliding_window == 0 {
+            false
+        } else if let Some(p) = &swa_pattern_arr {
+            p.get(i as usize).copied().unwrap_or(1) != 0
+        } else if swa_pattern_scalar > 0 {
+            (i + 1) % swa_pattern_scalar != 0
+        } else if arch == "gemma2" {
+            i % 2 == 0
+        } else {
+            true
+        };
+        if is_swa {
+            kv_k_elems_swa += kvh * k_len_swa;
+            kv_v_elems_swa += kvh * v_len_swa;
+        } else {
+            kv_k_elems_global += kvh * k_len;
+            kv_v_elems_global += kvh * v_len;
+        }
+    }
 
     // vocab_size: jawny klucz, inaczej dlugosc tablicy tokenizer.ggml.tokens.
     let vocab_size = get_u64(&kv, &key("vocab_size"))
         .or_else(|| get_arr_len(&kv, "tokenizer.ggml.tokens"))
+        .unwrap_or(0);
+
+    // general.size_label ("31B", "780M", "3.8B") carries the official parameter
+    // count — far more accurate than the dimensional heuristic.
+    let num_parameters = get_str(&kv, "general.size_label")
+        .and_then(|s| parse_size_label(&s))
         .unwrap_or(0);
 
     // Quantization z nazwy pliku (jednoznaczna). Fallback: bf16 gdy nazwa milczy.
@@ -2330,11 +2609,34 @@ pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
         tie_word_embeddings: false,
         has_vision: false,
         has_audio: false,
-        num_parameters: 0,
+        num_parameters,
         num_active_parameters: 0,
         quantization: quant_label,
         bytes_per_param_override: None,
+        sliding_window,
+        kv_k_elems_global,
+        kv_v_elems_global,
+        kv_k_elems_swa,
+        kv_v_elems_swa,
     })
+}
+
+/// Parses a `general.size_label` value ("31B", "780M", "3.8B") into a parameter
+/// count. MoE labels like "8x7B" are left to the caller (returns None).
+fn parse_size_label(label: &str) -> Option<u64> {
+    let t = label.trim().to_uppercase();
+    let (num, mult) = if let Some(p) = t.strip_suffix('B') {
+        (p, 1e9)
+    } else if let Some(p) = t.strip_suffix('M') {
+        (p, 1e6)
+    } else {
+        return None;
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    if n <= 0.0 {
+        return None;
+    }
+    Some((n * mult) as u64)
 }
 
 /// Pobiera rozmiar pliku (Content-Length) przez HEAD. HF zwraca 302 do CDN,
@@ -2481,6 +2783,8 @@ mod tests {
         }
     }
 
+    /// Real google/gemma-4-31b GGUF header: 60 layers, 50 SWA (16 kv heads,
+    /// 256-dim K/V) + 10 global (4 kv heads, 512-dim K/V), window 1024.
     fn gemma4_31b() -> ModelSpec {
         ModelSpec {
             model_type: "gemma4".into(),
@@ -2493,9 +2797,16 @@ mod tests {
             vocab_size: 262144,
             head_dim: 256,
             intermediate_size: 21504,
-            max_position_embeddings: 131072,
+            max_position_embeddings: 262144,
             has_vision: true,
             num_parameters: 31_000_000_000,
+            sliding_window: 1024,
+            // 10 global layers × 4 kv heads × 512 = 20480 elems per token.
+            kv_k_elems_global: 20480,
+            kv_v_elems_global: 20480,
+            // 50 SWA layers × 16 kv heads × 256 = 204800 elems per token.
+            kv_k_elems_swa: 204800,
+            kv_v_elems_swa: 204800,
             ..Default::default()
         }
     }
@@ -3309,10 +3620,10 @@ mod tests {
 
     #[test]
     fn auto_default_serves_with_full_ctx_and_server_seqs() {
-        // Gemma2 27B-like, 4x 24GB, brak request + brak lockow -> polityka serwujaca.
-        // Oczekiwanie: max_num_seqs = 256 (cap serwera, nie REPL), max_model_len
+        // Gemma2 27B-like, 4x 24GB, brak request + brak lockow. max_model_len
         // wyciagniety do max mieszczacego JEDNA sekwencje w puli, capped przez
-        // model.max_position_embeddings = 32768.
+        // model.max_position_embeddings = 32768. max_num_seqs to rekomendacja z
+        // osiagalnej wspolbieznosci puli (floor(pool_tokens/ctx)), nie slepe 256.
         let m = gemma2_27b_like();
         let fit = auto_fit_config(
             &m,
@@ -3334,11 +3645,6 @@ mod tests {
             },
         );
         assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
-        assert_eq!(
-            fit.applied.max_num_seqs, 256,
-            "default num_seqs to wartosc serwerowa 256 (nie 1), got {}",
-            fit.applied.max_num_seqs
-        );
         // Pula KV mocno przewyzsza 32k tokenow dla 1 sekwencji, wiec ctx siega
         // pelnego model.max_position_embeddings (32768) bez cappingu KV.
         assert_eq!(
@@ -3352,6 +3658,13 @@ mod tests {
             est.concurrent_full_len_seqs >= 1.0,
             "Pula powinna pomiescic >=1 pelna sekwencje 32k: {}",
             est.concurrent_full_len_seqs
+        );
+        // Rekomendacja seqs = osiagalna wspolbieznosc puli, clamp 1..=256.
+        let pool_seqs = (est.pool_tokens / fit.applied.max_model_len).clamp(1, 256);
+        assert_eq!(
+            fit.applied.max_num_seqs, pool_seqs,
+            "seqs ma odzwierciedlac pule (floor(pool/ctx)), got {} pool_seqs {}",
+            fit.applied.max_num_seqs, pool_seqs
         );
     }
 
@@ -3381,11 +3694,19 @@ mod tests {
             },
         );
         assert!(fit.error.is_none(), "Powinno fits: {:?}", fit.error);
-        assert_eq!(fit.applied.max_num_seqs, 256, "default seqs serwerowe = 256");
         assert_eq!(
             fit.applied.max_model_len, m.max_position_embeddings,
             "Maly model: ctx == model.max_position_embeddings ({}), got {}",
             m.max_position_embeddings, fit.applied.max_model_len
+        );
+        // Olbrzymia pula 0.5B na 24 GB: rekomendacja seqs > 1 ale zgodna z pula.
+        let est = estimate_vllm_vram(&m, &fit.applied);
+        let pool_seqs = (est.pool_tokens / fit.applied.max_model_len).clamp(1, 256);
+        assert_eq!(fit.applied.max_num_seqs, pool_seqs);
+        assert!(
+            fit.applied.max_num_seqs > 1,
+            "0.5B na 24 GB ma dac wspolbieznosc > 1: {}",
+            fit.applied.max_num_seqs
         );
     }
 
@@ -3493,8 +3814,9 @@ mod tests {
     }
 
     #[test]
-    fn kv_per_token_bytes_separate_k_and_v() {
-        // GQA-style spec: 32 layers, 8 kv_heads, head_dim 128.
+    fn kv_bytes_for_ctx_separate_k_and_v() {
+        // GQA-style spec: 32 layers, 8 kv_heads, head_dim 128, no SWA — the
+        // legacy uniform fallback path of kv_layer_elem_sums.
         let m = ModelSpec {
             num_hidden_layers: 32,
             num_key_value_heads: 8,
@@ -3506,18 +3828,38 @@ mod tests {
         let factor = 32.0 * 8.0 * 128.0; // layers * kv_heads * head_dim
 
         // Rozne K/V: K=q8_0 (1.0625), V=q4_0 (0.5625) -> suma osobnych szerokosci.
-        let mixed = kv_per_token_bytes(&m, DeployEngine::LlamaCpp, "q8_0", "q4_0");
+        let mixed = m.kv_bytes_for_ctx(DeployEngine::LlamaCpp, "q8_0", "q4_0", 1);
         assert!((mixed - factor * (1.0625 + 0.5625)).abs() < 1e-9);
 
-        // k == v daje identyczny wynik jak stary wrapper `2.0 * ... * bytes_kv`.
-        let symmetric = kv_per_token_bytes(&m, DeployEngine::LlamaCpp, "q4_0", "q4_0");
+        // k == v: 2 × szerokosc pojedynczego cache.
+        let symmetric = m.kv_bytes_for_ctx(DeployEngine::LlamaCpp, "q4_0", "q4_0", 1);
         assert!((symmetric - factor * 2.0 * 0.5625).abs() < 1e-9);
-        let wrapper = kv_bytes_per_seq_per_token(&m, DeployEngine::LlamaCpp, "q4_0");
-        assert!((symmetric - wrapper).abs() < 1e-9);
+
+        // Bez SWA wynik skaluje sie liniowo z ctx.
+        let ctx_4k = m.kv_bytes_for_ctx(DeployEngine::LlamaCpp, "q4_0", "q4_0", 4096);
+        assert!((ctx_4k - symmetric * 4096.0).abs() < 1e-3);
 
         // Nieprawidlowa etykieta fallbackuje do 2.0 (fp16) per element.
-        let fallback = kv_per_token_bytes(&m, DeployEngine::LlamaCpp, "bogus", "bogus");
+        let fallback = m.kv_bytes_for_ctx(DeployEngine::LlamaCpp, "bogus", "bogus", 1);
         assert!((fallback - factor * 2.0 * 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kv_bytes_for_ctx_gemma4_swa_matches_real_header() {
+        // Real gemma4-31b @ ctx 262144, f16: global layers 80 KiB/token × 262144
+        // = 20.0 GiB; SWA layers 800 KiB/token capped at window 1024 (+512
+        // ubatch padding) ≈ 1.17 GiB. Total ≈ 21.17 GiB vs the ideal 20.78 GiB
+        // (padding adds ~0.39 GiB). The old uniform formula gave ~960 GB.
+        let m = gemma4_31b();
+        let kv = m.kv_bytes_for_ctx(DeployEngine::LlamaCpp, "f16", "f16", 262144);
+        let kv_gib = kv / (1024.0 * 1024.0 * 1024.0);
+        assert!(
+            (kv_gib - 20.78).abs() < 0.45,
+            "gemma4 KV @262k f16 ma byc ~20.78-21.2 GiB, got {kv_gib}"
+        );
+        // q8_0 K+V: 1.0625/2.0 ratio vs f16.
+        let kv_q8 = m.kv_bytes_for_ctx(DeployEngine::LlamaCpp, "q8_0", "q8_0", 262144);
+        assert!(((kv_q8 / kv) - 1.0625 / 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -3700,21 +4042,19 @@ mod tests {
             },
         );
         assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
-        assert_eq!(
-            fit.applied.max_num_seqs, 256,
-            "polityka serwujaca: seqs = 256, got {}",
-            fit.applied.max_num_seqs
-        );
-        // Gemma4 31B ma 60 layers × 16 kv_heads × 256 head_dim → KV ~960 KB/token.
-        // Male wagi NVFP4 (~17 GB) zostawiaja ~15 GB/GPU puli KV → ctx rzedu ~67k
-        // (capped przez model.max_position_embeddings 131072). Wczesniej (bez modelu
-        // puli + bez NVFP4 w wagach) model w ogole nie fit'owal.
+        // SWA-aware KV: 50 warstw okienkowych nie rosnie z ctx, wiec male wagi
+        // NVFP4 (~17 GB) pozwalaja na bardzo duzy kontekst na 4×24 GB.
         assert!(
             fit.applied.max_model_len >= 32768,
             "Z malymi wagami (NVFP4) pula KV powinna dac duzy ctx (>= 32k), got {}",
             fit.applied.max_model_len
         );
         assert!(fit.applied.max_model_len <= m.max_position_embeddings);
+        // Rekomendacja seqs z osiagalnej wspolbieznosci puli, nie slepe 256.
+        let est = estimate_vllm_vram(&m, &fit.applied);
+        assert!(est.fits_per_gpu, "Po auto-fit musi fits: {est:?}");
+        let pool_seqs = (est.pool_tokens / fit.applied.max_model_len).clamp(1, 256);
+        assert_eq!(fit.applied.max_num_seqs, pool_seqs);
     }
 
     // --- Pomocniki budujace syntetyczny naglowek GGUF (v3, little-endian) ---
@@ -3734,6 +4074,18 @@ mod tests {
         gguf_push_string(buf, key);
         buf.extend_from_slice(&8u32.to_le_bytes()); // value_type 8 = string
         gguf_push_string(buf, val);
+    }
+
+    /// Tablica u32 (value_type 9, elem_type 4) - per-layer metadane (kv heads,
+    /// SWA pattern).
+    fn gguf_kv_u32_array(buf: &mut Vec<u8>, key: &str, items: &[u32]) {
+        gguf_push_string(buf, key);
+        buf.extend_from_slice(&9u32.to_le_bytes()); // value_type 9 = array
+        buf.extend_from_slice(&4u32.to_le_bytes()); // elem_type 4 = u32
+        buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
+        for it in items {
+            buf.extend_from_slice(&it.to_le_bytes());
+        }
     }
 
     /// Tablica stringow (value_type 9, elem_type 8) - test poprawnego przejscia.
@@ -4037,7 +4389,7 @@ mod tests {
         );
         // Szerokosc KV per token per GPU = kv_per_token_total / (kv_tp_shards*pp).
         // kv_tp_shards clamp na 8 dla TP=8 ORAZ TP=16 → identyczna szerokosc.
-        let kv_total = kv_per_token_bytes(&m, DeployEngine::Vllm, "auto", "auto");
+        let kv_total = m.kv_bytes_for_ctx(DeployEngine::Vllm, "auto", "auto", 1);
         let width_tp8 = kv_total / 8.0; // min(8,8)
         let width_tp16 = kv_total / 8.0; // min(16,8) clamp
         assert!((width_tp8 - width_tp16).abs() < 1e-9, "clamp na kv_heads=8");
@@ -4192,6 +4544,14 @@ mod tests {
         );
         let est = estimate_vllm_vram(&m, &fit.applied);
         assert!(est.fits_per_gpu, "Po auto-fit musi fits: {est:?}");
+        // Rekomendacja nie przekracza osiagalnej wspolbieznosci puli.
+        assert!(
+            fit.applied.max_num_seqs <= (est.pool_tokens / fit.applied.max_model_len).max(1),
+            "seqs {} > floor(pool {}/ctx {})",
+            fit.applied.max_num_seqs,
+            est.pool_tokens,
+            fit.applied.max_model_len
+        );
     }
 
     #[test]
@@ -4587,5 +4947,339 @@ mod tests {
         .unwrap();
         let spec64 = parse_hf_config(&json64, "mlx-community/foo-4bit").unwrap();
         assert!((spec64.bytes_per_param() - 0.5625).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_gguf_header_gemma4_swa_aggregates_and_size_label() {
+        // Synthetic gemma4 header mirroring the real
+        // google/gemma-4-31b-it-qat-q4_0-gguf metadata: per-layer kv heads
+        // [16,16,16,16,16,4]×10, SWA pattern [1,1,1,1,1,0]×10 (every 6th layer
+        // global), separate _swa K/V widths and size_label "31B".
+        let mut kv_heads: Vec<u32> = Vec::new();
+        let mut swa_pattern: Vec<u32> = Vec::new();
+        for _ in 0..10 {
+            kv_heads.extend_from_slice(&[16, 16, 16, 16, 16, 4]);
+            swa_pattern.extend_from_slice(&[1, 1, 1, 1, 1, 0]);
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&15u64.to_le_bytes()); // metadata_kv_count
+
+        gguf_kv_string(&mut buf, "general.architecture", "gemma4");
+        gguf_kv_string(&mut buf, "general.size_label", "31B");
+        gguf_kv_u32(&mut buf, "gemma4.block_count", 60);
+        gguf_kv_u32(&mut buf, "gemma4.embedding_length", 5376);
+        gguf_kv_u32(&mut buf, "gemma4.attention.head_count", 32);
+        gguf_kv_u32_array(&mut buf, "gemma4.attention.head_count_kv", &kv_heads);
+        gguf_kv_u32(&mut buf, "gemma4.context_length", 262144);
+        gguf_kv_u32(&mut buf, "gemma4.feed_forward_length", 21504);
+        gguf_kv_u32(&mut buf, "gemma4.attention.key_length", 512);
+        gguf_kv_u32(&mut buf, "gemma4.attention.value_length", 512);
+        gguf_kv_u32(&mut buf, "gemma4.attention.key_length_swa", 256);
+        gguf_kv_u32(&mut buf, "gemma4.attention.value_length_swa", 256);
+        gguf_kv_u32(&mut buf, "gemma4.attention.sliding_window", 1024);
+        gguf_kv_u32_array(&mut buf, "gemma4.attention.sliding_window_pattern", &swa_pattern);
+        gguf_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["<pad>", "a", "b"]);
+
+        let spec = parse_gguf_header(&buf, "gemma-4-31b-it-qat-q4_0.gguf")
+            .expect("parser GGUF powinien przejsc");
+
+        assert_eq!(spec.model_type, "gemma4");
+        assert_eq!(spec.num_hidden_layers, 60);
+        assert_eq!(spec.hidden_size, 5376);
+        assert_eq!(spec.num_attention_heads, 32);
+        // Scalar field carries the max of the per-layer array.
+        assert_eq!(spec.num_key_value_heads, 16);
+        assert_eq!(spec.sliding_window, 1024);
+        // Global: 10 layers × 4 kv heads × 512; SWA: 50 layers × 16 × 256.
+        assert_eq!(spec.kv_k_elems_global, 20480);
+        assert_eq!(spec.kv_v_elems_global, 20480);
+        assert_eq!(spec.kv_k_elems_swa, 204800);
+        assert_eq!(spec.kv_v_elems_swa, 204800);
+        // size_label "31B" -> 31e9 params (the dimensional heuristic gave 37.7B).
+        assert_eq!(spec.num_parameters, 31_000_000_000);
+        assert_eq!(spec.quantization.as_deref(), Some("int4"));
+    }
+
+    #[test]
+    fn parse_gguf_header_scalar_swa_pattern_every_nth_global() {
+        // gemma3-style: scalar sliding_window_pattern=6 means every 6th layer is
+        // global, the rest SWA; uniform kv heads.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&11u64.to_le_bytes());
+
+        gguf_kv_string(&mut buf, "general.architecture", "gemma3");
+        gguf_kv_u32(&mut buf, "gemma3.block_count", 12);
+        gguf_kv_u32(&mut buf, "gemma3.embedding_length", 2048);
+        gguf_kv_u32(&mut buf, "gemma3.attention.head_count", 8);
+        gguf_kv_u32(&mut buf, "gemma3.attention.head_count_kv", 4);
+        gguf_kv_u32(&mut buf, "gemma3.context_length", 32768);
+        gguf_kv_u32(&mut buf, "gemma3.feed_forward_length", 8192);
+        gguf_kv_u32(&mut buf, "gemma3.attention.key_length", 256);
+        gguf_kv_u32(&mut buf, "gemma3.attention.sliding_window", 512);
+        gguf_kv_u32(&mut buf, "gemma3.attention.sliding_window_pattern", 6);
+        gguf_kv_u32(&mut buf, "gemma3.vocab_size", 1000);
+
+        let spec = parse_gguf_header(&buf, "gemma3-x-q4_0.gguf").unwrap();
+        assert_eq!(spec.sliding_window, 512);
+        // 12 layers, global at i+1 ∈ {6, 12} -> 2 global, 10 SWA. value_length
+        // fallback -> key_length; _swa fallback -> non-swa.
+        assert_eq!(spec.kv_k_elems_global, 2 * 4 * 256);
+        assert_eq!(spec.kv_v_elems_global, 2 * 4 * 256);
+        assert_eq!(spec.kv_k_elems_swa, 10 * 4 * 256);
+        assert_eq!(spec.kv_v_elems_swa, 10 * 4 * 256);
+    }
+
+    #[test]
+    fn parse_hf_config_reads_sliding_window_layout() {
+        // layer_types array decides the global/SWA split.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "gemma3_text",
+            "hidden_size": 2048,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 4,
+            "head_dim": 256,
+            "vocab_size": 262144,
+            "intermediate_size": 8192,
+            "sliding_window": 512,
+            "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"]
+        }"#,
+        )
+        .unwrap();
+        let spec = parse_hf_config(&json, "google/gemma-3-x").unwrap();
+        assert_eq!(spec.sliding_window, 512);
+        assert_eq!(spec.kv_k_elems_global, 4 * 256);
+        assert_eq!(spec.kv_k_elems_swa, 3 * 4 * 256);
+        assert_eq!(spec.kv_v_elems_swa, 3 * 4 * 256);
+
+        // sliding_window_pattern=2: every 2nd layer global.
+        let json_pattern: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hidden_size": 2048,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 4,
+            "head_dim": 256,
+            "sliding_window": 512,
+            "sliding_window_pattern": 2
+        }"#,
+        )
+        .unwrap();
+        let spec_p = parse_hf_config(&json_pattern, "google/gemma-3-y").unwrap();
+        assert_eq!(spec_p.kv_k_elems_global, 2 * 4 * 256);
+        assert_eq!(spec_p.kv_k_elems_swa, 2 * 4 * 256);
+
+        // use_sliding_window=false neutralizes a declared window (Qwen2-style).
+        let json_off: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hidden_size": 2048,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 4,
+            "head_dim": 256,
+            "sliding_window": 4096,
+            "use_sliding_window": false
+        }"#,
+        )
+        .unwrap();
+        let spec_off = parse_hf_config(&json_off, "qwen/qwen2-x").unwrap();
+        assert_eq!(spec_off.sliding_window, 0);
+        assert_eq!(spec_off.kv_k_elems_swa, 0);
+    }
+
+    #[test]
+    fn parse_hf_config_gemma2_alternates_swa_without_layout() {
+        // Real gemma2 configs declare sliding_window but no layer_types and no
+        // sliding_window_pattern; the architecture alternates SWA (even layers)
+        // and global (odd layers).
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "gemma2",
+            "hidden_size": 4608,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 16,
+            "num_hidden_layers": 46,
+            "head_dim": 128,
+            "sliding_window": 4096
+        }"#,
+        )
+        .unwrap();
+        let spec = parse_hf_config(&json, "google/gemma-2-27b-it").unwrap();
+        assert_eq!(spec.sliding_window, 4096);
+        // 46 layers alternate: 23 SWA (even indices) + 23 global (odd).
+        assert_eq!(spec.kv_k_elems_swa, 23 * 16 * 128);
+        assert_eq!(spec.kv_v_elems_swa, 23 * 16 * 128);
+        assert_eq!(spec.kv_k_elems_global, 23 * 16 * 128);
+        assert_eq!(spec.kv_v_elems_global, 23 * 16 * 128);
+    }
+
+    #[test]
+    fn parse_hf_config_unknown_arch_window_without_layout_is_all_global() {
+        // Unknown architecture with a declared window but no layer layout:
+        // assume all layers global (overcount is safe, undercount OOMs).
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "somefuturearch",
+            "hidden_size": 2048,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 4,
+            "head_dim": 256,
+            "sliding_window": 2048
+        }"#,
+        )
+        .unwrap();
+        let spec = parse_hf_config(&json, "acme/future-7b").unwrap();
+        assert_eq!(spec.sliding_window, 2048);
+        assert_eq!(spec.kv_k_elems_swa, 0);
+        assert_eq!(spec.kv_v_elems_swa, 0);
+        assert_eq!(spec.kv_k_elems_global, 4 * 4 * 256);
+        assert_eq!(spec.kv_v_elems_global, 4 * 4 * 256);
+    }
+
+    #[test]
+    fn parse_gguf_header_gemma2_alternates_swa_without_pattern() {
+        // gemma2 GGUF files declare attention.sliding_window but no pattern;
+        // llama.cpp hardcodes even=SWA / odd=global alternation.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&10u64.to_le_bytes());
+
+        gguf_kv_string(&mut buf, "general.architecture", "gemma2");
+        gguf_kv_u32(&mut buf, "gemma2.block_count", 26);
+        gguf_kv_u32(&mut buf, "gemma2.embedding_length", 2304);
+        gguf_kv_u32(&mut buf, "gemma2.attention.head_count", 8);
+        gguf_kv_u32(&mut buf, "gemma2.attention.head_count_kv", 4);
+        gguf_kv_u32(&mut buf, "gemma2.context_length", 8192);
+        gguf_kv_u32(&mut buf, "gemma2.feed_forward_length", 9216);
+        gguf_kv_u32(&mut buf, "gemma2.attention.key_length", 256);
+        gguf_kv_u32(&mut buf, "gemma2.attention.sliding_window", 4096);
+        gguf_kv_u32(&mut buf, "gemma2.vocab_size", 256000);
+
+        let spec = parse_gguf_header(&buf, "gemma-2-2b-it-q4_k_m.gguf").unwrap();
+        assert_eq!(spec.model_type, "gemma2");
+        assert_eq!(spec.sliding_window, 4096);
+        // 26 layers alternate: 13 SWA (even indices) + 13 global (odd).
+        assert_eq!(spec.kv_k_elems_swa, 13 * 4 * 256);
+        assert_eq!(spec.kv_v_elems_swa, 13 * 4 * 256);
+        assert_eq!(spec.kv_k_elems_global, 13 * 4 * 256);
+        assert_eq!(spec.kv_v_elems_global, 13 * 4 * 256);
+    }
+
+    #[test]
+    fn auto_fit_llamacpp_gemma4_24gb_full_ctx_first() {
+        // User scenario: gemma4-31b Q4 GGUF (16.4 GiB file) on a single 24 GB
+        // GPU, f16 KV, no locks. Policy: full context first — seqs stays 1 and
+        // ctx gets a LARGE value (SWA keeps 50/60 layers window-capped).
+        let m = gemma4_31b();
+        let req = AutoFitRequest {
+            engine: DeployEngine::LlamaCpp,
+            gpu_count: 1,
+            gpu_memory_gb_each: 24.0,
+            kv_cache_dtype: "f16".into(),
+            kv_cache_dtype_v: None,
+            gpu_memory_utilization: 0.9,
+            requested_max_model_len: None,
+            requested_max_num_seqs: None,
+            requested_tensor_parallel: None,
+            requested_pipeline_parallel: None,
+            lock_max_model_len: false,
+            lock_max_num_seqs: false,
+            lock_tensor_parallel: false,
+            weights_bytes_override: Some(17_610_000_000),
+        };
+        let out = auto_fit_config(&m, &req);
+        assert!(out.error.is_none(), "Powinno fits: {:?}", out.error);
+        assert_eq!(
+            out.applied.max_num_seqs, 1,
+            "pelny kontekst przed wspolbieznoscia: seqs=1, got {}",
+            out.applied.max_num_seqs
+        );
+        assert!(
+            out.applied.max_model_len >= 16384,
+            "SWA-aware KV ma dac duzy ctx (>= 16k) na 24 GB, got {}",
+            out.applied.max_model_len
+        );
+        let est = estimate_llamacpp_vram(&m, &out.applied);
+        assert!(est.fits_per_gpu, "Po auto-fit musi fits: {est:?}");
+        println!(
+            "gemma4-31b/24GB f16: ctx={} seqs={} kv={:.2} GiB per_gpu={:.2} GiB",
+            out.applied.max_model_len, out.applied.max_num_seqs, est.kv_cache_gb, est.per_gpu_gb
+        );
+
+        // q8_0 KV: narrower cache -> at least as much context.
+        let mut req_q8 = req.clone();
+        req_q8.kv_cache_dtype = "q8_0".into();
+        let out_q8 = auto_fit_config(&m, &req_q8);
+        assert!(out_q8.error.is_none());
+        assert!(
+            out_q8.applied.max_model_len >= out.applied.max_model_len,
+            "q8_0 KV nie moze dac mniejszego ctx niz f16: {} vs {}",
+            out_q8.applied.max_model_len,
+            out.applied.max_model_len
+        );
+        let est_q8 = estimate_llamacpp_vram(&m, &out_q8.applied);
+        assert!(est_q8.fits_per_gpu, "q8_0 po auto-fit musi fits: {est_q8:?}");
+        println!(
+            "gemma4-31b/24GB q8_0: ctx={} seqs={} kv={:.2} GiB per_gpu={:.2} GiB",
+            out_q8.applied.max_model_len,
+            out_q8.applied.max_num_seqs,
+            est_q8.kv_cache_gb,
+            est_q8.per_gpu_gb
+        );
+    }
+
+    #[test]
+    fn auto_fit_llamacpp_small_model_scales_concurrency_after_full_ctx() {
+        // Small model on a big GPU: the full model window fits at seqs=1, so the
+        // auto-fit scales concurrency up (2,4,...,64) keeping the full context.
+        let m = qwen_05b();
+        let out = auto_fit_config(
+            &m,
+            &AutoFitRequest {
+                engine: DeployEngine::LlamaCpp,
+                gpu_count: 1,
+                gpu_memory_gb_each: 24.0,
+                kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
+                gpu_memory_utilization: 0.9,
+                requested_max_model_len: None,
+                requested_max_num_seqs: None,
+                requested_tensor_parallel: None,
+                requested_pipeline_parallel: None,
+                lock_max_model_len: false,
+                lock_max_num_seqs: false,
+                lock_tensor_parallel: false,
+                weights_bytes_override: None,
+            },
+        );
+        assert!(out.error.is_none(), "Powinno fits: {:?}", out.error);
+        assert_eq!(
+            out.applied.max_model_len, m.max_position_embeddings,
+            "pelne okno modelu (32768), got {}",
+            out.applied.max_model_len
+        );
+        assert!(
+            out.applied.max_num_seqs > 1,
+            "wspolbieznosc skalowana w gore po pelnym ctx: {}",
+            out.applied.max_num_seqs
+        );
+        assert!(
+            out.auto_adjusted.is_empty(),
+            "nic nie bylo obnizone vs request: {:?}",
+            out.auto_adjusted
+        );
+        let est = estimate_llamacpp_vram(&m, &out.applied);
+        assert!(est.fits_per_gpu, "Po auto-fit musi fits: {est:?}");
     }
 }

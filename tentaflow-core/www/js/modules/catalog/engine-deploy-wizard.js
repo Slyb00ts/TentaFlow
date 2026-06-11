@@ -1057,9 +1057,11 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
       ${noFitBanner}
       <div class="adv-kpi-grid" id="edw-adv-kpi">
         <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
-        <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(tAdv('kpi_kv_pool'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_kv_pool_sub', {
+        <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(isLcpp ? tAdv('kpi_kv_total') : tAdv('kpi_kv_pool'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv(isLcpp ? 'kpi_kv_total_sub' : 'kpi_kv_pool_sub', {
           tokens: poolTokens.toLocaleString(),
-          seqs: concurrentSeqs >= 10 ? Math.round(concurrentSeqs).toLocaleString() : concurrentSeqs.toFixed(1),
+          // llama.cpp: whole slots only (-c = ctx × slots); vLLM: fractional pool capacity.
+          seqs: isLcpp ? Math.max(1, Math.round(concurrentSeqs)).toLocaleString()
+            : (concurrentSeqs >= 10 ? Math.round(concurrentSeqs).toLocaleString() : concurrentSeqs.toFixed(1)),
           ctx: (r.max_model_len || 0).toLocaleString(),
         }))}</div></div>
         <div class="adv-kpi"><div class="k-label">${escapeHtml(isLcpp ? tAdv('kpi_compute_buffer') : tAdv('kpi_activations'))}</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(isLcpp ? tAdv('kpi_compute_buffer_sub') : tAdv('kpi_activations_sub'))}</div></div>
@@ -1163,9 +1165,12 @@ function renderAdvancedManualControls(adv, rec) {
   const vramMaxCtx = rec?.max_supported_model_len || 0;
   const ABSOLUTE_MAX = 1_048_576;
   const maxCtx = Math.min(ABSOLUTE_MAX, Math.max(modelMaxCtx, vramMaxCtx, 32768));
-  // Cap suwaka seqs = staly cap schedulera (256). `max_supported_num_seqs` to
-  // teraz INFORMACYJNA wspolbieznosc puli (mala liczba ~9) — nie limit suwaka.
-  const maxSeqs = 256;
+  // Seqs slider cap. vLLM family: fixed scheduler cap 256 (no memory cost).
+  // llama.cpp: each slot reserves a full KV context, so the real cap comes
+  // from the backend (`max_supported_num_seqs`).
+  const seqsCap = isLcpp
+    ? Math.max(1, Math.min(256, Number(rec?.max_supported_num_seqs) || 1))
+    : 256;
 
   // Wartosci pokazywane na sliderach: dla locked param bierzemy z `adv`
   // (user-set), dla pozostalych z `applied` (auto-fit przez backend).
@@ -1178,8 +1183,13 @@ function renderAdvancedManualControls(adv, rec) {
   const pp = adv.pipeline_parallel ?? applied.pipeline_parallel ?? recCfg.pipeline_parallel ?? 1;
   const ctx = valueFor('max_model_len', 8192);
   const seqs = valueFor('max_num_seqs', 16);
-  const kv = adv.kv_cache_dtype || applied.kv_cache_dtype || recCfg.kv_cache_dtype || (isLcpp ? 'f16' : 'auto');
-  const kvV = adv.kv_cache_dtype_v || kv;
+  // Never let the slider clamp a backend-applied value.
+  const maxSeqs = Math.max(seqsCap, Number(seqs) || 1);
+  // llama.cpp has no 'auto' option (its selects list f16..iq4_nl), so normalize
+  // 'auto' to the engine default f16 — otherwise the tf-select renders empty.
+  const normKv = (v) => (isLcpp && v === 'auto') ? 'f16' : v;
+  const kv = normKv(adv.kv_cache_dtype || applied.kv_cache_dtype || recCfg.kv_cache_dtype || (isLcpp ? 'f16' : 'auto'));
+  const kvV = normKv(adv.kv_cache_dtype_v || kv);
   const memUtil = valueFor('gpu_memory_utilization', 0.9);
   const totalGpus = (getAdvancedGpus() || []).length || 1;
 
@@ -1188,7 +1198,11 @@ function renderAdvancedManualControls(adv, rec) {
     if (lockedParam === key) return ''; // locked = user value, never auto-tune
     if (!autoAdjusted.has(key)) return '';
     const fmt = (v) => typeof v === 'number' ? (v >= 1 ? v.toLocaleString() : v.toFixed(2)) : String(v ?? '?');
-    return `<div class="adv-hint adjust-warn">⚙ ${escapeHtml(tAdv('auto_adjusted', { prev: fmt(prevVal), new: fmt(newVal) }))}</div>`;
+    const prevTxt = fmt(prevVal);
+    const newTxt = fmt(newVal);
+    // "Auto-adjusted from X to X" is noise — only show a real delta.
+    if (prevTxt === newTxt) return '';
+    return `<div class="adv-hint adjust-warn">⚙ ${escapeHtml(tAdv('auto_adjusted', { prev: prevTxt, new: newTxt }))}</div>`;
   };
 
   // Helper: lock marker rendered next to the slider label.
@@ -1339,7 +1353,7 @@ function renderAdvancedManualControls(adv, rec) {
       <div class="adv-form-row">
         <label><span>${escapeHtml(tAdv('seqs_label'))} ${lockMark('max_num_seqs')}</span><span class="v" id="edw-adv-seqs-val">${seqs}</span></label>
         <input type="range" class="adv-range" id="edw-adv-seqs" min="1" max="${maxSeqs}" step="1" value="${seqs}">
-        <div class="adv-hint">${escapeHtml(tAdv('seqs_hint'))}</div>
+        <div class="adv-hint">${escapeHtml(isLcpp ? tAdv('seqs_hint_llamacpp') : tAdv('seqs_hint'))}</div>
         ${seqsAdjust}
       </div>
       ${isLcpp ? '' : `
@@ -1457,7 +1471,9 @@ function bindAdvancedHandlers() {
       pipeline_parallel: a.pipeline_parallel || undefined,
       max_model_len: a.max_model_len || undefined,
       max_num_seqs: a.max_num_seqs || undefined,
-      kv_cache_dtype: a.kv_cache_dtype !== 'auto' ? a.kv_cache_dtype : undefined,
+      // llama.cpp default KV type is f16 and the engine emits no flag for it,
+      // so an explicit 'f16' is equivalent to 'auto' on the wire.
+      kv_cache_dtype: (a.kv_cache_dtype !== 'auto' && !(isLcpp && a.kv_cache_dtype === 'f16')) ? a.kv_cache_dtype : undefined,
       gpu_memory_utilization: a.gpu_memory_utilization || undefined,
       lock_max_model_len: lock === 'max_model_len' || undefined,
       lock_max_num_seqs: lock === 'max_num_seqs' || undefined,
