@@ -1081,8 +1081,8 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                 "INSERT INTO agents \
                  (id, name, display_name, description, system_prompt, model, tools_json, \
                   skills_json, params_json, max_iterations, timeout_secs, max_subagents, \
-                  max_spawn_depth, flow_id, routable, is_enabled) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+                  max_spawn_depth, flow_id, routable, is_enabled, on_child_complete) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                  ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, display_name = excluded.display_name, \
                  description = excluded.description, system_prompt = excluded.system_prompt, \
@@ -1091,7 +1091,8 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                  max_iterations = excluded.max_iterations, timeout_secs = excluded.timeout_secs, \
                  max_subagents = excluded.max_subagents, max_spawn_depth = excluded.max_spawn_depth, \
                  flow_id = excluded.flow_id, routable = excluded.routable, \
-                 is_enabled = excluded.is_enabled, updated_at = datetime('now')",
+                 is_enabled = excluded.is_enabled, on_child_complete = excluded.on_child_complete, \
+                 updated_at = datetime('now')",
                 rusqlite::params![
                     id,
                     field_string(operation, "name")?,
@@ -1109,6 +1110,7 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                     field_optional_string(operation, "flow_id")?,
                     field_bool_or(operation, "routable", true)?,
                     field_bool_or(operation, "is_enabled", true)?,
+                    field_string_or(operation, "on_child_complete", "notify")?,
                 ],
             )
             .map_err(sql_error),
@@ -1134,6 +1136,7 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                  flow_id = CASE WHEN ?17 THEN ?18 ELSE flow_id END, \
                  routable = COALESCE(?19, routable), \
                  is_enabled = COALESCE(?20, is_enabled), \
+                 on_child_complete = COALESCE(?21, on_child_complete), \
                  updated_at = datetime('now') \
                  WHERE id = ?1",
                 rusqlite::params![
@@ -1157,6 +1160,7 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                     flow_id.1,
                     optional_present_bool(operation, "routable")?,
                     optional_present_bool(operation, "is_enabled")?,
+                    optional_present_string(operation, "on_child_complete")?,
                 ],
             )
             .map_err(sql_error)

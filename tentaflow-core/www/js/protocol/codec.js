@@ -2245,6 +2245,121 @@ export const encode = {
   },
 
   /**
+   * MessageBody::SkillsBody(HubSearchRequest) — Admin. Search the configured
+   * GitHub taps (or one given source) for importable skills.
+   * payload: { query, source? }
+   */
+  skillsHubSearchRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsHubSearchRequest(
+      String(payload.query ?? ''),
+      payload.source != null && payload.source !== '' ? String(payload.source) : null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::SkillsBody(HubImportRequest) — Admin. Fetch a skill from a
+   * GitHub repo path or a direct SKILL.md URL into quarantine + scan it.
+   * payload: { source, gitRef? }
+   */
+  skillsHubImportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const ref = payload.gitRef ?? payload.git_ref;
+    const body = _wasm.encodeSkillsHubImportRequest(
+      String(payload.source ?? ''),
+      ref != null && ref !== '' ? String(ref) : null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  skillsHubApproveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsHubApproveRequest(String(payload.skillId ?? payload.skill_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  skillsHubRejectRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsHubRejectRequest(String(payload.skillId ?? payload.skill_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::SkillsBody(CuratorRunRequest) — Admin. Run a curator review pass:
+   * the auxiliary model proposes merge/umbrella/archive actions over the skill
+   * index (no mutation). Returns { proposalJson, snapshotId }.
+   */
+  skillsCuratorRunRequest(correlationId, _payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsCuratorRunRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::SkillsBody(CuratorApplyRequest) — Admin. Apply an admin-approved
+   * subset of a curator proposal against its snapshot.
+   * payload: { snapshotId, approvedActions: number[] }
+   */
+  skillsCuratorApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const approved = Array.isArray(payload.approvedActions) ? payload.approvedActions : [];
+    const body = _wasm.encodeSkillsCuratorApplyRequest(
+      String(payload.snapshotId ?? payload.snapshot_id ?? ''),
+      JSON.stringify(approved),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::SkillsBody(CuratorRollbackRequest) — Admin. Restore the captured
+   * pre-apply rows of an applied snapshot.
+   * payload: { snapshotId }
+   */
+  skillsCuratorRollbackRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSkillsCuratorRollbackRequest(
+      String(payload.snapshotId ?? payload.snapshot_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::AgentsBody(ListRequest) — UserSession. Agents registry list
    * with optional enabled/routable filters (booleans or null = no filter).
    * payload: { enabled?, routable? }

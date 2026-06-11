@@ -4879,7 +4879,8 @@ pub async fn scheduler_job_run_now(
 // =============================================================================
 // Skills registry (Harness plan §3.2) — CRUD over the binary protocol.
 // List/Detail are UserSession (Flow Builder reads skills too); writes are
-// Admin-only. Hub import and curator payloads arrive in phase 7.
+// Admin-only. Hub import (quarantine + scan) and the curator (report/apply/
+// rollback) live further down this file.
 // =============================================================================
 
 /// Handler-side shape of `SkillsUpsertRequest.skill_json`. `id` absent =
@@ -5257,6 +5258,464 @@ pub fn skills_fork(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 }
 
 // =============================================================================
+// Skills Hub (Harness plan §3.2 source `hub`) — runtime fetch/install.
+// Import a skill from a public GitHub repo path or a direct SKILL.md URL into
+// quarantine + run a static injection scan; admin approves (→ active) or rejects
+// (→ delete). Every fetch goes through the public-URL SSRF guard. Admin-only.
+// =============================================================================
+
+/// Settings key holding the operator's configured GitHub taps (newline- or
+/// comma-separated `owner/repo`). Unset → built-in defaults.
+const SKILLS_HUB_TAPS_SETTING: &str = "skills_hub_taps";
+
+/// Reference file the hub import is allowed to keep (registry prefixes only).
+fn hub_file_is_keepable(path: &str) -> bool {
+    repository::SKILL_FILE_ALLOWED_PREFIXES
+        .iter()
+        .any(|p| path.starts_with(p) && path.len() > p.len())
+}
+
+/// Derives a registry-valid kebab-case skill name from a frontmatter name or a
+/// source-path fallback, then disambiguates against existing rows by appending a
+/// numeric suffix (names are soft-unique — §3.2). Mirrors fallback_skill_name.
+fn hub_resolve_name(db: &db::DbPool, preferred: &str) -> Result<String, ProtocolError> {
+    let mut base = String::with_capacity(preferred.len());
+    for ch in preferred.chars() {
+        if ch.is_ascii_alphanumeric() {
+            base.push(ch.to_ascii_lowercase());
+        } else if !base.is_empty() && !base.ends_with('-') {
+            base.push('-');
+        }
+    }
+    while base.ends_with('-') {
+        base.pop();
+    }
+    if base.is_empty() {
+        base.push_str("hub-skill");
+    }
+    base.truncate(repository::SKILL_NAME_MAX_CHARS - 4);
+    while base.ends_with('-') {
+        base.pop();
+    }
+    if repository::get_skill_by_name(db, &base)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Ok(base);
+    }
+    for n in 2..=999 {
+        let candidate = format!("{base}-{n}");
+        if repository::get_skill_by_name(db, &candidate)
+            .map_err(db_err)?
+            .is_none()
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(ProtocolError::bad_request(
+        "could not allocate a unique skill name for the import",
+    ))
+}
+
+#[handler(variant = "SkillsHubSearchRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn skills_hub_search(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::HubSearchRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SkillsHubSearchRequest",
+            ));
+        }
+    };
+    let taps_setting = repository::get_setting(&ctx.state.db, SKILLS_HUB_TAPS_SETTING)
+        .map_err(db_err)?;
+    // A `source` override scopes to one tap; otherwise enumerate configured taps.
+    let taps: Vec<String> = match payload.source.as_deref().filter(|s| !s.is_empty()) {
+        Some(src) => vec![src.to_string()],
+        None => crate::skills_hub::resolve_taps(taps_setting.as_deref()),
+    };
+    let query = payload.query.trim().to_lowercase();
+
+    let results = tokio::task::spawn_blocking(move || {
+        crate::skills_hub::search_taps(&taps, &query)
+    })
+    .await
+    .map_err(|e| ProtocolError::internal(format!("hub search task failed: {e}")))?
+    .map_err(|e| ProtocolError::internal(format!("hub search failed: {e}")))?;
+
+    let results_json = serde_json::to_string(&results)
+        .map_err(|e| ProtocolError::internal(format!("hub search encode failed: {e}")))?;
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::HubSearchResponse(
+            tentaflow_protocol::SkillsHubSearchResponse { results_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SkillsHubImportRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn skills_hub_import(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::HubImportRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SkillsHubImportRequest",
+            ));
+        }
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let source = crate::skills_hub::HubSource::parse(&payload.source, payload.git_ref.as_deref())
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    // Network fetch (blocking SSRF-guarded client) off the async runtime thread.
+    let fetched = tokio::task::spawn_blocking({
+        let source = source.clone();
+        move || crate::skills_hub::fetch_skill(&source)
+    })
+    .await
+    .map_err(|e| ProtocolError::internal(format!("hub fetch task failed: {e}")))?
+    .map_err(|e| ProtocolError::bad_request(format!("hub import failed: {e}")))?;
+
+    let parsed = crate::skills_hub::parse_skill_md(&fetched.source_md);
+    // Validate every reference file up front; a non-keepable path (e.g. a stray
+    // scripts/ file that slipped past directory filtering) rejects the import.
+    let mut files: Vec<(String, String)> = Vec::new();
+    for f in &fetched.files {
+        if !hub_file_is_keepable(&f.path) {
+            return Err(ProtocolError::bad_request(format!(
+                "imported reference file '{}' is not under references/ or templates/",
+                f.path
+            )));
+        }
+        repository::validate_skill_file(&f.path, &f.content)
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+        files.push((f.path.clone(), f.content.clone()));
+    }
+
+    let verdict = crate::skills_hub::scan_skill(&parsed.body, &fetched.files);
+
+    let preferred = parsed
+        .name
+        .clone()
+        .unwrap_or_else(|| match &source {
+            crate::skills_hub::HubSource::Github { repo, path, .. } => {
+                if path.is_empty() {
+                    repo.clone()
+                } else {
+                    path.rsplit('/').next().unwrap_or(repo).to_string()
+                }
+            }
+            crate::skills_hub::HubSource::Url(url) => url
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or("hub-skill")
+                .to_string(),
+        });
+    let name = hub_resolve_name(&ctx.state.db, &preferred)?;
+    let description = parsed
+        .description
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| format!("Imported from {}", source.provenance()));
+    let description: String = description
+        .chars()
+        .take(repository::SKILL_DESCRIPTION_MAX_CHARS)
+        .collect();
+    let content: String = parsed
+        .body
+        .chars()
+        .take(repository::SKILL_CONTENT_MAX_CHARS)
+        .collect();
+    let tags_json = serde_json::to_string(&parsed.tags)
+        .map_err(|e| ProtocolError::internal(format!("hub tags encode failed: {e}")))?;
+    let provenance = source.provenance();
+    let skill_id = uuid::Uuid::new_v4().to_string();
+    let params = db::models::SkillParams {
+        id: &skill_id,
+        name: &name,
+        display_name: parsed.name.as_deref(),
+        description: &description,
+        content: &content,
+        tags_json: &tags_json,
+        category: None,
+        source: "hub",
+        source_ref: Some(&provenance),
+        status: "quarantine",
+        created_by: Some(&user_id),
+        actor_user_id: Some(&user_id),
+    };
+    repository::validate_skill_params(&params)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    repository::upsert_skill(&ctx.state.db, &params).map_err(db_err)?;
+    if !files.is_empty() {
+        repository::replace_skill_files(&ctx.state.db, &skill_id, &files, Some(&user_id))
+            .map_err(db_err)?;
+    }
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "skill.hub_import",
+        Some(&format!("skill:{skill_id}")),
+        Some(&format!(
+            "{provenance} → quarantine ({} finding(s))",
+            verdict.findings.len()
+        )),
+    );
+
+    let verdict_json = serde_json::to_string(&verdict)
+        .map_err(|e| ProtocolError::internal(format!("verdict encode failed: {e}")))?;
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::HubImportResponse(
+            tentaflow_protocol::SkillsHubImportResponse {
+                skill_id,
+                verdict_json,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "SkillsHubApproveRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn skills_hub_approve(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::HubApproveRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SkillsHubApproveRequest",
+            ));
+        }
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let skill = repository::get_skill(&ctx.state.db, &payload.skill_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("skill not found: {}", payload.skill_id))
+        })?;
+    if skill.source != "hub" {
+        return Err(ProtocolError::bad_request(
+            "approve only applies to imported hub skills",
+        ));
+    }
+    if skill.status != "quarantine" {
+        return Err(ProtocolError::bad_request(
+            "skill is not awaiting approval (status is not quarantine)",
+        ));
+    }
+    // Flip quarantine → active in place, preserving every other field (provenance,
+    // tags, content). Goes through the same upsert capture so the activation
+    // replicates fleet-wide.
+    let params = db::models::SkillParams {
+        id: &skill.id,
+        name: &skill.name,
+        display_name: skill.display_name.as_deref(),
+        description: &skill.description,
+        content: &skill.content,
+        tags_json: &skill.tags_json,
+        category: skill.category.as_deref(),
+        source: &skill.source,
+        source_ref: skill.source_ref.as_deref(),
+        status: "active",
+        created_by: skill.created_by.as_deref(),
+        actor_user_id: Some(&user_id),
+    };
+    repository::upsert_skill(&ctx.state.db, &params).map_err(db_err)?;
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "skill.hub_approve",
+        Some(&format!("skill:{}", skill.id)),
+        Some(&format!(
+            "{} → active",
+            skill.source_ref.as_deref().unwrap_or(&skill.name)
+        )),
+    );
+
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::HubApproveResponse(
+            tentaflow_protocol::SkillsHubApproveResponse { approved: true },
+        ),
+    ))
+}
+
+#[handler(variant = "SkillsHubRejectRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn skills_hub_reject(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::HubRejectRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SkillsHubRejectRequest",
+            ));
+        }
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let skill = repository::get_skill(&ctx.state.db, &payload.skill_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("skill not found: {}", payload.skill_id))
+        })?;
+    if skill.source != "hub" || skill.status != "quarantine" {
+        return Err(ProtocolError::bad_request(
+            "reject only applies to quarantined hub skills",
+        ));
+    }
+    let rejected = repository::delete_skill(&ctx.state.db, &payload.skill_id).map_err(db_err)?;
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "skill.hub_reject",
+        Some(&format!("skill:{}", payload.skill_id)),
+        Some(skill.source_ref.as_deref().unwrap_or(&skill.name)),
+    );
+
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::HubRejectResponse(
+            tentaflow_protocol::SkillsHubRejectResponse { rejected },
+        ),
+    ))
+}
+
+// =============================================================================
+// Skills curator (Harness plan §3.2) — report-then-apply collection maintenance.
+// Run produces a structured merge/umbrella/archive proposal (no mutation) anchored
+// to a reversible snapshot; apply executes an admin-approved subset; rollback
+// restores the captured pre-apply rows. The review LLM call goes through the
+// router (auxiliary model). All Admin-only.
+// =============================================================================
+
+#[handler(variant = "SkillsCuratorRunRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn skills_curator_run(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorRunRequest(_)) => {}
+        _ => {
+            return Err(ProtocolError::bad_request("expected SkillsCuratorRunRequest"));
+        }
+    }
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let model = crate::skills::resolve_model(&ctx.state.db);
+    let router = ctx.state.router.clone();
+    let call_model = model.clone();
+    let outcome = crate::skills::run_curator_review(&ctx.state.db, Some(&user_id), &model, move |prompt| {
+        Box::pin(async move { crate::skills::router_complete(&router, &call_model, prompt).await })
+    })
+    .await
+    .map_err(|e| ProtocolError::internal(format!("curator review failed: {e}")))?;
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "skill.curator_run",
+        Some(&format!("snapshot:{}", outcome.snapshot_id)),
+        Some(&format!("{} proposed action(s)", outcome.proposal.actions.len())),
+    );
+
+    let proposal_json = serde_json::to_string(&outcome.proposal)
+        .map_err(|e| ProtocolError::internal(format!("proposal encode failed: {e}")))?;
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::CuratorRunResponse(
+            tentaflow_protocol::SkillsCuratorRunResponse {
+                proposal_json,
+                snapshot_id: outcome.snapshot_id,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "SkillsCuratorApplyRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn skills_curator_apply(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorApplyRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request("expected SkillsCuratorApplyRequest"));
+        }
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let approved: Vec<usize> = serde_json::from_str(&payload.approved_actions_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid approved_actions json: {e}")))?;
+    // Per-mutation audit entries are emitted by the curator through this closure so
+    // every archive/merge/umbrella records its own `audit_log` row (§3.2). Borrowed
+    // (not moved) so `user_id` is still available as the apply's actor argument.
+    let audit_fn = |event_kind: &str, resource: Option<&str>, message: Option<&str>| {
+        audit(ctx, Some(&user_id), event_kind, resource, message);
+    };
+    let mutated = crate::skills::apply_proposal(
+        &ctx.state.db,
+        &payload.snapshot_id,
+        &approved,
+        Some(&user_id),
+        &audit_fn,
+    )
+    .map_err(|e| ProtocolError::bad_request(format!("curator apply failed: {e}")))?;
+
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::CuratorApplyResponse(
+            tentaflow_protocol::SkillsCuratorApplyResponse {
+                mutated: mutated as u32,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "SkillsCuratorRollbackRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn skills_curator_rollback(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorRollbackRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request("expected SkillsCuratorRollbackRequest"));
+        }
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let audit_fn = |event_kind: &str, resource: Option<&str>, message: Option<&str>| {
+        audit(ctx, Some(&user_id), event_kind, resource, message);
+    };
+    let restored =
+        crate::skills::rollback_snapshot(&ctx.state.db, &payload.snapshot_id, Some(&user_id), &audit_fn)
+            .map_err(|e| ProtocolError::bad_request(format!("curator rollback failed: {e}")))?;
+
+    Ok(MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::CuratorRollbackResponse(
+            tentaflow_protocol::SkillsCuratorRollbackResponse {
+                restored: restored as u32,
+            },
+        ),
+    ))
+}
+
+// =============================================================================
 // Agents registry (Harness plan §3.3)
 // =============================================================================
 
@@ -5292,6 +5751,11 @@ struct AgentUpsertInput {
     routable: bool,
     #[serde(default = "default_true")]
     is_enabled: bool,
+    /// `notify` (default) | `continue` — autonomous parent continuation on child
+    /// completion (Harness §3.6 level 3). Admin-only to set (this handler is
+    /// already #[policy(Admin)]); validated against the allowed set on upsert.
+    #[serde(default = "default_on_child_complete")]
+    on_child_complete: String,
 }
 
 fn default_skills_selection() -> serde_json::Value {
@@ -5311,6 +5775,9 @@ fn default_max_spawn_depth() -> i64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_on_child_complete() -> String {
+    "notify".to_string()
 }
 
 /// List projection of `DbAgent` — the columns the list screen renders plus the
@@ -5531,6 +5998,7 @@ pub fn agents_upsert(
         flow_id,
         routable: input.routable,
         is_enabled: input.is_enabled,
+        on_child_complete: &input.on_child_complete,
         actor_user_id: Some(&user_id),
     };
     repository::validate_agent_params(&params)

@@ -19,6 +19,8 @@ import '/js/components/tf-searchbox.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-empty-state.js';
+import '/js/components/tf-tabs.js';
+import '/js/components/tf-checkbox.js';
 
 // Limits mirror db::repository SKILL_* constants so violations surface inline
 // instead of as backend bad_request round-trips.
@@ -40,6 +42,14 @@ const state = {
   tagFilter: 'all',
   editor: null,
   forkWin: null,
+  topTab: 'registry',
+  hubResults: [],
+  hubBusy: false,
+  curatorBusy: false,
+  curatorProposal: null,
+  curatorSnapshotId: null,
+  curatorApproved: new Set(),
+  curatorAppliedSnapshotId: null,
 };
 
 function sprite(id) {
@@ -62,22 +72,57 @@ const SkillsScreen = {
         </div>
       </div>
 
-      <section class="card skills-card">
-        <div class="skills-toolbar">
-          <tf-searchbox id="skills-search" placeholder="${escapeAttr(I18n.t('skills.search_placeholder'))}" debounce="200"></tf-searchbox>
-          <tf-select id="skills-filter-source" class="skills-filter" value="all">
-            <option value="all">${escapeHtml(I18n.t('skills.filter_source_all'))}</option>
-            ${SOURCE_VALUES.map((s) => `<option value="${escapeAttr(s)}">${escapeHtml(sourceLabel(s))}</option>`).join('')}
-          </tf-select>
-          <span id="skills-filter-tag-slot"></span>
-        </div>
-        <div id="skills-table-host" class="skills-table-host"></div>
-      </section>
+      <tf-tabs variant="underline" value="registry" id="skills-top-tabs">
+        <tf-tab id="registry" icon="sparkle">${escapeHtml(I18n.t('skills.tab_registry'))}</tf-tab>
+        <tf-tab id="hub" icon="download">${escapeHtml(I18n.t('skills.tab_hub'))}</tf-tab>
+        <tf-tab id="curator" icon="cluster">${escapeHtml(I18n.t('skills.tab_curator'))}</tf-tab>
+      </tf-tabs>
+
+      <div class="skills-top-panel" data-top-panel="registry">
+        <section class="card skills-card">
+          <div class="skills-toolbar">
+            <tf-searchbox id="skills-search" placeholder="${escapeAttr(I18n.t('skills.search_placeholder'))}" debounce="200"></tf-searchbox>
+            <tf-select id="skills-filter-source" class="skills-filter" value="all">
+              <option value="all">${escapeHtml(I18n.t('skills.filter_source_all'))}</option>
+              ${SOURCE_VALUES.map((s) => `<option value="${escapeAttr(s)}">${escapeHtml(sourceLabel(s))}</option>`).join('')}
+            </tf-select>
+            <span id="skills-filter-tag-slot"></span>
+          </div>
+          <div id="skills-table-host" class="skills-table-host"></div>
+        </section>
+      </div>
+
+      <div class="skills-top-panel" data-top-panel="hub" hidden>
+        <section class="card skills-card">
+          <div class="skills-toolbar">
+            <tf-searchbox id="hub-search" placeholder="${escapeAttr(I18n.t('skills.hub.search_placeholder'))}" debounce="0"></tf-searchbox>
+            <tf-input id="hub-source" placeholder="${escapeAttr(I18n.t('skills.hub.source_placeholder'))}"></tf-input>
+            <tf-button variant="primary" icon="search" id="hub-search-btn">${escapeHtml(I18n.t('skills.hub.search_action'))}</tf-button>
+            <tf-button variant="ghost" icon="download" id="hub-import-direct">${escapeHtml(I18n.t('skills.hub.import_direct'))}</tf-button>
+          </div>
+          <div class="skills-hub-hint">${escapeHtml(I18n.t('skills.hub.hint'))}</div>
+          <div id="hub-results-host" class="skills-table-host"></div>
+        </section>
+      </div>
+
+      <div class="skills-top-panel" data-top-panel="curator" hidden>
+        <section class="card skills-card">
+          <div class="skills-toolbar">
+            <tf-button variant="primary" icon="cluster" id="curator-run">${escapeHtml(I18n.t('skills.curator.run_action'))}</tf-button>
+            <tf-button variant="ghost" icon="rotate" id="curator-rollback" disabled>${escapeHtml(I18n.t('skills.curator.rollback_action'))}</tf-button>
+          </div>
+          <div class="skills-hub-hint">${escapeHtml(I18n.t('skills.curator.hint'))}</div>
+          <div id="curator-host" class="skills-table-host"></div>
+        </section>
+      </div>
     `;
   },
 
   async mount() {
-    byId('skills-refresh')?.addEventListener('click', () => loadSkills());
+    byId('skills-refresh')?.addEventListener('click', () => {
+      if (state.topTab === 'hub') runHubSearch();
+      else loadSkills();
+    });
     byId('skills-new')?.addEventListener('click', () => openSkillEditor(null));
     byId('skills-search')?.addEventListener('search', (e) => {
       state.searchQuery = String(e.detail?.value ?? '');
@@ -87,7 +132,17 @@ const SkillsScreen = {
       state.sourceFilter = e.detail?.value ?? e.target.value ?? 'all';
       renderTable();
     });
+    byId('skills-top-tabs')?.addEventListener('change', (e) => {
+      const id = e.detail?.value;
+      if (id) switchTopTab(id);
+    });
+    byId('hub-search-btn')?.addEventListener('click', () => runHubSearch());
+    byId('hub-search')?.addEventListener('search', () => runHubSearch());
+    byId('hub-import-direct')?.addEventListener('click', () => importDirectFromSource());
+    byId('curator-run')?.addEventListener('click', () => runCuratorReview());
+    byId('curator-rollback')?.addEventListener('click', () => rollbackCurator());
     renderTagFilter();
+    renderCurator();
     await loadSkills();
   },
 
@@ -99,8 +154,25 @@ const SkillsScreen = {
     state.searchQuery = '';
     state.sourceFilter = 'all';
     state.tagFilter = 'all';
+    state.topTab = 'registry';
+    state.hubResults = [];
+    state.hubBusy = false;
+    state.curatorBusy = false;
+    state.curatorProposal = null;
+    state.curatorSnapshotId = null;
+    state.curatorApproved = new Set();
+    state.curatorAppliedSnapshotId = null;
   },
 };
+
+const TOP_TABS = ['registry', 'hub', 'curator'];
+
+function switchTopTab(tabId) {
+  state.topTab = TOP_TABS.includes(tabId) ? tabId : 'registry';
+  document.querySelectorAll('.skills-top-panel').forEach((panel) => {
+    panel.hidden = panel.getAttribute('data-top-panel') !== state.topTab;
+  });
+}
 
 export default SkillsScreen;
 
@@ -654,4 +726,327 @@ function openForkDialog(skill) {
       forkError(`${I18n.t('skills.fork_failed')}: ${err.message}`);
     }
   });
+}
+
+// =============================================================================
+// Hub (Harness plan §3.2 source `hub`) — search a tap, import → quarantine +
+// scan verdict, admin approve/reject.
+// =============================================================================
+
+async function runHubSearch() {
+  if (state.hubBusy) return;
+  const query = (byId('hub-search')?.value || '').trim();
+  const source = (byId('hub-source')?.value || '').trim();
+  state.hubBusy = true;
+  renderHubResults(true);
+  try {
+    const resp = await ApiBinary.one('skillsHubSearchRequest', {
+      query,
+      source: source || undefined,
+    });
+    const rows = JSON.parse(resp.resultsJson ?? resp.results_json ?? '[]');
+    state.hubResults = Array.isArray(rows) ? rows : [];
+    renderHubResults(false);
+  } catch (err) {
+    toast(`${I18n.t('skills.hub.search_failed')}: ${err.message}`, 'error');
+    renderHubResults(false);
+  } finally {
+    state.hubBusy = false;
+  }
+}
+
+function renderHubResults(busy) {
+  const host = byId('hub-results-host');
+  if (!host) return;
+  if (busy) {
+    host.innerHTML = `<tf-empty-state icon="download" title="${escapeAttr(I18n.t('skills.hub.searching'))}"></tf-empty-state>`;
+    return;
+  }
+  if (!state.hubResults.length) {
+    host.innerHTML = `<tf-empty-state icon="download" title="${escapeAttr(I18n.t('skills.hub.empty'))}" message="${escapeAttr(I18n.t('skills.hub.empty_hint'))}"></tf-empty-state>`;
+    return;
+  }
+  host.innerHTML = `
+    <tf-table id="hub-table">
+      <tf-column key="name" label="${escapeAttr(I18n.t('skills.col_name'))}"></tf-column>
+      <tf-column key="description" label="${escapeAttr(I18n.t('skills.label_description'))}"></tf-column>
+      <tf-column key="tags" label="${escapeAttr(I18n.t('skills.col_tags'))}" renderer="html"></tf-column>
+      <tf-column key="source" label="${escapeAttr(I18n.t('skills.col_source'))}"></tf-column>
+    </tf-table>
+  `;
+  const table = byId('hub-table');
+  table.rows = state.hubResults.map((r, i) => ({
+    _idx: i,
+    name: r.name || '',
+    description: r.description || '',
+    tags: (Array.isArray(r.tags) ? r.tags : [])
+      .map((t) => `<span class="tf-chip info" style="margin: 1px 2px;">${escapeHtml(t)}</span>`)
+      .join(''),
+    source: r.source || '',
+  }));
+  table.rowActions = (row) => {
+    const wrap = document.createElement('div');
+    wrap.style.display = 'flex';
+    wrap.style.justifyContent = 'flex-end';
+    const imp = document.createElement('tf-button');
+    imp.setAttribute('variant', 'primary');
+    imp.setAttribute('size', 'sm');
+    imp.textContent = I18n.t('skills.hub.import_action');
+    imp.addEventListener('click', () => {
+      const result = state.hubResults[row._idx];
+      if (result) importFromSource(result.source);
+    });
+    wrap.appendChild(imp);
+    return wrap;
+  };
+}
+
+async function importDirectFromSource() {
+  const source = (byId('hub-source')?.value || '').trim();
+  if (!source) {
+    toast(I18n.t('skills.hub.source_required'), 'error');
+    return;
+  }
+  importFromSource(source);
+}
+
+async function importFromSource(source) {
+  if (state.hubBusy) return;
+  state.hubBusy = true;
+  try {
+    const resp = await ApiBinary.one('skillsHubImportRequest', { source });
+    const skillId = resp.skillId ?? resp.skill_id;
+    const verdict = JSON.parse(resp.verdictJson ?? resp.verdict_json ?? '{"clean":true,"findings":[]}');
+    toast(I18n.t('skills.hub.import_ok'), 'success');
+    await loadSkills();
+    openVerdictModal(skillId, source, verdict);
+  } catch (err) {
+    toast(`${I18n.t('skills.hub.import_failed')}: ${err.message}`, 'error');
+  } finally {
+    state.hubBusy = false;
+  }
+}
+
+function findingSeverityChip(severity) {
+  if (severity === 'critical') return 'err';
+  if (severity === 'high') return 'warn';
+  return 'info';
+}
+
+function openVerdictModal(skillId, source, verdict) {
+  const findings = Array.isArray(verdict.findings) ? verdict.findings : [];
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', I18n.t('skills.hub.verdict_title'));
+  win.setAttribute('icon', 'download');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('width', '640');
+  win.setAttribute('draggable', '');
+
+  const body = document.createElement('div');
+  body.slot = 'body';
+  const verdictLine = verdict.clean
+    ? `<div class="tf-chip ok">${escapeHtml(I18n.t('skills.hub.verdict_clean'))}</div>`
+    : `<div class="tf-chip ${findings.some((f) => f.severity === 'critical') ? 'err' : 'warn'}">${escapeHtml(I18n.t('skills.hub.verdict_flagged', { count: findings.length }))}</div>`;
+  const findingsHtml = findings.length
+    ? `<ul class="skills-hub-findings">${findings
+        .map(
+          (f) => `<li>
+            <span class="tf-chip ${findingSeverityChip(f.severity)}">${escapeHtml(f.severity || '')}</span>
+            <strong>${escapeHtml(f.pattern_id || '')}</strong>
+            <span class="muted">${escapeHtml(f.file || '')}:${escapeHtml(String(f.line ?? ''))}</span>
+            <div>${escapeHtml(f.description || '')}</div>
+            <code>${escapeHtml(f.snippet || '')}</code>
+          </li>`,
+        )
+        .join('')}</ul>`
+    : `<p class="muted">${escapeHtml(I18n.t('skills.hub.no_findings'))}</p>`;
+  body.innerHTML = `
+    <p class="muted">${escapeHtml(I18n.t('skills.hub.verdict_source', { source }))}</p>
+    ${verdictLine}
+    ${findingsHtml}
+  `;
+  win.appendChild(body);
+
+  const foot = document.createElement('div');
+  foot.slot = 'footer';
+  foot.innerHTML = `
+    <tf-button variant="danger" data-action="reject">${escapeHtml(I18n.t('skills.hub.reject_action'))}</tf-button>
+    <tf-button variant="primary" data-action="approve">${escapeHtml(I18n.t('skills.hub.approve_action'))}</tf-button>
+  `;
+  win.appendChild(foot);
+
+  document.body.appendChild(win);
+
+  foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    try {
+      if (btn.dataset.action === 'approve') {
+        await ApiBinary.one('skillsHubApproveRequest', { skillId });
+        toast(I18n.t('skills.hub.approve_ok'), 'success');
+      } else {
+        await ApiBinary.one('skillsHubRejectRequest', { skillId });
+        toast(I18n.t('skills.hub.reject_ok'), 'success');
+      }
+      win.close(true);
+      await loadSkills();
+    } catch (err) {
+      toast(`${I18n.t('skills.hub.action_failed')}: ${err.message}`, 'error');
+    }
+  });
+}
+
+// =============================================================================
+// Curator (Harness plan §3.2) — run a review pass (auxiliary LLM proposes
+// merge/umbrella/archive actions, no mutation), approve a subset, apply against
+// the snapshot, optionally roll back the last apply.
+// =============================================================================
+
+async function runCuratorReview() {
+  if (state.curatorBusy) return;
+  state.curatorBusy = true;
+  renderCurator();
+  try {
+    const resp = await ApiBinary.one('skillsCuratorRunRequest', {});
+    const proposal = JSON.parse(resp.proposalJson ?? resp.proposal_json ?? '{"actions":[]}');
+    state.curatorProposal = Array.isArray(proposal.actions) ? proposal : { actions: [] };
+    state.curatorSnapshotId = resp.snapshotId ?? resp.snapshot_id ?? null;
+    state.curatorApproved = new Set(state.curatorProposal.actions.map((_, i) => i));
+    state.curatorAppliedSnapshotId = null;
+  } catch (err) {
+    toast(`${I18n.t('skills.curator.run_failed')}: ${err.message}`, 'error');
+  } finally {
+    state.curatorBusy = false;
+    renderCurator();
+  }
+}
+
+async function applyCurator() {
+  if (state.curatorBusy || !state.curatorSnapshotId) return;
+  const approved = [...state.curatorApproved].sort((a, b) => a - b);
+  if (!approved.length) {
+    toast(I18n.t('skills.curator.none_selected'), 'error');
+    return;
+  }
+  state.curatorBusy = true;
+  renderCurator();
+  try {
+    const resp = await ApiBinary.one('skillsCuratorApplyRequest', {
+      snapshotId: state.curatorSnapshotId,
+      approvedActions: approved,
+    });
+    const mutated = Number(resp.mutated ?? 0);
+    toast(I18n.t('skills.curator.apply_ok', { count: mutated }), 'success');
+    state.curatorAppliedSnapshotId = state.curatorSnapshotId;
+    state.curatorProposal = null;
+    state.curatorSnapshotId = null;
+    state.curatorApproved = new Set();
+    await loadSkills();
+  } catch (err) {
+    toast(`${I18n.t('skills.curator.apply_failed')}: ${err.message}`, 'error');
+  } finally {
+    state.curatorBusy = false;
+    renderCurator();
+  }
+}
+
+async function rollbackCurator() {
+  if (state.curatorBusy || !state.curatorAppliedSnapshotId) return;
+  state.curatorBusy = true;
+  renderCurator();
+  try {
+    const resp = await ApiBinary.one('skillsCuratorRollbackRequest', {
+      snapshotId: state.curatorAppliedSnapshotId,
+    });
+    const restored = Number(resp.restored ?? 0);
+    toast(I18n.t('skills.curator.rollback_ok', { count: restored }), 'success');
+    state.curatorAppliedSnapshotId = null;
+    await loadSkills();
+  } catch (err) {
+    toast(`${I18n.t('skills.curator.rollback_failed')}: ${err.message}`, 'error');
+  } finally {
+    state.curatorBusy = false;
+    renderCurator();
+  }
+}
+
+function curatorActionLabel(kind) {
+  const key = `skills.curator.action_${kind}`;
+  const label = I18n.t(key);
+  return label === key ? kind : label;
+}
+
+function renderCurator() {
+  const runBtn = byId('curator-run');
+  if (runBtn) runBtn.toggleAttribute('disabled', state.curatorBusy);
+  const rollbackBtn = byId('curator-rollback');
+  if (rollbackBtn) {
+    rollbackBtn.toggleAttribute('disabled', state.curatorBusy || !state.curatorAppliedSnapshotId);
+  }
+
+  const host = byId('curator-host');
+  if (!host) return;
+
+  if (state.curatorBusy && !state.curatorProposal) {
+    host.innerHTML = `<tf-empty-state icon="cluster" title="${escapeAttr(I18n.t('skills.curator.running'))}"></tf-empty-state>`;
+    return;
+  }
+  if (!state.curatorProposal) {
+    host.innerHTML = `<tf-empty-state icon="cluster" title="${escapeAttr(I18n.t('skills.curator.empty'))}" message="${escapeAttr(I18n.t('skills.curator.empty_hint'))}"></tf-empty-state>`;
+    return;
+  }
+  const actions = state.curatorProposal.actions;
+  if (!actions.length) {
+    host.innerHTML = `<tf-empty-state icon="check" title="${escapeAttr(I18n.t('skills.curator.nothing'))}" message="${escapeAttr(I18n.t('skills.curator.nothing_hint'))}"></tf-empty-state>`;
+    return;
+  }
+
+  const skillNameById = new Map(state.skills.map((s) => [s.id, s.name]));
+  const rows = actions
+    .map((action, idx) => {
+      const members = (Array.isArray(action.skill_ids) ? action.skill_ids : [])
+        .map((id) => escapeHtml(skillNameById.get(id) || id))
+        .map((n) => `<span class="tf-chip info" style="margin: 1px 2px;">${n}</span>`)
+        .join('');
+      const target = action.target_name
+        ? `<span class="tf-chip ok" style="margin: 1px 2px;">${escapeHtml(action.target_name)}</span>`
+        : '<span class="muted">—</span>';
+      const checked = state.curatorApproved.has(idx) ? 'checked' : '';
+      return `
+        <tr>
+          <td><tf-checkbox data-action-idx="${idx}" ${checked} ${state.curatorBusy ? 'disabled' : ''}></tf-checkbox></td>
+          <td><span class="tf-chip accent">${escapeHtml(curatorActionLabel(action.action))}</span></td>
+          <td>${members || '<span class="muted">—</span>'}</td>
+          <td>${target}</td>
+          <td>${escapeHtml(action.rationale || '')}</td>
+        </tr>`;
+    })
+    .join('');
+
+  host.innerHTML = `
+    <table class="skills-curator-table">
+      <thead>
+        <tr>
+          <th>${escapeHtml(I18n.t('skills.curator.col_approve'))}</th>
+          <th>${escapeHtml(I18n.t('skills.curator.col_action'))}</th>
+          <th>${escapeHtml(I18n.t('skills.curator.col_members'))}</th>
+          <th>${escapeHtml(I18n.t('skills.curator.col_target'))}</th>
+          <th>${escapeHtml(I18n.t('skills.curator.col_rationale'))}</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="skills-curator-foot">
+      <tf-button variant="primary" id="curator-apply" ${state.curatorBusy ? 'disabled' : ''}>${escapeHtml(I18n.t('skills.curator.apply_action'))}</tf-button>
+    </div>
+  `;
+
+  host.querySelectorAll('tf-checkbox[data-action-idx]').forEach((cb) => {
+    cb.addEventListener('change', (e) => {
+      const idx = Number(cb.getAttribute('data-action-idx'));
+      if (e.detail?.checked) state.curatorApproved.add(idx);
+      else state.curatorApproved.delete(idx);
+    });
+  });
+  byId('curator-apply')?.addEventListener('click', () => applyCurator());
 }

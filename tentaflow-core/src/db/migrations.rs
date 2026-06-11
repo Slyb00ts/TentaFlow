@@ -377,6 +377,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "flow_executions_parent_execution_id",
             MigrationStep::Sql(FLOW_EXECUTIONS_PARENT_EXECUTION_ID),
         ),
+        (
+            68,
+            "agent_mailbox_and_auto_continuation",
+            MigrationStep::Sql(AGENT_MAILBOX_AND_AUTO_CONTINUATION),
+        ),
+        (
+            69,
+            "skills_curator_snapshots",
+            MigrationStep::Sql(SKILLS_CURATOR_SNAPSHOTS),
+        ),
     ]
 }
 
@@ -487,6 +497,82 @@ CREATE INDEX idx_agents_enabled ON agents(is_enabled);
 CREATE INDEX idx_agent_runs_agent ON agent_runs(agent_id);
 CREATE INDEX idx_agent_runs_status ON agent_runs(status);
 CREATE INDEX idx_agent_runs_parent ON agent_runs(parent_run_id);
+";
+
+// Mailbox + auto-continuation (Harness §3.6 levels 2 & 3, Codex V2 pattern).
+//
+// `agent_mailbox`: when a background CHILD run settles and it knows the context
+// that spawned it (a chat session and/or a parent agent), the manager enqueues
+// the child's final answer here. The next time `agent_context` primes a run for
+// that session/agent it drains the undelivered rows into the model context
+// ("a delegated task finished with result: ...") and stamps `delivered_at`.
+// `run_id` is the finished child run. Undelivered rows survive a restart
+// (SQLite) — that is the whole point of the mailbox over the transient event.
+// Runtime state, never synced (like `agent_runs`); retention rides the existing
+// `agent_runs` retention scope (the periodic purge redacts both past term).
+//
+// `agents.on_child_complete`: opt-in autonomous continuation. `notify` (default)
+// = phase-6 behavior (enqueue mailbox + emit event). `continue` = the child's
+// completion starts a NEW parent run with the child result as input (Ralph
+// style); it counts toward concurrency + depth caps like any run, so a mutual
+// continuation loop dies on the limits. Admin-only to set (the agents upsert
+// handler is already #[policy(Admin)]); the CHECK keeps the column to the two
+// known values fleet-wide.
+const AGENT_MAILBOX_AND_AUTO_CONTINUATION: &str = "
+ALTER TABLE agents ADD COLUMN on_child_complete TEXT NOT NULL DEFAULT 'notify'
+    CHECK(on_child_complete IN ('notify','continue'));
+
+CREATE TABLE agent_mailbox (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    target_session_id TEXT,
+    target_agent_id TEXT,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    delivered_at TEXT
+);
+CREATE INDEX idx_agent_mailbox_session ON agent_mailbox(target_session_id, delivered_at);
+CREATE INDEX idx_agent_mailbox_agent ON agent_mailbox(target_agent_id, delivered_at);
+";
+
+// Skills curator (Harness plan §3.2 — grouping/umbrella mechanism). The curator
+// is a report-then-apply maintenance pass: an LLM proposes merge/umbrella/archive
+// actions over the skill index, an admin approves a subset, and apply mutates the
+// `skills` table. Apply is reversible: before any mutation we snapshot the exact
+// pre-apply rows of every skill the proposal touches into `skill_curator_snapshots`.
+// Rollback restores those rows verbatim. Both tables are node-local runtime state
+// (a maintenance audit trail, not synced) — the resulting skill mutations replicate
+// fleet-wide through the normal `skills` sync capture, the snapshot rows do not.
+const SKILLS_CURATOR_SNAPSHOTS: &str = "
+CREATE TABLE skill_curator_snapshots (
+    id TEXT PRIMARY KEY,
+    proposal_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK(status IN ('open','applied','rolled_back')),
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    applied_at TEXT,
+    rolled_back_at TEXT
+);
+
+CREATE TABLE skill_curator_snapshot_rows (
+    snapshot_id TEXT NOT NULL REFERENCES skill_curator_snapshots(id) ON DELETE CASCADE,
+    skill_id TEXT NOT NULL,
+    existed INTEGER NOT NULL,
+    name TEXT,
+    display_name TEXT,
+    description TEXT,
+    content TEXT,
+    tags_json TEXT,
+    category TEXT,
+    source TEXT,
+    source_ref TEXT,
+    status TEXT,
+    files_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (snapshot_id, skill_id)
+);
+
+CREATE INDEX idx_skill_curator_snapshots_status ON skill_curator_snapshots(status, created_at);
 ";
 
 // Multi-instance addons: split the single `addons.addon_id` identity into a

@@ -1555,6 +1555,88 @@ pub fn encode_skills_fork_request(skill_id: String, new_name: String) -> Result<
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeSkillsHubSearchRequest)]
+pub fn encode_skills_hub_search_request(
+    query: String,
+    source: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::HubSearchRequest(
+            tentaflow_protocol::SkillsHubSearchRequest { query, source },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsHubImportRequest)]
+pub fn encode_skills_hub_import_request(
+    source: String,
+    git_ref: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::HubImportRequest(
+            tentaflow_protocol::SkillsHubImportRequest { source, git_ref },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsHubApproveRequest)]
+pub fn encode_skills_hub_approve_request(skill_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::HubApproveRequest(
+            tentaflow_protocol::SkillsHubApproveRequest { skill_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsHubRejectRequest)]
+pub fn encode_skills_hub_reject_request(skill_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::HubRejectRequest(
+            tentaflow_protocol::SkillsHubRejectRequest { skill_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsCuratorRunRequest)]
+pub fn encode_skills_curator_run_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::CuratorRunRequest(
+            tentaflow_protocol::SkillsCuratorRunRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsCuratorApplyRequest)]
+pub fn encode_skills_curator_apply_request(
+    snapshot_id: String,
+    approved_actions_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::CuratorApplyRequest(
+            tentaflow_protocol::SkillsCuratorApplyRequest {
+                snapshot_id,
+                approved_actions_json,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSkillsCuratorRollbackRequest)]
+pub fn encode_skills_curator_rollback_request(snapshot_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SkillsBody(
+        tentaflow_protocol::SkillsPayload::CuratorRollbackRequest(
+            tentaflow_protocol::SkillsCuratorRollbackRequest { snapshot_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeAgentsListRequest)]
 pub fn encode_agents_list_request(
     enabled: Option<bool>,
@@ -4130,6 +4212,77 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "SkillsForkResponse".into());
                 set(&obj, "skillId", resp.skill_id.clone().into());
                 set(&obj, "skill_id", resp.skill_id.into());
+            }
+            tentaflow_protocol::SkillsPayload::HubSearchRequest(req) => {
+                set(&obj, "variant", "SkillsHubSearchRequest".into());
+                set(&obj, "query", req.query.into());
+                set_optional_string(&obj, "source", req.source);
+            }
+            tentaflow_protocol::SkillsPayload::HubSearchResponse(resp) => {
+                set(&obj, "variant", "SkillsHubSearchResponse".into());
+                set(&obj, "resultsJson", resp.results_json.clone().into());
+                set(&obj, "results_json", resp.results_json.into());
+            }
+            tentaflow_protocol::SkillsPayload::HubImportRequest(req) => {
+                set(&obj, "variant", "SkillsHubImportRequest".into());
+                set(&obj, "source", req.source.into());
+                set_optional_string(&obj, "gitRef", req.git_ref.clone());
+                set_optional_string(&obj, "git_ref", req.git_ref);
+            }
+            tentaflow_protocol::SkillsPayload::HubImportResponse(resp) => {
+                set(&obj, "variant", "SkillsHubImportResponse".into());
+                set(&obj, "skillId", resp.skill_id.clone().into());
+                set(&obj, "skill_id", resp.skill_id.into());
+                set(&obj, "verdictJson", resp.verdict_json.clone().into());
+                set(&obj, "verdict_json", resp.verdict_json.into());
+            }
+            tentaflow_protocol::SkillsPayload::HubApproveRequest(req) => {
+                set(&obj, "variant", "SkillsHubApproveRequest".into());
+                set(&obj, "skillId", req.skill_id.clone().into());
+                set(&obj, "skill_id", req.skill_id.into());
+            }
+            tentaflow_protocol::SkillsPayload::HubApproveResponse(resp) => {
+                set(&obj, "variant", "SkillsHubApproveResponse".into());
+                set(&obj, "approved", resp.approved.into());
+            }
+            tentaflow_protocol::SkillsPayload::HubRejectRequest(req) => {
+                set(&obj, "variant", "SkillsHubRejectRequest".into());
+                set(&obj, "skillId", req.skill_id.clone().into());
+                set(&obj, "skill_id", req.skill_id.into());
+            }
+            tentaflow_protocol::SkillsPayload::HubRejectResponse(resp) => {
+                set(&obj, "variant", "SkillsHubRejectResponse".into());
+                set(&obj, "rejected", resp.rejected.into());
+            }
+            tentaflow_protocol::SkillsPayload::CuratorRunRequest(_) => {
+                set(&obj, "variant", "SkillsCuratorRunRequest".into());
+            }
+            tentaflow_protocol::SkillsPayload::CuratorRunResponse(resp) => {
+                set(&obj, "variant", "SkillsCuratorRunResponse".into());
+                set(&obj, "proposalJson", resp.proposal_json.clone().into());
+                set(&obj, "proposal_json", resp.proposal_json.into());
+                set(&obj, "snapshotId", resp.snapshot_id.clone().into());
+                set(&obj, "snapshot_id", resp.snapshot_id.into());
+            }
+            tentaflow_protocol::SkillsPayload::CuratorApplyRequest(req) => {
+                set(&obj, "variant", "SkillsCuratorApplyRequest".into());
+                set(&obj, "snapshotId", req.snapshot_id.clone().into());
+                set(&obj, "snapshot_id", req.snapshot_id.into());
+                set(&obj, "approvedActionsJson", req.approved_actions_json.clone().into());
+                set(&obj, "approved_actions_json", req.approved_actions_json.into());
+            }
+            tentaflow_protocol::SkillsPayload::CuratorApplyResponse(resp) => {
+                set(&obj, "variant", "SkillsCuratorApplyResponse".into());
+                set(&obj, "mutated", resp.mutated.into());
+            }
+            tentaflow_protocol::SkillsPayload::CuratorRollbackRequest(req) => {
+                set(&obj, "variant", "SkillsCuratorRollbackRequest".into());
+                set(&obj, "snapshotId", req.snapshot_id.clone().into());
+                set(&obj, "snapshot_id", req.snapshot_id.into());
+            }
+            tentaflow_protocol::SkillsPayload::CuratorRollbackResponse(resp) => {
+                set(&obj, "variant", "SkillsCuratorRollbackResponse".into());
+                set(&obj, "restored", resp.restored.into());
             }
         },
         MessageBody::AgentsBody(payload) => match payload {

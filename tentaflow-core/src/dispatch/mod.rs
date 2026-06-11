@@ -529,6 +529,26 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::SkillsPayload::DeleteResponse(_) => "SkillsDeleteResponse",
             tentaflow_protocol::SkillsPayload::ForkRequest(_) => "SkillsForkRequest",
             tentaflow_protocol::SkillsPayload::ForkResponse(_) => "SkillsForkResponse",
+            tentaflow_protocol::SkillsPayload::HubSearchRequest(_) => "SkillsHubSearchRequest",
+            tentaflow_protocol::SkillsPayload::HubSearchResponse(_) => "SkillsHubSearchResponse",
+            tentaflow_protocol::SkillsPayload::HubImportRequest(_) => "SkillsHubImportRequest",
+            tentaflow_protocol::SkillsPayload::HubImportResponse(_) => "SkillsHubImportResponse",
+            tentaflow_protocol::SkillsPayload::HubApproveRequest(_) => "SkillsHubApproveRequest",
+            tentaflow_protocol::SkillsPayload::HubApproveResponse(_) => "SkillsHubApproveResponse",
+            tentaflow_protocol::SkillsPayload::HubRejectRequest(_) => "SkillsHubRejectRequest",
+            tentaflow_protocol::SkillsPayload::HubRejectResponse(_) => "SkillsHubRejectResponse",
+            tentaflow_protocol::SkillsPayload::CuratorRunRequest(_) => "SkillsCuratorRunRequest",
+            tentaflow_protocol::SkillsPayload::CuratorRunResponse(_) => "SkillsCuratorRunResponse",
+            tentaflow_protocol::SkillsPayload::CuratorApplyRequest(_) => "SkillsCuratorApplyRequest",
+            tentaflow_protocol::SkillsPayload::CuratorApplyResponse(_) => {
+                "SkillsCuratorApplyResponse"
+            }
+            tentaflow_protocol::SkillsPayload::CuratorRollbackRequest(_) => {
+                "SkillsCuratorRollbackRequest"
+            }
+            tentaflow_protocol::SkillsPayload::CuratorRollbackResponse(_) => {
+                "SkillsCuratorRollbackResponse"
+            }
         },
         MessageBody::AgentsBody(p) => match p {
             tentaflow_protocol::AgentsPayload::ListRequest(_) => "AgentsListRequest",
@@ -1806,6 +1826,7 @@ mod tests {
             flow_id: None,
             routable: true,
             is_enabled: true,
+            on_child_complete: "notify",
             actor_user_id: None,
         };
         crate::db::repository::upsert_agent(&state.db, &params).unwrap();
@@ -1880,6 +1901,7 @@ mod tests {
             flow_id: None,
             routable: true,
             is_enabled: true,
+            on_child_complete: "notify",
             actor_user_id: None,
         };
         crate::db::repository::upsert_agent(&state.db, &params).unwrap();
@@ -1933,6 +1955,7 @@ mod tests {
             flow_id: None,
             routable: true,
             is_enabled: true,
+            on_child_complete: "notify",
             actor_user_id: None,
         };
         crate::db::repository::upsert_agent(&state.db, &params).unwrap();
@@ -2045,6 +2068,144 @@ mod tests {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
             other => panic!("expected PolicyDenied, got {:?}", other),
         }
+    }
+
+    /// Seeds a quarantined hub skill straight through the repository so the
+    /// approve/reject handler tests do not have to perform a network import.
+    fn seed_quarantine_hub_skill(db: &crate::db::DbPool, id: &str, name: &str) {
+        let actor = uuid::Uuid::from_bytes(seeded_admin_bytes()).to_string();
+        let params = crate::db::models::SkillParams {
+            id,
+            name,
+            display_name: None,
+            description: "Imported from github:acme/skills/x",
+            content: "# body",
+            tags_json: "[]",
+            category: None,
+            source: "hub",
+            source_ref: Some("github:acme/skills/x@main"),
+            status: "quarantine",
+            created_by: Some(&actor),
+            actor_user_id: Some(&actor),
+        };
+        crate::db::repository::upsert_skill(db, &params).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hub_import_rejects_private_url_via_ssrf_guard() {
+        use tentaflow_protocol::{SkillsHubImportRequest, SkillsPayload};
+        let state = state::AppState::for_test();
+        let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
+        // A loopback target never leaves the box — the public-URL guard denies it
+        // before any socket is opened.
+        let req = MessageBody::SkillsBody(SkillsPayload::HubImportRequest(SkillsHubImportRequest {
+            source: "https://127.0.0.1/SKILL.md".to_string(),
+            git_ref: None,
+        }));
+        let (resp, is_err) = dispatch(&req, &admin).await;
+        assert!(is_err, "private URL must be rejected");
+        match resp {
+            MessageBody::Error(e) => {
+                assert!(
+                    e.message.to_lowercase().contains("local")
+                        || e.message.to_lowercase().contains("import failed"),
+                    "unexpected error: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_import_denied_for_non_admin() {
+        use tentaflow_protocol::{SkillsHubImportRequest, SkillsPayload};
+        let state = state::AppState::for_test();
+        let user = agents_ctx("user", [7u8; 16], state.clone());
+        let req = MessageBody::SkillsBody(SkillsPayload::HubImportRequest(SkillsHubImportRequest {
+            source: "acme/skills/x".to_string(),
+            git_ref: None,
+        }));
+        let (resp, is_err) = dispatch(&req, &user).await;
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
+            other => panic!("expected PolicyDenied, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_approve_flips_quarantine_to_active_preserving_provenance() {
+        use tentaflow_protocol::{SkillsHubApproveRequest, SkillsPayload};
+        let state = state::AppState::for_test();
+        let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
+        let skill_id = "11111111-1111-4111-8111-111111111111";
+        seed_quarantine_hub_skill(&state.db, skill_id, "imported-skill");
+
+        let req = MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(SkillsHubApproveRequest {
+            skill_id: skill_id.to_string(),
+        }));
+        let (resp, is_err) = dispatch(&req, &admin).await;
+        assert!(!is_err, "approve failed: {:?}", resp);
+        match resp {
+            MessageBody::SkillsBody(SkillsPayload::HubApproveResponse(r)) => assert!(r.approved),
+            other => panic!("expected HubApproveResponse, got {:?}", other),
+        }
+        let skill = crate::db::repository::get_skill(&state.db, skill_id)
+            .unwrap()
+            .expect("skill present");
+        assert_eq!(skill.status, "active");
+        assert_eq!(skill.source, "hub");
+        assert_eq!(
+            skill.source_ref.as_deref(),
+            Some("github:acme/skills/x@main"),
+            "provenance must survive approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_approve_rejects_non_quarantine_skill() {
+        use tentaflow_protocol::{SkillsHubApproveRequest, SkillsPayload};
+        let state = state::AppState::for_test();
+        let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
+        let skill_id = "22222222-2222-4222-8222-222222222222";
+        seed_quarantine_hub_skill(&state.db, skill_id, "already-active");
+        // First approval activates it; a second must be refused (not quarantine).
+        let approve = MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(
+            SkillsHubApproveRequest {
+                skill_id: skill_id.to_string(),
+            },
+        ));
+        let (_resp, is_err) = dispatch(&approve, &admin).await;
+        assert!(!is_err);
+        let (resp, is_err) = dispatch(&approve, &admin).await;
+        assert!(is_err, "re-approving an active skill must fail");
+        assert!(matches!(resp, MessageBody::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn hub_reject_deletes_quarantined_skill() {
+        use tentaflow_protocol::{SkillsHubRejectRequest, SkillsPayload};
+        let state = state::AppState::for_test();
+        let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
+        let skill_id = "33333333-3333-4333-8333-333333333333";
+        seed_quarantine_hub_skill(&state.db, skill_id, "to-reject");
+
+        let req = MessageBody::SkillsBody(SkillsPayload::HubRejectRequest(SkillsHubRejectRequest {
+            skill_id: skill_id.to_string(),
+        }));
+        let (resp, is_err) = dispatch(&req, &admin).await;
+        assert!(!is_err, "reject failed: {:?}", resp);
+        match resp {
+            MessageBody::SkillsBody(SkillsPayload::HubRejectResponse(r)) => assert!(r.rejected),
+            other => panic!("expected HubRejectResponse, got {:?}", other),
+        }
+        assert!(
+            crate::db::repository::get_skill(&state.db, skill_id)
+                .unwrap()
+                .is_none(),
+            "rejected skill must be deleted"
+        );
     }
 }
 

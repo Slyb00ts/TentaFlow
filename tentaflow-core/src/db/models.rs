@@ -328,6 +328,40 @@ pub struct SkillListFilter<'a> {
     pub tag: Option<&'a str>,
 }
 
+/// One pre-apply snapshot of a skill captured before the curator mutates it
+/// (Harness §3.2 — reversible apply). `existed=false` records a skill that the
+/// apply step is about to CREATE (umbrella target): rollback then deletes it. For
+/// an existing skill every field carries the verbatim pre-apply value so rollback
+/// restores the row exactly. `files_json` is the JSON-encoded reference-file set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCuratorSnapshotRow {
+    pub skill_id: String,
+    pub existed: bool,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub content: Option<String>,
+    pub tags_json: Option<String>,
+    pub category: Option<String>,
+    pub source: Option<String>,
+    pub source_ref: Option<String>,
+    pub status: Option<String>,
+    pub files_json: String,
+}
+
+/// Header of a curator snapshot — the proposal it was taken for plus its
+/// lifecycle (`open` → `applied` → `rolled_back`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCuratorSnapshot {
+    pub id: String,
+    pub proposal_json: String,
+    pub status: String,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub applied_at: Option<String>,
+    pub rolled_back_at: Option<String>,
+}
+
 /// Agent — a harness definition from the Agents registry (Harness §3.3).
 /// Replicates fleet-wide like skills/flows; `name` is soft-unique (no UNIQUE).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +382,10 @@ pub struct DbAgent {
     pub flow_id: Option<String>,
     pub routable: bool,
     pub is_enabled: bool,
+    /// Behavior when a spawned child run finishes (Harness §3.6 level 3):
+    /// `notify` (default) enqueues the mailbox + emits the event; `continue`
+    /// also starts a fresh parent run with the child result (Ralph-style).
+    pub on_child_complete: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -373,6 +411,9 @@ pub struct AgentParams<'a> {
     pub flow_id: Option<&'a str>,
     pub routable: bool,
     pub is_enabled: bool,
+    /// `notify` | `continue` (Harness §3.6 level 3). Validated against the set
+    /// in `validate_agent_params`; the column CHECK is the fleet-wide backstop.
+    pub on_child_complete: &'a str,
     pub actor_user_id: Option<&'a str>,
 }
 
@@ -440,6 +481,36 @@ pub struct AgentRunListFilter<'a> {
     pub status: Option<&'a str>,
     pub parent_run_id: Option<&'a str>,
     pub user_id: Option<&'a str>,
+}
+
+/// One mailbox entry (Harness §3.6 level 2): a finished CHILD run's final answer
+/// addressed back to the context that spawned it. RUNTIME state, never synced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAgentMailbox {
+    pub id: String,
+    /// The finished child run whose result this carries.
+    pub run_id: String,
+    /// Chat session that should pick this up on its next interaction (if any).
+    pub target_session_id: Option<String>,
+    /// Agent that should pick this up the next time it is primed (if any).
+    pub target_agent_id: Option<String>,
+    /// The child's final answer text.
+    pub payload: String,
+    pub created_at: String,
+    /// NULL until `agent_context` injects the entry into a run's context.
+    pub delivered_at: Option<String>,
+}
+
+/// Parameters for enqueuing a mailbox entry (the undelivered insert). At least
+/// one of `target_session_id` / `target_agent_id` must be set or the entry is
+/// unreachable; the manager only enqueues when a target exists.
+#[derive(Debug, Clone)]
+pub struct NewAgentMailboxEntry<'a> {
+    pub id: &'a str,
+    pub run_id: &'a str,
+    pub target_session_id: Option<&'a str>,
+    pub target_agent_id: Option<&'a str>,
+    pub payload: &'a str,
 }
 
 /// Parametry tworzenia/aktualizacji szablonu wezla flow

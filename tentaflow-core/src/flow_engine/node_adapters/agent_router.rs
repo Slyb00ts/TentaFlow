@@ -359,6 +359,7 @@ mod tests {
                 flow_id: None,
                 routable,
                 is_enabled: enabled,
+                on_child_complete: "notify",
                 actor_user_id: None,
             },
         )

@@ -676,6 +676,11 @@ function editorBodyHtml(agent, mode, models) {
           value="${escapeAttr(String(agent?.max_subagents ?? 0))}" min="0"></tf-input>
         <tf-input id="agent-ed-max-spawn-depth" type="number" label="${escapeAttr(I18n.t('agents.label_max_spawn_depth'))}"
           value="${escapeAttr(String(agent?.max_spawn_depth ?? 1))}" min="1"></tf-input>
+        <tf-select id="agent-ed-on-child-complete" label="${escapeAttr(I18n.t('agents.label_on_child_complete'))}"
+          value="${escapeAttr(agent?.on_child_complete || 'notify')}">
+          <option value="notify">${escapeHtml(I18n.t('agents.on_child_complete_notify'))}</option>
+          <option value="continue">${escapeHtml(I18n.t('agents.on_child_complete_continue'))}</option>
+        </tf-select>
       </div>
 
       <div class="agents-toggles">
@@ -1021,6 +1026,7 @@ async function saveEditor() {
   const timeoutSecs = intField('#agent-ed-timeout-secs', 600);
   const maxSubagents = intField('#agent-ed-max-subagents', 0);
   const maxSpawnDepth = intField('#agent-ed-max-spawn-depth', 1);
+  const onChildComplete = (field('#agent-ed-on-child-complete')?.value || 'notify').trim();
   const routable = field('#agent-ed-routable')?.hasAttribute('checked') ?? true;
   const isEnabled = field('#agent-ed-enabled')?.hasAttribute('checked') ?? true;
 
@@ -1046,6 +1052,7 @@ async function saveEditor() {
     timeout_secs: timeoutSecs,
     max_subagents: maxSubagents,
     max_spawn_depth: maxSpawnDepth,
+    on_child_complete: onChildComplete,
     flow_id: flowId || null,
     routable,
     is_enabled: isEnabled,

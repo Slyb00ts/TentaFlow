@@ -192,6 +192,7 @@ export class FlowConfig {
       </div>
       <nav class="fb-config-tabs" role="tablist">
         <button class="fb-config-tab ${this.activeTab === 'config' ? 'active' : ''}" data-tab="config">${escapeHtml(I18n.t('flows_config.tab_config'))}</button>
+        <button class="fb-config-tab ${this.activeTab === 'mapping' ? 'active' : ''}" data-tab="mapping">${escapeHtml(I18n.t('flows_config.tab_mapping'))}</button>
         <button class="fb-config-tab ${this.activeTab === 'ports' ? 'active' : ''}" data-tab="ports">${escapeHtml(I18n.t('flows_config.tab_ports'))}</button>
         <button class="fb-config-tab ${this.activeTab === 'advanced' ? 'active' : ''}" data-tab="advanced">${escapeHtml(I18n.t('flows_config.tab_advanced'))}</button>
       </nav>
@@ -225,10 +226,12 @@ export class FlowConfig {
     const body = this.root.querySelector('[data-role="body"]');
     if (!body) return;
     if (this.activeTab === 'config') body.innerHTML = this._renderConfigTab();
+    else if (this.activeTab === 'mapping') body.innerHTML = this._renderMappingTab();
     else if (this.activeTab === 'ports') body.innerHTML = this._renderPortsTab();
     else body.innerHTML = this._renderAdvancedTab();
 
     if (this.activeTab === 'config') this._bindConfigInputs(body);
+    if (this.activeTab === 'mapping') this._bindMappingInputs(body);
     if (this.activeTab === 'advanced') this._bindAdvancedInputs(body);
     if (this.activeTab === 'ports') this._bindPortsInputs(body);
   }
@@ -457,6 +460,225 @@ export class FlowConfig {
         console.warn(`[fb-config] dynamic_enum load failed for ${source}:${category}:`, err);
       }
     });
+  }
+
+  // Io-mapping editor (§3.12, phase 7): CEL expressions feeding node config
+  // (input_mapping) and writing flow variables (output_mapping). The backend
+  // executor evaluates these around the adapter; it also rejects malformed
+  // shapes and undeclared output targets (R10) on save, so the client only adds
+  // a lightweight sanity hint and never reimplements CEL validation.
+  _renderMappingTab() {
+    const n = this.node;
+    const input = this._mappingRowsFrom(n.config?.input_mapping);
+    const output = this._mappingRowsFrom(n.config?.output_mapping);
+    const declaredVars = this._declaredVariables();
+
+    return `
+      <div class="fb-map-section" data-mapping="input_mapping">
+        <label class="fb-label">${escapeHtml(I18n.t('flows_config.map_input_label'))}</label>
+        <div class="fb-field-hint">${escapeHtml(I18n.t('flows_config.map_input_hint'))}</div>
+        <div class="fb-map-list" data-role="rows">${
+          input.length
+            ? input.map((r, i) => this._renderMappingRow('input_mapping', r, i)).join('')
+            : `<div class="fb-vars-empty">${escapeHtml(I18n.t('flows_config.map_input_empty'))}</div>`
+        }</div>
+        <tf-button variant="secondary" size="sm" icon="plus" data-action="add-row">${escapeHtml(I18n.t('flows_config.map_add'))}</tf-button>
+      </div>
+      <div class="fb-map-section" data-mapping="output_mapping">
+        <label class="fb-label">${escapeHtml(I18n.t('flows_config.map_output_label'))}</label>
+        <div class="fb-field-hint">${escapeHtml(I18n.t('flows_config.map_output_hint'))}</div>
+        ${
+          declaredVars.length
+            ? ''
+            : `<div class="fb-field-hint fb-map-warn">${escapeHtml(I18n.t('flows_config.map_no_vars'))}</div>`
+        }
+        <div class="fb-map-list" data-role="rows">${
+          output.length
+            ? output.map((r, i) => this._renderMappingRow('output_mapping', r, i)).join('')
+            : `<div class="fb-vars-empty">${escapeHtml(I18n.t('flows_config.map_output_empty'))}</div>`
+        }</div>
+        <tf-button variant="secondary" size="sm" icon="plus" data-action="add-row">${escapeHtml(I18n.t('flows_config.map_add'))}</tf-button>
+      </div>
+      <div class="fb-field">
+        <label class="fb-label">${escapeHtml(I18n.t('flows_config.map_scope_label'))}</label>
+        <div class="fb-field-hint">${escapeHtml(I18n.t('flows_config.map_scope_hint'))}</div>
+      </div>
+    `;
+  }
+
+  _renderMappingRow(mapping, row, idx) {
+    const keyPlaceholder = mapping === 'input_mapping'
+      ? I18n.t('flows_config.map_key_placeholder')
+      : I18n.t('flows_config.map_var_placeholder');
+    const warn = this._expressionHint(row.expression);
+    return `
+      <div class="fb-map-row" data-idx="${idx}">
+        <tf-combobox class="fb-map-key" data-field="key" placeholder="${escapeAttr(keyPlaceholder)}" value="${escapeAttr(row.key)}"></tf-combobox>
+        <span class="fb-map-arrow" aria-hidden="true">→</span>
+        <tf-input class="fb-map-expr" data-field="expression" placeholder="${escapeAttr(I18n.t('flows_config.map_expr_placeholder'))}" value="${escapeAttr(row.expression)}"></tf-input>
+        <tf-button variant="ghost" size="sm" icon="trash" data-action="remove-row" title="${escapeAttr(I18n.t('flows_config.map_remove'))}"></tf-button>
+        <div class="fb-map-rowhint ${warn ? 'warn' : ''}" data-role="rowhint">${warn ? escapeHtml(warn) : ''}</div>
+      </div>`;
+  }
+
+  // Populates each row's tf-combobox key field with suggestions (config keys for
+  // input_mapping, declared variables for output_mapping). tf-combobox ingests
+  // options only via the `.options` property, so it must be set after mount.
+  _populateMappingKeys(sectionEl, mapping) {
+    const keys = mapping === 'input_mapping'
+      ? this._knownConfigKeys()
+      : this._declaredVariables();
+    const options = keys.map((k) => ({ value: k, label: k }));
+    sectionEl.querySelectorAll('tf-combobox[data-field="key"]').forEach((cb) => {
+      cb.options = options;
+    });
+  }
+
+  // Converts a stored {key: "<CEL>"} object into ordered editable rows. Keeps
+  // insertion order from Object.entries so re-rendering is stable.
+  _mappingRowsFrom(obj) {
+    if (!obj || typeof obj !== 'object') return [];
+    return Object.entries(obj).map(([key, expression]) => ({
+      key: String(key),
+      expression: typeof expression === 'string' ? expression : '',
+    }));
+  }
+
+  // Config keys the adapter declares in params_schema — suggested as
+  // input_mapping targets. Free text is still allowed (combobox), because some
+  // adapters read keys not surfaced in the schema.
+  _knownConfigKeys() {
+    const schema = this._paramsSchema();
+    const props = schema.properties || {};
+    return (schema.order && schema.order.length ? schema.order : Object.keys(props))
+      .filter((k) => k !== 'input_mapping' && k !== 'output_mapping');
+  }
+
+  // Declared flow variables (flow_json.variables) — the only legal
+  // output_mapping targets (R10). Supplied by the builder page via getFlowVariables.
+  _declaredVariables() {
+    const list = this.opts.getFlowVariables?.() || [];
+    return (Array.isArray(list) ? list : [])
+      .map((v) => v?.name)
+      .filter((name) => typeof name === 'string' && name.length > 0);
+  }
+
+  // Lightweight, non-blocking sanity hint. NOT a CEL validator — the backend
+  // rejects bad expressions on save with a precise message surfaced as a toast.
+  // Here we only flag obviously broken input: empty, unbalanced quotes or parens.
+  _expressionHint(expr) {
+    const e = (expr ?? '').trim();
+    if (e === '') return I18n.t('flows_config.map_hint_empty');
+    let inSingle = false;
+    let inDouble = false;
+    let depth = 0;
+    for (let i = 0; i < e.length; i += 1) {
+      const c = e[i];
+      if (c === "'" && !inDouble) inSingle = !inSingle;
+      else if (c === '"' && !inSingle) inDouble = !inDouble;
+      else if (!inSingle && !inDouble) {
+        if (c === '(' || c === '[' || c === '{') depth += 1;
+        else if (c === ')' || c === ']' || c === '}') depth -= 1;
+        if (depth < 0) return I18n.t('flows_config.map_hint_unbalanced');
+      }
+    }
+    if (inSingle || inDouble) return I18n.t('flows_config.map_hint_quotes');
+    if (depth !== 0) return I18n.t('flows_config.map_hint_unbalanced');
+    return '';
+  }
+
+  _bindMappingInputs(body) {
+    const n = this.node;
+
+    // Reads all rows of one section back into a {key: expr} object. Empty keys
+    // and empty expressions are dropped so half-typed rows never reach flow_json.
+    const readMapping = (sectionEl) => {
+      const out = {};
+      sectionEl.querySelectorAll('.fb-map-row').forEach((rowEl) => {
+        const keyEl = rowEl.querySelector('[data-field="key"]');
+        const exprEl = rowEl.querySelector('[data-field="expression"]');
+        const key = (keyEl?.value ?? '').trim();
+        const expr = (exprEl?.value ?? '').trim();
+        if (key === '' || expr === '') return;
+        out[key] = expr;
+      });
+      return out;
+    };
+
+    const commit = (sectionEl) => {
+      const mapping = sectionEl.dataset.mapping;
+      const obj = readMapping(sectionEl);
+      // Empty object → remove the key entirely so legacy flows round-trip
+      // byte-identically (backend uses skip_serializing_if on absent mappings).
+      const patch = { [mapping]: Object.keys(obj).length ? obj : undefined };
+      this.opts.onConfigChange?.(n.id, patch);
+    };
+
+    body.querySelectorAll('.fb-map-section').forEach((sectionEl) => {
+      this._populateMappingKeys(sectionEl, sectionEl.dataset.mapping);
+      // `input` only updates the cheap inline hint (no canvas/history churn);
+      // `change` (blur/commit) persists into node.config — matches the switch
+      // cases editor and avoids pushing history on every keystroke.
+      sectionEl.addEventListener('input', (ev) => {
+        const rowEl = ev.target.closest('.fb-map-row');
+        if (rowEl && ev.target.dataset.field === 'expression') {
+          const hintEl = rowEl.querySelector('[data-role="rowhint"]');
+          const warn = this._expressionHint(ev.target.value);
+          if (hintEl) {
+            hintEl.textContent = warn;
+            hintEl.classList.toggle('warn', Boolean(warn));
+          }
+        }
+      });
+      sectionEl.addEventListener('change', () => commit(sectionEl));
+      // tf-combobox only emits `change` when a suggestion is picked, not after
+      // free typing; `focusout` guarantees a free-typed key gets persisted when
+      // the field loses focus.
+      sectionEl.addEventListener('focusout', () => commit(sectionEl));
+
+      sectionEl.querySelector('[data-action="add-row"]')?.addEventListener('click', () => {
+        const mapping = sectionEl.dataset.mapping;
+        // Current visible rows (including half-typed ones) plus one fresh empty
+        // row; reading from the DOM keeps in-flight edits during the re-render.
+        const rows = this._readMappingRows(sectionEl).concat([{ key: '', expression: '' }]);
+        this._renderMappingSection(sectionEl, mapping, rows);
+      });
+
+      sectionEl.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('[data-action="remove-row"]');
+        if (!btn) return;
+        const rowEl = btn.closest('.fb-map-row');
+        rowEl?.remove();
+        commit(sectionEl);
+        const mapping = sectionEl.dataset.mapping;
+        this._renderMappingSection(sectionEl, mapping, this._readMappingRows(sectionEl));
+      });
+    });
+  }
+
+  // Reads visible rows of a section as ordered {key, expression} pairs,
+  // including half-typed ones (so a re-render after add/remove keeps edits).
+  _readMappingRows(sectionEl) {
+    const rows = [];
+    sectionEl.querySelectorAll('.fb-map-row').forEach((rowEl) => {
+      const keyEl = rowEl.querySelector('[data-field="key"]');
+      const exprEl = rowEl.querySelector('[data-field="expression"]');
+      rows.push({ key: keyEl?.value ?? '', expression: exprEl?.value ?? '' });
+    });
+    return rows;
+  }
+
+  // Re-renders one mapping section's row list in place (after add/remove)
+  // without rebuilding the whole tab — preserves the other section's focus.
+  _renderMappingSection(sectionEl, mapping, rows) {
+    const list = sectionEl.querySelector('[data-role="rows"]');
+    if (!list) return;
+    list.innerHTML = rows.length
+      ? rows.map((r, i) => this._renderMappingRow(mapping, r, i)).join('')
+      : `<div class="fb-vars-empty">${escapeHtml(I18n.t(
+          mapping === 'input_mapping' ? 'flows_config.map_input_empty' : 'flows_config.map_output_empty',
+        ))}</div>`;
+    this._populateMappingKeys(sectionEl, mapping);
   }
 
   _renderPortsTab() {

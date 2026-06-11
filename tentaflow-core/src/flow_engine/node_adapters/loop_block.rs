@@ -12,8 +12,21 @@
 // loop the block stamps meta.loop_iterations + meta.loop_exit_reason. Harness
 // control signals (harness_done / loop_max_iterations / loop_final_pass) stay
 // in envelope.meta — engine plumbing exchanged with agent_context, never
-// promoted to declared variables. (Harness §3.5 block 1, §3.5.0, §3.10,
-// §3.11 C.) =====
+// promoted to declared variables.
+//
+// Continuation nudges (§1.1): false-completion is common with open-weight
+// models. After a body iteration signals `harness_done` (final, no tool calls)
+// the loop applies two bounded heuristics BEFORE accepting the end:
+//   * empty-after-tools (once per run): an empty final right after the model
+//     used tools usually means it forgot to read the results — inject a
+//     "process the tool results and continue" nudge and run one more iteration.
+//   * intermediate-ack (≤2 per run): a short future-tense "I'll do X…" final
+//     with no tools used is an acknowledgement, not an answer — inject a
+//     "continue now, execute the tools" nudge and run one more iteration.
+// Both are counted in envelope.meta and bounded; the synthetic nudge messages
+// and counters are stripped from the envelope before the loop returns, so they
+// never persist into the parent flow. (Harness §3.5 block 1, §3.5.0, §3.10,
+// §3.11 C, §1.1.) =====
 
 use std::time::Instant;
 
@@ -23,7 +36,9 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use crate::flow_engine::dispatchers::ProgressEvent;
-use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue, NodeInput};
+use crate::flow_engine::envelope::{
+    ChatMessage, ChatRole, EnvelopeDelta, FlowEnvelope, FlowValue, NodeInput,
+};
 use crate::flow_engine::expr::{evaluate_bool, ExprScope};
 use crate::flow_engine::node_adapter::{
     ExecutionContext, NodeAdapter, PortSpec, StreamProducerAdapter,
@@ -32,6 +47,31 @@ use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot, MAX_S
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "loop";
+
+/// Sentinel prefix on synthetic nudge messages so they can be stripped from the
+/// envelope before the loop returns (they must NOT persist into the parent
+/// flow). Visible to the model only during the run, exactly like a system note.
+const NUDGE_PREFIX: &str = "[System:";
+
+/// Body the empty-after-tools nudge injects (§1.1).
+const NUDGE_EMPTY_AFTER_TOOLS: &str =
+    "[System: the previous tool calls returned results but your reply was empty. \
+Process the tool results and continue — do not stop yet.]";
+
+/// Body the intermediate-ack nudge injects (§1.1).
+const NUDGE_INTERMEDIATE_ACK: &str =
+    "[System: continue now, execute the tools, only send the final answer after \
+completing the work.]";
+
+/// Meta key: whether the empty-after-tools nudge already fired (once per run).
+const META_EMPTY_NUDGE_USED: &str = "loop_empty_nudge_used";
+/// Meta key: how many intermediate-ack nudges fired (bounded to 2 per run).
+const META_ACK_NUDGE_COUNT: &str = "loop_ack_nudge_count";
+/// Cap on intermediate-ack nudges per run (§1.1).
+const MAX_ACK_NUDGES: u64 = 2;
+/// A final answer at or below this many chars counts as "short" for the
+/// intermediate-ack heuristic (a real answer is rarely this terse).
+const ACK_MAX_CHARS: usize = 240;
 
 /// Default `until` expression (§3.5 block 1). The harness end-of-task signal
 /// `harness_done` lives in `envelope.meta` (engine plumbing, set by tool_exec),
@@ -127,6 +167,138 @@ impl LoopNodeAdapter {
             extras: &extras,
         };
         evaluate_bool(expr, &scope, None).map_err(|e| anyhow!("loop until: {e}"))
+    }
+
+    /// The text of the last assistant message (the body's final turn this
+    /// iteration), empty string when absent.
+    fn last_assistant_text(envelope: &FlowEnvelope) -> String {
+        envelope
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::Assistant)
+            .map(|m| m.text_or_default())
+            .unwrap_or_default()
+    }
+
+    /// True when the most recent turn used tools: the conversation tail ends in
+    /// tool result messages (the body just ran `tool_exec`). Walks back from the
+    /// end over any trailing assistant/tool messages looking for a `Tool` role
+    /// before the next `User` boundary.
+    fn used_tools_recently(envelope: &FlowEnvelope) -> bool {
+        for m in envelope.context.messages.iter().rev() {
+            match m.role {
+                ChatRole::Tool => return true,
+                ChatRole::User => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Heuristic: a short, future-tense acknowledgement ("I'll do X…",
+    /// "Let me…", "I will now…") rather than a real final answer (§1.1). Bounded
+    /// to short texts so a genuine concise answer is not mistaken for an ack.
+    fn looks_like_intermediate_ack(text: &str) -> bool {
+        let t = text.trim();
+        if t.is_empty() || t.chars().count() > ACK_MAX_CHARS {
+            return false;
+        }
+        let lower = t.to_lowercase();
+        const OPENERS: [&str; 8] = [
+            "i'll ",
+            "i will ",
+            "let me ",
+            "i'm going to ",
+            "i am going to ",
+            "i'll now ",
+            "next, i'll ",
+            "now i'll ",
+        ];
+        OPENERS.iter().any(|p| lower.starts_with(p))
+    }
+
+    /// Applies the §1.1 continuation heuristics to an iteration that just
+    /// signalled `harness_done`. When a nudge fires it clears the done signal,
+    /// appends a synthetic nudge message (stripped before the loop returns),
+    /// bumps the bounded counter in meta, and returns true so the loop runs
+    /// another iteration. Returns false to accept the completion as final.
+    fn maybe_nudge(envelope: &mut FlowEnvelope) -> bool {
+        // Only intervene on a real "final response" completion — never on an
+        // `until` driven by some other condition.
+        let final_response = envelope
+            .meta
+            .get("harness_exit_reason")
+            .and_then(|v| v.as_str())
+            == Some("final_response");
+        if !final_response {
+            return false;
+        }
+
+        let final_text = Self::last_assistant_text(envelope);
+
+        // Empty-after-tools: fire at most once per run.
+        let empty_used = envelope
+            .meta
+            .get(META_EMPTY_NUDGE_USED)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if final_text.trim().is_empty()
+            && Self::used_tools_recently(envelope)
+            && !empty_used
+        {
+            Self::inject_nudge(envelope, NUDGE_EMPTY_AFTER_TOOLS);
+            envelope
+                .meta
+                .insert(META_EMPTY_NUDGE_USED.into(), Value::Bool(true));
+            return true;
+        }
+
+        // Intermediate-ack: the body used NO tools this turn and the final reads
+        // like an acknowledgement; bounded to MAX_ACK_NUDGES.
+        let ack_count = envelope
+            .meta
+            .get(META_ACK_NUDGE_COUNT)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if !Self::used_tools_recently(envelope)
+            && Self::looks_like_intermediate_ack(&final_text)
+            && ack_count < MAX_ACK_NUDGES
+        {
+            Self::inject_nudge(envelope, NUDGE_INTERMEDIATE_ACK);
+            envelope
+                .meta
+                .insert(META_ACK_NUDGE_COUNT.into(), Value::from(ack_count + 1));
+            return true;
+        }
+
+        false
+    }
+
+    /// Clears the done signal and appends a synthetic system nudge so the next
+    /// body iteration sees it as the latest message. The message carries the
+    /// `NUDGE_PREFIX` sentinel so `strip_scaffolding` can remove it later.
+    fn inject_nudge(envelope: &mut FlowEnvelope, body: &str) {
+        envelope.meta.remove("harness_done");
+        envelope.meta.remove("harness_exit_reason");
+        let mut msg = ChatMessage::system(body.to_string());
+        // System role keeps it a trusted instruction channel; the sentinel
+        // prefix is what marks it synthetic.
+        msg.role = ChatRole::System;
+        envelope.context.messages.push(msg);
+    }
+
+    /// Removes synthetic nudge messages and the nudge counters from the envelope
+    /// so the loop's internal continuation scaffolding never persists into the
+    /// parent flow (§1.1).
+    fn strip_scaffolding(envelope: &mut FlowEnvelope) {
+        envelope
+            .context
+            .messages
+            .retain(|m| !m.text_or_default().starts_with(NUDGE_PREFIX));
+        envelope.meta.remove(META_EMPTY_NUDGE_USED);
+        envelope.meta.remove(META_ACK_NUDGE_COUNT);
     }
 
     /// Runs the guards (depth + cycle) shared by `execute` and `produce_stream`,
@@ -238,6 +410,14 @@ impl LoopNodeAdapter {
                     n: iterations,
                 },
             );
+
+            // Continuation nudges (§1.1): if the body declared the run done,
+            // guard against a false completion. A fired nudge clears the done
+            // signal and appends a synthetic instruction so the next iteration
+            // continues; the bounded counters in meta stop it looping forever.
+            if Self::until_true(&plan.until, &current, iterations)? {
+                Self::maybe_nudge(&mut current);
+            }
         };
         Ok((current, iterations, exit_reason))
     }
@@ -284,6 +464,11 @@ impl NodeAdapter for LoopNodeAdapter {
 
         let (mut current, mut iterations, exit_reason) =
             Self::run_budgeted_iterations(&runner, &plan, node, ctx, seed).await?;
+
+        // Strip the continuation-nudge scaffolding before the grace pass and the
+        // return so it never persists into the parent flow (§1.1). Done before
+        // the grace pass so that pass starts from the clean conversation too.
+        Self::strip_scaffolding(&mut current);
 
         // Grace summary (§1.1): one extra body iteration with
         // meta.loop_final_pass=true so the body's llm block drops tools and asks
@@ -417,6 +602,10 @@ impl StreamProducerAdapter for LoopNodeAdapter {
         // Step 1: run intermediate tool-calling iterations blocking.
         let (mut current, iterations, exit_reason) =
             Self::run_budgeted_iterations(&runner, &plan, node, ctx, seed).await?;
+
+        // Strip nudge scaffolding before forwarding / the grace stream pass so it
+        // never reaches the client or the parent flow (§1.1).
+        Self::strip_scaffolding(&mut current);
 
         if exit_reason == "cancelled" {
             return Err(anyhow!(
@@ -1132,5 +1321,285 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    // --- §1.1 continuation nudges -------------------------------------------
+
+    /// Counts how many `[System:` nudge messages are in the conversation. The
+    /// body uses this to decide its behaviour: it produces a real answer once a
+    /// nudge has been injected, simulating a model that resumes after the nudge.
+    fn count_nudges(env: &FlowEnvelope) -> usize {
+        env.context
+            .messages
+            .iter()
+            .filter(|m| m.text_or_default().starts_with(NUDGE_PREFIX))
+            .count()
+    }
+
+    /// Test body simulating a harness iteration. Its `mode` controls the false
+    /// completion it produces until a nudge has been injected:
+    ///   * "empty_after_tools" — appends a tool result then an EMPTY assistant
+    ///     final; sets harness_done. After a nudge it answers "done".
+    ///   * "ack" — appends a future-tense "I'll do X…" assistant final with NO
+    ///     tools; sets harness_done. Keeps producing acks until `ack_until`
+    ///     nudges have fired, then answers "done".
+    struct NudgeBodyAdapter {
+        mode: &'static str,
+        ack_until: usize,
+    }
+
+    #[async_trait]
+    impl NodeAdapter for NudgeBodyAdapter {
+        fn node_type(&self) -> &str {
+            "loop_test_nudge_body"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("text", FlowDataType::Text)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("text", FlowDataType::Text)]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            let mut env = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+            let nudges = count_nudges(&env);
+
+            let answer_now = match self.mode {
+                "empty_after_tools" => nudges >= 1,
+                "ack" => nudges >= self.ack_until,
+                _ => true,
+            };
+
+            if answer_now {
+                env.context
+                    .messages
+                    .push(ChatMessage::assistant("done"));
+                env.payload = FlowValue::Text("done".into());
+            } else if self.mode == "empty_after_tools" {
+                // A tool result then an empty assistant final.
+                let mut tool = ChatMessage::assistant("");
+                tool.role = ChatRole::Tool;
+                tool.tool_call_id = Some("c0".into());
+                tool.name = Some("search.run".into());
+                tool.content =
+                    crate::flow_engine::envelope::ChatMessageContent::Text("result".into());
+                env.context.messages.push(tool);
+                env.context.messages.push(ChatMessage::assistant(""));
+                env.payload = FlowValue::Text(String::new());
+            } else {
+                // Intermediate ack: future-tense, no tools.
+                env.context
+                    .messages
+                    .push(ChatMessage::assistant("I'll run the search next."));
+                env.payload = FlowValue::Text("I'll run the search next.".into());
+            }
+
+            // Simulate tool_exec's end detection.
+            env.meta.insert("harness_done".into(), Value::Bool(true));
+            env.meta.insert(
+                "harness_exit_reason".into(),
+                Value::String("final_response".into()),
+            );
+            Ok(env)
+        }
+    }
+
+    fn nudge_body_json() -> String {
+        json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "b", "type": "loop_test_nudge_body", "config": {}},
+                {"id": "o", "type": "output", "config": {"format": "text"}}
+            ],
+            "edges": [
+                {"from": "t", "from_port": "text", "to": "b", "to_port": "text"},
+                {"from": "b", "from_port": "text", "to": "o", "to_port": "text"}
+            ]
+        })
+        .to_string()
+    }
+
+    fn nudge_registry_and_runner(
+        pool: DbPool,
+        mode: &'static str,
+        ack_until: usize,
+    ) -> (Arc<AdapterRegistry>, SubflowRunnerSlot) {
+        let mut registry = build_registry_for_test();
+        registry.register(Arc::new(NudgeBodyAdapter { mode, ack_until }));
+        let registry = Arc::new(registry);
+        let slot: SubflowRunnerSlot = Arc::new(parking_lot::RwLock::new(None));
+        let runner = Arc::new(SubflowRunner::new(pool, Arc::downgrade(&registry)));
+        *slot.write() = Some(runner);
+        (registry, slot)
+    }
+
+    /// §1.1 — an empty final right after tool use fires the empty-after-tools
+    /// nudge once; the loop continues and finishes on the next iteration (2
+    /// iterations total, exit `until`). The synthetic nudge message and its
+    /// counter are stripped from the returned envelope.
+    #[tokio::test]
+    async fn empty_after_tools_nudges_once_then_continues() {
+        let pool = db();
+        let body_id = "f0000000-loop-nudg-0000-000000000001";
+        insert_flow(&pool, body_id, "nudge-body", &nudge_body_json(), "active");
+        let (_registry, slot) = nudge_registry_and_runner(pool.clone(), "empty_after_tools", 0);
+
+        let out = LoopNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 10})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("execute");
+
+        // Iteration 1 produced the empty-after-tools false completion → nudge.
+        // Iteration 2 produced the real answer → until.
+        assert_eq!(
+            out.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            out.meta.get("loop_exit_reason").and_then(|v| v.as_str()),
+            Some("until")
+        );
+        // Scaffolding stripped: no nudge message survives, counters gone.
+        assert_eq!(count_nudges(&out), 0, "nudge message leaked into result");
+        assert!(out.meta.get("loop_empty_nudge_used").is_none());
+        // The real answer is present.
+        assert!(out
+            .context
+            .messages
+            .iter()
+            .any(|m| m.role == ChatRole::Assistant && m.text_or_default() == "done"));
+    }
+
+    /// §1.1 — the empty-after-tools nudge fires AT MOST ONCE. A body that keeps
+    /// returning an empty-after-tools final is allowed to end on the second such
+    /// completion (the nudge is not re-injected), so the loop does not spin.
+    #[tokio::test]
+    async fn empty_after_tools_nudge_is_bounded_to_once() {
+        let pool = db();
+        let body_id = "f0000000-loop-nudg-0000-000000000002";
+        insert_flow(&pool, body_id, "nudge-body", &nudge_body_json(), "active");
+        // ack_until huge so the empty-mode body NEVER answers "done" on its own;
+        // it always re-produces the empty-after-tools completion.
+        let (_registry, slot) = nudge_registry_and_runner(pool.clone(), "empty_after_tools", 999);
+
+        let out = LoopNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 10})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("execute");
+
+        // Iter 1 false-completes → nudge. Iter 2 false-completes again but the
+        // nudge already fired, so the loop accepts the end → 2 iterations.
+        assert_eq!(
+            out.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            out.meta.get("loop_exit_reason").and_then(|v| v.as_str()),
+            Some("until")
+        );
+        assert_eq!(count_nudges(&out), 0);
+    }
+
+    /// §1.1 — intermediate-ack nudges are bounded to 2. A body that keeps
+    /// acknowledging ("I'll do X…") is nudged twice, then the third ack is
+    /// accepted as the end. Total iterations: 3 (ack, ack, ack-accepted).
+    #[tokio::test]
+    async fn intermediate_ack_nudge_is_bounded_to_two() {
+        let pool = db();
+        let body_id = "f0000000-loop-nudg-0000-000000000003";
+        insert_flow(&pool, body_id, "nudge-body", &nudge_body_json(), "active");
+        // ack_until huge → the body always produces an ack, never "done".
+        let (_registry, slot) = nudge_registry_and_runner(pool.clone(), "ack", 999);
+
+        let out = LoopNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 10})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("execute");
+
+        // Two nudges fired (iters 1 and 2), the third ack (iter 3) is accepted.
+        assert_eq!(
+            out.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            Some(3)
+        );
+        assert_eq!(
+            out.meta.get("loop_exit_reason").and_then(|v| v.as_str()),
+            Some("until")
+        );
+        assert_eq!(count_nudges(&out), 0, "nudge messages leaked");
+        assert!(out.meta.get("loop_ack_nudge_count").is_none());
+    }
+
+    /// §1.1 — an intermediate ack that resolves into real work finishes cleanly:
+    /// nudged once, the body then answers, loop exits `until` after 2 iterations.
+    #[tokio::test]
+    async fn intermediate_ack_nudges_then_body_answers() {
+        let pool = db();
+        let body_id = "f0000000-loop-nudg-0000-000000000004";
+        insert_flow(&pool, body_id, "nudge-body", &nudge_body_json(), "active");
+        // ack_until=1 → after the first nudge the body answers "done".
+        let (_registry, slot) = nudge_registry_and_runner(pool.clone(), "ack", 1);
+
+        let out = LoopNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 10})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            out.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            Some(2)
+        );
+        assert_eq!(count_nudges(&out), 0);
+        assert!(out
+            .context
+            .messages
+            .iter()
+            .any(|m| m.role == ChatRole::Assistant && m.text_or_default() == "done"));
+    }
+
+    /// Unit-level checks of the nudge classifiers, independent of the loop
+    /// driver: the ack heuristic accepts future-tense openers and rejects real
+    /// answers / overlong text.
+    #[test]
+    fn ack_heuristic_classifies_intent() {
+        assert!(LoopNodeAdapter::looks_like_intermediate_ack(
+            "I'll run the search now."
+        ));
+        assert!(LoopNodeAdapter::looks_like_intermediate_ack(
+            "Let me check the database."
+        ));
+        assert!(LoopNodeAdapter::looks_like_intermediate_ack(
+            "I will now fetch the file."
+        ));
+        // A real, concise answer is not an ack.
+        assert!(!LoopNodeAdapter::looks_like_intermediate_ack(
+            "The total is 42."
+        ));
+        // An overlong text (a real answer) is not an ack even if it opens "I'll".
+        let long = format!("I'll explain: {}", "x".repeat(300));
+        assert!(!LoopNodeAdapter::looks_like_intermediate_ack(&long));
+        assert!(!LoopNodeAdapter::looks_like_intermediate_ack(""));
     }
 }

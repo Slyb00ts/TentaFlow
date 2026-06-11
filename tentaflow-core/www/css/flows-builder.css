@@ -1112,3 +1112,61 @@
     display: none;
   }
 }
+
+/* ============================================================================
+   Edytor io-mapping per node (config.js, zakladka "Mapowanie") — wiersze
+   {klucz konfiguracji -> CEL} oraz {zmienna -> CEL}
+   ============================================================================ */
+.fb-map-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+.fb-map-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 4px 0;
+}
+.fb-map-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.9fr) auto minmax(140px, 1.6fr) auto;
+  grid-template-areas:
+    "key arrow expr remove"
+    "hint hint hint hint";
+  gap: 6px;
+  align-items: center;
+}
+.fb-map-key { grid-area: key; }
+.fb-map-arrow {
+  grid-area: arrow;
+  color: var(--tf-text-3, #94a3b8);
+  font-size: 14px;
+  text-align: center;
+}
+.fb-map-expr { grid-area: expr; }
+.fb-map-row [data-action="remove-row"] { grid-area: remove; }
+.fb-map-rowhint {
+  grid-area: hint;
+  font-size: 11px;
+  min-height: 0;
+  color: var(--tf-text-3, #6a7196);
+}
+.fb-map-rowhint.warn {
+  color: var(--tf-warning, #d9a300);
+}
+.fb-map-warn {
+  color: var(--tf-warning, #d9a300);
+}
+@media (max-width: 640px) {
+  .fb-map-row {
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      "key remove"
+      "arrow arrow"
+      "expr expr"
+      "hint hint";
+  }
+  .fb-map-arrow { text-align: left; }
+}
