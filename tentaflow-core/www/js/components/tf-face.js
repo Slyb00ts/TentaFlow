@@ -54,6 +54,10 @@ const EDGES = (() => {
 // only x/y per vertex; z stays untouched. s(0) = 1 at the head pivot.
 const PERSPECTIVE_D_SRC = 3.4;  // 28mm FF headshot ≈ 0.40 m ≈ 3.4 head-units (1 unit ≈ 0.117 m)
 const PERSPECTIVE_D_DST = 6.1;  // 50mm FF same framing ≈ 0.71 m
+// Display camera matches the 50mm target distance so the on-screen projection
+// doesn't reintroduce wide-angle distortion; size at the z=0 plane is unchanged
+// because scalePersp compensates.
+const VIEW_CAMERA_DISTANCE = PERSPECTIVE_D_DST;
 
 function perspectiveScale(z) {
   return ((PERSPECTIVE_D_SRC - z) / PERSPECTIVE_D_SRC)
@@ -531,7 +535,7 @@ class TfFace extends HTMLElement {
       const wPx = canvas.width;
       const hPx = canvas.height;
       const baseScale = Math.min(wPx, hPx) * this._scaleMul;
-      const scalePersp = baseScale * 1.8;
+      const scalePersp = baseScale * VIEW_CAMERA_DISTANCE;
       const { dx, dy } = this._computeEyeOffset(eyeIndices, 0, PITCH_BASE_OFFSET);
       s.zoomCx = wPx * 0.5 - dx * scalePersp;
       s.zoomCy = hPx * 0.5 - dy * scalePersp;
@@ -584,7 +588,7 @@ class TfFace extends HTMLElement {
       const z1 = -x * sinY + z * cosY;
       const y1 = y * cosP - z1 * sinP;
       const z2 = y * sinP + z1 * cosP;
-      const depth = 1.8 - z2;
+      const depth = VIEW_CAMERA_DISTANCE - z2;
       const invDepth = depth > 0.1 ? 1.0 / depth : 1.0 / 0.1;
       sumX += x1 * invDepth;
       sumY += y1 * invDepth;
@@ -923,7 +927,7 @@ class TfFace extends HTMLElement {
     const cosY = Math.cos(yaw);
     const sinP = Math.sin(pitch);
     const cosP = Math.cos(pitch);
-    const scalePersp = scale * 1.8;
+    const scalePersp = scale * VIEW_CAMERA_DISTANCE;
     const src = this._workVertices;
     const px = this._projX;
     const py = this._projY;
@@ -942,7 +946,7 @@ class TfFace extends HTMLElement {
       const z1 = -x * sinY + z * cosY;
       const y1 = y * cosP - z1 * sinP;
       const z2 = y * sinP + z1 * cosP;
-      const depth = 1.8 - z2;
+      const depth = VIEW_CAMERA_DISTANCE - z2;
       const invDepth = depth > 0.1 ? 1.0 / depth : 1.0 / 0.1;
       px[i] = cx + x1 * invDepth * scalePersp;
       py[i] = cy + y1 * invDepth * scalePersp;
