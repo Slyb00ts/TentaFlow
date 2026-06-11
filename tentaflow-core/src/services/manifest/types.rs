@@ -204,6 +204,27 @@ pub use super::vocabulary::{
 };
 
 impl Category {
+    /// Odwrotnosc kebab-case tagu kategorii zapisywanego w `services.category`
+    /// (mapowanie `category_tag` w deploy). Fallback dla katalogu, gdy manifest
+    /// silnika nie jest znany na tym nodzie (np. wiersz serwisu z mesh).
+    pub fn from_category_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "llm" => Some(Self::Llm),
+            "stt" => Some(Self::Stt),
+            "tts" => Some(Self::Tts),
+            "embeddings" => Some(Self::Embeddings),
+            "reranker" => Some(Self::Reranker),
+            "vision" => Some(Self::Vision),
+            "image-gen" => Some(Self::ImageGen),
+            "video-gen" => Some(Self::VideoGen),
+            "music-gen" => Some(Self::MusicGen),
+            "model-3d-gen" => Some(Self::Model3dGen),
+            "agents" => Some(Self::Agents),
+            "tools" => Some(Self::Tools),
+            _ => None,
+        }
+    }
+
     /// Surface(s) implied by this category when the manifest does not
     /// declare `service_surfaces` explicitly. Categories without a
     /// catalog presence (`VideoGen`, `MusicGen`, `Model3dGen`, `Tools`)
