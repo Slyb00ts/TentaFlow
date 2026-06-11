@@ -145,6 +145,13 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
+    /// Pelny snapshot trwalej konfiguracji routingu (klastry + czlonkowie)
+    /// od zaufanego peera. JSON `RoutingSyncPayload`; odbiorca tylko zapisuje
+    /// lokalnie — nigdy nie re-broadcastuje (anty-petla).
+    RoutingSyncReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
     TrustRevokedReceived {
         node_id: String,
         revoked_node_id: String,
@@ -1586,6 +1593,18 @@ impl IrohMeshManager {
             .await;
     }
 
+    /// Broadcast snapshotu konfiguracji routingu (klastry + czlonkowie) do
+    /// zaufanych peerow po mutacji. Payload to JSON `RoutingSyncPayload`.
+    pub async fn broadcast_routing_sync(&self, routing_json: Vec<u8>) {
+        let _ = self
+            .broadcast_ufp2_to_trusted(
+                tentaflow_protocol::mesh::MESH_MSG_ROUTING_SYNC,
+                &routing_json,
+                None,
+            )
+            .await;
+    }
+
     /// Forward request na peera i czeka na odpowiedz. `request_id` uzyty w
     /// payloadzie dla tracking (format: [u32 id_len][id_bytes][payload]).
     /// Public trust check used by R3b.7 executor mesh dispatch before
@@ -2281,6 +2300,10 @@ impl IrohMeshManagerRef {
                 data: payload,
             },
             x if x == MESH_MSG_ALIAS_SYNC => IrohMeshEvent::AliasSyncReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_ROUTING_SYNC => IrohMeshEvent::RoutingSyncReceived {
                 from_node_id: remote_hex,
                 data: payload,
             },

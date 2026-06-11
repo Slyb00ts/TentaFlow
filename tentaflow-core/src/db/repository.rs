@@ -1941,6 +1941,53 @@ pub fn delete_model_alias(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Zapisuje pelny snapshot aliasow otrzymany przez mesh sync
+/// (`MESH_MSG_ALIAS_SYNC`). Upsert po nazwie aliasu zachowuje lokalne `id`
+/// (tabele FK: owners/visibility/consumers wisza na `alias_id`), a wpisy
+/// nieobecne w snapshocie sa usuwane. Walidacja chain-check jest pomijana —
+/// nadawca zwalidowal mutacje przed broadcastem.
+pub fn replace_model_aliases_from_sync(pool: &DbPool, aliases: &[DbModelAlias]) -> Result<()> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    for a in aliases {
+        tx.execute(
+            "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(alias) DO UPDATE SET \
+                target_model = excluded.target_model, \
+                is_active = excluded.is_active, \
+                fallback_targets = excluded.fallback_targets, \
+                strategy = excluded.strategy",
+            rusqlite::params![
+                a.alias,
+                a.target_model,
+                a.is_active,
+                a.fallback_targets,
+                a.strategy
+            ],
+        )?;
+    }
+    // Usun lokalne aliasy spoza snapshotu — snapshot jest pelnym stanem nadawcy.
+    let names: Vec<&str> = aliases.iter().map(|a| a.alias.as_str()).collect();
+    if names.is_empty() {
+        tx.execute("DELETE FROM model_aliases", [])?;
+    } else {
+        let placeholders = (1..=names.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute(
+            &format!(
+                "DELETE FROM model_aliases WHERE alias NOT IN ({})",
+                placeholders
+            ),
+            rusqlite::params_from_iter(names.iter()),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Validates alias identifier: `^[a-z][a-z0-9-]{0,63}$`.
 /// Untrusted input (manifest may declare arbitrary alias id); reject early
 /// so the registry cannot grow names that break URL routing or SQL LIKE
@@ -2533,6 +2580,111 @@ pub fn list_cluster_members(pool: &DbPool, cluster_id: &str) -> Result<Vec<DbClu
         .query_map(rusqlite::params![cluster_id], row_to_cluster_member)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Czlonkowie wszystkich klastrow — uzywane do budowy snapshotu konfiguracji
+/// routingu broadcastowanego przez mesh (`MESH_MSG_ROUTING_SYNC`).
+pub fn list_all_cluster_members(pool: &DbPool) -> Result<Vec<DbClusterMember>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM cluster_members ORDER BY cluster_id, joined_at",
+        CLUSTER_MEMBER_COLS
+    ))?;
+    let rows = stmt
+        .query_map([], row_to_cluster_member)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Zapisuje pelny snapshot konfiguracji routingu (klastry + czlonkowie)
+/// otrzymany przez mesh sync (`MESH_MSG_ROUTING_SYNC`). Upsert po
+/// `cluster_id` zachowuje lokalne `id`; klastry nieobecne w snapshocie sa
+/// usuwane (czlonkowie znikaja przez ON DELETE CASCADE). Czlonkowie sa
+/// zastepowani w calosci per klaster ze snapshotu.
+pub fn replace_routing_config_from_sync(
+    pool: &DbPool,
+    clusters: &[DbCluster],
+    members: &[DbClusterMember],
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    for c in clusters {
+        tx.execute(
+            "INSERT INTO clusters (cluster_id, name, description, strategy, created_at, updated_at, \
+                total_vram_mb, total_ram_mb, total_cpu_cores, bottleneck_speed_mbps, interconnect_type, \
+                failover_enabled, failover_target, health_check_interval_ms, timeout_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+             ON CONFLICT(cluster_id) DO UPDATE SET \
+                name = excluded.name, \
+                description = excluded.description, \
+                strategy = excluded.strategy, \
+                updated_at = excluded.updated_at, \
+                total_vram_mb = excluded.total_vram_mb, \
+                total_ram_mb = excluded.total_ram_mb, \
+                total_cpu_cores = excluded.total_cpu_cores, \
+                bottleneck_speed_mbps = excluded.bottleneck_speed_mbps, \
+                interconnect_type = excluded.interconnect_type, \
+                failover_enabled = excluded.failover_enabled, \
+                failover_target = excluded.failover_target, \
+                health_check_interval_ms = excluded.health_check_interval_ms, \
+                timeout_ms = excluded.timeout_ms",
+            rusqlite::params![
+                c.cluster_id,
+                c.name,
+                c.description,
+                c.strategy,
+                c.created_at,
+                c.updated_at,
+                c.total_vram_mb,
+                c.total_ram_mb,
+                c.total_cpu_cores,
+                c.bottleneck_speed_mbps,
+                c.interconnect_type,
+                c.failover_enabled,
+                c.failover_target,
+                c.health_check_interval_ms,
+                c.timeout_ms
+            ],
+        )?;
+    }
+    // Usun klastry spoza snapshotu (cascade czysci ich czlonkow).
+    let ids: Vec<&str> = clusters.iter().map(|c| c.cluster_id.as_str()).collect();
+    if ids.is_empty() {
+        tx.execute("DELETE FROM clusters", [])?;
+    } else {
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute(
+            &format!(
+                "DELETE FROM clusters WHERE cluster_id NOT IN ({})",
+                placeholders
+            ),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+    }
+    // Czlonkowie: pelna podmiana — snapshot niesie kompletny stan.
+    tx.execute("DELETE FROM cluster_members", [])?;
+    for m in members {
+        tx.execute(
+            "INSERT OR REPLACE INTO cluster_members (cluster_id, node_id, role, joined_at, \
+                interface_name, interface_ip, interface_speed_mbps, interface_type) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                m.cluster_id,
+                m.node_id,
+                m.role,
+                m.joined_at,
+                m.interface_name,
+                m.interface_ip,
+                m.interface_speed_mbps,
+                m.interface_type
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 // --- Flows ---

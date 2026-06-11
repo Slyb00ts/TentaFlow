@@ -7,6 +7,7 @@
 pub mod audio_stream;
 pub mod chat;
 pub mod chat_template;
+pub mod cluster_sync;
 pub mod embeddings;
 pub mod live_metrics;
 pub mod middleware;

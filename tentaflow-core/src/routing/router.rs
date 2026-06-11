@@ -85,6 +85,20 @@ pub struct Router {
         Arc<parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>>,
 }
 
+/// Globalny slot aktywnego routera procesu (Weak — nie przedluza zywotnosci
+/// routera po shutdown). Handlery mesh pipeline (np. AliasSyncReceived) nie
+/// maja dostepu do `HandlerContext`, a po zapisie snapshotu aliasow musza
+/// odswiezyc alias cache i katalog wlasnie na tym routerze. Ustawiany w
+/// `Router::start`.
+static ACTIVE_ROUTER: std::sync::OnceLock<parking_lot::RwLock<std::sync::Weak<Router>>> =
+    std::sync::OnceLock::new();
+
+/// Zwraca aktywny router procesu, jesli `Router::start` juz go zarejestrowal
+/// i router nadal zyje.
+pub fn active_router() -> Option<Arc<Router>> {
+    ACTIVE_ROUTER.get().and_then(|slot| slot.read().upgrade())
+}
+
 /// Wynik identyfikacji mowcy z poziomem pewnosci.
 #[derive(Debug, Clone)]
 pub struct SpeakerIdentifyResult {
@@ -369,6 +383,12 @@ impl Router {
     }
 
     pub fn start(self: &Arc<Self>) {
+        // Rejestracja w globalnym slocie — mesh pipeline odswieza przez niego
+        // alias cache + katalog po odbiorze MESH_MSG_ALIAS_SYNC.
+        *ACTIVE_ROUTER
+            .get_or_init(|| parking_lot::RwLock::new(std::sync::Weak::new()))
+            .write() = Arc::downgrade(self);
+
         // QUIC service connection tasks are owned by the supervisor (krok N7.2):
         // it spawns reconnect loops directly per `BackendHandle::Quic` planted
         // into `live_handles`. The reverse router for incoming container streams
