@@ -290,7 +290,12 @@ async fn handle_chat_completions(
     if is_streaming {
         // === STREAMING MODE: SSE ===
         match router
-            .route_chat_completion_stream(request, user_ctx.clone(), None)
+            .route_chat_completion_stream(
+                request,
+                user_ctx.clone(),
+                None,
+                crate::routing::streaming::ChatFlowSelector::Auto,
+            )
             .await
         {
             Ok(route_result) => {

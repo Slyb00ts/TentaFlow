@@ -803,8 +803,10 @@ function sendMessage() {
 // callerowi rozroznic via=voice w meta wiadomosci, a zarazem decyduje
 // czy assistant deltas trzeba feedowac do AudioPipeline.
 function sendMessageInternal(text, opts = {}) {
-  const modelSel = byId('chat-model');
-  const modelId = modelSel?.value || (modelOptions[0]?.id ?? 'default');
+  // Model dla syntetycznego flow — pierwszy chat-capable model z registry.
+  // Wybrany flow usera ma własny model w configu bloku LLM.
+  const modelId = modelOptions[0]?.id ?? 'default';
+  const { flowId, label: modelLabel } = currentFlowSelection();
   const conv = ensureActiveConv();
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 
@@ -814,15 +816,15 @@ function sendMessageInternal(text, opts = {}) {
 
   pushMessage(conv, { id: nextMsgId++, role: 'user', text, ts: Date.now(), via: opts.source || 'text' });
 
-  const modelLabel = currentModelLabel();
   const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: opts.source || 'text' };
   pushMessage(conv, assistantMsg);
 
-  // Wpisana wiadomość zawsze idzie tekstowym chatStreamRequest (bez TTS).
+  // Wpisana wiadomość zawsze idzie tekstowym chatStreamRequest (bez TTS),
+  // dispatchowanym przez WYBRANY flow (flowId) albo syntetyczny Default Chat.
   // Głosowe wypowiedzi idą osobno przez sendVoiceUtterance (FlowInvoke).
   ApiBinary.subscribe(
     'chatStreamRequest',
-    { modelId, userMessage: text },
+    { modelId, userMessage: text, flowId },
     {
       onChunk: (body) => {
         if (body.variant === 'ChatStreamChunk') {
@@ -831,9 +833,15 @@ function sendMessageInternal(text, opts = {}) {
           onStreamTick();
         }
       },
-      onEnd: () => {
+      onEnd: (endBody) => {
         unsubscribe = null;
         assistantMsg.streaming = false;
+        // ChatStreamEnd.text = pelny zakumulowany tekst z serwera — uzyj go
+        // gdy zlozone delty sa puste (np. zgubione chunki), zanim pokazemy
+        // "(pusta odpowiedz)".
+        if (assistantMsg.text === '' && endBody && typeof endBody.text === 'string' && endBody.text.length > 0) {
+          assistantMsg.text = endBody.text;
+        }
         if (assistantMsg.text === '') {
           assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
         }
@@ -866,17 +874,15 @@ function sendMessageInternal(text, opts = {}) {
 // engine: audio → STT → LLM → TTS, a flow odsyła przeplatane tekst+audio.
 // Tekst dopisujemy do bąbla asystenta, audio podajemy do AudioPipeline.
 function sendVoiceUtterance(wav, sampleRate) {
-  const modelSel = byId('chat-model');
-  const modelId = modelSel?.value || (modelOptions[0]?.id ?? 'default');
+  // Fallback rozwiązania flow po model+chat gdy brak flowId — pierwszy
+  // chat-capable model z registry (flow wybrany w trybie audio i tak
+  // niesie własne modele w blokach STT/LLM/TTS).
+  const modelId = modelOptions[0]?.id ?? 'default';
   const conv = ensureActiveConv();
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 
   // User bubble — wiadomość głosowa (transkrypt powstaje w flow po stronie STT).
   pushMessage(conv, { id: nextMsgId++, role: 'user', text: '🎤', ts: Date.now(), via: 'voice' });
-
-  const modelLabel = currentModelLabel();
-  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: 'voice' };
-  pushMessage(conv, assistantMsg);
 
   const lang = conv.audioConfig?.language || (I18n.getLanguage && I18n.getLanguage()) || 'pl';
 
@@ -885,6 +891,11 @@ function sendVoiceUtterance(wav, sampleRate) {
   const flowId = (flowSelEl && flowSelEl.value)
     ? flowSelEl.value
     : (conv.audioConfig?.flowId ?? null);
+
+  const flowForLabel = flowId ? flowCache.find((f) => String(f.id) === String(flowId)) : null;
+  const modelLabel = flowForLabel?.name || (I18n.t('chat.default_flow') || 'Default Chat');
+  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: 'voice' };
+  pushMessage(conv, assistantMsg);
 
   ApiBinary.subscribe(
     'flowInvokeRequest',
@@ -1056,11 +1067,16 @@ function setMicMutedVisual(muted) {
   el.setAttribute('title', muted ? I18n.t('chat.audio_unmute') : I18n.t('chat.audio_mute'));
 }
 
-function currentModelLabel() {
-  const sel = byId('chat-model');
-  const id = sel?.value;
-  const m = modelOptions.find((m) => m.id === id);
-  return m?.display_name || m?.displayName || id || 'Model';
+// Aktualny wybór flow z selektora na górze czatu. Pusty value = syntetyczny
+// "Default Chat" (flowId null → backend buduje synthetic chat-stream flow).
+function currentFlowSelection() {
+  const sel = byId('chat-flow');
+  const id = sel?.value || '';
+  if (!id) {
+    return { flowId: null, label: I18n.t('chat.default_flow') || 'Default Chat' };
+  }
+  const f = flowCache.find((f) => String(f.id) === id);
+  return { flowId: id, label: f?.name || `Flow #${id}` };
 }
 
 function pushMessage(conv, msg) {
@@ -1284,7 +1300,7 @@ const ChatScreen = {
           <div class="chat-head">
             <div class="chat-head-left">
               <tf-button variant="ghost" icon="management" id="chat-burger" class="head-burger" aria-label="Menu"></tf-button>
-              <tf-select class="chat-model-select" id="chat-model"></tf-select>
+              <tf-select class="chat-model-select" id="chat-flow" title="Flow"></tf-select>
             </div>
             <div class="head-title">
               <span class="title" id="chat-head-title"></span>
@@ -1363,20 +1379,9 @@ const ChatScreen = {
         const caps = Array.isArray(m.capabilities) ? m.capabilities : [];
         return caps.length === 0 || caps.includes('chat');
       });
-      const counts = new Map();
-      for (const m of chatOnly) {
-        counts.set(m.model_name, (counts.get(m.model_name) || 0) + 1);
-      }
-      modelOptions = chatOnly.map((m) => {
-        const baseLabel = m.display_name || m.model_name;
-        const dup = counts.get(m.model_name) > 1;
-        return {
-          id: m.model_name,
-          serviceId: m.service_id,
-          engineId: m.engine_id || '',
-          label: dup && m.engine_id ? `${baseLabel} (${m.engine_id})` : baseLabel,
-        };
-      });
+      // Selektor czatu wybiera flow, nie model — z listy modeli zostaje
+      // tylko id pierwszego chat-capable modelu (fallback dla synthetic flow).
+      modelOptions = chatOnly.map((m) => ({ id: m.model_name }));
       engineCache.stt = list.filter((m) => catOf(m) === 'stt');
       engineCache.tts = list.filter((m) => catOf(m) === 'tts');
     } catch {
@@ -1392,13 +1397,17 @@ const ChatScreen = {
       flowCache = [];
     }
 
-    const sel = byId('chat-model');
+    // Selektor na górze czatu wybiera FLOW (nie model): opcja domyślna
+    // "Default Chat" = syntetyczny flow po stronie backendu (pusty value),
+    // dalej flowy usera z Flow Buildera. Model dla syntetycznego flow to
+    // pierwszy chat-capable model z registry (modelOptions[0]).
+    const sel = byId('chat-flow');
     const innerSelect = sel?.querySelector('select');
-    const optionsHtml = modelOptions.length === 0
-      ? `<option value="default">default</option>`
-      : modelOptions.map((m) => {
-          return `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`;
-        }).join('');
+    const defaultFlowLabel = I18n.t('chat.default_flow') || 'Default Chat';
+    const optionsHtml = [`<option value="">${escapeHtml(defaultFlowLabel)}</option>`]
+      .concat(flowCache.map((f) =>
+        `<option value="${escapeHtml(String(f.id))}">${escapeHtml(f.name || ('Flow #' + f.id))}</option>`))
+      .join('');
     if (innerSelect) {
       innerSelect.innerHTML = optionsHtml;
       sel.setAttribute('value', innerSelect.value);

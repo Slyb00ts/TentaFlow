@@ -645,6 +645,12 @@ pub struct ChatStreamRequest {
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Flow wybrany przez usera w UI czatu — gdy ustawiony, backend odpala
+    /// KONKRETNY flow po ID zamiast syntetycznego. Brak = syntetyczny
+    /// "Default Chat". `#[serde(default)]` zachowuje kompatybilnosc ze
+    /// starszymi peerami.
+    #[serde(default)]
+    pub flow_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -657,6 +663,11 @@ pub struct ChatStreamChunk {
 pub struct ChatStreamEnd {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Pelny zakumulowany tekst odpowiedzi (suma wszystkich delt). Front
+    /// uzywa go gdy zlozone delty sa puste (np. zgubione chunki).
+    /// `#[serde(default)]` zachowuje kompatybilnosc ze starszymi peerami.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 // =============================================================================
@@ -5501,6 +5512,7 @@ mod tests {
             ],
             temperature: Some(0.7),
             max_tokens: Some(256),
+            flow_id: Some("flow-1".to_string()),
         });
         assert_eq!(round_trip(req.clone()), req);
 
@@ -5512,6 +5524,7 @@ mod tests {
         let end = MessageBody::ChatStreamEndBody(ChatStreamEnd {
             prompt_tokens: 12,
             completion_tokens: 34,
+            text: Some("Hello".to_string()),
         });
         assert_eq!(round_trip(end.clone()), end);
     }

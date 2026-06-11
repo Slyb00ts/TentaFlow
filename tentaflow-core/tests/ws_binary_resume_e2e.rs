@@ -35,6 +35,7 @@ async fn streaming_handler_emits_chunks_and_end() {
         }],
         temperature: None,
         max_tokens: None,
+        flow_id: None,
     });
     let ctx = HandlerContext {
         session: SessionAuth::UserSession {

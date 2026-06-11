@@ -556,6 +556,30 @@ impl FlowDispatcher {
         Ok(stream_exec)
     }
 
+    /// Streaming wariant z WYMUSZONYM synthetic flow — pomija resolver
+    /// (binding modelu / default flow z DB). Używany przez UI czatu gdy user
+    /// wybrał opcję "Default Chat" (syntetyczny trigger→llm→pii_filter→output).
+    pub async fn dispatch_synthetic_streaming(
+        &self,
+        model_name: &str,
+        service_type: &str,
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> std::result::Result<StreamingExecution, DispatchError> {
+        let compiled = self.compile_synthetic_streaming(service_type, model_name)?;
+        let ctx = self.ctx_factory.make_context(&meta);
+        let stream_exec = execute_streaming(
+            self.db.clone(),
+            compiled,
+            initial,
+            ctx,
+            self.registry.clone(),
+        )
+        .await
+        .map_err(DispatchError::from)?;
+        Ok(stream_exec)
+    }
+
     pub async fn try_dispatch_streaming(
         &self,
         model_name: &str,

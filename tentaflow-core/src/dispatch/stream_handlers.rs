@@ -43,6 +43,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 Some(MessageBody::ChatStreamEndBody(ChatStreamEnd {
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    text: None,
                 })),
             );
             return;
@@ -85,8 +86,15 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             audio_input: None,
         };
 
+        // Selektor flow z UI czatu: konkretny flow po ID albo synthetic
+        // "Default Chat". Celowo NIE Auto — Auto rozwiązuje default flow z DB
+        // (edytowalny w Flow Builderze), a UI czatu ma jawny wybór flow.
+        let flow_selector = match stream_req.flow_id.clone() {
+            Some(flow_id) => crate::routing::streaming::ChatFlowSelector::FlowId(flow_id),
+            None => crate::routing::streaming::ChatFlowSelector::Synthetic,
+        };
         let route_result = match router
-            .route_chat_completion_stream(request, None, None)
+            .route_chat_completion_stream(request, None, None, flow_selector)
             .await
         {
             Ok(r) => r,
@@ -103,6 +111,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                     Some(MessageBody::ChatStreamEndBody(ChatStreamEnd {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        text: None,
                     })),
                 );
                 return;
@@ -111,6 +120,9 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
         let mut stream = route_result.response;
         let mut completion_tokens: u32 = 0;
+        // Suma wszystkich wyslanych delt — ChatStreamEnd.text pozwala
+        // frontendowi odtworzyc odpowiedz gdy zlozone delty sa puste.
+        let mut full_text = String::new();
         // State machine: backend (vLLM/parser) wydziela chain-of-thought do
         // `delta.reasoning_content`, content do `delta.content`. Frontend
         // (chat.js) parsuje `<think>...</think>` jako collapsed block, więc
@@ -122,11 +134,11 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(e) => {
+                    let payload = format!("\n[stream error] {}", e);
+                    full_text.push_str(&payload);
                     let _ = push_chunk_async(
                         &sub,
-                        MessageBody::ChatStreamChunkBody(ChatStreamChunk {
-                            delta: format!("\n[stream error] {}", e),
-                        }),
+                        MessageBody::ChatStreamChunkBody(ChatStreamChunk { delta: payload }),
                     )
                     .await;
                     break;
@@ -147,6 +159,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                         in_thinking = true;
                         format!("<think>{}", r)
                     };
+                    full_text.push_str(&payload);
                     if push_chunk_async(
                         &sub,
                         MessageBody::ChatStreamChunkBody(ChatStreamChunk { delta: payload }),
@@ -166,6 +179,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                     } else {
                         c.to_string()
                     };
+                    full_text.push_str(&payload);
                     if push_chunk_async(
                         &sub,
                         MessageBody::ChatStreamChunkBody(ChatStreamChunk { delta: payload }),
@@ -182,6 +196,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         // Cleanup: gdy reasoning był ostatni (brak content po nim), domknij
         // tag żeby front miał poprawny `<think>...</think>` parować.
         if in_thinking {
+            full_text.push_str("</think>");
             let _ = push_chunk_async(
                 &sub,
                 MessageBody::ChatStreamChunkBody(ChatStreamChunk {
@@ -196,6 +211,11 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             Some(MessageBody::ChatStreamEndBody(ChatStreamEnd {
                 prompt_tokens: 0,
                 completion_tokens,
+                text: if full_text.is_empty() {
+                    None
+                } else {
+                    Some(full_text)
+                },
             })),
         )
         .await;
@@ -1195,6 +1215,7 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            flow_id: None,
         });
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
