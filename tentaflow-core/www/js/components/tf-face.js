@@ -3,7 +3,10 @@
 // Description: Multi-instance web component rendering the Head_5 wireframe face.
 //              Each <tf-face> owns its canvas pair, blendshape state, and RAF loop.
 //              Mini variant (size <= 32) renders a CSS-only gradient circle.
+//              `fullscreen` attribute fills the host and adapts scale to the
+//              viewport; `track="pointer gyro"` opts in to head tracking.
 // Example: <tf-face mode="idle" size="360"></tf-face>
+//          <tf-face fullscreen track="pointer gyro"></tf-face>
 // =============================================================================
 
 import {
@@ -23,8 +26,14 @@ import {
 const BS = BS_INDEX;
 const PITCH_BASE_OFFSET = -0.09;
 const DESKTOP_SCALE_MUL = 0.29;
+const MOBILE_SCALE_MUL = 0.44;
 const MINI_THRESHOLD = 32;
 const DEFAULT_SIZE = 200;
+
+const GYRO_GAMMA_RANGE = 45;
+const GYRO_BETA_RANGE = 30;
+const GYRO_YAW_GAIN = 0.3;
+const GYRO_PITCH_GAIN = 0.22;
 
 const EDGES = (() => {
   const result = [];
@@ -68,27 +77,66 @@ const BASE_NORMALS = (() => {
   return { nx, ny, nz };
 })();
 
+// Viewer-left eye vertices, derived from the blink blendshape: the vertices
+// the blink moves the most inside LEFT_MASK. Used as the zoom anchor in
+// transitionOut().
+const VIEWER_LEFT_EYE_INDICES = (() => {
+  const blinkIdx = BS_INDEX.blink;
+  if (blinkIdx == null || blinkIdx < 0) return [];
+  const deltas = BLENDSHAPE_DELTAS[blinkIdx];
+  if (!deltas) return [];
+  const MASK_THRESHOLD = 0.5;
+  const candidates = [];
+  for (let i = 0; i < NUM_VERTICES; i++) {
+    if (LEFT_MASK[i] < MASK_THRESHOLD) continue;
+    const j = i * 3;
+    const dx = deltas[j];
+    const dy = deltas[j + 1];
+    const dz = deltas[j + 2];
+    const mag = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (mag > 0) candidates.push({ i, mag });
+  }
+  candidates.sort((a, b) => b.mag - a.mag);
+  const TOP_K = Math.min(12, candidates.length);
+  return candidates.slice(0, TOP_K).map((c) => c.i);
+})();
+
 function easeInOut(t) {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) * 0.5;
 }
 
+function isMobileViewport() {
+  if (typeof window === 'undefined') return false;
+  const mql = window.matchMedia ? window.matchMedia('(pointer: coarse)') : null;
+  if (mql && mql.matches) return true;
+  return window.innerWidth < 768;
+}
+
 class TfFace extends HTMLElement {
   static get observedAttributes() {
-    return ['mode', 'size'];
+    return ['mode', 'size', 'fullscreen', 'track'];
   }
 
   constructor() {
     super();
     this._raf = 0;
+    this._transitionRaf = 0;
     this._canvas = null;
     this._ctx = null;
     this._glowCanvas = null;
     this._glowCtx = null;
     this._container = null;
     this._mini = false;
+    this._fullscreen = false;
+    this._scaleMul = DESKTOP_SCALE_MUL;
     this._resizeObs = null;
     this._mouseHandler = null;
     this._visHandler = null;
+    this._orientationHandler = null;
+    this._orientationSetupHandler = null;
+    this._orientationSetupAttempted = false;
+    this._betaBaseline = null;
+    this._gammaBaseline = null;
 
     this._workVertices = new Float32Array(NUM_VERTICES * 3);
     this._projX = new Float32Array(NUM_VERTICES);
@@ -127,6 +175,11 @@ class TfFace extends HTMLElement {
       uiMode: 'idle',
       speechAmp: 0,
       reducedMotion: false,
+      transitioning: false,
+      zoomCx: null,
+      zoomCy: null,
+      yawOverride: null,
+      pitchOverride: null,
     };
 
     this._frame = this._renderFrame.bind(this);
@@ -142,7 +195,15 @@ class TfFace extends HTMLElement {
 
   attributeChangedCallback(name, oldVal, newVal) {
     if (oldVal === newVal) return;
+    if (name === 'fullscreen' || name === 'track') {
+      if (this._container) {
+        this._teardown();
+        this._build();
+      }
+      return;
+    }
     if (name === 'size') {
+      if (this._fullscreen) return;
       const wasMini = this._mini;
       const isMini = this._parsedSize() <= MINI_THRESHOLD;
       if (wasMini !== isMini) {
@@ -181,6 +242,128 @@ class TfFace extends HTMLElement {
     });
   }
 
+  // Cinematic exit: zoom into the viewer-left eye, then fade the face out.
+  // opts.onMidpoint fires synchronously at start (caller mounts the UI there),
+  // opts.onProgress(uiScale) fires each animation frame with the 0..1 UI scale,
+  // opts.onComplete fires after the zoom + fade finished.
+  transitionOut(opts) {
+    const onMidpoint = (opts && opts.onMidpoint) || (() => {});
+    const onProgress = (opts && opts.onProgress) || (() => {});
+    const onComplete = (opts && opts.onComplete) || (() => {});
+    const s = this._state;
+
+    if (!this._canvas) { onMidpoint(); onComplete(); return; }
+
+    if (s.reducedMotion) {
+      onMidpoint();
+      this._glowCanvas.style.transition = 'opacity 0.2s linear';
+      this._canvas.style.transition = 'opacity 0.2s linear';
+      this._setLayerOpacity('0');
+      setTimeout(() => { onComplete(); }, 200);
+      return;
+    }
+
+    s.transitioning = true;
+    s.actions.length = 0;
+    s.targetYaw = 0;
+    s.targetPitch = 0;
+    s.parallaxYaw = 0;
+    s.parallaxPitch = 0;
+    s.yawOverride = 0;
+    s.pitchOverride = PITCH_BASE_OFFSET;
+
+    const eyeIndices = VIEWER_LEFT_EYE_INDICES.length > 0 ? VIEWER_LEFT_EYE_INDICES : [0];
+    const scaleStart = this._scaleMul;
+    const scaleEnd = isMobileViewport() ? 18 : 13;
+    const DURATION = 1600;
+    const FADE_START_T = 0.7;
+    const startTime = performance.now();
+
+    const easeInOutCubic = (t) =>
+      t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+    try { onMidpoint(); } catch (e) { console.error('[tf-face] onMidpoint error:', e); }
+
+    const tick = (nowMs) => {
+      const elapsed = nowMs - startTime;
+      const t = Math.min(elapsed / DURATION, 1);
+      const et = easeInOutCubic(t);
+
+      this._scaleMul = scaleStart + (scaleEnd - scaleStart) * et;
+
+      const canvas = this._canvas;
+      if (!canvas) {
+        this._transitionRaf = 0;
+        s.transitioning = false;
+        onComplete();
+        return;
+      }
+      const wPx = canvas.width;
+      const hPx = canvas.height;
+      const baseScale = Math.min(wPx, hPx) * this._scaleMul;
+      const scalePersp = baseScale * 1.8;
+      const { dx, dy } = this._computeEyeOffset(eyeIndices, 0, PITCH_BASE_OFFSET);
+      s.zoomCx = wPx * 0.5 - dx * scalePersp;
+      s.zoomCy = hPx * 0.5 - dy * scalePersp;
+
+      try { onProgress(this._scaleMul / scaleEnd); } catch (e) { console.error('[tf-face] onProgress error:', e); }
+
+      if (t > FADE_START_T) {
+        const ft = (t - FADE_START_T) / (1 - FADE_START_T);
+        this._setLayerOpacity((1 - ft).toFixed(3));
+      }
+
+      if (t < 1) {
+        this._transitionRaf = requestAnimationFrame(tick);
+      } else {
+        this._transitionRaf = 0;
+        s.transitioning = false;
+        s.zoomCx = null;
+        s.zoomCy = null;
+        s.yawOverride = null;
+        s.pitchOverride = null;
+        this._scaleMul = scaleStart;
+        try { onComplete(); } catch (e) { console.error('[tf-face] onComplete error:', e); }
+      }
+    };
+
+    this._transitionRaf = requestAnimationFrame(tick);
+  }
+
+  _setLayerOpacity(opacity) {
+    const value = String(opacity);
+    if (this._glowCanvas) this._glowCanvas.style.opacity = value;
+    if (this._canvas) this._canvas.style.opacity = value;
+  }
+
+  _computeEyeOffset(indices, yaw, pitch) {
+    const sinY = Math.sin(yaw);
+    const cosY = Math.cos(yaw);
+    const sinP = Math.sin(pitch);
+    const cosP = Math.cos(pitch);
+    const src = this._workVertices;
+    let sumX = 0, sumY = 0, count = 0;
+    for (let k = 0; k < indices.length; k++) {
+      const i = indices[k];
+      if (i >= NUM_VERTICES) continue;
+      const j = i * 3;
+      const x = src[j];
+      const y = src[j + 1];
+      const z = src[j + 2];
+      const x1 = x * cosY + z * sinY;
+      const z1 = -x * sinY + z * cosY;
+      const y1 = y * cosP - z1 * sinP;
+      const z2 = y * sinP + z1 * cosP;
+      const depth = 1.8 - z2;
+      const invDepth = depth > 0.1 ? 1.0 / depth : 1.0 / 0.1;
+      sumX += x1 * invDepth;
+      sumY += y1 * invDepth;
+      count++;
+    }
+    if (count === 0) return { dx: 0, dy: 0 };
+    return { dx: sumX / count, dy: sumY / count };
+  }
+
   _parsedSize() {
     const raw = this.getAttribute('size');
     if (raw === null || raw === '') return DEFAULT_SIZE;
@@ -189,8 +372,9 @@ class TfFace extends HTMLElement {
   }
 
   _build() {
+    this._fullscreen = this.hasAttribute('fullscreen');
     const size = this._parsedSize();
-    this._mini = size <= MINI_THRESHOLD;
+    this._mini = !this._fullscreen && size <= MINI_THRESHOLD;
     this._state.uiMode = this.getAttribute('mode') || 'idle';
 
     if (this._mini) {
@@ -213,12 +397,18 @@ class TfFace extends HTMLElement {
 
   _buildFull() {
     const wrap = document.createElement('div');
-    wrap.className = 'tf-face-glow';
     wrap.dataset.mode = this._state.uiMode;
-    const s = this._parsedSize();
-    wrap.style.width = `${s}px`;
-    wrap.style.height = `${s}px`;
-    wrap.style.background = 'radial-gradient(circle at 50% 45%, #0e1234 0%, #050818 70%)';
+    if (this._fullscreen) {
+      wrap.className = 'tf-face-fullscreen';
+      wrap.style.width = '100%';
+      wrap.style.height = '100%';
+    } else {
+      wrap.className = 'tf-face-glow';
+      const s = this._parsedSize();
+      wrap.style.width = `${s}px`;
+      wrap.style.height = `${s}px`;
+      wrap.style.background = 'radial-gradient(circle at 50% 45%, #0e1234 0%, #050818 70%)';
+    }
 
     const glow = document.createElement('canvas');
     glow.className = 'tf-face-glow-layer';
@@ -242,8 +432,16 @@ class TfFace extends HTMLElement {
     this._syncCanvasSize();
     this._renderStaticFrame();
 
-    this._mouseHandler = (e) => this._handleMouseMove(e);
-    window.addEventListener('mousemove', this._mouseHandler);
+    const track = (this.getAttribute('track') || '').split(/\s+/);
+    if (!this._state.reducedMotion) {
+      if (track.includes('pointer')) {
+        this._mouseHandler = (e) => this._handleMouseMove(e);
+        window.addEventListener('mousemove', this._mouseHandler);
+      }
+      if (track.includes('gyro')) {
+        this._setupDeviceOrientation();
+      }
+    }
     this._visHandler = () => {
       if (document.hidden) this._stopLoop();
       else this._startLoop();
@@ -264,10 +462,26 @@ class TfFace extends HTMLElement {
 
   _teardown() {
     this._stopLoop();
+    if (this._transitionRaf !== 0) {
+      cancelAnimationFrame(this._transitionRaf);
+      this._transitionRaf = 0;
+    }
     if (this._mouseHandler) {
       window.removeEventListener('mousemove', this._mouseHandler);
       this._mouseHandler = null;
     }
+    if (this._orientationHandler) {
+      window.removeEventListener('deviceorientation', this._orientationHandler);
+      this._orientationHandler = null;
+    }
+    if (this._orientationSetupHandler) {
+      window.removeEventListener('touchstart', this._orientationSetupHandler);
+      window.removeEventListener('click', this._orientationSetupHandler);
+      this._orientationSetupHandler = null;
+    }
+    this._orientationSetupAttempted = false;
+    this._betaBaseline = null;
+    this._gammaBaseline = null;
     if (this._visHandler) {
       document.removeEventListener('visibilitychange', this._visHandler);
       this._visHandler = null;
@@ -305,6 +519,11 @@ class TfFace extends HTMLElement {
     s.shakeT0 = null;
     s.shakeDuration = 0.8;
     s.speechAmp = 0;
+    s.transitioning = false;
+    s.zoomCx = null;
+    s.zoomCy = null;
+    s.yawOverride = null;
+    s.pitchOverride = null;
   }
 
   _syncCanvasSize() {
@@ -324,6 +543,9 @@ class TfFace extends HTMLElement {
       this._glowCanvas.width = gw;
       this._glowCanvas.height = gh;
       this._glowCtx = this._glowCanvas.getContext('2d', { alpha: true });
+    }
+    if (this._fullscreen && !this._state.transitioning) {
+      this._scaleMul = isMobileViewport() ? MOBILE_SCALE_MUL : DESKTOP_SCALE_MUL;
     }
   }
 
@@ -356,6 +578,67 @@ class TfFace extends HTMLElement {
     const my = ((e.clientY - rect.top) / rect.height - 0.5) * 2;
     this._state.targetYaw = mx * 0.25;
     this._state.targetPitch = -my * 0.18;
+  }
+
+  _handleDeviceOrientation(e) {
+    const gammaRaw = e.gamma;
+    const betaRaw = e.beta;
+    if (gammaRaw == null || betaRaw == null) return;
+    if (this._betaBaseline === null) this._betaBaseline = betaRaw;
+    if (this._gammaBaseline === null) this._gammaBaseline = gammaRaw;
+    const gDelta = gammaRaw - this._gammaBaseline;
+    const bDelta = betaRaw - this._betaBaseline;
+    const angle = (typeof screen !== 'undefined' && screen.orientation)
+      ? screen.orientation.angle : (window.orientation || 0);
+    let yawRaw, pitchRaw;
+    if (angle === 90) { yawRaw = -bDelta; pitchRaw = gDelta; }
+    else if (angle === -90 || angle === 270) { yawRaw = bDelta; pitchRaw = -gDelta; }
+    else if (angle === 180) { yawRaw = -gDelta; pitchRaw = -bDelta; }
+    else { yawRaw = gDelta; pitchRaw = bDelta; }
+    const clampG = (v) => Math.max(-GYRO_GAMMA_RANGE, Math.min(GYRO_GAMMA_RANGE, v));
+    const clampB = (v) => Math.max(-GYRO_BETA_RANGE, Math.min(GYRO_BETA_RANGE, v));
+    yawRaw = clampG(yawRaw);
+    pitchRaw = clampB(pitchRaw);
+    this._state.targetYaw = -(yawRaw / GYRO_GAMMA_RANGE) * GYRO_YAW_GAIN;
+    this._state.targetPitch = (pitchRaw / GYRO_BETA_RANGE) * GYRO_PITCH_GAIN;
+  }
+
+  _attachDeviceOrientationListener() {
+    if (typeof window === 'undefined') return;
+    if (typeof DeviceOrientationEvent === 'undefined') return;
+    if (this._orientationHandler) return;
+    this._orientationHandler = (e) => this._handleDeviceOrientation(e);
+    window.addEventListener('deviceorientation', this._orientationHandler);
+  }
+
+  _setupOrientationAfterGesture() {
+    if (this._orientationSetupAttempted) return;
+    this._orientationSetupAttempted = true;
+    if (typeof DeviceOrientationEvent === 'undefined') return;
+    const requestPermission = DeviceOrientationEvent.requestPermission;
+    if (typeof requestPermission === 'function') {
+      requestPermission.call(DeviceOrientationEvent).then((result) => {
+        if (result === 'granted') this._attachDeviceOrientationListener();
+      }).catch(() => {});
+    } else {
+      this._attachDeviceOrientationListener();
+    }
+  }
+
+  // iOS exposes gyro data only after requestPermission() from a user gesture,
+  // so the listener is armed lazily on the first touch/click.
+  _setupDeviceOrientation() {
+    if (typeof window === 'undefined') return;
+    if (typeof DeviceOrientationEvent === 'undefined') return;
+    const handler = () => {
+      window.removeEventListener('touchstart', handler);
+      window.removeEventListener('click', handler);
+      this._orientationSetupHandler = null;
+      this._setupOrientationAfterGesture();
+    };
+    this._orientationSetupHandler = handler;
+    window.addEventListener('touchstart', handler, { passive: true });
+    window.addEventListener('click', handler);
   }
 
   _applyBlendshapes(m) {
@@ -651,6 +934,8 @@ class TfFace extends HTMLElement {
       m.blink_right = 0;
     }
 
+    if (s.transitioning) { this._evalActions(t, m); return; }
+
     const uiMode = s.uiMode;
     const suppressLively = uiMode === 'speak' || uiMode === 'think';
     const dampenLively = uiMode === 'listen';
@@ -727,7 +1012,7 @@ class TfFace extends HTMLElement {
     this._ctx.clearRect(0, 0, w, h);
     const cx = w * 0.5;
     const cy = h * 0.56;
-    const baseScale = Math.min(w, h) * DESKTOP_SCALE_MUL;
+    const baseScale = Math.min(w, h) * this._scaleMul;
     this._project(cx, cy, baseScale, 0, PITCH_BASE_OFFSET);
     this._drawEdges(this._ctx, s.dpr);
   }
@@ -752,15 +1037,18 @@ class TfFace extends HTMLElement {
     const h = this._canvas.height;
     ctx.clearRect(0, 0, w, h);
 
-    const cx = w * 0.5;
-    const cy = h * 0.56;
-    const baseScale = Math.min(w, h) * DESKTOP_SCALE_MUL;
+    const cx = s.zoomCx !== null ? s.zoomCx : w * 0.5;
+    const cy = s.zoomCy !== null ? s.zoomCy : h * 0.56;
+    const baseScale = Math.min(w, h) * this._scaleMul;
 
     let yaw, pitch;
     if (s.shakeT0 !== null && (s.phase - s.shakeT0) >= s.shakeDuration) {
       s.shakeT0 = null;
     }
-    if (s.shakeT0 !== null) {
+    if (s.yawOverride !== null) {
+      yaw = s.yawOverride;
+      pitch = s.pitchOverride;
+    } else if (s.shakeT0 !== null) {
       const tShake = s.phase - s.shakeT0;
       const damp = 1 - tShake / s.shakeDuration;
       yaw = damp * Math.sin((tShake / s.shakeDuration) * Math.PI * 6) * 0.35;

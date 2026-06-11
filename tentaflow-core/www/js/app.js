@@ -23,7 +23,6 @@ import * as SystemEvents from '/js/modules/system-events.js';
 import { initTransport } from '/js/protocol/api-binary-shim.js';
 
 import LoginScreen from '/js/modules/login.js';
-import FaceBackground from '/js/modules/faceBackground.js';
 import DashboardScreen from '/js/modules/dashboard.js';
 import ServicesScreen from '/js/modules/services.js';
 import HubScreen from '/js/modules/hub.js';
