@@ -227,6 +227,9 @@ fn executor_err_to_core(
                 details: None,
             }
         }
+        ExecutorError::Resolve(ResolveError::NoLiveInstance(m)) => {
+            CoreError::AllBackendsUnavailable { model_name: m }
+        }
         ExecutorError::Resolve(other) => CoreError::InternalError {
             message: format!("alias resolution: {}", other),
             source: None,

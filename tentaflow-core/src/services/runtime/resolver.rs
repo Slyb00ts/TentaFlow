@@ -63,6 +63,12 @@ pub enum ResolveError {
         input: Vec<InputModality>,
         output: Vec<OutputModality>,
     },
+    /// Kandydaci pasują capability-owo, ale każda instancja odpadła z
+    /// powodu braku żywego handle'a (np. deploy w toku). Rozróżnione od
+    /// `CapabilityUnsupported`, bo komunikat o surface/modality byłby tu
+    /// mylący — problem leży w braku żywej instancji, nie w możliwościach.
+    #[error("model '{0}' has no live service instance")]
+    NoLiveInstance(String),
     #[error("alias chain limit hit while resolving '{requested}': {source}")]
     AliasLimit {
         requested: String,
@@ -156,9 +162,15 @@ impl AliasResolver {
         };
 
         let mut candidates = Vec::new();
-        self.expand_into(req, snapshot, entry, ctx, &mut candidates)?;
+        let mut dropped_no_live = false;
+        self.expand_into(req, snapshot, entry, ctx, &mut candidates, &mut dropped_no_live)?;
 
         if candidates.is_empty() {
+            // Capabilities pasowały, ale każda instancja odpadła przez brak
+            // żywego handle'a — komunikat o surface/modality byłby mylący.
+            if dropped_no_live {
+                return Err(ResolveError::NoLiveInstance(req.requested_model.to_string()));
+            }
             return Err(ResolveError::CapabilityUnsupported {
                 requested: req.requested_model.to_string(),
                 surface: req.required_surface,
@@ -190,6 +202,7 @@ impl AliasResolver {
         entry: &CatalogEntry,
         ctx: &mut ExecutionContext,
         out: &mut Vec<ResolvedExecutionTarget>,
+        dropped_no_live: &mut bool,
     ) -> Result<(), ResolveError> {
         match &entry.kind {
             CatalogEntryKind::Alias {
@@ -211,6 +224,7 @@ impl AliasResolver {
                     fallback_targets,
                     ctx,
                     out,
+                    dropped_no_live,
                 );
                 ctx.leave_alias();
                 result
@@ -219,7 +233,13 @@ impl AliasResolver {
                 if !satisfies(entry, req) {
                     return Ok(());
                 }
+                let before = out.len();
                 self.emit_service_model(&entry.id, instances, out);
+                // Capabilities pasowały, ale żadna instancja nie trafiła do
+                // kandydatów — odpadły przez brak żywego handle'a.
+                if out.len() == before {
+                    *dropped_no_live = true;
+                }
                 Ok(())
             }
             CatalogEntryKind::Flow {
@@ -254,6 +274,7 @@ impl AliasResolver {
         fallback_targets: &[String],
         ctx: &mut ExecutionContext,
         out: &mut Vec<ResolvedExecutionTarget>,
+        dropped_no_live: &mut bool,
     ) -> Result<(), ResolveError> {
         let primary = lookup_entry(snapshot, primary_target).ok_or_else(|| {
             ResolveError::AliasPrimaryMissing {
@@ -261,7 +282,7 @@ impl AliasResolver {
                 primary: primary_target.to_string(),
             }
         })?;
-        self.expand_into(req, snapshot, primary, ctx, out)?;
+        self.expand_into(req, snapshot, primary, ctx, out, dropped_no_live)?;
         for fb in fallback_targets {
             let Some(fb_entry) = lookup_entry(snapshot, fb) else {
                 tracing::trace!(
@@ -270,7 +291,7 @@ impl AliasResolver {
                 );
                 continue;
             };
-            if let Err(e) = self.expand_into(req, snapshot, fb_entry, ctx, out) {
+            if let Err(e) = self.expand_into(req, snapshot, fb_entry, ctx, out, dropped_no_live) {
                 tracing::trace!(
                     fallback = fb,
                     error = %e,
@@ -545,6 +566,24 @@ mod tests {
         let outcome = resolver.resolve(&req, &snap, &mut ctx).unwrap();
         assert_eq!(outcome.candidates.len(), 1);
         assert_eq!(outcome.candidates[0].requested_model(), "qwen-omni");
+    }
+
+    /// Lokalna instancja z pasującymi capabilities, ale bez żywego
+    /// handle'a w cache (deploy w toku) — błąd musi nazwać brak żywej
+    /// instancji, a nie mylnie raportować niedopasowanie capabilities.
+    #[test]
+    fn local_instance_without_handle_returns_no_live_instance() {
+        let entry = service_entry("m", "local", vec![ServiceSurface::Chat], vec![], vec![]);
+        let snap = snapshot(vec![entry]);
+        let resolver = resolver_for("local");
+        let mut ctx = ExecutionContext::new(None);
+        let err = resolver
+            .resolve(&chat_request("m"), &snap, &mut ctx)
+            .unwrap_err();
+        match err {
+            ResolveError::NoLiveInstance(model) => assert_eq!(model, "m"),
+            other => panic!("expected NoLiveInstance, got {:?}", other),
+        }
     }
 
     /// Wrong surface (asking for Stt while the entry is Chat) returns
