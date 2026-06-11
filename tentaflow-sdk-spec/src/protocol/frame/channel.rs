@@ -73,7 +73,7 @@ pub mod channels {
             0x01 => Some(0x0001..=0x07FF),
             0x02 => Some(0x0001..=0x00FF),
             0x03 => Some(0x0001..=0x00FF),
-            0x04 => Some(0x0010..=0x004C),
+            0x04 => Some(0x0010..=0x004D),
             0x05 => Some(0x0001..=0x00FF),
             0x06 => Some(0x0001..=0x00FF),
             0x07 => Some(0x0001..=0xFFFF),
@@ -122,8 +122,9 @@ mod tests {
         let r = channels::valid_kind_range(channels::MESH).unwrap();
         assert!(r.contains(&0x0010)); // HEARTBEAT
         assert!(r.contains(&0x004C)); // SYNC_SNAPSHOT_RESPONSE
+        assert!(r.contains(&0x004D)); // ROUTING_SYNC
         assert!(!r.contains(&0x000F));
-        assert!(!r.contains(&0x004D));
+        assert!(!r.contains(&0x004E));
     }
 
     #[test]

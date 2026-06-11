@@ -102,6 +102,7 @@ pub mod sync_kinds {
 ///   SYNC_SNAPSHOT_PULL, SYNC_SNAPSHOT_RESPONSE
 /// - 4c2.6b: NODE_INFO, HELLO, TOPOLOGY_ANNOUNCE, KNOWN_PEERS,
 ///   ALIAS_SYNC, MODEL_LIST, NODE_LEAVING
+/// - ROUTING_SYNC (broadcast konfiguracji routingu — klastry + czlonkowie)
 pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
     matches!(
         disc,
@@ -137,6 +138,7 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_ALIAS_SYNC
             | legacy::MESH_MSG_MODEL_LIST
             | legacy::MESH_MSG_NODE_LEAVING
+            | legacy::MESH_MSG_ROUTING_SYNC
     )
 }
 
@@ -153,6 +155,7 @@ pub mod kinds {
     pub const MODEL_LIST: Kind = Kind(legacy::MESH_MSG_MODEL_LIST as u16);
     pub const NODE_INFO: Kind = Kind(legacy::MESH_MSG_NODE_INFO as u16);
     pub const ALIAS_SYNC: Kind = Kind(legacy::MESH_MSG_ALIAS_SYNC as u16);
+    pub const ROUTING_SYNC: Kind = Kind(legacy::MESH_MSG_ROUTING_SYNC as u16);
     pub const NODE_LEAVING: Kind = Kind(legacy::MESH_MSG_NODE_LEAVING as u16);
     pub const HELLO: Kind = Kind(legacy::MESH_MSG_HELLO as u16);
     pub const TOPOLOGY_ANNOUNCE: Kind = Kind(legacy::MESH_MSG_TOPOLOGY_ANNOUNCE as u16);
@@ -256,6 +259,7 @@ mod tests {
             legacy::MESH_MSG_ALIAS_SYNC,
             legacy::MESH_MSG_MODEL_LIST,
             legacy::MESH_MSG_NODE_LEAVING,
+            legacy::MESH_MSG_ROUTING_SYNC,
         ];
         for d in migrated {
             assert!(

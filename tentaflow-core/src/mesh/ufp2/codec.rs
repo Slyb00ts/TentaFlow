@@ -160,7 +160,7 @@ pub fn encode_envelope(envelope: &Envelope) -> Result<Vec<u8>, FrameError> {
 /// 10 mandatory keys (no optionals, no fragments, no hop trail) and 17
 /// max keys, so the first byte falls in `0xAA..=0xB1`.
 ///
-/// Legacy MESH_MSG_* discriminators sit in `0x10..=0x4C`, with no overlap.
+/// Legacy MESH_MSG_* discriminators sit in `0x10..=0x4D`, with no overlap.
 pub const fn looks_like_ufp2_envelope_first_byte(first: u8) -> bool {
     first >= 0xAA && first <= 0xB1
 }
@@ -243,7 +243,7 @@ mod tests {
     fn looks_like_ufp2_envelope_first_byte_disjoint_from_legacy() {
         // Every UFP/2 envelope first byte must NOT collide with any legacy
         // MESH_MSG_* discriminator value.
-        for disc in 0x10u8..=0x4C {
+        for disc in 0x10u8..=0x4D {
             assert!(
                 !looks_like_ufp2_envelope_first_byte(disc),
                 "legacy discriminator 0x{:02X} must not be misinterpreted as UFP/2",

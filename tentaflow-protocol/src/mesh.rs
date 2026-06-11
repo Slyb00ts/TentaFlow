@@ -743,6 +743,10 @@ pub const MESH_MSG_SYNC_PULL_RESPONSE: u8 = 0x4A;
 pub const MESH_MSG_SYNC_SNAPSHOT_PULL: u8 = 0x4B;
 /// Sync Ledger snapshot response — metadane snapshotu, blob i tail operacji.
 pub const MESH_MSG_SYNC_SNAPSHOT_RESPONSE: u8 = 0x4C;
+/// Broadcast pelnego snapshotu trwalej konfiguracji routingu (klastry +
+/// czlonkowie) po mutacji create/update/delete. Odbiorca tylko zapisuje
+/// snapshot lokalnie — nigdy nie re-broadcastuje (anty-petla).
+pub const MESH_MSG_ROUTING_SYNC: u8 = 0x4D;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)

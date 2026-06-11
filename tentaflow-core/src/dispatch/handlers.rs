@@ -1470,6 +1470,8 @@ pub fn cluster_create(
     )
     .map_err(db_err)?;
 
+    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
+
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
@@ -1534,6 +1536,8 @@ pub fn cluster_update(
     )
     .map_err(db_err)?;
 
+    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
+
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -1577,6 +1581,8 @@ pub fn cluster_delete(
     }
 
     repository::delete_cluster(&ctx.state.db, &payload.cluster_id).map_err(db_err)?;
+
+    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -1630,6 +1636,8 @@ pub fn cluster_add_member(
     )
     .map_err(db_err)?;
 
+    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
+
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -1675,6 +1683,8 @@ pub fn cluster_remove_member(
 
     repository::remove_cluster_member(&ctx.state.db, &payload.cluster_id, &payload.node_id)
         .map_err(db_err)?;
+
+    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(

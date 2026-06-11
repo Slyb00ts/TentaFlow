@@ -2180,6 +2180,95 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
+                Ok(IrohMeshEvent::AliasSyncReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "AliasSync od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    let Some(ref pool) = db_pool else {
+                        debug!(peer = %from_node_id, "AliasSync bez db_pool — pomijam");
+                        continue;
+                    };
+                    match serde_json::from_slice::<Vec<crate::db::models::DbModelAlias>>(&data) {
+                        Ok(aliases) => {
+                            match crate::db::repository::replace_model_aliases_from_sync(
+                                pool, &aliases,
+                            ) {
+                                Ok(()) => {
+                                    debug!(
+                                        peer = %from_node_id,
+                                        count = aliases.len(),
+                                        "AliasSync: snapshot aliasow zapisany"
+                                    );
+                                    // Odswiez stan in-memory routera. Odbior synca
+                                    // NIE re-broadcastuje (anty-petla) — dlatego nie
+                                    // uzywamy broadcast_alias_mutation.
+                                    if let Some(router) = crate::routing::router::active_router()
+                                    {
+                                        router.update_alias_cache_from_sync(aliases);
+                                        router.rebuild_catalog();
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        peer = %from_node_id,
+                                        "AliasSync: blad zapisu snapshotu: {}", e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "AliasSync decode error: {}", e);
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::RoutingSyncReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "RoutingSync od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    let Some(ref pool) = db_pool else {
+                        debug!(peer = %from_node_id, "RoutingSync bez db_pool — pomijam");
+                        continue;
+                    };
+                    match serde_json::from_slice::<crate::routing::cluster_sync::RoutingSyncPayload>(
+                        &data,
+                    ) {
+                        Ok(payload) => {
+                            let clusters = payload.clusters.len();
+                            let members = payload.members.len();
+                            // Odbior synca tylko zapisuje snapshot — NIE
+                            // re-broadcastuje (anty-petla).
+                            match crate::routing::cluster_sync::apply_routing_sync(pool, payload) {
+                                Ok(()) => {
+                                    debug!(
+                                        peer = %from_node_id,
+                                        clusters,
+                                        members,
+                                        "RoutingSync: snapshot konfiguracji routingu zapisany"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        peer = %from_node_id,
+                                        "RoutingSync: blad zapisu snapshotu: {}", e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "RoutingSync decode error: {}", e);
+                        }
+                    }
+                }
                 Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data }) => {
                     let is_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&from_node_id),
