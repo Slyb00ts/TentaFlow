@@ -597,11 +597,11 @@ pub(crate) fn addon_skill_id(addon_id: &str) -> String {
 
 /// Optional frontmatter of a SKILL.md file (the three keys the Harness plan
 /// defines) plus the markdown body with the frontmatter block stripped.
-struct SkillFrontmatter {
-    name: Option<String>,
-    description: Option<String>,
-    tags: Vec<String>,
-    body: String,
+pub(crate) struct SkillFrontmatter {
+    pub(crate) name: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) body: String,
 }
 
 /// Strips surrounding single or double quotes from a scalar value.
@@ -622,7 +622,7 @@ fn unquote(value: &str) -> &str {
 /// would be dead weight. Supported tag shapes: inline `[a, b]`, a plain
 /// comma list, and a `- item` block list. A document without an opening
 /// `---` line (or with an unterminated block) is returned verbatim as body.
-fn parse_skill_frontmatter(raw: &str) -> SkillFrontmatter {
+pub(crate) fn parse_skill_frontmatter(raw: &str) -> SkillFrontmatter {
     let mut fm = SkillFrontmatter {
         name: None,
         description: None,

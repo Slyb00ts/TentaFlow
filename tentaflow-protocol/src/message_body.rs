@@ -1103,6 +1103,104 @@ pub struct SkillsForkResponse {
     pub skill_id: String,
 }
 
+// ----- Skills Hub: runtime fetch/install (Harness plan §3.2 source `hub`) -----
+//
+// Import a skill on the fly from a public source (a GitHub repo path resolved
+// through the Contents API, or a direct HTTPS URL to a SKILL.md). The import
+// lands in `quarantine` and an injection-pattern scan produces a verdict; an
+// admin approves (→ `active`) or rejects (→ delete). All fetches go through the
+// existing public-URL SSRF guard. Handlers are Admin-only.
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsHubSearchRequest {
+    pub query: String,
+    /// Optional single tap (`owner/repo`) or `https://` URL to scope the search.
+    /// Absent = search the configured taps.
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsHubSearchResponse {
+    /// JSON array of `{name, description, source, path, tags}` candidate skills.
+    pub results_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsHubImportRequest {
+    /// `owner/repo[/path]` (GitHub tap form) or an `https://` URL to a SKILL.md.
+    pub source: String,
+    /// Branch/tag/sha for the GitHub form; ignored for URL imports.
+    pub git_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsHubImportResponse {
+    pub skill_id: String,
+    /// JSON `{clean: bool, findings: [...]}` injection-scan verdict.
+    pub verdict_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsHubApproveRequest {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsHubApproveResponse {
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsHubRejectRequest {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsHubRejectResponse {
+    pub rejected: bool,
+}
+
+// Skills curator (Harness plan §3.2 — grouping/umbrella). A review pass proposes
+// merge/umbrella/archive actions (no autonomous mutation); the response carries a
+// structured proposal JSON + a snapshot id. Apply executes an admin-approved subset
+// against the live snapshot; rollback restores the captured pre-apply rows. All
+// handlers Admin-only.
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsCuratorRunRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsCuratorRunResponse {
+    /// JSON `{actions: [{action, skill_ids, target_name?, rationale}]}`.
+    pub proposal_json: String,
+    /// Handle for a subsequent apply / rollback against this proposal.
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsCuratorApplyRequest {
+    pub snapshot_id: String,
+    /// JSON array of approved action indices (into the proposal's `actions`).
+    pub approved_actions_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsCuratorApplyResponse {
+    /// Number of skills mutated (archived + umbrellas created).
+    pub mutated: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsCuratorRollbackRequest {
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SkillsCuratorRollbackResponse {
+    /// Number of skills restored.
+    pub restored: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum SkillsPayload {
     ListRequest(SkillsListRequest),
@@ -1115,6 +1213,20 @@ pub enum SkillsPayload {
     DeleteResponse(SkillsDeleteResponse),
     ForkRequest(SkillsForkRequest),
     ForkResponse(SkillsForkResponse),
+    HubSearchRequest(SkillsHubSearchRequest),
+    HubSearchResponse(SkillsHubSearchResponse),
+    HubImportRequest(SkillsHubImportRequest),
+    HubImportResponse(SkillsHubImportResponse),
+    HubApproveRequest(SkillsHubApproveRequest),
+    HubApproveResponse(SkillsHubApproveResponse),
+    HubRejectRequest(SkillsHubRejectRequest),
+    HubRejectResponse(SkillsHubRejectResponse),
+    CuratorRunRequest(SkillsCuratorRunRequest),
+    CuratorRunResponse(SkillsCuratorRunResponse),
+    CuratorApplyRequest(SkillsCuratorApplyRequest),
+    CuratorApplyResponse(SkillsCuratorApplyResponse),
+    CuratorRollbackRequest(SkillsCuratorRollbackRequest),
+    CuratorRollbackResponse(SkillsCuratorRollbackResponse),
 }
 
 // ----- Agents registry (Harness plan §3.3) -----
@@ -5507,6 +5619,33 @@ mod tests {
             })),
             MessageBody::SkillsBody(SkillsPayload::ForkResponse(SkillsForkResponse {
                 skill_id: "s2".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::HubSearchRequest(SkillsHubSearchRequest {
+                query: "pdf".to_string(),
+                source: Some("anthropics/skills".to_string()),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::HubSearchResponse(SkillsHubSearchResponse {
+                results_json: "[{\"name\":\"pdf\"}]".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::HubImportRequest(SkillsHubImportRequest {
+                source: "anthropics/skills/pdf".to_string(),
+                git_ref: Some("main".to_string()),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::HubImportResponse(SkillsHubImportResponse {
+                skill_id: "s3".to_string(),
+                verdict_json: "{\"clean\":true,\"findings\":[]}".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(SkillsHubApproveRequest {
+                skill_id: "s3".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::HubApproveResponse(SkillsHubApproveResponse {
+                approved: true,
+            })),
+            MessageBody::SkillsBody(SkillsPayload::HubRejectRequest(SkillsHubRejectRequest {
+                skill_id: "s3".to_string(),
+            })),
+            MessageBody::SkillsBody(SkillsPayload::HubRejectResponse(SkillsHubRejectResponse {
+                rejected: true,
             })),
         ];
         for body in bodies {

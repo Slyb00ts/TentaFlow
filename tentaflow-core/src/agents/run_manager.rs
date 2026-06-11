@@ -156,6 +156,13 @@ pub struct AgentRunManager {
     /// Live-run registry, shared with each spawned task so the task can evict
     /// its own entry on completion (dropping its permit + abort handle).
     runs: Arc<DashMap<String, RunHandle>>,
+    /// A `Weak` to the `Arc`-wrapped manager, so a finishing child's task can
+    /// start an auto-continuation parent run (§3.6 level 3) on the SAME manager
+    /// (counting toward its caps), without forcing the process-global instance —
+    /// tests wire their own. Set once via `attach_self` right after the `Arc` is
+    /// built (`init_global`, the test `manager()` helper). Empty = no
+    /// auto-continuation (a manager not yet attached, e.g. mid-construction).
+    weak_self: OnceLock<std::sync::Weak<AgentRunManager>>,
 }
 
 /// Process-global manager. Mirrors `progress_broker::global_broker` — one
@@ -167,6 +174,7 @@ static GLOBAL: OnceLock<Arc<AgentRunManager>> = OnceLock::new();
 /// already-installed instance (the first wins), so a re-entrant startup never
 /// forks the registry. Call once after the FlowDispatcher exists.
 pub fn init_global(manager: Arc<AgentRunManager>) -> Arc<AgentRunManager> {
+    manager.attach_self();
     let _ = GLOBAL.set(manager);
     GLOBAL.get().expect("manager just set").clone()
 }
@@ -194,7 +202,15 @@ impl AgentRunManager {
             progress,
             semaphore: Arc::new(Semaphore::new(cap)),
             runs: Arc::new(DashMap::new()),
+            weak_self: OnceLock::new(),
         }
+    }
+
+    /// Stores a `Weak` self-reference so a finishing child can start an
+    /// auto-continuation parent run on this same manager. Idempotent (first
+    /// wins). Call right after wrapping the manager in an `Arc`.
+    pub fn attach_self(self: &Arc<Self>) {
+        let _ = self.weak_self.set(Arc::downgrade(self));
     }
 
     fn runs_ref(&self) -> Arc<DashMap<String, RunHandle>> {
@@ -300,6 +316,7 @@ impl AgentRunManager {
         parent_run_id: Option<&str>,
         principal: &AgentPrincipal,
         inherited_tools: &[String],
+        target_session_id: Option<&str>,
     ) -> Result<String> {
         let agent = repository::get_agent(&self.db, agent_id)?
             .ok_or_else(|| anyhow!("agent '{agent_id}' not found"))?;
@@ -361,10 +378,12 @@ impl AgentRunManager {
             db: self.db.clone(),
             runner: self.runner.clone(),
             progress: self.progress.clone(),
+            manager: self.weak_self.get().cloned(),
             runs: self.runs_ref(),
             semaphore: self.semaphore.clone(),
             run_id: run_id.clone(),
             parent_run_id: parent_run_id.map(|s| s.to_string()),
+            target_session_id: target_session_id.map(|s| s.to_string()),
             flow_id,
             initial,
             principal: principal.clone(),
@@ -462,6 +481,7 @@ impl AgentRunManager {
                     Some(&caller.run_id),
                     &caller.principal,
                     &parent_tools,
+                    caller.session_id.as_deref(),
                 )
                 .await?;
             run_ids.push(run_id);
@@ -778,6 +798,11 @@ pub struct CallerRun {
     pub run_id: String,
     pub agent_id: String,
     pub principal: AgentPrincipal,
+    /// Chat session the spawning context belongs to (§3.6 level 2). A child
+    /// spawned here records it as `target_session_id` so its result reaches the
+    /// session's next interaction via the mailbox. `None` for a background
+    /// parent with no originating session.
+    pub session_id: Option<String>,
 }
 
 /// Everything the spawned task needs. Built in `spawn`, consumed by `run_task`.
@@ -785,10 +810,17 @@ struct TaskContext {
     db: DbPool,
     runner: Arc<dyn BackgroundFlowRunner>,
     progress: Arc<ProgressBroker>,
+    /// `Weak` to the owning manager, so the task can enqueue the mailbox + run an
+    /// auto-continuation parent run on completion (§3.6 levels 2 & 3). `None`
+    /// when the manager was not `attach_self`'d (no auto-continuation possible).
+    manager: Option<std::sync::Weak<AgentRunManager>>,
     runs: Arc<DashMap<String, RunHandle>>,
     semaphore: Arc<Semaphore>,
     run_id: String,
     parent_run_id: Option<String>,
+    /// Chat session the spawning context belonged to — the mailbox
+    /// `target_session_id` for this child's result.
+    target_session_id: Option<String>,
     flow_id: String,
     initial: FlowEnvelope,
     principal: AgentPrincipal,
@@ -809,10 +841,12 @@ async fn run_task(ctx: TaskContext) {
         db,
         runner,
         progress,
+        manager,
         runs,
         semaphore,
         run_id,
         parent_run_id,
+        target_session_id,
         flow_id,
         initial,
         principal,
@@ -936,6 +970,28 @@ async fn run_task(ctx: TaskContext) {
     // watch channel, not this event, so ordering vs. evict is safe.
     publish_child_finished(&progress, &run_id, parent_run_id.as_deref(), final_status);
 
+    // Mailbox + auto-continuation (§3.6 levels 2 & 3). A run that spawned a
+    // child (parent_run_id set) and completed with a result delivers that result
+    // back to the spawning context: always enqueue a mailbox entry addressed to
+    // the originating session and/or parent agent, and — if the parent agent
+    // opted into `on_child_complete='continue'` — start a fresh parent run with
+    // the child result as input. Failures/cancellations carry no result and skip
+    // delivery (nothing useful to hand back). The continuation goes through the
+    // same manager (`spawn`), so it counts toward depth + concurrency caps; a
+    // mutual-continuation loop dies on those limits like any other run.
+    if final_status == RunStatus::Completed {
+        if let (Some(parent), Some(result)) = (parent_run_id.as_deref(), result_text.as_deref()) {
+            deliver_child_result(
+                &db,
+                manager.clone(),
+                &run_id,
+                parent,
+                target_session_id.as_deref(),
+                result,
+            );
+        }
+    }
+
     // Drop the permit (returns the slot to the pool) before evicting so a queued
     // sibling can acquire it. Then evict the registry entry — any in-flight
     // waiter already holds its own watch::Receiver and observed the terminal
@@ -964,6 +1020,102 @@ fn publish_child_finished(
     if let Some(parent) = parent_run_id {
         progress.publish(parent, event);
     }
+}
+
+/// Delivers a finished child's result back to the context that spawned it
+/// (§3.6 levels 2 & 3). Always enqueues a mailbox entry addressed to the
+/// originating session and/or the parent run's agent (whichever is known), then,
+/// if the parent agent opted into `on_child_complete='continue'`, starts a fresh
+/// parent run with the child result as input. The continuation runs the parent
+/// AGENT (its own harness flow), inheriting the parent run's principal, and is a
+/// top-level run (no parent_run_id) so it does not re-enter the spawn-depth chain
+/// — it is a sibling of the original parent, bounded by the global concurrency
+/// cap. Best-effort: a failure to enqueue or spawn is logged, never fatal to the
+/// child's finalization.
+fn deliver_child_result(
+    db: &DbPool,
+    manager: Option<std::sync::Weak<AgentRunManager>>,
+    child_run_id: &str,
+    parent_run_id: &str,
+    target_session_id: Option<&str>,
+    result: &str,
+) {
+    let parent_run = match repository::get_agent_run(db, parent_run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("mailbox: parent run '{parent_run_id}' lookup failed: {e}");
+            return;
+        }
+    };
+
+    // A child must address at least one target or the mailbox row is
+    // unreachable. The parent run's agent is always a target; the originating
+    // session is an extra target when known.
+    let entry_id = uuid::Uuid::new_v4().to_string();
+    let entry = crate::db::models::NewAgentMailboxEntry {
+        id: &entry_id,
+        run_id: child_run_id,
+        target_session_id,
+        target_agent_id: Some(&parent_run.agent_id),
+        payload: result,
+    };
+    if let Err(e) = repository::enqueue_mailbox(db, &entry) {
+        tracing::warn!("mailbox: enqueue for child '{child_run_id}' failed: {e}");
+    }
+
+    // Auto-continuation (level 3) is opt-in per parent agent and autonomous, so
+    // it is gated strictly on the parent agent's `on_child_complete='continue'`.
+    let parent_agent = match repository::get_agent(db, &parent_run.agent_id) {
+        Ok(Some(agent)) => agent,
+        _ => return,
+    };
+    if parent_agent.on_child_complete != "continue" {
+        return;
+    }
+    let Some(manager) = manager.and_then(|w| w.upgrade()) else {
+        return;
+    };
+
+    // The continuation prompt is the child's result (Ralph-style: the parent
+    // resumes with what its delegate produced). Principal is inherited from the
+    // parent run; tools come from the parent agent's own allowlist (a top-level
+    // run, so no intersection narrowing applies). The continuation is launched on
+    // a fresh task — `spawn` returns a run id immediately, and detaching it here
+    // keeps `run_task`'s own future non-recursive (and `Send`): a child's
+    // finalization does not block on starting the parent's next run.
+    let principal = AgentPrincipal::new(parent_run.user_id.clone(), parent_run.org_id.clone());
+    let parent_tools: Vec<String> =
+        serde_json::from_str(&parent_agent.tools_json).unwrap_or_default();
+    let continuation_prompt = format!(
+        "A delegated task you spawned finished with this result:\n\n{result}\n\n\
+Continue your work using it.",
+    );
+    let child_run_id = child_run_id.to_string();
+    let target_session_id = target_session_id.map(|s| s.to_string());
+    tokio::spawn(async move {
+        match manager
+            .spawn(
+                &parent_agent.id,
+                &continuation_prompt,
+                None,
+                &principal,
+                &parent_tools,
+                target_session_id.as_deref(),
+            )
+            .await
+        {
+            Ok(new_run) => tracing::info!(
+                "auto-continuation: child '{child_run_id}' started parent run '{new_run}' \
+for agent '{}'",
+                parent_agent.id
+            ),
+            Err(e) => tracing::warn!(
+                "auto-continuation for agent '{}' failed: {e}",
+                parent_agent.id
+            ),
+        }
+    });
 }
 
 /// Parses the spawn argument into a list of tasks (single or batch form).
@@ -1070,7 +1222,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
 mod tests {
     use super::*;
     use crate::db::migrations;
-    use crate::db::models::AgentParams;
+    use crate::db::models::{AgentParams, AgentRunListFilter};
     use std::sync::Mutex;
 
     fn db() -> DbPool {
@@ -1107,6 +1259,43 @@ mod tests {
                 flow_id: Some("11111111-0000-4000-8000-000000000099"),
                 routable: true,
                 is_enabled: true,
+                on_child_complete: "notify",
+                actor_user_id: None,
+            },
+        )
+        .expect("seed agent");
+    }
+
+    /// Seeds an agent with an explicit `on_child_complete` (auto-continuation
+    /// tests). Same defaults as `seed_agent` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_agent_with_continue(
+        pool: &DbPool,
+        id: &str,
+        name: &str,
+        max_subagents: i64,
+        on_child_complete: &str,
+    ) {
+        repository::upsert_agent(
+            pool,
+            &AgentParams {
+                id,
+                name,
+                display_name: None,
+                description: "test agent",
+                system_prompt: None,
+                model: None,
+                tools_json: "[]",
+                skills_json: "{}",
+                params_json: "{}",
+                max_iterations: 5,
+                timeout_secs: 600,
+                max_subagents,
+                max_spawn_depth: 2,
+                flow_id: Some("11111111-0000-4000-8000-000000000099"),
+                routable: true,
+                is_enabled: true,
+                on_child_complete,
                 actor_user_id: None,
             },
         )
@@ -1197,12 +1386,16 @@ mod tests {
     }
 
     fn manager(db: DbPool, runner: Arc<dyn BackgroundFlowRunner>, cap: usize) -> Arc<AgentRunManager> {
-        Arc::new(AgentRunManager::new(
+        let mgr = Arc::new(AgentRunManager::new(
             db,
             runner,
             Arc::new(ProgressBroker::new()),
             cap,
-        ))
+        ));
+        // Attach the self-reference so auto-continuation (§3.6 level 3) can start
+        // a parent run on this same test-local manager (not the process-global).
+        mgr.attach_self();
+        mgr
     }
 
     #[tokio::test]
@@ -1221,7 +1414,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let run_id = mgr
-            .spawn("a1", "do it", None, &principal, &[])
+            .spawn("a1", "do it", None, &principal, &[], None)
             .await
             .expect("spawn");
 
@@ -1258,7 +1451,7 @@ mod tests {
 
         // A parent run row (created directly — the parent's own flow is elsewhere).
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[])
+            .spawn("parent", "lead", None, &principal, &[], None)
             .await
             .expect("spawn parent");
 
@@ -1266,6 +1459,7 @@ mod tests {
             run_id: parent_run.clone(),
             agent_id: "parent".into(),
             principal: principal.clone(),
+            session_id: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(
@@ -1332,13 +1526,14 @@ mod tests {
         let mut callers = Vec::new();
         for i in 0..(cap + 1) {
             let parent_run = mgr
-                .spawn("parent", &format!("lead-{i}"), None, &principal, &[])
+                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], None)
                 .await
                 .expect("spawn parent");
             callers.push(CallerRun {
                 run_id: parent_run,
                 agent_id: "parent".into(),
                 principal: principal.clone(),
+                session_id: None,
             });
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1395,13 +1590,14 @@ mod tests {
         );
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[])
+            .spawn("parent", "lead", None, &principal, &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
             run_id: parent_run,
             agent_id: "parent".into(),
             principal,
+            session_id: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "t"}))
@@ -1425,13 +1621,14 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[])
+            .spawn("parent", "lead", None, &principal, &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
             run_id: parent_run.clone(),
             agent_id: "parent".into(),
             principal: principal.clone(),
+            session_id: None,
         };
 
         // First child fits max_subagents=1.
@@ -1461,6 +1658,7 @@ mod tests {
                 Some(&parent_run),
                 &principal,
                 &[],
+                None,
             )
             .await
             .expect("spawn mid");
@@ -1468,6 +1666,7 @@ mod tests {
             run_id: child_run,
             agent_id: "spawner".into(),
             principal,
+            session_id: None,
         };
         let grand = mgr
             .handle_agent_spawn(&mid_caller, &json!({"agent_name": "worker", "task": "g"}))
@@ -1485,13 +1684,14 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[])
+            .spawn("parent", "lead", None, &principal, &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
             run_id: parent_run,
             agent_id: "parent".into(),
             principal,
+            session_id: None,
         };
         let out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "x"}))
@@ -1589,7 +1789,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         // First run wins the single permit and parks on the gate.
-        let run_a = mgr.spawn("a", "first", None, &principal, &[]).await.expect("spawn a");
+        let run_a = mgr.spawn("a", "first", None, &principal, &[], None).await.expect("spawn a");
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(mgr.semaphore.available_permits(), 0, "run holds the only permit");
 
@@ -1643,13 +1843,14 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[])
+            .spawn("parent", "lead", None, &principal, &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
             run_id: parent_run.clone(),
             agent_id: "parent".into(),
             principal: principal.clone(),
+            session_id: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -1689,5 +1890,198 @@ mod tests {
             1,
             "resume re-took a slot for a cancelled run"
         );
+    }
+
+    /// §3.6 level 2: when a child run (parent_run_id set) settles with a result,
+    /// the manager enqueues a mailbox entry addressed to the spawning session AND
+    /// the parent run's agent, so the result can be picked up later.
+    #[tokio::test]
+    async fn finished_child_enqueues_mailbox_for_its_target() {
+        let pool = db();
+        seed_agent(&pool, "parent", "boss", "[]", 4, 2);
+        seed_agent(&pool, "child", "worker", "[]", 0, 1);
+        let gate = Gate::new();
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: gate.clone(),
+                honor_cancel: false,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::user("u1");
+
+        let parent_run = mgr
+            .spawn("parent", "lead", None, &principal, &[], None)
+            .await
+            .expect("spawn parent");
+        // Caller carries the originating session — the mailbox target.
+        let caller = CallerRun {
+            run_id: parent_run.clone(),
+            agent_id: "parent".into(),
+            principal: principal.clone(),
+            session_id: Some("sess-7".into()),
+        };
+        let spawn_out = mgr
+            .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
+            .await
+            .expect("spawn child");
+        let child_id = spawn_out["run_ids"][0].as_str().unwrap().to_string();
+
+        // Release the child so it completes; its run_task enqueues the mailbox.
+        gate.open();
+        wait_until_status(&pool, &child_id, "completed").await;
+        // The task enqueues after writing the terminal row; poll briefly.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let entry = loop {
+            let by_session =
+                repository::list_undelivered_mailbox_for_session(&pool, "sess-7").unwrap();
+            if let Some(e) = by_session.into_iter().find(|e| e.run_id == child_id) {
+                break e;
+            }
+            if Instant::now() > deadline {
+                panic!("mailbox entry for child {child_id} never appeared");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(entry.payload, format!("result-of-{child_id}"));
+        assert_eq!(entry.target_agent_id.as_deref(), Some("parent"));
+        assert!(entry.delivered_at.is_none());
+
+        // Addressed to the parent agent too (the same entry is reachable by agent).
+        let by_agent = repository::list_undelivered_mailbox_for_agent(&pool, "parent").unwrap();
+        assert!(by_agent.iter().any(|e| e.id == entry.id));
+    }
+
+    /// §3.6 level 3: a parent agent with on_child_complete='continue' gets a new
+    /// run started when its child finishes (the child result is the new prompt).
+    #[tokio::test]
+    async fn continue_starts_a_new_parent_run_bounded_by_caps() {
+        let pool = db();
+        // Parent opts into auto-continuation; child does not spawn.
+        seed_agent_with_continue(&pool, "parent", "boss", 4, "continue");
+        seed_agent(&pool, "child", "worker", "[]", 0, 1);
+        let gate = Gate::new();
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: gate.clone(),
+                honor_cancel: false,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::user("u1");
+
+        let parent_run = mgr
+            .spawn("parent", "lead", None, &principal, &[], None)
+            .await
+            .expect("spawn parent");
+        let caller = CallerRun {
+            run_id: parent_run.clone(),
+            agent_id: "parent".into(),
+            principal: principal.clone(),
+            session_id: None,
+        };
+        let spawn_out = mgr
+            .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
+            .await
+            .expect("spawn child");
+        let child_id = spawn_out["run_ids"][0].as_str().unwrap().to_string();
+
+        gate.open();
+        wait_until_status(&pool, &child_id, "completed").await;
+
+        // A NEW top-level run of the parent agent (no parent_run_id) appears,
+        // distinct from the original parent run, with the child result as prompt.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let continuation = loop {
+            let runs = repository::list_agent_runs(
+                &pool,
+                &AgentRunListFilter {
+                    agent_id: Some("parent"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            if let Some(r) = runs
+                .into_iter()
+                .find(|r| r.id != parent_run && r.parent_run_id.is_none())
+            {
+                break r;
+            }
+            if Instant::now() > deadline {
+                panic!("auto-continuation run never started");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(continuation.prompt.contains(&format!("result-of-{child_id}")));
+        assert_eq!(continuation.agent_id, "parent");
+    }
+
+    /// §3.6 level 3 default: on_child_complete='notify' (the default) does NOT
+    /// start a new parent run — only the mailbox + event path runs.
+    #[tokio::test]
+    async fn notify_does_not_start_a_new_parent_run() {
+        let pool = db();
+        seed_agent_with_continue(&pool, "parent", "boss", 4, "notify");
+        seed_agent(&pool, "child", "worker", "[]", 0, 1);
+        let gate = Gate::new();
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: gate.clone(),
+                honor_cancel: false,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::user("u1");
+
+        let parent_run = mgr
+            .spawn("parent", "lead", None, &principal, &[], None)
+            .await
+            .expect("spawn parent");
+        let caller = CallerRun {
+            run_id: parent_run.clone(),
+            agent_id: "parent".into(),
+            principal: principal.clone(),
+            session_id: None,
+        };
+        let spawn_out = mgr
+            .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
+            .await
+            .expect("spawn child");
+        let child_id = spawn_out["run_ids"][0].as_str().unwrap().to_string();
+
+        gate.open();
+        wait_until_status(&pool, &child_id, "completed").await;
+        // The mailbox still gets the result (notify path), confirming the child
+        // settled fully — but no extra parent run is created.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mb = repository::list_undelivered_mailbox_for_agent(&pool, "parent").unwrap();
+            if mb.iter().any(|e| e.run_id == child_id) {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("notify path never enqueued the mailbox");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Give any (erroneous) continuation a moment to appear, then assert none.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let parent_runs = repository::list_agent_runs(
+            &pool,
+            &AgentRunListFilter {
+                agent_id: Some("parent"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            parent_runs.len(),
+            1,
+            "notify must not start a continuation run; got {parent_runs:?}"
+        );
+        assert_eq!(parent_runs[0].id, parent_run);
     }
 }

@@ -3188,6 +3188,7 @@ pub fn reseed_core_state_from_current_rows(
                         flow_id: agent.flow_id.as_deref(),
                         routable: agent.routable,
                         is_enabled: agent.is_enabled,
+                        on_child_complete: &agent.on_child_complete,
                         actor_user_id: None,
                     };
                     record_core_capture_tx(
@@ -4546,6 +4547,134 @@ pub fn replace_skill_files(
     Ok(())
 }
 
+// --- Skills curator snapshots (Harness §3.2 — reversible apply) ---
+
+/// Persists one pre-apply snapshot for a curator proposal. The header row carries
+/// the approved proposal JSON; each `rows` entry is the verbatim pre-apply state of
+/// a skill the apply step will touch (`existed=false` for an umbrella target the
+/// apply will create). Snapshot rows are node-local runtime state — not captured for
+/// sync. Returns nothing; the caller already holds the snapshot id.
+pub fn create_curator_snapshot(
+    pool: &DbPool,
+    snapshot_id: &str,
+    proposal_json: &str,
+    created_by: Option<&str>,
+    rows: &[DbCuratorSnapshotRow],
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO skill_curator_snapshots (id, proposal_json, status, created_by) \
+         VALUES (?1, ?2, 'open', ?3)",
+        rusqlite::params![snapshot_id, proposal_json, created_by],
+    )?;
+    for row in rows {
+        tx.execute(
+            "INSERT INTO skill_curator_snapshot_rows \
+             (snapshot_id, skill_id, existed, name, display_name, description, content, \
+              tags_json, category, source, source_ref, status, files_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                snapshot_id,
+                row.skill_id,
+                row.existed as i64,
+                row.name,
+                row.display_name,
+                row.description,
+                row.content,
+                row.tags_json,
+                row.category,
+                row.source,
+                row.source_ref,
+                row.status,
+                row.files_json,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn get_curator_snapshot(
+    pool: &DbPool,
+    snapshot_id: &str,
+) -> Result<Option<DbCuratorSnapshot>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, proposal_json, status, created_by, created_at, applied_at, rolled_back_at \
+         FROM skill_curator_snapshots WHERE id = ?1",
+    )?;
+    let result = stmt
+        .query_row(rusqlite::params![snapshot_id], |row| {
+            Ok(DbCuratorSnapshot {
+                id: row.get(0)?,
+                proposal_json: row.get(1)?,
+                status: row.get(2)?,
+                created_by: row.get(3)?,
+                created_at: row.get(4)?,
+                applied_at: row.get(5)?,
+                rolled_back_at: row.get(6)?,
+            })
+        })
+        .optional()?;
+    Ok(result)
+}
+
+pub fn list_curator_snapshot_rows(
+    pool: &DbPool,
+    snapshot_id: &str,
+) -> Result<Vec<DbCuratorSnapshotRow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT skill_id, existed, name, display_name, description, content, tags_json, \
+         category, source, source_ref, status, files_json \
+         FROM skill_curator_snapshot_rows WHERE snapshot_id = ?1 ORDER BY skill_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![snapshot_id], |row| {
+            Ok(DbCuratorSnapshotRow {
+                skill_id: row.get(0)?,
+                existed: row.get::<_, i64>(1)? != 0,
+                name: row.get(2)?,
+                display_name: row.get(3)?,
+                description: row.get(4)?,
+                content: row.get(5)?,
+                tags_json: row.get(6)?,
+                category: row.get(7)?,
+                source: row.get(8)?,
+                source_ref: row.get(9)?,
+                status: row.get(10)?,
+                files_json: row.get(11)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Marks a snapshot's lifecycle status (`applied` | `rolled_back`), stamping the
+/// matching timestamp column. Returns true when a row moved.
+pub fn set_curator_snapshot_status(
+    pool: &DbPool,
+    snapshot_id: &str,
+    status: &str,
+) -> Result<bool> {
+    let stamp_col = match status {
+        "applied" => "applied_at",
+        "rolled_back" => "rolled_back_at",
+        "open" => "created_at",
+        other => return Err(anyhow::anyhow!("invalid curator snapshot status: '{other}'")),
+    };
+    let conn = acquire(pool)?;
+    let rows = conn.execute(
+        &format!(
+            "UPDATE skill_curator_snapshots SET status = ?2, {stamp_col} = datetime('now') \
+             WHERE id = ?1"
+        ),
+        rusqlite::params![snapshot_id, status],
+    )?;
+    Ok(rows > 0)
+}
+
 #[cfg(test)]
 mod skills_repository_tests {
     use super::*;
@@ -4892,7 +5021,10 @@ pub const AGENT_RUN_STATES: &[&str] = &[
 
 const AGENT_COLS: &str = "id, name, display_name, description, system_prompt, model, tools_json, \
      skills_json, params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, \
-     flow_id, routable, is_enabled, created_at, updated_at";
+     flow_id, routable, is_enabled, on_child_complete, created_at, updated_at";
+
+/// Admissible `agents.on_child_complete` values (mirrors the column CHECK).
+pub const AGENT_ON_CHILD_COMPLETE_VALUES: &[&str] = &["notify", "continue"];
 
 const AGENT_RUN_COLS: &str = "id, agent_id, parent_run_id, flow_execution_id, user_id, org_id, \
      status, prompt, result, exit_reason, iterations, total_tokens, run_log, last_heartbeat_at, \
@@ -4916,8 +5048,9 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgent> {
         flow_id: row.get(13)?,
         routable: row.get::<_, i64>(14)? != 0,
         is_enabled: row.get::<_, i64>(15)? != 0,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
+        on_child_complete: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -4968,6 +5101,12 @@ pub fn validate_agent_params(params: &AgentParams<'_>) -> Result<()> {
     }
     if params.max_spawn_depth < 1 {
         return Err(anyhow::anyhow!("agent max_spawn_depth must be >= 1"));
+    }
+    if !AGENT_ON_CHILD_COMPLETE_VALUES.contains(&params.on_child_complete) {
+        return Err(anyhow::anyhow!(
+            "agent on_child_complete must be one of {AGENT_ON_CHILD_COMPLETE_VALUES:?}: '{}'",
+            params.on_child_complete
+        ));
     }
     // tools_json is an allowlist array; skills_json and params_json are objects.
     let _tools: Vec<String> = serde_json::from_str(params.tools_json)
@@ -5034,6 +5173,10 @@ fn agent_changed_fields(
         "is_enabled".to_string(),
         crate::sync::ledger::FieldValue::Bool(params.is_enabled),
     );
+    fields.insert(
+        "on_child_complete".to_string(),
+        field_string(params.on_child_complete),
+    );
     fields
 }
 
@@ -5093,8 +5236,8 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
         "INSERT INTO agents \
          (id, name, display_name, description, system_prompt, model, tools_json, skills_json, \
           params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, flow_id, \
-          routable, is_enabled) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+          routable, is_enabled, on_child_complete) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
          ON CONFLICT(id) DO UPDATE SET \
          name = excluded.name, display_name = excluded.display_name, \
          description = excluded.description, system_prompt = excluded.system_prompt, \
@@ -5103,7 +5246,8 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
          max_iterations = excluded.max_iterations, timeout_secs = excluded.timeout_secs, \
          max_subagents = excluded.max_subagents, max_spawn_depth = excluded.max_spawn_depth, \
          flow_id = excluded.flow_id, routable = excluded.routable, \
-         is_enabled = excluded.is_enabled, updated_at = datetime('now')",
+         is_enabled = excluded.is_enabled, on_child_complete = excluded.on_child_complete, \
+         updated_at = datetime('now')",
         rusqlite::params![
             params.id,
             params.name,
@@ -5121,6 +5265,7 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
             params.flow_id,
             params.routable as i64,
             params.is_enabled as i64,
+            params.on_child_complete,
         ],
     )?;
     record_core_capture_tx(
@@ -5319,6 +5464,153 @@ pub fn list_agent_runs_by_parent(pool: &DbPool, parent_run_id: &str) -> Result<V
     )
 }
 
+// --- Agent mailbox (runtime, not synced — Harness §3.6 level 2) ---
+
+const AGENT_MAILBOX_COLS: &str =
+    "id, run_id, target_session_id, target_agent_id, payload, created_at, delivered_at";
+
+fn row_to_agent_mailbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgentMailbox> {
+    Ok(DbAgentMailbox {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        target_session_id: row.get(2)?,
+        target_agent_id: row.get(3)?,
+        payload: row.get(4)?,
+        created_at: row.get(5)?,
+        delivered_at: row.get(6)?,
+    })
+}
+
+/// Enqueues a mailbox entry for a finished child run. The caller owns `id` (a
+/// fresh UUID). At least one target should be set or the row is unreachable —
+/// the manager only enqueues when a target exists.
+pub fn enqueue_mailbox(pool: &DbPool, entry: &NewAgentMailboxEntry<'_>) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO agent_mailbox \
+         (id, run_id, target_session_id, target_agent_id, payload) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            entry.id,
+            entry.run_id,
+            entry.target_session_id,
+            entry.target_agent_id,
+            entry.payload,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Undelivered entries addressed to a chat session, oldest first — drained by
+/// `agent_context` when it primes a run for that session.
+pub fn list_undelivered_mailbox_for_session(
+    pool: &DbPool,
+    session_id: &str,
+) -> Result<Vec<DbAgentMailbox>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {AGENT_MAILBOX_COLS} FROM agent_mailbox \
+         WHERE target_session_id = ?1 AND delivered_at IS NULL \
+         ORDER BY created_at, id"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], row_to_agent_mailbox)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Undelivered entries addressed to an agent, oldest first — drained by
+/// `agent_context` when it primes a run for that agent.
+pub fn list_undelivered_mailbox_for_agent(
+    pool: &DbPool,
+    agent_id: &str,
+) -> Result<Vec<DbAgentMailbox>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {AGENT_MAILBOX_COLS} FROM agent_mailbox \
+         WHERE target_agent_id = ?1 AND delivered_at IS NULL \
+         ORDER BY created_at, id"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![agent_id], row_to_agent_mailbox)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Stamps a mailbox entry delivered once its payload has been injected into a
+/// run's context. Idempotent: a second mark on an already-delivered row leaves
+/// `delivered_at` unchanged.
+pub fn mark_mailbox_delivered(pool: &DbPool, id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let rows = conn.execute(
+        "UPDATE agent_mailbox SET delivered_at = datetime('now') \
+         WHERE id = ?1 AND delivered_at IS NULL",
+        rusqlite::params![id],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Redacts a single run's PII columns past its retention term (§3.3): clears
+/// `run_log`/`prompt`/`result`, leaving the statistical row (status, counters,
+/// timestamps) for audit. Returns true when a row was redacted.
+pub fn redact_agent_run(pool: &DbPool, id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let rows = conn.execute(
+        "UPDATE agent_runs SET prompt = '', result = NULL, run_log = NULL WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Redacts one org's terminal agent runs finished before `cutoff` and deletes
+/// the mailbox entries that belong to them (§3.6 retention purge). One
+/// transaction so the two stay consistent. `cutoff` is a `datetime('now')`-
+/// comparable string the caller resolves from the org's `agent_runs` retention
+/// policy (e.g. `datetime('now','-30 days')`). `org_id` scopes the runs; a run
+/// with `org_id IS NULL` is treated as the default org and matched when
+/// `org_is_default` is true. A mailbox entry is purged when its referenced run
+/// is one of the redacted runs (the org boundary follows the run, since the
+/// mailbox row carries no org). Returns (runs_redacted, mailbox_deleted).
+pub fn purge_agent_runtime_before(
+    pool: &DbPool,
+    org_id: &str,
+    org_is_default: bool,
+    cutoff: &str,
+) -> Result<(usize, usize)> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    // Org match: exact org_id, plus NULL org_id for the default org (legacy /
+    // unattended runs that never carried an org are governed by the default
+    // policy). Only terminal runs are redacted — a live run keeps its
+    // prompt/log; an already-redacted run is skipped so the count reflects
+    // newly-redacted rows.
+    let org_match = "(org_id = ?1 OR (?2 AND org_id IS NULL))";
+    // Mailbox first (it references the runs about to be redacted): delete the
+    // entries whose child run is in this org and finished before the cutoff.
+    let mailbox = tx.execute(
+        &format!(
+            "DELETE FROM agent_mailbox WHERE run_id IN ( \
+                SELECT id FROM agent_runs \
+                WHERE finished_at IS NOT NULL AND finished_at < ?3 \
+                  AND status IN ('completed','failed','cancelled','interrupted') \
+                  AND {org_match})"
+        ),
+        rusqlite::params![org_id, org_is_default, cutoff],
+    )?;
+    let runs = tx.execute(
+        &format!(
+            "UPDATE agent_runs SET prompt = '', result = NULL, run_log = NULL \
+             WHERE finished_at IS NOT NULL AND finished_at < ?3 \
+               AND status IN ('completed','failed','cancelled','interrupted') \
+               AND {org_match} \
+               AND NOT (prompt = '' AND result IS NULL AND run_log IS NULL)"
+        ),
+        rusqlite::params![org_id, org_is_default, cutoff],
+    )?;
+    tx.commit()?;
+    Ok((runs, mailbox))
+}
+
 #[cfg(test)]
 mod agents_repository_tests {
     use super::*;
@@ -5346,6 +5638,7 @@ mod agents_repository_tests {
             flow_id: None,
             routable: true,
             is_enabled: true,
+            on_child_complete: "notify",
             actor_user_id: None,
         }
     }

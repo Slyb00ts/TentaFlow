@@ -556,7 +556,18 @@ async fn run_server(args: Args) -> Result<()> {
             tentaflow_core::agents::InteractionRegistry::new(),
         ));
         tracing::info!("AgentRunManager: global registry installed");
+
+        // Harness §3.6: periodic retention purge for agent runtime state —
+        // redacts expired agent_runs PII columns + deletes their mailbox entries
+        // per the org's agent_runs retention term (default 30 days). Runs once at
+        // startup, then daily.
+        tentaflow_core::agents::start_agent_runtime_purge_task(db.clone());
     }
+
+    // Harness §3.2: optional periodic skills curator REPORT pass. Spawns only when
+    // `curator_interval_hours` is set to a positive value; the task persists each
+    // proposal as an open snapshot for the dashboard and never auto-applies.
+    tentaflow_core::skills::start_curator_schedule_task(db.clone(), router.clone());
 
     // Auto-start wszystkich service-mode addonow ktore byly enabled przed
     // reboot'em — bez tego service mode dzialalby tylko w sesji w ktorej

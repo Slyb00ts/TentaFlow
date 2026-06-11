@@ -7,6 +7,7 @@ mod builtins;
 mod catalog;
 mod interaction;
 mod principal;
+mod retention_purge;
 mod run_manager;
 mod service;
 
@@ -22,6 +23,7 @@ pub use interaction::{
     DEFAULT_INTERACTION_TIMEOUT_SECS,
 };
 pub use principal::AgentPrincipal;
+pub use retention_purge::{purge_expired_agent_runtime, start_agent_runtime_purge_task};
 pub use run_manager::{
     global as agent_run_manager_global, init_global as agent_run_manager_init_global,
     AgentRunManager, BackgroundFlowRunner, CallerRun, FlowDispatcherRunner, RunStatus,

@@ -531,6 +531,7 @@ impl NodeAdapter for ToolExecNodeAdapter {
             run_id: run_id.clone(),
             agent_id: agent_id.unwrap_or_default().to_string(),
             principal: principal.clone(),
+            session_id: ctx.session_id.clone(),
         };
         // Parent chain for bubbling a child's question to the same principal
         // (§3.13 A): the dashboard sees the parent_run_id so the ask is visibly
@@ -712,6 +713,7 @@ mod tests {
                 flow_id: None,
                 routable: true,
                 is_enabled: true,
+                on_child_complete: "notify",
                 actor_user_id: None,
             },
         )

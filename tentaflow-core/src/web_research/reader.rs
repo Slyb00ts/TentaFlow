@@ -24,7 +24,12 @@ const DEFAULT_TIMEOUT_MS: u64 = 20_000;
 pub fn read_url(request: &ReadUrlRequest) -> Result<ReadPageResult> {
     let max_chars = request.max_chars.clamp(500, 200_000);
     let start_url = validate_public_http_url(&request.url)?;
-    let (final_url, status, content_type, body) = fetch_with_redirects(start_url)?;
+    let (final_url, status, content_type, body) = fetch_with_redirects(
+        start_url,
+        MAX_BODY_BYTES,
+        "text/html,text/plain,application/xhtml+xml",
+        ContentTypeGate::Readable,
+    )?;
     let extracted = extract_content(&body, &content_type, &final_url)?;
     let original_len = extracted.text.chars().count();
     let text = truncate_chars(&extracted.text, max_chars);
@@ -51,7 +56,35 @@ pub fn read_url(request: &ReadUrlRequest) -> Result<ReadPageResult> {
     })
 }
 
-fn fetch_with_redirects(mut url: Url) -> Result<(Url, StatusCode, String, String)> {
+/// Which content types a fetch will accept. The page reader only takes
+/// human-readable HTML/text (it runs readability afterwards); the skills hub
+/// also needs to fetch the GitHub Contents API, which returns JSON.
+#[derive(Clone, Copy)]
+enum ContentTypeGate {
+    Readable,
+    ReadableOrJson,
+}
+
+/// Fetches a public URL through the same SSRF guard the page reader uses —
+/// DNS pinning (`resolve_public_addrs`), per-hop redirect revalidation
+/// (`validate_public_http_url`) and a hard body-size cap — but returns the raw
+/// body. The skills hub reuses this for the GitHub Contents API and raw
+/// SKILL.md fetches instead of standing up a second HTTP client that would have
+/// to re-implement the guard. `body_cap` lets the caller pick a smaller ceiling
+/// than the reader's 8 MiB; `accept` is sent verbatim as the Accept header.
+pub fn fetch_raw_public_url(url: &str, body_cap: u64, accept: &str) -> Result<(String, String)> {
+    let start_url = validate_public_http_url(url)?;
+    let (_final_url, _status, content_type, body) =
+        fetch_with_redirects(start_url, body_cap, accept, ContentTypeGate::ReadableOrJson)?;
+    Ok((content_type, body))
+}
+
+fn fetch_with_redirects(
+    mut url: Url,
+    body_cap: u64,
+    accept: &str,
+    gate: ContentTypeGate,
+) -> Result<(Url, StatusCode, String, String)> {
     for _ in 0..=MAX_REDIRECTS {
         let addrs = resolve_public_addrs(&url)?;
         let host = url
@@ -67,7 +100,7 @@ fn fetch_with_redirects(mut url: Url) -> Result<(Url, StatusCode, String, String
         let response = client
             .get(url.clone())
             .header("User-Agent", "TentaFlow-WebResearch/1.0")
-            .header("Accept", "text/html,text/plain,application/xhtml+xml")
+            .header("Accept", accept)
             .send()
             .map_err(|e| WebResearchError::Http(e.to_string()))?;
 
@@ -94,13 +127,18 @@ fn fetch_with_redirects(mut url: Url) -> Result<(Url, StatusCode, String, String
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        validate_readable_content_type(&content_type)?;
+        match gate {
+            ContentTypeGate::Readable => validate_readable_content_type(&content_type)?,
+            ContentTypeGate::ReadableOrJson => {
+                validate_readable_or_json_content_type(&content_type)?
+            }
+        }
         let mut limited = Vec::new();
         response
-            .take(MAX_BODY_BYTES + 1)
+            .take(body_cap + 1)
             .read_to_end(&mut limited)
             .map_err(|e| WebResearchError::Http(format!("body read failed: {}", e)))?;
-        if limited.len() as u64 > MAX_BODY_BYTES {
+        if limited.len() as u64 > body_cap {
             return Err(WebResearchError::Http(
                 "response body too large".to_string(),
             ));
@@ -129,6 +167,17 @@ fn validate_readable_content_type(content_type: &str) -> Result<()> {
     )))
 }
 
+fn validate_readable_or_json_content_type(content_type: &str) -> Result<()> {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.contains("application/json")
+        || ct.contains("application/vnd.github")
+        || ct.contains("text/markdown")
+    {
+        return Ok(());
+    }
+    validate_readable_content_type(content_type)
+}
+
 pub(crate) fn truncate_chars(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars).collect()
 }
@@ -144,4 +193,22 @@ pub(crate) fn unix_time() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_fetch_rejects_private_and_non_https_targets() {
+        // The skills hub reuses this for GitHub/SKILL.md fetches — the SSRF guard
+        // must deny loopback, link-local and non-http schemes before any socket.
+        assert!(fetch_raw_public_url("http://127.0.0.1/x", 1024, "application/json").is_err());
+        assert!(fetch_raw_public_url("http://localhost/x", 1024, "application/json").is_err());
+        assert!(
+            fetch_raw_public_url("http://169.254.169.254/latest", 1024, "application/json")
+                .is_err()
+        );
+        assert!(fetch_raw_public_url("file:///etc/passwd", 1024, "text/plain").is_err());
+    }
 }
