@@ -7494,7 +7494,6 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&path_obj, "transport", path.transport.clone().into());
             set(&path_obj, "address", path.address.clone().into());
             set(&path_obj, "selected", path.selected.into());
-            set(&path_obj, "closed", path.closed.into());
             paths.push(&path_obj.into());
         }
         set(&connection_obj, "paths", paths.into());

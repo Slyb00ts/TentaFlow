@@ -92,7 +92,6 @@ codegen-units = 256
 opt-level = 0
 
 [patch.crates-io]
-ed25519-dalek = { path = "../vendor/ed25519-dalek" }
 llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
 sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
 whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }
