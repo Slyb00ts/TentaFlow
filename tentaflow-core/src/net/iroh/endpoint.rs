@@ -13,14 +13,13 @@ use std::net::SocketAddr;
 
 use futures::Stream;
 use iroh::{
-    address_lookup::{
-        AddrFilter, DhtAddressLookup, DiscoveryEvent, DnsAddressLookup, MdnsAddressLookup,
-        PkarrPublisher,
-    },
+    address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher},
     endpoint::{presets, PortmapperConfig, QuicTransportConfig},
     protocol::Router,
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
+use iroh_mainline_address_lookup::DhtAddressLookup;
+use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use std::time::Duration;
 
 use super::{ALPN_API, ALPN_BASELINE, ALPN_MESH, ALPN_PAIRING};

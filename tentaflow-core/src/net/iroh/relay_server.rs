@@ -46,17 +46,11 @@ pub async fn spawn_relay_server(config: RelayServerConfig) -> Result<Server> {
     // browser traffic until WebTransport/QUIC gets explicit TLS wiring.
     let _ = config.quic_bind_addr;
 
-    let server_config: ServerConfig<(), ()> = ServerConfig {
-        relay: Some(RelayConfig {
-            http_bind_addr: config.bind_addr,
-            tls: None,
-            limits: Default::default(),
-            key_cache_capacity: Some(1024),
-            access: iroh_relay::server::AccessConfig::Everyone,
-        }),
-        quic: None,
-        metrics_addr: None,
-    };
+    // RelayConfig::new defaults to AllowAll access, no TLS, default limits.
+    let mut relay_config = RelayConfig::new(config.bind_addr);
+    relay_config.key_cache_capacity = Some(1024);
+    let mut server_config = ServerConfig::default();
+    server_config.relay = Some(relay_config);
 
     Server::spawn(server_config)
         .await

@@ -9,11 +9,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use iroh::{
-    address_lookup::{DhtAddressLookup, MdnsAddressLookup},
-    endpoint::presets,
-    Endpoint, EndpointId, RelayUrl, SecretKey,
-};
+use iroh::{endpoint::presets, Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh_mainline_address_lookup::DhtAddressLookup;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 
 use crate::error::TransportError;
 
@@ -82,9 +80,8 @@ pub async fn build_server_endpoint(
         builder = builder.address_lookup(DhtAddressLookup::builder());
     }
 
-    if config.relay_url.is_some() {
-        // iroh 0.98: override relay wymaga osobnego API (relay_mode). Preset N0
-        // ustawia `use.iroh.network`. Do uzupelnienia po wyjsciu iroh 1.0.
+    if let Some(relay) = config.relay_url.clone() {
+        builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay)));
     }
 
     builder

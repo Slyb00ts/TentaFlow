@@ -331,7 +331,7 @@ pub async fn initiate_pairing_over_iroh(
     // Zawsze pairing relay-first: jesli hints nie niosa relay_url, uzupelniamy
     // go naszym home relay. Direct adresy (gdy sa) zostaja — iroh probuje ich
     // rownolegle i hole-punchuje LAN-side po otwartej sesji relay.
-    let receiver_hints = hints_with_relay_fallback(endpoint, receiver);
+    let receiver_hints = hints_with_relay_fallback(endpoint, receiver, Some(&local_relay_url));
     let endpoint_addr = endpoint_addr_from_hints(&receiver_hints)?;
 
     let request = PairingFirstContactRequest {
@@ -737,15 +737,25 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
 pub fn hints_with_relay_fallback(
     endpoint: &iroh::Endpoint,
     hints: &PairingContactHints,
+    configured_relay: Option<&str>,
 ) -> PairingContactHints {
     if !hints.relay_url.trim().is_empty() {
         return hints.clone();
     }
+    // endpoint.addr() lists the relay only once the home-relay session is up;
+    // right after startup it is empty, so the configured relay from config/DB
+    // is the backstop — without it early dials create p2p-only connections
+    // with no relay path to fail over to.
     let our_relay = endpoint
         .addr()
         .relay_urls()
         .next()
         .map(|u| u.to_string())
+        .or_else(|| {
+            configured_relay
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+        })
         .unwrap_or_default();
     if our_relay.is_empty() {
         return hints.clone();

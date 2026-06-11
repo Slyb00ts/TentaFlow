@@ -1051,6 +1051,24 @@ pub(crate) fn models_from_manifest(
 ) -> Vec<NewModel> {
     let capabilities = format!("[\"{}\"]", manifest.engine.capability_tag());
 
+    // Cloud external providers (requires_api_key) are addressed by the real API
+    // model id — the preset's `repo` (e.g. "gpt-5.5") — not the catalog preset id
+    // ("gpt-5-5"), so chat sends a name the provider accepts and the editor's
+    // live-model picker can pre-check it.
+    let cloud_external = manifest
+        .deploy
+        .external
+        .as_ref()
+        .map(|e| e.requires_api_key)
+        .unwrap_or(false);
+    let preset_model_name = |p: &crate::services::manifest::ModelPreset| -> String {
+        if cloud_external {
+            p.repo.clone()
+        } else {
+            p.id.clone()
+        }
+    };
+
     // 1. Custom HF repo from the wizard wins outright.
     if let Some(repo) = user_config
         .get("model_repo")
@@ -1079,7 +1097,7 @@ pub(crate) fn models_from_manifest(
         if let Some(p) = manifest.model_presets.iter().find(|m| m.id == id) {
             return vec![NewModel {
                 service_id: 0,
-                model_name: p.id.clone(),
+                model_name: preset_model_name(p),
                 display_name: Some(p.display_name.clone()),
                 capabilities,
                 context_length: None,
@@ -1102,7 +1120,7 @@ pub(crate) fn models_from_manifest(
         .unwrap_or(&manifest.model_presets[0]);
     vec![NewModel {
         service_id: 0,
-        model_name: chosen.id.clone(),
+        model_name: preset_model_name(chosen),
         display_name: Some(chosen.display_name.clone()),
         capabilities,
         context_length: None,

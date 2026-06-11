@@ -19,10 +19,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use iroh::{
-    address_lookup::{DiscoveryEvent, MdnsAddressLookup},
     endpoint::{presets, Endpoint},
     SecretKey,
 };
+use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tentaflow_core::net::iroh::{IrohConfig, IrohEndpoint};
 
 /// Sprawdza czy iroh sam z siebie emituje DiscoveryEvent::Discovered miedzy

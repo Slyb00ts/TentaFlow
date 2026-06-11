@@ -79,7 +79,6 @@ pub fn build_conn_info(
                     transport: p.transport.clone(),
                     address: p.address.clone(),
                     selected: p.selected,
-                    closed: p.closed,
                 })
                 .collect(),
         )
