@@ -2130,6 +2130,7 @@
     "attach": "Adjuntar",
     "attach_unavailable": "Adjuntos disponibles próximamente",
     "empty_response": "(respuesta vacía)",
+    "default_flow": "Chat predeterminado",
     "you": "Tú",
     "assistant": "Asistente",
     "connected": "Conectado",

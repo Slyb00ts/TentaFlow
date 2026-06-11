@@ -17,6 +17,17 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 
+/// Wybór flow dla streamowanego chatu (`route_chat_completion_stream`).
+#[derive(Debug, Clone)]
+pub enum ChatFlowSelector {
+    /// Standardowa rezolucja: binding modelu > default flow z DB > synthetic.
+    Auto,
+    /// Wymuszony synthetic chat-stream (opcja "Default Chat" w UI czatu).
+    Synthetic,
+    /// Konkretny flow użytkownika po ID (wybrany w selektorze czatu).
+    FlowId(String),
+}
+
 /// Bridge `StreamingExecution.stream` (CBOR `EnvelopeDelta::Llm`) na strumień
 /// `ChatCompletionChunk` zgodny z OpenAI SSE. Outcome receiver z executor'a
 /// jest spawnowany do background task'a (per plan: routing nie czeka na
@@ -568,6 +579,7 @@ impl Router {
         request: ChatCompletionRequest,
         user: Option<crate::auth::acl::UserContext>,
         compliance_context: Option<AiGatewayContext>,
+        flow_selector: ChatFlowSelector,
     ) -> Result<
         crate::routing::RouteResult<
             Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>,
@@ -678,10 +690,33 @@ impl Router {
             // (klient się rozłączył), token zostaje cancelled i finalizer
             // executor'a zauważa to przez biased select! (R7 plan).
             let stream_cancel = meta_stream.cancel_token.clone();
-            match dispatcher
-                .try_dispatch_streaming(&request.model, "chat", initial_stream, meta_stream)
-                .await
-            {
+            let dispatch_result = match &flow_selector {
+                ChatFlowSelector::Auto => {
+                    dispatcher
+                        .try_dispatch_streaming(&request.model, "chat", initial_stream, meta_stream)
+                        .await
+                }
+                ChatFlowSelector::Synthetic => {
+                    dispatcher
+                        .dispatch_synthetic_streaming(
+                            &request.model,
+                            "chat",
+                            initial_stream,
+                            meta_stream,
+                        )
+                        .await
+                }
+                ChatFlowSelector::FlowId(flow_id) => {
+                    dispatcher
+                        .dispatch_by_flow_id_streaming(
+                            flow_id.clone(),
+                            initial_stream,
+                            meta_stream,
+                        )
+                        .await
+                }
+            };
+            match dispatch_result {
                 Ok(stream_exec) => {
                     let model_for_stream = request.model.clone();
                     let include_usage = request

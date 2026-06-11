@@ -329,6 +329,7 @@ pub fn encode_me_preferences_update_request(language: Option<String>) -> Result<
 pub fn encode_chat_stream_request_simple(
     model_id: String,
     user_message: String,
+    flow_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ChatStreamRequestBody(ChatStreamRequest {
         model_id,
@@ -338,6 +339,7 @@ pub fn encode_chat_stream_request_simple(
         }],
         temperature: None,
         max_tokens: None,
+        flow_id,
     }))
     .map_err(|e| JsError::new(&e))
 }
@@ -3203,6 +3205,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 messages_arr.push(&item.into());
             }
             set(&obj, "messages", messages_arr.into());
+            match req.flow_id {
+                Some(f) => set(&obj, "flowId", f.into()),
+                None => set(&obj, "flowId", JsValue::NULL),
+            }
         }
         MessageBody::ChatStreamChunkBody(chunk) => {
             set(&obj, "variant", "ChatStreamChunk".into());
@@ -3216,6 +3222,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 "completionTokens",
                 (end.completion_tokens as u32).into(),
             );
+            match end.text {
+                Some(t) => set(&obj, "text", t.into()),
+                None => set(&obj, "text", JsValue::NULL),
+            }
         }
         MessageBody::FlowInvokeRequestBody(_) => {
             // Serwer nie odsyła requestu do klienta; arm dla wyczerpalności.

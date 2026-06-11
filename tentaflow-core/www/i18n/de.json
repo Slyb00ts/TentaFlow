@@ -2130,6 +2130,7 @@
     "attach": "Anhängen",
     "attach_unavailable": "Anhänge demnächst verfügbar",
     "empty_response": "(leere Antwort)",
+    "default_flow": "Standard-Chat",
     "you": "Du",
     "assistant": "Assistent",
     "connected": "Verbunden",
