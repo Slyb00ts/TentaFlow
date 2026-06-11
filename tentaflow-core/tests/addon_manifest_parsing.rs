@@ -870,6 +870,28 @@ fn test_backward_compat_teams_bot() {
     );
 }
 
+#[test]
+fn test_backward_compat_mcp() {
+    let manifest = std::fs::read_to_string("addons/mcp/manifest.toml").expect("read manifest");
+    let m = parse_manifest_toml(&manifest).expect("mcp manifest must still parse");
+    assert_eq!(m.addon_id, "mcp");
+    assert_eq!(m.tools.len(), 5);
+    assert!(m.network_rules.iter().any(|r| r.host == "*" && r.required));
+}
+
+#[test]
+fn test_backward_compat_ibm_mcp() {
+    let manifest = std::fs::read_to_string("addons/ibm-mcp/manifest.toml").expect("read manifest");
+    let m = parse_manifest_toml(&manifest).expect("ibm-mcp manifest must still parse");
+    assert_eq!(m.addon_id, "ibm-mcp");
+    assert_eq!(m.tools.len(), 5);
+    assert!(m.tools.iter().all(|t| t.name.starts_with("ibm_mcp_")));
+    assert!(m
+        .network_rules
+        .iter()
+        .any(|r| r.host == "*.ibm.com" && r.required));
+}
+
 // =============================================================================
 // Duplikaty pozostalych kolekcji
 // =============================================================================

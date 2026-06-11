@@ -1,0 +1,170 @@
+[addon]
+id = "ibm-mcp"
+name = "IBM MCP"
+version = "1.0.0"
+description = "Klient MCP dla serwerow IBM — watsonx Orchestrate, IBM MCP Gateway (ContextForge) i inne endpointy MCP IBM jako narzedzia AI. Gateway w LAN wymaga jawnej reguly sieciowej z dokladnym adresem (zakladka Network)."
+category = "ai"
+keywords = ["ibm", "mcp", "watsonx", "orchestrate", "contextforge", "tools", "agent"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = "https://www.ibm.com/products/watsonx-orchestrate"
+icon = "cloud"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "http.request"
+display_name = "Polaczenia do serwerow MCP IBM"
+description = "Wysyla zapytania JSON-RPC do skonfigurowanych serwerow MCP IBM przez HTTPS."
+risk = "high"
+
+[[permission]]
+id = "storage.read"
+display_name = "Odczyt konfiguracji serwerow"
+description = "Czyta zapisana liste serwerow MCP i mapowania dynamicznych narzedzi."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Zapis konfiguracji serwerow"
+description = "Zapisuje liste serwerow MCP i mapowania dynamicznych narzedzi."
+risk = "low"
+
+[[permission]]
+id = "secrets.read"
+display_name = "Odczyt tokenow serwerow"
+description = "Czyta tokeny uwierzytelniajace serwerow MCP IBM z magazynu sekretow."
+risk = "medium"
+
+[[permission]]
+id = "secrets.write"
+display_name = "Zapis tokenow serwerow"
+description = "Zapisuje tokeny uwierzytelniajace serwerow MCP IBM w magazynie sekretow."
+risk = "medium"
+
+[[network_rule]]
+id = "ibm-mcp-https"
+protocol = "tcp"
+host = "*.ibm.com"
+port = 443
+description = "HTTPS do endpointow MCP hostowanych przez IBM (watsonx, IBM Cloud)."
+required = true
+
+[[network_rule]]
+id = "ibm-mcp-selfhosted-https"
+protocol = "tcp"
+host = "*"
+port = 443
+description = "Opcjonalny dostep do self-hosted IBM MCP Gateway (ContextForge) poza domena ibm.com."
+required = false
+
+[visibility]
+admin_only = true
+default_groups = []
+show_in_catalog = true
+
+[resources]
+memory_mb = 64
+fuel_limit = 30000000
+http_requests_per_minute = 120
+
+[lifecycle]
+background = false
+auto_start = false
+
+[[tool]]
+id = "ibm_mcp_add_server"
+display_name = "Dodaj serwer IBM MCP"
+description = "Dodaje serwer MCP IBM (Streamable HTTP), weryfikuje go handshakem initialize i domyslnie rejestruje jego narzedzia jako narzedzia AI."
+keywords = ["ibm", "mcp", "server", "add", "configure"]
+
+[[tool.parameter]]
+name = "name"
+param_type = "string"
+description = "Krotka nazwa serwera, max 32 znaki [a-z0-9_-]."
+required = true
+
+[[tool.parameter]]
+name = "url"
+param_type = "string"
+description = "Pelny URL endpointu MCP, np. https://host.ibm.com/mcp."
+required = true
+
+[[tool.parameter]]
+name = "auth_token"
+param_type = "string"
+description = "Opcjonalny token uwierzytelniajacy (np. IBM Cloud IAM); bez schematu dostaje prefiks Bearer."
+required = false
+
+[[tool.parameter]]
+name = "auth_header"
+param_type = "string"
+description = "Naglowek auth, domyslnie Authorization (np. X-API-Key)."
+required = false
+
+[[tool.parameter]]
+name = "register_tools"
+param_type = "boolean"
+description = "Czy zarejestrowac narzedzia serwera jako narzedzia AI. Domyslnie true."
+required = false
+
+[[tool]]
+id = "ibm_mcp_remove_server"
+display_name = "Usun serwer IBM MCP"
+description = "Usuwa serwer MCP IBM, jego token i mapowania dynamicznych narzedzi."
+keywords = ["ibm", "mcp", "server", "remove"]
+
+[[tool.parameter]]
+name = "name"
+param_type = "string"
+description = "Nazwa serwera do usuniecia."
+required = true
+
+[[tool]]
+id = "ibm_mcp_list_servers"
+display_name = "Lista serwerow IBM MCP"
+description = "Zwraca skonfigurowane serwery MCP IBM (bez tokenow)."
+keywords = ["ibm", "mcp", "server", "list"]
+
+[[tool]]
+id = "ibm_mcp_list_tools"
+display_name = "Lista narzedzi serwera IBM MCP"
+description = "Pobiera liste narzedzi z serwera MCP IBM (tools/list); moze je tez zarejestrowac jako narzedzia AI."
+keywords = ["ibm", "mcp", "tools", "list", "discover"]
+
+[[tool.parameter]]
+name = "server"
+param_type = "string"
+description = "Nazwa serwera. Opcjonalna gdy skonfigurowany jest dokladnie jeden."
+required = false
+
+[[tool.parameter]]
+name = "register_tools"
+param_type = "boolean"
+description = "Czy zarejestrowac pobrane narzedzia jako narzedzia AI. Domyslnie false."
+required = false
+
+[[tool]]
+id = "ibm_mcp_call_tool"
+display_name = "Wywolaj narzedzie IBM MCP"
+description = "Wywoluje narzedzie na serwerze MCP IBM (tools/call) i zwraca jego wynik."
+keywords = ["ibm", "mcp", "tools", "call", "invoke"]
+
+[[tool.parameter]]
+name = "tool"
+param_type = "string"
+description = "Nazwa narzedzia na serwerze MCP."
+required = true
+
+[[tool.parameter]]
+name = "server"
+param_type = "string"
+description = "Nazwa serwera. Opcjonalna gdy skonfigurowany jest dokladnie jeden."
+required = false
+
+[[tool.parameter]]
+name = "arguments"
+param_type = "object"
+description = "Argumenty narzedzia zgodne z jego inputSchema."
+required = false

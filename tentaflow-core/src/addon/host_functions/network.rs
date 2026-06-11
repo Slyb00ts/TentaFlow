@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -103,59 +103,6 @@ impl NetworkConnectionManager {
     pub fn close_all(&mut self) {
         self.connections.clear();
     }
-}
-
-// =============================================================================
-// Walidacja IP — blokowanie adresow prywatnych/loopback (SSRF)
-// =============================================================================
-
-/// Sprawdza czy adres IP jest bezpieczny (publiczny).
-/// Blokuje: loopback, prywatne (RFC 1918), link-local, metadata chmurowe.
-fn is_safe_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.octets()[0] == 0
-                || v4.is_broadcast()
-            {
-                return false;
-            }
-            // Metadata chmurowe (169.254.169.254)
-            if v4.octets() == [169, 254, 169, 254] {
-                return false;
-            }
-            true
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return false;
-            }
-            // Link-local (fe80::/10)
-            if v6.segments()[0] & 0xffc0 == 0xfe80 {
-                return false;
-            }
-            // Unique local (fd00::/8)
-            if v6.segments()[0] & 0xff00 == 0xfd00 {
-                return false;
-            }
-            // IPv4-mapped IPv6 (::ffff:x.x.x.x) — sprawdz wewnetrzny IPv4
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 0
-                {
-                    return false;
-                }
-            }
-            true
-        }
-    }
-}
-
-/// VULN-043: Sprawdza czy adres IP jest prywatny/loopback (odwrotnosc is_safe_ip).
-/// Uzywa tej samej logiki co is_safe_ip — do weryfikacji peer_addr po polaczeniu (DNS rebinding).
-fn is_private_ip(ip: &IpAddr) -> bool {
-    !is_safe_ip(ip)
 }
 
 // =============================================================================
@@ -317,25 +264,9 @@ pub fn host_net_connect(
         return ABI_ERR_CONNECTION_FAILED;
     }
 
-    // Walidacja IP — blokuj adresy prywatne/loopback
-    for addr in &addrs {
-        if !is_safe_ip(&addr.ip()) {
-            warn!(
-                "net_connect: zablokowany adres prywatny/loopback: {}",
-                addr.ip()
-            );
-            audit_log(
-                caller.data(),
-                "net.connect",
-                Some("network"),
-                Some(&rule_id),
-                "denied",
-                Some(&format!("SSRF: adres {} jest prywatny/loopback", addr.ip())),
-            );
-            return ABI_ERR_PERMISSION;
-        }
-    }
-
+    // Cel pochodzi WPROST z zatwierdzonej reguly (host:port wpisany przez
+    // admina w ustawieniach), wiec adresy prywatne/LAN/loopback sa dozwolone
+    // — fail-closed realizuje wymog approved=1 powyzej, nie filtr IP.
     let target_addr = addrs[0];
 
     // 7. Nawiaz polaczenie TCP/UDP
@@ -343,27 +274,6 @@ pub fn host_net_connect(
         "tcp" => {
             match TcpStream::connect_timeout(&target_addr, CONNECT_TIMEOUT) {
                 Ok(stream) => {
-                    // VULN-043: Sprawdz peer_addr po polaczeniu — ochrona przed DNS rebinding
-                    if let Ok(peer) = stream.peer_addr() {
-                        if is_private_ip(&peer.ip()) {
-                            warn!(
-                                "net_connect: peer_addr {} prywatny po polaczeniu (DNS rebinding)",
-                                peer
-                            );
-                            audit_log(
-                                caller.data(),
-                                "net.connect",
-                                Some("network"),
-                                Some(&rule_id),
-                                "denied",
-                                Some(&format!(
-                                    "SSRF/DNS-rebinding: peer_addr {} jest prywatny",
-                                    peer
-                                )),
-                            );
-                            return ABI_ERR_PERMISSION;
-                        }
-                    }
                     // Ustaw timeouty
                     stream.set_read_timeout(Some(RECV_TIMEOUT)).ok();
                     stream.set_write_timeout(Some(SEND_TIMEOUT)).ok();

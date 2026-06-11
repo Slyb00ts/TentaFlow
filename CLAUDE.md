@@ -123,7 +123,11 @@ addon directory.
 
 `[[network_rule]].host` supports exact hosts, `*.domain` subdomain wildcards and `*` for
 public-web addons. Wildcards still require explicit admin approval, keep the declared port,
-and remain behind the host HTTP SSRF guard.
+and remain behind the host HTTP SSRF guard (public destinations only). Exact-host rules are
+the allowlist: once approved they may target ANY address, including private/LAN/loopback —
+admin explicitly approving `192.168.x.x:port` in the Network tab is the intended way to reach
+local services (e.g. a LAN MCP server). When a destination matches both, exact beats wildcard.
+`http.request` never follows redirects (addon receives the raw 3xx).
 
 `tentaflow-core/src/web_research/` is the central public-web research service for addons:
 configurable search providers (`searxng`, `duckduckgo`, `brave`, `tavily`), public URL reading with DNS
