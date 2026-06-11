@@ -61,27 +61,15 @@ let advancedRecommendation = null;
 let advancedRecommendDebounceTimer = null;
 
 // Cache `model_spec` (num_layers, num_kv_heads, head_dim, dtype) z pierwszego
-// fetchu — uzywamy go w `estimateKvGb` zeby pokazac szybki podglad VRAM
-// natychmiast po ruchu suwaka, zanim backend potwierdzi przez /recommend.
+// fetchu — pomocniczy kontekst dla readoutow (np. dtype wag). Pamiec KV NIE
+// jest juz liczona client-side: model puli vLLM (KRYT-1) i osobne K/V llama.cpp
+// liczy backend, a wizard pokazuje `vram_estimate.kv_pool_gb`/`pool_tokens`.
 let cachedModelSpec = null;
 
 // Poprzedni stan "at_limit" — gdy zmienia sie z false->true, dodajemy
 // klase pulse na adv-pill zeby user zauwazyl ze jest na granicy.
 let prevAtLimit = false;
 
-// Estymator KV cache po stronie klienta. Wzor:
-//   2 (K + V) * layers * kv_heads * head_dim * seq_len * batch * bytes_per_elem
-// Wartosci modelu czytamy z `cachedModelSpec`. Wynik w GB.
-function estimateKvGb({ num_layers, num_kv_heads, head_dim, max_model_len, max_num_seqs, kv_dtype_bytes = 2 }) {
-  if (!num_layers || !num_kv_heads || !head_dim || !max_model_len || !max_num_seqs) return null;
-  const bytes = 2 * num_layers * num_kv_heads * head_dim * max_model_len * max_num_seqs * kv_dtype_bytes;
-  return bytes / (1024 ** 3);
-}
-
-function kvDtypeBytes(kv) {
-  if (kv === 'fp8') return 1;
-  return 2; // auto/fp16/bfloat16
-}
 
 /// Publiczne API: otwiera wizard dla `engineId`. `opts` opcjonalnie zawiera
 /// `nodeId` (preselekcja z MeshDetail) i `hostOs` (z katalogu).
@@ -127,6 +115,11 @@ export async function openDeployWizard(engineId, opts = {}) {
       max_model_len: null,
       max_num_seqs: null,
       kv_cache_dtype: 'auto',
+      // llama.cpp: osobny typ V cache (None = rowny K). vLLM/MLX nie maja
+      // osobnego V — uzywaja samego `kv_cache_dtype`.
+      kv_cache_dtype_v: null,
+      // vLLM: opcjonalny `--max-num-batched-tokens` (driver szczytu aktywacji).
+      max_num_batched_tokens: 8192,
       gpu_memory_utilization: 0.9,
       gpu_memory_touched: false,
       // Quantization override do kalkulatora VRAM (`quantization_override`).
@@ -134,9 +127,17 @@ export async function openDeployWizard(engineId, opts = {}) {
       // np. NVFP4) albo `model_preset.quantization`. Pusty = dtype ze zrodla
       // (config.json). User moze zmienic w trybie manual i przeliczyc.
       quantization: null,
-      // MLX-only: budzet pamieci (MB) dla Apple unified memory. Kalkulator
-      // przelicza go na "max kontekst (tokeny)" client-side z model_spec.
-      mlx_max_memory_mb: 8192,
+      // MLX-only: budzet pamieci (MB) dla Apple unified memory. Backend liczy
+      // realny `pool_tokens` (engine='mlx') z tego budzetu + wybranych kv-bits.
+      // Default 16 GB — 8 GB jest mniejsze niz wagi modelu 7B+, wiec wizard
+      // otwieralby sie w permanentnym overflow. User moze zwiekszyc.
+      mlx_max_memory_mb: 16384,
+      // MLX kv-bits: 'none' | '8' | '4'. Mapowane na request `kv_cache_dtype`
+      // = none|kv8|kv4 (osobne od vLLM/llama, ale to samo pole wire).
+      mlx_kv_bits: 'none',
+      // MLX max rownoleglych sekwencji (mlx-lm batched generation). Cap puli,
+      // nie mnoznik pamieci pojedynczej sekwencji.
+      mlx_max_num_seqs: 1,
       lockedParam: null,           // 'max_model_len' | 'max_num_seqs' | 'tensor_parallel' | 'gpu_memory_utilization' | null
       // Speculative decoding via vLLM `--speculative-config`. Pre-fillsuje
       // sie z presetu (model_preset.speculator_*) jezeli wybrany preset go
@@ -619,9 +620,23 @@ function hfSearchFilterHint() {
   return '';
 }
 
+function engineId() {
+  return String(engineEntry?.engine?.id || '').toLowerCase();
+}
+
 function isLlamaCppEngine() {
-  const id = String(engineEntry?.engine?.id || '').toLowerCase();
+  const id = engineId();
   return id.includes('llama') || id.includes('llamacpp');
+}
+
+function isMlxEngine() {
+  return engineId() === 'mlx';
+}
+
+// vLLM-rodzina = silniki ktore akceptuja safetensors override kwantyzacji wag
+// i jeden select KV (auto/fp8). Wagi llama.cpp/MLX wynikaja z pobranego pliku.
+function isVllmFamilyEngine() {
+  return ['vllm', 'vllm-spark', 'sglang', 'tensorrt-llm'].includes(engineId());
 }
 
 function formatCount(n) {
@@ -660,15 +675,15 @@ function getAdvancedModelName() {
 }
 
 function getAdvancedGpus() {
-  // MLX nie ma dyskretnego GPU — recommend wolamy WYLACZNIE po model_spec +
-  // wagi. Syntetycznemu "urzadzeniu" dajemy DUZY budzet (nie realny limit MLX),
-  // bo backendowy auto_fit liczy vLLM workspace (~5 GB) i dla malego
-  // unified-memory budzetu zwrocilby twardy BadRequest ("zwieksz liczbe GPU"),
-  // przerywajac handler zanim odda model_spec. Realny limit (mlx_max_memory_mb)
-  // i tak liczymy client-side w computeMlxMaxContext — bez workspace'u vLLM.
-  if (String(engineEntry?.engine?.id || '').toLowerCase() === 'mlx') {
+  // MLX nie ma dyskretnego GPU — wysylamy REALNY budzet Apple unified memory
+  // jako pojedyncze "urzadzenie". Backend (engine='mlx', estimate_mlx_vram)
+  // liczy z niego pule KV bez workspace'u vLLM, wiec maly budzet nie wywala
+  // juz handlera twardym BadRequest. `gpu_memory_gb_each` = budzet / 1024.
+  if (isMlxEngine()) {
     const mb = Number(selection.advanced?.mlx_max_memory_mb) || 0;
-    return mb > 0 ? [{ index: 0, name: 'Apple unified memory', memory_gb: 4096 }] : [];
+    return mb > 0
+      ? [{ index: 0, name: 'Apple unified memory', memory_gb: mb / 1024 }]
+      : [];
   }
   const node = nodes.find((n) => (n.node_id || n.id) === selection.nodeId);
   if (!node) return [];
@@ -695,8 +710,11 @@ async function fetchVllmRecommendation(overrides = {}) {
   };
   // Jawne pole `engine` mowi backendowi ktorym modelem fizycznym liczyc VRAM.
   // Bez niego GGUF wykrywa sie po nazwie pliku, ale jawne pole jest pewne i
-  // dziala tez dla nie-GGUF modeli llama.cpp.
+  // dziala tez dla nie-GGUF modeli llama.cpp. MLX czyta config.json (NIE GGUF),
+  // ale ma wlasna fizyke unified-memory (estimate_mlx_vram) — bez engine='mlx'
+  // backend cicho spadalby na vLLM math i raportowal fałszywy budzet.
   if (isLlamaCppEngine()) body.engine = 'llama-cpp';
+  else if (isMlxEngine()) body.engine = 'mlx';
   // llama.cpp/GGUF: repo nie ma config.json, wiec backend liczy VRAM z metadanych
   // wybranego pliku .gguf. Bez sciezki pliku backend nie ma czego odczytac.
   // Wysylamy pole tylko gdy plik jest wybrany — pusty string oznaczalby dla
@@ -710,9 +728,7 @@ async function fetchVllmRecommendation(overrides = {}) {
     // structach — patrz tentaflow-protocol-wasm decode_message_body).
     const resp = wireResp && wireResp.json ? JSON.parse(wireResp.json) : wireResp;
     if (resp && resp.model_spec && !cachedModelSpec) {
-      // Cache field set wystarczajacy dla estimateKvGb. Backendy moga
-      // raportowac kv_heads pod alternatywnymi nazwami — bierzemy pierwszy
-      // niepusty.
+      // Cache pomocniczy: dtype wag do readoutow. Pamiec KV liczy backend.
       const ms = resp.model_spec;
       cachedModelSpec = {
         num_layers: ms.num_hidden_layers || ms.num_layers || 0,
@@ -727,76 +743,95 @@ async function fetchVllmRecommendation(overrides = {}) {
   }
 }
 
-// MLX: ile tokenow kontekstu zmiesci sie w budzecie pamieci. Closed-form na
-// podstawie model_spec (z recommend round-tripu) + wag — bez workspace'u vLLM.
-// KV jest fp16 (mlx-swift nie ma kwantyzacji KV cache).
-function computeMlxMaxContext() {
-  const ms = cachedModelSpec;
+// Mapuje wybor kv-bits ('none'|'8'|'4') na etykiete wire `kv_cache_dtype`
+// (none|kv8|kv4) ktora backend (estimate_mlx_vram) rozpoznaje.
+function mlxKvDtypeLabel() {
+  const bits = String(selection.advanced?.mlx_kv_bits || 'none');
+  if (bits === '8') return 'kv8';
+  if (bits === '4') return 'kv4';
+  return 'none';
+}
+
+// Maksymalny kontekst per sekwencja jaki zmiesci sie w budzecie — z backendu.
+// `pool_tokens` to cala pula KV; przy N sekwencjach kontekst per sekwencja to
+// pool_tokens / N (mlx-lm dzieli pule miedzy sloty). Floor do 512.
+function mlxMaxContextFromBackend() {
   const rec = advancedRecommendation;
-  const budgetMb = Number(selection.advanced?.mlx_max_memory_mb) || 0;
-  if (!ms || !ms.num_layers || !ms.num_kv_heads || !ms.head_dim || budgetMb <= 0) return null;
-  const weightsGb = (rec && rec.vram_estimate && rec.vram_estimate.model_weights_gb) || 0;
-  const kvPerTokGb = estimateKvGb({
-    num_layers: ms.num_layers,
-    num_kv_heads: ms.num_kv_heads,
-    head_dim: ms.head_dim,
-    max_model_len: 1,
-    max_num_seqs: 1,
-    kv_dtype_bytes: 2,
-  });
-  if (!kvPerTokGb) return null;
-  const availGb = budgetMb / 1024 - weightsGb;
-  if (availGb <= 0) return { tokens: 0, weightsGb, kvGb: 0, overflow: true };
-  let tokens = Math.floor(availGb / kvPerTokGb);
-  const maxPos = (rec && rec.model_spec && rec.model_spec.max_position_embeddings) || 0;
-  if (maxPos > 0) tokens = Math.min(tokens, maxPos);
-  tokens = Math.max(0, Math.floor(tokens / 512) * 512);
-  const kvGb = estimateKvGb({
-    num_layers: ms.num_layers, num_kv_heads: ms.num_kv_heads, head_dim: ms.head_dim,
-    max_model_len: tokens || 1, max_num_seqs: 1, kv_dtype_bytes: 2,
-  }) || 0;
-  return { tokens, weightsGb, kvGb };
+  if (!rec || rec.error || !rec.vram_estimate) return null;
+  const pool = Number(rec.vram_estimate.pool_tokens) || 0;
+  const seqs = Math.max(1, Number(selection.advanced?.mlx_max_num_seqs) || 1);
+  let perSeq = Math.floor(pool / seqs);
+  const maxPos = Number(rec.model_spec?.max_position_embeddings) || 0;
+  if (maxPos > 0) perSeq = Math.min(perSeq, maxPos);
+  return Math.max(0, Math.floor(perSeq / 512) * 512);
 }
 
 // Readout "max kontekst" — wydzielony, zeby handler inputa odswiezal tylko go
 // (bez re-renderu calego body, co gubiloby focus na polu).
 function mlxReadoutHtml() {
   const rec = advancedRecommendation;
-  const calc = computeMlxMaxContext();
-  const maxPos = (rec && rec.model_spec && rec.model_spec.max_position_embeddings) || 0;
-  if (!rec) return '<div class="adv-loading">Liczenie z konfiguracji modelu…</div>';
+  if (!rec) return `<div class="adv-loading">${escapeHtml(tAdv('mlx_computing'))}</div>`;
   if (rec.error) return `<div class="adv-error">${escapeHtml(rec.error)}</div>`;
-  if (!calc) return '<div class="adv-loading">Podaj limit pamięci, aby policzyć kontekst.</div>';
-  if (calc.overflow) return `<div class="adv-error">Same wagi modelu (${calc.weightsGb.toFixed(1)} GB) przekraczają budżet — zwiększ limit pamięci.</div>`;
+  const v = rec.vram_estimate || {};
+  const weightsGb = Number(v.model_weights_gb) || 0;
+  const kvPoolGb = Number(v.kv_pool_gb) || 0;
+  const maxPos = Number(rec.model_spec?.max_position_embeddings) || 0;
+  if (v.fits_per_gpu === false || v.fits_total === false) {
+    return `<div class="adv-error">${escapeHtml(tAdv('mlx_weights_overflow', { gb: weightsGb.toFixed(1) }))}</div>`;
+  }
+  const tokens = mlxMaxContextFromBackend();
+  if (tokens == null) return `<div class="adv-loading">${escapeHtml(tAdv('mlx_set_budget'))}</div>`;
   return `
-    <div class="adv-cell-value" style="font-size:1.4em;"><strong>${calc.tokens.toLocaleString()}</strong> tokenów</div>
-    <div class="adv-cell-sub">KV cache ${calc.kvGb.toFixed(2)} GB + wagi ${calc.weightsGb.toFixed(1)} GB${maxPos ? ` · natywny limit modelu ${maxPos.toLocaleString()}` : ''}</div>`;
+    <div class="adv-cell-value" style="font-size:1.4em;"><strong>${tokens.toLocaleString()}</strong> ${escapeHtml(tAdv('mlx_tokens_unit'))}</div>
+    <div class="adv-cell-sub">${escapeHtml(tAdv('mlx_readout_sub', {
+      pool: kvPoolGb.toFixed(2),
+      weights: weightsGb.toFixed(1),
+      max: maxPos ? maxPos.toLocaleString() : '—',
+    }))}</div>`;
 }
 
-// MLX advanced step — reuzywa ten sam krok co vLLM, ale liczy budzet pamieci
-// -> max kontekst zamiast vLLM args (zadnych TP/PP/seqs/speculative).
+// MLX advanced step — reuzywa ten sam krok co vLLM, ale liczy budzet pamieci +
+// kv-bits + seqs -> max kontekst (z backendu). Single device: zadnych TP/PP,
+// zadnego gpu_memory_utilization-jako-VRAM, zadnego override kwantyzacji wag
+// (wagi wynikaja z pobranego repo mlx-community).
 function renderMlxAdvanced() {
   const model = getAdvancedModelName() || '?';
   const adv = selection.advanced;
+  const kvBits = String(adv.mlx_kv_bits || 'none');
+  const seqs = Math.max(1, Number(adv.mlx_max_num_seqs) || 1);
 
   return `
-    <h4 class="wizard-step-title">Limit pamięci i kontekst (MLX)</h4>
-    <p class="form-hint" style="margin-bottom:14px;">
-      Apple unified memory — ustaw, ile maksymalnie pamięci model może użyć.
-      Runtime przerwie zadanie czystym błędem zamiast OOM, gdy kontekst tego nie zmieści.
-    </p>
+    <h4 class="wizard-step-title">${escapeHtml(tAdv('mlx_title'))}</h4>
+    <p class="form-hint" style="margin-bottom:14px;">${escapeHtml(tAdv('mlx_subtitle'))}</p>
     <div class="adv-section">
       <div class="adv-summary-cell">
-        <div class="adv-cell-label">Model</div>
+        <div class="adv-cell-label">${escapeHtml(tAdv('summary_model'))}</div>
         <div class="adv-cell-value"><code>${escapeHtml(model)}</code></div>
       </div>
     </div>
     <div class="adv-section">
-      <div class="adv-sec-title">Limit pamięci (MB)</div>
+      <div class="adv-sec-title">${escapeHtml(tAdv('mlx_mem_title'))}</div>
       <tf-input id="edw-mlx-mem" type="number" min="512" step="256"
         value="${escapeAttr(String(adv.mlx_max_memory_mb || ''))}" style="max-width:220px;"></tf-input>
+      <div class="adv-hint">${escapeHtml(tAdv('mlx_mem_hint'))}</div>
+      <div class="adv-row-2" style="margin-top:14px;">
+        <div class="adv-form-row">
+          <label>${escapeHtml(tAdv('mlx_kv_label'))}</label>
+          <tf-select id="edw-mlx-kv" value="${escapeAttr(kvBits)}">
+            <option value="none">${escapeHtml(tAdv('mlx_kv_opt_none'))}</option>
+            <option value="8">${escapeHtml(tAdv('mlx_kv_opt_8'))}</option>
+            <option value="4">${escapeHtml(tAdv('mlx_kv_opt_4'))}</option>
+          </tf-select>
+          <div class="adv-hint">${escapeHtml(tAdv('mlx_kv_hint'))}</div>
+        </div>
+        <div class="adv-form-row">
+          <label><span>${escapeHtml(tAdv('mlx_seqs_label'))}</span><span class="v" id="edw-mlx-seqs-val">${seqs}</span></label>
+          <input type="range" class="adv-range" id="edw-mlx-seqs" min="1" max="32" step="1" value="${seqs}">
+          <div class="adv-hint">${escapeHtml(tAdv('mlx_seqs_hint'))}</div>
+        </div>
+      </div>
       <div style="margin-top:14px;">
-        <div class="adv-cell-label">Maksymalny kontekst, który się zmieści</div>
+        <div class="adv-cell-label">${escapeHtml(tAdv('mlx_max_ctx_label'))}</div>
         <div id="edw-mlx-readout">${mlxReadoutHtml()}</div>
       </div>
     </div>
@@ -804,7 +839,7 @@ function renderMlxAdvanced() {
 }
 
 function renderStepAdvanced() {
-  if (String(engineEntry?.engine?.id || '').toLowerCase() === 'mlx') {
+  if (isMlxEngine()) {
     return renderMlxAdvanced();
   }
   const model = getAdvancedModelName() || '?';
@@ -957,12 +992,15 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   const totalUsed = (typeof v.total_gb === 'number' && v.total_gb > 0) ? v.total_gb : perGpu * tpPp;
   const headroomGb = totalVramGb - totalUsed;
   const pctUsed = totalVramGb > 0 ? Math.min(200, Math.round((totalUsed / totalVramGb) * 100)) : 0;
-  const fits = v.fits_per_gpu !== false && pctUsed <= 95;
+  // Werdykt OOM nalezy do backendu (model puli: dla vLLM total_gb ≈ util×VRAM
+  // gdy sie miesci, co jest POPRAWNE — vLLM realnie zajmuje util×VRAM). Czerwien
+  // tylko gdy backend zwroci fits_per_gpu/fits_total == false. NIE traktujemy
+  // wysokiego pctUsed jako OOM, inaczej "mieszczacy sie" deploy migalby na
+  // czerwono mimo poprawnej konfiguracji.
+  const backendFits = v.fits_per_gpu !== false && v.fits_total !== false;
 
-  // Backend (po ukonczeniu refactoru rust) raportuje `at_limit: true` gdy
-  // konfiguracja jest na granicy — wtedy pokazujemy zolty pill nawet jezeli
-  // pctUsed jeszcze nie przekroczylo progu (np. backend juz auto_adjusted
-  // parametry, fits, ale dalej recznie nie ma sie gdzie ruszyc).
+  // Backend raportuje `at_limit: true` gdy konfiguracja jest na granicy — wtedy
+  // pokazujemy zolty pill (auto_adjusted, mieści się, ale brak zapasu).
   const backendAtLimit = rec && rec.at_limit === true;
   let pillCls = 'adv-pill ok';
   let pillTxt = backendAtLimit ? tAdv('pill_at_limit', { p: pctUsed }) : tAdv('pill_fits');
@@ -970,10 +1008,10 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   let kvCls = '';
   let leftCls = 'success';
   let totalCls = 'accent';
-  if (pctUsed > 95) {
+  if (!backendFits) {
     pillCls = 'adv-pill danger'; pillTxt = tAdv('pill_oom', { p: pctUsed });
     barCls = 'danger'; kvCls = 'danger'; leftCls = 'danger'; totalCls = 'danger';
-  } else if (pctUsed > 80 || backendAtLimit) {
+  } else if (pctUsed > 90 || backendAtLimit) {
     pillCls = 'adv-pill warn';
     if (!backendAtLimit) pillTxt = tAdv('pill_warn', { p: pctUsed });
     barCls = 'warn'; kvCls = 'warn'; leftCls = 'warn';
@@ -985,7 +1023,12 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   if (becameAtLimit) pillCls += ' pulse';
 
   const weightsGb = v.model_weights_gb || 0;
-  const kvGb = v.kv_cache_gb || 0;
+  // KV to PULA resztkowa (vLLM: util*VRAM - wagi - aktywacje), nie skladnik
+  // wymagany. `kv_pool_gb` jest autorytatywne; `kv_cache_gb` zostaje fallbackiem
+  // dla starszych odpowiedzi. Pula nie zalezy od max_num_seqs (KRYT-1).
+  const kvGb = (typeof v.kv_pool_gb === 'number' && v.kv_pool_gb > 0) ? v.kv_pool_gb : (v.kv_cache_gb || 0);
+  const poolTokens = Number(v.pool_tokens) || 0;
+  const concurrentSeqs = Number(v.concurrent_full_len_seqs) || 0;
   const actGb = v.activations_gb || 0;
   // Legend percentages must sum to <=100. When totalUsed > totalVramGb each
   // segment would clamp at 100%, producing nonsense like "59 + 100 + 56 = 215%".
@@ -996,10 +1039,10 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   const overflow = totalUsed > totalVramGb;
   const freeGb = Math.max(0, totalVramGb - totalUsed);
 
-  // Realne przepelnienie VRAM (jedyne miejsce uzycia error_no_fit). Backend
-  // sygnalizuje to przez vram_estimate.fits_total === false; dodatkowo lapiemy
-  // przekroczenie policzone client-side (overflow / pctUsed > 95).
-  const doesNotFit = v.fits_total === false || overflow || pctUsed > 95;
+  // Realne przepelnienie VRAM (jedyne miejsce uzycia error_no_fit). Werdykt
+  // nalezy do backendu (fits_per_gpu/fits_total). NIE eskalujemy na podstawie
+  // samego pctUsed — vLLM celowo zajmuje util*VRAM i to nie jest OOM.
+  const doesNotFit = !backendFits;
   const noFitBanner = doesNotFit
     ? `<div class="adv-error-box"><strong>${escapeHtml(tAdv('error_no_fit'))}</strong>${escapeHtml(tAdv('error_no_fit_hint'))}</div>`
     : '';
@@ -1014,7 +1057,11 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
       ${noFitBanner}
       <div class="adv-kpi-grid" id="edw-adv-kpi">
         <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
-        <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(tAdv('kpi_kv_cache'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_kv_sub', { ctx: (r.max_model_len || 0).toLocaleString(), dtype: r.kv_cache_dtype || 'auto' }))}</div></div>
+        <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(tAdv('kpi_kv_pool'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_kv_pool_sub', {
+          tokens: poolTokens.toLocaleString(),
+          seqs: concurrentSeqs >= 10 ? Math.round(concurrentSeqs).toLocaleString() : concurrentSeqs.toFixed(1),
+          ctx: (r.max_model_len || 0).toLocaleString(),
+        }))}</div></div>
         <div class="adv-kpi"><div class="k-label">${escapeHtml(isLcpp ? tAdv('kpi_compute_buffer') : tAdv('kpi_activations'))}</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(isLcpp ? tAdv('kpi_compute_buffer_sub') : tAdv('kpi_activations_sub'))}</div></div>
         <div class="adv-kpi ${leftCls}"><div class="k-label">${escapeHtml(tAdv('kpi_headroom'))}</div><div class="k-value">${headroomGb >= 0 ? headroomGb.toFixed(1) : '−' + Math.abs(headroomGb).toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_headroom_sub', { p: Math.max(0, 100 - pctUsed) }))}</div></div>
         <div class="adv-kpi ${totalCls}"><div class="k-label">${escapeHtml(tAdv('kpi_total_avail'))}</div><div class="k-value">${totalUsed.toFixed(1)} GB / ${totalVramGb.toFixed(0)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_total_sub', { p: pctUsed, n: gpuCount }))}</div></div>
@@ -1116,7 +1163,9 @@ function renderAdvancedManualControls(adv, rec) {
   const vramMaxCtx = rec?.max_supported_model_len || 0;
   const ABSOLUTE_MAX = 1_048_576;
   const maxCtx = Math.min(ABSOLUTE_MAX, Math.max(modelMaxCtx, vramMaxCtx, 32768));
-  const maxSeqs = rec?.max_supported_num_seqs || 256;
+  // Cap suwaka seqs = staly cap schedulera (256). `max_supported_num_seqs` to
+  // teraz INFORMACYJNA wspolbieznosc puli (mala liczba ~9) — nie limit suwaka.
+  const maxSeqs = 256;
 
   // Wartosci pokazywane na sliderach: dla locked param bierzemy z `adv`
   // (user-set), dla pozostalych z `applied` (auto-fit przez backend).
@@ -1129,7 +1178,8 @@ function renderAdvancedManualControls(adv, rec) {
   const pp = adv.pipeline_parallel ?? applied.pipeline_parallel ?? recCfg.pipeline_parallel ?? 1;
   const ctx = valueFor('max_model_len', 8192);
   const seqs = valueFor('max_num_seqs', 16);
-  const kv = adv.kv_cache_dtype || applied.kv_cache_dtype || recCfg.kv_cache_dtype || 'auto';
+  const kv = adv.kv_cache_dtype || applied.kv_cache_dtype || recCfg.kv_cache_dtype || (isLcpp ? 'f16' : 'auto');
+  const kvV = adv.kv_cache_dtype_v || kv;
   const memUtil = valueFor('gpu_memory_utilization', 0.9);
   const totalGpus = (getAdvancedGpus() || []).length || 1;
 
@@ -1145,21 +1195,6 @@ function renderAdvancedManualControls(adv, rec) {
   const lockMark = (key) => lockedParam === key
     ? `<span class="adv-lock-tag" title="${escapeAttr(tAdv('lock_title'))}">🔒 ${escapeHtml(tAdv('lock_tag'))}</span>`
     : '';
-
-  // Live client-side KV estimator — instant VRAM preview before the backend
-  // round-trip resolves with the authoritative number.
-  let liveKvHint = '';
-  if (cachedModelSpec) {
-    const liveGb = estimateKvGb({
-      ...cachedModelSpec,
-      max_model_len: ctx,
-      max_num_seqs: seqs,
-      kv_dtype_bytes: kvDtypeBytes(kv),
-    });
-    if (liveGb != null) {
-      liveKvHint = `<div class="adv-hint">${escapeHtml(tAdv('live_kv_estimate', { gb: liveGb.toFixed(1) }))}</div>`;
-    }
-  }
 
   // Preset chips — disabled when they exceed the model's max context.
   const chips = CTX_PRESETS.map((p) => {
@@ -1187,16 +1222,19 @@ function renderAdvancedManualControls(adv, rec) {
     ? tAdv('ctx_hint_max_with_vram', { model: modelMaxCtx ? modelMaxCtx.toLocaleString() : '?', vram: vramMaxCtx.toLocaleString() })
     : tAdv('ctx_hint_max', { model: modelMaxCtx ? modelMaxCtx.toLocaleString() : '?' });
 
-  // Quantization wag — wejscie do kalkulatora VRAM (`quantization_override`).
-  // Domyslnie z presetu (vllm.quantize / quantization); user moze nadpisac.
-  const quant = (adv.quantization || '').toLowerCase();
-  const QUANT_OPTS = ['nvfp4', 'mxfp4', 'fp8', 'int8', 'awq', 'gptq'];
-  const quantOpts = [`<option value="">${escapeHtml(tAdv('quant_opt_source'))}</option>`];
-  if (quant && !QUANT_OPTS.includes(quant)) {
-    quantOpts.push(`<option value="${escapeAttr(quant)}">${escapeHtml(quant.toUpperCase())}</option>`);
-  }
-  QUANT_OPTS.forEach((q) => quantOpts.push(`<option value="${q}">${q.toUpperCase()}</option>`));
-  const quantRowHtml = `
+  // Override kwantyzacji WAG — tylko vLLM-rodzina (safetensors). Dla llama.cpp
+  // i MLX wagi wynikaja z pobranego pliku (GGUF / repo mlx-community), wiec
+  // dropdown jest ukryty (zadnego pola na zapas).
+  let quantRowHtml = '';
+  if (isVllmFamilyEngine()) {
+    const quant = (adv.quantization || '').toLowerCase();
+    const QUANT_OPTS = ['nvfp4', 'mxfp4', 'fp8', 'int8', 'awq', 'gptq'];
+    const quantOpts = [`<option value="">${escapeHtml(tAdv('quant_opt_source'))}</option>`];
+    if (quant && !QUANT_OPTS.includes(quant)) {
+      quantOpts.push(`<option value="${escapeAttr(quant)}">${escapeHtml(quant.toUpperCase())}</option>`);
+    }
+    QUANT_OPTS.forEach((q) => quantOpts.push(`<option value="${q}">${q.toUpperCase()}</option>`));
+    quantRowHtml = `
     <div class="adv-form-row">
       <label>${escapeHtml(tAdv('quant_label'))}</label>
       <tf-select id="edw-adv-quant" value="${escapeAttr(quant)}">
@@ -1204,6 +1242,72 @@ function renderAdvancedManualControls(adv, rec) {
       </tf-select>
       <div class="adv-hint">${escapeHtml(tAdv('quant_hint'))}</div>
     </div>`;
+  }
+
+  // Sekcja KV cache — engine-aware. vLLM: jeden select (auto/fp8*) + opcjonalny
+  // max-num-batched-tokens. llama.cpp: osobne K i V (f16..iq4_nl) + chip
+  // flash-attention gdy kwantyzowane. Etykiety = realne tokeny CLI silnika
+  // (vLLM nie ma fp16/bfloat16, llama nie ma fp8) — DRUG-11/DRUG-12.
+  const VLLM_KV_OPTS = [
+    ['auto', tAdv('kv_opt_auto')],
+    ['fp8', tAdv('kv_opt_fp8')],
+    ['fp8_e4m3', tAdv('kv_opt_fp8_e4m3')],
+    ['fp8_e5m2', tAdv('kv_opt_fp8_e5m2')],
+  ];
+  const LCPP_KV_OPTS = [
+    ['f16', tAdv('kv_opt_f16')],
+    ['bf16', tAdv('kv_opt_bf16')],
+    ['q8_0', tAdv('kv_opt_q8_0')],
+    ['q5_1', tAdv('kv_opt_q5_1')],
+    ['q5_0', tAdv('kv_opt_q5_0')],
+    ['q4_1', tAdv('kv_opt_q4_1')],
+    ['q4_0', tAdv('kv_opt_q4_0')],
+    ['iq4_nl', tAdv('kv_opt_iq4_nl')],
+  ];
+  const kvOptionsHtml = (opts, selected) => opts.map(([val, label]) =>
+    `<option value="${escapeAttr(val)}"${val === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('');
+
+  // llama.cpp: kwantyzowane K lub V wlacza flash-attention (backend dodaje -fa).
+  const lcppKvQuantized = (t) => !['f16', 'bf16', 'auto'].includes(String(t).toLowerCase());
+  const flashChip = isLcpp && (lcppKvQuantized(kv) || lcppKvQuantized(kvV))
+    ? `<tf-chip status="info" icon="zap">${escapeHtml(tAdv('flash_attn_auto'))}</tf-chip>`
+    : '';
+
+  let kvSectionHtml;
+  if (isLcpp) {
+    kvSectionHtml = `
+    <div class="adv-row-2">
+      <div class="adv-form-row">
+        <label>${escapeHtml(tAdv('kv_k_label'))}</label>
+        <tf-select id="edw-adv-kv" value="${escapeAttr(kv)}">${kvOptionsHtml(LCPP_KV_OPTS, kv)}</tf-select>
+        <div class="adv-hint">${escapeHtml(tAdv('kv_k_hint'))}</div>
+      </div>
+      <div class="adv-form-row">
+        <label>${escapeHtml(tAdv('kv_v_label'))}</label>
+        <tf-select id="edw-adv-kv-v" value="${escapeAttr(kvV)}">${kvOptionsHtml(LCPP_KV_OPTS, kvV)}</tf-select>
+        <div class="adv-hint">${escapeHtml(tAdv('kv_v_hint'))}</div>
+      </div>
+    </div>
+    ${flashChip ? `<div class="adv-form-row">${flashChip}</div>` : ''}
+    <div class="adv-form-row">
+      <tf-chip status="info" icon="cpu">${escapeHtml(tAdv('llamacpp_ngl_info'))}</tf-chip>
+    </div>`;
+  } else {
+    const batch = Number(adv.max_num_batched_tokens) || 8192;
+    kvSectionHtml = `
+    <div class="adv-row-2">
+      <div class="adv-form-row">
+        <label>${escapeHtml(tAdv('kv_label'))}</label>
+        <tf-select id="edw-adv-kv" value="${escapeAttr(kv)}">${kvOptionsHtml(VLLM_KV_OPTS, kv)}</tf-select>
+        <div class="adv-hint">${escapeHtml(tAdv('kv_hint'))}</div>
+      </div>
+      <div class="adv-form-row">
+        <label>${escapeHtml(tAdv('batch_label'))}</label>
+        <tf-input type="number" id="edw-adv-batch" min="512" step="512" value="${batch}"></tf-input>
+        <div class="adv-hint">${escapeHtml(tAdv('batch_hint'))}</div>
+      </div>
+    </div>`;
+  }
 
   return `
     <div class="adv-form-row">
@@ -1235,31 +1339,21 @@ function renderAdvancedManualControls(adv, rec) {
       <div class="adv-form-row">
         <label><span>${escapeHtml(tAdv('seqs_label'))} ${lockMark('max_num_seqs')}</span><span class="v" id="edw-adv-seqs-val">${seqs}</span></label>
         <input type="range" class="adv-range" id="edw-adv-seqs" min="1" max="${maxSeqs}" step="1" value="${seqs}">
-        <div class="adv-hint">${escapeHtml(tAdv('seqs_hint', { n: maxSeqs }))}</div>
+        <div class="adv-hint">${escapeHtml(tAdv('seqs_hint'))}</div>
         ${seqsAdjust}
       </div>
+      ${isLcpp ? '' : `
       <div class="adv-form-row">
         <label><span>${escapeHtml(tAdv('mem_label'))} ${lockMark('gpu_memory_utilization')}</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
         <input type="range" class="adv-range" id="edw-adv-mem" min="0.5" max="0.95" step="0.05" value="${memUtil}">
         <div class="adv-hint">${escapeHtml(tAdv('mem_hint'))}</div>
         ${memAdjust}
-      </div>
+      </div>`}
     </div>
-
-    ${liveKvHint}
 
     ${quantRowHtml}
 
-    <div class="adv-form-row">
-      <label>${escapeHtml(tAdv('kv_label'))}</label>
-      <tf-select id="edw-adv-kv" value="${escapeAttr(kv)}">
-        <option value="auto">${escapeHtml(tAdv('kv_opt_auto'))}</option>
-        <option value="fp16">${escapeHtml(tAdv('kv_opt_fp16'))}</option>
-        <option value="bfloat16">${escapeHtml(tAdv('kv_opt_bf16'))}</option>
-        <option value="fp8">${escapeHtml(tAdv('kv_opt_fp8'))}</option>
-      </tf-select>
-      <div class="adv-hint">${escapeHtml(tAdv('kv_hint'))}</div>
-    </div>
+    ${kvSectionHtml}
 
     <div class="adv-hint" style="margin-top:10px;">
       ${escapeHtml(isLcpp ? tAdv('llamacpp_args_note') : tAdv('vllm_args_note'))}
@@ -1268,18 +1362,42 @@ function renderAdvancedManualControls(adv, rec) {
 }
 
 function bindAdvancedHandlers() {
-  // MLX: budzet pamieci -> przelicz max kontekst client-side i odswiez tylko
-  // readout (bez re-renderu body, zeby nie gubic focusu na polu).
+  // MLX: budzet pamieci / kv-bits / seqs -> backend liczy pule KV i pool_tokens,
+  // readout odczytuje max kontekst z odpowiedzi. Debounce, zeby kazdy ruch
+  // suwaka nie odpalal HF fetchu.
   const mlxMem = document.getElementById('edw-mlx-mem');
   if (mlxMem) {
     const onMlxMem = () => {
       const v = Math.max(0, Math.floor(Number(mlxMem.value) || 0));
       selection.advanced.mlx_max_memory_mb = v;
       const out = document.getElementById('edw-mlx-readout');
-      if (out) out.innerHTML = mlxReadoutHtml();
+      if (out) out.innerHTML = `<div class="adv-loading">${escapeHtml(tAdv('mlx_computing'))}</div>`;
+      mlxDebounceRecompute();
     };
     mlxMem.addEventListener('input', onMlxMem);
     mlxMem.addEventListener('change', onMlxMem);
+  }
+
+  const mlxKv = document.getElementById('edw-mlx-kv');
+  if (mlxKv) {
+    mlxKv.addEventListener('change', (e) => {
+      selection.advanced.mlx_kv_bits = String(e.detail?.value ?? mlxKv.value ?? 'none');
+      mlxDebounceRecompute();
+    });
+  }
+
+  const mlxSeqs = document.getElementById('edw-mlx-seqs');
+  const mlxSeqsVal = document.getElementById('edw-mlx-seqs-val');
+  if (mlxSeqs) {
+    mlxSeqs.addEventListener('input', () => {
+      const v = Math.max(1, parseInt(mlxSeqs.value, 10) || 1);
+      selection.advanced.mlx_max_num_seqs = v;
+      if (mlxSeqsVal) mlxSeqsVal.textContent = String(v);
+      // Kontekst per sekwencja = pool_tokens / seqs — liczymy z aktualnej
+      // odpowiedzi bez ponownego fetchu (pula nie zalezy od seqs).
+      const out = document.getElementById('edw-mlx-readout');
+      if (out) out.innerHTML = mlxReadoutHtml();
+    });
   }
 
   // Auto/manual mode — tf-segmented emits "change" with detail.value.
@@ -1307,50 +1425,71 @@ function bindAdvancedHandlers() {
     }, 300);
   };
 
+  // MLX: ten sam round-trip, ale odswiezamy WYLACZNIE readout (bez re-renderu
+  // calego MLX panelu) — zeby nie gubic focusu na polu budzetu pamieci.
+  const mlxDebounceRecompute = () => {
+    if (advancedRecommendDebounceTimer) clearTimeout(advancedRecommendDebounceTimer);
+    advancedRecommendDebounceTimer = setTimeout(async () => {
+      advancedRecommendation = await fetchVllmRecommendation(buildOverrides());
+      const out = document.getElementById('edw-mlx-readout');
+      if (out) out.innerHTML = mlxReadoutHtml();
+    }, 300);
+  };
+
   const buildOverrides = () => {
     const a = selection.advanced;
+    // MLX: single device, brak TP/PP/locka. Wysylamy budzet (przez getAdvancedGpus),
+    // kv-bits (none|kv8|kv4 jako kv_cache_dtype) i max_num_seqs (cap puli).
+    if (isMlxEngine()) {
+      const kvLabel = mlxKvDtypeLabel();
+      return {
+        max_num_seqs: Math.max(1, Number(a.mlx_max_num_seqs) || 1),
+        kv_cache_dtype: kvLabel !== 'none' ? kvLabel : undefined,
+      };
+    }
     // `lock_<param>: true` informuje backend ze user zafiksowal ten parametr —
     // pozostale (auto-fit) zostana zmniejszone zeby zmiescic sie w VRAM. Bez
     // locka backend traktuje overrides jako sugestie i moze je obnizyc.
     const lock = a.lockedParam;
-    return {
+    const isLcpp = isLlamaCppEngine();
+    const overrides = {
       tensor_parallel: a.tensor_parallel || undefined,
       pipeline_parallel: a.pipeline_parallel || undefined,
       max_model_len: a.max_model_len || undefined,
       max_num_seqs: a.max_num_seqs || undefined,
       kv_cache_dtype: a.kv_cache_dtype !== 'auto' ? a.kv_cache_dtype : undefined,
       gpu_memory_utilization: a.gpu_memory_utilization || undefined,
-      quantization_override: a.quantization || undefined,
       lock_max_model_len: lock === 'max_model_len' || undefined,
       lock_max_num_seqs: lock === 'max_num_seqs' || undefined,
       lock_tensor_parallel: lock === 'tensor_parallel' || undefined,
     };
+    // Override kwantyzacji wag tylko dla vLLM-rodziny (safetensors). Dla
+    // llama.cpp/MLX wagi wynikaja z pobranego pliku, wiec nie nadpisujemy.
+    if (isVllmFamilyEngine() && a.quantization) {
+      overrides.quantization_override = a.quantization;
+    }
+    // llama.cpp: osobny typ V cache (gdy user wybral inny niz K). vLLM nie ma
+    // osobnego V, MLX idzie wlasna sciezka wyzej.
+    if (isLcpp && a.kv_cache_dtype_v && a.kv_cache_dtype_v !== a.kv_cache_dtype) {
+      overrides.kv_cache_dtype_v = a.kv_cache_dtype_v;
+    }
+    // vLLM: opcjonalny `--max-num-batched-tokens` (driver szczytu aktywacji).
+    if (isVllmFamilyEngine() && a.max_num_batched_tokens) {
+      overrides.max_num_batched_tokens = a.max_num_batched_tokens;
+    }
+    return overrides;
   };
 
-  // Live update KPI tile "KV cache" — natychmiastowy feedback przed backendem.
-  // Klasa `.estimating` przelacza tile na szary kolor (kalkulowane lokalnie),
-  // backend potem nadpisze przy odpowiedzi /recommend.
-  const updateLiveKvTile = () => {
-    if (!cachedModelSpec) return;
-    const a = selection.advanced;
-    const ctx = a.max_model_len ?? advancedRecommendation?.applied?.max_model_len ?? advancedRecommendation?.recommended?.max_model_len;
-    const seqs = a.max_num_seqs ?? advancedRecommendation?.applied?.max_num_seqs ?? advancedRecommendation?.recommended?.max_num_seqs;
-    const kv = a.kv_cache_dtype || advancedRecommendation?.applied?.kv_cache_dtype || 'auto';
-    const liveGb = estimateKvGb({
-      ...cachedModelSpec,
-      max_model_len: ctx,
-      max_num_seqs: seqs,
-      kv_dtype_bytes: kvDtypeBytes(kv),
-    });
-    if (liveGb == null) return;
+  // Po ruchu suwaka ctx/seqs/KV pokazujemy "przeliczam…" na kafelku KV — pula
+  // (kv_pool_gb) i jej pojemnosc liczy backend, wiec nie estymujemy client-side
+  // (to powielalo bug seqs-mnoznika). Backend nadpisze wartosc przy odpowiedzi.
+  const markKvTileEstimating = () => {
     const tiles = document.querySelectorAll('#edw-adv-kpi .adv-kpi');
-    // KV cache jest drugim tile w gridzie (Wagi, KV, Aktywacje, Zostaje, Total).
     const kvTile = tiles[1];
     if (!kvTile) return;
     const valEl = kvTile.querySelector('.k-value');
-    if (valEl) valEl.textContent = `${liveGb.toFixed(1)} GB`;
+    if (valEl) valEl.textContent = tAdv('kv_recomputing');
     kvTile.classList.add('estimating');
-    setTimeout(() => kvTile.classList.remove('estimating'), 300);
   };
 
   const bindRange = (id, valSpanId, key, transform, displayFn, lockable) => {
@@ -1363,7 +1502,11 @@ function bindAdvancedHandlers() {
       if (key === 'gpu_memory_utilization') selection.advanced.gpu_memory_touched = true;
       if (lockable) selection.advanced.lockedParam = lockable;
       if (valSpan) valSpan.textContent = displayFn ? displayFn(v) : v.toLocaleString();
-      updateLiveKvTile();
+      // Dla vLLM max_num_seqs to wylacznie cap schedulera — pula KV od niego
+      // NIE zalezy, wiec ruch suwaka seqs NIE rusza kafelka KV. llama.cpp i MLX
+      // licza n_ctx = max_model_len * max_num_seqs, wiec tam seqs REALNIE zmienia
+      // pule i kafelek musi pokazac "przeliczam…" do round-tripu z backendem.
+      if (!(key === 'max_num_seqs' && isVllmFamilyEngine())) markKvTileEstimating();
       debounceRecompute(buildOverrides());
     });
   };
@@ -1391,7 +1534,7 @@ function bindAdvancedHandlers() {
       if (valSpan) valSpan.textContent = v.toLocaleString();
       document.querySelectorAll('.adv-ctx-chip[data-ctx]').forEach((c) => c.classList.remove('active'));
       chip.classList.add('active');
-      updateLiveKvTile();
+      markKvTileEstimating();
       debounceRecompute(buildOverrides());
     });
   });
@@ -1414,14 +1557,38 @@ function bindAdvancedHandlers() {
     });
   });
 
-  // tf-select dla KV dtype. Nie ma osobnego locka — backend traktuje kv_cache_dtype
-  // jako stale wejscie, nie jako parametr auto-fit.
+  // tf-select dla KV dtype (K). Nie ma osobnego locka — backend traktuje
+  // kv_cache_dtype jako stale wejscie, nie jako parametr auto-fit.
   const kvSelect = document.getElementById('edw-adv-kv');
   if (kvSelect) {
     kvSelect.addEventListener('change', (e) => {
       const v = e.detail?.value ?? kvSelect.value;
       selection.advanced.kv_cache_dtype = v;
-      updateLiveKvTile();
+      markKvTileEstimating();
+      debounceRecompute(buildOverrides());
+    });
+  }
+
+  // llama.cpp: osobny select V cache. Zmiana V (kwantyzowane) zmienia pule KV
+  // i wymaga flash-attention (backend dodaje -fa automatycznie).
+  const kvVSelect = document.getElementById('edw-adv-kv-v');
+  if (kvVSelect) {
+    kvVSelect.addEventListener('change', (e) => {
+      const v = e.detail?.value ?? kvVSelect.value;
+      selection.advanced.kv_cache_dtype_v = v;
+      markKvTileEstimating();
+      debounceRecompute(buildOverrides());
+    });
+  }
+
+  // vLLM: opcjonalny `--max-num-batched-tokens` (driver szczytu aktywacji).
+  const batchInput = document.getElementById('edw-adv-batch');
+  if (batchInput) {
+    batchInput.addEventListener('change', (e) => {
+      const raw = e.detail?.value ?? batchInput.value;
+      const v = parseInt(raw, 10);
+      selection.advanced.max_num_batched_tokens = Number.isFinite(v) && v > 0 ? v : 8192;
+      markKvTileEstimating();
       debounceRecompute(buildOverrides());
     });
   }
@@ -2255,7 +2422,14 @@ async function startDeploy() {
   // Manual -> sklada CLI string z user-set wartosci suwakow.
   let vllmArgs = null;
   if (!shouldSkipAdvancedStep() && advancedRecommendation && !advancedRecommendation.error) {
-    if (selection.advanced.mode === 'auto') {
+    // llama.cpp: backend zwraca w `recommended_vllm_args` POPRAWNE argi
+    // llama-server (-c/-np/-ngl/-ub/--split-mode/--cache-type-k/v/-fa), juz po
+    // round-tripie z manualnymi override'ami (ctx/seqs/K/V poszly w requeście,
+    // backend przeliczyl). Reczne sklejanie flag vLLM dla llama (DRUG-10) dalo
+    // niepoprawna komende — uzywamy tego co policzyl backend, w OBU trybach.
+    if (isLlamaCppEngine()) {
+      vllmArgs = (advancedRecommendation.recommended_vllm_args || '').trim() || null;
+    } else if (selection.advanced.mode === 'auto') {
       // recommended_vllm_args z kalkulatora zawiera m.in. `--gpu-memory-utilization`
       // ktore backend traktuje jako "user explicit" i nadpisuje auto-clamp z
       // free VRAM. W trybie auto user nie wybral tej wartosci — wycinamy ja
@@ -2270,13 +2444,14 @@ async function startDeploy() {
         '--gpu-memory-utilization', String(a.gpu_memory_utilization ?? r.gpu_memory_utilization ?? 0.9),
         '--max-model-len', String(a.max_model_len ?? r.max_model_len ?? 8192),
         '--max-num-seqs', String(a.max_num_seqs ?? r.max_num_seqs ?? 16),
-        '--max-num-batched-tokens', String(Math.max(a.max_model_len ?? 8192, 8192)),
+        '--max-num-batched-tokens', String(a.max_num_batched_tokens || Math.max(a.max_model_len ?? 8192, 8192)),
         '--enable-chunked-prefill',
       ];
       const tp = a.tensor_parallel ?? r.tensor_parallel ?? 1;
       const pp = a.pipeline_parallel ?? r.pipeline_parallel ?? 1;
       if (tp > 1) parts.push('--tensor-parallel-size', String(tp));
       if (pp > 1) parts.push('--pipeline-parallel-size', String(pp));
+      // KV dtype tylko z rodziny fp8 (auto/fp8*) — vLLM odrzuca fp16/bfloat16.
       const kv = a.kv_cache_dtype || r.kv_cache_dtype || 'auto';
       if (kv !== 'auto') parts.push('--kv-cache-dtype', kv);
       vllmArgs = parts.join(' ');
@@ -2318,11 +2493,12 @@ async function startDeploy() {
   // kluczach manifestowych [[parameter]] (mlx_field) — apply_parameters_deploy
   // je persistuje, a runtime guard egzekwuje. NIE uzywamy vllm_args dla MLX.
   let mlxParameters = null;
-  if (advActive && String(eng.id || '').toLowerCase() === 'mlx') {
-    const calc = computeMlxMaxContext();
+  if (advActive && isMlxEngine()) {
+    // Max kontekst per sekwencja liczy backend (pool_tokens / seqs) — patrz
+    // mlxMaxContextFromBackend. 0 = sentinel "natywny kontekst / bez capa".
     mlxParameters = {
       memory_budget_mb: Number(selection.advanced.mlx_max_memory_mb) || 0,
-      max_context_tokens: (calc && calc.tokens) || 0,
+      max_context_tokens: mlxMaxContextFromBackend() || 0,
     };
   }
   const configJson = JSON.stringify({

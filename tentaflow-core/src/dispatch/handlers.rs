@@ -3985,7 +3985,7 @@ pub async fn deploy_vllm_recommend(
     use crate::deploy::vram_calculator::{
         analyze_gpu_compatibility, analyze_gpu_compatibility_llamacpp, auto_fit_config,
         build_llamacpp_args_string, build_vllm_args_string, estimate_vram, fetch_gguf_spec,
-        fetch_hf_config,
+        fetch_hf_config, fetch_safetensors_total_size,
         max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config_with_override,
         AutoFitOutcome, AutoFitRequest, DeployEngine,
     };
@@ -4017,26 +4017,34 @@ pub async fn deploy_vllm_recommend(
     // z naglowka pliku .gguf, a rozmiar pliku JEST dokladnym footprintem wag.
     // Aktywna gdy frontend poda `gguf_file` albo gdy sama nazwa modelu wskazuje GGUF.
     let model_lower = payload.model.to_lowercase();
-    let looks_gguf = payload.gguf_file.is_some()
+    let raw_gguf = payload.gguf_file.is_some()
         || model_lower.ends_with("-gguf")
         || model_lower.contains("gguf");
 
-    // Silnik: jawny `engine=llama-cpp` z requestu albo wykryty GGUF -> llama.cpp.
-    // GGUF deployuje sie wylacznie na llama.cpp, wiec jego fizyka VRAM jest tu
-    // jedyna poprawna. Normalizujemy etykiete (case + '.'/'-') zeby `llama.cpp`,
-    // `llamacpp`, `LLAMA-CPP` trafialy w ta sama galez zamiast cicho spadac na vLLM.
+    // Silnik: jawny `engine=llama-cpp`/`mlx` z requestu albo wykryty GGUF ->
+    // llama.cpp. GGUF deployuje sie wylacznie na llama.cpp, wiec jego fizyka VRAM
+    // jest tu jedyna poprawna. MLX czyta config.json (NIE GGUF), wiec idzie ta
+    // sama sciezka co vLLM (fetch_hf_config/parse), tylko z fizyka unified-memory.
+    // Normalizujemy etykiete (case + '.'/'-') zeby `llama.cpp`, `llamacpp`,
+    // `mlx-lm` trafialy w ta sama galez zamiast cicho spadac na vLLM.
     let eng_norm = payload
         .engine
         .as_deref()
         .map(|s| s.to_lowercase().replace('.', "-"));
-    let engine = if matches!(eng_norm.as_deref(), Some("llama-cpp") | Some("llamacpp")) || looks_gguf
-    {
+    let engine = if matches!(eng_norm.as_deref(), Some("mlx") | Some("mlx-lm")) {
+        DeployEngine::Mlx
+    } else if matches!(eng_norm.as_deref(), Some("llama-cpp") | Some("llamacpp")) || raw_gguf {
         DeployEngine::LlamaCpp
     } else {
         DeployEngine::Vllm
     };
 
-    let (spec, weights_override) = if looks_gguf {
+    // GGUF deployuje sie wylacznie na llama.cpp, wiec sciezka GGUF (fetch_gguf_spec)
+    // jest wazna tylko gdy rozstrzygniety silnik to LlamaCpp. Mlx/Vllm czytaja
+    // config.json nawet gdy nazwa repo zawiera "gguf" — inaczej zadalyby gguf_file.
+    let use_gguf_path = raw_gguf && engine == DeployEngine::LlamaCpp;
+
+    let (spec, weights_override) = if use_gguf_path {
         let gguf_file = payload.gguf_file.clone().ok_or_else(|| {
             ProtocolError::bad_request(format!(
                 "Model {} wyglada na GGUF ale nie podano sciezki pliku .gguf (gguf_file).",
@@ -4067,7 +4075,13 @@ pub async fn deploy_vllm_recommend(
             payload.quantization_override.as_deref(),
         )
         .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
-        (spec, None)
+        // Dokladny rozmiar wag z safetensors index (metadata.total_size) — gdy
+        // dostepny, dziala jak override GGUF i omija heurystyke param-count.
+        // Brak indexu/sieci -> None, estimated_params (MoE/GQA-swiadomy) jest
+        // fallbackiem.
+        let weights_override =
+            fetch_safetensors_total_size(&client, &payload.model, hf_token.as_deref()).await;
+        (spec, weights_override)
     };
 
     let gpu_count = payload.gpus.len() as u32;
@@ -4094,6 +4108,7 @@ pub async fn deploy_vllm_recommend(
             gpu_count,
             gpu_memory_gb_each: gpu_memory_gb,
             kv_cache_dtype: kv_dtype.clone(),
+            kv_cache_dtype_v: payload.kv_cache_dtype_v.clone(),
             gpu_memory_utilization: gpu_mem_util,
             requested_max_model_len: payload.max_model_len,
             requested_max_num_seqs: payload.max_num_seqs,
@@ -4107,11 +4122,21 @@ pub async fn deploy_vllm_recommend(
     );
 
     let AutoFitOutcome {
-        applied: applied_input,
+        applied: mut applied_input,
         auto_adjusted,
         at_limit,
         error: fit_error,
     } = fit;
+
+    // auto_fit nie propaguje typu V cache ani batcha tokenow — ustawiamy je na
+    // applied PRZED estymacja i builderem argow, zeby estymata KV (osobne K/V)
+    // i wygenerowana komenda uzywaly tych samych wartosci co wybor uzytkownika.
+    // Domyslny batch = max_model_len (min. 8192) napedza szczyt aktywacji w
+    // modelu puli KV vLLM.
+    applied_input.kv_cache_dtype_v = payload.kv_cache_dtype_v.clone();
+    applied_input.max_num_batched_tokens = payload
+        .max_num_batched_tokens
+        .unwrap_or_else(|| applied_input.max_model_len.max(8192));
 
     // Over-budget NIE jest twardym bledem requestu — auto_fit zwraca uzywalny
     // `applied` (minimalny ctx/seqs), wiec liczymy estymacje i oddajemy
@@ -4131,6 +4156,13 @@ pub async fn deploy_vllm_recommend(
     let recommended_vllm_args = match engine {
         DeployEngine::LlamaCpp => build_llamacpp_args_string(&spec, &applied_input),
         DeployEngine::Vllm => build_vllm_args_string(&spec, &applied_input),
+        // MLX (mlx-lm) uruchamiany jest przez wlasny runner, nie przez flagi CLI
+        // jednego procesu serwera - kontekst/seqs/KV przekazuje config deployu.
+        DeployEngine::Mlx => format!(
+            "--max-tokens {} --max-kv-size {}",
+            applied_input.max_model_len,
+            applied_input.max_model_len * applied_input.max_num_seqs.max(1)
+        ),
     };
 
     let estimated_params = spec.estimated_params() as f64 / 1_000_000_000.0;
@@ -4140,6 +4172,16 @@ pub async fn deploy_vllm_recommend(
     let gpu_compat = match engine {
         DeployEngine::LlamaCpp => analyze_gpu_compatibility_llamacpp(&spec, gpu_count),
         DeployEngine::Vllm => analyze_gpu_compatibility(&spec, gpu_count),
+        // MLX to pojedyncze urzadzenie (unified memory) - zawsze "czysta" partycja
+        // bez TP/PP, brak ograniczen podzielnosci heads/layers.
+        DeployEngine::Mlx => crate::deploy::vram_calculator::GpuCompatibilityReport {
+            used_tp: 1,
+            used_pp: 1,
+            uses_all_gpus: true,
+            clean_partition: true,
+            better_gpu_counts: vec![1],
+            warning: None,
+        },
     };
     if let Some(w) = &gpu_compat.warning {
         warnings.push(w.clone());
@@ -4171,6 +4213,9 @@ pub async fn deploy_vllm_recommend(
         fits_per_gpu: estimate.fits_per_gpu,
         fits_total: estimate.fits_total,
         warnings: estimate.warnings.clone(),
+        kv_pool_gb: estimate.kv_pool_gb,
+        pool_tokens: estimate.pool_tokens,
+        concurrent_full_len_seqs: estimate.concurrent_full_len_seqs,
     };
 
     let recommended = tentaflow_protocol::DeployVllmConfig {
@@ -4273,8 +4318,8 @@ pub async fn engine_recommend(
                 ));
             }
             use crate::deploy::vram_calculator::{
-                auto_fit_config, fetch_hf_config, parse_hf_config_with_override, AutoFitRequest,
-                DeployEngine,
+                auto_fit_config, fetch_hf_config, fetch_safetensors_total_size,
+                parse_hf_config_with_override, AutoFitRequest, DeployEngine,
             };
 
             let client = reqwest::Client::builder()
@@ -4289,6 +4334,13 @@ pub async fn engine_recommend(
                 })?;
             let spec = parse_hf_config_with_override(&config_json, &payload.model_repo, None)
                 .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
+            // DRUG-5: dokladny rozmiar wag z safetensors index (jak w
+            // deploy_vllm_recommend) — usuwa najwieksza rozbieznosc miedzy
+            // tym prefillem a glownym kalkulatorem (wagi MoE/quant inaczej liczone
+            // heurystyka param-count). Auto_fit liczy ta sama fizyke budzetu KV.
+            let weights_override =
+                fetch_safetensors_total_size(&client, &payload.model_repo, hf_token.as_deref())
+                    .await;
 
             let gpu_count = payload.gpus.len() as u32;
             let gpu_memory_gb = payload
@@ -4302,6 +4354,7 @@ pub async fn engine_recommend(
                 gpu_count,
                 gpu_memory_gb_each: gpu_memory_gb,
                 kv_cache_dtype: "auto".to_string(),
+                kv_cache_dtype_v: None,
                 gpu_memory_utilization: 0.9,
                 requested_max_model_len: None,
                 requested_max_num_seqs: None,
@@ -4310,10 +4363,13 @@ pub async fn engine_recommend(
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
-                weights_bytes_override: None,
+                weights_bytes_override: weights_override,
             };
             let outcome = auto_fit_config(&spec, &req_fit);
-            let cfg = outcome.applied;
+            let mut cfg = outcome.applied;
+            // Spojnie z deploy_vllm_recommend: applied nie niesie batcha tokenow,
+            // ustawiamy default (max_model_len, min 8192) dla szczytu aktywacji.
+            cfg.max_num_batched_tokens = cfg.max_model_len.max(8192);
             if let Some(err) = outcome.error {
                 warnings.push(err);
             }
@@ -4340,7 +4396,7 @@ pub async fn engine_recommend(
                     push(
                         &mut parameters,
                         "max_num_batched_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)),
+                        serde_json::json!(cfg.max_num_batched_tokens),
                     );
                     push(
                         &mut parameters,
@@ -4378,7 +4434,7 @@ pub async fn engine_recommend(
                     push(
                         &mut parameters,
                         "max_total_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)),
+                        serde_json::json!(cfg.max_num_batched_tokens),
                     );
                     push(
                         &mut parameters,
@@ -4410,7 +4466,7 @@ pub async fn engine_recommend(
                     push(
                         &mut parameters,
                         "max_num_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)),
+                        serde_json::json!(cfg.max_num_batched_tokens),
                     );
                 }
                 _ => unreachable!(),

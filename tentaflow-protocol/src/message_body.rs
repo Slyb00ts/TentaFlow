@@ -2829,6 +2829,14 @@ pub struct DeployVllmRecommendRequest {
     /// (oraz wykryty GGUF) mapuje na domyslny vLLM/llama.cpp w handlerze.
     #[serde(default)]
     pub engine: Option<String>,
+    /// Typ kwantyzacji KV dla strony V (osobny od K dla llama.cpp, np. K=q8_0
+    /// V=q4_0). None → rowny K/V. Wire-additive, wiec `#[serde(default)]`.
+    #[serde(default)]
+    pub kv_cache_dtype_v: Option<String>,
+    /// Limit `--max-num-batched-tokens` (vLLM) — driver szczytu aktywacji w
+    /// modelu puli KV. None → handler wylicza default z max_model_len.
+    #[serde(default)]
+    pub max_num_batched_tokens: Option<u64>,
 }
 
 #[derive(
@@ -2875,6 +2883,17 @@ pub struct DeployVllmVramEstimate {
     pub fits_per_gpu: bool,
     pub fits_total: bool,
     pub warnings: Vec<String>,
+    /// Rozmiar puli KV (vLLM: util*VRAM - wagi - aktywacje) w GB. To pula
+    /// resztkowa, nie skladnik wymagany — UI pokazuje "pula KV X GiB".
+    #[serde(default)]
+    pub kv_pool_gb: f64,
+    /// Ile tokenow miesci pula KV (`kv_pool_bytes / kv_per_token_per_gpu`).
+    #[serde(default)]
+    pub pool_tokens: u64,
+    /// Informacyjna wspolbieznosc: `pool_tokens / max_model_len`. Ile pelnych
+    /// sekwencji o dlugosci max_model_len zmiesci sie naraz.
+    #[serde(default)]
+    pub concurrent_full_len_seqs: f64,
 }
 
 #[derive(
