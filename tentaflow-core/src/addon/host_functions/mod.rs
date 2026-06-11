@@ -721,8 +721,9 @@ fn tool_register(
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        // SDK register_tool sends the JSON schema under "parameters".
         let params_schema = tool_def
-            .get("parameters_schema")
+            .get("parameters")
             .map(|v| v.to_string())
             .unwrap_or_else(|| "{}".to_string());
         let return_schema = tool_def.get("return_schema").map(|v| v.to_string());

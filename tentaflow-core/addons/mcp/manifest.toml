@@ -1,0 +1,170 @@
+[addon]
+id = "mcp"
+name = "MCP Client"
+version = "1.0.0"
+description = "Klient Model Context Protocol — podlacza zewnetrzne serwery MCP (Streamable HTTP) i udostepnia ich narzedzia jako narzedzia AI. Serwer w LAN wymaga jawnej reguly sieciowej z dokladnym adresem (zakladka Network)."
+category = "ai"
+keywords = ["mcp", "model context protocol", "tools", "integracja", "json-rpc", "agent"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = "https://modelcontextprotocol.io"
+icon = "puzzle"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "http.request"
+display_name = "Polaczenia do serwerow MCP"
+description = "Wysyla zapytania JSON-RPC do skonfigurowanych serwerow MCP przez HTTPS."
+risk = "high"
+
+[[permission]]
+id = "storage.read"
+display_name = "Odczyt konfiguracji serwerow"
+description = "Czyta zapisana liste serwerow MCP i mapowania dynamicznych narzedzi."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Zapis konfiguracji serwerow"
+description = "Zapisuje liste serwerow MCP i mapowania dynamicznych narzedzi."
+risk = "low"
+
+[[permission]]
+id = "secrets.read"
+display_name = "Odczyt tokenow serwerow"
+description = "Czyta tokeny uwierzytelniajace serwerow MCP z magazynu sekretow."
+risk = "medium"
+
+[[permission]]
+id = "secrets.write"
+display_name = "Zapis tokenow serwerow"
+description = "Zapisuje tokeny uwierzytelniajace serwerow MCP w magazynie sekretow."
+risk = "medium"
+
+[[network_rule]]
+id = "mcp-https"
+protocol = "tcp"
+host = "*"
+port = 443
+description = "HTTPS do dowolnego publicznego serwera MCP — host podaje admin przy dodawaniu serwera."
+required = true
+
+[[network_rule]]
+id = "mcp-http-8080"
+protocol = "tcp"
+host = "*"
+port = 8080
+description = "Opcjonalny port 8080 dla publicznych serwerow MCP wystawionych poza 443."
+required = false
+
+[visibility]
+admin_only = true
+default_groups = []
+show_in_catalog = true
+
+[resources]
+memory_mb = 64
+fuel_limit = 30000000
+http_requests_per_minute = 120
+
+[lifecycle]
+background = false
+auto_start = false
+
+[[tool]]
+id = "mcp_add_server"
+display_name = "Dodaj serwer MCP"
+description = "Dodaje serwer MCP (Streamable HTTP), weryfikuje go handshakem initialize i domyslnie rejestruje jego narzedzia jako narzedzia AI."
+keywords = ["mcp", "server", "add", "configure"]
+
+[[tool.parameter]]
+name = "name"
+param_type = "string"
+description = "Krotka nazwa serwera, max 32 znaki [a-z0-9_-]."
+required = true
+
+[[tool.parameter]]
+name = "url"
+param_type = "string"
+description = "Pelny URL endpointu MCP, np. https://host/mcp."
+required = true
+
+[[tool.parameter]]
+name = "auth_token"
+param_type = "string"
+description = "Opcjonalny token uwierzytelniajacy; bez schematu dostaje prefiks Bearer."
+required = false
+
+[[tool.parameter]]
+name = "auth_header"
+param_type = "string"
+description = "Naglowek auth, domyslnie Authorization (np. X-API-Key)."
+required = false
+
+[[tool.parameter]]
+name = "register_tools"
+param_type = "boolean"
+description = "Czy zarejestrowac narzedzia serwera jako narzedzia AI. Domyslnie true."
+required = false
+
+[[tool]]
+id = "mcp_remove_server"
+display_name = "Usun serwer MCP"
+description = "Usuwa serwer MCP, jego token i mapowania dynamicznych narzedzi."
+keywords = ["mcp", "server", "remove"]
+
+[[tool.parameter]]
+name = "name"
+param_type = "string"
+description = "Nazwa serwera do usuniecia."
+required = true
+
+[[tool]]
+id = "mcp_list_servers"
+display_name = "Lista serwerow MCP"
+description = "Zwraca skonfigurowane serwery MCP (bez tokenow)."
+keywords = ["mcp", "server", "list"]
+
+[[tool]]
+id = "mcp_list_tools"
+display_name = "Lista narzedzi serwera MCP"
+description = "Pobiera liste narzedzi z serwera MCP (tools/list); moze je tez zarejestrowac jako narzedzia AI."
+keywords = ["mcp", "tools", "list", "discover"]
+
+[[tool.parameter]]
+name = "server"
+param_type = "string"
+description = "Nazwa serwera. Opcjonalna gdy skonfigurowany jest dokladnie jeden."
+required = false
+
+[[tool.parameter]]
+name = "register_tools"
+param_type = "boolean"
+description = "Czy zarejestrowac pobrane narzedzia jako narzedzia AI. Domyslnie false."
+required = false
+
+[[tool]]
+id = "mcp_call_tool"
+display_name = "Wywolaj narzedzie MCP"
+description = "Wywoluje narzedzie na serwerze MCP (tools/call) i zwraca jego wynik."
+keywords = ["mcp", "tools", "call", "invoke"]
+
+[[tool.parameter]]
+name = "tool"
+param_type = "string"
+description = "Nazwa narzedzia na serwerze MCP."
+required = true
+
+[[tool.parameter]]
+name = "server"
+param_type = "string"
+description = "Nazwa serwera. Opcjonalna gdy skonfigurowany jest dokladnie jeden."
+required = false
+
+[[tool.parameter]]
+name = "arguments"
+param_type = "object"
+description = "Argumenty narzedzia zgodne z jego inputSchema."
+required = false

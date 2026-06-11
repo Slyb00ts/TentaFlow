@@ -21,9 +21,12 @@ use crate::addon::rate_limiter::ResourceType;
 // Walidacja SSRF — blokowanie lokalnych adresow
 // =============================================================================
 
-/// VULN-006: Solidna walidacja SSRF — parsuje URL, sprawdza host i IP.
-/// Blokuje: localhost, adresy prywatne (RFC 1918), link-local, metadata chmurowe,
-/// IPv4-mapped IPv6, numeryczne hosty, schematy inne niz http/https.
+/// VULN-006: Walidacja SSRF dla celow dopasowanych regula WILDCARD (`*`,
+/// `*.domena` = "publiczny web"). Blokuje: localhost, adresy prywatne
+/// (RFC 1918), link-local, metadata chmurowe, IPv4-mapped IPv6, numeryczne
+/// hosty, schematy inne niz http/https. Cele dopasowane regula exact-host
+/// NIE przechodza przez ten guard — admin jawnie zatwierdzil host:port w
+/// ustawieniach, wiec moze to byc adres LAN/loopback.
 fn is_safe_url(url: &str) -> bool {
     let parsed = match url::Url::parse(url) {
         Ok(u) => u,
@@ -156,20 +159,6 @@ pub fn http_request(
         }
     };
 
-    // CR-002: Walidacja SSRF — blokuj adresy lokalne i wewnetrzne
-    if !is_safe_url(&url) {
-        warn!("http_request: zablokowany URL (SSRF): {}", url);
-        audit_log(
-            caller.data(),
-            "http.request",
-            Some("http"),
-            Some(&url),
-            "denied",
-            Some("SSRF: URL wskazuje na adres lokalny/wewnetrzny"),
-        );
-        return ABI_ERR_PERMISSION;
-    }
-
     let (domain, port) = match extract_http_destination(&url) {
         Some(destination) => destination,
         None => {
@@ -185,33 +174,6 @@ pub fn http_request(
         }
     };
 
-    let resolved_addrs = match resolve_public_destination(&domain, port) {
-        Some(addrs) => addrs,
-        None => {
-            audit_log(
-                caller.data(),
-                "http.request",
-                Some("http"),
-                Some(&url),
-                "denied",
-                Some("DNS resolution points to a local or private address"),
-            );
-            return ABI_ERR_PERMISSION;
-        }
-    };
-
-    if resolved_addrs.is_empty() {
-        audit_log(
-            caller.data(),
-            "http.request",
-            Some("http"),
-            Some(&url),
-            "denied",
-            Some("DNS resolution points to a local or private address"),
-        );
-        return ABI_ERR_PERMISSION;
-    }
-
     if !check_permission(caller.data(), "http.request", None) {
         audit_log(
             caller.data(),
@@ -224,20 +186,56 @@ pub fn http_request(
         return ABI_ERR_PERMISSION;
     }
 
-    if !is_http_destination_approved(caller.data(), &domain, port) {
+    // Fail-closed: jedynym zrodlem prawdy o dozwolonych celach jest lista
+    // zatwierdzonych network_rules. Regula exact-host pozwala na dowolny
+    // adres (rowniez LAN/loopback — admin jawnie wpisal host:port);
+    // regula wildcard oznacza "publiczny web" i trzyma pelny guard SSRF.
+    let rule_match = match approved_destination_match(caller.data(), &domain, port) {
+        Some(m) => m,
+        None => {
+            audit_log(
+                caller.data(),
+                "http.request",
+                Some("http"),
+                Some(&url),
+                "denied",
+                Some(&format!(
+                    "brak zatwierdzonej network_rule dla {}:{}",
+                    domain, port
+                )),
+            );
+            return ABI_ERR_PERMISSION;
+        }
+    };
+
+    let require_public = rule_match == ApprovedMatch::Wildcard;
+    if require_public && !is_safe_url(&url) {
+        warn!("http_request: zablokowany URL (SSRF): {}", url);
         audit_log(
             caller.data(),
             "http.request",
             Some("http"),
             Some(&url),
             "denied",
-            Some(&format!(
-                "brak zatwierdzonej network_rule dla {}:{}",
-                domain, port
-            )),
+            Some("SSRF: URL wskazuje na adres lokalny/wewnetrzny (regula wildcard)"),
         );
         return ABI_ERR_PERMISSION;
     }
+
+    let resolved_addrs = match resolve_destination(&domain, port, require_public) {
+        Some(addrs) => addrs,
+        None => {
+            audit_log(
+                caller.data(),
+                "http.request",
+                Some("http"),
+                Some(&url),
+                "denied",
+                Some("DNS resolution failed or points to a local or private address"),
+            );
+            return ABI_ERR_PERMISSION;
+        }
+    };
 
     // K2: Sprawdz rate limit HTTP przez in-memory rate limiter (zamiast COUNT(*) na audit_log)
     if let Some(ref rate_limiter) = caller.data().rate_limiter {
@@ -310,30 +308,63 @@ pub fn http_request(
 // Funkcje pomocnicze
 // =============================================================================
 
-/// Wyodrebnia publiczny host i port HTTP z URL.
+/// Wyodrebnia host i port HTTP z URL. Schemat sprawdzany tutaj, bo cele
+/// dopasowane regula exact-host omijaja `is_safe_url`.
 fn extract_http_destination(url: &str) -> Option<(String, u16)> {
     let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
     let host = parsed.host_str()?.to_lowercase();
     let port = parsed.port_or_known_default()?;
     Some((host, port))
 }
 
+/// Rodzaj reguly, ktora dopuscila cel HTTP. Exact = host wpisany doslownie
+/// w regule (moze byc adres prywatny), Wildcard = `*` albo `*.domena`
+/// (tylko publiczny web).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovedMatch {
+    Exact,
+    Wildcard,
+}
+
 /// Sprawdza czy manifest addonu i DB pozwalaja na konkretny cel HTTP.
-fn is_http_destination_approved(state: &AddonState, domain: &str, port: u16) -> bool {
-    let rule = match state.manifest.network_rules.iter().find(|rule| {
+/// Gdy cel pasuje do wielu zatwierdzonych regul, exact-host wygrywa z
+/// wildcardem — to od rodzaju dopasowania zalezy, czy SSRF guard obowiazuje.
+fn approved_destination_match(
+    state: &AddonState,
+    domain: &str,
+    port: u16,
+) -> Option<ApprovedMatch> {
+    let mut wildcard_approved = false;
+    for rule in state.manifest.network_rules.iter().filter(|rule| {
         rule.protocol == "tcp" && rule.port == port && host_rule_matches(&rule.host, domain)
     }) {
-        Some(rule) => rule,
-        None => return false,
-    };
+        if !network_rule_approved(state, &rule.id, &rule.host, port) {
+            continue;
+        }
+        if rule.host.contains('*') {
+            wildcard_approved = true;
+        } else {
+            return Some(ApprovedMatch::Exact);
+        }
+    }
+    if wildcard_approved {
+        Some(ApprovedMatch::Wildcard)
+    } else {
+        None
+    }
+}
 
+fn network_rule_approved(state: &AddonState, rule_id: &str, rule_host: &str, port: u16) -> bool {
     match state.db.lock() {
         Ok(conn) => {
             conn.query_row(
                 "SELECT approved FROM addon_network_rules \
                  WHERE addon_id = ?1 AND rule_id = ?2 AND protocol = 'tcp' \
                    AND host = ?3 COLLATE NOCASE AND port = ?4",
-                rusqlite::params![&state.addon_id, &rule.id, &rule.host, port],
+                rusqlite::params![&state.addon_id, rule_id, rule_host, port],
                 |row| row.get::<_, i32>(0),
             )
             .unwrap_or(0)
@@ -361,7 +392,7 @@ fn host_rule_matches(rule_host: &str, domain: &str) -> bool {
     rule_host == domain
 }
 
-fn resolve_public_destination(domain: &str, port: u16) -> Option<Vec<SocketAddr>> {
+fn resolve_destination(domain: &str, port: u16, require_public: bool) -> Option<Vec<SocketAddr>> {
     let addrs = match (domain, port).to_socket_addrs() {
         Ok(addrs) => addrs,
         Err(_) => return None,
@@ -369,13 +400,17 @@ fn resolve_public_destination(domain: &str, port: u16) -> Option<Vec<SocketAddr>
 
     let mut out = Vec::new();
     for addr in addrs {
-        if !is_public_ip(addr.ip()) {
+        if require_public && !is_public_ip(addr.ip()) {
             return None;
         }
         out.push(addr);
     }
 
-    Some(out)
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn is_public_ip(ip: std::net::IpAddr) -> bool {
@@ -443,9 +478,14 @@ fn execute_http_request(
     domain: &str,
     resolved_addrs: &[SocketAddr],
 ) -> serde_json::Value {
+    // Redirecty wylaczone: walidacja i pinning DNS obejmuja tylko pierwotny
+    // host — follow na 3xx pozwolilby zatwierdzonemu hostowi przekierowac
+    // request na adres spoza zatwierdzonych regul (redirect SSRF). Addon
+    // dostaje surowy 3xx i moze podazyc recznie przez zatwierdzone hosty.
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_millis(30_000))
         .pool_max_idle_per_host(10)
+        .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(domain, resolved_addrs)
         .build()
     {
@@ -598,7 +638,7 @@ mod tests {
             Vec::new(),
         );
 
-        assert!(!is_http_destination_approved(&state, "example.com", 443));
+        assert!(approved_destination_match(&state, "example.com", 443).is_none());
     }
 
     #[test]
@@ -627,7 +667,7 @@ mod tests {
             .unwrap();
         }
 
-        assert!(!is_http_destination_approved(&state, "example.com", 443));
+        assert!(approved_destination_match(&state, "example.com", 443).is_none());
 
         {
             let conn = state.db.lock().unwrap();
@@ -639,9 +679,12 @@ mod tests {
             .unwrap();
         }
 
-        assert!(is_http_destination_approved(&state, "example.com", 443));
-        assert!(!is_http_destination_approved(&state, "other.example", 443));
-        assert!(!is_http_destination_approved(&state, "example.com", 80));
+        assert_eq!(
+            approved_destination_match(&state, "example.com", 443),
+            Some(ApprovedMatch::Exact)
+        );
+        assert!(approved_destination_match(&state, "other.example", 443).is_none());
+        assert!(approved_destination_match(&state, "example.com", 80).is_none());
     }
 
     #[test]
@@ -684,9 +727,99 @@ mod tests {
             .unwrap();
         }
 
-        assert!(is_http_destination_approved(&state, "example.com", 443));
-        assert!(is_http_destination_approved(&state, "docs.rs", 443));
-        assert!(!is_http_destination_approved(&state, "example.com", 80));
+        assert_eq!(
+            approved_destination_match(&state, "example.com", 443),
+            Some(ApprovedMatch::Wildcard)
+        );
+        assert_eq!(
+            approved_destination_match(&state, "docs.rs", 443),
+            Some(ApprovedMatch::Wildcard)
+        );
+        assert!(approved_destination_match(&state, "example.com", 80).is_none());
+    }
+
+    /// Regula exact-host z prywatnym adresem LAN jest dozwolona po
+    /// zatwierdzeniu, a exact wygrywa z rownoczesnie pasujacym wildcardem.
+    #[test]
+    fn exact_private_rule_allows_lan_and_beats_wildcard() {
+        let exact = ManifestNetworkRule {
+            id: "lan-mcp".to_string(),
+            protocol: "tcp".to_string(),
+            host: "192.168.11.122".to_string(),
+            port: 443,
+            description: Some("LAN MCP server".to_string()),
+            required: false,
+        };
+        let wildcard = ManifestNetworkRule {
+            id: "public-web-https".to_string(),
+            protocol: "tcp".to_string(),
+            host: "*".to_string(),
+            port: 443,
+            description: Some("Public web".to_string()),
+            required: true,
+        };
+        let state = make_state(
+            vec!["http.request".to_string(), "http".to_string()],
+            vec![wildcard, exact],
+        );
+
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO addon_network_rules \
+                 (addon_id, rule_id, protocol, host, port, description, required, approved) \
+                 VALUES (?1, 'public-web-https', 'tcp', '*', 443, 'Public web', 1, 1)",
+                rusqlite::params![&state.addon_id],
+            )
+            .unwrap();
+        }
+
+        // Tylko wildcard zatwierdzony — LAN host dopasowany jako Wildcard,
+        // czyli guard SSRF go zablokuje.
+        assert_eq!(
+            approved_destination_match(&state, "192.168.11.122", 443),
+            Some(ApprovedMatch::Wildcard)
+        );
+        assert!(!is_safe_url("https://192.168.11.122/mcp"));
+
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO addon_network_rules \
+                 (addon_id, rule_id, protocol, host, port, description, required, approved) \
+                 VALUES (?1, 'lan-mcp', 'tcp', '192.168.11.122', 443, 'LAN MCP', 0, 1)",
+                rusqlite::params![&state.addon_id],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            approved_destination_match(&state, "192.168.11.122", 443),
+            Some(ApprovedMatch::Exact)
+        );
+    }
+
+    #[test]
+    fn resolve_destination_gates_private_only_when_required() {
+        let public_only = resolve_destination("127.0.0.1", 8080, true);
+        assert!(public_only.is_none(), "wildcard match musi odrzucic loopback");
+        let exact = resolve_destination("127.0.0.1", 8080, false)
+            .expect("exact match pozwala na loopback");
+        assert!(!exact.is_empty());
+    }
+
+    #[test]
+    fn extract_http_destination_rejects_non_http_schemes() {
+        assert!(extract_http_destination("ftp://example.com/x").is_none());
+        assert!(extract_http_destination("file:///etc/passwd").is_none());
+        assert_eq!(
+            extract_http_destination("https://example.com/x"),
+            Some(("example.com".to_string(), 443))
+        );
+        assert_eq!(
+            extract_http_destination("http://192.168.11.122:8080/mcp"),
+            Some(("192.168.11.122".to_string(), 8080))
+        );
     }
 
     #[test]
