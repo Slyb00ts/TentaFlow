@@ -27,6 +27,18 @@ pub struct ModelSpec {
     pub head_dim: u64,
     pub intermediate_size: u64,
     pub max_position_embeddings: u64,
+    /// Liczba ekspertow MoE per warstwa. 0 = model gesty (dense).
+    pub num_experts: u64,
+    /// Liczba ekspertow aktywowanych na token (top-K routingu). 0 dla dense.
+    pub num_experts_per_tok: u64,
+    /// Wymiar posredni pojedynczego eksperta MoE. Czesto inny (mniejszy) niz
+    /// `intermediate_size`; gdy 0 a model jest MoE, fallback do intermediate_size.
+    pub moe_intermediate_size: u64,
+    /// Wymiar posredni wspoldzielonego eksperta (Qwen-MoE/DeepSeek). 0 = brak.
+    pub shared_expert_intermediate_size: u64,
+    /// Wagi lm_head wspoldzielone z embeddingiem wejsciowym. Gdy true, lm_head
+    /// nie dodaje osobnych parametrow.
+    pub tie_word_embeddings: bool,
     /// Jest multimodal (vision/audio)
     pub has_vision: bool,
     pub has_audio: bool,
@@ -37,14 +49,22 @@ pub struct ModelSpec {
     pub num_active_parameters: u64,
     /// Quantization wykryta z nazwy modelu / config (auto/awq/gptq/int4/int8/fp8).
     pub quantization: Option<String>,
+    /// Jawny bytes/param (MLX top-level `quantization` z group_size: szerokosc
+    /// zalezy od group_size, np. 4-bit g64 = 0.5625, g32 = 0.625). Gdy `Some`,
+    /// ma pierwszenstwo przed `quantization`/`dtype` w `bytes_per_param`.
+    pub bytes_per_param_override: Option<f64>,
 }
 
 impl ModelSpec {
-    /// Liczba bajtow per parametr na podstawie dtype/quantization.
+    /// Liczba bajtow per parametr na podstawie dtype/quantization. Jawny
+    /// `bytes_per_param_override` (MLX group-size) wygrywa nad etykieta i dtype.
     /// Quantization wartosci uwzgledniaja overhead skali/zero-pointow:
     /// - 4-bit (awq/gptq/nvfp4/fp4/mxfp4/bnb_4bit/...): 0.5 + ~0.0625 = 0.5625
     /// - 8-bit (int8/fp8/bnb_8bit): 1.0 + ~0.0625 = 1.0625
     pub fn bytes_per_param(&self) -> f64 {
+        if let Some(b) = self.bytes_per_param_override {
+            return b;
+        }
         if let Some(q) = &self.quantization {
             return quant_label_to_bytes(q).unwrap_or_else(|| self.bytes_per_dtype());
         }
@@ -55,25 +75,53 @@ impl ModelSpec {
         match self.dtype.as_str() {
             "bfloat16" | "float16" | "f16" | "bf16" => 2.0,
             "float32" | "f32" => 4.0,
-            "int8" | "fp8" => 1.0,
+            // dtype 8-bitowy w config zapisuje wagi po 1 bajcie na parametr
+            // (fp8 per-tensor/block, uint8 dla pakowanych int8) - bez tego
+            // wpadaja w default 2.0 i zawyzaja raw fp8 2x.
+            "int8" | "fp8" | "float8_e4m3fn" | "float8_e5m2" | "float8" | "uint8" => 1.0,
             "int4" => 0.5,
             _ => 2.0, // bf16 default dla nowoczesnych LLM
         }
     }
 
-    /// Bajty per element KV cache. fp8 ekstra opcja - dwukrotna oszczednosc.
-    pub fn bytes_per_kv_element(kv_cache_dtype: &str) -> f64 {
-        match kv_cache_dtype {
-            "fp8" | "fp8_e5m2" | "fp8_e4m3" => 1.0,
-            "auto" | "fp16" | "float16" | "bfloat16" | "bf16" => 2.0,
-            _ => 2.0,
+    /// Liczba glow KV (z fallbackiem do glow uwagi gdy config nie podaje GQA).
+    fn kv_heads_effective(&self) -> u64 {
+        if self.num_key_value_heads > 0 {
+            self.num_key_value_heads
+        } else {
+            self.num_attention_heads
+        }
+    }
+
+    /// Wymiar pojedynczej glowy (jawny `head_dim` albo `hidden/heads`).
+    fn head_dim_effective(&self) -> u64 {
+        if self.head_dim > 0 {
+            self.head_dim
+        } else if self.num_attention_heads > 0 {
+            self.hidden_size / self.num_attention_heads
+        } else {
+            0
+        }
+    }
+
+    /// Wymiar posredni eksperta MoE. Czesc configow trzyma rozmiar per-ekspert
+    /// w `intermediate_size`, wiec gdy `moe_intermediate_size==0` ale model jest
+    /// MoE, traktujemy `intermediate_size` jako wartosc per-ekspert.
+    fn moe_intermediate_effective(&self) -> u64 {
+        if self.moe_intermediate_size > 0 {
+            self.moe_intermediate_size
+        } else {
+            self.intermediate_size
         }
     }
 
     /// Wzor liczenia parametrow gdy num_parameters = 0:
     ///   embed: vocab × hidden
-    ///   per_layer: 4 × hidden² (qkv+o) + 3 × hidden × intermediate (gate+up+down) + 2×hidden (norms)
-    ///   total: embed + layers × per_layer + lm_head(vocab × hidden)
+    ///   attn per warstwa: q(h²) + o(h²) + k+v z GQA (2·h·kv_heads·head_dim)
+    ///   ffn per warstwa: dense = 3·h·intermediate; MoE = sumy wszystkich ekspertow
+    ///     (vLLM/MLX ladują WSZYSTKIE wagi ekspertow) + ewentualny shared expert + router
+    ///   norms per warstwa: 2·h
+    ///   lm_head: vocab × hidden, tylko gdy embeddingi NIE sa tied
     pub fn estimated_params(&self) -> u64 {
         if self.num_parameters > 0 {
             return self.num_parameters;
@@ -86,19 +134,60 @@ impl ModelSpec {
             h * 4.0
         };
         let l = self.num_hidden_layers as f64;
+        let kv_heads = self.kv_heads_effective() as f64;
+        let head_dim = self.head_dim_effective() as f64;
+
         let embed = v * h;
-        let per_layer = 4.0 * h * h + 3.0 * h * i + 2.0 * h;
-        let lm_head = v * h;
-        (embed + l * per_layer + lm_head) as u64
+        // q i o sa pelne (h×h); k i v sa zwezone przez GQA do kv_heads głow.
+        let attn_per_layer = 2.0 * h * h + 2.0 * h * kv_heads * head_dim;
+        let ffn_per_layer = if self.num_experts > 0 {
+            let moe_i = self.moe_intermediate_effective() as f64;
+            let experts = self.num_experts as f64;
+            let shared = if self.shared_expert_intermediate_size > 0 {
+                3.0 * h * self.shared_expert_intermediate_size as f64
+            } else {
+                0.0
+            };
+            // 3 macierze (gate+up+down) na eksperta + router (h × num_experts).
+            experts * 3.0 * h * moe_i + shared + h * experts
+        } else {
+            3.0 * h * i
+        };
+        let norms_per_layer = 2.0 * h;
+        let lm_head = if self.tie_word_embeddings { 0.0 } else { v * h };
+        (embed + l * (attn_per_layer + ffn_per_layer + norms_per_layer) + lm_head) as u64
     }
 
     /// Liczba aktywnych parametrow (MoE: tylko top-K expertow). Default = wszystkie.
+    /// Dla MoE liczy te same czlony co `estimated_params`, ale FFN obejmuje jedynie
+    /// `num_experts_per_tok` ekspertow zamiast wszystkich.
     pub fn active_params(&self) -> u64 {
-        if self.num_active_parameters > 0 {
-            self.num_active_parameters
-        } else {
-            self.estimated_params()
+        if self.num_parameters > 0 && self.num_active_parameters > 0 {
+            return self.num_active_parameters;
         }
+        if self.num_experts == 0 {
+            return self.estimated_params();
+        }
+        let h = self.hidden_size as f64;
+        let v = self.vocab_size as f64;
+        let l = self.num_hidden_layers as f64;
+        let kv_heads = self.kv_heads_effective() as f64;
+        let head_dim = self.head_dim_effective() as f64;
+        let moe_i = self.moe_intermediate_effective() as f64;
+        let active_experts = self.num_experts_per_tok.max(1) as f64;
+
+        let embed = v * h;
+        let attn_per_layer = 2.0 * h * h + 2.0 * h * kv_heads * head_dim;
+        let shared = if self.shared_expert_intermediate_size > 0 {
+            3.0 * h * self.shared_expert_intermediate_size as f64
+        } else {
+            0.0
+        };
+        let ffn_per_layer =
+            active_experts * 3.0 * h * moe_i + shared + h * self.num_experts as f64;
+        let norms_per_layer = 2.0 * h;
+        let lm_head = if self.tie_word_embeddings { 0.0 } else { v * h };
+        (embed + l * (attn_per_layer + ffn_per_layer + norms_per_layer) + lm_head) as u64
     }
 }
 
@@ -108,7 +197,10 @@ impl ModelSpec {
 pub fn quant_label_to_bytes(label: &str) -> Option<f64> {
     let q = label.to_lowercase().replace('-', "_");
     match q.as_str() {
-        // 4-bit: AWQ, GPTQ, AutoRound INT4, bnb-4bit, NVFP4, FP4, MXFP4, w4a16
+        // mxfp4: 4 bity + wspoldzielony skalar e8m0 per 32 elementy = 4.25 bit/param
+        // (4.25/8 = 0.5312), wezej niz group-scale 4-bit ponizej.
+        "mxfp4" => Some(0.5312),
+        // 4-bit: AWQ, GPTQ, AutoRound INT4, bnb-4bit, NVFP4, FP4, w4a16
         "int4"
         | "awq"
         | "gptq"
@@ -119,12 +211,14 @@ pub fn quant_label_to_bytes(label: &str) -> Option<f64> {
         | "load_in_4bit"
         | "nvfp4"
         | "fp4"
-        | "mxfp4"
         | "w4a16"
         | "compressed_tensors_4bit" => Some(0.5625),
-        // 8-bit: int8, fp8, bnb-8bit, w8a8, w8a16
-        "int8" | "fp8" | "fp8_e4m3" | "fp8_e5m2" | "bnb_8bit" | "bitsandbytes_8bit"
-        | "load_in_8bit" | "w8a8" | "w8a16" | "modelopt_fp8" => Some(1.0625),
+        // fp8 per-tensor/block: znikomy overhead skali, 1 bajt/param.
+        "fp8" | "fp8_e4m3" | "fp8_e5m2" | "modelopt_fp8" => Some(1.0),
+        // int8 group-scale: 1 bajt + ~6.25% skali na grupe = 1.0625.
+        "int8" | "w8a8" | "w8a16" | "bnb_8bit" | "bitsandbytes_8bit" | "load_in_8bit" => {
+            Some(1.0625)
+        }
         // 2-bit (rzadkie ale istnieje)
         "int2" | "w2a16" => Some(0.3125),
         // 16-bit warianty
@@ -132,6 +226,15 @@ pub fn quant_label_to_bytes(label: &str) -> Option<f64> {
         "fp32" | "float32" | "f32" => Some(4.0),
         _ => None,
     }
+}
+
+/// Bajty na parametr dla kwantyzacji MLX z jawnym `group_size`. MLX trzyma jeden
+/// 16-bitowy skalar i jeden bias per grupa, czyli `32 bity / group_size` overheadu
+/// ponad surowe `bits/8` bajtow. Przyklady: 4-bit g64 = 0.5 + 32/64/8 = 0.5625;
+/// 4-bit g32 = 0.5 + 32/32/8 = 0.625; 8-bit g64 = 1.0 + 0.0625 = 1.0625.
+pub fn mlx_weight_bytes(bits: u64, group_size: u64) -> f64 {
+    let g = group_size.max(1) as f64;
+    bits as f64 / 8.0 + 32.0 / g / 8.0
 }
 
 /// Heurystyka: wykrywa kwantyzacje na podstawie nazwy repo HF
@@ -260,12 +363,82 @@ pub fn detect_quantization(
 pub enum DeployEngine {
     Vllm,
     LlamaCpp,
+    /// Apple MLX (mlx-lm / mlx-swift). Unified memory: JEDNO urzadzenie, brak
+    /// TP/PP/split-mode i brak ~5 GB workspace vLLM. Budzet pamieci pochodzi z
+    /// wired-limit, nie z liczby kart.
+    Mlx,
 }
 
 impl Default for DeployEngine {
     fn default() -> Self {
         DeployEngine::Vllm
     }
+}
+
+/// Bajty per element KV cache dla danego silnika i etykiety typu cache. To
+/// JEDYNE zrodlo prawdy dla szerokosci KV — uzywane przez estymacje, auto_fit
+/// i builder argow, zeby estymacja i wdrozona komenda nigdy sie nie rozjechaly.
+///
+/// `None` = etykieta nieprawidlowa dla tego silnika (caller decyduje co zrobic;
+/// estymacja fallbackuje do 2.0 jak fp16). Etykieta normalizowana: lowercase,
+/// '-' -> '_'; `auto` mapuje per silnik na natywny domyslny typ.
+///
+/// Wartosci llama.cpp to `block_bytes / 32` z ggml-common.h (rozmiar bloku 32
+/// elementow): q8_0 = 34/32 = 1.0625, q5_1 = 24/32 = 0.75, q5_0 = 22/32 = 0.6875,
+/// q4_1 = 20/32 = 0.625, q4_0 = 18/32 = 0.5625, iq4_nl = 18/32 = 0.5625.
+pub fn kv_bytes_per_element(engine: DeployEngine, label: &str) -> Option<f64> {
+    let l = label.to_lowercase().replace('-', "_");
+    match engine {
+        DeployEngine::Vllm => match l.as_str() {
+            "auto" | "f16" | "fp16" | "bf16" | "bfloat16" | "float16" => Some(2.0),
+            "fp8" | "fp8_e4m3" | "fp8_e5m2" => Some(1.0),
+            _ => None,
+        },
+        DeployEngine::LlamaCpp => match l.as_str() {
+            "auto" | "f16" | "fp16" | "bf16" | "bfloat16" => Some(2.0),
+            "q8_0" => Some(1.0625),
+            "q5_1" => Some(0.75),
+            "q5_0" => Some(0.6875),
+            "q4_1" => Some(0.625),
+            "q4_0" => Some(0.5625),
+            "iq4_nl" => Some(0.5625),
+            _ => None,
+        },
+        // MLX QuantizedKVCache: kv8 ~ q8_0 (1.0625), kv4 ~ q4_0 (0.5625).
+        DeployEngine::Mlx => match l.as_str() {
+            "none" | "auto" | "f16" | "fp16" | "bf16" | "bfloat16" => Some(2.0),
+            "kv8" | "q8" => Some(1.0625),
+            "kv4" | "q4" => Some(0.5625),
+            _ => None,
+        },
+    }
+}
+
+/// KV cache w bajtach na 1 token, z OSOBNYMI typami K i V. Pozwala na rozne
+/// szerokosci (np. K=q8_0, V=q4_0 w llama.cpp). Nieprawidlowa etykieta
+/// fallbackuje do 2.0 (fp16). Dla k==v wynik jest identyczny ze stara formula
+/// `2.0 * ... * bytes_kv` (suma bytes_k + bytes_v = 2 * bytes_kv).
+pub fn kv_per_token_bytes(
+    model: &ModelSpec,
+    engine: DeployEngine,
+    k_label: &str,
+    v_label: &str,
+) -> f64 {
+    let head_dim = if model.head_dim > 0 {
+        model.head_dim
+    } else if model.num_attention_heads > 0 {
+        model.hidden_size / model.num_attention_heads
+    } else {
+        128
+    };
+    let kv_heads = if model.num_key_value_heads > 0 {
+        model.num_key_value_heads
+    } else {
+        model.num_attention_heads.max(1)
+    };
+    let bytes_k = kv_bytes_per_element(engine, k_label).unwrap_or(2.0);
+    let bytes_v = kv_bytes_per_element(engine, v_label).unwrap_or(2.0);
+    model.num_hidden_layers as f64 * kv_heads as f64 * head_dim as f64 * (bytes_k + bytes_v)
 }
 
 /// Konfiguracja runtime do estymacji.
@@ -280,8 +453,15 @@ pub struct VramEstimateInput {
     pub pipeline_parallel: u32,
     pub max_model_len: u64,
     pub max_num_seqs: u64,
+    /// vLLM `--max-num-batched-tokens`: liczba tokenow w jednym kroku schedulera.
+    /// Driver szczytu aktywacji (residual + bufory MLP skaluja sie z nim, NIE
+    /// z liczba parametrow modelu).
+    pub max_num_batched_tokens: u64,
     /// `auto` (=fp16), `fp16`, `bfloat16`, `fp8`
     pub kv_cache_dtype: String,
+    /// Osobny typ V cache dla llama.cpp (K=q8_0, V=q4_0). `None` = uzyj
+    /// `kv_cache_dtype` dla obu (vLLM/MLX nie maja osobnego V).
+    pub kv_cache_dtype_v: Option<String>,
     /// vLLM `--gpu-memory-utilization` (0.0–1.0). Default 0.9.
     pub gpu_memory_utilization: f64,
     /// Activation memory overhead jako % weights+kv. Empirycznie 8-15%.
@@ -302,11 +482,27 @@ impl Default for VramEstimateInput {
             pipeline_parallel: 1,
             max_model_len: 8192,
             max_num_seqs: 256,
+            max_num_batched_tokens: 8192,
             kv_cache_dtype: "auto".to_string(),
+            kv_cache_dtype_v: None,
             gpu_memory_utilization: 0.9,
             activation_overhead_pct: 10.0,
             weights_bytes_override: None,
         }
+    }
+}
+
+impl VramEstimateInput {
+    /// Etykieta typu K cache (zawsze `kv_cache_dtype`).
+    fn k_label(&self) -> &str {
+        &self.kv_cache_dtype
+    }
+
+    /// Etykieta typu V cache: osobny `kv_cache_dtype_v` gdy podany, inaczej K.
+    fn v_label(&self) -> &str {
+        self.kv_cache_dtype_v
+            .as_deref()
+            .unwrap_or(&self.kv_cache_dtype)
     }
 }
 
@@ -322,6 +518,16 @@ pub struct VramEstimate {
     pub per_gpu_gb: f64,
     pub fits_per_gpu: bool,
     pub fits_total: bool,
+    /// Pula KV (cluster-wide) = `util*VRAM - weights - activations` zsumowana po
+    /// wszystkich GPU. Dla vLLM to resztkowa pamiec dostepna dla PagedAttention,
+    /// NIE iloczyn ctx*seqs. Dla llama.cpp = realne KV calego `-c`.
+    pub kv_pool_gb: f64,
+    /// Ile tokenow KV miesci pula na JEDNEJ GPU (vLLM). Limit twardy: musi byc
+    /// >= max_model_len, inaczej vLLM odrzuci start (max seq len > KV cache).
+    pub pool_tokens: u64,
+    /// Ile pelnych sekwencji `max_model_len` miesci pula (`pool_tokens / ctx`).
+    /// Wartosc informacyjna o osiagalnej wspolbieznosci, nie limit pamieci.
+    pub concurrent_full_len_seqs: f64,
     pub warnings: Vec<String>,
 }
 
@@ -332,16 +538,18 @@ pub fn estimate_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEstima
     match input.engine {
         DeployEngine::Vllm => estimate_vllm_vram(model, input),
         DeployEngine::LlamaCpp => estimate_llamacpp_vram(model, input),
+        DeployEngine::Mlx => estimate_mlx_vram(model, input),
     }
 }
 
-/// Estymacja VRAM dla vLLM.
+/// Estymacja VRAM dla vLLM wedlug modelu PULI KV.
 ///
-/// Modeluje cluster-wide totals (weights + kv_cache + activations + overhead) oraz
-/// realistyczne wartosci per-GPU po podziale przez TP*PP. KV cache uwzglednia GQA
-/// (`num_key_value_heads` zamiast pelnej liczby attention heads). Activations
-/// modelowane jako workspace ~5 GB na GPU + drobny percent weights/GPU (real vLLM
-/// behavior - workspace doesn't shard symmetrically with weights).
+/// vLLM nie prealokuje siatki `max_num_seqs × max_model_len`. Po zaladowaniu wag
+/// i sprofilowaniu aktywacji tworzy JEDNA pule KV (PagedAttention):
+/// `KV_pool = util*VRAM - weights - activations`. `max_num_seqs` to limit admisji
+/// schedulera, NIE rozmiar pamieci — dlatego nie wchodzi do zadnej formuly pamieci.
+/// Fit zalezy od dwoch warunkow: staly footprint miesci sie w `util*VRAM` ORAZ pula
+/// pomiesci co najmniej jedna pelna sekwencje (`pool_tokens >= max_model_len`).
 pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEstimate {
     let mut warnings: Vec<String> = Vec::new();
 
@@ -354,52 +562,69 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
     };
     let model_weights_gb = bytes_to_gib(model_weights_bytes);
 
-    // KV cache GQA: `num_key_value_heads` (NOT num_attention_heads) decyduje o
-    // KV memory; `head_dim = hidden / num_attention_heads` chyba ze HF zadeklarowal
-    // jawnie. `seq_len` = `max_model_len` z requesta (nie `max_position_embeddings` -
-    // to byl stary bug, zawyzal KV ~8x dla modeli z 256k context window).
-    // Formula: 2 (K+V) × layers × kv_heads × head_dim × max_model_len × max_num_seqs × bytes_kv
-    let head_dim = if model.head_dim > 0 {
-        model.head_dim
-    } else if model.num_attention_heads > 0 {
-        model.hidden_size / model.num_attention_heads
-    } else {
-        128
-    };
-    let kv_heads = if model.num_key_value_heads > 0 {
-        model.num_key_value_heads
-    } else {
-        model.num_attention_heads.max(1)
-    };
-    let bytes_kv = ModelSpec::bytes_per_kv_element(&input.kv_cache_dtype);
-    let kv_per_seq_per_token =
-        2.0 * model.num_hidden_layers as f64 * kv_heads as f64 * head_dim as f64 * bytes_kv;
-    let kv_cache_bytes =
-        kv_per_seq_per_token * input.max_model_len as f64 * input.max_num_seqs as f64;
-    let kv_cache_gb = bytes_to_gib(kv_cache_bytes);
-
-    // Activations modelowane PER-GPU: real vLLM bierze stale ~5 GB workspace na
-    // kazdy worker (CUDA graphs, allocator pools, intermediate buffers) + ok 10%
-    // weights/GPU jako transient activations w forwardzie. Ten model jest blizszy
-    // realnemu zachowaniu niz jednolite skalowanie sumy.
     let tp = input.tensor_parallel.max(1) as f64;
     let pp = input.pipeline_parallel.max(1) as f64;
     let parallel = tp * pp;
 
     let weights_per_gpu = model_weights_gb / parallel;
-    // KV cache shardsuje sie z TP (per-head split); PP shardsuje warstwy ale KV
-    // dla aktywnej warstwy zyje pelny - aproksymujemy podzialem przez tp*pp jak
-    // wczesniej (dominujacy efekt: TP).
-    let kv_per_gpu = kv_cache_gb / parallel;
-    let activation_pct = (input.activation_overhead_pct / 100.0).max(0.0);
-    let activations_per_gpu = 5.0 + weights_per_gpu * activation_pct;
+
+    // Szczyt aktywacji skaluje sie z liczba tokenow w kroku schedulera, nie z liczba
+    // parametrow: residual stream (2*hidden) + jeden bufor MLP intermediate, razy
+    // szerokosc aktywacji (bf16/fp16 = 2 bajty). Do tego staly koszt CUDA graphs
+    // i bufory NCCL przy TP>1.
+    let act_dtype_bytes = 2.0;
+    let activation_peak = bytes_to_gib(
+        input.max_num_batched_tokens as f64
+            * (2.0 * model.hidden_size as f64 + model.intermediate_size.max(1) as f64)
+            * act_dtype_bytes,
+    );
+    let cuda_graph_const = 1.5;
+    let nccl = if tp > 1.0 { 0.3 * tp } else { 0.0 };
+    let activations_per_gpu = activation_peak + cuda_graph_const + nccl;
     let activations_gb = activations_per_gpu * parallel; // cluster-wide (informational)
     let overhead_gb = 0.5; // CUDA runtime, allocator metadata - per cluster
 
-    let total_gb = model_weights_gb + kv_cache_gb + activations_gb + overhead_gb;
-    let per_gpu_gb = weights_per_gpu + kv_per_gpu + activations_per_gpu;
+    let required_fixed_per_gpu = weights_per_gpu + activations_per_gpu;
 
-    // Walidacja TP/PP vs model heads/layers
+    // KV shardsuje sie tylko do `min(tp, kv_heads)` — powyzej vLLM REPLIKUJE glowy
+    // KV (kazdy rank trzyma >=1 cala glowe), wiec per-GPU KV przestaje malec. PP
+    // dzieli warstwy osobno, wiec szerokosc tokena dzieli sie dodatkowo przez pp.
+    let kv_heads = if model.num_key_value_heads > 0 {
+        model.num_key_value_heads
+    } else {
+        model.num_attention_heads.max(1)
+    };
+    let kv_tp_shards = (input.tensor_parallel as u64).min(kv_heads).max(1) as f64;
+    let kv_per_token_total =
+        kv_per_token_bytes(model, input.engine, &input.kv_cache_dtype, &input.kv_cache_dtype);
+    let kv_per_token_per_gpu = kv_per_token_total / (kv_tp_shards * pp);
+
+    let usable_per_gpu = input.gpu_memory_gb_each * input.gpu_memory_utilization;
+    let kv_pool_per_gpu = (usable_per_gpu - required_fixed_per_gpu).max(0.0);
+    let kv_pool_per_gpu_bytes = kv_pool_per_gpu * 1024.0 * 1024.0 * 1024.0;
+    let pool_tokens = if kv_per_token_per_gpu > 0.0 {
+        (kv_pool_per_gpu_bytes / kv_per_token_per_gpu).floor() as u64
+    } else {
+        0
+    };
+    let concurrent_full_len_seqs = if input.max_model_len > 0 {
+        pool_tokens as f64 / input.max_model_len as f64
+    } else {
+        0.0
+    };
+
+    // Pula KV cluster-wide do paska UI — kazda GPU trzyma osobna pule tej samej
+    // wielkosci, wiec roll-up to per-GPU × liczba shardow.
+    let kv_cache_gb = kv_pool_per_gpu * parallel;
+    let kv_pool_gb = kv_cache_gb;
+
+    let total_gb = model_weights_gb + activations_gb + kv_pool_gb + overhead_gb;
+    let per_gpu_gb = required_fixed_per_gpu + kv_pool_per_gpu;
+
+    // Walidacja TP/PP vs model heads/layers. `num_attention_heads % tp` i
+    // `layers % pp` sa twarde (vLLM odrzuci). `kv_heads % tp` NIE jest bledem:
+    // przy TP > kv_heads vLLM replikuje glowy KV (legalne, lecz bez dalszej
+    // oszczednosci pamieci per-GPU).
     if model.num_attention_heads > 0
         && model.num_attention_heads % input.tensor_parallel as u64 != 0
     {
@@ -409,11 +634,12 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
         ));
     }
     if model.num_key_value_heads > 0
-        && model.num_key_value_heads % input.tensor_parallel as u64 != 0
+        && (input.tensor_parallel as u64) > model.num_key_value_heads
     {
         warnings.push(format!(
-            "tensor_parallel={} nie dzieli num_key_value_heads={} - vLLM odrzuci konfiguracje",
-            input.tensor_parallel, model.num_key_value_heads
+            "tensor_parallel={} > num_key_value_heads={} - KV replikowane miedzy ranki, \
+             brak dalszej oszczednosci KV per-GPU powyzej TP={}",
+            input.tensor_parallel, model.num_key_value_heads, model.num_key_value_heads
         ));
     }
     if model.num_hidden_layers > 0 && model.num_hidden_layers % input.pipeline_parallel as u64 != 0
@@ -430,17 +656,27 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
         ));
     }
 
-    let usable_per_gpu = input.gpu_memory_gb_each * input.gpu_memory_utilization;
-    let fits_per_gpu = per_gpu_gb <= usable_per_gpu;
-    let fits_total = total_gb <= input.gpu_memory_gb_each * input.gpu_count as f64;
+    let fits_per_gpu =
+        required_fixed_per_gpu <= usable_per_gpu && pool_tokens >= input.max_model_len;
+    // DRUG-1: budzet calkowity respektuje util (vLLM nie ma dostepu do calego VRAM)
+    // i nigdy nie jest spelniony gdy ktorakolwiek GPU nie miesci stalego footprintu.
+    let fits_total = fits_per_gpu
+        && total_gb <= input.gpu_memory_gb_each * input.gpu_count as f64 * input.gpu_memory_utilization;
 
-    if !fits_per_gpu {
+    if required_fixed_per_gpu > usable_per_gpu {
         warnings.push(format!(
-            "VRAM per GPU {:.1} GB > dostepne {:.1} GB ({}% z {:.1} GB) - OOM przy starcie",
-            per_gpu_gb,
+            "Staly footprint per GPU {:.1} GB (wagi + aktywacje) > dostepne {:.1} GB \
+             ({}% z {:.1} GB) - OOM przy starcie",
+            required_fixed_per_gpu,
             usable_per_gpu,
             (input.gpu_memory_utilization * 100.0) as u32,
             input.gpu_memory_gb_each
+        ));
+    } else if pool_tokens < input.max_model_len {
+        warnings.push(format!(
+            "pula KV miesci {} tokenow < max_model_len {} - vLLM odrzuci (max seq len > KV cache); \
+             zwieksz liczbe GPU, uzyj fp8 KV albo zmniejsz max_model_len",
+            pool_tokens, input.max_model_len
         ));
     }
 
@@ -461,6 +697,9 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
         per_gpu_gb,
         fits_per_gpu,
         fits_total,
+        kv_pool_gb,
+        pool_tokens,
+        concurrent_full_len_seqs,
         warnings,
     }
 }
@@ -472,10 +711,13 @@ const LLAMACPP_UBATCH: f64 = 512.0;
 /// trzymajacej fragment modelu.
 const LLAMACPP_CUDA_CTX_PER_GPU: f64 = 0.40;
 
-/// Compute buffer llama.cpp (GB): logits dla calego ubatch + scratch aktywacji
-/// grafu. Siedzi glownie na karcie main, dlatego liczony bez podzialu przez GPU.
-fn llamacpp_compute_buffer_gb(model: &ModelSpec) -> f64 {
-    let logits = model.vocab_size as f64 * LLAMACPP_UBATCH * 4.0;
+/// Compute buffer llama.cpp (GB): logits dla aktywnych sekwencji + scratch
+/// aktywacji grafu. Siedzi glownie na karcie main, dlatego liczony bez podzialu
+/// przez GPU. Server liczy logits TYLKO dla ostatniego tokena kazdej aktywnej
+/// sekwencji (`vocab * n_active_seq * 4`), nie dla calego ubatch — `vocab*ubatch`
+/// zawyzalo decode ~512x.
+fn llamacpp_compute_buffer_gb(model: &ModelSpec, max_num_seqs: u64) -> f64 {
+    let logits = model.vocab_size as f64 * max_num_seqs.max(1) as f64 * 4.0;
     // ~6 zywych tensorow aktywacji w grafie forward (residual, attn, mlp...).
     let scratch = LLAMACPP_UBATCH * model.hidden_size as f64 * 4.0 * 6.0;
     bytes_to_gib(logits + scratch)
@@ -495,13 +737,16 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
     };
     let weights_gb = bytes_to_gib(model_weights_bytes);
 
-    // KV dla calego kontekstu (-c). llama.cpp dzieli `-c` na `-np` slotow, wiec
-    // total KV = kv_per_token × n_ctx (NIE × max_num_seqs jak w vLLM page-cache).
-    let n_ctx = input.max_model_len;
-    let kv_per_token = kv_bytes_per_seq_per_token(model, &input.kv_cache_dtype);
+    // `max_model_len` to kontekst PER-REQUEST; llama-server dzieli `-c` na `-np`
+    // slotow (`n_ctx_seq = n_ctx / n_seq_max`). Zeby kazdy slot dostal pelne
+    // `max_model_len`, calkowity `-c` = max_model_len × max_num_seqs, wiec total
+    // KV rosnie liniowo z liczba slotow (inaczej niz w vLLM page-cache).
+    let seqs = input.max_num_seqs.max(1);
+    let n_ctx = input.max_model_len * seqs;
+    let kv_per_token = kv_per_token_bytes(model, input.engine, input.k_label(), input.v_label());
     let kv_cache_gb = bytes_to_gib(kv_per_token * n_ctx as f64);
 
-    let compute_buffer_gb = llamacpp_compute_buffer_gb(model);
+    let compute_buffer_gb = llamacpp_compute_buffer_gb(model, seqs);
 
     // llama.cpp uzywa JEDNEGO split-mode; TP i PP mapuja na liczbe kart splicie.
     let tp = input.tensor_parallel.max(1);
@@ -509,7 +754,6 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
     let gpus_used = ((tp * pp).min(input.gpu_count.max(1))).max(1) as f64;
 
     let weights_per_gpu = weights_gb / gpus_used;
-    let kv_per_gpu = kv_cache_gb / gpus_used;
     let overhead_gb = 0.3; // allocator / metadata
 
     // Cluster-wide activations (do paska UI): compute buffer + CUDA context na kazdej
@@ -517,9 +761,18 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
     let activations_gb = compute_buffer_gb + LLAMACPP_CUDA_CTX_PER_GPU * gpus_used;
     let total_gb = weights_gb + kv_cache_gb + activations_gb + overhead_gb;
 
-    // Per-GPU konserwatywnie: compute buffer + logits siedza glownie na main GPU,
-    // wiec pelny compute liczymy na najciezszej karcie.
-    let per_gpu_gb = weights_per_gpu + kv_per_gpu + compute_buffer_gb + LLAMACPP_CUDA_CTX_PER_GPU;
+    // Per-GPU zalezy od trybu split. Row-split (tp>1): KV + compute (attention)
+    // siedza na MAIN GPU i NIE dziela sie rowno — main = weights/gpus + PELNE KV
+    // + compute + cuda; secondary = weights/gpus + cuda. Layer-split (pp>1, tp==1):
+    // warstwa KV zyje na karcie tej warstwy, wiec KV dzieli sie rowno (kv/gpus).
+    let per_gpu_gb = if tp > 1 {
+        let main_gpu = weights_per_gpu + kv_cache_gb + compute_buffer_gb + LLAMACPP_CUDA_CTX_PER_GPU;
+        let secondary = weights_per_gpu + LLAMACPP_CUDA_CTX_PER_GPU;
+        main_gpu.max(secondary)
+    } else {
+        let kv_per_gpu = kv_cache_gb / gpus_used;
+        weights_per_gpu + kv_per_gpu + compute_buffer_gb + LLAMACPP_CUDA_CTX_PER_GPU
+    };
 
     if tp > 1 && pp > 1 {
         warnings.push(format!(
@@ -587,6 +840,8 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
         );
     }
 
+    // KV llama.cpp to realne KV calego `-c` (= max_model_len × slotow): pool_tokens
+    // = n_ctx, kv_pool_gb = KV, a wspolbieznosc to liczba slotow `-np`.
     VramEstimate {
         model_weights_gb: weights_gb,
         kv_cache_gb,
@@ -596,6 +851,101 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
         per_gpu_gb,
         fits_per_gpu,
         fits_total,
+        kv_pool_gb: kv_cache_gb,
+        pool_tokens: n_ctx,
+        concurrent_full_len_seqs: seqs as f64,
+        warnings,
+    }
+}
+
+/// Estymacja VRAM dla MLX (Apple unified memory): JEDNO urzadzenie, brak TP/PP
+/// i split-mode, brak ~5 GB workspace vLLM. `gpu_memory_gb_each` niesie budzet
+/// urzadzenia (wizard wysyla `mlx_max_memory_mb`), a `gpu_memory_utilization`
+/// pelni role rezerwy dla OS (np. 0.9). Pamiec = wagi + scratch grafu + pula KV.
+pub fn estimate_mlx_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEstimate {
+    let mut warnings: Vec<String> = Vec::new();
+
+    let model_weights_bytes = match input.weights_bytes_override {
+        Some(bytes) => bytes as f64,
+        None => model.estimated_params() as f64 * model.bytes_per_param(),
+    };
+    let weights_gb = bytes_to_gib(model_weights_bytes);
+
+    // KV per-request × liczba sekwencji (mlx-lm batchuje). Single device, wiec
+    // bez shardingu — pelna szerokosc tokena.
+    let seqs = input.max_num_seqs.max(1);
+    let kv_per_token = kv_per_token_bytes(model, input.engine, input.k_label(), input.v_label());
+    let kv_cache_gb = bytes_to_gib(kv_per_token * input.max_model_len as f64 * seqs as f64);
+
+    // Graf MLX: residual + bufor MLP na tokeny batcha; brak osobnego CUDA-graph
+    // const, ale 0.5 GB na bufory frameworka/Metal heap.
+    let batch_tokens = input.max_num_batched_tokens.max(512) as f64;
+    let scratch_gb = 0.5 + bytes_to_gib(batch_tokens * model.hidden_size as f64 * 2.0 * 4.0);
+    let overhead_gb = 0.0; // brak osobnego allocatora poza scratch
+
+    let budget_gb = input.gpu_memory_gb_each * input.gpu_memory_utilization;
+    let required_gb = weights_gb + scratch_gb;
+
+    let kv_pool_gb = (budget_gb - required_gb).max(0.0);
+    // Pula tokenow liczona per-request KV (single device, brak shardingu).
+    let kv_per_token_per_request = kv_per_token.max(1.0);
+    let pool_tokens = if kv_pool_gb > 0.0 {
+        ((kv_pool_gb * 1024.0 * 1024.0 * 1024.0) / kv_per_token_per_request).floor() as u64
+    } else {
+        0
+    };
+    let concurrent_full_len_seqs = if input.max_model_len > 0 {
+        pool_tokens as f64 / input.max_model_len as f64
+    } else {
+        0.0
+    };
+
+    let total_gb = required_gb + kv_cache_gb;
+    let per_gpu_gb = total_gb;
+    let fits = total_gb <= budget_gb;
+
+    if input.tensor_parallel > 1 || input.pipeline_parallel > 1 {
+        warnings.push(
+            "MLX to pojedyncze urzadzenie (unified memory) - TP/PP nie maja \
+             zastosowania, zignorowano"
+                .to_string(),
+        );
+    }
+    if weights_gb > budget_gb {
+        warnings.push(format!(
+            "Same wagi {:.1} GB przekraczaja budzet pamieci {:.1} GB ({}% z {:.1} GB) \
+             - uzyj mocniejszej kwantyzacji albo zwieksz budzet",
+            weights_gb,
+            budget_gb,
+            (input.gpu_memory_utilization * 100.0) as u32,
+            input.gpu_memory_gb_each
+        ));
+    } else if !fits {
+        warnings.push(format!(
+            "wagi + KV + scratch {:.1} GB > budzet {:.1} GB - zmniejsz max_model_len, \
+             max_num_seqs albo uzyj kv4",
+            total_gb, budget_gb
+        ));
+    }
+    if model.has_vision || model.has_audio {
+        warnings.push(
+            "Model multimodalny (vision/audio) - encoder/projektor nie jest tu policzony"
+                .to_string(),
+        );
+    }
+
+    VramEstimate {
+        model_weights_gb: weights_gb,
+        kv_cache_gb,
+        activations_gb: scratch_gb,
+        overhead_gb,
+        total_gb,
+        per_gpu_gb,
+        fits_per_gpu: fits,
+        fits_total: fits,
+        kv_pool_gb,
+        pool_tokens,
+        concurrent_full_len_seqs,
         warnings,
     }
 }
@@ -793,7 +1143,9 @@ pub fn recommend_parallelism_vram_aware(
             pipeline_parallel: *pp,
             max_model_len: 1024,
             max_num_seqs: 1,
+            max_num_batched_tokens: 8192,
             kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
             gpu_memory_utilization,
             activation_overhead_pct: 10.0,
             weights_bytes_override,
@@ -821,6 +1173,8 @@ pub struct AutoFitRequest {
     pub gpu_count: u32,
     pub gpu_memory_gb_each: f64,
     pub kv_cache_dtype: String,
+    /// Osobny typ V cache (llama.cpp). `None` = uzyj `kv_cache_dtype` dla obu.
+    pub kv_cache_dtype_v: Option<String>,
     pub gpu_memory_utilization: f64,
     pub requested_max_model_len: Option<u64>,
     pub requested_max_num_seqs: Option<u64>,
@@ -865,6 +1219,8 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     // bez NVLink). Jawne TP od usera nadal wygrywa przez requested_*.unwrap_or.
     let (rec_tp, rec_pp) = match req.engine {
         DeployEngine::LlamaCpp => (1, req.gpu_count.max(1)),
+        // MLX to pojedyncze urzadzenie (unified memory) - brak TP/PP.
+        DeployEngine::Mlx => (1, 1),
         DeployEngine::Vllm => recommend_parallelism_vram_aware(
             model,
             req.engine,
@@ -874,9 +1230,20 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             req.weights_bytes_override,
         ),
     };
-    let chosen_tp = req.requested_tensor_parallel.unwrap_or(rec_tp);
-    let chosen_pp = req.requested_pipeline_parallel.unwrap_or(rec_pp);
+    // MLX ignoruje TP/PP nawet jesli user je poda; jedno urzadzenie => parallel=1.
+    let (chosen_tp, chosen_pp) = match req.engine {
+        DeployEngine::Mlx => (1, 1),
+        _ => (
+            req.requested_tensor_parallel.unwrap_or(rec_tp),
+            req.requested_pipeline_parallel.unwrap_or(rec_pp),
+        ),
+    };
     let parallel = (chosen_tp.max(1) * chosen_pp.max(1)) as f64;
+    // Etykieta V cache: osobna gdy podana, inaczej K (kv_cache_dtype).
+    let v_dtype = req
+        .kv_cache_dtype_v
+        .as_deref()
+        .unwrap_or(&req.kv_cache_dtype);
 
     // 2. KV budget per GPU. Wagi z override (GGUF) lub z params×bytes_per_param.
     let weights_bytes = match req.weights_bytes_override {
@@ -885,24 +1252,88 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     };
     let weights_gb = bytes_to_gib(weights_bytes);
     let weights_per_gpu = weights_gb / parallel;
-    // Activations roznia sie fizyka per silnik: vLLM = staly ~5 GB workspace na
-    // worker + 10% wag; llama.cpp = jeden compute buffer (setki MB) + primary CUDA
-    // context na karte. Bez tego rozdzielenia llama.cpp dziedziczyl falszywe 5 GB.
+    // Activations roznia sie fizyka per silnik: vLLM = szczyt aktywacji f(tokeny
+    // batcha, hidden, intermediate) + staly CUDA-graph + NCCL (DRUG-2); llama.cpp =
+    // jeden compute buffer (setki MB) + primary CUDA context na karte. Bez override
+    // batcha uzywamy domyslnych 8192 tokenow (jak VramEstimateInput::default), zeby
+    // budzet auto_fit zgadzal sie z estymacja puli.
+    // Liczba sekwencji (cap schedulera). Driver logitow llama.cpp i wielkosci KV
+    // MLX; potrzebny juz tu, bo wchodzi w activations llama (logits per slot).
+    let budget_seqs = req.requested_max_num_seqs.unwrap_or(256).max(1);
     let activations_per_gpu = match req.engine {
-        DeployEngine::Vllm => 5.0 + weights_per_gpu * 0.10,
-        DeployEngine::LlamaCpp => llamacpp_compute_buffer_gb(model) + LLAMACPP_CUDA_CTX_PER_GPU,
+        DeployEngine::Vllm => {
+            let act_dtype_bytes = 2.0;
+            let activation_peak = bytes_to_gib(
+                8192.0
+                    * (2.0 * model.hidden_size as f64 + model.intermediate_size.max(1) as f64)
+                    * act_dtype_bytes,
+            );
+            let nccl = if chosen_tp.max(1) > 1 {
+                0.3 * chosen_tp.max(1) as f64
+            } else {
+                0.0
+            };
+            activation_peak + 1.5 + nccl
+        }
+        DeployEngine::LlamaCpp => {
+            // Gdy metadane GGUF nie podaja vocab/hidden, compute buffer wychodzi ~0
+            // i over-credituje budzet KV. Floor ~0.5 GB chroni przed wyborem ctx,
+            // ktory potem realnie OOM-uje na compute bufferze.
+            let compute = if model.vocab_size == 0 || model.hidden_size == 0 {
+                0.5
+            } else {
+                llamacpp_compute_buffer_gb(model, budget_seqs)
+            };
+            compute + LLAMACPP_CUDA_CTX_PER_GPU
+        }
+        // MLX: graf (residual + bufor MLP na tokeny batcha) + heap Metala. Bez
+        // 5 GB workspace vLLM i bez CUDA-graph const.
+        DeployEngine::Mlx => {
+            0.5 + bytes_to_gib(8192.0 * model.hidden_size as f64 * 2.0 * 4.0)
+        }
     };
     let usable_per_gpu = req.gpu_memory_gb_each * req.gpu_memory_utilization;
     let kv_budget_per_gpu = (usable_per_gpu - weights_per_gpu - activations_per_gpu).max(0.0);
     // llama.cpp trzyma JEDEN proces dzielacy `-c` na wszystkie karty, wiec calkowity
-    // budzet KV rosnie liniowo z liczba kart. vLLM liczy budzet per GPU (KV shardsuje
-    // sie symetrycznie z TP/PP) i porownuje per-GPU.
+    // budzet KV rosnie liniowo z liczba kart. vLLM liczy budzet per GPU (pula KV
+    // zyje osobno na kazdej GPU).
     let kv_budget_gb = match req.engine {
         DeployEngine::Vllm => kv_budget_per_gpu,
-        DeployEngine::LlamaCpp => kv_budget_per_gpu * parallel,
+        // Row-split llama.cpp (tp>1): KV siedzi na MAIN GPU, wiec budzet to JEDNA
+        // karta (per_gpu), nie suma. Layer-split (pp>1, tp==1): KV dzieli sie rowno,
+        // wiec budzet rosnie liniowo z liczba kart.
+        DeployEngine::LlamaCpp => {
+            if chosen_tp.max(1) > 1 {
+                kv_budget_per_gpu
+            } else {
+                kv_budget_per_gpu * parallel
+            }
+        }
+        // MLX: jedno urzadzenie, budzet = pula per-device (parallel=1).
+        DeployEngine::Mlx => kv_budget_per_gpu,
     };
     let kv_budget_bytes = kv_budget_gb * 1024.0 * 1024.0 * 1024.0;
-    let kv_per_seq_token = kv_bytes_per_seq_per_token(model, &req.kv_cache_dtype).max(1.0);
+    // Szerokosc KV na token PO shardingu per GPU: dla vLLM dzieli sie przez
+    // min(tp, kv_heads)*pp (powyzej kv_heads vLLM replikuje glowy, brak dalszej
+    // oszczednosci). llama.cpp trzyma KV per token bez shardingu w tej ksiegowosci
+    // (budzet zsumowany powyzej × parallel), wiec dzielnik = 1.
+    let kv_per_seq_token = match req.engine {
+        DeployEngine::Vllm => {
+            let kv_heads = if model.num_key_value_heads > 0 {
+                model.num_key_value_heads
+            } else {
+                model.num_attention_heads.max(1)
+            };
+            let kv_tp_shards = (chosen_tp.max(1) as u64).min(kv_heads).max(1) as f64;
+            kv_per_token_bytes(model, req.engine, &req.kv_cache_dtype, v_dtype)
+                / (kv_tp_shards * chosen_pp.max(1) as f64)
+        }
+        // llama.cpp / MLX: brak shardingu KV w tej ksiegowosci, osobne K/V.
+        DeployEngine::LlamaCpp | DeployEngine::Mlx => {
+            kv_per_token_bytes(model, req.engine, &req.kv_cache_dtype, v_dtype)
+        }
+    }
+    .max(1.0);
 
     if kv_budget_gb <= 0.0 {
         return AutoFitOutcome {
@@ -913,8 +1344,10 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
                 tensor_parallel: chosen_tp,
                 pipeline_parallel: chosen_pp,
                 max_model_len: req.requested_max_model_len.unwrap_or(2048),
-                max_num_seqs: req.requested_max_num_seqs.unwrap_or(1),
+                max_num_seqs: req.requested_max_num_seqs.unwrap_or(256),
+                max_num_batched_tokens: 8192,
                 kv_cache_dtype: req.kv_cache_dtype.clone(),
+                kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
                 gpu_memory_utilization: req.gpu_memory_utilization,
                 activation_overhead_pct: 10.0,
                 weights_bytes_override: req.weights_bytes_override,
@@ -940,19 +1373,25 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     } else {
         absolute_ctx_ceiling
     };
-    let default_seqs: u64 = 1;
+    // Domyslna wspolbieznosc to wartosc serwerowa (vLLM/sglang batchuja setki
+    // requestow), nie REPL jednoosobowy. max_num_seqs to wylacznie cap admisji
+    // schedulera — nie zabiera dedykowanej pamieci w modelu puli.
+    let default_seqs: u64 = 256;
     let default_ctx = model_ctx_ceiling.max(2048);
 
     let req_ctx = req.requested_max_model_len.unwrap_or(default_ctx).max(512);
     let req_seqs = req.requested_max_num_seqs.unwrap_or(default_seqs).max(1);
 
-    // KV-volume mnoznik per seq: vLLM page-cache trzyma KV osobno per sekwencja
-    // (ctx × seqs), llama.cpp dzieli jeden `-c` na sloty `-np`, wiec KV zalezy
-    // TYLKO od ctx (mnoznik 1). Uzywany wszedzie gdzie liczymy volume KV.
-    let kv_seq_factor = |seqs: u64| -> f64 {
-        match req.engine {
-            DeployEngine::Vllm => seqs as f64,
-            DeployEngine::LlamaCpp => 1.0,
+    // KV-volume mnoznik per seq dla strony POPYTU fitu. vLLM: model puli, demand =
+    // JEDNA sekwencja max_model_len (PagedAttention dzieli pule miedzy sekwencje,
+    // max_num_seqs to cap schedulera) — mnoznik 1. llama.cpp / MLX: n_ctx =
+    // max_model_len × max_num_seqs (kazdy slot dostaje pelne okno), wiec KV rosnie
+    // z liczba sekwencji — mnoznik = seqs (spojne z estimate_*_vram).
+    let engine_for_factor = req.engine;
+    let kv_seq_factor = move |seqs: u64| -> f64 {
+        match engine_for_factor {
+            DeployEngine::Vllm => 1.0,
+            DeployEngine::LlamaCpp | DeployEngine::Mlx => seqs.max(1) as f64,
         }
     };
 
@@ -960,7 +1399,9 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     let mut auto_adjusted: Vec<String> = Vec::new();
     let (final_ctx, final_seqs) = match (req.lock_max_model_len, req.lock_max_num_seqs) {
         (true, true) => {
-            // Oba locked - sprawdz czy fits.
+            // Oba locked. W modelu puli vLLM max_num_seqs nie zajmuje pamieci, wiec
+            // popyt to JEDNA sekwencja max_model_len (kv_seq_factor==1) — overflow
+            // oznacza, ze pojedyncza pelna sekwencja nie miesci sie w puli KV.
             let needed = kv_per_seq_token * req_ctx as f64 * kv_seq_factor(req_seqs);
             if needed > kv_budget_bytes {
                 return AutoFitOutcome {
@@ -972,7 +1413,9 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
                         pipeline_parallel: chosen_pp,
                         max_model_len: req_ctx,
                         max_num_seqs: req_seqs,
+                        max_num_batched_tokens: 8192,
                         kv_cache_dtype: req.kv_cache_dtype.clone(),
+                        kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
                         gpu_memory_utilization: req.gpu_memory_utilization,
                         activation_overhead_pct: 10.0,
                         weights_bytes_override: req.weights_bytes_override,
@@ -980,11 +1423,10 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
                     auto_adjusted: Vec::new(),
                     at_limit: true,
                     error: Some(format!(
-                        "Locked max_model_len={} × max_num_seqs={} wymaga {:.1} GB \
-                         KV cache ale budget per GPU to {:.1} GB. Odblokuj jeden \
-                         z parametrow albo zwieksz GPU/uzyj fp8 KV.",
+                        "Locked max_model_len={} wymaga {:.1} GB puli KV na jedna sekwencje \
+                         ale budget per GPU to {:.1} GB. Zmniejsz max_model_len, zwieksz \
+                         liczbe GPU albo uzyj fp8 KV.",
                         req_ctx,
-                        req_seqs,
                         needed / (1024.0 * 1024.0 * 1024.0),
                         kv_budget_gb
                     )),
@@ -993,27 +1435,41 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             (req_ctx, req_seqs)
         }
         (true, false) => {
-            // ctx locked - skaluj seqs. Dla llama.cpp sloty `-np` nie konsumuja KV
-            // (jeden `-c` dzielony), wiec kv_seq_factor==1 zostawia req_seqs.
-            let ctx_fits = kv_per_seq_token * req_ctx as f64 <= kv_budget_bytes;
-            let capped = match req.engine {
-                DeployEngine::LlamaCpp => {
-                    if ctx_fits {
-                        req_seqs
-                    } else {
-                        1
-                    }
-                }
-                DeployEngine::Vllm => {
-                    let max_seqs =
-                        (kv_budget_bytes / (kv_per_seq_token * req_ctx as f64)).floor() as u64;
-                    max_seqs.max(1).min(req_seqs)
-                }
-            };
-            if capped < req_seqs {
-                auto_adjusted.push("max_num_seqs".into());
+            // ctx locked, seqs swobodne. W modelu puli vLLM max_num_seqs to cap
+            // schedulera (nie zabiera pamieci), wiec zachowujemy req_seqs jako cap.
+            // Gdy sama pojedyncza sekwencja max_model_len NIE miesci sie w puli, to
+            // problem zalockowanego ctx (seqs nic nie zmieni) — zwracamy error.
+            let needed = kv_per_seq_token * req_ctx as f64;
+            if needed > kv_budget_bytes {
+                return AutoFitOutcome {
+                    applied: VramEstimateInput {
+                        engine: req.engine,
+                        gpu_count: req.gpu_count,
+                        gpu_memory_gb_each: req.gpu_memory_gb_each,
+                        tensor_parallel: chosen_tp,
+                        pipeline_parallel: chosen_pp,
+                        max_model_len: req_ctx,
+                        max_num_seqs: req_seqs,
+                        max_num_batched_tokens: 8192,
+                        kv_cache_dtype: req.kv_cache_dtype.clone(),
+                        kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
+                        gpu_memory_utilization: req.gpu_memory_utilization,
+                        activation_overhead_pct: 10.0,
+                        weights_bytes_override: req.weights_bytes_override,
+                    },
+                    auto_adjusted: Vec::new(),
+                    at_limit: true,
+                    error: Some(format!(
+                        "Locked max_model_len={} wymaga {:.1} GB puli KV na jedna sekwencje \
+                         ale budget per GPU to {:.1} GB. Odblokuj max_model_len albo zwieksz \
+                         liczbe GPU/uzyj fp8 KV.",
+                        req_ctx,
+                        needed / (1024.0 * 1024.0 * 1024.0),
+                        kv_budget_gb
+                    )),
+                };
             }
-            (req_ctx, capped)
+            (req_ctx, req_seqs)
         }
         (false, true) => {
             // seqs locked - skaluj ctx. Dla llama.cpp ctx liczony z calego budzetu
@@ -1027,29 +1483,12 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             (capped, req_seqs)
         }
         (false, false) => {
-            // Brak lockow. Polityka: trzymaj num_seqs jak najnizej (default 1)
-            // a max_model_len pcham do gornego limitu VRAM, capped przez
-            // model.max_position_embeddings i absolutny ceiling 1M.
-            //
-            // Gdy user explicit podal max_num_seqs (req.requested_max_num_seqs)
-            // bez locka - traktujemy to jako preferencje throughputu i probujemy
-            // zachowac, ale ctx i tak rozszerzamy do max ktory fits.
-            let target_seqs = req_seqs.max(1);
-            let mut new_seqs = target_seqs;
-            let kv_per_seq_full = kv_per_seq_token * req_ctx as f64;
-            // Jesli przy zadanym ctx + seqs nie fits - obnizamy seqs (nie ctx).
-            // Min 1 seq; jak nie fits przy 1 seq to dopiero kapujemy ctx.
-            // Dla llama.cpp seqs nie obciazaja KV (kv_seq_factor==1), wiec
-            // ten warunek redukuje seqs tylko dla vLLM.
-            if kv_per_seq_full * kv_seq_factor(new_seqs) > kv_budget_bytes {
-                let max_seqs_at_req_ctx = (kv_budget_bytes / kv_per_seq_full).floor() as u64;
-                new_seqs = max_seqs_at_req_ctx.max(1).min(target_seqs);
-                if new_seqs < target_seqs {
-                    auto_adjusted.push("max_num_seqs".into());
-                }
-            }
-            // Teraz wyznacz max ctx ktory fits przy ustalonym new_seqs. Bierzemy
-            // wieksze z dwojga: req_ctx (jak fits) lub max mozliwy z VRAM.
+            // Brak lockow. Polityka serwujaca: trzymaj max_num_seqs jako cap
+            // schedulera (default 256 lub wartosc usera) — w modelu puli nie zabiera
+            // dedykowanej pamieci — a max_model_len pcham do maksimum mieszczacego
+            // JEDNA pelna sekwencje w puli, capped przez model.max_position_embeddings
+            // i absolutny ceiling. Suwak seqs nie zjeżdża juz ctx (kv_seq_factor==1).
+            let new_seqs = req_seqs.max(1);
             let max_ctx_from_vram =
                 (kv_budget_bytes / (kv_per_seq_token * kv_seq_factor(new_seqs))).floor() as u64;
             let max_ctx_capped = max_ctx_from_vram.min(model_ctx_ceiling);
@@ -1077,7 +1516,9 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             pipeline_parallel: chosen_pp,
             max_model_len: final_ctx,
             max_num_seqs: final_seqs,
+            max_num_batched_tokens: 8192,
             kv_cache_dtype: req.kv_cache_dtype.clone(),
+            kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
             gpu_memory_utilization: req.gpu_memory_utilization,
             activation_overhead_pct: 10.0,
             weights_bytes_override: req.weights_bytes_override,
@@ -1088,24 +1529,15 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     }
 }
 
-/// KV cache rozmiar (GB) dla 1 sekwencji × 1 tokena dla danej konfiguracji.
-/// Wykorzystywane przez auto-fit do obliczenia ile sekwencji × tokenow zmiesci
-/// sie w wolnym budzecie KV.
-pub fn kv_bytes_per_seq_per_token(model: &ModelSpec, kv_cache_dtype: &str) -> f64 {
-    let head_dim = if model.head_dim > 0 {
-        model.head_dim
-    } else if model.num_attention_heads > 0 {
-        model.hidden_size / model.num_attention_heads
-    } else {
-        128
-    };
-    let kv_heads = if model.num_key_value_heads > 0 {
-        model.num_key_value_heads
-    } else {
-        model.num_attention_heads.max(1)
-    };
-    let bytes_kv = ModelSpec::bytes_per_kv_element(kv_cache_dtype);
-    2.0 * model.num_hidden_layers as f64 * kv_heads as f64 * head_dim as f64 * bytes_kv
+/// KV cache w bajtach na 1 sekwencje × 1 token dla danej konfiguracji. Cienki
+/// wrapper nad `kv_per_token_bytes` z jednym typem cache dla K i V — pozostaje
+/// dla estymacji i auto_fit, ktore (na razie) wymuszaja rowne K/V.
+pub fn kv_bytes_per_seq_per_token(
+    model: &ModelSpec,
+    engine: DeployEngine,
+    kv_cache_dtype: &str,
+) -> f64 {
+    kv_per_token_bytes(model, engine, kv_cache_dtype, kv_cache_dtype)
 }
 
 /// Maksymalny `max_model_len` ktory zmiesci sie przy danej konfiguracji + batch.
@@ -1131,22 +1563,35 @@ pub fn max_context_for_budget(model: &ModelSpec, input: &VramEstimateInput) -> u
     lo
 }
 
-/// Maksymalna `max_num_seqs` (rownoleglych zapytan) przy zadanym ctx_len.
+/// Maksymalna osiagalna wspolbieznosc (pelnych sekwencji `max_model_len`) przy
+/// zadanym ctx_len. W modelu puli vLLM fit NIE zalezy od `max_num_seqs` (to cap
+/// schedulera, nie pamiec), wiec binary search po seqs zwracalby bez sensu `hi`.
+/// Zamiast tego liczymy jedna estymate i czytamy `concurrent_full_len_seqs`
+/// (ile pelnych sekwencji miesci pula KV). llama.cpp i MLX skaluja KV z liczba
+/// slotow (n_ctx = max_model_len × seqs), wiec tam binary search po `-np`/seqs.
 pub fn max_concurrent_seqs_for_budget(model: &ModelSpec, input: &VramEstimateInput) -> u64 {
-    let mut lo: u64 = 1;
-    let mut hi: u64 = 1024;
-    while lo + 4 < hi {
-        let mid = (lo + hi) / 2;
-        let mut try_input = input.clone();
-        try_input.max_num_seqs = mid;
-        let est = estimate_vram(model, &try_input);
-        if est.fits_per_gpu {
-            lo = mid;
-        } else {
-            hi = mid;
+    match input.engine {
+        DeployEngine::Vllm => {
+            let est = estimate_vram(model, input);
+            est.concurrent_full_len_seqs.floor().max(1.0) as u64
+        }
+        DeployEngine::LlamaCpp | DeployEngine::Mlx => {
+            let mut lo: u64 = 1;
+            let mut hi: u64 = 1024;
+            while lo + 4 < hi {
+                let mid = (lo + hi) / 2;
+                let mut try_input = input.clone();
+                try_input.max_num_seqs = mid;
+                let est = estimate_vram(model, &try_input);
+                if est.fits_per_gpu {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
         }
     }
-    lo
 }
 
 /// Parsuj HF config.json (przekazany jako serde_json::Value). Obsluguje
@@ -1184,6 +1629,26 @@ pub fn parse_hf_config_with_override(
         } else {
             pick_u64(cfg, key)
         }
+    };
+
+    // Pierwszy klucz z listy aliasow ktory niesie dodatnia wartosc (configy MoE
+    // uzywaja roznych nazw: num_experts / num_local_experts / n_routed_experts).
+    let pick_u64_aliases = |keys: &[&str]| -> u64 {
+        for key in keys {
+            let v = pick_u64_either(key);
+            if v > 0 {
+                return v;
+            }
+        }
+        0
+    };
+
+    let pick_bool_either = |key: &str| -> bool {
+        text_cfg
+            .get(key)
+            .and_then(|v| v.as_bool())
+            .or_else(|| cfg.get(key).and_then(|v| v.as_bool()))
+            .unwrap_or(false)
     };
 
     let pick_str = |obj: &serde_json::Map<String, serde_json::Value>, key: &str| -> String {
@@ -1224,7 +1689,24 @@ pub fn parse_hf_config_with_override(
     };
 
     // Quantization detection: override -> HF quantization_config -> name heuristic.
-    let quantization = detect_quantization(model_name, config_json, quantization_override);
+    let mut quantization = detect_quantization(model_name, config_json, quantization_override);
+
+    // MLX-community trzyma kwantyzacje jako TOP-LEVEL obiekt `quantization:
+    // {bits, group_size}` (NIE `quantization_config`). Gdy obecny, szerokosc wag
+    // zalezy od group_size (g64 4-bit = 0.5625, g32 = 0.625), wiec liczymy jawny
+    // bytes/param i ustawiamy etykiete. vLLM/GGUF nie uzywaja tego pola, wiec
+    // override ich nie dotyczy.
+    let mlx_bytes_override = cfg.get("quantization").and_then(|v| v.as_object()).and_then(|q| {
+        let bits = q.get("bits").and_then(|b| b.as_u64())?;
+        let group_size = q.get("group_size").and_then(|g| g.as_u64()).unwrap_or(64);
+        Some((bits, group_size, mlx_weight_bytes(bits, group_size)))
+    });
+    let bytes_per_param_override = mlx_bytes_override.map(|(_, _, b)| b);
+    if let Some((bits, group_size, _)) = mlx_bytes_override {
+        if quantization.is_none() {
+            quantization = Some(format!("mlx_{bits}bit_g{group_size}"));
+        }
+    }
 
     let has_vision = cfg.contains_key("vision_config")
         || architectures
@@ -1243,7 +1725,17 @@ pub fn parse_hf_config_with_override(
         num_attention_heads
     };
 
-    Ok(ModelSpec {
+    let num_experts = pick_u64_aliases(&["num_experts", "num_local_experts", "n_routed_experts"]);
+    let num_experts_per_tok = pick_u64_aliases(&[
+        "num_experts_per_tok",
+        "num_experts_per_token",
+        "n_experts_per_tok",
+    ]);
+    let moe_intermediate_size = pick_u64_either("moe_intermediate_size");
+    let shared_expert_intermediate_size = pick_u64_either("shared_expert_intermediate_size");
+    let tie_word_embeddings = pick_bool_either("tie_word_embeddings");
+
+    let mut spec = ModelSpec {
         model_type: pick_str(cfg, "model_type"),
         architectures,
         dtype: if dtype.is_empty() {
@@ -1259,12 +1751,26 @@ pub fn parse_hf_config_with_override(
         head_dim,
         intermediate_size: pick_u64_either("intermediate_size"),
         max_position_embeddings: pick_u64_either("max_position_embeddings"),
+        num_experts,
+        num_experts_per_tok,
+        moe_intermediate_size,
+        shared_expert_intermediate_size,
+        tie_word_embeddings,
         has_vision,
         has_audio,
+        // Dokladny rozmiar wag dostarcza safetensors index (handler ustawia
+        // weights_bytes_override); tu zostawiamy 0, by estimated_params() byl
+        // fallbackiem. Dla MoE publikujemy aktywne parametry, zeby UI pokazalo
+        // realny rozmiar aktywnej sciezki zamiast pelnej sumy ekspertow.
         num_parameters: 0,
         num_active_parameters: 0,
         quantization,
-    })
+        bytes_per_param_override,
+    };
+    if spec.num_experts > 0 {
+        spec.num_active_parameters = spec.active_params();
+    }
+    Ok(spec)
 }
 
 /// Buduje string `--key val --key val ...` do wpisania w VLLM_ARGS env.
@@ -1364,16 +1870,21 @@ pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> St
 pub fn build_llamacpp_args_string(_spec: &ModelSpec, input: &VramEstimateInput) -> String {
     let mut parts: Vec<String> = Vec::new();
 
+    // `max_model_len` to kontekst per-request; `-c` to CALY kontekst dzielony na
+    // `-np` slotow, wiec emitujemy max_model_len × max_num_seqs.
+    let seqs = input.max_num_seqs.max(1);
     parts.push("-c".into());
-    parts.push(input.max_model_len.to_string());
+    parts.push((input.max_model_len * seqs).to_string());
     parts.push("-ngl".into());
     parts.push("999".into());
-    parts.push("-b".into());
+    // Fizyczny ubatch (`-ub`, default 512) steruje compute bufferem; logiczny `-b`
+    // niepotrzebnie obniza przepustowosc prefilla.
+    parts.push("-ub".into());
     parts.push("512".into());
 
-    if input.max_num_seqs > 1 {
+    if seqs > 1 {
         parts.push("-np".into());
-        parts.push(input.max_num_seqs.to_string());
+        parts.push(seqs.to_string());
     }
 
     let tp = input.tensor_parallel.max(1);
@@ -1388,19 +1899,39 @@ pub fn build_llamacpp_args_string(_spec: &ModelSpec, input: &VramEstimateInput) 
     parts.push("--split-mode".into());
     parts.push(split_mode.into());
 
-    // KV cache dtype: llama.cpp uzywa osobnych flag dla K i V.
-    if input.kv_cache_dtype != "auto" {
-        let cache_type = match input.kv_cache_dtype.as_str() {
-            "fp8" | "fp8_e5m2" | "fp8_e4m3" => "q8_0",
-            other => other,
-        };
+    // KV cache: osobne typy K i V. Etykiete mapujemy na token CLI llama.cpp
+    // (fp16->f16, bfloat16->bf16, fp8->q8_0, q*_0 doslownie). Domyslne f16/bf16/auto
+    // (2.0 B/elem) NIE emituja flagi (server uzywa f16 z defaultu). Kwantyzowane V
+    // wymaga flash-attention, wiec `-fa` dodajemy gdy K lub V jest kwantyzowane.
+    let k_cli = llamacpp_cache_type_cli(input.k_label());
+    let v_cli = llamacpp_cache_type_cli(input.v_label());
+    if let Some(k) = &k_cli {
         parts.push("--cache-type-k".into());
-        parts.push(cache_type.into());
+        parts.push(k.clone());
+    }
+    if let Some(v) = &v_cli {
         parts.push("--cache-type-v".into());
-        parts.push(cache_type.into());
+        parts.push(v.clone());
+    }
+    if k_cli.is_some() || v_cli.is_some() {
+        parts.push("-fa".into());
     }
 
     parts.join(" ")
+}
+
+/// Mapuje etykiete KV cache (UI/config) na token CLI `--cache-type-k/v` llama.cpp.
+/// Zwraca `None` dla typow domyslnych (f16/bf16/auto = 2.0 B), ktorych flaga nie
+/// trzeba emitowac (server uzywa f16). Kwantyzowane typy zwracaja swoj token; dla
+/// fp8 (vLLM) mapujemy na q8_0 (najblizszy 8-bitowy KV llama.cpp).
+fn llamacpp_cache_type_cli(label: &str) -> Option<String> {
+    let l = label.to_lowercase().replace('-', "_");
+    match l.as_str() {
+        "auto" | "f16" | "fp16" | "bf16" | "bfloat16" => None,
+        "fp8" | "fp8_e5m2" | "fp8_e4m3" => Some("q8_0".into()),
+        "q8_0" | "q5_1" | "q5_0" | "q4_1" | "q4_0" | "iq4_nl" => Some(l),
+        _ => None,
+    }
 }
 
 /// Pobierz HF config.json przez HTTP. Wymaga internet + ewentualnie HF token
@@ -1433,6 +1964,60 @@ pub async fn fetch_hf_config(
     }
     let json: serde_json::Value = resp.json().await.context("HF config JSON parse")?;
     Ok(json)
+}
+
+/// Wyciaga `metadata.total_size` z `model.safetensors.index.json`. To suma
+/// bajtow WSZYSTKICH tensorow modelu (= realny footprint wag dla zapisanego
+/// dtype/quant), wiec uzyta jako `weights_bytes_override` daje dokladny rozmiar
+/// wag bez heurystyki param-count. Zwraca None gdy pola brak lub zero.
+pub fn parse_safetensors_total_size(index_json: &serde_json::Value) -> Option<u64> {
+    let n = index_json
+        .get("metadata")?
+        .get("total_size")?
+        .as_u64()
+        .filter(|&n| n > 0)?;
+    Some(n)
+}
+
+/// Dokladny rozmiar wag (w bajtach) dla repo safetensors. Najpierw probuje
+/// `model.safetensors.index.json` (modele wieloplikowe -> `metadata.total_size`);
+/// gdy index nie istnieje (model jednoplikowy), robi HEAD na `model.safetensors`
+/// i czyta Content-Length. Zwraca None przy dowolnym bledzie - caller fallbackuje
+/// do heurystyki `estimated_params`. Bearer token dla gated repo.
+pub async fn fetch_safetensors_total_size(
+    client: &reqwest::Client,
+    model_name: &str,
+    hf_token: Option<&str>,
+) -> Option<u64> {
+    let index_url = format!(
+        "https://huggingface.co/{}/resolve/main/model.safetensors.index.json",
+        model_name
+    );
+    let mut req = client.get(&index_url);
+    if let Some(t) = hf_token {
+        if !t.is_empty() {
+            req = req.bearer_auth(t);
+        }
+    }
+    if let Ok(resp) = req.send().await {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(total) = parse_safetensors_total_size(&json) {
+                    return Some(total);
+                }
+            }
+        }
+    }
+
+    // Model jednoplikowy: brak index.json -> rozmiar pliku model.safetensors.
+    let single_url = format!(
+        "https://huggingface.co/{}/resolve/main/model.safetensors",
+        model_name
+    );
+    match fetch_gguf_size(client, &single_url, hf_token).await {
+        Ok(n) if n > 0 => Some(n),
+        _ => None,
+    }
 }
 
 // =============================================================================
@@ -1735,11 +2320,20 @@ pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
         head_dim,
         intermediate_size,
         max_position_embeddings,
+        // GGUF deployuje sie wylacznie na llama.cpp, gdzie rozmiar pliku .gguf
+        // jest dokladnym footprintem wag (weights_bytes_override), wiec MoE-aware
+        // param-count nie jest tu uzywany — zostawiamy pola w stanie dense.
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        moe_intermediate_size: 0,
+        shared_expert_intermediate_size: 0,
+        tie_word_embeddings: false,
         has_vision: false,
         has_audio: false,
         num_parameters: 0,
         num_active_parameters: 0,
         quantization: quant_label,
+        bytes_per_param_override: None,
     })
 }
 
@@ -1938,7 +2532,9 @@ mod tests {
             pipeline_parallel: 1,
             max_model_len: 1024,
             max_num_seqs: 1,
+            max_num_batched_tokens: 8192,
             kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
             gpu_memory_utilization: 0.9,
             activation_overhead_pct: 10.0,
             // 15.9 GB Q4 footprint pliku .gguf.
@@ -1985,6 +2581,18 @@ mod tests {
             &m,
             &VramEstimateInput {
                 engine: DeployEngine::LlamaCpp,
+                ..base.clone()
+            },
+        );
+        // MLX to pojedyncze urzadzenie: budzet z gpu_memory_gb_each, scratch bez
+        // 5 GB workspace, brak TP/PP (parallel ignorowany).
+        let mlx = estimate_vram(
+            &m,
+            &VramEstimateInput {
+                engine: DeployEngine::Mlx,
+                tensor_parallel: 1,
+                pipeline_parallel: 1,
+                gpu_memory_gb_each: 64.0,
                 ..base
             },
         );
@@ -1995,6 +2603,16 @@ mod tests {
             vllm.activations_gb,
             llama.activations_gb
         );
+        // MLX nie ma 5 GB workspace per worker: scratch znacznie mniejszy niz vLLM.
+        assert!(
+            mlx.activations_gb < vllm.activations_gb,
+            "MLX scratch {} < vLLM activations {}",
+            mlx.activations_gb,
+            vllm.activations_gb
+        );
+        // 15.9 GB Q4 na 64 GB budzecie MLX musi sie zmiescic z pula KV.
+        assert!(mlx.fits_per_gpu, "MLX 15.9 GB na 64 GB: {mlx:?}");
+        assert!(mlx.pool_tokens > 0, "MLX pula tokenow: {}", mlx.pool_tokens);
     }
 
     #[test]
@@ -2033,12 +2651,24 @@ mod tests {
         };
         let est = estimate_vllm_vram(&m, &input);
         assert!(est.fits_per_gpu, "Qwen 0.5B powinien sie miescic: {est:?}");
-        // ~1 GB weights + KV + 5 GB workspace + 10% activations + 0.5 GB overhead = ~7 GB.
-        // Margines do 12 GB chroni przed drobnymi zmianami formuly.
+        // Model puli: ~1.2 GB wag + ~1.6 GB aktywacji to caly staly footprint, reszta
+        // 24 GB GPU (~18.7 GB po util) idzie do puli KV — ogrom miejsca dla setek
+        // pelnych sekwencji 4k.
+        let fixed = est.model_weights_gb + est.activations_gb;
         assert!(
-            est.total_gb < 12.0,
-            "Qwen 0.5B nie powinien zjesc >12GB: {}",
-            est.total_gb
+            fixed < 5.0,
+            "Staly footprint Qwen 0.5B (wagi+akt) powinien byc < 5 GB: {}",
+            fixed
+        );
+        assert!(
+            est.pool_tokens > 1_000_000,
+            "Pula 0.5B na 24 GB powinna miescic >1M tokenow: {}",
+            est.pool_tokens
+        );
+        assert!(
+            est.concurrent_full_len_seqs > 50.0,
+            "Pula powinna dac >50 pelnych sekwencji 4k: {}",
+            est.concurrent_full_len_seqs
         );
     }
 
@@ -2082,6 +2712,7 @@ mod tests {
             max_model_len: 4096,
             max_num_seqs: 4,
             kv_cache_dtype: "fp8".into(),
+            kv_cache_dtype_v: None,
             gpu_memory_utilization: 0.95,
             ..Default::default()
         };
@@ -2177,6 +2808,7 @@ mod tests {
             gpu_count: 8,
             gpu_memory_gb_each: 8.0,
             kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
             gpu_memory_utilization: 0.9,
             requested_max_model_len: None,
             requested_max_num_seqs: None,
@@ -2278,8 +2910,194 @@ mod tests {
     }
 
     #[test]
+    fn estimated_params_mixtral_8x7b_counts_all_experts() {
+        // Mixtral-8x7B: 8 ekspertow ladowanych w calosci (~46.7B), NIE 8.05B
+        // ktore dawal stary wzor traktujacy MoE jak jeden ekspert dense.
+        let m = ModelSpec {
+            hidden_size: 4096,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            num_hidden_layers: 32,
+            vocab_size: 32000,
+            head_dim: 128,
+            intermediate_size: 14336,
+            num_experts: 8,
+            num_experts_per_tok: 2,
+            moe_intermediate_size: 14336,
+            ..Default::default()
+        };
+        let p = m.estimated_params() as f64;
+        let expected = 46.7e9;
+        assert!(
+            (p - expected).abs() / expected < 0.02,
+            "Mixtral-8x7B params ~46.7B (±2%), dostalismy {:.3}B",
+            p / 1e9
+        );
+        assert!(
+            p > 40e9,
+            "MoE nie moze byc zaniżony do dense ~8B: {:.3}B",
+            p / 1e9
+        );
+    }
+
+    #[test]
+    fn estimated_params_qwen25_7b_respects_gqa() {
+        // Qwen2.5-7B: GQA (28 glow uwagi, 4 glowy KV) — stary wzor 4h² dawal
+        // ~8.23B; GQA-poprawny attn daje ~7.6B.
+        let m = ModelSpec {
+            hidden_size: 3584,
+            num_attention_heads: 28,
+            num_key_value_heads: 4,
+            num_hidden_layers: 28,
+            vocab_size: 152064,
+            head_dim: 128,
+            intermediate_size: 18944,
+            ..Default::default()
+        };
+        let p = m.estimated_params() as f64;
+        let expected = 7.6e9;
+        assert!(
+            (p - expected).abs() / expected < 0.03,
+            "Qwen2.5-7B params ~7.6B (±3%), dostalismy {:.4}B",
+            p / 1e9
+        );
+    }
+
+    #[test]
+    fn estimated_params_tied_embeddings_no_double_lm_head() {
+        // Qwen2.5-0.5B-like z tie_word_embeddings: lm_head wspoldzieli wagi
+        // z embeddingiem, wiec nie liczy sie podwojnie. ~0.49B, NIE ~0.66B.
+        let m = ModelSpec {
+            hidden_size: 896,
+            num_attention_heads: 14,
+            num_key_value_heads: 2,
+            num_hidden_layers: 24,
+            vocab_size: 151936,
+            head_dim: 64,
+            intermediate_size: 4864,
+            tie_word_embeddings: true,
+            ..Default::default()
+        };
+        let p = m.estimated_params() as f64;
+        let expected = 0.49e9;
+        assert!(
+            (p - expected).abs() / expected < 0.05,
+            "tied 0.5B params ~0.49B (±5%), dostalismy {:.4}B",
+            p / 1e9
+        );
+        // Bez tied lm_head dodaje vocab×hidden — wynik musi byc wyraznie wiekszy.
+        let mut untied = m.clone();
+        untied.tie_word_embeddings = false;
+        assert!(
+            untied.estimated_params() > m.estimated_params(),
+            "untied musi byc wieksze (osobny lm_head)"
+        );
+    }
+
+    #[test]
+    fn active_params_moe_below_full_params() {
+        // Mixtral aktywuje top-2 z 8 ekspertow: aktywne (~12.9B) << pelne (~46.7B).
+        let m = ModelSpec {
+            hidden_size: 4096,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            num_hidden_layers: 32,
+            vocab_size: 32000,
+            head_dim: 128,
+            intermediate_size: 14336,
+            num_experts: 8,
+            num_experts_per_tok: 2,
+            moe_intermediate_size: 14336,
+            ..Default::default()
+        };
+        let active = m.active_params() as f64;
+        let full = m.estimated_params() as f64;
+        assert!(
+            active < full,
+            "aktywne MoE musza byc mniejsze niz pelne: active={:.3}B full={:.3}B",
+            active / 1e9,
+            full / 1e9
+        );
+        let expected_active = 12.9e9;
+        assert!(
+            (active - expected_active).abs() / expected_active < 0.05,
+            "Mixtral aktywne ~12.9B (±5%), dostalismy {:.3}B",
+            active / 1e9
+        );
+    }
+
+    #[test]
+    fn active_params_dense_equals_estimated() {
+        let m = ModelSpec {
+            hidden_size: 3584,
+            num_attention_heads: 28,
+            num_key_value_heads: 4,
+            num_hidden_layers: 28,
+            vocab_size: 152064,
+            head_dim: 128,
+            intermediate_size: 18944,
+            ..Default::default()
+        };
+        assert_eq!(m.active_params(), m.estimated_params());
+    }
+
+    #[test]
+    fn parse_hf_config_reads_moe_and_tie_fields() {
+        // Config w stylu Mixtral: num_local_experts + moe_intermediate_size + tie.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "mixtral",
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 32,
+            "vocab_size": 32000,
+            "head_dim": 128,
+            "intermediate_size": 14336,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 14336,
+            "shared_expert_intermediate_size": 0,
+            "tie_word_embeddings": true
+        }"#,
+        )
+        .unwrap();
+        let spec = parse_hf_config(&json, "mistralai/Mixtral-8x7B-v0.1").unwrap();
+        assert_eq!(spec.num_experts, 8);
+        assert_eq!(spec.num_experts_per_tok, 2);
+        assert_eq!(spec.moe_intermediate_size, 14336);
+        assert_eq!(spec.shared_expert_intermediate_size, 0);
+        assert!(spec.tie_word_embeddings);
+        // Dla MoE parser publikuje aktywne parametry dla wyswietlania.
+        assert!(spec.num_active_parameters > 0);
+        assert!((spec.num_active_parameters as f64) < spec.estimated_params() as f64);
+    }
+
+    #[test]
+    fn parse_safetensors_total_size_reads_metadata() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "metadata": {"total_size": 93405585408},
+            "weight_map": {"model.embed_tokens.weight": "model-00001-of-00019.safetensors"}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(parse_safetensors_total_size(&json), Some(93405585408));
+
+        let no_meta: serde_json::Value = serde_json::from_str(r#"{"weight_map": {}}"#).unwrap();
+        assert_eq!(parse_safetensors_total_size(&no_meta), None);
+
+        let zero: serde_json::Value =
+            serde_json::from_str(r#"{"metadata": {"total_size": 0}}"#).unwrap();
+        assert_eq!(parse_safetensors_total_size(&zero), None);
+    }
+
+    #[test]
     fn max_context_decreases_when_kv_cache_dtype_fp16() {
-        // Wieksze KV (Llama-7B-class) zeby fp16 vs fp8 miala znaczenie.
+        // Wieksze KV (Llama-7B-class, brak GQA) zeby fp16 vs fp8 miala znaczenie.
+        // max_position_embeddings ustawione bardzo wysoko, zeby to PULA KV (a nie
+        // limit pozycji) ograniczala max_context — wtedy fp8 (polowa szerokosci KV)
+        // realnie podwaja liczbe mieszczonych tokenow.
         let m = ModelSpec {
             model_type: "llama".into(),
             architectures: vec!["LlamaForCausalLM".into()],
@@ -2291,11 +3109,11 @@ mod tests {
             vocab_size: 32000,
             head_dim: 128,
             intermediate_size: 11008,
-            max_position_embeddings: 32768,
+            max_position_embeddings: 524288,
             ..Default::default()
         };
-        // 80GB GPU (A100/H100) + duzy batch zeby KV byl dominujacy i mial
-        // 'oddech' do wzrostu po zmianie z fp16 na fp8.
+        // 80GB GPU (A100/H100): staly footprint (~14 GB) maly wobec puli ~58 GB,
+        // wiec o max ctx decyduje szerokosc KV.
         let mut input = VramEstimateInput {
             gpu_count: 1,
             gpu_memory_gb_each: 80.0,
@@ -2345,6 +3163,7 @@ mod tests {
             gpu_count: 4,
             gpu_memory_gb_each: 24.0,
             kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
             gpu_memory_utilization: 0.9,
             requested_max_model_len: Some(32768),
             requested_max_num_seqs: Some(8),
@@ -2388,8 +3207,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_fit_caps_max_num_seqs_when_ctx_locked() {
-        // Gemma 27B z lockedmax_model_len = 131072 - powinno auto-cap max_num_seqs.
+    fn auto_fit_keeps_seqs_as_cap_when_ctx_locked() {
+        // Model puli: gdy ctx zalockowane na wartosc mieszczaca sie w puli, suwak
+        // max_num_seqs to czysty cap schedulera — NIE jest obnizany pod pamiec.
+        // (Przed fixem KRYT-2 ctx=131072 × 256 "wymagal" 512 GiB i seqs spadalo do 4.)
         let m = gemma2_27b_like();
         let fit = auto_fit_config(
             &m,
@@ -2398,9 +3219,10 @@ mod tests {
                 gpu_count: 4,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
                 gpu_memory_utilization: 0.9,
-                requested_max_model_len: Some(131072),
-                requested_max_num_seqs: Some(256), // request duzo
+                requested_max_model_len: Some(16384),
+                requested_max_num_seqs: Some(256),
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
                 lock_max_model_len: true,
@@ -2410,13 +3232,19 @@ mod tests {
             },
         );
         assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
-        assert_eq!(fit.applied.max_model_len, 131072, "ctx zachowane (locked)");
-        assert!(fit.applied.max_num_seqs < 256, "seqs powinno byc obniżone");
+        assert_eq!(fit.applied.max_model_len, 16384, "ctx zachowane (locked)");
+        assert_eq!(
+            fit.applied.max_num_seqs, 256,
+            "seqs to cap schedulera, nie pamiec — musi zostac 256, got {}",
+            fit.applied.max_num_seqs
+        );
         assert!(
-            fit.auto_adjusted.iter().any(|s| s == "max_num_seqs"),
-            "auto_adjusted powinno zawierac max_num_seqs: {:?}",
+            !fit.auto_adjusted.iter().any(|s| s == "max_num_seqs"),
+            "max_num_seqs NIE moze byc auto-cap'owane pod pamiec: {:?}",
             fit.auto_adjusted
         );
+        let est = estimate_vllm_vram(&m, &fit.applied);
+        assert!(est.fits_per_gpu, "Po auto-fit musi fits: {est:?}");
     }
 
     #[test]
@@ -2429,6 +3257,7 @@ mod tests {
                 gpu_count: 4,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
                 gpu_memory_utilization: 0.9,
                 requested_max_model_len: Some(1_000_000),
                 requested_max_num_seqs: Some(256),
@@ -2460,6 +3289,7 @@ mod tests {
                 gpu_count: 2,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
                 gpu_memory_utilization: 0.9,
                 requested_max_model_len: Some(32768),
                 requested_max_num_seqs: Some(64),
@@ -2478,10 +3308,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_default_prefers_max_ctx_with_single_seq() {
-        // Gemma2 27B-like, 4x 24GB, brak request + brak lockow -> default policy.
-        // Oczekiwanie: max_num_seqs = 1, max_model_len = max mozliwy z VRAM
-        // (capped przez model.max_position_embeddings = 32768).
+    fn auto_default_serves_with_full_ctx_and_server_seqs() {
+        // Gemma2 27B-like, 4x 24GB, brak request + brak lockow -> polityka serwujaca.
+        // Oczekiwanie: max_num_seqs = 256 (cap serwera, nie REPL), max_model_len
+        // wyciagniety do max mieszczacego JEDNA sekwencje w puli, capped przez
+        // model.max_position_embeddings = 32768.
         let m = gemma2_27b_like();
         let fit = auto_fit_config(
             &m,
@@ -2490,6 +3321,7 @@ mod tests {
                 gpu_count: 4,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
                 gpu_memory_utilization: 0.9,
                 requested_max_model_len: None,
                 requested_max_num_seqs: None,
@@ -2503,26 +3335,24 @@ mod tests {
         );
         assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
         assert_eq!(
-            fit.applied.max_num_seqs, 1,
-            "default num_seqs powinien byc 1, got {}",
+            fit.applied.max_num_seqs, 256,
+            "default num_seqs to wartosc serwerowa 256 (nie 1), got {}",
             fit.applied.max_num_seqs
         );
-        // 27B BF16 na 4×24GB: ~13.5 GB weights/GPU + ~6.5 act = ~20 GB, KV budget
-        // ~1.7 GB/GPU dla 1 seq -> ~4-7k ctx. Test sprawdza ze ctx wynosi co najmniej
-        // 4k (default policy realnie wyciaga budget) i nie przekracza model maxa.
-        assert!(
-            fit.applied.max_model_len >= 4096,
-            "max_model_len powinien wykorzystac VRAM (>= 4k), got {}",
+        // Pula KV mocno przewyzsza 32k tokenow dla 1 sekwencji, wiec ctx siega
+        // pelnego model.max_position_embeddings (32768) bez cappingu KV.
+        assert_eq!(
+            fit.applied.max_model_len, m.max_position_embeddings,
+            "ctx powinien siegnac model.max_position_embeddings, got {}",
             fit.applied.max_model_len
-        );
-        assert!(
-            fit.applied.max_model_len <= m.max_position_embeddings,
-            "max_model_len {} > model.max_position_embeddings {}",
-            fit.applied.max_model_len,
-            m.max_position_embeddings
         );
         let est = estimate_vllm_vram(&m, &fit.applied);
         assert!(est.fits_per_gpu, "Per GPU musi fits: {est:?}");
+        assert!(
+            est.concurrent_full_len_seqs >= 1.0,
+            "Pula powinna pomiescic >=1 pelna sekwencje 32k: {}",
+            est.concurrent_full_len_seqs
+        );
     }
 
     #[test]
@@ -2538,6 +3368,7 @@ mod tests {
                 gpu_count: 1,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
                 gpu_memory_utilization: 0.9,
                 requested_max_model_len: None,
                 requested_max_num_seqs: None,
@@ -2550,7 +3381,7 @@ mod tests {
             },
         );
         assert!(fit.error.is_none(), "Powinno fits: {:?}", fit.error);
-        assert_eq!(fit.applied.max_num_seqs, 1);
+        assert_eq!(fit.applied.max_num_seqs, 256, "default seqs serwerowe = 256");
         assert_eq!(
             fit.applied.max_model_len, m.max_position_embeddings,
             "Maly model: ctx == model.max_position_embeddings ({}), got {}",
@@ -2560,11 +3391,10 @@ mod tests {
 
     #[test]
     fn quant_label_to_bytes_mapping() {
-        // 4-bit warianty -> 0.5625 (z overhead skali)
+        // 4-bit warianty -> 0.5625 (z overhead group-scales)
         for q in &[
             "nvfp4",
             "fp4",
-            "mxfp4",
             "awq",
             "gptq",
             "int4",
@@ -2581,19 +3411,23 @@ mod tests {
                 q
             );
         }
-        // 8-bit -> 1.0625
-        for q in &[
-            "int8",
-            "fp8",
-            "fp8-e4m3",
-            "bnb_8bit",
-            "w8a8",
-            "load_in_8bit",
-        ] {
+        // mxfp4: 4.25 bit (skalar e8m0 per 32) -> 0.5312, wezej niz group-scale 4-bit
+        assert_eq!(quant_label_to_bytes("mxfp4"), Some(0.5312));
+        // fp8 per-tensor/block -> 1.0 (znikomy overhead skali)
+        for q in &["fp8", "fp8-e4m3", "fp8_e5m2", "modelopt_fp8"] {
+            assert_eq!(
+                quant_label_to_bytes(q),
+                Some(1.0),
+                "fp8 '{}' powinno dac 1.0",
+                q
+            );
+        }
+        // int8 group-scale -> 1.0625
+        for q in &["int8", "bnb_8bit", "w8a8", "load_in_8bit"] {
             assert_eq!(
                 quant_label_to_bytes(q),
                 Some(1.0625),
-                "8-bit '{}' powinno dac 1.0625",
+                "int8 '{}' powinno dac 1.0625",
                 q
             );
         }
@@ -2603,6 +3437,87 @@ mod tests {
         assert_eq!(quant_label_to_bytes("fp32"), Some(4.0));
         // Nieznane -> None (fallback do dtype)
         assert_eq!(quant_label_to_bytes("definitely-not-a-quant"), None);
+    }
+
+    #[test]
+    fn kv_bytes_per_element_engine_aware() {
+        // llama.cpp: warianty q*_0 maja realne (mniejsze) szerokosci z ggml-common.h.
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::LlamaCpp, "q4_0"),
+            Some(0.5625)
+        );
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::LlamaCpp, "q8_0"),
+            Some(1.0625)
+        );
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::LlamaCpp, "q5_1"),
+            Some(0.75)
+        );
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::LlamaCpp, "q5_0"),
+            Some(0.6875)
+        );
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::LlamaCpp, "q4_1"),
+            Some(0.625)
+        );
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::LlamaCpp, "iq4_nl"),
+            Some(0.5625)
+        );
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::LlamaCpp, "auto"),
+            Some(2.0)
+        );
+        // Normalizacja '-' -> '_'.
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::LlamaCpp, "Q4-0"),
+            Some(0.5625)
+        );
+        // Token vLLM (fp8) nieprawidlowy dla llama.cpp.
+        assert_eq!(kv_bytes_per_element(DeployEngine::LlamaCpp, "bogus"), None);
+        assert_eq!(kv_bytes_per_element(DeployEngine::LlamaCpp, "fp8"), None);
+
+        // vLLM: tylko auto/f16-rodzina (2.0) i fp8-rodzina (1.0).
+        assert_eq!(kv_bytes_per_element(DeployEngine::Vllm, "fp8"), Some(1.0));
+        assert_eq!(
+            kv_bytes_per_element(DeployEngine::Vllm, "fp8_e4m3"),
+            Some(1.0)
+        );
+        assert_eq!(kv_bytes_per_element(DeployEngine::Vllm, "auto"), Some(2.0));
+        assert_eq!(kv_bytes_per_element(DeployEngine::Vllm, "bf16"), Some(2.0));
+        // Etykiety llama.cpp (q*_0) nieprawidlowe dla vLLM.
+        assert_eq!(kv_bytes_per_element(DeployEngine::Vllm, "q4_0"), None);
+        assert_eq!(kv_bytes_per_element(DeployEngine::Vllm, "q8_0"), None);
+    }
+
+    #[test]
+    fn kv_per_token_bytes_separate_k_and_v() {
+        // GQA-style spec: 32 layers, 8 kv_heads, head_dim 128.
+        let m = ModelSpec {
+            num_hidden_layers: 32,
+            num_key_value_heads: 8,
+            num_attention_heads: 32,
+            head_dim: 128,
+            hidden_size: 4096,
+            ..Default::default()
+        };
+        let factor = 32.0 * 8.0 * 128.0; // layers * kv_heads * head_dim
+
+        // Rozne K/V: K=q8_0 (1.0625), V=q4_0 (0.5625) -> suma osobnych szerokosci.
+        let mixed = kv_per_token_bytes(&m, DeployEngine::LlamaCpp, "q8_0", "q4_0");
+        assert!((mixed - factor * (1.0625 + 0.5625)).abs() < 1e-9);
+
+        // k == v daje identyczny wynik jak stary wrapper `2.0 * ... * bytes_kv`.
+        let symmetric = kv_per_token_bytes(&m, DeployEngine::LlamaCpp, "q4_0", "q4_0");
+        assert!((symmetric - factor * 2.0 * 0.5625).abs() < 1e-9);
+        let wrapper = kv_bytes_per_seq_per_token(&m, DeployEngine::LlamaCpp, "q4_0");
+        assert!((symmetric - wrapper).abs() < 1e-9);
+
+        // Nieprawidlowa etykieta fallbackuje do 2.0 (fp16) per element.
+        let fallback = kv_per_token_bytes(&m, DeployEngine::LlamaCpp, "bogus", "bogus");
+        assert!((fallback - factor * 2.0 * 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2729,7 +3644,9 @@ mod tests {
             pipeline_parallel: 2,
             max_model_len: 32768,
             max_num_seqs: 1,
+            max_num_batched_tokens: 8192,
             kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
             gpu_memory_utilization: 0.9,
             activation_overhead_pct: 10.0,
             weights_bytes_override: None,
@@ -2742,11 +3659,19 @@ mod tests {
             est.model_weights_gb
         );
         assert!(est.fits_per_gpu, "NVFP4 30.6B na 4×24GB musi fits: {est:?}");
-        // Per GPU << 24 GB - duzo zapasu.
+        // Model puli: per_gpu_gb wypelnia sie pula KV (~usable), wiec "komfort"
+        // mierzymy stalym footprintem (wagi/GPU + aktywacje) — musi byc maly,
+        // zostawiajac wielka pule na KV.
+        let fixed = est.model_weights_gb / 4.0 + est.activations_gb / 4.0;
         assert!(
-            est.per_gpu_gb < 18.0,
-            "Per GPU powinien byc << 24 GB (komfortowo): got {}",
-            est.per_gpu_gb
+            fixed < 10.0,
+            "Staly footprint per GPU (wagi/GPU + akt) powinien byc maly: got {}",
+            fixed
+        );
+        assert!(
+            est.kv_pool_gb > 30.0,
+            "Pula KV cluster-wide powinna byc duza (>30 GB): got {}",
+            est.kv_pool_gb
         );
     }
 
@@ -2762,6 +3687,7 @@ mod tests {
                 gpu_count: 4,
                 gpu_memory_gb_each: 24.0,
                 kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
                 gpu_memory_utilization: 0.9,
                 requested_max_model_len: None,
                 requested_max_num_seqs: None,
@@ -2774,15 +3700,18 @@ mod tests {
             },
         );
         assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
-        assert_eq!(fit.applied.max_num_seqs, 1, "default policy: 1 seq");
+        assert_eq!(
+            fit.applied.max_num_seqs, 256,
+            "polityka serwujaca: seqs = 256, got {}",
+            fit.applied.max_num_seqs
+        );
         // Gemma4 31B ma 60 layers × 16 kv_heads × 256 head_dim → KV ~960 KB/token.
-        // Z budgetu ~12 GB/GPU dla 1 seq dostajemy ~12k tokenow ctx. NVFP4 oszczednosc
-        // dotyczy WAGS (~17 GB vs 56 GB) ale KV cache zostaje na bf16 i to on tu
-        // dominuje. Test wymaga zeby ctx byl realnie wyciagniety (>= 8k - vs PRZED
-        // poprawka, kiedy weights byly liczone jak bf16, model w ogole nie fit'owal).
+        // Male wagi NVFP4 (~17 GB) zostawiaja ~15 GB/GPU puli KV → ctx rzedu ~67k
+        // (capped przez model.max_position_embeddings 131072). Wczesniej (bez modelu
+        // puli + bez NVFP4 w wagach) model w ogole nie fit'owal.
         assert!(
-            fit.applied.max_model_len >= 8192,
-            "Z malymi wagami (NVFP4) powinno dac sensowny ctx (>= 8k), got {}",
+            fit.applied.max_model_len >= 32768,
+            "Z malymi wagami (NVFP4) pula KV powinna dac duzy ctx (>= 32k), got {}",
             fit.applied.max_model_len
         );
         assert!(fit.applied.max_model_len <= m.max_position_embeddings);
@@ -2984,5 +3913,679 @@ mod tests {
             est.model_weights_gb,
             expected_gb
         );
+    }
+
+    /// Qwen2.5-32B (dense): hidden 5120, 40 heads, 8 kv_heads, 64 layers, head_dim
+    /// 128, vocab 152064, intermediate 27648, bf16, ~32.5B params.
+    fn qwen25_32b() -> ModelSpec {
+        ModelSpec {
+            model_type: "qwen2".into(),
+            architectures: vec!["Qwen2ForCausalLM".into()],
+            dtype: "bfloat16".into(),
+            hidden_size: 5120,
+            num_attention_heads: 40,
+            num_key_value_heads: 8,
+            num_hidden_layers: 64,
+            vocab_size: 152064,
+            head_dim: 128,
+            intermediate_size: 27648,
+            max_position_embeddings: 131072,
+            num_parameters: 32_500_000_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qwen25_32b_tp2_pool_model_fits_not_inflated() {
+        // Rdzeniowy fix KRYT-1: model puli zamiast kv = ctx*seqs. Przed fixem ten
+        // sam config raportowal per_gpu_gb ~1062 GB (false OOM). Teraz: staly
+        // footprint + pula KV mieszczaca setki tysiecy tokenow.
+        let m = qwen25_32b();
+        let input = VramEstimateInput {
+            engine: DeployEngine::Vllm,
+            gpu_count: 2,
+            gpu_memory_gb_each: 80.0,
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            max_model_len: 32768,
+            max_num_seqs: 256,
+            max_num_batched_tokens: 8192,
+            kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
+            gpu_memory_utilization: 0.9,
+            activation_overhead_pct: 10.0,
+            weights_bytes_override: None,
+        };
+        let est = estimate_vllm_vram(&m, &input);
+        assert!(
+            est.fits_per_gpu,
+            "Qwen2.5-32B TP=2 na 2×80GB musi fits: {est:?}"
+        );
+        assert!(
+            est.per_gpu_gb < 80.0,
+            "per_gpu_gb musi byc < 80 GB (nie 1062): got {}",
+            est.per_gpu_gb
+        );
+        // Pula ~39 GB/GPU → ~320k tokenow przy 128 KiB/token TP-shardowanym.
+        assert!(
+            (250_000..=340_000).contains(&est.pool_tokens),
+            "pool_tokens rzedu ~250k-340k: got {}",
+            est.pool_tokens
+        );
+        assert!(
+            (7.0..=11.0).contains(&est.concurrent_full_len_seqs),
+            "wspolbieznosc ~7-11 pelnych sekwencji 32k: got {}",
+            est.concurrent_full_len_seqs
+        );
+        // Pula cluster-wide (2 GPU) to ~78 GB — to liczba ktora widzi renderVramCard
+        // zamiast dawnych 1062 GB.
+        assert!(
+            est.kv_pool_gb > 60.0 && est.kv_pool_gb < 90.0,
+            "kv_pool_gb cluster-wide ~78 GB: got {}",
+            est.kv_pool_gb
+        );
+    }
+
+    #[test]
+    fn kv_tp_shards_clamped_at_kv_heads() {
+        // KRYT-4: KV shardsuje sie tylko do min(tp, kv_heads). Llama-70B-like
+        // (kv_heads=8). Powyzej TP=8 vLLM replikuje glowy → szerokosc KV per GPU
+        // przestaje malec. Porownujemy TP=8 vs TP=16 na duzym klastrze.
+        let m = ModelSpec {
+            model_type: "llama".into(),
+            architectures: vec!["LlamaForCausalLM".into()],
+            dtype: "bfloat16".into(),
+            hidden_size: 8192,
+            num_attention_heads: 64,
+            num_key_value_heads: 8,
+            num_hidden_layers: 80,
+            vocab_size: 128256,
+            head_dim: 128,
+            intermediate_size: 28672,
+            max_position_embeddings: 131072,
+            num_parameters: 70_000_000_000,
+            ..Default::default()
+        };
+        let base = VramEstimateInput {
+            engine: DeployEngine::Vllm,
+            gpu_count: 16,
+            gpu_memory_gb_each: 80.0,
+            pipeline_parallel: 1,
+            max_model_len: 8192,
+            max_num_seqs: 256,
+            max_num_batched_tokens: 8192,
+            kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
+            gpu_memory_utilization: 0.9,
+            activation_overhead_pct: 10.0,
+            weights_bytes_override: None,
+            tensor_parallel: 8,
+        };
+        let est_tp8 = estimate_vllm_vram(
+            &m,
+            &VramEstimateInput {
+                tensor_parallel: 8,
+                ..base.clone()
+            },
+        );
+        let est_tp16 = estimate_vllm_vram(
+            &m,
+            &VramEstimateInput {
+                tensor_parallel: 16,
+                ..base
+            },
+        );
+        // Szerokosc KV per token per GPU = kv_per_token_total / (kv_tp_shards*pp).
+        // kv_tp_shards clamp na 8 dla TP=8 ORAZ TP=16 → identyczna szerokosc.
+        let kv_total = kv_per_token_bytes(&m, DeployEngine::Vllm, "auto", "auto");
+        let width_tp8 = kv_total / 8.0; // min(8,8)
+        let width_tp16 = kv_total / 8.0; // min(16,8) clamp
+        assert!((width_tp8 - width_tp16).abs() < 1e-9, "clamp na kv_heads=8");
+        // pool_tokens przy TP=16 NIE moze byc mniejszy z powodu KV (szerokosc plaska);
+        // wagi/GPU sa mniejsze przy TP=16, wiec pula moze byc nawet wieksza.
+        assert!(
+            est_tp16.pool_tokens >= est_tp8.pool_tokens,
+            "TP=16 nie daje wezszej szerokosci KV niz TP=8: tp8={} tp16={}",
+            est_tp8.pool_tokens,
+            est_tp16.pool_tokens
+        );
+        // Ostrzezenie o replikacji KV przy TP>kv_heads (informacyjne, nie blad).
+        assert!(
+            est_tp16
+                .warnings
+                .iter()
+                .any(|w| w.contains("KV replikowane")),
+            "TP>kv_heads powinno dac informacyjne ostrzezenie o replikacji: {:?}",
+            est_tp16.warnings
+        );
+    }
+
+    #[test]
+    fn max_num_seqs_does_not_change_vllm_memory() {
+        // CORE fix: w modelu puli max_num_seqs to cap schedulera, NIE pamiec.
+        // Ta sama konfiguracja z seqs=1 vs seqs=256 musi dac identyczny footprint.
+        let m = qwen25_32b();
+        let base = VramEstimateInput {
+            engine: DeployEngine::Vllm,
+            gpu_count: 2,
+            gpu_memory_gb_each: 80.0,
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            max_model_len: 32768,
+            max_num_seqs: 1,
+            max_num_batched_tokens: 8192,
+            kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
+            gpu_memory_utilization: 0.9,
+            activation_overhead_pct: 10.0,
+            weights_bytes_override: None,
+        };
+        let est_1 = estimate_vllm_vram(&m, &base);
+        let est_256 = estimate_vllm_vram(
+            &m,
+            &VramEstimateInput {
+                max_num_seqs: 256,
+                ..base
+            },
+        );
+        assert!(
+            (est_1.per_gpu_gb - est_256.per_gpu_gb).abs() < 1e-9,
+            "per_gpu_gb nie moze zalezec od max_num_seqs: 1seq={} 256seq={}",
+            est_1.per_gpu_gb,
+            est_256.per_gpu_gb
+        );
+        assert!(
+            (est_1.kv_pool_gb - est_256.kv_pool_gb).abs() < 1e-9,
+            "kv_pool_gb nie moze zalezec od max_num_seqs: 1seq={} 256seq={}",
+            est_1.kv_pool_gb,
+            est_256.kv_pool_gb
+        );
+        assert_eq!(
+            est_1.fits_per_gpu, est_256.fits_per_gpu,
+            "fits_per_gpu nie moze zalezec od max_num_seqs"
+        );
+        assert_eq!(
+            est_1.pool_tokens, est_256.pool_tokens,
+            "pool_tokens nie moze zalezec od max_num_seqs"
+        );
+    }
+
+    #[test]
+    fn fits_total_respects_util() {
+        // DRUG-1: fits_total musi mnozyc budzet przez util. Config tuz powyzej
+        // count*each*util ma fits_total=false, mimo ze count*each (bez util) by go
+        // pomiescil. Maly model na 2×24GB: total ~weights+akt+pula+overhead ≈
+        // 2*each*util gdy pula wypelnia budzet, wiec total > 2*each*0.9 jest false.
+        let m = qwen_05b();
+        let input = VramEstimateInput {
+            engine: DeployEngine::Vllm,
+            gpu_count: 2,
+            gpu_memory_gb_each: 24.0,
+            tensor_parallel: 1,
+            pipeline_parallel: 2,
+            max_model_len: 4096,
+            max_num_seqs: 256,
+            max_num_batched_tokens: 8192,
+            kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
+            gpu_memory_utilization: 0.9,
+            activation_overhead_pct: 10.0,
+            weights_bytes_override: None,
+        };
+        let est = estimate_vllm_vram(&m, &input);
+        // total wypelnia pule do util*VRAM, wiec lezy tuz powyzej count*each*util
+        // (przez overhead 0.5) → fits_total musi byc false (z util), choc total
+        // < count*each (bez util).
+        let raw_total = input.gpu_memory_gb_each * input.gpu_count as f64;
+        let util_total = raw_total * input.gpu_memory_utilization;
+        assert!(
+            est.total_gb > util_total,
+            "total {} powinno przekroczyc budzet z util {}",
+            est.total_gb,
+            util_total
+        );
+        assert!(
+            est.total_gb <= raw_total,
+            "total {} powinno miescic sie w surowym VRAM {}",
+            est.total_gb,
+            raw_total
+        );
+        assert!(
+            !est.fits_total,
+            "fits_total z util musi byc false gdy total > count*each*util: {est:?}"
+        );
+    }
+
+    #[test]
+    fn auto_fit_vllm_default_uses_server_concurrency() {
+        // Bez lockow vLLM powinien zwrocic seqs serwerowe (>= 2) i sensowny ctx.
+        let m = qwen25_32b();
+        let fit = auto_fit_config(
+            &m,
+            &AutoFitRequest {
+                engine: DeployEngine::Vllm,
+                gpu_count: 2,
+                gpu_memory_gb_each: 80.0,
+                kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
+                gpu_memory_utilization: 0.9,
+                requested_max_model_len: None,
+                requested_max_num_seqs: None,
+                requested_tensor_parallel: None,
+                requested_pipeline_parallel: None,
+                lock_max_model_len: false,
+                lock_max_num_seqs: false,
+                lock_tensor_parallel: false,
+                weights_bytes_override: None,
+            },
+        );
+        assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
+        assert!(
+            fit.applied.max_num_seqs >= 2,
+            "default seqs serwerowe (>=2, nie 1): got {}",
+            fit.applied.max_num_seqs
+        );
+        assert!(
+            fit.applied.max_model_len >= 8192,
+            "ctx sensowny (>= 8k): got {}",
+            fit.applied.max_model_len
+        );
+        let est = estimate_vllm_vram(&m, &fit.applied);
+        assert!(est.fits_per_gpu, "Po auto-fit musi fits: {est:?}");
+    }
+
+    #[test]
+    fn max_concurrent_seqs_reports_pool_concurrency() {
+        // Po fixie KRYT-2: dla vLLM max_concurrent_seqs_for_budget czyta osiagalna
+        // wspolbieznosc z puli (concurrent_full_len_seqs), nie binary search po seqs
+        // (ktory zwracalby bez sensu hi, bo fit nie zalezy od seqs).
+        let m = qwen25_32b();
+        let input = VramEstimateInput {
+            engine: DeployEngine::Vllm,
+            gpu_count: 2,
+            gpu_memory_gb_each: 80.0,
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            max_model_len: 32768,
+            max_num_seqs: 256,
+            max_num_batched_tokens: 8192,
+            kv_cache_dtype: "auto".into(),
+            kv_cache_dtype_v: None,
+            gpu_memory_utilization: 0.9,
+            activation_overhead_pct: 10.0,
+            weights_bytes_override: None,
+        };
+        let est = estimate_vllm_vram(&m, &input);
+        let conc = max_concurrent_seqs_for_budget(&m, &input);
+        assert_eq!(
+            conc,
+            est.concurrent_full_len_seqs.floor().max(1.0) as u64,
+            "max_concurrent = floor(concurrent_full_len_seqs)"
+        );
+        assert!(conc >= 7, "Qwen2.5-32B TP=2 puli starcza na >=7 sekwencji 32k: {conc}");
+    }
+
+    #[test]
+    fn llamacpp_args_emit_total_ctx_and_np_and_ubatch() {
+        // KRYT-7: `-c` to CALY kontekst (max_model_len × max_num_seqs), `-np` to
+        // liczba slotow. LCPP-UBATCH-B-FLAG: `-ub 512` zamiast `-b 512`.
+        let m = qwen25_32b();
+        let input = VramEstimateInput {
+            engine: DeployEngine::LlamaCpp,
+            max_model_len: 8192,
+            max_num_seqs: 8,
+            ..Default::default()
+        };
+        let args = build_llamacpp_args_string(&m, &input);
+        assert!(args.contains("-c 65536"), "caly ctx = 8192*8: {args}");
+        assert!(args.contains("-np 8"), "8 slotow: {args}");
+        assert!(args.contains("-ub 512"), "fizyczny ubatch: {args}");
+        assert!(!args.contains("-b 512"), "logiczny -b NIE emitowany: {args}");
+    }
+
+    #[test]
+    fn llamacpp_separate_kv_emits_both_flags_and_fa() {
+        // Osobne K/V (K=q8_0, V=q4_0) -> obie flagi + -fa (kwantyzowane V wymaga FA).
+        let m = qwen25_32b();
+        let input = VramEstimateInput {
+            engine: DeployEngine::LlamaCpp,
+            max_model_len: 4096,
+            max_num_seqs: 1,
+            kv_cache_dtype: "q8_0".into(),
+            kv_cache_dtype_v: Some("q4_0".into()),
+            ..Default::default()
+        };
+        let args = build_llamacpp_args_string(&m, &input);
+        assert!(args.contains("--cache-type-k q8_0"), "K=q8_0: {args}");
+        assert!(args.contains("--cache-type-v q4_0"), "V=q4_0: {args}");
+        assert!(args.contains("-fa"), "kwantyzowane V wymaga flash-attn: {args}");
+
+        // f16/auto NIE emituja flagi cache-type ani -fa (domyslne 2.0 B).
+        let input_default = VramEstimateInput {
+            engine: DeployEngine::LlamaCpp,
+            kv_cache_dtype: "auto".into(),
+            ..Default::default()
+        };
+        let args_default = build_llamacpp_args_string(&m, &input_default);
+        assert!(
+            !args_default.contains("--cache-type") && !args_default.contains("-fa"),
+            "domyslne f16 nie emituje cache-type/-fa: {args_default}"
+        );
+
+        // fp8 (token vLLM) mapuje na q8_0 dla llama.cpp.
+        let input_fp8 = VramEstimateInput {
+            engine: DeployEngine::LlamaCpp,
+            kv_cache_dtype: "fp8".into(),
+            ..Default::default()
+        };
+        let args_fp8 = build_llamacpp_args_string(&m, &input_fp8);
+        assert!(args_fp8.contains("--cache-type-k q8_0"), "fp8->q8_0: {args_fp8}");
+    }
+
+    #[test]
+    fn llamacpp_q4_0_kv_is_smaller_than_f16() {
+        // KRYT-6/Faza 3: q4_0 KV = 0.5625× f16 przy tym samym n_ctx.
+        let m = qwen25_32b();
+        let base = VramEstimateInput {
+            engine: DeployEngine::LlamaCpp,
+            gpu_count: 1,
+            gpu_memory_gb_each: 80.0,
+            max_model_len: 8192,
+            max_num_seqs: 1,
+            ..Default::default()
+        };
+        let f16 = estimate_llamacpp_vram(
+            &m,
+            &VramEstimateInput {
+                kv_cache_dtype: "f16".into(),
+                ..base.clone()
+            },
+        );
+        let q4 = estimate_llamacpp_vram(
+            &m,
+            &VramEstimateInput {
+                kv_cache_dtype: "q4_0".into(),
+                ..base
+            },
+        );
+        // q4_0 K+V = 2×0.5625 vs f16 2×2.0, wiec ratio = 0.5625/2.0 = 0.28125.
+        let ratio = q4.kv_cache_gb / f16.kv_cache_gb;
+        assert!(
+            (ratio - 0.28125).abs() < 1e-6,
+            "q4_0 KV / f16 KV = {ratio} (oczekiwane 0.28125)"
+        );
+        // Osobne K/V K=q8_0 V=q4_0: srednia (1.0625+0.5625)/2 vs 2.0 dla f16.
+        let mixed = estimate_llamacpp_vram(
+            &m,
+            &VramEstimateInput {
+                engine: DeployEngine::LlamaCpp,
+                gpu_count: 1,
+                gpu_memory_gb_each: 80.0,
+                max_model_len: 8192,
+                max_num_seqs: 1,
+                kv_cache_dtype: "q8_0".into(),
+                kv_cache_dtype_v: Some("q4_0".into()),
+                ..Default::default()
+            },
+        );
+        let expected_ratio = (1.0625 + 0.5625) / (2.0 + 2.0);
+        let mixed_ratio = mixed.kv_cache_gb / f16.kv_cache_gb;
+        assert!(
+            (mixed_ratio - expected_ratio).abs() < 1e-6,
+            "mixed KV / f16 = {mixed_ratio} (oczekiwane {expected_ratio})"
+        );
+    }
+
+    #[test]
+    fn llamacpp_n_ctx_scales_with_seqs() {
+        // KRYT-7: n_ctx = max_model_len × seqs, wiec KV rosnie z liczba slotow.
+        let m = qwen25_32b();
+        let base = VramEstimateInput {
+            engine: DeployEngine::LlamaCpp,
+            gpu_count: 1,
+            gpu_memory_gb_each: 80.0,
+            max_model_len: 8192,
+            kv_cache_dtype: "f16".into(),
+            ..Default::default()
+        };
+        let one = estimate_llamacpp_vram(
+            &m,
+            &VramEstimateInput {
+                max_num_seqs: 1,
+                ..base.clone()
+            },
+        );
+        let eight = estimate_llamacpp_vram(
+            &m,
+            &VramEstimateInput {
+                max_num_seqs: 8,
+                ..base
+            },
+        );
+        assert_eq!(one.pool_tokens, 8192, "1 slot: n_ctx = ctx");
+        assert_eq!(eight.pool_tokens, 65536, "8 slotow: n_ctx = ctx*8");
+        assert!(
+            (eight.kv_cache_gb / one.kv_cache_gb - 8.0).abs() < 1e-6,
+            "8 slotow daje 8x KV: {} vs {}",
+            eight.kv_cache_gb,
+            one.kv_cache_gb
+        );
+    }
+
+    #[test]
+    fn llamacpp_row_split_puts_full_kv_on_main_gpu() {
+        // KRYT-8: tp=2 (row) -> per_gpu liczone z PELNYM KV na main GPU, nie kv/2.
+        // fits = max(main, secondary).
+        let m = qwen25_32b();
+        let input = VramEstimateInput {
+            engine: DeployEngine::LlamaCpp,
+            gpu_count: 2,
+            gpu_memory_gb_each: 24.0,
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            max_model_len: 32768,
+            max_num_seqs: 1,
+            kv_cache_dtype: "f16".into(),
+            weights_bytes_override: Some((20.0 * 1024.0 * 1024.0 * 1024.0) as u64),
+            ..Default::default()
+        };
+        let est = estimate_llamacpp_vram(&m, &input);
+        let weights_per_gpu = 20.0 / 2.0;
+        let main_gpu = weights_per_gpu
+            + est.kv_cache_gb
+            + llamacpp_compute_buffer_gb(&m, 1)
+            + LLAMACPP_CUDA_CTX_PER_GPU;
+        assert!(
+            (est.per_gpu_gb - main_gpu).abs() < 0.01,
+            "row-split per_gpu = main z pelnym KV: {} vs {}",
+            est.per_gpu_gb,
+            main_gpu
+        );
+        // per_gpu z pelnym KV musi byc znacznie wyzsze niz naiwne kv/2.
+        let naive_even = weights_per_gpu
+            + est.kv_cache_gb / 2.0
+            + llamacpp_compute_buffer_gb(&m, 1)
+            + LLAMACPP_CUDA_CTX_PER_GPU;
+        assert!(
+            est.per_gpu_gb > naive_even,
+            "row-split nie dzieli KV rowno: {} > {}",
+            est.per_gpu_gb,
+            naive_even
+        );
+    }
+
+    #[test]
+    fn auto_fit_llamacpp_kv_scales_with_locked_seqs() {
+        // KRYT-7 w auto: seqs wplywa na budzet KV (n_ctx = ctx*seqs). Lock ctx +
+        // seqs=8 liczy KV dla ctx*8.
+        let m = qwen25_32b();
+        let req = AutoFitRequest {
+            engine: DeployEngine::LlamaCpp,
+            gpu_count: 1,
+            gpu_memory_gb_each: 80.0,
+            kv_cache_dtype: "f16".into(),
+            kv_cache_dtype_v: None,
+            gpu_memory_utilization: 0.9,
+            requested_max_model_len: Some(8192),
+            requested_max_num_seqs: Some(8),
+            requested_tensor_parallel: None,
+            requested_pipeline_parallel: None,
+            lock_max_model_len: true,
+            lock_max_num_seqs: true,
+            lock_tensor_parallel: false,
+            weights_bytes_override: Some((16.0 * 1024.0 * 1024.0 * 1024.0) as u64),
+        };
+        let out = auto_fit_config(&m, &req);
+        assert!(out.error.is_none(), "ctx 8192 × 8 slotow miesci sie w 80 GB: {:?}", out.error);
+        let est = estimate_llamacpp_vram(&m, &out.applied);
+        assert_eq!(est.pool_tokens, 8192 * 8, "n_ctx liczone dla ctx*seqs");
+    }
+
+    fn mlx_4bit_20gb() -> ModelSpec {
+        // ~20 GB w 4-bit (g64 -> 0.5625 B/param) => ~35.5B parametrow.
+        ModelSpec {
+            model_type: "qwen2".into(),
+            architectures: vec!["Qwen2ForCausalLM".into()],
+            dtype: "bfloat16".into(),
+            hidden_size: 5120,
+            num_attention_heads: 40,
+            num_key_value_heads: 8,
+            num_hidden_layers: 64,
+            vocab_size: 152064,
+            head_dim: 128,
+            intermediate_size: 27648,
+            max_position_embeddings: 131072,
+            quantization: Some("mlx_4bit_g64".into()),
+            num_parameters: 35_500_000_000,
+            bytes_per_param_override: Some(0.5625),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mlx_fits_on_64gb_unified_with_kv_pool() {
+        // Faza 5: model 4bit ~20 GB na budzecie 64 GB -> fits, pool_tokens > 0.
+        let m = mlx_4bit_20gb();
+        let input = VramEstimateInput {
+            engine: DeployEngine::Mlx,
+            gpu_count: 1,
+            gpu_memory_gb_each: 64.0,
+            tensor_parallel: 1,
+            pipeline_parallel: 1,
+            max_model_len: 8192,
+            max_num_seqs: 1,
+            kv_cache_dtype: "none".into(),
+            gpu_memory_utilization: 0.9,
+            ..Default::default()
+        };
+        let est = estimate_mlx_vram(&m, &input);
+        // 35.5B × 0.5625 B = ~19.97e9 B = ~18.6 GiB.
+        assert!(
+            est.model_weights_gb > 17.0 && est.model_weights_gb < 20.0,
+            "wagi ~18.6 GB (35.5B × 0.5625): {}",
+            est.model_weights_gb
+        );
+        assert!(est.fits_per_gpu, "20 GB na 64 GB unified: {est:?}");
+        assert!(est.pool_tokens > 0, "pula KV > 0: {}", est.pool_tokens);
+        assert!(
+            est.per_gpu_gb == est.total_gb,
+            "single device: per_gpu == total"
+        );
+
+        // kv4 daje wiekszy pool_tokens niz none (mniej bajtow na token).
+        let kv4 = estimate_mlx_vram(
+            &m,
+            &VramEstimateInput {
+                kv_cache_dtype: "kv4".into(),
+                ..input.clone()
+            },
+        );
+        assert!(
+            kv4.pool_tokens > est.pool_tokens,
+            "kv4 ({}) > none ({}) pool_tokens",
+            kv4.pool_tokens,
+            est.pool_tokens
+        );
+    }
+
+    #[test]
+    fn mlx_ignores_tp_pp_and_warns_when_weights_exceed_budget() {
+        let m = mlx_4bit_20gb();
+        // TP/PP > 1 ignorowane (single device); ostrzezenie obecne.
+        let input = VramEstimateInput {
+            engine: DeployEngine::Mlx,
+            gpu_count: 1,
+            gpu_memory_gb_each: 8.0,
+            tensor_parallel: 4,
+            pipeline_parallel: 2,
+            max_model_len: 4096,
+            max_num_seqs: 1,
+            kv_cache_dtype: "none".into(),
+            gpu_memory_utilization: 0.9,
+            ..Default::default()
+        };
+        let est = estimate_mlx_vram(&m, &input);
+        assert!(!est.fits_per_gpu, "20 GB nie miesci sie w 8 GB budzecie");
+        assert!(
+            est.warnings.iter().any(|w| w.contains("Same wagi")),
+            "ostrzezenie o wagach > budzet: {:?}",
+            est.warnings
+        );
+        assert!(
+            est.warnings.iter().any(|w| w.contains("unified memory")),
+            "ostrzezenie o ignorowaniu TP/PP: {:?}",
+            est.warnings
+        );
+    }
+
+    #[test]
+    fn mlx_kv_bytes_per_element_table() {
+        assert_eq!(kv_bytes_per_element(DeployEngine::Mlx, "none"), Some(2.0));
+        assert_eq!(kv_bytes_per_element(DeployEngine::Mlx, "f16"), Some(2.0));
+        assert_eq!(kv_bytes_per_element(DeployEngine::Mlx, "kv8"), Some(1.0625));
+        assert_eq!(kv_bytes_per_element(DeployEngine::Mlx, "kv4"), Some(0.5625));
+        assert_eq!(kv_bytes_per_element(DeployEngine::Mlx, "bogus"), None);
+    }
+
+    #[test]
+    fn mlx_weight_bytes_group_size_aware() {
+        // 4-bit g64 = 0.5625, g32 = 0.625, 8-bit g64 = 1.0625.
+        assert!((mlx_weight_bytes(4, 64) - 0.5625).abs() < 1e-9);
+        assert!((mlx_weight_bytes(4, 32) - 0.625).abs() < 1e-9);
+        assert!((mlx_weight_bytes(8, 64) - 1.0625).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_mlx_top_level_quantization_sets_group_size_bytes() {
+        // MLX-community: top-level `quantization: {bits, group_size}` (NIE
+        // quantization_config). g32 4-bit -> 0.625 B/param, nie 0.5625.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "qwen2",
+            "hidden_size": 5120,
+            "num_attention_heads": 40,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 64,
+            "vocab_size": 152064,
+            "head_dim": 128,
+            "intermediate_size": 27648,
+            "quantization": {"group_size": 32, "bits": 4}
+        }"#,
+        )
+        .unwrap();
+        let spec = parse_hf_config(&json, "mlx-community/Qwen2.5-32B-4bit").unwrap();
+        assert!(
+            (spec.bytes_per_param() - 0.625).abs() < 1e-9,
+            "g32 4-bit = 0.625 (nie 0.5625): {}",
+            spec.bytes_per_param()
+        );
+
+        // g64 4-bit = 0.5625.
+        let json64: serde_json::Value = serde_json::from_str(
+            r#"{"hidden_size": 5120, "quantization": {"group_size": 64, "bits": 4}}"#,
+        )
+        .unwrap();
+        let spec64 = parse_hf_config(&json64, "mlx-community/foo-4bit").unwrap();
+        assert!((spec64.bytes_per_param() - 0.5625).abs() < 1e-9);
     }
 }
