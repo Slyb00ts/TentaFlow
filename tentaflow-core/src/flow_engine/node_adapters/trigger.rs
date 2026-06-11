@@ -5,10 +5,12 @@
 //       przed `execute_blocking`/`execute_streaming`). Plan v4.2 D2.
 // =============================================================================
 
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
+use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -75,6 +77,51 @@ impl NodeAdapter for TriggerNodeAdapter {
             ));
         }
         Ok((*ctx.initial_envelope).clone())
+    }
+
+    /// Bramkowanie gałęzi po modalności (§3.11 A): aktywne są tylko porty
+    /// odpowiadające modalnościom obecnym w envelope — payload + artefakty
+    /// `input_*` (multimodalny seed: pierwsze wejście → payload, kolejne →
+    /// artefakty `input_{n}`, patrz `flow_envelope_from_inputs`). Payload Text
+    /// nie aktywuje gałęzi `audio` (STT), payload Audio nie aktywuje gałęzi
+    /// `text` itd. Envelope bez żadnej modalności (Empty seed, np. synthetic
+    /// flow bez payloadu) nie bramkuje — `None` = wszystkie porty aktywne.
+    fn active_output_ports(
+        &self,
+        _node: &FlowNode,
+        result: &FlowEnvelope,
+    ) -> Option<HashSet<String>> {
+        let mut ports = HashSet::new();
+        if let Some(p) = modality_port(&result.payload) {
+            ports.insert(p.to_string());
+        }
+        for (name, value) in &result.artifacts {
+            if name.starts_with("input_") {
+                if let Some(p) = modality_port(value) {
+                    ports.insert(p.to_string());
+                }
+            }
+        }
+        if ports.is_empty() {
+            None
+        } else {
+            Some(ports)
+        }
+    }
+}
+
+/// Mapuje wariant `FlowValue` na nazwę output portu triggera. `Json` idzie
+/// kanałem `text` (structured data konsumowane przez gałęzie tekstowe, nie
+/// plikowe). `Empty` nie niesie modalności — brak portu.
+fn modality_port(value: &FlowValue) -> Option<&'static str> {
+    match value {
+        FlowValue::Empty => None,
+        FlowValue::Text(_) | FlowValue::Json(_) => Some("text"),
+        FlowValue::Audio { .. } => Some("audio"),
+        FlowValue::Image { .. } => Some("image"),
+        FlowValue::Video { .. } => Some("video"),
+        FlowValue::Embedding(_) => Some("embedding"),
+        FlowValue::Other { .. } => Some("other"),
     }
 }
 
@@ -143,5 +190,62 @@ mod tests {
         assert_eq!(a.output_port_type("embedding"), FlowDataType::Embedding);
         assert_eq!(a.output_port_type("other"), FlowDataType::Other);
         assert_eq!(a.output_port_type("unknown"), FlowDataType::Any);
+    }
+
+    fn audio_value() -> FlowValue {
+        FlowValue::Audio {
+            blob_ref: crate::flow_engine::blob_store::BlobRef {
+                id: "b1".into(),
+                sha256: "deadbeef".into(),
+                size_bytes: 4,
+                mime: "audio/wav".into(),
+            },
+            mime: "audio/wav".into(),
+            sample_rate: Some(16_000),
+        }
+    }
+
+    #[test]
+    fn text_payload_activates_only_text_port() {
+        let a = TriggerNodeAdapter::new();
+        let env = FlowEnvelope::with_payload(FlowValue::Text("hi".into()));
+        let ports = a.active_output_ports(&trigger_node(), &env).unwrap();
+        assert_eq!(ports, HashSet::from(["text".to_string()]));
+    }
+
+    #[test]
+    fn audio_payload_activates_only_audio_port() {
+        let a = TriggerNodeAdapter::new();
+        let env = FlowEnvelope::with_payload(audio_value());
+        let ports = a.active_output_ports(&trigger_node(), &env).unwrap();
+        assert_eq!(ports, HashSet::from(["audio".to_string()]));
+    }
+
+    #[test]
+    fn multimodal_seed_activates_port_per_modality() {
+        let a = TriggerNodeAdapter::new();
+        let mut env = FlowEnvelope::with_payload(FlowValue::Text("hi".into()));
+        env.artifacts.insert("input_0".into(), audio_value());
+        let ports = a.active_output_ports(&trigger_node(), &env).unwrap();
+        assert_eq!(
+            ports,
+            HashSet::from(["text".to_string(), "audio".to_string()])
+        );
+    }
+
+    #[test]
+    fn non_input_artifacts_do_not_activate_ports() {
+        let a = TriggerNodeAdapter::new();
+        let mut env = FlowEnvelope::with_payload(FlowValue::Text("hi".into()));
+        env.artifacts.insert("memory_hits".into(), audio_value());
+        let ports = a.active_output_ports(&trigger_node(), &env).unwrap();
+        assert_eq!(ports, HashSet::from(["text".to_string()]));
+    }
+
+    #[test]
+    fn empty_payload_does_not_gate_any_port() {
+        let a = TriggerNodeAdapter::new();
+        let env = FlowEnvelope::empty();
+        assert_eq!(a.active_output_ports(&trigger_node(), &env), None);
     }
 }
