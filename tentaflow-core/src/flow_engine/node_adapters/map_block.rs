@@ -245,8 +245,12 @@ impl NodeAdapter for MapNodeAdapter {
 
         for (index, item) in items.into_iter().enumerate() {
             // Honour cancel / deadline before scheduling more elements — an
-            // already-cancelled map must not keep spawning bodies.
-            if ctx.cancel_token.is_cancelled() || ctx.deadline.is_some_and(|d| Instant::now() >= d)
+            // already-cancelled map must not keep spawning bodies. Uses
+            // `effective_deadline` so a body that parked in `waiting_user`
+            // (ask_user / permission grant) and extended the shared deadline Arc
+            // is not aborted by the human-wait time it just added back (§3.13).
+            if ctx.cancel_token.is_cancelled()
+                || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
             {
                 join_set.abort_all();
                 return Err(anyhow!("map '{}': cancelled before completion", node.id));
@@ -287,8 +291,10 @@ impl NodeAdapter for MapNodeAdapter {
         let mut fail_fast_error: Option<String> = None;
 
         while let Some(joined) = join_set.join_next().await {
-            // Cancel / deadline aborts the rest in flight.
-            if ctx.cancel_token.is_cancelled() || ctx.deadline.is_some_and(|d| Instant::now() >= d)
+            // Cancel / deadline aborts the rest in flight (effective deadline —
+            // see the pre-spawn gate above).
+            if ctx.cancel_token.is_cancelled()
+                || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
             {
                 join_set.abort_all();
                 return Err(anyhow!("map '{}': cancelled mid-flight", node.id));

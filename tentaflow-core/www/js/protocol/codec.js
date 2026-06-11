@@ -2337,6 +2337,41 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::AgentsBody(RunCancelRequest) — UserSession. Cancels one live
+   * run (ACL: run principal or admin). payload: { runId }
+   */
+  agentRunCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentRunCancelRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::AgentsBody(RunEventsSubscribeRequest) — UserSession. Long-lived
+   * stream of AgentRunEvent frames for a scope. payload: { scopeKind:
+   * 'session'|'run', scopeId }. Use via ApiBinary.subscribe — the stream stays
+   * open until cancel/disconnect.
+   */
+  agentRunEventsSubscribeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentRunEventsSubscribeRequest(
+      String(payload.scopeKind ?? payload.scope_kind ?? 'session'),
+      String(payload.scopeId ?? payload.scope_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   syncConflictsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeSyncConflictsListRequest(

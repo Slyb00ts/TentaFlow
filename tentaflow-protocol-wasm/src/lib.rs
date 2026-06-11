@@ -1635,6 +1635,74 @@ pub fn encode_tools_catalog_request() -> Result<Vec<u8>, JsError> {
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeAgentRunReplyRequest)]
+pub fn encode_agent_run_reply_request(
+    run_id: String,
+    question_id: String,
+    answer: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunReplyRequest(
+            tentaflow_protocol::AgentRunReplyRequest {
+                run_id,
+                question_id,
+                answer,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentPermissionReplyRequest)]
+pub fn encode_agent_permission_reply_request(
+    run_id: String,
+    request_id: String,
+    decision: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::PermissionReplyRequest(
+            tentaflow_protocol::AgentPermissionReplyRequest {
+                run_id,
+                request_id,
+                decision,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentRunCancelRequest)]
+pub fn encode_agent_run_cancel_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunCancelRequest(
+            tentaflow_protocol::AgentRunCancelRequest { run_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// Subscribe to a run-events scope. `scope_kind` is "session" or "run";
+/// `scope_id` is the session id or run id respectively.
+#[wasm_bindgen(js_name = encodeAgentRunEventsSubscribeRequest)]
+pub fn encode_agent_run_events_subscribe_request(
+    scope_kind: String,
+    scope_id: String,
+) -> Result<Vec<u8>, JsError> {
+    let scope = match scope_kind.as_str() {
+        "session" => tentaflow_protocol::AgentRunEventScope::Session {
+            session_id: scope_id,
+        },
+        "run" => tentaflow_protocol::AgentRunEventScope::Run { run_id: scope_id },
+        _ => return Err(JsError::new("scope_kind must be 'session' or 'run'")),
+    };
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunEventsSubscribeRequest(
+            tentaflow_protocol::AgentRunEventsSubscribeRequest { scope },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 fn parse_sync_conflict_resolution(
     resolution: &str,
 ) -> Result<tentaflow_protocol::SyncConflictResolution, JsError> {
@@ -4142,6 +4210,86 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "ToolsCatalogResponse".into());
                 set(&obj, "toolsJson", resp.tools_json.clone().into());
                 set(&obj, "tools_json", resp.tools_json.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunReplyRequest(req) => {
+                set(&obj, "variant", "AgentRunReplyRequest".into());
+                set(&obj, "runId", req.run_id.clone().into());
+                set(&obj, "run_id", req.run_id.into());
+                set(&obj, "questionId", req.question_id.clone().into());
+                set(&obj, "question_id", req.question_id.into());
+                set(&obj, "answer", req.answer.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunReplyResponse(resp) => {
+                set(&obj, "variant", "AgentRunReplyResponse".into());
+                set(&obj, "delivered", resp.delivered.into());
+            }
+            tentaflow_protocol::AgentsPayload::PermissionReplyRequest(req) => {
+                set(&obj, "variant", "AgentPermissionReplyRequest".into());
+                set(&obj, "runId", req.run_id.clone().into());
+                set(&obj, "run_id", req.run_id.into());
+                set(&obj, "requestId", req.request_id.clone().into());
+                set(&obj, "request_id", req.request_id.into());
+                set(&obj, "decision", req.decision.into());
+            }
+            tentaflow_protocol::AgentsPayload::PermissionReplyResponse(resp) => {
+                set(&obj, "variant", "AgentPermissionReplyResponse".into());
+                set(&obj, "delivered", resp.delivered.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunCancelRequest(req) => {
+                set(&obj, "variant", "AgentRunCancelRequest".into());
+                set(&obj, "runId", req.run_id.clone().into());
+                set(&obj, "run_id", req.run_id.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunCancelResponse(resp) => {
+                set(&obj, "variant", "AgentRunCancelResponse".into());
+                set(&obj, "cancelled", resp.cancelled.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunEventsSubscribeRequest(req) => {
+                set(&obj, "variant", "AgentRunEventsSubscribeRequest".into());
+                let (kind, id) = match req.scope {
+                    tentaflow_protocol::AgentRunEventScope::Session { session_id } => {
+                        ("session", session_id)
+                    }
+                    tentaflow_protocol::AgentRunEventScope::Run { run_id } => ("run", run_id),
+                };
+                set(&obj, "scopeKind", kind.into());
+                set(&obj, "scope_kind", kind.into());
+                set(&obj, "scopeId", id.clone().into());
+                set(&obj, "scope_id", id.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunEvent(ev) => {
+                set(&obj, "variant", "AgentRunEvent".into());
+                set(&obj, "scope", ev.scope.into());
+                set(&obj, "kind", ev.kind.into());
+                set(&obj, "runId", ev.run_id.clone().into());
+                set(&obj, "run_id", ev.run_id.into());
+                set(&obj, "nodeId", ev.node_id.clone().into());
+                set(&obj, "node_id", ev.node_id.into());
+                set(&obj, "nodeType", ev.node_type.clone().into());
+                set(&obj, "node_type", ev.node_type.into());
+                set(&obj, "status", ev.status.into());
+                set(&obj, "name", ev.name.into());
+                set(&obj, "agent", ev.agent.into());
+                set(&obj, "n", ev.n.into());
+                set(&obj, "max", ev.max.into());
+                set(&obj, "index", ev.index.into());
+                set(&obj, "total", ev.total.into());
+                set(&obj, "selected", ev.selected.into());
+                set(&obj, "reason", ev.reason.into());
+                set(&obj, "interactionId", ev.interaction_id.clone().into());
+                set(&obj, "interaction_id", ev.interaction_id.into());
+                set(&obj, "question", ev.question.into());
+                let choices = js_sys::Array::new();
+                for c in ev.choices {
+                    choices.push(&JsValue::from_str(&c));
+                }
+                set(&obj, "choices", choices.into());
+                set(&obj, "addonId", ev.addon_id.clone().into());
+                set(&obj, "addon_id", ev.addon_id.into());
+                set(&obj, "toolName", ev.tool_name.clone().into());
+                set(&obj, "tool_name", ev.tool_name.into());
+                set(&obj, "permission", ev.permission.into());
+                set(&obj, "outcome", ev.outcome.into());
             }
         },
         MessageBody::SyncConflictBody(payload) => match payload {

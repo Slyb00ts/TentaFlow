@@ -36,6 +36,7 @@ pub mod metrics;
 pub mod recorder;
 pub mod resume_token;
 pub mod role_catalog;
+pub mod run_events;
 pub mod state;
 pub mod stream;
 pub mod stream_handlers;
@@ -544,6 +545,20 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::AgentsPayload::RunDetailResponse(_) => "AgentRunDetailResponse",
             tentaflow_protocol::AgentsPayload::ToolsCatalogRequest(_) => "ToolsCatalogRequest",
             tentaflow_protocol::AgentsPayload::ToolsCatalogResponse(_) => "ToolsCatalogResponse",
+            tentaflow_protocol::AgentsPayload::RunReplyRequest(_) => "AgentRunReplyRequest",
+            tentaflow_protocol::AgentsPayload::RunReplyResponse(_) => "AgentRunReplyResponse",
+            tentaflow_protocol::AgentsPayload::PermissionReplyRequest(_) => {
+                "AgentPermissionReplyRequest"
+            }
+            tentaflow_protocol::AgentsPayload::PermissionReplyResponse(_) => {
+                "AgentPermissionReplyResponse"
+            }
+            tentaflow_protocol::AgentsPayload::RunCancelRequest(_) => "AgentRunCancelRequest",
+            tentaflow_protocol::AgentsPayload::RunCancelResponse(_) => "AgentRunCancelResponse",
+            tentaflow_protocol::AgentsPayload::RunEventsSubscribeRequest(_) => {
+                "AgentRunEventsSubscribeRequest"
+            }
+            tentaflow_protocol::AgentsPayload::RunEvent(_) => "AgentRunEvent",
         },
         MessageBody::SyncConflictBody(p) => match p {
             tentaflow_protocol::SyncConflictPayload::ListRequest(_) => "SyncConflictsListRequest",
@@ -1722,10 +1737,19 @@ mod tests {
             other => panic!("expected ListResponse, got {:?}", other),
         };
         let rows: serde_json::Value = serde_json::from_str(&agents_json).unwrap();
-        assert_eq!(rows.as_array().unwrap().len(), 1);
-        assert_eq!(rows[0]["name"], "researcher");
+        // The list also contains the seeded system `general` agent (§3.8), so
+        // assert the upserted researcher is present rather than the exact count.
+        let researcher = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "researcher")
+            .expect("researcher in list");
         // The list summary preloads the tools_json the editor needs.
-        assert!(rows[0]["tools_json"].as_str().unwrap().contains("memory.memory_store"));
+        assert!(researcher["tools_json"]
+            .as_str()
+            .unwrap()
+            .contains("memory.memory_store"));
 
         let detail = MessageBody::AgentsBody(AgentsPayload::DetailRequest(AgentsDetailRequest {
             agent_id: agent_id.clone(),
@@ -1883,6 +1907,108 @@ mod tests {
         match resp {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotFound),
             other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_reply_delivers_for_owner_and_is_acl_gated() {
+        use tentaflow_protocol::{AgentPermissionReplyRequest, AgentRunReplyRequest, AgentsPayload};
+        let state = state::AppState::for_test();
+        let owner_bytes = [42u8; 16];
+        let owner = uuid::Uuid::from_bytes(owner_bytes).to_string();
+        let params = crate::db::models::AgentParams {
+            id: "agent-r",
+            name: "asker",
+            display_name: None,
+            description: "asks",
+            system_prompt: None,
+            model: None,
+            tools_json: "[]",
+            skills_json: "{}",
+            params_json: "{}",
+            max_iterations: 25,
+            timeout_secs: 600,
+            max_subagents: 0,
+            max_spawn_depth: 1,
+            flow_id: None,
+            routable: true,
+            is_enabled: true,
+            actor_user_id: None,
+        };
+        crate::db::repository::upsert_agent(&state.db, &params).unwrap();
+        crate::db::repository::create_agent_run(
+            &state.db,
+            &crate::db::models::NewAgentRun {
+                id: "run-ask",
+                agent_id: "agent-r",
+                parent_run_id: None,
+                flow_execution_id: None,
+                user_id: Some(&owner),
+                org_id: None,
+                prompt: "p",
+            },
+        )
+        .unwrap();
+
+        // Register a pending question for that run.
+        let reg = crate::agents::interaction_registry_global();
+        let _rx = reg.register(crate::agents::PendingInteraction {
+            id: "q-1".into(),
+            run_id: "run-ask".into(),
+            parent_run_id: None,
+            kind: crate::agents::InteractionKind::Question,
+            prompt: "which?".into(),
+            choices: vec!["a".into()],
+            addon_id: None,
+            tool_name: None,
+            permission: None,
+            raised_at_ms: crate::agents::interaction_now_ms(),
+        });
+
+        // A stranger may not answer it — NotFound (no existence leak).
+        let stranger = agents_ctx("user", [7u8; 16], state.clone());
+        let strange_req = MessageBody::AgentsBody(AgentsPayload::RunReplyRequest(
+            AgentRunReplyRequest {
+                run_id: "run-ask".into(),
+                question_id: "q-1".into(),
+                answer: "a".into(),
+            },
+        ));
+        let (_resp, is_err) = dispatch(&strange_req, &stranger).await;
+        assert!(is_err, "stranger must be denied");
+
+        // The owner's reply is delivered.
+        let owner_ctx = agents_ctx("user", owner_bytes, state.clone());
+        let owner_req = MessageBody::AgentsBody(AgentsPayload::RunReplyRequest(
+            AgentRunReplyRequest {
+                run_id: "run-ask".into(),
+                question_id: "q-1".into(),
+                answer: "a".into(),
+            },
+        ));
+        let (resp, is_err) = dispatch(&owner_req, &owner_ctx).await;
+        assert!(!is_err);
+        match resp {
+            MessageBody::AgentsBody(AgentsPayload::RunReplyResponse(r)) => assert!(r.delivered),
+            other => panic!("expected RunReplyResponse, got {:?}", other),
+        }
+
+        // A permission reply for a question interaction does not match → not
+        // delivered (kind guard), but the handler still succeeds.
+        let perm_req = MessageBody::AgentsBody(AgentsPayload::PermissionReplyRequest(
+            AgentPermissionReplyRequest {
+                run_id: "run-ask".into(),
+                request_id: "q-1".into(),
+                decision: "deny".into(),
+            },
+        ));
+        let (resp, is_err) = dispatch(&perm_req, &owner_ctx).await;
+        assert!(!is_err);
+        match resp {
+            MessageBody::AgentsBody(AgentsPayload::PermissionReplyResponse(r)) => {
+                assert!(!r.delivered, "already-answered question must not deliver")
+            }
+            other => panic!("expected PermissionReplyResponse, got {:?}", other),
         }
     }
 

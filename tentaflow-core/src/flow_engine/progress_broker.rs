@@ -38,13 +38,47 @@ const SCOPE_CHANNEL_CAPACITY: usize = 256;
 /// subscriber goes away AND no fresh event arrives — see `prune_if_idle`.
 pub struct ProgressBroker {
     scopes: DashMap<String, broadcast::Sender<ProgressEvent>>,
+    /// §3.3 ACL — server-side binding of a session-scope key to the principal
+    /// that started the flow under it. A `Session` event scope is the
+    /// client-minted conversation id (low entropy, time-correlated); it MUST
+    /// NOT double as an authorization token. The dispatch layer records the
+    /// owner here when a foreground flow starts, and `authorize_scope` rejects a
+    /// `Session` subscription whose key is unbound or owned by a different
+    /// principal (admin bypass). Without this, any authenticated user could
+    /// guess/observe another user's session id and read their harness activity
+    /// (UserQuestion / PermissionRequest / RouterDecision) — cross-principal
+    /// leak (OWASP A01).
+    session_owners: DashMap<String, String>,
 }
 
 impl ProgressBroker {
     pub fn new() -> Self {
         Self {
             scopes: DashMap::new(),
+            session_owners: DashMap::new(),
         }
+    }
+
+    /// Binds a session-scope key to the principal that started a flow under it.
+    /// Called from the foreground dispatch path with the authenticated
+    /// `user_id`. Idempotent re-binding to the same owner is a no-op; a session
+    /// id is owned by the first principal to claim it, so a second principal
+    /// cannot hijack an in-flight session scope by re-dispatching under the same
+    /// id (the binding is only cleared by `release_session_owner`).
+    pub fn bind_session_owner(&self, session_id: &str, user_id: &str) {
+        if session_id.is_empty() || user_id.is_empty() {
+            return;
+        }
+        self.session_owners
+            .entry(session_id.to_string())
+            .or_insert_with(|| user_id.to_string());
+    }
+
+    /// Returns the principal that owns a session-scope key, if bound.
+    pub fn session_owner(&self, session_id: &str) -> Option<String> {
+        self.session_owners
+            .get(session_id)
+            .map(|o| o.value().clone())
     }
 
     /// Subscribe to a scope's progress stream. Creates the channel if absent so
@@ -163,6 +197,21 @@ mod tests {
             },
         );
         assert_eq!(broker.subscriber_count("session-2"), 0);
+    }
+
+    #[test]
+    fn session_owner_binds_first_principal_and_rejects_hijack() {
+        let broker = ProgressBroker::new();
+        assert_eq!(broker.session_owner("s1"), None);
+        broker.bind_session_owner("s1", "user-a");
+        assert_eq!(broker.session_owner("s1").as_deref(), Some("user-a"));
+        // A second principal cannot steal an in-flight session scope.
+        broker.bind_session_owner("s1", "user-b");
+        assert_eq!(broker.session_owner("s1").as_deref(), Some("user-a"));
+        // Empty inputs never create a binding.
+        broker.bind_session_owner("", "user-c");
+        broker.bind_session_owner("s2", "");
+        assert_eq!(broker.session_owner("s2"), None);
     }
 
     #[tokio::test]

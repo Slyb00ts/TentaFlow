@@ -1242,4 +1242,49 @@ mod tests {
             FlowValidationError::ConditionEdgeFromNonCondition { .. }
         ));
     }
+
+    /// §3.11 B — R7 accepts the three harness stream producers (subflow / loop /
+    /// agent), proving the harness streaming topology validates: Agent Run's
+    /// `loop` → output(stream), and Harness's `subflow` → output(stream). The
+    /// full registry registers all three as stream producers; a flow wiring
+    /// their `stream` port must validate AND resolve as the stream producer.
+    #[test]
+    fn r7_accepts_harness_stream_producers() {
+        use crate::flow_engine::cache::CompiledFlow;
+        use crate::flow_engine::dispatcher::build_registry_for_test;
+
+        let reg = build_registry_for_test();
+        // (node_type, config-key for the body/flow/agent id) — validation does
+        // not dereference these ids, only checks the streaming topology.
+        for (producer, cfg) in [
+            ("subflow", r#"{"flow_id":"any-id"}"#),
+            ("loop", r#"{"body_flow_id":"any-id"}"#),
+            ("agent", r#"{"agent_id":"any-id"}"#),
+        ] {
+            let flow_json = format!(
+                r#"{{
+                    "nodes":[
+                        {{"id":"t","type":"trigger","config":{{}}}},
+                        {{"id":"p","type":"{producer}","config":{cfg}}},
+                        {{"id":"o","type":"output","config":{{"mode":"stream"}}}}
+                    ],
+                    "edges":[
+                        {{"from":"t","to":"p","from_port":"text","to_port":"in"}},
+                        {{"from":"p","to":"o","from_port":"stream","to_port":"text"}}
+                    ]
+                }}"#
+            );
+            let def = parse(&flow_json);
+            validate(&def, &reg)
+                .unwrap_or_else(|e| panic!("R7 rejected {producer} stream producer: {e:?}"));
+            // And the compiler resolves the block as the flow's stream producer.
+            let cf = CompiledFlow::from_json("0", &flow_json, &reg)
+                .unwrap_or_else(|e| panic!("compile {producer}: {e:?}"));
+            assert!(cf.is_streaming, "{producer} flow must be streaming");
+            assert!(
+                cf.stream_producer_run_idx(&reg).is_some(),
+                "{producer} must resolve as the stream producer"
+            );
+        }
+    }
 }

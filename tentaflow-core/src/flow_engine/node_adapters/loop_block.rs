@@ -19,13 +19,16 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use serde_json::Value;
 
 use crate::flow_engine::dispatchers::ProgressEvent;
-use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
+use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::expr::{evaluate_bool, ExprScope};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
-use crate::flow_engine::subflow_runner::{SubflowRunnerSlot, MAX_SUBFLOW_DEPTH};
+use crate::flow_engine::node_adapter::{
+    ExecutionContext, NodeAdapter, PortSpec, StreamProducerAdapter,
+};
+use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot, MAX_SUBFLOW_DEPTH};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "loop";
@@ -125,34 +128,18 @@ impl LoopNodeAdapter {
         };
         evaluate_bool(expr, &scope, None).map_err(|e| anyhow!("loop until: {e}"))
     }
-}
 
-#[async_trait]
-impl NodeAdapter for LoopNodeAdapter {
-    fn node_type(&self) -> &str {
-        NODE_TYPE
-    }
-    fn input_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("in", FlowDataType::Any)]
-    }
-    fn output_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("full", FlowDataType::Any)]
-    }
-
-    async fn execute(
+    /// Runs the guards (depth + cycle) shared by `execute` and `produce_stream`,
+    /// resolves the runner, and returns the resolved loop plan + seed envelope.
+    fn prepare(
         &self,
         node: &FlowNode,
         inputs: &[NodeInput],
         ctx: &ExecutionContext,
-    ) -> Result<FlowEnvelope> {
+    ) -> Result<(std::sync::Arc<SubflowRunner>, LoopPlan, FlowEnvelope)> {
         let body_flow_id = Self::body_flow_id(node)?;
 
-        // Same recursion guards as `subflow` (§3.10): a body running at depth+1
-        // must not exceed the cap, and the body flow id must not already be on
-        // the call path. Sequential repetition of the same body is legal — the
-        // visited set tracks nesting depth of distinct flows, not repeat count,
-        // because the runner pushes the body id once and the loop reuses the
-        // same depth-incremented child context for every iteration.
+        // Same recursion guards as `subflow` (§3.10).
         if ctx.subflow_depth >= MAX_SUBFLOW_DEPTH {
             return Err(anyhow!(
                 "loop: max nesting depth {MAX_SUBFLOW_DEPTH} reached (body flow '{body_flow_id}')"
@@ -170,42 +157,63 @@ impl NodeAdapter for LoopNodeAdapter {
             .clone()
             .ok_or_else(|| anyhow!("loop: SubflowRunner slot not wired"))?;
 
-        let until = Self::until_expr(node);
-        let final_pass = Self::final_pass_enabled(node);
-
         // The current envelope seeds iteration 0; each iteration's output feeds
         // the next. Built from the incoming input (falls back to the initial
         // envelope for a triggerless test harness).
-        let mut current: FlowEnvelope = inputs
+        let seed: FlowEnvelope = inputs
             .first()
             .map(|i| (*i.envelope).clone())
             .unwrap_or_else(|| (*ctx.initial_envelope).clone());
 
-        // Budget is resolved against the seed envelope (agent_context has
-        // already stamped meta.loop_max_iterations by the time the loop runs).
-        let max_iterations = Self::max_iterations(node, &current);
+        let plan = LoopPlan {
+            body_flow_id,
+            until: Self::until_expr(node),
+            final_pass: Self::final_pass_enabled(node),
+            // Budget is resolved against the seed envelope (agent_context has
+            // already stamped meta.loop_max_iterations by the time the loop runs).
+            max_iterations: Self::max_iterations(node, &seed),
+        };
+        Ok((runner, plan, seed))
+    }
 
+    /// Runs the budgeted blocking iterations: the body executes repeatedly (the
+    /// output of iteration N is the input of N+1) until `until` turns true, the
+    /// budget is exhausted, or cancel/deadline fires. Each iteration runs in
+    /// light mode (no per-iteration flow_executions row) and drives the agent's
+    /// tool-calling turn. Returns the final envelope, the iteration count, and
+    /// the exit reason. Shared by `execute` (blocking) and `produce_stream`
+    /// (streaming): the streaming path runs these intermediate tool-calling
+    /// iterations blocking FIRST, then streams only the final iteration.
+    async fn run_budgeted_iterations(
+        runner: &SubflowRunner,
+        plan: &LoopPlan,
+        node: &FlowNode,
+        ctx: &ExecutionContext,
+        mut current: FlowEnvelope,
+    ) -> Result<(FlowEnvelope, u32, &'static str)> {
         let mut iterations: u32 = 0;
-
-        // The loop yields its exit reason — every break path supplies one, so
-        // there is no dead pre-initialized sentinel.
         let exit_reason: &str = loop {
-            // Cancel / deadline checked before each iteration — a long agent
-            // loop must honour a client disconnect or the flow deadline without
+            // Cancel / deadline checked before each iteration — a long agent loop
+            // must honour a client disconnect or the flow deadline without
             // waiting for the body to finish first.
             if ctx.cancel_token.is_cancelled() {
                 break "cancelled";
             }
-            if ctx.deadline.is_some_and(|d| Instant::now() >= d) {
+            // Iteration gating must honour the human-wait extension: a turn that
+            // parked in `waiting_user` (ask_user / permission grant inside the
+            // body's tool_exec) extends the SHARED deadline Arc, so the loop
+            // driver reads `effective_deadline`, never the bare `deadline` —
+            // otherwise the next iteration boundary would abort a run that the
+            // §3.13 extension just kept alive.
+            if ctx.effective_deadline().is_some_and(|d| Instant::now() >= d) {
                 break "cancelled";
             }
-
             // Exit-on-until is checked at the top so an already-satisfied
             // condition on entry runs zero body iterations.
-            if Self::until_true(&until, &current, iterations)? {
+            if Self::until_true(&plan.until, &current, iterations)? {
                 break "until";
             }
-            if iterations >= max_iterations {
+            if iterations >= plan.max_iterations {
                 break "max_iterations";
             }
 
@@ -214,21 +222,15 @@ impl NodeAdapter for LoopNodeAdapter {
                 ProgressEvent::IterationStarted {
                     node_id: node.id.clone(),
                     n: iterations + 1,
-                    max: max_iterations,
+                    max: plan.max_iterations,
                 },
             );
-
-            // Light-mode body run (§3.5 block 1): the runner skips the
-            // per-iteration flow_executions row, so 25 iterations never spam the
-            // table; the body shares the parent agent run's accounting via the
-            // agent_runs log instead.
             let next = runner
-                .run(&body_flow_id, current, ctx, 1, true)
+                .run(&plan.body_flow_id, current, ctx, 1, true)
                 .await
                 .map_err(|e| anyhow!("loop iteration {}: {e}", iterations + 1))?;
             current = next;
             iterations += 1;
-
             ctx.progress.emit(
                 &ctx.progress_scope,
                 ProgressEvent::IterationFinished {
@@ -237,15 +239,60 @@ impl NodeAdapter for LoopNodeAdapter {
                 },
             );
         };
+        Ok((current, iterations, exit_reason))
+    }
+}
+
+/// Resolved loop configuration, computed once in `prepare` and reused by the
+/// blocking and streaming iteration drivers.
+struct LoopPlan {
+    body_flow_id: String,
+    until: String,
+    final_pass: bool,
+    max_iterations: u32,
+}
+
+#[async_trait]
+impl NodeAdapter for LoopNodeAdapter {
+    fn node_type(&self) -> &str {
+        NODE_TYPE
+    }
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Any)]
+    }
+    fn output_ports(&self) -> Vec<PortSpec> {
+        // `full` is the blocking loop result; `stream` (§3.11 B) forwards the
+        // final iteration's stream and makes this block the parent's stream
+        // producer (R7). This is the harness final-answer path.
+        vec![
+            PortSpec::new("full", FlowDataType::Any),
+            PortSpec::new("stream", FlowDataType::Any),
+        ]
+    }
+
+    async fn execute(
+        &self,
+        node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<FlowEnvelope> {
+        // The recursion guards, runner, resolved plan and seed envelope are
+        // shared with `produce_stream` (§3.5 block 1, §3.10). Sequential
+        // repetition of the same body is legal — the visited set tracks nesting
+        // depth of distinct flows, not repeat count.
+        let (runner, plan, seed) = self.prepare(node, inputs, ctx)?;
+
+        let (mut current, mut iterations, exit_reason) =
+            Self::run_budgeted_iterations(&runner, &plan, node, ctx, seed).await?;
 
         // Grace summary (§1.1): one extra body iteration with
         // meta.loop_final_pass=true so the body's llm block drops tools and asks
         // the model to summarise. Only after budget exhaustion (not on `until`
         // / `cancelled`), and not when cancel/deadline already fired.
-        if final_pass
+        if plan.final_pass
             && exit_reason == "max_iterations"
             && !ctx.cancel_token.is_cancelled()
-            && !ctx.deadline.is_some_and(|d| Instant::now() >= d)
+            && !ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
         {
             current
                 .meta
@@ -255,11 +302,11 @@ impl NodeAdapter for LoopNodeAdapter {
                 ProgressEvent::IterationStarted {
                     node_id: node.id.clone(),
                     n: iterations + 1,
-                    max: max_iterations,
+                    max: plan.max_iterations,
                 },
             );
             current = runner
-                .run(&body_flow_id, current, ctx, 1, true)
+                .run(&plan.body_flow_id, current, ctx, 1, true)
                 .await
                 .map_err(|e| anyhow!("loop final pass: {e}"))?;
             iterations += 1;
@@ -276,7 +323,7 @@ impl NodeAdapter for LoopNodeAdapter {
             // surface — the loop chose "max_iterations" before the pass, so
             // re-check here and convert to the cancelled error path below.
             if ctx.cancel_token.is_cancelled()
-                || ctx.deadline.is_some_and(|d| Instant::now() >= d)
+                || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
             {
                 return Err(anyhow!(
                     "loop '{}': cancelled during final pass after {iterations} iteration(s)",
@@ -310,6 +357,103 @@ impl NodeAdapter for LoopNodeAdapter {
     }
 }
 
+/// Wraps an already-computed envelope's text payload as a terminal one-shot
+/// stream: one text delta carrying the final answer, then a finish delta. Used
+/// by the streaming path when the loop already holds the final answer (the body
+/// finished via `until`, or the budget ran out with no grace pass) so it does
+/// NOT issue a redundant extra LLM call — that would double-bill and could
+/// diverge from the answer the blocking iterations already produced.
+fn terminal_stream_from(envelope: &FlowEnvelope) -> BoxStream<'static, Result<EnvelopeDelta>> {
+    use crate::flow_engine::envelope::{FinishReason, LlmStreamChunk};
+    use futures::StreamExt;
+    let text = envelope.payload.as_text().unwrap_or_default().to_string();
+    let deltas = vec![
+        Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+            text_delta: text,
+            ..Default::default()
+        })),
+        Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+            finish_reason: Some(FinishReason::Stop),
+            ..Default::default()
+        })),
+    ];
+    futures::stream::iter(deltas).boxed()
+}
+
+/// §3.11 B — the harness stream path. When a flow wires this block's `stream`
+/// output port, the loop is the parent's stream producer.
+///
+/// Control flow (SCOPE item 5 — `max_iterations` + cancel/deadline are still
+/// honoured; this mirrors `execute` exactly so the streamed answer never differs
+/// from the blocking one):
+///   1. The intermediate tool-calling iterations run BLOCKING via
+///      `run_budgeted_iterations` — exactly as `execute` would — until `until`
+///      turns true, the budget is exhausted, or cancel/deadline fires. These
+///      drive the agent's tool calls and MUST complete before any streaming.
+///   2a. `until`: the body's `tool_exec` already produced the final no-tool
+///      answer (it is in `current.payload`). It is forwarded as a terminal
+///      stream — NO extra LLM call. Issuing a fresh streaming pass here would
+///      re-answer a turn that already finished, doubling the model cost and
+///      risking a streamed summary that diverges from the computed answer.
+///   2b. `max_iterations` WITH `final_pass`: one FINAL body iteration runs
+///      STREAMING with `meta.loop_final_pass=true`, so the body's `llm` block
+///      drops tools (deterministic — `pick_tools` returns empty on the final
+///      pass) and produces the streaming grace summary (§1.1). This is the only
+///      case that streams a fresh pass, matching `execute`'s grace-summary gate.
+///   2c. `max_iterations` WITHOUT `final_pass`: the budget ran out; the last
+///      computed envelope is the answer, forwarded as a terminal stream.
+/// A loop that exited blocking for `cancelled` does NOT run a streaming final
+/// pass — the cancel surfaces as a producer error so the executor aborts.
+#[async_trait]
+impl StreamProducerAdapter for LoopNodeAdapter {
+    async fn produce_stream(
+        &self,
+        node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+        let (runner, plan, seed) = self.prepare(node, inputs, ctx)?;
+
+        // Step 1: run intermediate tool-calling iterations blocking.
+        let (mut current, iterations, exit_reason) =
+            Self::run_budgeted_iterations(&runner, &plan, node, ctx, seed).await?;
+
+        if exit_reason == "cancelled" {
+            return Err(anyhow!(
+                "loop '{}': cancelled after {iterations} iteration(s)",
+                node.id
+            ));
+        }
+
+        // The grace-summary streaming pass runs ONLY when the budget was
+        // exhausted AND final_pass is configured — identical gate to `execute`.
+        // Every other terminal state already holds the final answer.
+        if exit_reason != "max_iterations" || !plan.final_pass {
+            return Ok(terminal_stream_from(&current));
+        }
+
+        // Grace summary: drop tools via loop_final_pass so the model produces a
+        // clean streaming answer instead of another tool call, then forward the
+        // body's stream.
+        current
+            .meta
+            .insert("loop_final_pass".into(), Value::Bool(true));
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            ProgressEvent::IterationStarted {
+                node_id: node.id.clone(),
+                n: iterations + 1,
+                max: plan.max_iterations,
+            },
+        );
+        let exec = runner
+            .run_streaming(&plan.body_flow_id, current, ctx, 1, true)
+            .await
+            .map_err(|e| anyhow!("loop final stream pass: {e}"))?;
+        Ok(exec.stream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,18 +479,6 @@ mod tests {
             rusqlite::params![id, name, flow_json, status],
         )
         .expect("insert flow");
-    }
-
-    /// Body flow: trigger → tool_exec-style stand-in is not available here, so
-    /// the body is a passthrough that bumps an iteration counter in meta and
-    /// flips harness_done once it reaches the configured stop count. We model
-    /// that with a tiny custom adapter registered in a bespoke registry below.
-    fn registry_and_runner(pool: DbPool) -> (Arc<AdapterRegistry>, SubflowRunnerSlot) {
-        let registry = Arc::new(build_registry_for_test());
-        let slot: SubflowRunnerSlot = Arc::new(parking_lot::RwLock::new(None));
-        let runner = Arc::new(SubflowRunner::new(pool, Arc::downgrade(&registry)));
-        *slot.write() = Some(runner);
-        (registry, slot)
     }
 
     /// Counter body flow: a `loop_test_body` node increments meta.iter and sets
@@ -722,5 +854,283 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("slot not wired"), "{err}");
+    }
+
+    /// Streaming-capable counter body (§3.11 B test double). Its `execute`
+    /// (blocking path, run for intermediate tool-calling iterations) bumps a
+    /// counter and sets harness_done at `stop_at`; its `produce_stream` (final
+    /// pass) emits a two-chunk delta stream tagged with the iteration count so a
+    /// test can assert which iteration streamed.
+    struct StreamingCounterBodyAdapter {
+        stop_at: i64,
+    }
+
+    #[async_trait]
+    impl NodeAdapter for StreamingCounterBodyAdapter {
+        fn node_type(&self) -> &str {
+            "loop_test_stream_body"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Text)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![
+                PortSpec::new("stream", FlowDataType::Text),
+                PortSpec::new("full", FlowDataType::Text),
+            ]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            let mut env = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+            let n = env.meta.get("iter").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+            env.meta.insert("iter".into(), Value::from(n));
+            if n >= self.stop_at {
+                env.meta.insert("harness_done".into(), Value::Bool(true));
+            }
+            env.payload = FlowValue::Text(format!("iter {n}"));
+            Ok(env)
+        }
+    }
+
+    #[async_trait]
+    impl StreamProducerAdapter for StreamingCounterBodyAdapter {
+        async fn produce_stream(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+            use crate::flow_engine::envelope::{FinishReason, LlmStreamChunk};
+            use futures::StreamExt;
+            let env = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+            let iter = env.meta.get("iter").and_then(|v| v.as_i64()).unwrap_or(0);
+            // Final pass means tools are dropped — assert the harness signalled it.
+            let final_pass = env
+                .meta
+                .get("loop_final_pass")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let first = LlmStreamChunk {
+                text_delta: format!("final-answer iter={iter} final_pass={final_pass}"),
+                ..Default::default()
+            };
+            let last = LlmStreamChunk {
+                finish_reason: Some(FinishReason::Stop),
+                ..Default::default()
+            };
+            Ok(futures::stream::iter(vec![
+                Ok(EnvelopeDelta::Llm(first)),
+                Ok(EnvelopeDelta::Llm(last)),
+            ])
+            .boxed())
+        }
+    }
+
+    /// Streaming body flow: trigger → loop_test_stream_body → output(stream).
+    /// Blocking iterations drive the counter; the final pass streams.
+    fn stream_body_json() -> String {
+        json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "b", "type": "loop_test_stream_body", "config": {}},
+                {"id": "o", "type": "output", "config": {"mode": "stream"}}
+            ],
+            "edges": [
+                {"from": "t", "from_port": "text", "to": "b", "to_port": "in"},
+                {"from": "b", "from_port": "stream", "to": "o", "to_port": "text"}
+            ]
+        })
+        .to_string()
+    }
+
+    fn stream_registry_and_runner(
+        pool: DbPool,
+        stop_at: i64,
+    ) -> (Arc<AdapterRegistry>, SubflowRunnerSlot) {
+        let mut registry = build_registry_for_test();
+        registry.register_stream_producer(Arc::new(StreamingCounterBodyAdapter { stop_at }));
+        let registry = Arc::new(registry);
+        let slot: SubflowRunnerSlot = Arc::new(parking_lot::RwLock::new(None));
+        let runner = Arc::new(SubflowRunner::new(pool, Arc::downgrade(&registry)));
+        *slot.write() = Some(runner);
+        (registry, slot)
+    }
+
+    async fn collect_stream(
+        stream: BoxStream<'static, Result<EnvelopeDelta>>,
+    ) -> (String, bool) {
+        use crate::flow_engine::envelope::FinishReason;
+        use futures::StreamExt;
+        let mut text = String::new();
+        let mut saw_finish = false;
+        let mut s = stream;
+        while let Some(item) = s.next().await {
+            if let EnvelopeDelta::Llm(c) = item.expect("delta ok") {
+                text.push_str(&c.text_delta);
+                if c.finish_reason == Some(FinishReason::Stop) {
+                    saw_finish = true;
+                }
+            }
+        }
+        (text, saw_finish)
+    }
+
+    /// §3.11 B — a loop that finished via `until` already holds the final
+    /// answer; `produce_stream` forwards THAT payload as a terminal stream and
+    /// MUST NOT issue a fresh streaming pass (that would re-answer a finished
+    /// turn, doubling cost and risking divergence). The body sets harness_done
+    /// at iter 1, so the loop runs one blocking iteration (payload "iter 1"),
+    /// exits `until`, and the stream is the computed answer — not the body's
+    /// streaming-pass marker.
+    #[tokio::test]
+    async fn produce_stream_forwards_computed_answer_on_until() {
+        let pool = db();
+        let body_id = "aaaa0000-loop-strm-0000-000000000001";
+        insert_flow(&pool, body_id, "stream-body", &stream_body_json(), "active");
+        // Body flips harness_done at iter 1 → loop exits `until` after one
+        // blocking iteration; no streaming grace pass.
+        let (_registry, slot) = stream_registry_and_runner(pool.clone(), 1);
+
+        let stream = LoopNodeAdapter::new(slot)
+            .produce_stream(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 10})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("produce_stream");
+
+        let (text, saw_finish) = collect_stream(stream).await;
+        // The forwarded answer is the blocking iteration's payload, NOT the
+        // streaming body's "final-answer ..." marker (which only appears when a
+        // fresh streaming pass runs).
+        assert_eq!(text, "iter 1", "expected forwarded computed answer: {text:?}");
+        assert!(
+            !text.contains("final-answer"),
+            "until exit must not run a streaming pass: {text:?}"
+        );
+        assert!(saw_finish, "client never got finish_reason=Stop");
+    }
+
+    /// Finding 3 — a loop that finished via `until` after multiple tool-calling
+    /// turns still forwards the computed answer, never a fresh streaming pass.
+    /// The body sets harness_done at iter 3 → 3 blocking iterations, payload
+    /// "iter 3", terminal stream.
+    #[tokio::test]
+    async fn multi_iteration_until_forwards_computed_answer() {
+        let pool = db();
+        let body_id = "bbbb0000-loop-strm-0000-000000000001";
+        insert_flow(&pool, body_id, "stream-body", &stream_body_json(), "active");
+        let (_registry, slot) = stream_registry_and_runner(pool.clone(), 3);
+
+        let stream = LoopNodeAdapter::new(slot)
+            .produce_stream(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 10})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("produce_stream");
+
+        let (text, saw_finish) = collect_stream(stream).await;
+        assert_eq!(text, "iter 3", "expected forwarded computed answer: {text:?}");
+        assert!(
+            !text.contains("final-answer"),
+            "until exit must not run a streaming pass: {text:?}"
+        );
+        assert!(saw_finish, "client never got finish_reason=Stop");
+    }
+
+    /// Finding 3 — the streaming grace pass runs ONLY on `max_iterations` with
+    /// `final_pass=true`, matching `execute`. The body never sets harness_done,
+    /// so the loop exhausts its 2-iteration budget, then streams one final pass
+    /// (loop_final_pass=true, tools dropped) via the streaming body.
+    #[tokio::test]
+    async fn produce_stream_runs_grace_pass_on_budget_with_final_pass() {
+        let pool = db();
+        let body_id = "dddd0000-loop-strm-0000-000000000001";
+        insert_flow(&pool, body_id, "stream-body", &stream_body_json(), "active");
+        // Body never stops on its own → budget exhausted at max_iterations.
+        let (_registry, slot) = stream_registry_and_runner(pool.clone(), 1000);
+
+        let stream = LoopNodeAdapter::new(slot)
+            .produce_stream(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 2, "final_pass": true})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("produce_stream");
+
+        let (text, saw_finish) = collect_stream(stream).await;
+        // 2 blocking iterations ran; the streaming grace pass then carries
+        // iter=2 (the last blocking iteration's count) and loop_final_pass=true.
+        assert!(text.contains("final-answer"), "grace pass must stream: {text:?}");
+        assert!(text.contains("iter=2"), "expected grace pass on iter 2: {text:?}");
+        assert!(text.contains("final_pass=true"), "stream text: {text:?}");
+        assert!(saw_finish, "client never got finish_reason=Stop");
+    }
+
+    /// Finding 3 — budget exhausted WITHOUT final_pass forwards the last
+    /// computed envelope as a terminal stream, no fresh LLM call (mirrors
+    /// `execute`, which does not run a grace pass when final_pass is off).
+    #[tokio::test]
+    async fn produce_stream_forwards_answer_on_budget_without_final_pass() {
+        let pool = db();
+        let body_id = "eeee0000-loop-strm-0000-000000000001";
+        insert_flow(&pool, body_id, "stream-body", &stream_body_json(), "active");
+        let (_registry, slot) = stream_registry_and_runner(pool.clone(), 1000);
+
+        let stream = LoopNodeAdapter::new(slot)
+            .produce_stream(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 2})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("produce_stream");
+
+        let (text, saw_finish) = collect_stream(stream).await;
+        assert_eq!(text, "iter 2", "expected forwarded computed answer: {text:?}");
+        assert!(
+            !text.contains("final-answer"),
+            "no final_pass must not run a streaming pass: {text:?}"
+        );
+        assert!(saw_finish, "client never got finish_reason=Stop");
+    }
+
+    /// SCOPE item 5 — a cancelled loop never streams a final pass; the cancel
+    /// surfaces as a producer error so the executor aborts the flow.
+    #[tokio::test]
+    async fn cancelled_loop_produce_stream_is_error() {
+        let pool = db();
+        let body_id = "cccc0000-loop-strm-0000-000000000001";
+        insert_flow(&pool, body_id, "stream-body", &stream_body_json(), "active");
+        let (_registry, slot) = stream_registry_and_runner(pool.clone(), 1000);
+
+        let ctx = stub_ctx();
+        ctx.cancel_token.cancel();
+        let result = LoopNodeAdapter::new(slot)
+            .produce_stream(
+                &node(json!({"body_flow_id": body_id, "max_iterations": 10})),
+                &[input(FlowEnvelope::empty())],
+                &ctx,
+            )
+            .await;
+        let err = match result {
+            Ok(_) => panic!("cancelled loop must not produce a stream"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("cancelled"), "{err}");
     }
 }

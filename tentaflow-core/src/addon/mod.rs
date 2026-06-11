@@ -1925,22 +1925,51 @@ impl AddonManager {
         params: serde_json::Value,
         user_id: &str,
     ) -> Result<serde_json::Value> {
+        self.call_tool_inner(addon_id, tool_name, params, user_id, false)
+    }
+
+    /// Like `call_tool` but skips the per-addon `"llm"` permission check because
+    /// the caller already adjudicated it (§3.13 B: the harness raised a grant
+    /// card and the operator chose AllowOnce / AllowForRun — neither persists a
+    /// grant the checker would see, so the in-line check is bypassed for this
+    /// pre-authorized retry). NEVER call without first gating the permission
+    /// yourself; the only caller is the harness tool_exec permission path.
+    pub fn call_tool_preauthorized(
+        &self,
+        addon_id: &str,
+        tool_name: &str,
+        params: serde_json::Value,
+        user_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.call_tool_inner(addon_id, tool_name, params, user_id, true)
+    }
+
+    fn call_tool_inner(
+        &self,
+        addon_id: &str,
+        tool_name: &str,
+        params: serde_json::Value,
+        user_id: &str,
+        skip_permission_check: bool,
+    ) -> Result<serde_json::Value> {
         info!(
             "Wywolanie narzedzia '{}.{}' przez user_id={}",
             addon_id, tool_name, user_id
         );
 
-        // Sprawdz uprawnienia uzytkownika
-        let perm_result = self
-            .permission_checker
-            .check(addon_id, user_id, "llm", None);
-        if !perm_result.is_granted() {
-            bail!(
-                "Brak uprawnien do wywolania narzedzia '{}.{}' dla user_id={}",
-                addon_id,
-                tool_name,
-                user_id
-            );
+        // Sprawdz uprawnienia uzytkownika (pomijane gdy harness już wydał zgodę).
+        if !skip_permission_check {
+            let perm_result = self
+                .permission_checker
+                .check(addon_id, user_id, "llm", None);
+            if !perm_result.is_granted() {
+                bail!(
+                    "Brak uprawnien do wywolania narzedzia '{}.{}' dla user_id={}",
+                    addon_id,
+                    tool_name,
+                    user_id
+                );
+            }
         }
 
         // K4: Wez instancje z mapy pod lockiem (krotko)

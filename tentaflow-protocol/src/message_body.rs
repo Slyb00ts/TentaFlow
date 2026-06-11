@@ -1197,6 +1197,133 @@ pub struct ToolsCatalogResponse {
     pub tools_json: String,
 }
 
+// ----- Run interaction replies (Harness plan §3.13) -----
+//
+// A run that asks the operator a question (`core.ask_user` / the `ask_user`
+// block) or needs a permission grant parks in `waiting_user`; the dashboard
+// answers it over these requests. `question_id` / `request_id` is the pending
+// interaction id (server-minted, surfaced in the progress event). ACL: the run's
+// principal or an admin (enforced by the handler). The subscribe/event-push side
+// of the RunEvents channel is stage D and deliberately absent here.
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunReplyRequest {
+    pub run_id: String,
+    pub question_id: String,
+    /// Free-text answer, or the chosen option's label.
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunReplyResponse {
+    /// True when a pending question with that id was waiting and got the reply.
+    pub delivered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentPermissionReplyRequest {
+    pub run_id: String,
+    pub request_id: String,
+    /// One of: "deny" | "allow_once" | "allow_for_run" | "always".
+    pub decision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentPermissionReplyResponse {
+    pub delivered: bool,
+}
+
+// ----- Run control: cancel (§3.6) -----
+//
+// Cancel one in-flight run. The handler signals the run's cancel token through
+// the process-global `AgentRunManager`. ACL is the run principal or an admin.
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunCancelRequest {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunCancelResponse {
+    /// True when a live run was signalled (false = run already terminal/unknown).
+    pub cancelled: bool,
+}
+
+// ----- Run events: subscribe + push (§3.11 C) -----
+//
+// The dashboard subscribes to a scope (the chat session id, or one run id) and
+// receives ephemeral `AgentRunEvent` frames over the existing WS/WT stream
+// channel — the same mechanism chat streaming already uses. Events are NOT
+// persisted (durable record is `run_log`); on reconnect the UI reconciles from
+// `RunDetail` and re-subscribes. ACL: a session scope is always the caller's
+// own session; a run scope must resolve to the caller's principal or an admin.
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum AgentRunEventScope {
+    /// All runs published under the caller's chat session id.
+    Session { session_id: String },
+    /// One specific run (and its own scope only).
+    Run { run_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunEventsSubscribeRequest {
+    pub scope: AgentRunEventScope,
+}
+
+/// One progress event pushed to a subscriber. Mirrors the engine
+/// `ProgressEvent` enum (flow_engine::dispatchers::progress) flattened onto the
+/// wire: `kind` is the event discriminant, the rest are kind-specific fields
+/// (absent fields stay empty / zero). `scope` echoes the broadcast key the
+/// event arrived under so a multiplexed subscriber can route it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunEvent {
+    pub scope: String,
+    /// One of: node_started | node_finished | iteration_started |
+    /// iteration_finished | map_element | tool_call_started | tool_call_finished
+    /// | compaction | child_spawned | child_finished | router_decision |
+    /// user_question | permission_request | interaction_resolved.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    #[serde(default)]
+    pub n: u32,
+    #[serde(default)]
+    pub max: u32,
+    #[serde(default)]
+    pub index: u32,
+    #[serde(default)]
+    pub total: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub selected: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub interaction_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub addon_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permission: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AgentsPayload {
     ListRequest(AgentsListRequest),
@@ -1213,6 +1340,14 @@ pub enum AgentsPayload {
     RunDetailResponse(AgentRunDetailResponse),
     ToolsCatalogRequest(ToolsCatalogRequest),
     ToolsCatalogResponse(ToolsCatalogResponse),
+    RunReplyRequest(AgentRunReplyRequest),
+    RunReplyResponse(AgentRunReplyResponse),
+    PermissionReplyRequest(AgentPermissionReplyRequest),
+    PermissionReplyResponse(AgentPermissionReplyResponse),
+    RunCancelRequest(AgentRunCancelRequest),
+    RunCancelResponse(AgentRunCancelResponse),
+    RunEventsSubscribeRequest(AgentRunEventsSubscribeRequest),
+    RunEvent(AgentRunEvent),
 }
 
 // =============================================================================
@@ -5424,6 +5559,60 @@ mod tests {
             MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {})),
             MessageBody::AgentsBody(AgentsPayload::ToolsCatalogResponse(ToolsCatalogResponse {
                 tools_json: "{\"addons\":[],\"core\":[]}".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunReplyRequest(AgentRunReplyRequest {
+                run_id: "r1".to_string(),
+                question_id: "q1".to_string(),
+                answer: "yes".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunReplyResponse(AgentRunReplyResponse {
+                delivered: true,
+            })),
+            MessageBody::AgentsBody(AgentsPayload::PermissionReplyRequest(
+                AgentPermissionReplyRequest {
+                    run_id: "r1".to_string(),
+                    request_id: "p1".to_string(),
+                    decision: "allow_for_run".to_string(),
+                },
+            )),
+            MessageBody::AgentsBody(AgentsPayload::PermissionReplyResponse(
+                AgentPermissionReplyResponse { delivered: true },
+            )),
+            MessageBody::AgentsBody(AgentsPayload::RunCancelRequest(AgentRunCancelRequest {
+                run_id: "r1".to_string(),
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunCancelResponse(AgentRunCancelResponse {
+                cancelled: true,
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunEventsSubscribeRequest(
+                AgentRunEventsSubscribeRequest {
+                    scope: AgentRunEventScope::Session {
+                        session_id: "sess-1".to_string(),
+                    },
+                },
+            )),
+            MessageBody::AgentsBody(AgentsPayload::RunEventsSubscribeRequest(
+                AgentRunEventsSubscribeRequest {
+                    scope: AgentRunEventScope::Run {
+                        run_id: "r1".to_string(),
+                    },
+                },
+            )),
+            MessageBody::AgentsBody(AgentsPayload::RunEvent(AgentRunEvent {
+                scope: "sess-1".to_string(),
+                kind: "tool_call_finished".to_string(),
+                name: "memory.memory_search".to_string(),
+                status: "ok".to_string(),
+                ..Default::default()
+            })),
+            MessageBody::AgentsBody(AgentsPayload::RunEvent(AgentRunEvent {
+                scope: "r1".to_string(),
+                kind: "user_question".to_string(),
+                run_id: "r1".to_string(),
+                interaction_id: "q1".to_string(),
+                question: "Which region?".to_string(),
+                choices: vec!["EU".to_string(), "US".to_string()],
+                ..Default::default()
             })),
         ];
         for body in bodies {

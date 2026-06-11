@@ -100,6 +100,14 @@ pub struct ExecutionContext {
     pub user_id: Option<String>,
     pub user_role: Option<String>,
     pub deadline: Option<Instant>,
+    /// §3.13 — accumulated human-wait time (millis) that the deadline check adds
+    /// back to `deadline`, so time a run spends parked in `waiting_user` (an
+    /// `ask_user` question / permission grant) does NOT consume `agent.timeout_secs`.
+    /// Shared (`Arc`) so a clone of the context — a `loop`/`map`/`subflow` body —
+    /// extends the SAME deadline its parent enforces. An `ask_user` block / the
+    /// permission path bumps it by the millis it waited on the human; the
+    /// executor adds it to `deadline` between nodes.
+    pub deadline_extension_ms: Arc<std::sync::atomic::AtomicU64>,
     pub cancel_token: CancellationToken,
 
     /// §3.5 / §3.10 — guard rekurencji sub-flow, trzymany TU (nie w
@@ -146,6 +154,31 @@ pub struct ExecutionContext {
     pub progress_scope: String,
 
     pub usage_sink: Arc<UsageSink>,
+}
+
+impl ExecutionContext {
+    /// Effective deadline = the base deadline pushed back by the human-wait time
+    /// accumulated in `deadline_extension_ms` (§3.13). The executor checks this
+    /// between nodes instead of the bare `deadline`, so a run parked in
+    /// `waiting_user` does not burn its `agent.timeout_secs`.
+    pub fn effective_deadline(&self) -> Option<Instant> {
+        let base = self.deadline?;
+        let extra = self
+            .deadline_extension_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Some(base + std::time::Duration::from_millis(extra))
+    }
+
+    /// Records `waited` human-wait time so it is added back to the deadline. An
+    /// `ask_user` block / the permission path calls this after a human reply
+    /// (or timeout) so the time spent blocked on a person is not charged against
+    /// the run's budget.
+    pub fn extend_deadline(&self, waited: std::time::Duration) {
+        self.deadline_extension_ms.fetch_add(
+            waited.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 /// Pojedynczy port — nazwa + typ danych. Adapter zwraca `Vec<PortSpec>` z
@@ -632,6 +665,7 @@ pub mod test_support {
             user_id: None,
             user_role: None,
             deadline: None,
+            deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: CancellationToken::new(),
             subflow_depth: 0,
             subflow_visited: Arc::new(Vec::new()),
@@ -770,6 +804,28 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extend_deadline_pushes_effective_deadline_back() {
+        // §3.13 — a run's human-wait time is added back to the deadline so a
+        // run parked in waiting_user does not burn its budget.
+        let base = Instant::now() + std::time::Duration::from_secs(10);
+        let mut ctx = test_support::stub_ctx();
+        ctx.deadline = Some(base);
+        // No extension yet: effective == base.
+        assert_eq!(ctx.effective_deadline(), Some(base));
+        // A 5 s human wait pushes the effective deadline back by 5 s.
+        ctx.extend_deadline(std::time::Duration::from_secs(5));
+        let eff = ctx.effective_deadline().expect("deadline");
+        assert!(eff >= base + std::time::Duration::from_secs(5));
+        // Extensions accumulate.
+        ctx.extend_deadline(std::time::Duration::from_secs(3));
+        let eff2 = ctx.effective_deadline().expect("deadline");
+        assert!(eff2 >= base + std::time::Duration::from_secs(8));
+        // No base deadline → no effective deadline (an unbounded run).
+        ctx.deadline = None;
+        assert_eq!(ctx.effective_deadline(), None);
+    }
 
     #[test]
     fn usage_sink_aggregate_sums_records() {

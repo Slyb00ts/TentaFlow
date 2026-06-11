@@ -158,7 +158,11 @@ impl NodeAdapter for AgentContextNodeAdapter {
 
         let principal = AgentPrincipal::new(ctx.user_id.clone(), None);
         let skills = service.skill_index(&agent.skills_json)?;
-        let tool_specs = service.tool_catalog_from_allowlist(&agent.tools_json, &principal);
+        let tool_specs = service.tool_catalog_from_allowlist(
+            &agent.tools_json,
+            &principal,
+            agent.max_subagents > 0,
+        );
 
         let mut out: FlowEnvelope = (**envelope).clone();
 

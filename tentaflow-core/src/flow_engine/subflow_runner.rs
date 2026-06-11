@@ -12,8 +12,10 @@ use anyhow::{anyhow, Result};
 
 use crate::db::{repository, DbPool};
 use crate::flow_engine::cache::CompiledFlow;
-use crate::flow_engine::envelope::{FlowEnvelope, FlowExecutionOutcome};
-use crate::flow_engine::executor::execute_blocking;
+use crate::flow_engine::envelope::{
+    AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
+};
+use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, UsageSink};
 
 /// Hard cap on sub-flow nesting depth (§3.5 block 8). A flow may nest sub-flows
@@ -68,6 +70,95 @@ impl SubflowRunner {
         extra_depth: u8,
         light: bool,
     ) -> Result<FlowEnvelope> {
+        let Prepared {
+            registry,
+            compiled,
+            child_ctx,
+        } = self.prepare(flow_id, parent_ctx, extra_depth, light).await?;
+
+        let outcome: FlowExecutionOutcome = execute_blocking(
+            self.db.clone(),
+            Arc::new(compiled),
+            initial_envelope,
+            child_ctx,
+            registry,
+        )
+        .await?;
+
+        if let Some(err) = outcome.error {
+            return Err(anyhow!("subflow_runner: flow '{flow_id}' failed: {err}"));
+        }
+        Ok(outcome.final_envelope)
+    }
+
+    /// Streaming variant of `run` (§3.11 B): runs the child flow in streaming
+    /// mode and returns its `EnvelopeDelta` stream + outcome receiver, so a
+    /// `subflow` / `agent` / `loop` block that is the parent flow's stream
+    /// producer can forward the inner final unit's tokens straight out without
+    /// buffering the whole answer. The child ctx is built exactly as in `run`
+    /// (fresh usage sink, parent_execution_id link, depth/visited guards).
+    ///
+    /// A child flow WITHOUT a streaming end-shape (no `from_port="stream"` edge)
+    /// cannot be driven by `execute_streaming`; rather than fail, it runs
+    /// blocking and the single final payload is wrapped as one terminal delta —
+    /// callers always get a stream regardless of how the child was authored.
+    /// The child's own finalizer (or the blocking persist) writes its
+    /// `flow_executions` row; the returned outcome receiver lets the caller
+    /// observe the settled result if it wants to (the executor's producer
+    /// finalizer builds the PARENT outcome from the forwarded deltas, so most
+    /// callers drop it).
+    pub async fn run_streaming(
+        &self,
+        flow_id: &str,
+        initial_envelope: FlowEnvelope,
+        parent_ctx: &ExecutionContext,
+        extra_depth: u8,
+        light: bool,
+    ) -> Result<StreamingExecution> {
+        let Prepared {
+            registry,
+            compiled,
+            child_ctx,
+        } = self.prepare(flow_id, parent_ctx, extra_depth, light).await?;
+
+        if compiled.is_streaming {
+            return execute_streaming(
+                self.db.clone(),
+                Arc::new(compiled),
+                initial_envelope,
+                child_ctx,
+                registry,
+            )
+            .await;
+        }
+
+        // Non-streaming child: run blocking, then surface its final payload as a
+        // single terminal delta so the forwarding parent still produces a stream.
+        let blobs = child_ctx.blobs.clone();
+        let outcome = execute_blocking(
+            self.db.clone(),
+            Arc::new(compiled),
+            initial_envelope,
+            child_ctx,
+            registry,
+        )
+        .await?;
+        if let Some(err) = &outcome.error {
+            return Err(anyhow!("subflow_runner: flow '{flow_id}' failed: {err}"));
+        }
+        Ok(wrap_outcome_as_stream(outcome, blobs))
+    }
+
+    /// Shared setup for `run` / `run_streaming`: upgrades the registry Weak,
+    /// loads + compiles the flow, and builds the child execution context with
+    /// the same field rewrites both paths need.
+    async fn prepare(
+        &self,
+        flow_id: &str,
+        parent_ctx: &ExecutionContext,
+        extra_depth: u8,
+        light: bool,
+    ) -> Result<Prepared> {
         let registry = self
             .registry
             .upgrade()
@@ -108,7 +199,8 @@ impl SubflowRunner {
         // - `subflow_depth` + `extra_depth`;
         // - `subflow_visited` extended with the child flow id.
         let mut child_ctx = parent_ctx.clone();
-        child_ctx.parent_execution_id = (parent_ctx.execution_id > 0).then_some(parent_ctx.execution_id);
+        child_ctx.parent_execution_id =
+            (parent_ctx.execution_id > 0).then_some(parent_ctx.execution_id);
         child_ctx.light = light;
         child_ctx.usage_sink = Arc::new(UsageSink::new());
         child_ctx.subflow_depth = parent_ctx.subflow_depth.saturating_add(extra_depth);
@@ -116,18 +208,82 @@ impl SubflowRunner {
         visited.push(flow.id.clone());
         child_ctx.subflow_visited = Arc::new(visited);
 
-        let outcome: FlowExecutionOutcome = execute_blocking(
-            self.db.clone(),
-            Arc::new(compiled),
-            initial_envelope,
-            child_ctx,
+        Ok(Prepared {
             registry,
-        )
-        .await?;
+            compiled,
+            child_ctx,
+        })
+    }
+}
 
-        if let Some(err) = outcome.error {
-            return Err(anyhow!("subflow_runner: flow '{flow_id}' failed: {err}"));
+/// Output of `SubflowRunner::prepare` — the upgraded registry, the compiled
+/// child flow, and the rewritten child execution context.
+struct Prepared {
+    registry: Arc<AdapterRegistry>,
+    compiled: CompiledFlow,
+    child_ctx: ExecutionContext,
+}
+
+/// Wraps a blocking child `FlowExecutionOutcome` as a single-delta stream so a
+/// streaming-forwarding parent (subflow / agent / a loop whose final iteration
+/// body is not itself streaming) still emits a `StreamingExecution`. Mirrors
+/// the dispatcher's `wrap_blocking_as_stream`: an audio payload is fetched from
+/// the blob store and emitted as one `EnvelopeDelta::Audio`, everything else as
+/// one terminal `EnvelopeDelta::Llm` carrying the whole text.
+fn wrap_outcome_as_stream(
+    outcome: FlowExecutionOutcome,
+    blobs: Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> StreamingExecution {
+    use futures::stream::StreamExt;
+    let payload = outcome.final_envelope.payload.clone();
+    let usage = outcome.usage.clone();
+    let finish = outcome.finish_reason.clone();
+    let err = outcome.error.clone();
+    let stream = futures::stream::once(async move {
+        match payload {
+            FlowValue::Audio {
+                blob_ref,
+                mime,
+                sample_rate,
+            } => {
+                let bytes = blobs
+                    .get(&blob_ref)
+                    .await
+                    .map_err(|e| anyhow!("subflow_runner: audio blob fetch: {e}"))?;
+                Ok(EnvelopeDelta::Audio(AudioStreamChunk {
+                    choice_index: 0,
+                    bytes_delta: bytes,
+                    mime,
+                    sample_rate,
+                    finish_reason: Some(finish),
+                }))
+            }
+            other => {
+                let text_delta = match &other {
+                    FlowValue::Text(t) => t.clone(),
+                    FlowValue::Empty => String::new(),
+                    v => serde_json::to_string(
+                        &crate::flow_engine::converter::payload_to_json(v),
+                    )
+                    .unwrap_or_default(),
+                };
+                Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                    choice_index: 0,
+                    text_delta,
+                    reasoning_delta: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(usage),
+                    finish_reason: Some(finish),
+                    error: err,
+                }))
+            }
         }
-        Ok(outcome.final_envelope)
+    })
+    .boxed();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(outcome);
+    StreamingExecution {
+        stream,
+        outcome: rx,
     }
 }

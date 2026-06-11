@@ -5,14 +5,28 @@
 
 mod builtins;
 mod catalog;
+mod interaction;
 mod principal;
+mod run_manager;
 mod service;
 
 use std::sync::Arc;
 
 pub use builtins::{is_core_tool, BuiltinToolError, CoreToolName};
 pub use catalog::{tool_in_allowlist, AllowlistEntry, ToolCatalog};
+pub use interaction::{
+    await_reply as await_interaction_reply, global as interaction_registry_global,
+    init_global as interaction_registry_init_global, no_response_sentinel, now_ms as interaction_now_ms,
+    run_ask_user, run_permission_request, wrap_user_reply, InteractionKind, InteractionOutcome,
+    InteractionRegistry, InteractionReply, PendingInteraction, PermissionDecision, QuestionReply,
+    DEFAULT_INTERACTION_TIMEOUT_SECS,
+};
 pub use principal::AgentPrincipal;
+pub use run_manager::{
+    global as agent_run_manager_global, init_global as agent_run_manager_init_global,
+    AgentRunManager, BackgroundFlowRunner, CallerRun, FlowDispatcherRunner, RunStatus,
+    MAX_CONCURRENT_RUNS_SETTING,
+};
 pub use service::AgentService;
 
 /// Late-bound `AgentService` slot (§3.5.0), mirroring `ModelRuntimeSlot`.

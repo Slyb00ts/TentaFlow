@@ -20,6 +20,8 @@ import { createVirtualList } from '/js/lib/virtual-list.js';
 import { renderMarkdown, extractPlainText } from '/js/lib/md-lite.js';
 import FaceBackground from '/js/modules/faceBackground.js';
 import { AudioPipeline } from '/js/modules/chat-audio.js';
+import '/js/components/tf-agent-activity.js';
+import { attachAgentActivity } from '/js/lib/agent-activity-bridge.js';
 
 const STORAGE_KEY = 'tentaflow_chat_conversations_v1';
 const MAX_INPUT_CHARS = 4096;
@@ -33,6 +35,9 @@ const FENCE_HEADER_PX = 30;
 const THINK_COLLAPSED_PX = 40;
 
 let unsubscribe = null;
+// Teardown for the per-session agent-activity run-events subscription. Re-bound
+// on every conversation switch (each conversation is its own session scope).
+let agentActivityTeardown = null;
 let modelOptions = [];
 let conversations = [];
 let activeConvId = null;
@@ -683,6 +688,11 @@ function switchMode(targetMode) {
 function applyMode(conv) {
   const body = byId('chat-body');
   if (!body) return;
+  // The activity widget lives in the composer wrap (outside #chat-body), so it
+  // survives mode swaps; only its density changes — audio mode uses the narrow
+  // dot+badge variant (§3.9).
+  const activity = byId('chat-agent-activity');
+  if (activity) activity.variant = conv.mode === 'audio' ? 'chat-audio' : 'chat';
   if (conv.mode === 'audio') {
     if (vlist) { vlist.destroy(); vlist = null; }
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
@@ -711,6 +721,16 @@ function applyMode(conv) {
 
 // ---- Conversation switching ----------------------------------------------
 
+// (Re)subscribe the agent-activity widget to the active conversation's session
+// scope. The conversation id is the flow `session_id` background runs publish
+// under (§3.9). Tears down any prior subscription first.
+function rebindAgentActivity() {
+  if (agentActivityTeardown) { agentActivityTeardown(); agentActivityTeardown = null; }
+  const widget = byId('chat-agent-activity');
+  if (!widget || !activeConvId) return;
+  agentActivityTeardown = attachAgentActivity(widget, activeConvId);
+}
+
 function selectConversation(id) {
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
   // Switch konwersacji = inny audioConfig + inny conv ref → pipeline z poprzedniej
@@ -718,6 +738,7 @@ function selectConversation(id) {
   // ponownie udostepni mic-button.
   stopAudioPipeline();
   activeConvId = id;
+  rebindAgentActivity();
   renderConvList();
   updateHeaderTitle();
   const conv = activeConv();
@@ -1297,6 +1318,7 @@ const ChatScreen = {
           <div class="chat-body" id="chat-body"></div>
           <div class="chat-new-pill" id="chat-new-pill">${sprite('chevron-down')}<span>${escapeHtml(I18n.t('chat.new_messages') || 'Nowe wiadomości')}</span></div>
           <div class="composer-wrap">
+            <tf-agent-activity id="chat-agent-activity" variant="chat"></tf-agent-activity>
             <div class="composer">
               <tf-button variant="ghost" icon="paperclip" id="chat-attach" class="composer-attach" aria-label="${escapeHtml(I18n.t('chat.attach') || 'Załącz')}"></tf-button>
               <tf-textarea id="chat-input" autogrow rows="1"
@@ -1442,6 +1464,7 @@ const ChatScreen = {
       conversations.push(conv);
       activeConvId = conv.id;
       saveConversations();
+      rebindAgentActivity();
       // Nowa rozmowa = tryb tekstowy; jesli wczesniej byl mountowany face,
       // applyMode sprzata go i przywraca vlist.
       stopAudioPipeline();
@@ -1510,10 +1533,14 @@ const ChatScreen = {
 
     resizeListener = () => remountIfWidthChanged();
     window.addEventListener('resize', resizeListener);
+
+    // Subscribe the activity widget to the active conversation's session scope.
+    rebindAgentActivity();
   },
 
   async unmount() {
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    if (agentActivityTeardown) { agentActivityTeardown(); agentActivityTeardown = null; }
     if (vlist) { vlist.destroy(); vlist = null; }
     stopAudioPipeline();
     destroyFace();

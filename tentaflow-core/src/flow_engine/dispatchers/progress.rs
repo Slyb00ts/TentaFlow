@@ -53,6 +53,33 @@ pub enum ProgressEvent {
         selected: String,
         reason: String,
     },
+    /// A run is asking the operator a question and entered `waiting_user`
+    /// (§3.13 A — `core.ask_user` / the `ask_user` block). The dashboard renders
+    /// the question card from `interaction_id` + `question` + `choices`.
+    UserQuestion {
+        run_id: String,
+        interaction_id: String,
+        question: String,
+        choices: Vec<String>,
+    },
+    /// A run needs a permission grant to run a denied tool and entered
+    /// `waiting_user` (§3.13 B). The dashboard renders the grant card naming the
+    /// addon/tool/permission; the reply carries the operator's decision.
+    PermissionRequest {
+        run_id: String,
+        interaction_id: String,
+        addon_id: String,
+        tool_name: String,
+        permission: String,
+    },
+    /// A pending interaction was resolved (answered, decided, or timed out), so
+    /// the dashboard can dismiss its card. `outcome` is a short label
+    /// (`replied` / `timed_out`).
+    InteractionResolved {
+        run_id: String,
+        interaction_id: String,
+        outcome: String,
+    },
 }
 
 /// Narrow sink the executor publishes progress to. Mirrors `MetricsSink`:

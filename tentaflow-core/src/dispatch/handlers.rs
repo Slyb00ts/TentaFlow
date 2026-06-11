@@ -5670,6 +5670,128 @@ pub fn agent_run_detail(
     ))
 }
 
+/// ACL for answering a run's interaction (§3.13): a non-admin may reply only to
+/// a run whose principal is themselves; an unattended (no-principal) run is
+/// admin-only. A missing run is reported as not-found (not leaking existence).
+fn assert_run_reply_access(ctx: &HandlerContext, run_id: &str) -> Result<(), ProtocolError> {
+    let actor_id = user_id_to_uuid(&require_user_id(ctx)?);
+    let run = repository::get_agent_run(&ctx.state.db, run_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found(format!("agent run not found: {run_id}")))?;
+    if !session_is_admin(ctx) && run.user_id.as_deref() != Some(actor_id.as_str()) {
+        return Err(ProtocolError::not_found(format!(
+            "agent run not found: {run_id}"
+        )));
+    }
+    Ok(())
+}
+
+#[handler(variant = "AgentRunReplyRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn agent_run_reply(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::RunReplyRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentRunReplyRequest")),
+    };
+    // ACL: the run's principal or an admin may answer its questions (§3.13 A).
+    assert_run_reply_access(ctx, &payload.run_id)?;
+
+    let registry = crate::agents::interaction_registry_global();
+    // The interaction must belong to the named run (an answer cannot be routed
+    // to another run's question).
+    let belongs = registry
+        .info(&payload.question_id)
+        .map(|i| i.run_id == payload.run_id && i.kind == crate::agents::InteractionKind::Question)
+        .unwrap_or(false);
+    let delivered = belongs
+        && registry.reply(
+            &payload.question_id,
+            crate::agents::InteractionReply::Question(crate::agents::QuestionReply {
+                answer: payload.answer.clone(),
+            }),
+        );
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunReplyResponse(
+            tentaflow_protocol::AgentRunReplyResponse { delivered },
+        ),
+    ))
+}
+
+#[handler(variant = "AgentPermissionReplyRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn agent_permission_reply(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::PermissionReplyRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentPermissionReplyRequest")),
+    };
+    assert_run_reply_access(ctx, &payload.run_id)?;
+
+    let decision = crate::agents::PermissionDecision::parse(&payload.decision)
+        .ok_or_else(|| ProtocolError::bad_request("unknown permission decision"))?;
+    // An "always" grant is always persisted principal-scoped (tool_exec hardcodes
+    // global=false), and the wire decision set has no global variant — so a
+    // non-admin reply cannot widen a grant past its own principal. No admin check
+    // is needed here; run ownership is enforced by assert_run_reply_access above.
+
+    let registry = crate::agents::interaction_registry_global();
+    let belongs = registry
+        .info(&payload.request_id)
+        .map(|i| i.run_id == payload.run_id && i.kind == crate::agents::InteractionKind::Permission)
+        .unwrap_or(false);
+    let delivered = belongs
+        && registry.reply(
+            &payload.request_id,
+            crate::agents::InteractionReply::Permission(decision),
+        );
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::PermissionReplyResponse(
+            tentaflow_protocol::AgentPermissionReplyResponse { delivered },
+        ),
+    ))
+}
+
+#[handler(variant = "AgentRunCancelRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn agent_run_cancel(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::RunCancelRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentRunCancelRequest")),
+    };
+    // ACL: the run's principal or an admin may cancel it (§3.3).
+    assert_run_reply_access(ctx, &payload.run_id)?;
+
+    let user_id = require_user_id(ctx)?;
+    let cancelled = crate::agents::agent_run_manager_global()
+        .map(|m| m.cancel(&payload.run_id))
+        .unwrap_or(false);
+
+    audit(
+        ctx,
+        Some(&user_id_to_uuid(&user_id)),
+        "agent.run_cancel",
+        Some(&format!("run:{}", payload.run_id)),
+        Some(if cancelled { "cancelled" } else { "not_live" }),
+    );
+
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunCancelResponse(
+            tentaflow_protocol::AgentRunCancelResponse { cancelled },
+        ),
+    ))
+}
+
 #[handler(variant = "ToolsCatalogRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]

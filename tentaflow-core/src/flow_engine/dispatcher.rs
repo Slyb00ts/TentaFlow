@@ -36,12 +36,12 @@ use crate::flow_engine::envelope::{
 use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
-    AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, CombineNodeAdapter,
-    CompactContextNodeAdapter, ConditionNodeAdapter, ConversationHistoryNodeAdapter,
-    EmbeddingsNodeAdapter, LlmNodeAdapter, LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter,
-    OutputNodeAdapter, PiiFilterNodeAdapter, SessionContextNodeAdapter, SpeakerContextNodeAdapter,
-    SttNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter,
-    TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
+    AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
+    CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
+    ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, LlmNodeAdapter, LoopNodeAdapter,
+    MapNodeAdapter, MemoryNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter,
+    SessionContextNodeAdapter, SpeakerContextNodeAdapter, SttNodeAdapter, SubflowNodeAdapter,
+    ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -181,6 +181,7 @@ impl ContextFactory {
             user_id: meta.user_id.clone(),
             user_role: meta.user_role.clone(),
             deadline: meta.deadline,
+            deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: meta.cancel_token.clone(),
             subflow_depth: 0,
             subflow_visited: Arc::new(Vec::new()),
@@ -446,6 +447,56 @@ impl FlowDispatcher {
         self.run_blocking(compiled, initial, meta)
             .await
             .map_err(DispatchError::from)
+    }
+
+    /// Background-run variant (Harness §3.6/§3.7): runs the agent harness flow
+    /// for an `AgentRunManager` task. Unlike `dispatch_by_flow_id` it does NOT
+    /// impose the 120 s `FLOW_TIMEOUT_SECS` cap — a long agent run is governed
+    /// solely by `meta.deadline` (the agent's own budget) and `meta.cancel_token`,
+    /// both already enforced between nodes by the executor. ACL is skipped: the
+    /// manager already verified the spawning principal and the harness flows are
+    /// resolver-unreachable system flows (no per-user ACL rows).
+    pub async fn dispatch_by_flow_id_background(
+        &self,
+        flow_id: String,
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
+        let pool = self.db.clone();
+        let lookup_id = flow_id.clone();
+        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, &lookup_id))
+            .await
+            .map_err(|e| DispatchError::Internal(e.to_string()))?
+            .map_err(|e| DispatchError::Internal(e.to_string()))?;
+        let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
+            flow_id: flow_id.clone(),
+            msg: "flow id does not exist in DB".to_string(),
+        })?;
+        if flow.status != "active" {
+            return Err(DispatchError::CompileFailed {
+                flow_id,
+                msg: format!("flow status='{}' (not active)", flow.status),
+            });
+        }
+        let compiled = match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                return Err(DispatchError::CompileFailed {
+                    flow_id,
+                    msg: e.to_string(),
+                });
+            }
+        };
+        let ctx = self.ctx_factory.make_context(&meta);
+        execute_blocking(
+            self.db.clone(),
+            compiled,
+            initial,
+            ctx,
+            self.registry.clone(),
+        )
+        .await
+        .map_err(DispatchError::from)
     }
 
     /// Streaming wariant `dispatch_by_flow_id` — odpala KONKRETNY flow po ID
@@ -822,6 +873,9 @@ fn build_registry(
         Arc::new(SessionContextNodeAdapter::new()),
         Arc::new(SpeakerContextNodeAdapter::new()),
         Arc::new(VisionNodeAdapter::new()),
+        // ask_user (§3.13 C) — BPMN User Task: no dependency slot, it uses the
+        // process-global interaction registry + run manager.
+        Arc::new(AskUserNodeAdapter::new()),
     ];
     for a in arcs {
         r.register(a);
@@ -838,10 +892,16 @@ fn build_registry(
     // SubflowRunnerSlot (filled by FlowDispatcher::new) — each runs another flow
     // as its body. `agent` additionally needs the AgentServiceSlot to resolve
     // the agent's harness flow id.
-    r.register(Arc::new(SubflowNodeAdapter::new(subflow_runner.clone())));
-    r.register(Arc::new(LoopNodeAdapter::new(subflow_runner.clone())));
+    //
+    // §3.11 B: subflow / loop / agent register as stream producers too (dual
+    // NodeAdapter + StreamProducerAdapter) — a flow wiring their `stream` output
+    // port forwards the inner final unit's token stream (subflow → child flow,
+    // loop → final iteration, agent → harness flow's loop). `map` stays blocking
+    // (its result is an aggregated array, not a single streamable unit).
+    r.register_stream_producer(Arc::new(SubflowNodeAdapter::new(subflow_runner.clone())));
+    r.register_stream_producer(Arc::new(LoopNodeAdapter::new(subflow_runner.clone())));
     r.register(Arc::new(MapNodeAdapter::new(subflow_runner.clone())));
-    r.register(Arc::new(AgentNodeAdapter::new(agent_service, subflow_runner)));
+    r.register_stream_producer(Arc::new(AgentNodeAdapter::new(agent_service, subflow_runner)));
     r.register_llm(Arc::new(LlmNodeAdapter::new()));
     // Streaming-aware adaptery (dual-trait NodeAdapter + StreamingNodeAdapter)
     // trafiają do obu slotów. `tts` jest dual: blocking (całość) + streaming
@@ -863,6 +923,16 @@ pub fn build_registry_for_test() -> AdapterRegistry {
         Arc::new(parking_lot::RwLock::new(None)),
         Arc::new(parking_lot::RwLock::new(None)),
     )
+}
+
+/// Like `build_registry_for_test` but wires the given `SubflowRunnerSlot` into
+/// the subflow / loop / map / agent adapters — for tests that drive these
+/// blocks through a live `SubflowRunner` (e.g. end-to-end harness streaming).
+/// The caller fills the slot with a runner whose registry `Weak` points at the
+/// returned registry once it is `Arc`-wrapped.
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_registry_with_runner(subflow_runner: SubflowRunnerSlot) -> AdapterRegistry {
+    build_registry(Arc::new(parking_lot::RwLock::new(None)), subflow_runner)
 }
 
 #[cfg(test)]
@@ -899,6 +969,7 @@ mod tests {
             "loop",
             "map",
             "agent",
+            "ask_user",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }
