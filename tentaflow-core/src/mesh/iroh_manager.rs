@@ -297,7 +297,6 @@ pub struct ConnectionPathSnapshot {
     pub transport: String,
     pub address: String,
     pub selected: bool,
-    pub closed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -582,7 +581,7 @@ impl IrohMeshManager {
                         info!("iroh_mesh: discovery stream zamkniety");
                         return;
                     };
-                    use iroh::address_lookup::DiscoveryEvent;
+                    use iroh_mdns_address_lookup::DiscoveryEvent;
                     if let DiscoveryEvent::Discovered { endpoint_info, .. } = ev {
                         let peer_id = endpoint_info.endpoint_id;
                         let peer_hex = hex::encode(peer_id.as_bytes());
@@ -683,10 +682,7 @@ impl IrohMeshManager {
                             .paths
                             .iter()
                             .map(|p| {
-                                format!(
-                                    "{}@{} selected={} closed={}",
-                                    p.transport, p.address, p.selected, p.closed
-                                )
+                                format!("{}@{} selected={}", p.transport, p.address, p.selected)
                             })
                             .collect::<Vec<_>>()
                             .join(" | ");
@@ -910,6 +906,20 @@ impl IrohMeshManager {
         }
     }
 
+    /// Relay dokladany do kazdego wychodzacego diala. endpoint.addr() zna
+    /// relay dopiero po zestawieniu sesji home-relay — tuz po starcie lista
+    /// jest pusta i dial tworzylby polaczenie p2p-only bez sciezki relay do
+    /// failoveru. Skonfigurowany relay z configu/DB jest wtedy backstopem.
+    fn dial_relay_url(&self) -> Option<RelayUrl> {
+        self.endpoint
+            .inner()
+            .addr()
+            .relay_urls()
+            .next()
+            .cloned()
+            .or_else(|| self.config.relay_url.clone())
+    }
+
     /// Zwraca (lub tworzy) per-peer mutex zabezpieczajacy przed rownoleglymi
     /// dialami do tego samego peera z roznych tasków.
     fn dial_lock_for(&self, peer_hex: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1001,7 +1011,7 @@ impl IrohMeshManager {
         // parze z naszym home relay, co otwiera sciezke jesli peer siedzi za
         // NATem albo w innej sieci.
         let mut endpoint_addr = endpoint_addr_from_target(node_id_hex, Some(addr))?;
-        if let Some(relay) = self.endpoint.inner().addr().relay_urls().next().cloned() {
+        if let Some(relay) = self.dial_relay_url() {
             endpoint_addr = endpoint_addr.with_relay_url(relay);
         }
         let connection = self
@@ -1059,7 +1069,7 @@ impl IrohMeshManager {
         }
         let endpoint_id = parse_endpoint_id(node_id_hex)?;
         let mut addr = EndpointAddr::new(endpoint_id).with_ip_addr(direct_addr);
-        if let Some(relay) = self.endpoint.inner().addr().relay_urls().next().cloned() {
+        if let Some(relay) = self.dial_relay_url() {
             addr = addr.with_relay_url(relay);
         }
         let connection = self
@@ -1108,7 +1118,11 @@ impl IrohMeshManager {
         }
         // Relay-first: dokladamy nasz home relay jako fallback zawsze gdy
         // hints go nie maja (direct addrs leca rownolegle).
-        let hints_resolved = hints_with_relay_fallback(self.endpoint.inner(), hints);
+        let hints_resolved = hints_with_relay_fallback(
+            self.endpoint.inner(),
+            hints,
+            self.config.relay_url.as_ref().map(|u| u.as_str()),
+        );
         let addr = endpoint_addr_from_hints(&hints_resolved)?;
         let connection = self
             .endpoint
@@ -1168,7 +1182,11 @@ impl IrohMeshManager {
             .ok_or_else(|| {
                 anyhow::anyhow!("baseline pull: no trusted contact hints for donor {donor_node_id}")
             })?;
-        let hints_resolved = hints_with_relay_fallback(self.endpoint.inner(), &hints);
+        let hints_resolved = hints_with_relay_fallback(
+            self.endpoint.inner(),
+            &hints,
+            self.config.relay_url.as_ref().map(|u| u.as_str()),
+        );
         let addr = endpoint_addr_from_hints(&hints_resolved)
             .map_err(|e| anyhow::anyhow!("baseline pull: donor addr: {e}"))?;
 
@@ -2101,10 +2119,7 @@ impl IrohMeshManagerRef {
                 .paths
                 .iter()
                 .map(|p| {
-                    format!(
-                        "{}@{} selected={} closed={}",
-                        p.transport, p.address, p.selected, p.closed
-                    )
+                    format!("{}@{} selected={}", p.transport, p.address, p.selected)
                 })
                 .collect::<Vec<_>>()
                 .join(" | ");
@@ -2603,7 +2618,6 @@ fn connection_snapshot_from_connection(connection: &Connection) -> ConnectionSna
                 transport,
                 address,
                 selected: path.is_selected(),
-                closed: path.is_closed(),
             }
         })
         .collect();

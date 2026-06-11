@@ -87,8 +87,10 @@ bytes = "1.11"
 # Networking — iroh (QUIC-based p2p z relay fallback, LAN mDNS, DHT discovery).
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez
 # tentaflow-client/native i tentaflow-containers/sidecar.
-iroh = { version = "=0.98.2", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
-iroh-relay = { version = "0.98.0", default-features = false, features = ["server"] }
+iroh = { version = "=1.0.0-rc.1", default-features = false, features = ["portmapper", "tls-ring"] }
+iroh-relay = { version = "=1.0.0-rc.1", default-features = false, features = ["server"] }
+iroh-mdns-address-lookup = "0.3.0"
+iroh-mainline-address-lookup = "0.3.0"
 tentaflow-transport = { path = "../tentaflow-transport" }
 rustls = { version = "0.23.40", features = ["ring"] }
 tokio-rustls = "0.26.4"
@@ -357,7 +359,6 @@ harness = false
 required-features = ["test-support"]
 
 [patch.crates-io]
-ed25519-dalek = { path = "../vendor/ed25519-dalek" }
 llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
 sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
 whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }

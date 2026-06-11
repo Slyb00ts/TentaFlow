@@ -1822,7 +1822,6 @@ pub struct MeshConnectionPathInfo {
     pub transport: String,
     pub address: String,
     pub selected: bool,
-    pub closed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
