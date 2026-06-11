@@ -46,6 +46,37 @@ const EDGES = (() => {
   return result;
 })();
 
+// Perspective rewarp: the mesh was reconstructed from 28mm full-frame photos
+// shot at close range, which bakes wide-angle close-up distortion into the
+// geometry — vertices near the camera (nose, +z) are laterally inflated and
+// far ones (cheek outline, ears, -z) compressed. s(z) undoes the source
+// projection and reapplies a longer-distance (50mm-equivalent) one, scaling
+// only x/y per vertex; z stays untouched. s(0) = 1 at the head pivot.
+const PERSPECTIVE_D_SRC = 3.4;  // 28mm FF headshot ≈ 0.40 m ≈ 3.4 head-units (1 unit ≈ 0.117 m)
+const PERSPECTIVE_D_DST = 6.1;  // 50mm FF same framing ≈ 0.71 m
+
+function perspectiveScale(z) {
+  return ((PERSPECTIVE_D_SRC - z) / PERSPECTIVE_D_SRC)
+    * (PERSPECTIVE_D_DST / (PERSPECTIVE_D_DST - z));
+}
+
+// Base mesh rewarped to 50mm perspective. Every renderer path uses this; raw
+// BASE_POSITIONS only feed the warp itself and the capture-space rigid fit.
+const WARPED_POSITIONS = (() => {
+  const out = new Float32Array(BASE_POSITIONS.length);
+  for (let i = 0; i < NUM_VERTICES; i++) {
+    const j = i * 3;
+    const z = BASE_POSITIONS[j + 2];
+    const s = perspectiveScale(z);
+    out[j] = BASE_POSITIONS[j] * s;
+    out[j + 1] = BASE_POSITIONS[j + 1] * s;
+    out[j + 2] = z;
+  }
+  return out;
+})();
+
+// Shading normals derived from the warped geometry so edge visibility fades
+// match what is actually drawn.
 const BASE_NORMALS = (() => {
   const nx = new Float32Array(NUM_VERTICES);
   const ny = new Float32Array(NUM_VERTICES);
@@ -53,18 +84,18 @@ const BASE_NORMALS = (() => {
   let cx = 0, cy = 0, cz = 0;
   for (let i = 0; i < NUM_VERTICES; i++) {
     const j = i * 3;
-    cx += BASE_POSITIONS[j];
-    cy += BASE_POSITIONS[j + 1];
-    cz += BASE_POSITIONS[j + 2];
+    cx += WARPED_POSITIONS[j];
+    cy += WARPED_POSITIONS[j + 1];
+    cz += WARPED_POSITIONS[j + 2];
   }
   cx /= NUM_VERTICES;
   cy /= NUM_VERTICES;
   cz /= NUM_VERTICES;
   for (let i = 0; i < NUM_VERTICES; i++) {
     const j = i * 3;
-    const dx = BASE_POSITIONS[j] - cx;
-    const dy = BASE_POSITIONS[j + 1] - cy;
-    const dz = BASE_POSITIONS[j + 2] - cz;
+    const dx = WARPED_POSITIONS[j] - cx;
+    const dy = WARPED_POSITIONS[j + 1] - cy;
+    const dz = WARPED_POSITIONS[j + 2] - cz;
     const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (len > 1e-6) {
       nx[i] = dx / len;
@@ -249,13 +280,29 @@ export function removeRigidMotion(basePositions, delta, numVertices) {
 
 // Rigid-motion-free blendshape deltas; the renderer must only ever use these
 // (never raw BLENDSHAPE_DELTAS) so animating a weight deforms the face
-// locally instead of rocking the whole head.
+// locally instead of rocking the whole head. The rigid fit runs in capture
+// space (against raw BASE_POSITIONS), then each cleaned delta is rewarped so
+// it stays consistent with WARPED_POSITIONS:
+// final_i = W(base_i + clean_i) - W(base_i), with W using the deformed
+// vertex's own z (base_z + delta_z).
 const CLEAN_DELTAS = (() => {
+  const warpDelta = (delta) => {
+    const out = new Float32Array(delta.length);
+    for (let i = 0; i < NUM_VERTICES; i++) {
+      const j = i * 3;
+      const dz = delta[j + 2];
+      const s = perspectiveScale(BASE_POSITIONS[j + 2] + dz);
+      out[j] = (BASE_POSITIONS[j] + delta[j]) * s - WARPED_POSITIONS[j];
+      out[j + 1] = (BASE_POSITIONS[j + 1] + delta[j + 1]) * s - WARPED_POSITIONS[j + 1];
+      out[j + 2] = dz;
+    }
+    return out;
+  };
   return BLENDSHAPE_DELTAS.map((delta, s) => {
     const cleaned = removeRigidMotion(BASE_POSITIONS, delta, NUM_VERTICES);
-    if (cleaned) return cleaned;
+    if (cleaned) return warpDelta(cleaned);
     console.warn(`tf-face: rigid-motion removal failed for blendshape ${s}, keeping raw delta`);
-    return delta;
+    return warpDelta(delta);
   });
 })();
 
@@ -826,7 +873,7 @@ class TfFace extends HTMLElement {
 
   _applyBlendshapes(m) {
     const dst = this._workVertices;
-    dst.set(BASE_POSITIONS);
+    dst.set(WARPED_POSITIONS);
     const THRESHOLD = 1e-4;
 
     const apply = (bsIdx, weight, maskL, maskR) => {
