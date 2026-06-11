@@ -77,13 +77,196 @@ const BASE_NORMALS = (() => {
   return { nx, ny, nz };
 })();
 
+// Removes the rigid head motion (rotation + translation) baked into one raw
+// blendshape delta. The capture frames behind face-data.js had different head
+// poses, so every raw delta carries a whole-head transform — animating any
+// weight (blink, speech visemes) rocks the entire skull. A trimmed Kabsch fit
+// (orthogonal Procrustes with IRLS halving: each round keeps the half of the
+// vertex set with the smallest rigid-fit residual, which converges on the
+// skull) finds that rigid transform; subtracting it leaves only the local
+// deformation. Pure function, runs once per blendshape at import. Returns a
+// new Float32Array (same layout as the input delta) or null when the
+// iteration goes non-finite.
+export function removeRigidMotion(basePositions, delta, numVertices) {
+  const finite = (m) => m.every(Number.isFinite);
+  // c = a * b for row-major 3x3 matrices
+  const matMul = (a, b) => {
+    const c = new Array(9);
+    for (let r = 0; r < 3; r++) {
+      for (let k = 0; k < 3; k++) {
+        c[r * 3 + k] =
+          a[r * 3] * b[k] + a[r * 3 + 1] * b[3 + k] + a[r * 3 + 2] * b[6 + k];
+      }
+    }
+    return c;
+  };
+  // c = a^T * b
+  const matTMul = (a, b) => {
+    const c = new Array(9);
+    for (let r = 0; r < 3; r++) {
+      for (let k = 0; k < 3; k++) {
+        c[r * 3 + k] = a[r] * b[k] + a[3 + r] * b[3 + k] + a[6 + r] * b[6 + k];
+      }
+    }
+    return c;
+  };
+  const det3 = (m) =>
+    m[0] * (m[4] * m[8] - m[5] * m[7]) -
+    m[1] * (m[3] * m[8] - m[5] * m[6]) +
+    m[2] * (m[3] * m[7] - m[4] * m[6]);
+
+  // Best rigid (R, t) mapping P -> Q = P + delta over the given index set.
+  const fitRigid = (indices) => {
+    const n = indices.length;
+    let pcx = 0, pcy = 0, pcz = 0, qcx = 0, qcy = 0, qcz = 0;
+    for (const i of indices) {
+      const j = i * 3;
+      pcx += basePositions[j];
+      pcy += basePositions[j + 1];
+      pcz += basePositions[j + 2];
+      qcx += delta[j];
+      qcy += delta[j + 1];
+      qcz += delta[j + 2];
+    }
+    pcx /= n; pcy /= n; pcz /= n;
+    qcx = qcx / n + pcx; qcy = qcy / n + pcy; qcz = qcz / n + pcz;
+
+    // Cross-covariance M = sum (q - qc)(p - pc)^T; the Kabsch rotation is
+    // the orthogonal polar factor of M.
+    const M = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for (const i of indices) {
+      const j = i * 3;
+      const px = basePositions[j] - pcx;
+      const py = basePositions[j + 1] - pcy;
+      const pz = basePositions[j + 2] - pcz;
+      const qx = basePositions[j] + delta[j] - qcx;
+      const qy = basePositions[j + 1] + delta[j + 1] - qcy;
+      const qz = basePositions[j + 2] + delta[j + 2] - qcz;
+      M[0] += qx * px; M[1] += qx * py; M[2] += qx * pz;
+      M[3] += qy * px; M[4] += qy * py; M[5] += qy * pz;
+      M[6] += qz * px; M[7] += qz * py; M[8] += qz * pz;
+    }
+    let frob = 0;
+    for (const v of M) frob += v * v;
+    frob = Math.sqrt(frob);
+    let R;
+    if (!(frob > 1e-12)) {
+      // Degenerate covariance (e.g. near-zero delta): rigid part is pure
+      // translation between centroids.
+      R = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    } else {
+      // Newton-Schulz polar iteration on the Frobenius-normalized M; its
+      // singular values are then <= 1, inside the convergence region.
+      let X = M.map((v) => v / frob);
+      for (let it = 0; it < 30; it++) {
+        const T = matTMul(X, X);
+        const E = [
+          3 - T[0], -T[1], -T[2],
+          -T[3], 3 - T[4], -T[5],
+          -T[6], -T[7], 3 - T[8],
+        ];
+        X = matMul(X, E).map((v) => v * 0.5);
+      }
+      if (!finite(X)) return null;
+      R = X;
+      if (det3(R) <= 0) {
+        // Polar factor is a reflection; flip the smallest singular direction:
+        // R <- R (I - 2 v v^T), v = eigenvector of M^T M with the smallest
+        // eigenvalue, found by power iteration on (trace(A) I - A).
+        const A = matTMul(M, M);
+        const s = A[0] + A[4] + A[8];
+        const B = [
+          s - A[0], -A[1], -A[2],
+          -A[3], s - A[4], -A[5],
+          -A[6], -A[7], s - A[8],
+        ];
+        let v = [1, 0.5, 0.25];
+        for (let it = 0; it < 60; it++) {
+          const w = [
+            B[0] * v[0] + B[1] * v[1] + B[2] * v[2],
+            B[3] * v[0] + B[4] * v[1] + B[5] * v[2],
+            B[6] * v[0] + B[7] * v[1] + B[8] * v[2],
+          ];
+          const len = Math.sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+          if (!(len > 1e-12)) break;
+          v = [w[0] / len, w[1] / len, w[2] / len];
+        }
+        const F = [
+          1 - 2 * v[0] * v[0], -2 * v[0] * v[1], -2 * v[0] * v[2],
+          -2 * v[1] * v[0], 1 - 2 * v[1] * v[1], -2 * v[1] * v[2],
+          -2 * v[2] * v[0], -2 * v[2] * v[1], 1 - 2 * v[2] * v[2],
+        ];
+        R = matMul(R, F);
+      }
+    }
+    const t = [
+      qcx - (R[0] * pcx + R[1] * pcy + R[2] * pcz),
+      qcy - (R[3] * pcx + R[4] * pcy + R[5] * pcz),
+      qcz - (R[6] * pcx + R[7] * pcy + R[8] * pcz),
+    ];
+    if (!finite(R) || !finite(t)) return null;
+    return { R, t };
+  };
+
+  const residual = (R, t, i) => {
+    const j = i * 3;
+    const px = basePositions[j];
+    const py = basePositions[j + 1];
+    const pz = basePositions[j + 2];
+    const rx = px + delta[j] - (R[0] * px + R[1] * py + R[2] * pz + t[0]);
+    const ry = py + delta[j + 1] - (R[3] * px + R[4] * py + R[5] * pz + t[1]);
+    const rz = pz + delta[j + 2] - (R[6] * px + R[7] * py + R[8] * pz + t[2]);
+    return Math.sqrt(rx * rx + ry * ry + rz * rz);
+  };
+
+  let indices = Array.from({ length: numVertices }, (_, i) => i);
+  let fit = null;
+  for (let round = 0; round < 3; round++) {
+    fit = fitRigid(indices);
+    if (!fit) return null;
+    if (round < 2) {
+      const scored = indices.map((i) => ({ i, r: residual(fit.R, fit.t, i) }));
+      scored.sort((a, b) => a.r - b.r);
+      indices = scored
+        .slice(0, Math.max(3, Math.ceil(scored.length / 2)))
+        .map((s) => s.i);
+    }
+  }
+
+  const { R, t } = fit;
+  const out = new Float32Array(numVertices * 3);
+  for (let i = 0; i < numVertices; i++) {
+    const j = i * 3;
+    const px = basePositions[j];
+    const py = basePositions[j + 1];
+    const pz = basePositions[j + 2];
+    out[j] = px + delta[j] - (R[0] * px + R[1] * py + R[2] * pz + t[0]);
+    out[j + 1] = py + delta[j + 1] - (R[3] * px + R[4] * py + R[5] * pz + t[1]);
+    out[j + 2] = pz + delta[j + 2] - (R[6] * px + R[7] * py + R[8] * pz + t[2]);
+  }
+  return out;
+}
+
+// Rigid-motion-free blendshape deltas; the renderer must only ever use these
+// (never raw BLENDSHAPE_DELTAS) so animating a weight deforms the face
+// locally instead of rocking the whole head.
+const CLEAN_DELTAS = (() => {
+  return BLENDSHAPE_DELTAS.map((delta, s) => {
+    const cleaned = removeRigidMotion(BASE_POSITIONS, delta, NUM_VERTICES);
+    if (cleaned) return cleaned;
+    console.warn(`tf-face: rigid-motion removal failed for blendshape ${s}, keeping raw delta`);
+    return delta;
+  });
+})();
+
 // Viewer-left eye vertices, derived from the blink blendshape: the vertices
 // the blink moves the most inside LEFT_MASK. Used as the zoom anchor in
-// transitionOut().
+// transitionOut(). Uses CLEAN_DELTAS so the magnitude ranking reflects the
+// actual eyelid deformation, not the rigid head motion baked into raw data.
 const VIEWER_LEFT_EYE_INDICES = (() => {
   const blinkIdx = BS_INDEX.blink;
   if (blinkIdx == null || blinkIdx < 0) return [];
-  const deltas = BLENDSHAPE_DELTAS[blinkIdx];
+  const deltas = CLEAN_DELTAS[blinkIdx];
   if (!deltas) return [];
   const MASK_THRESHOLD = 0.5;
   const candidates = [];
@@ -648,7 +831,7 @@ class TfFace extends HTMLElement {
 
     const apply = (bsIdx, weight, maskL, maskR) => {
       if (bsIdx < 0 || Math.abs(weight) <= THRESHOLD) return;
-      const deltas = BLENDSHAPE_DELTAS[bsIdx];
+      const deltas = CLEAN_DELTAS[bsIdx];
       const mask = maskL || maskR || null;
       if (mask) {
         for (let i = 0; i < NUM_VERTICES; i++) {
