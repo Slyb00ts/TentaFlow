@@ -218,7 +218,16 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
             let mut svc_inputs: HashSet<InputModality> = HashSet::new();
             let mut svc_outputs: HashSet<OutputModality> = HashSet::new();
             if let Some(m) = manifest {
-                let preset = m.model_presets.iter().find(|p| p.id == model.model_name);
+                // Wiersz modelu moze nosic nazwe presetu (`p.id`, lokalne
+                // silniki) albo realny identyfikator API providera (`p.repo`,
+                // cloud external — patrz `models_from_manifest`). Dopasowanie
+                // po obu konwencjach gwarantuje, ze preset-level overrides
+                // dzialaja niezaleznie od tego, ktora nazwa trafila do
+                // `model_registry`.
+                let preset = m
+                    .model_presets
+                    .iter()
+                    .find(|p| p.id == model.model_name || p.repo == model.model_name);
                 for s in m.engine.effective_service_surfaces(preset) {
                     if let Some(v) = ServiceSurface::from_wire_str(&s) {
                         svc_surfaces.insert(v);
@@ -234,8 +243,27 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
                         svc_outputs.insert(v);
                     }
                 }
-            } else if let Some(s) = ServiceSurface::from_manifest_category(&svc.category) {
-                svc_surfaces.insert(s);
+            } else {
+                // Manifest nieznany na tym nodzie (np. serwis z mesh od noda
+                // z innym zestawem silnikow) — surfaces i modalnosci spadaja
+                // na domyslne wartosci kategorii zapisanej w `services.category`.
+                if let Some(s) = ServiceSurface::from_manifest_category(&svc.category) {
+                    svc_surfaces.insert(s);
+                }
+                if let Some(cat) =
+                    crate::services::manifest::Category::from_category_tag(&svc.category)
+                {
+                    for s in cat.default_input_modalities() {
+                        if let Some(v) = InputModality::from_wire_str(s) {
+                            svc_inputs.insert(v);
+                        }
+                    }
+                    for s in cat.default_output_modalities() {
+                        if let Some(v) = OutputModality::from_wire_str(s) {
+                            svc_outputs.insert(v);
+                        }
+                    }
+                }
             }
 
             // Entry-level union — keeps `/v1/models` and the catalog
@@ -1080,6 +1108,153 @@ mod tests {
             "expected RemoteShadowed diagnostic, got {:?}",
             survivor.diagnostic
         );
+    }
+
+    /// `ServiceInfo` dla external cloud providera (engine_id + category +
+    /// pojedynczy model). Wspolny builder dla testow ponizej.
+    fn external_service_info(
+        id: i64,
+        node_id: &str,
+        engine_id: &str,
+        category: &str,
+        model_name: &str,
+    ) -> tentaflow_protocol::ServiceInfo {
+        use tentaflow_protocol::{ServiceInfo, ServiceModelEntry};
+        ServiceInfo {
+            id,
+            node_id: node_id.to_string(),
+            engine_id: engine_id.into(),
+            category: category.into(),
+            display_name: "OpenAI".into(),
+            deploy_method: "external".into(),
+            transport: "external_http".into(),
+            status: "running".into(),
+            pinned: false,
+            paused: false,
+            runtime_pid: None,
+            runtime_port: None,
+            sidecar_quic_port: None,
+            endpoint_url: Some("https://api.openai.com/v1".into()),
+            restart_count: 0,
+            health_last_err: None,
+            active_deploy_id: String::new(),
+            last_deploy_id: String::new(),
+            deployment_progress_pct: 100,
+            progress_message: None,
+            models: vec![ServiceModelEntry {
+                model_name: model_name.into(),
+                display_name: None,
+                capabilities: vec!["chat".into()],
+                context_length: None,
+                quantization: None,
+                is_default: true,
+            }],
+            update_available: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            request_time_parameters: Default::default(),
+        }
+    }
+
+    /// External cloud provider (openai) z presetem o `id != repo`
+    /// ("gpt-5-5" vs "gpt-5.5"). Wpis katalogu musi dostac surfaces=[Chat]
+    /// i tekstowe modalnosci niezaleznie od tego, ktora konwencja nazwy
+    /// trafila do `model_registry` (preset id ze starszych deployow albo
+    /// repo z `models_from_manifest` dla cloud external).
+    #[test]
+    fn external_openai_models_get_chat_surface_for_both_name_conventions() {
+        let registry = MeshServicesRegistry::new();
+        let local_node = "node-test".to_string();
+        registry.replace_local(
+            local_node.clone(),
+            vec![
+                external_service_info(1, &local_node, "openai", "llm", "gpt-5-5"),
+                external_service_info(2, &local_node, "openai", "llm", "gpt-5.5"),
+            ],
+        );
+        let entries = build_service_model_entries(&registry);
+        for name in ["gpt-5-5", "gpt-5.5"] {
+            let entry = entries
+                .iter()
+                .find(|e| e.id == name)
+                .unwrap_or_else(|| panic!("entry '{name}' must exist"));
+            assert_eq!(
+                entry.service_surfaces,
+                vec![ServiceSurface::Chat],
+                "entry '{name}' surfaces"
+            );
+            assert_eq!(entry.input_modalities, vec![InputModality::Text]);
+            assert_eq!(entry.output_modalities, vec![OutputModality::Text]);
+        }
+    }
+
+    /// Serwis z mesh, ktorego silnika nie ma w lokalnym rejestrze manifestow
+    /// (np. nod z innym zestawem silnikow). Fallback z `services.category`
+    /// musi dac zarowno surface jak i domyslne modalnosci kategorii.
+    #[test]
+    fn unknown_engine_falls_back_to_category_surfaces_and_modalities() {
+        let registry = MeshServicesRegistry::new();
+        registry.replace_local(
+            "local-node".to_string(),
+            vec![external_service_info(
+                1,
+                "peer-node",
+                "engine-not-in-registry",
+                "llm",
+                "mystery-model",
+            )],
+        );
+        let entries = build_service_model_entries(&registry);
+        let entry = entries
+            .iter()
+            .find(|e| e.id == "mystery-model")
+            .expect("mystery-model entry must exist");
+        assert_eq!(entry.service_surfaces, vec![ServiceSurface::Chat]);
+        assert_eq!(entry.input_modalities, vec![InputModality::Text]);
+        assert_eq!(entry.output_modalities, vec![OutputModality::Text]);
+    }
+
+    /// End-to-end: wpis external openai zbudowany przez provider musi
+    /// rozwiazywac sie w resolverze dla surface=Chat output=[Text] —
+    /// dokladnie ten zestaw wymagan, ktory wysyla `stream_chat`.
+    #[test]
+    fn external_openai_entry_resolves_for_chat_text_request() {
+        use crate::services::handles_cache::LiveHandlesCache;
+        use crate::services::runtime::context::ExecutionContext;
+        use crate::services::runtime::resolver::{AliasResolver, ResolveRequest};
+
+        let pool = fresh_db();
+        let registry = MeshServicesRegistry::new();
+        registry.replace_local(
+            "local-node".to_string(),
+            vec![external_service_info(
+                1,
+                "peer-node",
+                "openai",
+                "llm",
+                "gpt-5-5",
+            )],
+        );
+        let provider = CatalogProvider::new();
+        provider.rebuild(&registry, &pool).unwrap();
+        let snap = provider.snapshot();
+
+        let resolver = AliasResolver::new_with_static_id(
+            Arc::new(LiveHandlesCache::new()),
+            "local-node".to_string(),
+        );
+        let mut ctx = ExecutionContext::new(None);
+        let req = ResolveRequest {
+            requested_model: "gpt-5-5",
+            required_surface: ServiceSurface::Chat,
+            required_input_modalities: &[],
+            required_output_modalities: &[OutputModality::Text],
+        };
+        let outcome = resolver
+            .resolve(&req, &snap, &mut ctx)
+            .expect("external openai model must resolve for chat/text");
+        assert_eq!(outcome.candidates.len(), 1);
+        assert_eq!(outcome.candidates[0].requested_model(), "gpt-5-5");
     }
 
     #[test]
