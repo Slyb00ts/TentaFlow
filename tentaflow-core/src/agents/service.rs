@@ -114,23 +114,26 @@ impl AgentService {
     /// `principal`: addon tools admitted by the agent's allowlist AND granted
     /// to the principal, plus the allowed core.* builtins (§3.1, §3.3). Reads
     /// the live addon tool list and per-addon "llm" permission for the
-    /// principal's user.
+    /// principal's user. The sub-agent control builtins surface only when the
+    /// agent may spawn (`max_subagents > 0`, §3.6).
     pub fn tool_catalog(&self, agent: &DbAgent, principal: &AgentPrincipal) -> Vec<LlmToolSpec> {
-        self.tool_catalog_from_allowlist(&agent.tools_json, principal)
+        self.tool_catalog_from_allowlist(&agent.tools_json, principal, agent.max_subagents > 0)
     }
 
-    /// Same as `tool_catalog` but driven by a raw allowlist JSON — the harness
-    /// passes the agent's `tools_json` through flow variables, so the block can
-    /// resolve the catalog without re-loading the agent row.
+    /// Same as `tool_catalog` but driven by a raw allowlist JSON + an explicit
+    /// `can_spawn` flag — the harness passes the agent's `tools_json` through
+    /// flow variables, so the block can resolve the catalog without re-loading
+    /// the agent row.
     pub fn tool_catalog_from_allowlist(
         &self,
         tools_json: &str,
         principal: &AgentPrincipal,
+        can_spawn: bool,
     ) -> Vec<LlmToolSpec> {
         let addon_tools = self.addon_manager.list_tools();
         let checker = self.addon_manager.permission_checker();
         let user_id = principal.user_id().map(|s| s.to_string());
-        ToolCatalog::resolve(tools_json, principal, &addon_tools, |addon_id| {
+        ToolCatalog::resolve(tools_json, principal, &addon_tools, can_spawn, |addon_id| {
             // No user → no addon tool admission (the catalog already short-
             // circuits, but keep the check explicit). Admin bypass and grant
             // logic live entirely in the permission engine.
@@ -193,6 +196,65 @@ impl AgentService {
     ) -> Result<serde_json::Value> {
         self.tool_dispatcher
             .dispatch_tool_call(tool_name, arguments, user_id)
+    }
+
+    /// Executes one addon tool call skipping the addon permission check — the
+    /// harness already adjudicated a grant (§3.13 B, AllowOnce / AllowForRun
+    /// retries). NEVER call without first gating permission via
+    /// `permission_for_tool`.
+    pub fn dispatch_addon_tool_preauthorized(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        user_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.tool_dispatcher
+            .dispatch_tool_call_preauthorized(tool_name, arguments, user_id)
+    }
+
+    /// Resolves the live `"llm"` permission of `user_id` for the addon owning
+    /// `tool_name` (the per-tool permission the harness gates on, §3.13 B).
+    /// Returns the three-state result so the caller can distinguish an explicit
+    /// deny from a NotConfigured deny (only the latter raises a grant card).
+    pub fn permission_for_tool(
+        &self,
+        tool_name: &str,
+        user_id: &str,
+    ) -> crate::addon::permissions::PermissionResult {
+        let addon_id = tool_name.split_once('.').map(|(a, _)| a).unwrap_or(tool_name);
+        self.addon_manager
+            .permission_checker()
+            .check(addon_id, user_id, "llm", None)
+    }
+
+    /// Persists a principal-scoped `"llm"` grant for the addon owning
+    /// `tool_name` (the `Always` decision, §3.13 B) and refreshes the permission
+    /// cache so a retry passes immediately. `global` (admin-only, decided by the
+    /// handler) writes the addon default instead of a per-user grant.
+    pub fn persist_tool_grant(
+        &self,
+        tool_name: &str,
+        user_id: &str,
+        global: bool,
+        actor_user_id: Option<&str>,
+    ) -> Result<()> {
+        let addon_id = tool_name.split_once('.').map(|(a, _)| a).unwrap_or(tool_name);
+        if global {
+            repository::upsert_permission_default(&self.db, addon_id, "llm", "allow", actor_user_id)?;
+        } else {
+            repository::upsert_permission(
+                &self.db,
+                addon_id,
+                "user",
+                user_id,
+                "llm",
+                "allow",
+                actor_user_id,
+            )?;
+        }
+        // Refresh the proactive cache so the retried call sees the grant.
+        self.addon_manager.permission_checker().refresh_addon(addon_id);
+        Ok(())
     }
 
     /// Whether a model-issued tool name is inside the agent's allowlist — the

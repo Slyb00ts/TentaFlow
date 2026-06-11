@@ -183,7 +183,7 @@ pub async fn execute_blocking(
             abort_join_set(&mut join_set).await;
             break;
         }
-        if let Some(dl) = ctx.deadline {
+        if let Some(dl) = ctx.effective_deadline() {
             if Instant::now() >= dl {
                 error = Some("deadline exceeded".into());
                 last_finish_reason = Some(FinishReason::Error);
@@ -503,7 +503,7 @@ pub async fn execute_streaming(
         if ctx.cancel_token.is_cancelled() {
             return Err(anyhow!("cancelled"));
         }
-        if let Some(dl) = ctx.deadline {
+        if let Some(dl) = ctx.effective_deadline() {
             if Instant::now() >= dl {
                 return Err(anyhow!("deadline exceeded"));
             }
@@ -2114,5 +2114,301 @@ mod concurrent_executor_tests {
             )),
             "true branch must be reported skipped: {evs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod harness_streaming_tests {
+    //! §3.11 B end-to-end: `execute_streaming` drives a `loop` block as the
+    //! stream producer. The outer flow is `trigger → loop → output(stream)`; the
+    //! loop's body flow is `trigger → stream_body → output(stream)`. Intermediate
+    //! iterations run blocking (driving a counter), and the FINAL iteration
+    //! streams its deltas, which `execute_streaming` forwards to the client. This
+    //! is the harness final-answer path: Agent Run's loop produces, Agent
+    //! Iteration ends in output(stream).
+    use super::execute_streaming;
+    use crate::db::{migrations, DbPool};
+    use crate::flow_engine::cache::CompiledFlow;
+    use crate::flow_engine::envelope::{
+        EnvelopeDelta, FinishReason, FlowEnvelope, FlowValue, LlmStreamChunk, NodeInput,
+    };
+    use crate::flow_engine::node_adapter::{
+        test_support::stub_ctx, ExecutionContext, NodeAdapter, PortSpec, StreamProducerAdapter,
+    };
+    use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
+    use crate::flow_engine::types::{FlowDataType, FlowNode};
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use futures::stream::{BoxStream, StreamExt};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    fn db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        migrations::run(&conn).expect("migrations");
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn insert_flow(pool: &DbPool, id: &str, json: &str) {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO flows (id, name, service_type, flow_json, status, is_default) \
+             VALUES (?1, ?2, NULL, ?3, 'active', 0)",
+            rusqlite::params![id, id, json],
+        )
+        .expect("insert flow");
+    }
+
+    /// Body producer: `execute` (blocking iterations) bumps a counter + sets
+    /// harness_done at `stop_at`; `produce_stream` (final pass) streams the
+    /// final answer tagged with the iteration count.
+    struct StreamBody {
+        stop_at: i64,
+    }
+
+    #[async_trait]
+    impl NodeAdapter for StreamBody {
+        fn node_type(&self) -> &str {
+            "harness_stream_body"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Text)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![
+                PortSpec::new("stream", FlowDataType::Text),
+                PortSpec::new("full", FlowDataType::Text),
+            ]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            let mut env = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+            let n = env.meta.get("iter").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+            env.meta.insert("iter".into(), Value::from(n));
+            if n >= self.stop_at {
+                env.meta.insert("harness_done".into(), Value::Bool(true));
+            }
+            env.payload = FlowValue::Text(format!("blocking iter {n}"));
+            Ok(env)
+        }
+    }
+
+    #[async_trait]
+    impl StreamProducerAdapter for StreamBody {
+        async fn produce_stream(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+            let env = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+            let iter = env.meta.get("iter").and_then(|v| v.as_i64()).unwrap_or(0);
+            let first = LlmStreamChunk {
+                text_delta: format!("FINAL(iter={iter})"),
+                ..Default::default()
+            };
+            let last = LlmStreamChunk {
+                finish_reason: Some(FinishReason::Stop),
+                ..Default::default()
+            };
+            Ok(futures::stream::iter(vec![
+                Ok(EnvelopeDelta::Llm(first)),
+                Ok(EnvelopeDelta::Llm(last)),
+            ])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_drives_loop_producer_end_to_end() {
+        let pool = db();
+
+        // The loop block (a registered stream producer) drives the body flow
+        // through a live SubflowRunner. Wire the runner's slot into the loop
+        // adapter via `build_registry_with_runner`, then fill the slot with a
+        // runner whose registry Weak points back at the Arc-wrapped registry.
+        let slot: SubflowRunnerSlot = Arc::new(parking_lot::RwLock::new(None));
+        let registry = {
+            let mut r = crate::flow_engine::dispatcher::build_registry_with_runner(slot.clone());
+            r.register_stream_producer(Arc::new(StreamBody { stop_at: 3 }));
+            Arc::new(r)
+        };
+        *slot.write() = Some(Arc::new(SubflowRunner::new(
+            pool.clone(),
+            Arc::downgrade(&registry),
+        )));
+
+        // Body flow (streaming end-shape): trigger → stream_body → output(stream).
+        let body_id = "00000000-harn-strm-body-000000000001";
+        insert_flow(
+            &pool,
+            body_id,
+            &json!({
+                "nodes": [
+                    {"id": "t", "type": "trigger", "config": {}},
+                    {"id": "b", "type": "harness_stream_body", "config": {}},
+                    {"id": "o", "type": "output", "config": {"mode": "stream"}}
+                ],
+                "edges": [
+                    {"from": "t", "from_port": "text", "to": "b", "to_port": "in"},
+                    {"from": "b", "from_port": "stream", "to": "o", "to_port": "text"}
+                ]
+            })
+            .to_string(),
+        );
+
+        // Outer flow row under id "0" so the executor's flow_executions write is
+        // FK-satisfiable (the outer run is a real audit row; the loop body
+        // iterations run light, no per-iteration rows).
+        insert_flow(&pool, "0", "{}");
+
+        // Outer flow: trigger → loop(body) → output(stream).
+        let outer_json = format!(
+            r#"{{
+                "nodes":[
+                    {{"id":"t1","type":"trigger","config":{{}}}},
+                    {{"id":"l1","type":"loop","config":{{"body_flow_id":"{body_id}","max_iterations":10}}}},
+                    {{"id":"o1","type":"output","config":{{"mode":"stream"}}}}
+                ],
+                "edges":[
+                    {{"from":"t1","to":"l1","from_port":"text","to_port":"in"}},
+                    {{"from":"l1","to":"o1","from_port":"stream","to_port":"text"}}
+                ]
+            }}"#
+        );
+        let compiled = Arc::new(
+            CompiledFlow::from_json("0", &outer_json, &registry).expect("compile outer"),
+        );
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("go".into());
+
+        let exec = execute_streaming(pool.clone(), compiled, initial, stub_ctx(), registry)
+            .await
+            .expect("execute_streaming");
+
+        let mut text = String::new();
+        let mut saw_finish = false;
+        let mut stream = exec.stream;
+        while let Some(item) = stream.next().await {
+            if let EnvelopeDelta::Llm(c) = item.expect("delta ok") {
+                text.push_str(&c.text_delta);
+                if c.finish_reason == Some(FinishReason::Stop) {
+                    saw_finish = true;
+                }
+            }
+        }
+        // 3 blocking iterations drove harness_done → the loop exits `until` with
+        // the already-computed answer ("blocking iter 3") and forwards THAT as a
+        // terminal stream. It must NOT run a fresh streaming pass (no
+        // "FINAL(iter=...)" marker) — that would re-answer a finished turn.
+        assert!(
+            text.contains("blocking iter 3"),
+            "loop did not forward the computed answer: {text:?}"
+        );
+        assert!(
+            !text.contains("FINAL("),
+            "until exit must not run a streaming pass: {text:?}"
+        );
+        assert!(saw_finish, "client never got finish_reason=Stop");
+
+        let outcome = exec.outcome.await.expect("outcome");
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("blocking iter 3"));
+    }
+
+    /// Finding 3 (end-to-end) — the grace-summary streaming pass runs through the
+    /// executor ONLY when the budget is exhausted with `final_pass=true`. The
+    /// body never sets harness_done, so the loop runs its full budget blocking,
+    /// then streams one final pass that emits the "FINAL(iter=N)" marker.
+    #[tokio::test]
+    async fn execute_streaming_runs_grace_pass_end_to_end() {
+        let pool = db();
+
+        let slot: SubflowRunnerSlot = Arc::new(parking_lot::RwLock::new(None));
+        let registry = {
+            let mut r = crate::flow_engine::dispatcher::build_registry_with_runner(slot.clone());
+            // stop_at far above the budget → harness_done never set.
+            r.register_stream_producer(Arc::new(StreamBody { stop_at: 1000 }));
+            Arc::new(r)
+        };
+        *slot.write() = Some(Arc::new(SubflowRunner::new(
+            pool.clone(),
+            Arc::downgrade(&registry),
+        )));
+
+        let body_id = "00000000-harn-strm-body-000000000002";
+        insert_flow(
+            &pool,
+            body_id,
+            &json!({
+                "nodes": [
+                    {"id": "t", "type": "trigger", "config": {}},
+                    {"id": "b", "type": "harness_stream_body", "config": {}},
+                    {"id": "o", "type": "output", "config": {"mode": "stream"}}
+                ],
+                "edges": [
+                    {"from": "t", "from_port": "text", "to": "b", "to_port": "in"},
+                    {"from": "b", "from_port": "stream", "to": "o", "to_port": "text"}
+                ]
+            })
+            .to_string(),
+        );
+        insert_flow(&pool, "0", "{}");
+
+        // Outer flow: budget 2 + final_pass so the grace pass streams.
+        let outer_json = format!(
+            r#"{{
+                "nodes":[
+                    {{"id":"t1","type":"trigger","config":{{}}}},
+                    {{"id":"l1","type":"loop","config":{{"body_flow_id":"{body_id}","max_iterations":2,"final_pass":true}}}},
+                    {{"id":"o1","type":"output","config":{{"mode":"stream"}}}}
+                ],
+                "edges":[
+                    {{"from":"t1","to":"l1","from_port":"text","to_port":"in"}},
+                    {{"from":"l1","to":"o1","from_port":"stream","to_port":"text"}}
+                ]
+            }}"#
+        );
+        let compiled = Arc::new(
+            CompiledFlow::from_json("0", &outer_json, &registry).expect("compile outer"),
+        );
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("go".into());
+
+        let exec = execute_streaming(pool.clone(), compiled, initial, stub_ctx(), registry)
+            .await
+            .expect("execute_streaming");
+
+        let mut text = String::new();
+        let mut saw_finish = false;
+        let mut stream = exec.stream;
+        while let Some(item) = stream.next().await {
+            if let EnvelopeDelta::Llm(c) = item.expect("delta ok") {
+                text.push_str(&c.text_delta);
+                if c.finish_reason == Some(FinishReason::Stop) {
+                    saw_finish = true;
+                }
+            }
+        }
+        // 2 blocking iterations exhausted the budget; the grace pass streamed
+        // with the last blocking iteration's count (iter=2).
+        assert!(text.contains("FINAL(iter=2)"), "grace pass did not stream: {text:?}");
+        assert!(saw_finish, "client never got finish_reason=Stop");
+
+        let outcome = exec.outcome.await.expect("outcome");
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some("FINAL(iter=2)"));
     }
 }

@@ -7,20 +7,24 @@
 // would do. Only the summary returns to the parent (Codex-review pattern): the
 // inner loop's full conversation (context.messages, the harness control signals)
 // is dropped, the parent envelope keeps its own context, and the result surfaces
-// as payload=Text(final) plus meta.agent_run_id / meta.agent_exit_reason. The
-// streaming final answer is forwarded via the loop's producer in a later §3.11-B
-// stage; this block is blocking now (documented gap). Recursion is bounded by
-// the same depth + visited guard as `subflow`, living in ExecutionContext.
-// (Harness §3.5 block 6, §3.5.0, §3.10.) =====
+// as payload=Text(final) plus meta.agent_run_id / meta.agent_exit_reason. When
+// a flow wires the block's `stream` output port, the agent block becomes the
+// parent's stream producer and forwards the agent harness flow's stream
+// (the harness flow's loop is the producer) token-by-token (§3.11 B). Recursion
+// is bounded by the same depth + visited guard as `subflow`, living in
+// ExecutionContext. (Harness §3.5 block 6, §3.5.0, §3.10, §3.11 B.) =====
 
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use serde_json::Value;
 
-use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue, NodeInput};
+use crate::flow_engine::node_adapter::{
+    ExecutionContext, NodeAdapter, PortSpec, StreamProducerAdapter,
+};
 use crate::flow_engine::subflow_runner::{SubflowRunnerSlot, MAX_SUBFLOW_DEPTH};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -69,26 +73,23 @@ impl AgentNodeAdapter {
             (None, c) => c,
         }
     }
-}
 
-#[async_trait]
-impl NodeAdapter for AgentNodeAdapter {
-    fn node_type(&self) -> &str {
-        NODE_TYPE
-    }
-    fn input_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("in", FlowDataType::Any)]
-    }
-    fn output_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("text", FlowDataType::Text)]
-    }
-
-    async fn execute(
+    /// Resolves the agent + runner, runs the recursion guards, and builds the
+    /// harness flow's trigger envelope (with `meta.agent_id` stamped) + the
+    /// budget-clamped child context — the setup shared by `execute` (blocking)
+    /// and `produce_stream` (streaming forward). Returns the resolved harness
+    /// flow id, the child input envelope, the runner, and the child ctx.
+    async fn prepare(
         &self,
         node: &FlowNode,
         inputs: &[NodeInput],
         ctx: &ExecutionContext,
-    ) -> Result<FlowEnvelope> {
+    ) -> Result<(
+        String,
+        FlowEnvelope,
+        std::sync::Arc<crate::flow_engine::subflow_runner::SubflowRunner>,
+        ExecutionContext,
+    )> {
         let agent_id = Self::agent_id(node)?;
 
         let service = self
@@ -149,6 +150,36 @@ impl NodeAdapter for AgentNodeAdapter {
         let mut child_ctx = ctx.clone();
         child_ctx.deadline = Self::clamp_deadline(agent.timeout_secs, ctx.deadline);
 
+        Ok((flow_id, child_input, runner, child_ctx))
+    }
+}
+
+#[async_trait]
+impl NodeAdapter for AgentNodeAdapter {
+    fn node_type(&self) -> &str {
+        NODE_TYPE
+    }
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Any)]
+    }
+    fn output_ports(&self) -> Vec<PortSpec> {
+        // `text` is the blocking final answer; `stream` (§3.11 B) forwards the
+        // agent harness flow's stream (the harness loop is the producer). A flow
+        // wiring `stream` makes this block the parent's stream producer (R7).
+        vec![
+            PortSpec::new("text", FlowDataType::Text),
+            PortSpec::new("stream", FlowDataType::Text),
+        ]
+    }
+
+    async fn execute(
+        &self,
+        node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<FlowEnvelope> {
+        let (flow_id, child_input, runner, child_ctx) = self.prepare(node, inputs, ctx).await?;
+
         let child_final = runner.run(&flow_id, child_input, &child_ctx, 1, false).await?;
 
         // Codex-review pattern: only the summary returns. The parent keeps its
@@ -178,6 +209,32 @@ impl NodeAdapter for AgentNodeAdapter {
         out.meta.insert("agent_exit_reason".into(), exit_reason);
 
         Ok(out)
+    }
+}
+
+/// §3.11 B — when a flow wires this block's `stream` output port, the agent
+/// block is the parent's stream producer: it forwards the agent harness flow's
+/// stream (the harness flow's `loop` is the producer) token-by-token. The
+/// harness flow runs via `SubflowRunner::run_streaming`; a harness flow without
+/// a streaming end-shape falls back to one terminal delta. The executor's
+/// producer finalizer aggregates the forwarded deltas into the parent outcome,
+/// so the harness flow's own outcome receiver is dropped here. Unlike the
+/// blocking `execute`, the streaming path forwards the harness deltas directly —
+/// the per-iteration conversation never enters the parent envelope because the
+/// deltas only carry the final answer text the harness loop streams out.
+#[async_trait]
+impl StreamProducerAdapter for AgentNodeAdapter {
+    async fn produce_stream(
+        &self,
+        node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+        let (flow_id, child_input, runner, child_ctx) = self.prepare(node, inputs, ctx).await?;
+        let exec = runner
+            .run_streaming(&flow_id, child_input, &child_ctx, 1, false)
+            .await?;
+        Ok(exec.stream)
     }
 }
 
@@ -482,5 +539,151 @@ mod tests {
             err.to_string().contains("missing config 'agent_id'"),
             "{err}"
         );
+    }
+
+    /// Streaming harness stand-in: a node that is the producer of a streaming
+    /// harness flow. Models the harness loop's streamed final answer.
+    struct StreamingHarnessAdapter;
+
+    #[async_trait]
+    impl NodeAdapter for StreamingHarnessAdapter {
+        fn node_type(&self) -> &str {
+            "fake_harness_stream"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Text)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![
+                PortSpec::new("stream", FlowDataType::Text),
+                PortSpec::new("full", FlowDataType::Text),
+            ]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            Ok(inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(|| (*ctx.initial_envelope).clone()))
+        }
+    }
+
+    #[async_trait]
+    impl StreamProducerAdapter for StreamingHarnessAdapter {
+        async fn produce_stream(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            _ctx: &ExecutionContext,
+        ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+            use crate::flow_engine::envelope::{FinishReason, LlmStreamChunk};
+            use futures::StreamExt;
+            // Assert the agent block stamped meta.agent_id into the trigger seed.
+            let agent_id = inputs
+                .first()
+                .and_then(|i| i.envelope.meta.get("agent_id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let first = LlmStreamChunk {
+                text_delta: format!("streamed answer for {agent_id}"),
+                ..Default::default()
+            };
+            let last = LlmStreamChunk {
+                finish_reason: Some(FinishReason::Stop),
+                ..Default::default()
+            };
+            Ok(futures::stream::iter(vec![
+                Ok(EnvelopeDelta::Llm(first)),
+                Ok(EnvelopeDelta::Llm(last)),
+            ])
+            .boxed())
+        }
+    }
+
+    fn streaming_harness_flow_json() -> String {
+        json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "h", "type": "fake_harness_stream", "config": {}},
+                {"id": "o", "type": "output", "config": {"mode": "stream"}}
+            ],
+            "edges": [
+                {"from": "t", "from_port": "text", "to": "h", "to_port": "in"},
+                {"from": "h", "from_port": "stream", "to": "o", "to_port": "text"}
+            ]
+        })
+        .to_string()
+    }
+
+    /// §3.11 B — `agent.produce_stream` forwards the agent harness flow's stream.
+    /// The harness flow's producer streams the final answer; the agent block
+    /// pipes those deltas straight out.
+    #[tokio::test]
+    async fn produce_stream_forwards_harness_flow_stream() {
+        use crate::flow_engine::envelope::FinishReason;
+        use futures::StreamExt;
+
+        let pool = db();
+        let flow_id = "eeee0000-agnt-strm-0000-000000000001";
+        insert_flow(&pool, flow_id, "agent-run", &streaming_harness_flow_json(), "active");
+        seed_agent(&pool, "agent-stream", "streamer", Some(flow_id), true);
+        let svc = service(pool.clone());
+
+        let mut registry = build_registry_for_test();
+        registry.register_stream_producer(Arc::new(StreamingHarnessAdapter));
+        let registry = Arc::new(registry);
+        let slot: SubflowRunnerSlot = Arc::new(parking_lot::RwLock::new(None));
+        let runner = Arc::new(SubflowRunner::new(pool.clone(), Arc::downgrade(&registry)));
+        *slot.write() = Some(runner);
+
+        let stream = AgentNodeAdapter::new(svc, slot)
+            .produce_stream(
+                &node(json!({"agent_id": "agent-stream"})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("produce_stream");
+
+        let mut text = String::new();
+        let mut saw_finish = false;
+        let mut s = stream;
+        while let Some(item) = s.next().await {
+            if let EnvelopeDelta::Llm(c) = item.expect("delta ok") {
+                text.push_str(&c.text_delta);
+                if c.finish_reason == Some(FinishReason::Stop) {
+                    saw_finish = true;
+                }
+            }
+        }
+        // The harness flow producer saw the agent id the block stamped.
+        assert!(text.contains("streamed answer for agent-stream"), "stream text: {text:?}");
+        assert!(saw_finish, "client never got finish_reason=Stop");
+    }
+
+    /// A disabled agent never streams — `produce_stream` errors at the guard.
+    #[tokio::test]
+    async fn produce_stream_disabled_agent_is_error() {
+        let pool = db();
+        seed_agent(&pool, "agent-off-stream", "off", None, false);
+        let svc = service(pool.clone());
+        let (_registry, runner) = registry_and_runner(pool.clone());
+
+        let result = AgentNodeAdapter::new(svc, runner)
+            .produce_stream(
+                &node(json!({"agent_id": "agent-off-stream"})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await;
+        let err = match result {
+            Ok(_) => panic!("disabled agent must not produce a stream"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("disabled"), "{err}");
     }
 }

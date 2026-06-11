@@ -14,8 +14,12 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::flow_engine::envelope::{ArtifactProvenance, FlowEnvelope, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use futures::stream::BoxStream;
+
+use crate::flow_engine::envelope::{ArtifactProvenance, EnvelopeDelta, FlowEnvelope, NodeInput};
+use crate::flow_engine::node_adapter::{
+    ExecutionContext, NodeAdapter, PortSpec, StreamProducerAdapter,
+};
 use crate::flow_engine::subflow_runner::{SubflowRunnerSlot, MAX_SUBFLOW_DEPTH};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -59,26 +63,22 @@ impl SubflowNodeAdapter {
             (None, c) => c,
         }
     }
-}
 
-#[async_trait]
-impl NodeAdapter for SubflowNodeAdapter {
-    fn node_type(&self) -> &str {
-        NODE_TYPE
-    }
-    fn input_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("in", FlowDataType::Any)]
-    }
-    fn output_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("full", FlowDataType::Any)]
-    }
-
-    async fn execute(
+    /// Resolves the runner, runs the recursion guards, and builds the child
+    /// trigger envelope + clamped child context — the setup shared by `execute`
+    /// (blocking) and `produce_stream` (streaming forward). Returns the resolved
+    /// flow id, the child input envelope, the runner handle, and the child ctx.
+    fn prepare<'a>(
         &self,
         node: &FlowNode,
         inputs: &[NodeInput],
-        ctx: &ExecutionContext,
-    ) -> Result<FlowEnvelope> {
+        ctx: &'a ExecutionContext,
+    ) -> Result<(
+        String,
+        FlowEnvelope,
+        std::sync::Arc<crate::flow_engine::subflow_runner::SubflowRunner>,
+        ExecutionContext,
+    )> {
         let flow_id = Self::flow_id(node)?;
 
         // Depth guard (§3.10): the child would run at depth+1, so a parent
@@ -88,12 +88,9 @@ impl NodeAdapter for SubflowNodeAdapter {
                 "subflow: max nesting depth {MAX_SUBFLOW_DEPTH} reached (flow '{flow_id}')"
             ));
         }
-
         // Cycle guard (§3.10): the flow id is on the visited stack path — this
         // also covers a block referencing its own enclosing flow (self-ref),
-        // since the enclosing flow id was pushed by the level above. The UI
-        // dynamic_enum cannot yet exclude the current flow id, so the runtime
-        // guard is the authoritative self-exclusion (UI gap).
+        // since the enclosing flow id was pushed by the level above.
         if ctx.subflow_visited.iter().any(|v| v == &flow_id) {
             return Err(anyhow!(
                 "subflow: cycle detected — flow '{flow_id}' already on the call path"
@@ -106,9 +103,6 @@ impl NodeAdapter for SubflowNodeAdapter {
             .clone()
             .ok_or_else(|| anyhow!("subflow: SubflowRunner slot not wired"))?;
 
-        // The current envelope is the child's trigger input. Build a child ctx
-        // with the clamped deadline; the runner clones it and rewrites the
-        // execution_id / usage_sink / depth / visited.
         let input_envelope: FlowEnvelope = inputs
             .first()
             .map(|i| (*i.envelope).clone())
@@ -116,6 +110,40 @@ impl NodeAdapter for SubflowNodeAdapter {
 
         let mut child_ctx = ctx.clone();
         child_ctx.deadline = Self::clamp_deadline(node, ctx.deadline);
+
+        Ok((flow_id, input_envelope, runner, child_ctx))
+    }
+}
+
+#[async_trait]
+impl NodeAdapter for SubflowNodeAdapter {
+    fn node_type(&self) -> &str {
+        NODE_TYPE
+    }
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Any)]
+    }
+    fn output_ports(&self) -> Vec<PortSpec> {
+        // `stream` (§3.11 B) forwards the child flow's stream producer output;
+        // `full` is the blocking child result. A flow wiring `stream` makes this
+        // block the parent's stream producer (R7); `full` keeps the blocking
+        // composition path.
+        vec![
+            PortSpec::new("stream", FlowDataType::Any),
+            PortSpec::new("full", FlowDataType::Any),
+        ]
+    }
+
+    async fn execute(
+        &self,
+        node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<FlowEnvelope> {
+        // The current envelope is the child's trigger input. The runner clones
+        // the child ctx and rewrites the execution_id / usage_sink / depth /
+        // visited; guards + clamped deadline are applied in `prepare`.
+        let (flow_id, input_envelope, runner, child_ctx) = self.prepare(node, inputs, ctx)?;
 
         let child_final = runner
             .run(&flow_id, input_envelope.clone(), &child_ctx, 1, false)
@@ -151,6 +179,30 @@ impl NodeAdapter for SubflowNodeAdapter {
         }
 
         Ok(out)
+    }
+}
+
+/// §3.11 B — when a flow wires this block's `stream` output port, the subflow is
+/// the parent's stream producer: it forwards the child flow's own stream
+/// producer output token-by-token. The child runs in streaming mode via
+/// `SubflowRunner::run_streaming`; a child without a streaming end-shape falls
+/// back to one terminal delta (the runner wraps the blocking result), so a
+/// `stream`-wired subflow always streams. The executor's producer finalizer
+/// aggregates the forwarded deltas into the parent outcome, so the child's own
+/// outcome receiver is dropped here.
+#[async_trait]
+impl StreamProducerAdapter for SubflowNodeAdapter {
+    async fn produce_stream(
+        &self,
+        node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+        let (flow_id, input_envelope, runner, child_ctx) = self.prepare(node, inputs, ctx)?;
+        let exec = runner
+            .run_streaming(&flow_id, input_envelope, &child_ctx, 1, false)
+            .await?;
+        Ok(exec.stream)
     }
 }
 
@@ -416,5 +468,102 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("slot not wired"), "{err}");
+    }
+
+    /// Streaming child flow: trigger → test_producer → output(stream). The
+    /// `TestStreamProducer` (test_support) emits a fixed two-chunk delta stream.
+    fn streaming_child_json() -> String {
+        json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "p", "type": "test_producer", "config": {}},
+                {"id": "o", "type": "output", "config": {"mode": "stream"}}
+            ],
+            "edges": [
+                {"from": "t", "from_port": "text", "to": "p", "to_port": "in"},
+                {"from": "p", "from_port": "stream", "to": "o", "to_port": "text"}
+            ]
+        })
+        .to_string()
+    }
+
+    /// §3.11 B — `subflow.produce_stream` forwards the child flow's stream
+    /// producer output token-by-token (the child runs in streaming mode).
+    #[tokio::test]
+    async fn produce_stream_forwards_child_stream() {
+        use crate::flow_engine::envelope::{EnvelopeDelta, FinishReason};
+        use crate::flow_engine::node_adapter::test_support::TestStreamProducer;
+        use futures::StreamExt;
+
+        let pool = db();
+        let child_id = "ffff0000-subf-strm-0000-000000000001";
+        insert_flow(&pool, child_id, "stream-child", &streaming_child_json(), "active");
+
+        // Registry with the streaming TestStreamProducer registered so the child
+        // flow's output(stream) end-shape validates and produces a stream.
+        let mut registry = build_registry_for_test();
+        registry.register_stream_producer(Arc::new(TestStreamProducer::new("test_producer")));
+        let registry = Arc::new(registry);
+        let slot: SubflowRunnerSlot = Arc::new(parking_lot::RwLock::new(None));
+        let runner = Arc::new(SubflowRunner::new(pool.clone(), Arc::downgrade(&registry)));
+        *slot.write() = Some(runner);
+
+        let stream = SubflowNodeAdapter::new(slot)
+            .produce_stream(
+                &node(json!({"flow_id": child_id})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("produce_stream");
+
+        let mut text = String::new();
+        let mut saw_finish = false;
+        let mut s = stream;
+        while let Some(item) = s.next().await {
+            if let EnvelopeDelta::Llm(c) = item.expect("delta ok") {
+                text.push_str(&c.text_delta);
+                if c.finish_reason == Some(FinishReason::Stop) {
+                    saw_finish = true;
+                }
+            }
+        }
+        assert!(text.contains("hello from test producer"), "stream text: {text:?}");
+        assert!(saw_finish, "client never got finish_reason=Stop");
+    }
+
+    /// A non-streaming child flow still produces a stream via `produce_stream` —
+    /// the runner wraps the blocking result as one terminal delta.
+    #[tokio::test]
+    async fn produce_stream_wraps_non_streaming_child() {
+        use crate::flow_engine::envelope::EnvelopeDelta;
+        use futures::StreamExt;
+
+        let pool = db();
+        let child_id = "ffff0000-subf-strm-0000-000000000002";
+        insert_flow(&pool, child_id, "blocking-child", &passthrough_flow_json(), "active");
+        let (_registry, slot) = registry_and_runner(pool.clone());
+
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("blocking-text".into());
+
+        let stream = SubflowNodeAdapter::new(slot)
+            .produce_stream(&node(json!({"flow_id": child_id})), &[input(env)], &stub_ctx())
+            .await
+            .expect("produce_stream");
+
+        let mut text = String::new();
+        let mut saw_finish = false;
+        let mut s = stream;
+        while let Some(item) = s.next().await {
+            if let EnvelopeDelta::Llm(c) = item.expect("delta ok") {
+                text.push_str(&c.text_delta);
+                if c.finish_reason.is_some() {
+                    saw_finish = true;
+                }
+            }
+        }
+        assert_eq!(text, "blocking-text");
+        assert!(saw_finish, "wrapped blocking result must carry a terminal finish_reason");
     }
 }

@@ -23,6 +23,8 @@ import '/js/components/tf-searchbox.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-empty-state.js';
+import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
+import { activityLabels } from '/js/lib/agent-activity-bridge.js';
 
 // Limits mirror db::repository AGENT_* constants so violations surface inline
 // instead of as backend bad_request round-trips.
@@ -48,6 +50,15 @@ const state = {
   enabledFilter: 'all',
   routableFilter: 'all',
   editor: null,
+  // Top-level Runs tab.
+  topTab: 'agents',
+  runs: [],
+  runsStatusFilter: 'all',
+  selectedRunId: null,
+  // Live AgentRunEvent steps keyed by run id (in-memory, ephemeral). Reconciled
+  // from RunDetail.run_log on open and appended from the run-events stream.
+  runSteps: new Map(),
+  runsUnsub: null,
 };
 
 function sprite(id) {
@@ -70,27 +81,53 @@ const AgentsScreen = {
         </div>
       </div>
 
-      <section class="card agents-card">
-        <div class="agents-toolbar">
-          <tf-searchbox id="agents-search" placeholder="${escapeAttr(I18n.t('agents.search_placeholder'))}" debounce="200"></tf-searchbox>
-          <tf-select id="agents-filter-enabled" class="agents-filter" value="all">
-            <option value="all">${escapeHtml(I18n.t('agents.filter_enabled_all'))}</option>
-            <option value="enabled">${escapeHtml(I18n.t('agents.filter_enabled_on'))}</option>
-            <option value="disabled">${escapeHtml(I18n.t('agents.filter_enabled_off'))}</option>
-          </tf-select>
-          <tf-select id="agents-filter-routable" class="agents-filter" value="all">
-            <option value="all">${escapeHtml(I18n.t('agents.filter_routable_all'))}</option>
-            <option value="routable">${escapeHtml(I18n.t('agents.filter_routable_on'))}</option>
-            <option value="not_routable">${escapeHtml(I18n.t('agents.filter_routable_off'))}</option>
-          </tf-select>
-        </div>
-        <div id="agents-table-host" class="agents-table-host"></div>
-      </section>
+      <tf-tabs variant="underline" value="agents" id="agents-top-tabs">
+        <tf-tab id="agents" icon="brain">${escapeHtml(I18n.t('agents.tab_agents'))}</tf-tab>
+        <tf-tab id="runs" icon="clock">${escapeHtml(I18n.t('agents.tab_runs'))}</tf-tab>
+      </tf-tabs>
+
+      <div class="agents-top-panel" data-top-panel="agents">
+        <section class="card agents-card">
+          <div class="agents-toolbar">
+            <tf-searchbox id="agents-search" placeholder="${escapeAttr(I18n.t('agents.search_placeholder'))}" debounce="200"></tf-searchbox>
+            <tf-select id="agents-filter-enabled" class="agents-filter" value="all">
+              <option value="all">${escapeHtml(I18n.t('agents.filter_enabled_all'))}</option>
+              <option value="enabled">${escapeHtml(I18n.t('agents.filter_enabled_on'))}</option>
+              <option value="disabled">${escapeHtml(I18n.t('agents.filter_enabled_off'))}</option>
+            </tf-select>
+            <tf-select id="agents-filter-routable" class="agents-filter" value="all">
+              <option value="all">${escapeHtml(I18n.t('agents.filter_routable_all'))}</option>
+              <option value="routable">${escapeHtml(I18n.t('agents.filter_routable_on'))}</option>
+              <option value="not_routable">${escapeHtml(I18n.t('agents.filter_routable_off'))}</option>
+            </tf-select>
+          </div>
+          <div id="agents-table-host" class="agents-table-host"></div>
+        </section>
+      </div>
+
+      <div class="agents-top-panel" data-top-panel="runs" hidden>
+        <section class="card agents-card">
+          <div class="agents-toolbar">
+            <tf-select id="runs-filter-status" class="agents-filter" value="all">
+              <option value="all">${escapeHtml(I18n.t('agents.runs_filter_status_all'))}</option>
+              <option value="active">${escapeHtml(I18n.t('agents.runs_filter_status_active'))}</option>
+              <option value="completed">${escapeHtml(I18n.t('agents.run_status_completed'))}</option>
+              <option value="failed">${escapeHtml(I18n.t('agents.run_status_failed'))}</option>
+            </tf-select>
+            <tf-button variant="ghost" icon="refresh" id="runs-refresh">${escapeHtml(I18n.t('agents.refresh'))}</tf-button>
+          </div>
+          <div id="runs-table-host" class="agents-runs-host"></div>
+          <div id="runs-detail-host" class="agents-run-detail"></div>
+        </section>
+      </div>
     `;
   },
 
   async mount() {
-    byId('agents-refresh')?.addEventListener('click', () => loadAgents());
+    byId('agents-refresh')?.addEventListener('click', () => {
+      if (state.topTab === 'runs') loadRunsTab();
+      else loadAgents();
+    });
     byId('agents-new')?.addEventListener('click', () => openAgentEditor(null));
     byId('agents-search')?.addEventListener('search', (e) => {
       state.searchQuery = String(e.detail?.value ?? '');
@@ -104,15 +141,29 @@ const AgentsScreen = {
       state.routableFilter = e.detail?.value ?? e.target.value ?? 'all';
       renderTable();
     });
+    byId('agents-top-tabs')?.addEventListener('change', (e) => {
+      const id = e.detail?.value;
+      if (id) switchTopTab(id);
+    });
+    byId('runs-refresh')?.addEventListener('click', () => loadRunsTab());
+    byId('runs-filter-status')?.addEventListener('change', (e) => {
+      state.runsStatusFilter = e.detail?.value ?? e.target.value ?? 'all';
+      renderRunsTable();
+    });
     await loadAgents();
   },
 
   unmount() {
     state.editor?.cleanup();
+    if (state.runsUnsub) { state.runsUnsub(); state.runsUnsub = null; }
     state.agents = [];
     state.searchQuery = '';
     state.enabledFilter = 'all';
     state.routableFilter = 'all';
+    state.topTab = 'agents';
+    state.runs = [];
+    state.selectedRunId = null;
+    state.runSteps = new Map();
   },
 };
 
@@ -264,6 +315,189 @@ function formatTimestamp(value) {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString(I18n.getLanguage());
+}
+
+// =============================================================================
+// Top-level Runs tab — live run list + shared timeline + cancel (ACL per
+// principal is enforced server-side; the list only returns the caller's runs
+// unless they are an admin).
+// =============================================================================
+
+function switchTopTab(tabId) {
+  state.topTab = tabId === 'runs' ? 'runs' : 'agents';
+  document.querySelectorAll('[data-top-panel]').forEach((panel) => {
+    panel.hidden = panel.getAttribute('data-top-panel') !== state.topTab;
+  });
+  if (state.topTab === 'runs') loadRunsTab();
+  else if (state.runsUnsub) { state.runsUnsub(); state.runsUnsub = null; }
+}
+
+async function loadRunsTab() {
+  const host = byId('runs-table-host');
+  if (host) host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.runs_loading'))}</div>`;
+  try {
+    const resp = await ApiBinary.one('agentRunsListRequest', {});
+    const rows = JSON.parse(resp.runsJson ?? resp.runs_json ?? '[]');
+    state.runs = Array.isArray(rows) ? rows : [];
+  } catch (err) {
+    if (host) host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${I18n.t('agents.runs_failed')}: ${err.message}`)}</div>`;
+    return;
+  }
+  renderRunsTable();
+}
+
+function filteredRuns() {
+  const f = state.runsStatusFilter;
+  return state.runs.filter((r) => {
+    if (f === 'all') return true;
+    if (f === 'active') return !['completed', 'failed', 'cancelled', 'interrupted'].includes(r.status);
+    return r.status === f;
+  });
+}
+
+function renderRunsTable() {
+  const host = byId('runs-table-host');
+  if (!host) return;
+  const runs = filteredRuns();
+  if (!runs.length) {
+    host.innerHTML = `<tf-empty-state icon="clock" title="${escapeAttr(I18n.t('agents.runs_empty'))}"></tf-empty-state>`;
+    return;
+  }
+  host.innerHTML = `
+    <tf-table id="runs-tab-table" sortable>
+      <tf-column key="status" label="${escapeAttr(I18n.t('agents.runs_col_status'))}" renderer="chip"></tf-column>
+      <tf-column key="agent" label="${escapeAttr(I18n.t('agents.runs_col_agent'))}" sortable></tf-column>
+      <tf-column key="iterations" label="${escapeAttr(I18n.t('agents.runs_col_iterations'))}" renderer="num" sortable></tf-column>
+      <tf-column key="tokens" label="${escapeAttr(I18n.t('agents.runs_col_tokens'))}" renderer="num" sortable></tf-column>
+      <tf-column key="exit_reason" label="${escapeAttr(I18n.t('agents.runs_col_exit'))}"></tf-column>
+      <tf-column key="created" label="${escapeAttr(I18n.t('agents.runs_col_created'))}" sortable></tf-column>
+    </tf-table>
+  `;
+  const table = host.querySelector('#runs-tab-table');
+  table.rows = runs.map((r) => ({
+    _id: r.id,
+    _status: r.status,
+    status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
+    agent: r.agent_id || '—',
+    iterations: r.iterations ?? 0,
+    tokens: r.total_tokens ?? 0,
+    exit_reason: r.exit_reason || '—',
+    created: formatTimestamp(r.created_at),
+  }));
+  table.rowActions = buildRunRowActions;
+  table.addEventListener('row-click', (e) => {
+    const id = e.detail?.row?._id;
+    if (id) openRunDetail(id);
+  });
+}
+
+function buildRunRowActions(row) {
+  const active = !['completed', 'failed', 'cancelled', 'interrupted'].includes(row._status);
+  if (!active) return null;
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', 'ghost');
+  btn.setAttribute('size', 'sm');
+  btn.textContent = I18n.t('agents.action_cancel');
+  btn.addEventListener('click', () => cancelRun(row._id));
+  return btn;
+}
+
+async function cancelRun(runId) {
+  if (!runId) return;
+  try {
+    const resp = await ApiBinary.action('agentRunCancelRequest', { runId });
+    if (resp && (resp.cancelled === true || resp.cancelled === 'true')) {
+      toast(I18n.t('agents.run_cancel_ok'), 'success');
+    }
+    await loadRunsTab();
+  } catch (err) {
+    toast(`${I18n.t('agents.run_cancel_failed')}: ${err.message}`, 'error');
+  }
+}
+
+// Live per-step updates land in the open detail timeline via its own run-scope
+// subscription (openRunDetail). The list refreshes on tab open and on each
+// cancel — a list-wide socket would need one broadcast key per run, whereas the
+// drill-in owns a single key matching the widget's level-2 contract.
+async function openRunDetail(runId) {
+  state.selectedRunId = runId;
+  const host = byId('runs-detail-host');
+  if (!host) return;
+  host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.runs_loading'))}</div>`;
+  let run = null;
+  try {
+    const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
+    run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+  } catch (err) {
+    host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${I18n.t('agents.run_detail_failed')}: ${err.message}`)}</div>`;
+    return;
+  }
+  if (!run) return;
+  // Seed the timeline from run_log (durable record), then append live events.
+  state.runSteps.set(runId, runLogToSteps(run));
+  host.innerHTML = renderRunDetail(run);
+
+  // Live updates for this run scope: append each AgentRunEvent as a step.
+  if (state.runsUnsub) { state.runsUnsub(); state.runsUnsub = null; }
+  if (!['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status)) {
+    ApiBinary.subscribe(
+      'agentRunEventsSubscribeRequest',
+      { scopeKind: 'run', scopeId: runId },
+      {
+        onChunk: (body) => {
+          if (!body || body.variant !== 'AgentRunEvent') return;
+          if (state.selectedRunId !== runId) return;
+          const steps = state.runSteps.get(runId) || [];
+          const step = TfAgentActivity.stepsFromEvents([body], activityLabels())[0];
+          step.ts = new Date().toLocaleTimeString();
+          steps.push(step);
+          state.runSteps.set(runId, steps);
+          const tl = byId('runs-detail-host')?.querySelector('[data-run-timeline]');
+          if (tl) tl.innerHTML = TfAgentActivity.renderTimeline(steps, activityLabels());
+        },
+        onError: () => {},
+        onEnd: () => { state.runsUnsub = null; },
+      },
+    ).then((unsub) => { state.runsUnsub = unsub; }).catch(() => {});
+  }
+}
+
+// run_log is a JSON array of harness step objects. Map them onto the shared
+// timeline's step shape so live events and durable history render identically.
+function runLogToSteps(run) {
+  let raw = [];
+  try {
+    const parsed = JSON.parse(run.run_log || '[]');
+    if (Array.isArray(parsed)) raw = parsed;
+  } catch {
+    raw = [];
+  }
+  return raw.map((s) => ({
+    tone: s.status === 'error' || s.status === 'failed' ? 'err' : s.status === 'ok' ? 'ok' : 'info',
+    kind: String(s.kind || s.type || I18n.t('agents.run_step')),
+    detail: String(s.detail || s.message || s.tool || ''),
+    ts: s.at || s.timestamp ? formatTimestamp(String(s.at || s.timestamp)) : '',
+  }));
+}
+
+function renderRunDetail(run) {
+  const steps = state.runSteps.get(run.id) || [];
+  const meta = `
+    <div class="agents-run-meta">
+      <tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}">${escapeHtml(runStatusLabel(run.status))}</tf-chip>
+      <span>${escapeHtml(I18n.t('agents.runs_col_iterations'))}: ${escapeHtml(String(run.iterations ?? 0))}</span>
+      <span>${escapeHtml(I18n.t('agents.runs_col_tokens'))}: ${escapeHtml(String(run.total_tokens ?? 0))}</span>
+      ${run.exit_reason ? `<span>${escapeHtml(I18n.t('agents.runs_col_exit'))}: ${escapeHtml(run.exit_reason)}</span>` : ''}
+    </div>`;
+  const prompt = run.prompt
+    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_prompt'))}</span><pre>${escapeHtml(run.prompt)}</pre></div>`
+    : '';
+  const result = run.result
+    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_result'))}</span><pre>${escapeHtml(run.result)}</pre></div>`
+    : '';
+  const timeline = `<div data-run-timeline>${TfAgentActivity.renderTimeline(steps, activityLabels())}</div>`;
+  return `${meta}${prompt}${result}
+    <div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_timeline'))}</span>${timeline}</div>`;
 }
 
 // =============================================================================
@@ -682,60 +916,13 @@ async function loadRunDetail(runId) {
     return;
   }
   if (!run) return;
-  host.innerHTML = renderRunTimeline(run);
+  // Same shared renderer as the top-level Runs tab (one renderer, two contexts).
+  state.runSteps.set(run.id, runLogToSteps(run));
+  host.innerHTML = renderRunDetail(run);
 }
 
 function runStatusLabel(status) {
   return RUN_STATUS_CHIP[status] ? I18n.t(`agents.run_status_${status}`) : status;
-}
-
-// The run_log is a JSON array of step objects written by the harness blocks
-// (agent_context / tool_exec). We render whatever structured fields are present
-// without assuming a fixed schema — the timeline degrades gracefully.
-function renderRunTimeline(run) {
-  let steps = [];
-  try {
-    const parsed = JSON.parse(run.run_log || '[]');
-    if (Array.isArray(parsed)) steps = parsed;
-  } catch {
-    steps = [];
-  }
-
-  const meta = `
-    <div class="agents-run-meta">
-      <tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}">${escapeHtml(runStatusLabel(run.status))}</tf-chip>
-      <span>${escapeHtml(I18n.t('agents.runs_col_iterations'))}: ${escapeHtml(String(run.iterations ?? 0))}</span>
-      <span>${escapeHtml(I18n.t('agents.runs_col_tokens'))}: ${escapeHtml(String(run.total_tokens ?? 0))}</span>
-      ${run.exit_reason ? `<span>${escapeHtml(I18n.t('agents.runs_col_exit'))}: ${escapeHtml(run.exit_reason)}</span>` : ''}
-    </div>
-  `;
-
-  const prompt = run.prompt
-    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_prompt'))}</span><pre>${escapeHtml(run.prompt)}</pre></div>`
-    : '';
-  const result = run.result
-    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_result'))}</span><pre>${escapeHtml(run.result)}</pre></div>`
-    : '';
-
-  const timeline = steps.length
-    ? `<ol class="agents-run-timeline">${steps.map(renderRunStep).join('')}</ol>`
-    : `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.run_no_steps'))}</div>`;
-
-  return `${meta}${prompt}${result}
-    <div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_timeline'))}</span>${timeline}</div>`;
-}
-
-function renderRunStep(step) {
-  const kind = step?.kind || step?.type || I18n.t('agents.run_step');
-  const detail = step?.detail || step?.message || step?.tool || '';
-  const ts = step?.at || step?.timestamp || '';
-  return `
-    <li class="agents-run-step">
-      <span class="agents-run-step-kind">${escapeHtml(String(kind))}</span>
-      ${detail ? `<span class="agents-run-step-detail">${escapeHtml(String(detail))}</span>` : ''}
-      ${ts ? `<span class="agents-run-step-ts">${escapeHtml(formatTimestamp(String(ts)))}</span>` : ''}
-    </li>
-  `;
 }
 
 // =============================================================================

@@ -113,6 +113,22 @@ impl ToolDispatcher {
             .call_tool(&tool.addon_id, &tool.tool_name, arguments, user_id)
     }
 
+    /// Like `dispatch_tool_call` but skips the addon permission check — the
+    /// caller (harness tool_exec permission path) already adjudicated the grant
+    /// (§3.13 B). Used only for AllowOnce / AllowForRun retries, which do not
+    /// persist a grant the checker would otherwise see.
+    pub fn dispatch_tool_call_preauthorized(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        user_id: &str,
+    ) -> Result<serde_json::Value> {
+        let tools = self.addon_manager.list_tools();
+        let tool = resolve_tool(&tools, tool_name)?;
+        self.addon_manager
+            .call_tool_preauthorized(&tool.addon_id, &tool.tool_name, arguments, user_id)
+    }
+
     /// Executes every call requested by one assistant turn, in order
     /// (sequential by design — simpler to audit, addon instances pool
     /// anyway). A failed call becomes an error result, never an aborted

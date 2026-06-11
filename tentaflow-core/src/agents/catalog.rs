@@ -100,10 +100,16 @@ impl ToolCatalog {
     /// `is_permitted(addon_id)` must return the "llm" permission decision for
     /// the run principal. An unattended run (`principal.user_id == None`) admits
     /// NO addon tools — only core builtins — because there is no user to check.
+    ///
+    /// `can_spawn` gates the sub-agent control builtins (agent_spawn/wait/list/
+    /// cancel): they appear only when the running agent may spawn children
+    /// (`max_subagents > 0`, §3.6), even if its allowlist names them. An agent
+    /// that cannot spawn never sees the delegation surface.
     pub fn resolve<F>(
         tools_json: &str,
         principal: &AgentPrincipal,
         addon_tools: &[ToolDefinition],
+        can_spawn: bool,
         mut is_permitted: F,
     ) -> Vec<LlmToolSpec>
     where
@@ -124,6 +130,9 @@ impl ToolCatalog {
         }
 
         for core in CoreToolName::all() {
+            if core.is_subagent_control() && !can_spawn {
+                continue;
+            }
             if entries.iter().any(|e| e == &AllowlistEntry::Core(*core)) {
                 out.push(core.spec());
             }
@@ -167,8 +176,12 @@ mod tests {
             AllowlistEntry::parse("core.skill_view"),
             Some(AllowlistEntry::Core(CoreToolName::SkillView))
         );
-        // Unknown core builtin is rejected, not treated as an addon tool.
-        assert!(AllowlistEntry::parse("core.agent_spawn").is_none());
+        assert_eq!(
+            AllowlistEntry::parse("core.agent_spawn"),
+            Some(AllowlistEntry::Core(CoreToolName::AgentSpawn))
+        );
+        // An UNKNOWN core builtin is rejected, not treated as an addon tool.
+        assert!(AllowlistEntry::parse("core.bogus").is_none());
         assert!(AllowlistEntry::parse("nodot").is_none());
         assert!(AllowlistEntry::parse(".tool").is_none());
     }
@@ -184,7 +197,8 @@ mod tests {
         // Allowlist admits all memory tools (wildcard) + contacts.lookup +
         // core.skill_view. Permission denies the `contacts` addon.
         let json = r#"["memory.*","contacts.lookup","core.skill_view"]"#;
-        let specs = ToolCatalog::resolve(json, &principal, &tools, |addon| addon == "memory");
+        let specs =
+            ToolCatalog::resolve(json, &principal, &tools, false, |addon| addon == "memory");
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -201,9 +215,26 @@ mod tests {
         let tools = vec![tool("memory", "memory_store"), tool("memory", "memory_recall")];
         let principal = AgentPrincipal::user("u1");
         let json = r#"["memory.memory_store"]"#;
-        let specs = ToolCatalog::resolve(json, &principal, &tools, |_| true);
+        let specs = ToolCatalog::resolve(json, &principal, &tools, false, |_| true);
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["memory.memory_store"]);
+    }
+
+    #[test]
+    fn subagent_control_builtins_gated_by_can_spawn() {
+        let principal = AgentPrincipal::user("u1");
+        let json = r#"["core.skill_view","core.agent_spawn","core.agent_wait"]"#;
+        // can_spawn=false hides the delegation surface even when allowlisted.
+        let no_spawn = ToolCatalog::resolve(json, &principal, &[], false, |_| true);
+        let names: Vec<&str> = no_spawn.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["core.skill_view"]);
+        // can_spawn=true surfaces the allowlisted control builtins.
+        let with_spawn = ToolCatalog::resolve(json, &principal, &[], true, |_| true);
+        let names: Vec<&str> = with_spawn.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["core.skill_view", "core.agent_spawn", "core.agent_wait"]
+        );
     }
 
     #[test]
@@ -212,7 +243,7 @@ mod tests {
         let principal = AgentPrincipal::default();
         let json = r#"["memory.*","core.skill_view"]"#;
         // Even with a permissive checker, no user_id means no addon tools.
-        let specs = ToolCatalog::resolve(json, &principal, &tools, |_| true);
+        let specs = ToolCatalog::resolve(json, &principal, &tools, false, |_| true);
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["core.skill_view"]);
     }

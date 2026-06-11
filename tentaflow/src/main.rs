@@ -532,6 +532,30 @@ async fn run_server(args: Args) -> Result<()> {
         ));
         dispatcher.set_agent_service(agent_service);
         tracing::info!("FlowDispatcher: AgentService wpiety do slotu");
+
+        // Harness §3.6: background agent runs. Mark orphaned runs (running/
+        // waiting from a previous process) interrupted, then install the
+        // process-global AgentRunManager backed by this dispatcher (no second
+        // loop engine — a background run is a flow execution).
+        match tentaflow_core::agents::AgentRunManager::reap_interrupted_on_startup(&db) {
+            Ok(n) if n > 0 => {
+                tracing::info!("AgentRunManager: {n} orphaned run(s) marked interrupted")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("AgentRunManager: orphan reap failed: {e}"),
+        }
+        let run_manager = std::sync::Arc::new(tentaflow_core::agents::AgentRunManager::from_setting(
+            db.clone(),
+            std::sync::Arc::new(tentaflow_core::agents::FlowDispatcherRunner::new(dispatcher)),
+            tentaflow_core::flow_engine::progress_broker::global_broker(),
+        ));
+        tentaflow_core::agents::agent_run_manager_init_global(run_manager);
+        // Harness §3.13: install the process-global pending-interaction registry
+        // (ask_user questions + permission grants raised during a run).
+        tentaflow_core::agents::interaction_registry_init_global(std::sync::Arc::new(
+            tentaflow_core::agents::InteractionRegistry::new(),
+        ));
+        tracing::info!("AgentRunManager: global registry installed");
     }
 
     // Auto-start wszystkich service-mode addonow ktore byly enabled przed

@@ -7,13 +7,21 @@
 // end detection à la Codex/Hermes). The loop that re-runs this block is a Flow
 // Builder flow (phase 5). (Harness §3.4, §3.5.) =====
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use serde_json::Value;
 
 use crate::addon::tool_dispatch::{format_results_as_messages, ToolCallResult};
-use crate::agents::{is_core_tool, AgentPrincipal, AgentService, AgentServiceSlot};
+use crate::agents::{
+    is_core_tool, AgentPrincipal, AgentRunManager, AgentService, AgentServiceSlot, CallerRun,
+    CoreToolName, PermissionDecision, DEFAULT_INTERACTION_TIMEOUT_SECS,
+};
 use crate::db::repository;
+use crate::flow_engine::dispatchers::ProgressEvent;
 use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, LlmToolCall, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
@@ -22,6 +30,81 @@ const NODE_TYPE: &str = "tool_exec";
 const DEFAULT_MAX_RESULT_CHARS: usize = 16_000;
 const DEFAULT_MAX_TOOL_CALLS: usize = 16;
 const TRUNCATION_MARKER: &str = "\n…[truncated]…\n";
+
+/// Human-wait budget for a permission grant card (§3.13 B). A grant has no
+/// model-supplied timeout (unlike ask_user), so it uses the shared default.
+const DEFAULT_PERMISSION_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_INTERACTION_TIMEOUT_SECS);
+
+/// Shapes a failed tool call into a recoverable `[TOOL_ERROR]`-style result the
+/// model can adapt to (mirrors the service's private helper).
+fn error_result(call: &LlmToolCall, error: String) -> ToolCallResult {
+    ToolCallResult {
+        tool_call_id: call.id.clone(),
+        name: call.name.clone(),
+        content: serde_json::json!({ "error": error }).to_string(),
+        success: false,
+    }
+}
+
+/// Resolves an ask_user `timeout_secs` argument (clamped to a sane ceiling),
+/// defaulting to the shared 600 s budget when absent (§3.13 A).
+fn resolve_timeout(args: &Value) -> Duration {
+    let secs = args
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_INTERACTION_TIMEOUT_SECS)
+        // Cap at one hour so a model-chosen timeout cannot park a run for days.
+        .min(3600);
+    Duration::from_secs(secs)
+}
+
+/// Runs one synchronous core builtin (skill_view) and shapes its result. Async
+/// core builtins (ask_user, agent_*) never reach here — they route on the async
+/// path in `execute`.
+fn run_core_sync(service: &AgentService, call: &LlmToolCall) -> ToolCallResult {
+    let arguments = match serde_json::from_str::<Value>(&call.arguments) {
+        Ok(v) => v,
+        Err(e) => return error_result(call, format!("invalid arguments JSON: {e}")),
+    };
+    match service.execute_core_tool(&call.name, &arguments) {
+        Ok(output) => ToolCallResult {
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+            content: serde_json::to_string(&output).unwrap_or_default(),
+            success: true,
+        },
+        Err(e) => error_result(call, e.to_string()),
+    }
+}
+
+/// Audits one permission decision to the `audit_log` chain (§3.13 B — every
+/// decision is recorded). Best-effort: an audit write failure must not abort the
+/// tool loop.
+fn record_permission_decision(
+    service: &AgentService,
+    user_id: &str,
+    tool_name: &str,
+    decision: PermissionDecision,
+) {
+    let addon_id = tool_name.split_once('.').map(|(a, _)| a);
+    let details = serde_json::json!({
+        "tool": tool_name,
+        "decision": decision.as_str(),
+    })
+    .to_string();
+    let _ = repository::log_audit(
+        service.db(),
+        Some(user_id),
+        addon_id,
+        "agent.permission_decision",
+        Some(tool_name),
+        Some(&details),
+        None,
+        None,
+    );
+}
 
 pub struct ToolExecNodeAdapter {
     service: AgentServiceSlot,
@@ -77,6 +160,247 @@ impl ToolExecNodeAdapter {
         let head: String = chars[..head_len].iter().collect();
         let tail: String = chars[chars.len() - tail_len..].iter().collect();
         format!("{head}{TRUNCATION_MARKER}{tail}")
+    }
+
+    /// True for the async sub-agent control builtins, dispatched through the
+    /// AgentRunManager rather than the synchronous core path.
+    fn is_subagent_control(name: &str) -> bool {
+        CoreToolName::from_public_name(name)
+            .map(|c| c.is_subagent_control())
+            .unwrap_or(false)
+    }
+
+    /// Runs one sub-agent control call (agent_spawn/wait/list/cancel) through the
+    /// manager and shapes the outcome into a ToolCallResult. A missing manager
+    /// (headless / not wired) or any handler error becomes a recoverable tool
+    /// error — never an aborted iteration.
+    async fn run_manager_call(
+        manager: &AgentRunManager,
+        caller: &CallerRun,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        let args: Value = match serde_json::from_str(&call.arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                return error_result(call, format!("invalid arguments JSON: {e}"));
+            }
+        };
+        let outcome = match CoreToolName::from_public_name(&call.name) {
+            Some(CoreToolName::AgentSpawn) => manager.handle_agent_spawn(caller, &args).await,
+            Some(CoreToolName::AgentWait) => manager.handle_agent_wait(caller, &args).await,
+            Some(CoreToolName::AgentList) => manager.handle_agent_list(caller),
+            Some(CoreToolName::AgentCancel) => manager.handle_agent_cancel(caller, &args),
+            _ => Err(anyhow!("tool '{}' is not a sub-agent control call", call.name)),
+        };
+        match outcome {
+            Ok(output) => ToolCallResult {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                content: serde_json::to_string(&output).unwrap_or_default(),
+                success: true,
+            },
+            Err(e) => error_result(call, e.to_string()),
+        }
+    }
+
+    /// Runs one `core.ask_user` call (§3.13 A): raises a question interaction,
+    /// parks the run in `waiting_user` (releasing its permit + pausing its
+    /// deadline) and awaits the operator's reply with the configured timeout.
+    /// The reply enters the model result wrapped in a trusted-user-channel
+    /// marker; a timeout yields the no-response sentinel so the model adapts.
+    async fn run_ask_user_call(
+        manager: Option<&AgentRunManager>,
+        ctx: &ExecutionContext,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        let args: Value = match serde_json::from_str(&call.arguments) {
+            Ok(v) => v,
+            Err(e) => return error_result(call, format!("invalid arguments JSON: {e}")),
+        };
+        let question = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let Some(question) = question else {
+            return error_result(call, "ask_user: 'question' is required".to_string());
+        };
+        // At most 4 choices (§3.13 A); the dashboard appends its own "other".
+        let choices: Vec<String> = args
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .take(4)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let timeout = resolve_timeout(&args);
+
+        let (answer, waited) = crate::agents::run_ask_user(
+            &crate::agents::interaction_registry_global(),
+            manager,
+            ctx.progress.as_ref(),
+            &ctx.progress_scope,
+            run_id,
+            parent_run_id,
+            question,
+            &choices,
+            timeout,
+        )
+        .await;
+        // Human think-time must not consume the run's deadline (§3.13).
+        ctx.extend_deadline(waited);
+
+        ToolCallResult {
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+            content: serde_json::json!({
+                "question": question,
+                "choices_offered": choices,
+                "user_response": answer,
+            })
+            .to_string(),
+            success: true,
+        }
+    }
+
+    /// Runs one non-control tool call: `core.skill_view` (sync DB read) or an
+    /// addon tool. Addon tools are permission-gated (§3.13 B): a NotConfigured
+    /// deny raises a grant card and waits for the operator's decision; AllowOnce
+    /// /AllowForRun dispatch pre-authorized, Always persists the grant, Deny /
+    /// timeout becomes a `[TOOL_ERROR] permission denied` result. An explicit
+    /// (configured) deny is final — it never prompts.
+    async fn run_tool_call(
+        service: &Arc<AgentService>,
+        manager: Option<&AgentRunManager>,
+        ctx: &ExecutionContext,
+        principal: &AgentPrincipal,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        // Core builtins (skill_view) run synchronously on a blocking thread.
+        if is_core_tool(&call.name) {
+            let service = service.clone();
+            let call_for_blocking = call.clone();
+            return tokio::task::spawn_blocking(move || run_core_sync(&service, &call_for_blocking))
+                .await
+                .unwrap_or_else(|e| {
+                    error_result(call, format!("core tool dispatch join failed: {e}"))
+                });
+        }
+
+        // Addon tools need a user principal.
+        let Some(user_id) = principal.user_id().map(|s| s.to_string()) else {
+            return error_result(
+                call,
+                format!("tool '{}' requires a user principal", call.name),
+            );
+        };
+        let arguments: Value = match serde_json::from_str(&call.arguments) {
+            Ok(v) => v,
+            Err(e) => return error_result(call, format!("invalid arguments JSON: {e}")),
+        };
+
+        let registry = crate::agents::interaction_registry_global();
+        // A grant earned earlier in this run skips the prompt (§3.13 B).
+        let run_granted = !run_id.is_empty() && registry.run_grant_holds(run_id, &call.name);
+
+        let mut preauthorized = run_granted;
+        if !run_granted {
+            use crate::addon::permissions::PermissionResult;
+            match service.permission_for_tool(&call.name, &user_id) {
+                // Already granted (explicit grant / default / admin bypass):
+                // dispatch through the normal checked path.
+                PermissionResult::Granted => {}
+                // Explicitly denied — final, never prompts.
+                PermissionResult::Denied => {
+                    return error_result(
+                        call,
+                        format!("[TOOL_ERROR] permission denied for '{}'", call.name),
+                    );
+                }
+                // NotConfigured → raise a grant card and wait for a decision.
+                PermissionResult::NotConfigured => {
+                    let addon_id =
+                        call.name.split_once('.').map(|(a, _)| a).unwrap_or(&call.name);
+                    let (decision, waited) = crate::agents::run_permission_request(
+                        &registry,
+                        manager,
+                        ctx.progress.as_ref(),
+                        &ctx.progress_scope,
+                        run_id,
+                        parent_run_id,
+                        addon_id,
+                        &call.name,
+                        "llm",
+                        DEFAULT_PERMISSION_TIMEOUT,
+                    )
+                    .await;
+                    ctx.extend_deadline(waited);
+                    record_permission_decision(service, &user_id, &call.name, decision);
+
+                    use crate::agents::PermissionDecision;
+                    match decision {
+                        PermissionDecision::Deny => {
+                            return error_result(
+                                call,
+                                format!("[TOOL_ERROR] permission denied for '{}'", call.name),
+                            );
+                        }
+                        PermissionDecision::AllowOnce => preauthorized = true,
+                        PermissionDecision::AllowForRun => {
+                            if !run_id.is_empty() {
+                                registry.grant_for_run(run_id, &call.name);
+                            }
+                            preauthorized = true;
+                        }
+                        PermissionDecision::Always => {
+                            // Persist a principal-scoped grant; the refreshed
+                            // checker lets the normal path through (not pre-auth).
+                            if let Err(e) = service.persist_tool_grant(
+                                &call.name,
+                                &user_id,
+                                false,
+                                Some(&user_id),
+                            ) {
+                                return error_result(
+                                    call,
+                                    format!("failed to persist grant: {e}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dispatch on a blocking thread (wasmtime, §2.12). Pre-authorized retries
+        // (AllowOnce / AllowForRun) skip the in-line permission re-check.
+        let service = service.clone();
+        let name = call.name.clone();
+        let call_for_err = call.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            if preauthorized {
+                service.dispatch_addon_tool_preauthorized(&name, arguments, &user_id)
+            } else {
+                service.dispatch_addon_tool(&name, arguments, &user_id)
+            }
+        })
+        .await;
+        match outcome {
+            Ok(Ok(output)) => ToolCallResult {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                content: serde_json::to_string(&output).unwrap_or_default(),
+                success: true,
+            },
+            Ok(Err(e)) => error_result(call, e.to_string()),
+            Err(e) => error_result(&call_for_err, format!("tool dispatch join failed: {e}")),
+        }
     }
 
     /// Records every executed call against the run's AI event (§3.10). Core
@@ -184,19 +508,101 @@ impl NodeAdapter for ToolExecNodeAdapter {
         let principal = AgentPrincipal::new(ctx.user_id.clone(), None);
         let started_at = Utc::now();
 
-        // Tool dispatch (incl. wasmtime addon calls) is synchronous — run it on
-        // a blocking thread so the async executor is not stalled (§2.12).
-        let service_for_blocking = service.clone();
-        let calls_for_blocking = calls.clone();
-        let results = tokio::task::spawn_blocking(move || {
-            service_for_blocking.process_tool_calls(
-                &tools_json,
-                &calls_for_blocking,
-                &principal,
-            )
-        })
-        .await
-        .map_err(|e| anyhow!("tool_exec: dispatch task join failed: {e}"))?;
+        // The calling run's identity (sub-agent control calls act under it).
+        let run_id = envelope
+            .meta
+            .get("agent_run_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Dispatch every call in order. Each goes to exactly one path:
+        //   - core.ask_user → async question interaction (§3.13 A),
+        //   - sub-agent control → async AgentRunManager (§3.6),
+        //   - addon tool → permission-gated dispatch, which may raise an async
+        //     grant card on a NotConfigured deny (§3.13 B),
+        //   - other core.* (skill_view) → synchronous DB read.
+        // Order is preserved so results line up with the assistant turn for the
+        // audit. wasmtime dispatch is offloaded per call to a blocking thread.
+        let manager = crate::agents::agent_run_manager_global();
+        let mut results: Vec<ToolCallResult> = Vec::with_capacity(calls.len());
+
+        let caller = CallerRun {
+            run_id: run_id.clone(),
+            agent_id: agent_id.unwrap_or_default().to_string(),
+            principal: principal.clone(),
+        };
+        // Parent chain for bubbling a child's question to the same principal
+        // (§3.13 A): the dashboard sees the parent_run_id so the ask is visibly
+        // attributed up the spawn tree.
+        let parent_run_id = if run_id.is_empty() {
+            None
+        } else {
+            repository::get_agent_run(service.db(), &run_id)
+                .ok()
+                .flatten()
+                .and_then(|r| r.parent_run_id)
+        };
+
+        for call in &calls {
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                ProgressEvent::ToolCallStarted {
+                    name: call.name.clone(),
+                },
+            );
+
+            let result = if !service.tool_allowed(&tools_json, &call.name) {
+                error_result(
+                    call,
+                    format!("tool '{}' not in agent allowlist", call.name),
+                )
+            } else if CoreToolName::from_public_name(&call.name)
+                .map(|c| c.is_ask_user())
+                .unwrap_or(false)
+            {
+                Self::run_ask_user_call(
+                    manager.as_deref(),
+                    ctx,
+                    &run_id,
+                    parent_run_id.as_deref(),
+                    call,
+                )
+                .await
+            } else if Self::is_subagent_control(&call.name) {
+                match (&manager, run_id.is_empty()) {
+                    (Some(mgr), false) => Self::run_manager_call(mgr, &caller, call).await,
+                    (Some(_), true) => error_result(
+                        call,
+                        "sub-agent control requires a managed run context".to_string(),
+                    ),
+                    (None, _) => error_result(
+                        call,
+                        "sub-agent control is not available on this node".to_string(),
+                    ),
+                }
+            } else {
+                Self::run_tool_call(
+                    &service,
+                    manager.as_deref(),
+                    ctx,
+                    &principal,
+                    &run_id,
+                    parent_run_id.as_deref(),
+                    call,
+                )
+                .await
+            };
+
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                ProgressEvent::ToolCallFinished {
+                    name: call.name.clone(),
+                    status: if result.success { "ok" } else { "error" }.to_string(),
+                },
+            );
+            results.push(result);
+        }
 
         // Audit + run log against the run's AI event before truncation (the
         // audit keeps the full output; only the model-facing message is cut).
@@ -505,5 +911,92 @@ mod tests {
         }
         // Content already within budget is returned verbatim.
         assert_eq!(ToolExecNodeAdapter::truncate_middle_out("hi".into(), 3), "hi");
+    }
+
+    #[tokio::test]
+    async fn ask_user_call_delivers_wrapped_reply() {
+        // An allowlisted core.ask_user call raises a question; the operator's
+        // reply lands wrapped in the tool result (§3.13 A).
+        let pool = db();
+        seed_agent(&pool, "agent-ask", r#"["core.ask_user"]"#);
+        let slot = service(pool);
+
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_id".into(), json!("agent-ask"));
+        env.context.messages.push(assistant_with_calls(vec![LlmToolCall {
+            id: "ask-1".into(),
+            name: "core.ask_user".into(),
+            arguments: r#"{"question":"proceed?","choices":["yes","no"]}"#.into(),
+        }]));
+        let ctx = stub_ctx();
+
+        let adapter = ToolExecNodeAdapter::new(slot);
+        let exec = tokio::spawn(async move {
+            adapter.execute(&node(json!({})), &[input(env)], &ctx).await
+        });
+
+        // Resolve the single pending question.
+        let reg = crate::agents::interaction_registry_global();
+        let id = loop {
+            if let Some(p) = reg.list_for(true, &[]).iter().find(|p| p.prompt == "proceed?") {
+                break p.id.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert!(reg.reply(
+            &id,
+            crate::agents::InteractionReply::Question(crate::agents::QuestionReply {
+                answer: "yes".into()
+            })
+        ));
+
+        let out = exec.await.expect("join").expect("execute");
+        let tool_msg = out
+            .context
+            .messages
+            .iter()
+            .find(|m| m.role == ChatRole::Tool && m.tool_call_id.as_deref() == Some("ask-1"))
+            .expect("ask_user tool message");
+        if let ChatMessageContent::Text(t) = &tool_msg.content {
+            assert!(t.contains("trusted user channel"), "got: {t}");
+            assert!(t.contains("yes"));
+            assert!(t.contains("choices_offered"));
+        } else {
+            panic!("tool content must be text");
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_call_outside_allowlist_is_rejected() {
+        // ask_user is NOT in subagent allowlists by default — an agent without
+        // core.ask_user gets a rejection, not a question (§3.13 A).
+        let pool = db();
+        seed_agent(&pool, "agent-noask", r#"["core.skill_view"]"#);
+        let slot = service(pool);
+
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_id".into(), json!("agent-noask"));
+        env.context.messages.push(assistant_with_calls(vec![LlmToolCall {
+            id: "ask-2".into(),
+            name: "core.ask_user".into(),
+            arguments: r#"{"question":"hi"}"#.into(),
+        }]));
+        let ctx = stub_ctx();
+
+        let out = ToolExecNodeAdapter::new(slot)
+            .execute(&node(json!({})), &[input(env)], &ctx)
+            .await
+            .expect("execute");
+        let tool_msg = out
+            .context
+            .messages
+            .iter()
+            .find(|m| m.role == ChatRole::Tool)
+            .expect("tool message");
+        if let ChatMessageContent::Text(t) = &tool_msg.content {
+            assert!(t.contains("not in agent allowlist"), "got: {t}");
+        } else {
+            panic!("tool content must be text");
+        }
     }
 }

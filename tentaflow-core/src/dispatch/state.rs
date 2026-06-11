@@ -71,6 +71,12 @@ pub struct AppState {
     /// phase-3 wire handlers (`AgentsPayload::RunEventsSubscribe`) subscribe.
     /// Events are ephemeral — durable record stays in `run_log`.
     pub progress_broker: Arc<crate::flow_engine::progress_broker::ProgressBroker>,
+    /// §3.6 — background agent runs. Process-global registry + concurrency
+    /// governor for `core.agent_spawn/wait/list/cancel`. A clone of the global
+    /// instance installed at startup (`agent_run_manager_init_global`). `None`
+    /// only in tests / headless deploys that never wired the FlowDispatcher;
+    /// the sub-agent builtins then refuse with a recoverable tool error.
+    pub agent_run_manager: Option<Arc<crate::agents::AgentRunManager>>,
 }
 
 impl AppState {
@@ -126,6 +132,7 @@ impl AppState {
                 reg
             },
             progress_broker: crate::flow_engine::progress_broker::global_broker(),
+            agent_run_manager: crate::agents::agent_run_manager_global(),
         })
     }
 }

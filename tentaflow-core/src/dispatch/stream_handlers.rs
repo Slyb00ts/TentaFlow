@@ -238,6 +238,18 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
     let router = ctx.state.router.clone();
     let correlation_id = ctx.correlation_id;
+    let progress_broker = ctx.state.progress_broker.clone();
+    // Authenticated principal of this foreground flow. Bound to the session
+    // scope below so run-events ACL (§3.3) can reject a foreign subscriber — the
+    // client-minted session id is not an authorization token on its own.
+    let actor_id = match &ctx.session {
+        SessionAuth::UserSession { user_id, .. } => Some(
+            uuid::Uuid::from_bytes(*user_id)
+                .hyphenated()
+                .to_string(),
+        ),
+        _ => None,
+    };
 
     // Rozwiazanie jezyka TTS per-request, w kolejnosci priorytetow:
     //  1. jawny `language` z requestu klienta,
@@ -293,7 +305,17 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         let cancel = CancellationToken::new();
         let mut meta = FlowRequestMeta::new(format!("flowinvoke-{correlation_id}"));
         meta.session_id = invoke.session_id.clone();
+        meta.user_id = actor_id.clone();
         meta.cancel_token = cancel.clone();
+
+        // Bind the session scope to this principal so run-events ACL (§3.3) can
+        // authorize a `Session` subscription — the progress scope is this
+        // session id (engine plumbing), and without the binding any user could
+        // subscribe by guessing it.
+        if let (Some(session_id), Some(actor)) = (invoke.session_id.as_deref(), actor_id.as_deref())
+        {
+            progress_broker.bind_session_owner(session_id, actor);
+        }
 
         // flow_id ma priorytet — odpala dokładnie ten flow który user wybrał
         // (np. w trybie audio). Bez niego rozwiązanie przez model/service_type.

@@ -428,6 +428,15 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "minimize-2",
             r#"{"properties":{"threshold_percent":{"type":"integer","title":"Próg (% okna)","minimum":1,"maximum":100,"default":50,"description":"Powyżej tego udziału okna kontekstu uruchamia kompakcję"},"protect_last_messages":{"type":"integer","title":"Chroń ostatnie N wiadomości","minimum":0,"maximum":50,"default":4},"summary_model":{"type":"string","title":"Model streszczający","description":"Puste = model z meta","dynamic_enum":{"source":"models","category":"llm"}}},"order":["threshold_percent","protect_last_messages","summary_model"]}"#,
         ),
+        (
+            "ask_user",
+            "service",
+            "Zapytaj użytkownika",
+            "Pyta operatora (odpowiednik BPMN User Task): zatrzymuje flow, czeka na odpowiedź (z pauzą deadline'u) i zapisuje ją do zmiennej; po timeout wpisuje sentinel, więc warunek dalej może rozgałęzić",
+            r#"{"question":"","choices":[],"timeout_secs":600,"output_variable":"user_response"}"#,
+            "help-circle",
+            r#"{"properties":{"question":{"type":"string","title":"Pytanie","format":"textarea","description":"Treść pytania (interpolowalna wyrażeniem CEL nad envelope)"},"choices":{"type":"array","title":"Opcje (≤4)","description":"Do 4 opcji wyboru; puste = pytanie otwarte. UI dokleja \"Inna odpowiedź…\"","items":{"type":"string"}},"timeout_secs":{"type":"integer","title":"Timeout (s)","minimum":1,"maximum":3600,"default":600,"description":"Po tym czasie wynik = sentinel \"użytkownik nie odpowiedział\""},"output_variable":{"type":"string","title":"Zmienna wyjściowa","default":"user_response","description":"Zmienna flow, do której trafia odpowiedź"}},"required":["question"],"order":["question","choices","timeout_secs","output_variable"]}"#,
+        ),
     ];
 
     // INSERT OR REPLACE — przy unique node_type aktualizujemy istniejace
