@@ -1034,3 +1034,40 @@ pub struct DbVoiceTempSpeaker {
     pub assigned_profile_id: Option<i64>,
     pub created_at: String,
 }
+
+/// Durable conversation turn message (table `conversation_messages`). The
+/// in-memory cache only buffered `role`+`content`; this is the full record the
+/// `persist_turn` node writes and `conversation_history` replays, including the
+/// `tool_calls`/`tool_call_id`/`name` round-trip and multimodal blob refs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbConversationMessage {
+    pub id: i64,
+    pub session_id: String,
+    pub seq: i64,
+    pub role: String,
+    pub content: Option<String>,
+    /// JSON-encoded `Vec<LlmToolCall>` for assistant tool calls; NULL otherwise.
+    pub tool_calls: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub name: Option<String>,
+    /// Blob id of a multimodal payload (audio/image/video/file); NULL for text.
+    pub payload_ref: Option<String>,
+    /// `FlowValue::kind()` tag of the multimodal payload; NULL for text.
+    pub payload_kind: Option<String>,
+    pub node_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Insert shape for `conversation_messages`. `seq` is assigned per session by
+/// the repository (monotonic), so it is not part of this struct.
+#[derive(Debug, Clone)]
+pub struct NewConversationMessage<'a> {
+    pub role: &'a str,
+    pub content: Option<&'a str>,
+    pub tool_calls: Option<String>,
+    pub tool_call_id: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub payload_ref: Option<&'a str>,
+    pub payload_kind: Option<&'a str>,
+    pub node_id: Option<&'a str>,
+}

@@ -450,7 +450,17 @@ impl NodeAdapter for ToolExecNodeAdapter {
         vec![PortSpec::new("in", FlowDataType::Any)]
     }
     fn output_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("full", FlowDataType::Any)]
+        // `full` is the blocking output (one envelope per iteration / final
+        // turn). `stream` marks this node as an inline loop region's exit-side
+        // stream producer: when a region's exit wires its `stream` port, the
+        // executor drives the region's streaming runner (the real tokens come
+        // from the region's `llm` member), forwarding live deltas through here.
+        // tool_exec itself never produces tokens — the port exists so a region
+        // exit can be wired as the producer (R3/R7) without a synthetic node.
+        vec![
+            PortSpec::new("full", FlowDataType::Any),
+            PortSpec::new("stream", FlowDataType::Text),
+        ]
     }
 
     async fn execute(
@@ -527,12 +537,8 @@ impl NodeAdapter for ToolExecNodeAdapter {
         let manager = crate::agents::agent_run_manager_global();
         let mut results: Vec<ToolCallResult> = Vec::with_capacity(calls.len());
 
-        let caller = CallerRun {
-            run_id: run_id.clone(),
-            agent_id: agent_id.unwrap_or_default().to_string(),
-            principal: principal.clone(),
-            session_id: ctx.session_id.clone(),
-        };
+        let caller =
+            CallerRun::from_envelope(envelope, principal.clone(), ctx.session_id.clone());
         // Parent chain for bubbling a child's question to the same principal
         // (§3.13 A): the dashboard sees the parent_run_id so the ask is visibly
         // attributed up the spawn tree.
@@ -727,6 +733,7 @@ mod tests {
             config,
             position: None,
             label: None,
+            region: None,
         }
     }
 

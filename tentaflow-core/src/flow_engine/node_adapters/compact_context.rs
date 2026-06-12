@@ -128,6 +128,19 @@ impl CompactContextNodeAdapter {
             .unwrap_or(DEFAULT_PROTECT_LAST_MESSAGES)
     }
 
+    /// Reads a string prompt field from node config, falling back to the built-in
+    /// default when absent/empty. The prompt content is admin-editable; any
+    /// anti-injection sanitization happens independently at the call site (the
+    /// delimiter defusing applies to DATA folded into the prompt, not to this
+    /// instruction text).
+    fn prompt_field<'a>(node: &'a FlowNode, key: &str, default: &'a str) -> &'a str {
+        node.config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+    }
+
     /// Summary model: node config `summary_model`, falling back to
     /// `envelope.meta["model"]` (the conversation's own model). Empty/absent
     /// config + no meta model → no model to call, so phase 2 is skipped (phase 1
@@ -340,19 +353,18 @@ impl CompactContextNodeAdapter {
     fn existing_summary<'a>(
         messages: &'a [ChatMessage],
         dropped: &[usize],
+        prefix: &str,
+        suffix: &str,
     ) -> Option<(&'a str, usize)> {
         let &first = dropped.first()?;
         let m = &messages[first];
         if m.role == ChatRole::Assistant {
             let text = m.text();
             if let Some(t) = text {
-                if t.starts_with(SUMMARY_PREFIX) {
+                if t.starts_with(prefix) {
                     // Strip the prefix/suffix back to the bare template body for
                     // the update prompt.
-                    let body = t
-                        .strip_prefix(SUMMARY_PREFIX)
-                        .unwrap_or(t)
-                        .trim_end_matches(SUMMARY_SUFFIX);
+                    let body = t.strip_prefix(prefix).unwrap_or(t).trim_end_matches(suffix);
                     return Some((body, first));
                 }
             }
@@ -362,8 +374,8 @@ impl CompactContextNodeAdapter {
 
     /// Wraps a raw summary body in the reference-only prefix/suffix as one
     /// assistant message.
-    fn wrap_summary(body: &str) -> ChatMessage {
-        ChatMessage::assistant(format!("{SUMMARY_PREFIX}{body}{SUMMARY_SUFFIX}"))
+    fn wrap_summary(body: &str, prefix: &str, suffix: &str) -> ChatMessage {
+        ChatMessage::assistant(format!("{prefix}{body}{suffix}"))
     }
 }
 
@@ -398,6 +410,12 @@ impl NodeAdapter for CompactContextNodeAdapter {
 
         let threshold = Self::threshold_percent(node);
         let protect_last = Self::protect_last_messages(node);
+        let summary_system_prompt =
+            Self::prompt_field(node, "summary_system_prompt", SUMMARY_SYSTEM_PROMPT);
+        let update_system_prompt =
+            Self::prompt_field(node, "update_system_prompt", UPDATE_SYSTEM_PROMPT);
+        let summary_prefix = Self::prompt_field(node, "summary_prefix", SUMMARY_PREFIX);
+        let summary_suffix = Self::prompt_field(node, "summary_suffix", SUMMARY_SUFFIX);
 
         let mut out: FlowEnvelope = (**envelope).clone();
 
@@ -428,8 +446,9 @@ impl NodeAdapter for CompactContextNodeAdapter {
 
         // Detect an existing summary at the head of the dropped span BEFORE
         // phase-1 rewrites the span, so re-compaction updates it in place.
-        let prior_summary = Self::existing_summary(&out.context.messages, &dropped)
-            .map(|(body, _)| body.to_string());
+        let prior_summary =
+            Self::existing_summary(&out.context.messages, &dropped, summary_prefix, summary_suffix)
+                .map(|(body, _)| body.to_string());
 
         // Phase 1 (no LLM): prune tool results / dedup / truncate args.
         let pruned = Self::phase1_prune(&out.context.messages, &dropped);
@@ -483,11 +502,11 @@ impl NodeAdapter for CompactContextNodeAdapter {
         let span_text = Self::render_span(&pruned);
         let (system_prompt, user_prompt) = match &prior_summary {
             Some(prev) => (
-                UPDATE_SYSTEM_PROMPT,
+                update_system_prompt,
                 format!("Previous summary:\n{prev}\n\nConversation since:\n{span_text}"),
             ),
             None => (
-                SUMMARY_SYSTEM_PROMPT,
+                summary_system_prompt,
                 format!("Conversation so far:\n{span_text}"),
             ),
         };
@@ -528,7 +547,11 @@ impl NodeAdapter for CompactContextNodeAdapter {
 
         // Rebuild: one reference-prefixed summary replacing the dropped span,
         // then the protected live tail in order.
-        rebuilt.push(Self::wrap_summary(&response.content));
+        rebuilt.push(Self::wrap_summary(
+            &response.content,
+            summary_prefix,
+            summary_suffix,
+        ));
         for &i in &protected {
             rebuilt.push(out.context.messages[i].clone());
         }
@@ -648,6 +671,7 @@ mod tests {
             config,
             position: None,
             label: None,
+            region: None,
         }
     }
 
@@ -859,7 +883,11 @@ mod tests {
     #[tokio::test]
     async fn recompaction_updates_previous_summary() {
         let mut env = FlowEnvelope::empty();
-        let prior = CompactContextNodeAdapter::wrap_summary("## Active Task\nold task");
+        let prior = CompactContextNodeAdapter::wrap_summary(
+            "## Active Task\nold task",
+            SUMMARY_PREFIX,
+            SUMMARY_SUFFIX,
+        );
         env.context.messages = vec![
             prior,
             big(ChatRole::Assistant, 'b', 4000),
@@ -971,5 +999,110 @@ mod tests {
             .events()
             .iter()
             .any(|(_, e)| matches!(e, ProgressEvent::Compaction { .. })));
+    }
+
+    fn prose_env() -> FlowEnvelope {
+        let mut env = FlowEnvelope::empty();
+        env.context.messages = vec![
+            big(ChatRole::User, 'a', 4000),
+            big(ChatRole::Assistant, 'b', 4000),
+            big(ChatRole::User, 'c', 4000),
+            big(ChatRole::Assistant, 'd', 4000),
+            big(ChatRole::User, 'e', 4000),
+            big(ChatRole::Assistant, 'f', 4000),
+        ];
+        env.meta.insert("model".into(), json!("m"));
+        env
+    }
+
+    /// No prompt config → the built-in defaults reach the summary model and the
+    /// reference prefix/suffix wrap the injected summary.
+    #[tokio::test]
+    async fn prompts_default_to_consts_when_absent() {
+        let llm = RecordingLlm::new("## Active Task\ndone");
+        let mut ctx = stub_ctx();
+        ctx.llm = llm.clone();
+
+        let out = CompactContextNodeAdapter::new()
+            .execute(
+                &node(json!({"protect_last_messages": 2})),
+                &[input(prose_env())],
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+        // Default summary system prompt was used verbatim.
+        assert_eq!(*llm.last_system.lock().unwrap(), SUMMARY_SYSTEM_PROMPT);
+        // Default prefix/suffix wrap the injected summary.
+        let first = out.context.messages[0].text_or_default();
+        assert!(first.starts_with(SUMMARY_PREFIX));
+        assert!(first.ends_with(SUMMARY_SUFFIX));
+    }
+
+    /// Configured summary prompts override the defaults and the configured
+    /// prefix/suffix wrap the injected summary (and are detected on re-compaction).
+    #[tokio::test]
+    async fn configured_prompts_override_defaults() {
+        let llm = RecordingLlm::new("CUSTOM SUMMARY BODY");
+        let mut ctx = stub_ctx();
+        ctx.llm = llm.clone();
+
+        let cfg = json!({
+            "protect_last_messages": 2,
+            "summary_system_prompt": "CUSTOM SUMMARY INSTRUCTION",
+            "summary_prefix": "[[BEGIN]]",
+            "summary_suffix": "[[END]]",
+        });
+        let out = CompactContextNodeAdapter::new()
+            .execute(&node(cfg), &[input(prose_env())], &ctx)
+            .await
+            .expect("execute");
+
+        assert_eq!(*llm.last_system.lock().unwrap(), "CUSTOM SUMMARY INSTRUCTION");
+        let first = out.context.messages[0].text_or_default();
+        assert!(first.starts_with("[[BEGIN]]"), "got: {first}");
+        assert!(first.ends_with("[[END]]"), "got: {first}");
+        assert!(first.contains("CUSTOM SUMMARY BODY"));
+    }
+
+    /// A configured update prompt is used when a prior summary (wrapped with the
+    /// configured prefix/suffix) sits at the head of the dropped span.
+    #[tokio::test]
+    async fn configured_update_prompt_and_prefix_detected_on_recompaction() {
+        let prior =
+            CompactContextNodeAdapter::wrap_summary("## Active Task\nold", "[[BEGIN]]", "[[END]]");
+        let mut env = FlowEnvelope::empty();
+        env.context.messages = vec![
+            prior,
+            big(ChatRole::Assistant, 'b', 4000),
+            big(ChatRole::User, 'c', 4000),
+            big(ChatRole::Assistant, 'd', 4000),
+            big(ChatRole::User, 'e', 4000),
+            big(ChatRole::Assistant, 'f', 4000),
+        ];
+        env.meta.insert("model".into(), json!("m"));
+        env.meta.insert(META_HAS_SUMMARY.into(), json!(true));
+
+        let llm = RecordingLlm::new("## Active Task\nnew");
+        let mut ctx = stub_ctx();
+        ctx.llm = llm.clone();
+
+        let cfg = json!({
+            "protect_last_messages": 2,
+            "update_system_prompt": "CUSTOM UPDATE INSTRUCTION",
+            "summary_prefix": "[[BEGIN]]",
+            "summary_suffix": "[[END]]",
+        });
+        CompactContextNodeAdapter::new()
+            .execute(&node(cfg), &[input(env)], &ctx)
+            .await
+            .expect("execute");
+
+        // The prior summary was detected (configured prefix) → UPDATE path used.
+        assert_eq!(*llm.last_system.lock().unwrap(), "CUSTOM UPDATE INSTRUCTION");
+        assert!(llm.last_user.lock().unwrap().contains("Previous summary:"));
+        assert!(llm.last_user.lock().unwrap().contains("old"));
     }
 }

@@ -9,6 +9,61 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { getNodeName, getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
+import '/js/components/tf-input.js';
+import '/js/components/tf-textarea.js';
+import '/js/components/tf-toggle.js';
+import '/js/components/tf-select.js';
+
+// Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
+// these from `node.config`; an empty value means "use the built-in default".
+// Schema-driven fields (params_schema) still render via `_renderField`; these
+// supplement node types whose prompts are not surfaced in the template schema.
+// `textarea` → tf-textarea, `number` → tf-input[type=number], `bool` → tf-toggle.
+const HARNESS_FIELDS = {
+  agent_context: [
+    { key: 'skills_template', kind: 'textarea', rows: 4, defaultHint: true },
+    { key: 'anti_injection_note', kind: 'textarea', rows: 3, defaultHint: true },
+    { key: 'delegated_results_template', kind: 'textarea', rows: 4, defaultHint: true },
+  ],
+  compact_context: [
+    { key: 'summary_system_prompt', kind: 'textarea', rows: 4, defaultHint: true },
+    { key: 'update_system_prompt', kind: 'textarea', rows: 4, defaultHint: true },
+    { key: 'summary_prefix', kind: 'textarea', rows: 2, defaultHint: true },
+    { key: 'summary_suffix', kind: 'textarea', rows: 2, defaultHint: true },
+  ],
+  agent_router: [
+    { key: 'system_prompt', kind: 'textarea', rows: 5, defaultHint: true },
+  ],
+  spawn: [
+    { key: 'agent_id', kind: 'text' },
+    { key: 'agent_name', kind: 'text' },
+    { key: 'task', kind: 'textarea', rows: 3 },
+    { key: 'output_variable', kind: 'text' },
+  ],
+  await_subagents: [
+    { key: 'run_ids_var', kind: 'text' },
+    { key: 'timeout_secs', kind: 'number', min: 1, step: 1, placeholder: '300' },
+    { key: 'mode', kind: 'enum', options: ['all', 'any'] },
+  ],
+  subagent_status: [
+    { key: 'output_variable', kind: 'text' },
+  ],
+  interval: [
+    { key: 'seconds', kind: 'number', min: 1, step: 1, placeholder: '10' },
+  ],
+  persist_turn: [
+    { key: 'session_id', kind: 'text' },
+  ],
+};
+
+// Region-level loop config (loop_max_iterations, loop_final_pass). These live on
+// the region-ENTRY node — the target of the region's `loop_back` edge — regardless
+// of its node_type (e.g. a seeded "Agent Run" uses `compact_context` as the entry,
+// not a node typed `loop`). The backend reads them off the entry node (cache.rs).
+const LOOP_REGION_FIELDS = [
+  { key: 'loop_max_iterations', kind: 'number', min: 1, max: 100, step: 1, placeholder: '25' },
+  { key: 'loop_final_pass', kind: 'bool' },
+];
 
 // Cache dla dynamic_enum dropdown opcji. Klucz `<source>:<category>`. Wartosc
 // to Promise<Array<{value,label}>> — pojedynczy fetch na cala sesje GUI.
@@ -278,21 +333,43 @@ export class FlowConfig {
     const required = schema.required;
     const keys = schema.order && schema.order.length ? schema.order : Object.keys(props);
 
+    const labelVal = isAutoNodeLabel(n.label, n.type, this.template?.label) ? '' : (n.label || '');
     let html = `
       <div class="fb-field">
-        <label class="fb-label">${escapeHtml(I18n.t('flows_config.name'))}</label>
-        <input class="fb-input" data-bind="label" value="${escapeAttr(isAutoNodeLabel(n.label, n.type, this.template?.label) ? '' : (n.label || ''))}" placeholder="${escapeAttr(getNodeName(n.type, this.template?.label))}">
+        <tf-input data-bind="label" data-type="string" label="${escapeAttr(I18n.t('flows_config.name'))}" value="${escapeAttr(labelVal)}" placeholder="${escapeAttr(getNodeName(n.type, this.template?.label))}"></tf-input>
       </div>
     `;
 
+    // Schema-driven config keys already covered by HARNESS_FIELDS are skipped
+    // here so each prompt/field renders exactly once (harness fields win, they
+    // carry the "empty → default" hint the backend expects).
+    const harness = HARNESS_FIELDS[n.type] || [];
+    const harnessKeys = new Set(harness.map((f) => f.key));
+
     for (const key of keys) {
+      if (harnessKeys.has(key)) continue;
       const def = props[key];
       if (!def) continue;
       const value = n.config?.[key];
       html += this._renderField(key, def, value, required.includes(key));
     }
 
-    if (keys.length === 0) {
+    for (const f of harness) {
+      html += this._renderHarnessField(f, n.config?.[f.key]);
+    }
+
+    // Region-level loop config belongs to the region-ENTRY node only (target of
+    // the region's loop_back edge), independent of node_type. The role is read
+    // from the live graph so it tracks edits without a schema marker.
+    const isRegionEntry = this.opts.getCanvas?.()?.regionRole?.(n.id) === 'entry';
+    if (isRegionEntry) {
+      html += `<div class="fb-field-section">${escapeHtml(I18n.t('flows_config.loop_region_section'))}</div>`;
+      for (const f of LOOP_REGION_FIELDS) {
+        html += this._renderHarnessField(f, n.config?.[f.key]);
+      }
+    }
+
+    if (keys.length === 0 && harness.length === 0 && !isRegionEntry) {
       html += `<div class="fb-field-hint">${escapeHtml(I18n.t('flows_config.no_params_hint'))}</div>`;
     }
 
@@ -311,7 +388,9 @@ export class FlowConfig {
     const title = def.title || key;
     const hint = def.description || '';
     const curVal = value !== undefined && value !== null ? value : (def.default !== undefined ? def.default : '');
-    const reqMark = isRequired ? ' <span style="color:var(--tf-danger);">*</span>' : '';
+    const reqMark = isRequired ? ' *' : '';
+    const labelAttr = escapeAttr(title + reqMark);
+    const hintAttr = hint ? ` hint="${escapeAttr(hint)}"` : '';
 
     if (type === 'boolean') {
       return `
@@ -320,7 +399,7 @@ export class FlowConfig {
             <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
             ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
           </div>
-          <span class="fb-toggle ${curVal ? 'on' : ''}" role="switch" data-bind="${escapeAttr(key)}" data-type="boolean"></span>
+          <tf-toggle data-bind="${escapeAttr(key)}" data-type="boolean" ${curVal ? 'checked' : ''}></tf-toggle>
         </div>`;
     }
 
@@ -333,66 +412,94 @@ export class FlowConfig {
       }).join('');
       return `
         <div class="fb-field">
-          <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
-          <select class="fb-select" data-bind="${escapeAttr(key)}" data-type="string">${opts}</select>
-          ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
+          <tf-select data-bind="${escapeAttr(key)}" data-type="string" label="${labelAttr}"${hintAttr} value="${escapeAttr(String(curVal))}">${opts}</tf-select>
         </div>`;
     }
 
     if (def.dynamic_enum && typeof def.dynamic_enum === 'object') {
-      // Renderujemy placeholder select; opcje zaciagamy async po renderze
+      // Renderujemy placeholder tf-select; opcje zaciagamy async po renderze
       // (loadDynamicEnumOptions z cache). Aktualna wartosc trzymana jako
       // jedyna opcja zeby preview JSON pokazywal poprawnie.
       const source = String(def.dynamic_enum.source || '');
       const category = String(def.dynamic_enum.category || '');
-      const placeholder = curVal ? escapeHtml(String(curVal)) : '— wybierz —';
+      const placeholder = curVal ? escapeHtml(String(curVal)) : escapeHtml(I18n.t('flows_config.select_placeholder'));
       return `
         <div class="fb-field">
-          <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
-          <select class="fb-select" data-bind="${escapeAttr(key)}" data-type="string"
+          <tf-select data-bind="${escapeAttr(key)}" data-type="string" label="${labelAttr}"${hintAttr}
                   data-dynamic-source="${escapeAttr(source)}"
-                  data-dynamic-category="${escapeAttr(category)}">
+                  data-dynamic-category="${escapeAttr(category)}" value="${escapeAttr(curVal || '')}">
             <option value="${escapeAttr(curVal || '')}" selected>${placeholder}</option>
-          </select>
-          ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
+          </tf-select>
         </div>`;
     }
 
     if (type === 'number' || type === 'integer') {
-      const hasRange = def.minimum != null && def.maximum != null;
-      if (hasRange) {
-        return `
-          <div class="fb-field">
-            <div class="fb-field-row">
-              <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
-              <span class="fb-range-val" data-role="rangeval-${escapeAttr(key)}">${escapeHtml(String(curVal))}</span>
-            </div>
-            <input class="fb-range" type="range" min="${def.minimum}" max="${def.maximum}" step="${def.step || (type === 'integer' ? 1 : 0.1)}" value="${escapeAttr(String(curVal))}" data-bind="${escapeAttr(key)}" data-type="number">
-            ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
-          </div>`;
-      }
+      const step = def.step || (type === 'integer' ? 1 : 'any');
+      const rangeAttrs = `${def.minimum != null ? ` min="${def.minimum}"` : ''}${def.maximum != null ? ` max="${def.maximum}"` : ''} step="${step}"`;
       return `
         <div class="fb-field">
-          <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
-          <input class="fb-input" type="number" step="${def.step || (type === 'integer' ? 1 : 'any')}" value="${escapeAttr(String(curVal))}" data-bind="${escapeAttr(key)}" data-type="number">
-          ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
+          <tf-input type="number" data-bind="${escapeAttr(key)}" data-type="number" label="${labelAttr}"${hintAttr}${rangeAttrs} value="${escapeAttr(String(curVal))}"></tf-input>
         </div>`;
     }
 
     if (def.format === 'textarea' || (typeof curVal === 'string' && curVal.length > 80)) {
       return `
         <div class="fb-field">
-          <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
-          <textarea class="fb-textarea" data-bind="${escapeAttr(key)}" data-type="string" placeholder="${escapeAttr(def.placeholder || '')}">${escapeHtml(String(curVal))}</textarea>
-          ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
+          <tf-textarea data-bind="${escapeAttr(key)}" data-type="string" label="${labelAttr}"${hintAttr} rows="4" placeholder="${escapeAttr(def.placeholder || '')}" value="${escapeAttr(String(curVal))}"></tf-textarea>
         </div>`;
     }
 
     return `
       <div class="fb-field">
-        <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
-        <input class="fb-input" type="text" value="${escapeAttr(String(curVal))}" data-bind="${escapeAttr(key)}" data-type="string" placeholder="${escapeAttr(def.placeholder || '')}">
-        ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
+        <tf-input type="text" data-bind="${escapeAttr(key)}" data-type="string" label="${labelAttr}"${hintAttr} value="${escapeAttr(String(curVal))}" placeholder="${escapeAttr(def.placeholder || '')}"></tf-input>
+      </div>`;
+  }
+
+  // Renders a hardcoded harness field (prompts / loop region / background block
+  // params from Part 4-5) through tf-* primitives. `defaultHint` shows the
+  // "empty → built-in default" note the backend relies on.
+  _renderHarnessField(f, value) {
+    const title = I18n.t(`flows_config.harness.${f.key}`);
+    const curVal = value !== undefined && value !== null ? value : '';
+    const hint = f.defaultHint ? ` hint="${escapeAttr(I18n.t('flows_config.harness_default_hint'))}"` : '';
+    const labelAttr = escapeAttr(title);
+
+    if (f.kind === 'bool') {
+      return `
+        <div class="fb-field fb-field-row">
+          <div>
+            <label class="fb-label">${escapeHtml(title)}</label>
+            ${f.defaultHint ? `<div class="fb-field-hint">${escapeHtml(I18n.t('flows_config.harness_default_hint'))}</div>` : ''}
+          </div>
+          <tf-toggle data-bind="${escapeAttr(f.key)}" data-type="boolean" ${curVal ? 'checked' : ''}></tf-toggle>
+        </div>`;
+    }
+    if (f.kind === 'number') {
+      const rangeAttrs = `${f.min != null ? ` min="${f.min}"` : ''}${f.max != null ? ` max="${f.max}"` : ''}${f.step != null ? ` step="${f.step}"` : ''}`;
+      return `
+        <div class="fb-field">
+          <tf-input type="number" data-bind="${escapeAttr(f.key)}" data-type="number" label="${labelAttr}"${hint}${rangeAttrs} value="${escapeAttr(String(curVal))}" placeholder="${escapeAttr(f.placeholder || '')}"></tf-input>
+        </div>`;
+    }
+    if (f.kind === 'enum') {
+      const opts = (f.options || []).map((opt) => {
+        const sel = String(curVal) === String(opt) ? 'selected' : '';
+        return `<option value="${escapeAttr(opt)}" ${sel}>${escapeHtml(opt)}</option>`;
+      }).join('');
+      return `
+        <div class="fb-field">
+          <tf-select data-bind="${escapeAttr(f.key)}" data-type="string" label="${labelAttr}"${hint} value="${escapeAttr(String(curVal))}">${opts}</tf-select>
+        </div>`;
+    }
+    if (f.kind === 'textarea') {
+      return `
+        <div class="fb-field">
+          <tf-textarea data-bind="${escapeAttr(f.key)}" data-type="string" label="${labelAttr}"${hint} rows="${f.rows || 3}" placeholder="${escapeAttr(f.placeholder || '')}" value="${escapeAttr(String(curVal))}"></tf-textarea>
+        </div>`;
+    }
+    return `
+      <div class="fb-field">
+        <tf-input type="text" data-bind="${escapeAttr(f.key)}" data-type="string" label="${labelAttr}"${hint} value="${escapeAttr(String(curVal))}" placeholder="${escapeAttr(f.placeholder || '')}"></tf-input>
       </div>`;
   }
 
@@ -400,34 +507,33 @@ export class FlowConfig {
     body.querySelectorAll('[data-bind]').forEach((el) => {
       const key = el.dataset.bind;
       if (key === 'label') {
+        // tf-input emits `change` with detail.value; read .value for both.
         el.addEventListener('change', () => {
           this.opts.onLabelChange?.(this.node.id, el.value);
         });
         return;
       }
-      if (el.classList.contains('fb-toggle')) {
-        el.addEventListener('click', () => {
-          const on = !el.classList.contains('on');
-          el.classList.toggle('on', on);
+      // tf-toggle reports its new state in detail.checked (no .value).
+      if (el.tagName === 'TF-TOGGLE') {
+        el.addEventListener('change', (e) => {
+          const on = e.detail?.checked ?? el.checked;
           this.opts.onConfigChange?.(this.node.id, { [key]: on });
         });
         return;
       }
       const type = el.dataset.type;
-      const ev = el.type === 'range' ? 'input' : 'change';
-      el.addEventListener(ev, () => {
+      // tf-input/tf-textarea/tf-select all expose `.value` and emit `change`.
+      el.addEventListener('change', () => {
         let v = el.value;
-        if (type === 'number') v = parseFloat(v);
-        const rv = body.querySelector(`[data-role="rangeval-${CSS.escape(key)}"]`);
-        if (rv) rv.textContent = String(v);
+        if (type === 'number') v = v === '' ? undefined : parseFloat(v);
         this.opts.onConfigChange?.(this.node.id, { [key]: v });
       });
     });
 
-    // Async populate dynamic_enum dropdownow. Bierzemy aktualna wartosc z
+    // Async populate dynamic_enum tf-select. Bierzemy aktualna wartosc z
     // node.config zeby zachowac selekcje po refresh listy. Jak fetch
     // failuje, zostawiamy single-option placeholder + log do konsoli.
-    body.querySelectorAll('select[data-dynamic-source]').forEach(async (sel) => {
+    body.querySelectorAll('tf-select[data-dynamic-source]').forEach(async (sel) => {
       const source = sel.dataset.dynamicSource;
       const category = sel.dataset.dynamicCategory || '';
       const key = sel.dataset.bind;
@@ -435,26 +541,16 @@ export class FlowConfig {
       try {
         const opts = await loadDynamicEnumOptions(source, category);
         if (!opts.length) {
-          sel.innerHTML = `<option value="" disabled selected>— brak dostepnych ${source} ${category} —</option>`;
+          sel.setOptions([{ value: '', label: I18n.t('flows_config.dynamic_empty', { source, category }), disabled: true }], '');
           return;
         }
-        const html = [
-          `<option value="" ${currentValue ? '' : 'selected'}>— wybierz —</option>`,
-          ...opts.map((o) => {
-            const sel2 = String(currentValue) === String(o.value) ? 'selected' : '';
-            return `<option value="${escapeAttr(o.value)}" ${sel2}>${escapeHtml(o.label)}</option>`;
-          }),
-        ].join('');
-        sel.innerHTML = html;
-        // Jesli aktualna wartosc nie jest na liscie (np. usuniety alias), zostawiamy
-        // placeholder selected — user widzi ze cos przepadlo i moze wybrac inny.
+        const list = [{ value: '', label: I18n.t('flows_config.select_placeholder') }, ...opts];
+        // Jesli aktualna wartosc nie jest na liscie (np. usuniety alias),
+        // dodajemy ja jako "niedostepne" zeby user widzial ze cos przepadlo.
         if (currentValue && !opts.some((o) => String(o.value) === String(currentValue))) {
-          const stale = document.createElement('option');
-          stale.value = currentValue;
-          stale.textContent = `${currentValue} (niedostepne)`;
-          stale.selected = true;
-          sel.appendChild(stale);
+          list.push({ value: currentValue, label: I18n.t('flows_config.dynamic_stale', { value: currentValue }) });
         }
+        sel.setOptions(list, currentValue || '');
       } catch (err) {
         // eslint-disable-next-line no-console
         console.warn(`[fb-config] dynamic_enum load failed for ${source}:${category}:`, err);

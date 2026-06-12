@@ -1,0 +1,60 @@
+flowchart TD
+    classDef exist fill:#bfdbfe,stroke:#1e40af,color:#000;
+    classDef change fill:#fde68a,stroke:#b45309,color:#000;
+    classDef new fill:#bbf7d0,stroke:#15803d,color:#000;
+    classDef region fill:#fce7f3,stroke:#9d174d,stroke-width:2px,color:#000;
+    classDef io fill:#e5e7eb,stroke:#374151,color:#000;
+    classDef store fill:#ddd6fe,stroke:#5b21b6,stroke-width:2px,color:#000;
+
+    TRIG["trigger (wejscie)"]:::io
+    DB[("conversation_messages<br/>NOWA trwala tabela SQLite<br/>role+content+tool_calls+multimodal")]:::store
+
+    CH["conversation_history (read-mode)<br/>laduje TRWALA historie do messages<br/>zapamietuje meta.history_base_len"]:::change
+    AC["agent_context<br/>system_prompt + skills + MAILBOX-DRAIN<br/>+ harness_tools + budzet (prompty edytowalne)"]:::change
+
+    subgraph REGION["LOOP REGION 'agent turn'  —  inline, jeden envelope, stop: ostatni assistant bez tool_calls"]
+        direction TB
+        CC["compact_context (gdy ctx > prog)"]:::change
+        LLM["llm(tools)<br/>czyta ALL messages; doN. assistant+tool_calls"]:::exist
+        TE["tool_exec<br/>core.* + addon; doN. role=tool results<br/>ask_user / spawn / wait / list / skill_view"]:::change
+        CC --> LLM --> TE
+        TE -. "loop_back (max_iter cap, cancel/deadline)" .-> CC
+    end
+
+    PT["persist_turn (NOWY)<br/>zapisz DELTE messages[base..] durably<br/>multimodal -> BlobStore"]:::new
+    OUT["output (stream finalnej iteracji)"]:::io
+
+    DB -. "recent(session, N)" .-> CH
+    TRIG --> CH --> AC --> CC
+    TE --> PT
+    PT -. "append_batch(session, delta)" .-> DB
+    PT --> OUT
+
+    subgraph BG["Subagenty w tle (osobne watki, semafor 8)"]
+        direction TB
+        SPAWN["spawn (NOWY) detach, run_ids->vars<br/>lub model: core.agent_spawn"]:::new
+        ST["subagent_status (NOWY) snapshot statusow"]:::new
+        IV["interval (NOWY) co N s, honor cancel"]:::new
+        AW["await_subagents/join (NOWY) blokuj az all/any"]:::new
+        SPAWN --> ST --> IV
+        IV -. "stop: wszystkie terminal" .-> ST
+        IV --> AW
+    end
+
+    TE -. "model deleguje (core.agent_spawn)" .-> SPAWN
+    AW --> CMB["combine"]:::exist --> OUT
+    SPAWN -. "agent_runs (trwale)" .-> DB2[("agent_runs / agent_mailbox<br/>trwale SQLite")]:::store
+
+    subgraph REACT["Reaktywny trigger po zakonczeniu"]
+        direction TB
+        OSC["on_subagent_complete (NOWY trigger)<br/>fires na ProgressEvent::ChildFinished"]:::new
+        RPROC["llm / tool_exec / output (przetworz wynik)"]:::exist
+        OSC --> RPROC
+    end
+
+    TE -. "child Completed -> mailbox + ChildFinished" .-> DB2
+    DB2 -. "ChildFinished" .-> OSC
+    DB2 -. "mailbox pull" .-> AC
+
+    AUD[("flow_executions trace + audit_log hash-chain<br/>+ agent_runs.run_log  (juz trwale)")]:::store
+    REGION -. "trace / audit / run_log per krok" .-> AUD

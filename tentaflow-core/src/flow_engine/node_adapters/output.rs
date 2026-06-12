@@ -106,6 +106,7 @@ mod tests {
             config: serde_json::Value::Null,
             position: None,
             label: None,
+            region: None,
         }
     }
 

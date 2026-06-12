@@ -84,6 +84,12 @@ pub struct FlowNode {
     pub position: Option<(f64, f64)>,
     #[serde(default)]
     pub label: Option<String>,
+    /// Inline loop region this node belongs to (`None` = outside any region).
+    /// Nodes sharing a region id form one loop body run inline over a single
+    /// envelope by the executor; the back edge (`FlowEdge.kind == "loop_back"`)
+    /// closes the cycle without the outer DAG becoming cyclic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Parsuje pole `position` — akceptuje zarowno format GUI (`{"x":0,"y":0}`)
@@ -156,6 +162,23 @@ pub struct FlowEdge {
     /// `konsument.input_port_type`.
     #[serde(default, skip_serializing_if = "is_default_data_type")]
     pub data_type: FlowDataType,
+
+    /// Structural edge kind. `Some("loop_back")` marks the single back edge of
+    /// an inline loop region: it is excluded from the topological in-degree (so
+    /// the outer DAG stays acyclic) and from R4's incoming-edge count. `None` =
+    /// an ordinary forward edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// `FlowEdge.kind` value marking the inline loop-region back edge.
+pub const EDGE_KIND_LOOP_BACK: &str = "loop_back";
+
+impl FlowEdge {
+    /// True when this edge is the back edge of an inline loop region.
+    pub fn is_loop_back(&self) -> bool {
+        self.kind.as_deref() == Some(EDGE_KIND_LOOP_BACK)
+    }
 }
 
 fn is_default_data_type(t: &FlowDataType) -> bool {
@@ -237,6 +260,7 @@ mod tests {
             from_port: "full".into(),
             to_port: "in".into(),
             data_type: FlowDataType::Any,
+            kind: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(!s.contains("from_port"), "got: {s}");

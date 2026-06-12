@@ -118,6 +118,7 @@ fn trigger_node() -> FlowNode {
         config: serde_json::Value::Null,
         position: None,
         label: None,
+        region: None,
     }
 }
 
@@ -128,6 +129,7 @@ fn capability_node(node_type: &str, id: &str, model: &str) -> FlowNode {
         config: json!({ "model": model }),
         position: None,
         label: None,
+        region: None,
     }
 }
 
@@ -138,6 +140,7 @@ fn pii_filter_node() -> FlowNode {
         config: serde_json::Value::Null,
         position: None,
         label: None,
+        region: None,
     }
 }
 
@@ -148,6 +151,7 @@ fn output_node() -> FlowNode {
         config: serde_json::Value::Null,
         position: None,
         label: None,
+        region: None,
     }
 }
 
@@ -161,6 +165,7 @@ fn edge(from: &str, to: &str, from_port: &str, to_port: &str) -> FlowEdge {
         from_port: from_port.to_string(),
         to_port: to_port.to_string(),
         data_type: crate::flow_engine::types::FlowDataType::Any,
+        kind: None,
     }
 }
 

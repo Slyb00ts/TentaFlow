@@ -8,8 +8,9 @@
 //         R2. każdy node ma adapter w registry
 //         R3. edge.from_port ∈ output_ports producenta;
 //             edge.to_port ∈ input_ports konsumenta
-//         R4. strict 1-input-edge dla każdego non-trigger node'a
-//         R5. dokładnie jeden trigger node
+//         R4. strict 1-input-edge dla każdego non-entry node'a
+//         R5. dokładnie jeden węzeł-entry; entry ∈ {`trigger`,
+//             `on_subagent_complete`} — request-driven XOR event-driven flow
 //         R6. condition edges (from_port "true"/"false") tylko z node'a
 //             "condition"
 //         R7. streaming end-shape — edge `from_port="stream"` musi prowadzić
@@ -53,7 +54,9 @@ pub enum FlowValidationError {
         node_id: String,
         actual: usize,
     },
-    TriggerCount {
+    /// R5: a flow must have exactly one entry node, where an entry is either a
+    /// `trigger` (request-driven) or an `on_subagent_complete` (event-driven).
+    EntryNodeCount {
         actual: usize,
     },
     ConditionEdgeFromNonCondition {
@@ -117,6 +120,13 @@ pub enum FlowValidationError {
         node_type: String,
         mapping: &'static str,
     },
+    /// R11: an inline loop region is structurally malformed. `detail` carries
+    /// the specific breach (entry/exit count, boundary crossing, back-edge span,
+    /// iteration cap) for the editor.
+    InvalidLoopRegion {
+        region_id: String,
+        detail: String,
+    },
 }
 
 impl fmt::Display for FlowValidationError {
@@ -155,9 +165,9 @@ impl fmt::Display for FlowValidationError {
                 f,
                 "node '{node_id}' has {actual} incoming edges (1-input-edge rule)"
             ),
-            Self::TriggerCount { actual } => write!(
+            Self::EntryNodeCount { actual } => write!(
                 f,
-                "flow must have exactly one trigger node, found {actual}"
+                "flow must have exactly one entry node (trigger or on_subagent_complete), found {actual}"
             ),
             Self::ConditionEdgeFromNonCondition {
                 node_id,
@@ -223,11 +233,22 @@ impl fmt::Display for FlowValidationError {
                 "node '{node_id}' (type '{node_type}') is a stream producer and cannot declare \
                  {mapping}; the streaming path does not apply io-mapping to the producer"
             ),
+            Self::InvalidLoopRegion { region_id, detail } => {
+                write!(f, "loop region '{region_id}' is invalid: {detail}")
+            }
         }
     }
 }
 
 impl std::error::Error for FlowValidationError {}
+
+/// Entry node types — the two mutually exclusive flow entries. `trigger` is
+/// request-driven; `on_subagent_complete` is event-driven (the reactor seeds it
+/// when a sub-agent run settles). Both are sources (0 incoming edges) and emit
+/// the seeded initial envelope. R5 requires exactly one entry of either kind.
+pub fn is_entry_node_type(node_type: &str) -> bool {
+    matches!(node_type, "trigger" | "on_subagent_complete")
+}
 
 pub fn validate(
     def: &FlowDefinition,
@@ -236,15 +257,15 @@ pub fn validate(
     let nodes_by_id: HashMap<&str, &crate::flow_engine::types::FlowNode> =
         def.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
-    // R5 trigger uniqueness
-    let trigger_count = def
+    // R5 entry uniqueness — exactly one entry, of either entry kind.
+    let entry_count = def
         .nodes
         .iter()
-        .filter(|n| n.node_type == "trigger")
+        .filter(|n| is_entry_node_type(&n.node_type))
         .count();
-    if trigger_count != 1 {
-        return Err(FlowValidationError::TriggerCount {
-            actual: trigger_count,
+    if entry_count != 1 {
+        return Err(FlowValidationError::EntryNodeCount {
+            actual: entry_count,
         });
     }
 
@@ -348,16 +369,22 @@ pub fn validate(
             });
         }
 
-        *incoming_count.entry(to_node.id.as_str()).or_insert(0) += 1;
+        // R4 counts only forward edges. The inline loop-region back edge feeds
+        // the entry node a second time but is NOT a structural input — without
+        // this exclusion the entry node would always read as 2-input and fail
+        // the 1-input-edge rule.
+        if !edge.is_loop_back() {
+            *incoming_count.entry(to_node.id.as_str()).or_insert(0) += 1;
+        }
     }
 
-    // R4: trigger ma 0 incoming (jest źródłem flow), każdy non-trigger ≤1.
-    // Wyjątek: `combine` to fan-in node ktory z definicji konsumuje N
+    // R4: an entry node has 0 incoming (it is the flow source), every non-entry
+    // node ≤1. Wyjątek: `combine` to fan-in node ktory z definicji konsumuje N
     // incoming edges (kazdy z osobnego brancha) i czeka na wszystkie zanim
     // wyemituje swoj single text output. Walidacja R4 nie liczy go.
     for node in &def.nodes {
         let count = incoming_count.get(node.id.as_str()).copied().unwrap_or(0);
-        if node.node_type == "trigger" {
+        if is_entry_node_type(&node.node_type) {
             if count > 0 {
                 return Err(FlowValidationError::MultipleInputs {
                     node_id: node.id.clone(),
@@ -457,12 +484,25 @@ pub fn validate(
         .copied()
         .filter(|node_id| !stream_in_count.contains_key(*node_id))
         .collect();
+    // The exit node of an inline loop region is itself a valid stream producer:
+    // the region is the contracted producer unit (its `llm` member is the real
+    // token source). Such a node need not implement `StreamProducerAdapter` —
+    // the executor drives the region's streaming runner. A region exit is the
+    // source of that region's `loop_back` edge.
+    let region_exit_ids: HashSet<&str> = def
+        .edges
+        .iter()
+        .filter(|e| e.is_loop_back())
+        .map(|e| e.from.as_str())
+        .collect();
+
     for producer in producers {
         // §3.11 B — the head of a stream chain must be a registered
         // `StreamProducerAdapter` (LLM is one such producer). R7 no longer
         // assumes node_type=="llm" — any registered producer is accepted.
         let producer_node = nodes_by_id[producer];
-        if !registry.is_stream_producer(&producer_node.node_type) {
+        let is_region_exit = region_exit_ids.contains(producer);
+        if !is_region_exit && !registry.is_stream_producer(&producer_node.node_type) {
             return Err(FlowValidationError::StreamProducerNotRegistered {
                 node_id: producer_node.id.clone(),
                 node_type: producer_node.node_type.clone(),
@@ -561,6 +601,131 @@ pub fn validate(
         }
     }
 
+    // R11: inline loop-region integrity.
+    validate_loop_regions(def)?;
+
+    Ok(())
+}
+
+/// R11 — inline loop-region integrity. For every distinct `FlowNode.region` id:
+///   * exactly one `loop_back` edge, both endpoints in this region;
+///   * the back edge's target (entry) and source (exit) are members;
+///   * no forward (non-loop_back) edge crosses the region boundary except an
+///     external edge INTO the entry and an external edge OUT of the exit;
+///   * the entry's `loop_max_iterations` (if set) is within the hard cap.
+///
+/// Runs after R1 (endpoints exist), so node lookups here are infallible.
+fn validate_loop_regions(def: &FlowDefinition) -> Result<(), FlowValidationError> {
+    use std::collections::BTreeMap;
+
+    // region id → member node ids.
+    let mut members: BTreeMap<&str, HashSet<&str>> = BTreeMap::new();
+    for node in &def.nodes {
+        if let Some(region_id) = node.region.as_deref() {
+            members.entry(region_id).or_default().insert(node.id.as_str());
+        }
+    }
+    if members.is_empty() {
+        return Ok(());
+    }
+
+    let region_of: HashMap<&str, &str> = def
+        .nodes
+        .iter()
+        .filter_map(|n| n.region.as_deref().map(|r| (n.id.as_str(), r)))
+        .collect();
+
+    for (region_id, region_members) in &members {
+        // Exactly one back edge touching this region.
+        let back_edges: Vec<_> = def
+            .edges
+            .iter()
+            .filter(|e| {
+                e.is_loop_back()
+                    && (region_members.contains(e.from.as_str())
+                        || region_members.contains(e.to.as_str()))
+            })
+            .collect();
+        if back_edges.len() != 1 {
+            return Err(FlowValidationError::InvalidLoopRegion {
+                region_id: region_id.to_string(),
+                detail: format!(
+                    "expected exactly one loop_back edge, found {}",
+                    back_edges.len()
+                ),
+            });
+        }
+        let back = back_edges[0];
+        if !region_members.contains(back.from.as_str())
+            || !region_members.contains(back.to.as_str())
+        {
+            return Err(FlowValidationError::InvalidLoopRegion {
+                region_id: region_id.to_string(),
+                detail: "loop_back edge must connect two nodes of the same region".to_string(),
+            });
+        }
+        let entry = back.to.as_str();
+        let exit = back.from.as_str();
+
+        // No forward edge crosses the region boundary except INTO entry / OUT of
+        // exit. A forward edge with exactly one endpoint in the region is a
+        // crossing; it is legal only when that endpoint is entry (incoming) or
+        // exit (outgoing).
+        for edge in def.edges.iter().filter(|e| !e.is_loop_back()) {
+            let from_in = region_members.contains(edge.from.as_str());
+            let to_in = region_members.contains(edge.to.as_str());
+            if from_in == to_in {
+                // Wholly inside or wholly outside. A wholly-inside edge must not
+                // join two different regions' members.
+                if from_in
+                    && region_of.get(edge.from.as_str()) != region_of.get(edge.to.as_str())
+                {
+                    return Err(FlowValidationError::InvalidLoopRegion {
+                        region_id: region_id.to_string(),
+                        detail: "an internal edge connects nodes of different regions".to_string(),
+                    });
+                }
+                continue;
+            }
+            if to_in && edge.to.as_str() != entry {
+                return Err(FlowValidationError::InvalidLoopRegion {
+                    region_id: region_id.to_string(),
+                    detail: format!(
+                        "external edge enters region at non-entry node '{}'",
+                        edge.to
+                    ),
+                });
+            }
+            if from_in && edge.from.as_str() != exit {
+                return Err(FlowValidationError::InvalidLoopRegion {
+                    region_id: region_id.to_string(),
+                    detail: format!(
+                        "external edge leaves region at non-exit node '{}'",
+                        edge.from
+                    ),
+                });
+            }
+        }
+
+        // Iteration cap.
+        if let Some(entry_node) = def.nodes.iter().find(|n| n.id == entry) {
+            if let Some(max) = entry_node
+                .config
+                .get("loop_max_iterations")
+                .and_then(|v| v.as_i64())
+            {
+                if max > crate::flow_engine::cache::LOOP_REGION_MAX_ITERATIONS_CAP as i64 {
+                    return Err(FlowValidationError::InvalidLoopRegion {
+                        region_id: region_id.to_string(),
+                        detail: format!(
+                            "loop_max_iterations {max} exceeds cap {}",
+                            crate::flow_engine::cache::LOOP_REGION_MAX_ITERATIONS_CAP
+                        ),
+                    });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -598,13 +763,15 @@ fn validate_mapping_shape(
 mod tests {
     use super::*;
     use crate::flow_engine::node_adapters::{
-        ConditionNodeAdapter, LlmNodeAdapter, OutputNodeAdapter, TriggerNodeAdapter,
+        ConditionNodeAdapter, LlmNodeAdapter, OnSubagentCompleteNodeAdapter, OutputNodeAdapter,
+        TriggerNodeAdapter,
     };
     use std::sync::Arc;
 
     fn registry() -> AdapterRegistry {
         let mut r = AdapterRegistry::new();
         r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OnSubagentCompleteNodeAdapter::new()));
         r.register(Arc::new(OutputNodeAdapter::new()));
         r.register(Arc::new(ConditionNodeAdapter::new()));
         r.register_llm(Arc::new(LlmNodeAdapter::new()));
@@ -624,12 +791,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_no_trigger() {
+    fn rejects_no_entry() {
         let def = parse(r#"{"nodes":[{"id":"o","type":"output","config":{}}],"edges":[]}"#);
         let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(
             err,
-            FlowValidationError::TriggerCount { actual: 0 }
+            FlowValidationError::EntryNodeCount { actual: 0 }
         ));
     }
 
@@ -641,8 +808,60 @@ mod tests {
         let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(
             err,
-            FlowValidationError::TriggerCount { actual: 2 }
+            FlowValidationError::EntryNodeCount { actual: 2 }
         ));
+    }
+
+    /// R5: `on_subagent_complete` is a valid sole entry (event-driven flow).
+    #[test]
+    fn ok_on_subagent_complete_as_sole_entry() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"e","type":"on_subagent_complete","config":{"agent_id":"a1"}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[{"from":"e","to":"o","from_port":"text","to_port":"text"}]}"#,
+        );
+        validate(&def, &registry()).expect("event entry must validate as the one entry");
+    }
+
+    /// R5: a flow with TWO entries of mixed kind (trigger + on_subagent_complete)
+    /// is rejected — entries are mutually exclusive.
+    #[test]
+    fn rejects_trigger_plus_event_entry() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"e","type":"on_subagent_complete","config":{"agent_id":"a1"}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"t","to":"o","from_port":"text","to_port":"text"}
+            ]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::EntryNodeCount { actual: 2 }
+        ));
+    }
+
+    /// An `on_subagent_complete` entry is a source with NO input ports, so any
+    /// inbound edge is structurally rejected (R3: the entry has no `to_port` to
+    /// target) — the same guarantee that keeps `trigger` a source.
+    #[test]
+    fn rejects_event_entry_with_incoming_edge() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"e","type":"on_subagent_complete","config":{"agent_id":"a1"}},
+                {"id":"c","type":"condition","config":{}}
+            ],"edges":[
+                {"from":"c","to":"e","from_port":"true","to_port":"text"}
+            ]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::InvalidInputPort { .. }),
+            "an entry node has no input ports, so an inbound edge must be rejected; got {err:?}"
+        );
     }
 
     #[test]

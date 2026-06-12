@@ -549,7 +549,18 @@ async fn run_server(args: Args) -> Result<()> {
             std::sync::Arc::new(tentaflow_core::agents::FlowDispatcherRunner::new(dispatcher)),
             tentaflow_core::flow_engine::progress_broker::global_broker(),
         ));
-        tentaflow_core::agents::agent_run_manager_init_global(run_manager);
+        let run_manager = tentaflow_core::agents::agent_run_manager_init_global(run_manager);
+
+        // Harness §3.6 phase 4b: the subagent reactor turns child-completion
+        // events into reactive flow runs (flows whose entry is
+        // `on_subagent_complete`). It subscribes to the manager's completion
+        // stream and dispatches matching flows through this same dispatcher.
+        tentaflow_core::agents::subagent_reactor_init_global(
+            db.clone(),
+            dispatcher,
+            run_manager.child_finished_subscribe(),
+        );
+        tracing::info!("SubagentReactor: zainstalowany (reaktywne flow on_subagent_complete)");
         // Harness §3.13: install the process-global pending-interaction registry
         // (ask_user questions + permission grants raised during a run).
         tentaflow_core::agents::interaction_registry_init_global(std::sync::Arc::new(

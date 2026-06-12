@@ -1181,7 +1181,13 @@
     "invalid_port": "Le port « {port} » n'est pas pris en charge par {node_type}",
     "invalid_port_type": "Types de ports incompatibles : {from_type} → {to_type}",
     "edge_dangling": "L'arête pointe vers un nœud inexistant",
-    "cycle_detected": "Cycle détecté dans le graphe de flux"
+    "cycle_detected": "Cycle détecté dans le graphe de flux",
+    "loop_region_label": "Loop region: {id}",
+    "group_loop_region": "Group into loop region",
+    "ungroup_loop_region": "Ungroup loop region",
+    "loop_back_cross_region": "A loop_back edge must connect nodes of the same loop region",
+    "loop_region_entry": "entry",
+    "loop_region_exit": "exit"
   },
   "flows_vars": {
     "title": "Variables du flux",
@@ -1262,7 +1268,33 @@
     "map_scope_hint": "Disponible dans les expressions : vars, payload, artifacts, meta (lecture seule). Le serveur valide les expressions à l'enregistrement et signale les erreurs.",
     "map_hint_empty": "L'expression est vide.",
     "map_hint_unbalanced": "Parenthèses ou crochets non équilibrés.",
-    "map_hint_quotes": "Guillemet non fermé."
+    "map_hint_quotes": "Guillemet non fermé.",
+    "select_placeholder": "— select —",
+    "dynamic_empty": "— no available {source} {category} —",
+    "dynamic_stale": "{value} (unavailable)",
+    "harness_default_hint": "Empty → built-in default",
+    "loop_region_section": "Loop region config",
+    "harness": {
+      "skills_template": "Skills index template",
+      "anti_injection_note": "Anti-injection note",
+      "delegated_results_template": "Delegated results template",
+      "summary_system_prompt": "Summary system prompt",
+      "update_system_prompt": "Update system prompt",
+      "summary_prefix": "Summary prefix",
+      "summary_suffix": "Summary suffix",
+      "system_prompt": "System prompt",
+      "loop_max_iterations": "Max iterations",
+      "loop_final_pass": "Final pass",
+      "agent_id": "Agent ID",
+      "agent_name": "Agent name",
+      "task": "Task",
+      "output_variable": "Output variable",
+      "run_ids_var": "run_ids variable",
+      "timeout_secs": "Timeout (seconds)",
+      "mode": "Mode",
+      "seconds": "Seconds",
+      "session_id": "Session ID"
+    }
   },
   "flows": {
     "title": "Flow Builder",
@@ -1321,7 +1353,12 @@
       "map": "Map",
       "agent": "Agent",
       "agent_router": "Routeur d'agents",
-      "compact_context": "Compactage du contexte"
+      "compact_context": "Compactage du contexte",
+      "persist_turn": "Persist turn",
+      "spawn": "Spawn subagent",
+      "await_subagents": "Await subagents",
+      "subagent_status": "Subagent status",
+      "interval": "Time gate"
     },
     "node_descriptions": {
       "trigger": "Point d'entrée du flow (HTTP, QUIC, webhook)",
@@ -1349,7 +1386,12 @@
       "map": "Exécute le flow-corps en parallèle pour chaque élément du tableau ; résultats dans l'ordre d'entrée",
       "agent": "Exécute un agent comme bloc et ne renvoie que le résumé (réponse finale)",
       "agent_router": "Choisit le meilleur agent pour la tâche avec un appel LLM ; ne l'exécute pas",
-      "compact_context": "Résume le milieu de la conversation quand le contexte dépasse le seuil, en protégeant le system prompt et les messages les plus récents"
+      "compact_context": "Résume le milieu de la conversation quand le contexte dépasse le seuil, en protégeant le system prompt et les messages les plus récents",
+      "persist_turn": "Durably persist the turn message delta to conversation history",
+      "spawn": "Deterministically launch a subagent in the background (returns run_ids)",
+      "await_subagents": "Block until named subagents finish (with timeout)",
+      "subagent_status": "Snapshot of subagent statuses into a flow variable",
+      "interval": "Time gate (sleep) for periodic polling inside a loop region"
     },
     "fields": {
       "model": "Modèle",

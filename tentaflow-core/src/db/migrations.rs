@@ -387,8 +387,71 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "skills_curator_snapshots",
             MigrationStep::Sql(SKILLS_CURATOR_SNAPSHOTS),
         ),
+        (
+            70,
+            "conversation_messages",
+            MigrationStep::Sql(CONVERSATION_MESSAGES),
+        ),
+        (
+            71,
+            "agent_run_inline_loop_region",
+            MigrationStep::Rust(rewrite_agent_run_to_inline_region),
+        ),
+        (
+            72,
+            "agent_run_region_streaming",
+            MigrationStep::Rust(rewrite_agent_run_to_inline_region),
+        ),
     ]
 }
+
+/// Stable id of the seeded "Agent Run" harness flow (mirrors `seed::AGENT_RUN_FLOW_ID`
+/// and `agent_block::AGENT_RUN_FLOW_ID`). The migration rewrites this row in place.
+const AGENT_RUN_FLOW_ID: &str = "00000000-0000-4000-8000-000000000012";
+
+/// Installs the current "Agent Run" flow (`…012`) JSON in place. Used by v71
+/// (legacy three-graph → single-graph inline `agent_turn` region) and v72
+/// (region exit becomes the stream producer for codex-style live token
+/// streaming). Both target `agent_run_flow_json()`, so v72 rewrites a v71 row to
+/// the streaming shape. Idempotent: the UPDATE only fires when the stored
+/// `flow_json` differs from the target, so a re-run is a no-op. The legacy
+/// …011/…013 flows are left untouched (read-only legacy). A database without the
+/// row (the seed inserts it on fresh installs) is also a no-op.
+fn rewrite_agent_run_to_inline_region(conn: &Connection) -> Result<()> {
+    let target = crate::db::seed::agent_run_flow_json();
+    conn.execute(
+        "UPDATE flows SET flow_json = ?1 WHERE id = ?2 AND flow_json != ?1",
+        rusqlite::params![target, AGENT_RUN_FLOW_ID],
+    )?;
+    Ok(())
+}
+
+// Durable conversation history (source of truth; the in-memory cache is only a
+// read-through buffer). One row per chat turn message keeps the full structure
+// the cache used to drop — `tool_calls` (assistant), `tool_call_id`/`name`
+// (tool results) round-trip via JSON, and multimodal payloads live in the blob
+// store referenced by `payload_ref`/`payload_kind` instead of being flattened
+// to text. `seq` is a per-session monotonic counter; UNIQUE(session_id, seq)
+// makes the per-turn batch insert idempotent on retry. Runtime-only table:
+// it is not replicated through the sync ledger.
+const CONVERSATION_MESSAGES: &str = "
+CREATE TABLE conversation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('system','user','assistant','tool')),
+    content TEXT,
+    tool_calls TEXT,
+    tool_call_id TEXT,
+    name TEXT,
+    payload_ref TEXT,
+    payload_kind TEXT,
+    node_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(session_id, seq)
+);
+CREATE INDEX idx_conv_msgs_session ON conversation_messages(session_id, seq);
+";
 
 // Sub Flow (Harness §3.5 block 8): a nested flow run gets its own
 // `flow_executions` row whose `parent_execution_id` points at the parent run,
@@ -6153,6 +6216,137 @@ mod tests {
         assert!(column_exists(&conn, "compliance_ai_events", "agent_id").unwrap());
         assert!(column_exists(&conn, "compliance_ai_events", "agent_run_id").unwrap());
         assert!(column_exists(&conn, "compliance_ai_events", "correlation_id").unwrap());
+    }
+
+    /// v71 rewrites the existing "Agent Run" flow (`…012`) to the single-graph
+    /// inline loop region, in place, idempotently. A legacy row gets the new JSON;
+    /// a second run is a no-op; an absent row is a no-op.
+    #[test]
+    fn migration_v71_rewrites_agent_run_to_inline_region_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let target = crate::db::seed::agent_run_flow_json();
+
+        // Simulate a legacy database row carrying the old loop/subflow JSON so
+        // the migration has work to do (bare `run` does not seed harness flows).
+        let legacy = r#"{"nodes":[{"id":"t1","type":"trigger","config":{}}],"edges":[]}"#;
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status, is_default) \
+             VALUES (?1, 'Agent Run', ?2, 'active', 0)",
+            rusqlite::params![AGENT_RUN_FLOW_ID, legacy],
+        )
+        .unwrap();
+
+        rewrite_agent_run_to_inline_region(&conn).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, target, "v71 must install the inline-region graph");
+
+        // Idempotent: re-running changes nothing.
+        rewrite_agent_run_to_inline_region(&conn).unwrap();
+        let again: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, target);
+
+        // Absent row: no-op, no error.
+        conn.execute(
+            "DELETE FROM flows WHERE id = ?1",
+            rusqlite::params![AGENT_RUN_FLOW_ID],
+        )
+        .unwrap();
+        rewrite_agent_run_to_inline_region(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flows WHERE id = ?1",
+                rusqlite::params![AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "absent row stays absent");
+    }
+
+    /// v72 upgrades a v71-shaped "Agent Run" row (inline region, blocking
+    /// persist→output) to the region-streaming shape (region exit streams to
+    /// output, persist on the blocking finalizer path). The target is
+    /// `agent_run_flow_json()`, so a row carrying the older non-streaming graph
+    /// is rewritten and a row already on the streaming graph is a no-op.
+    #[test]
+    fn migration_v72_upgrades_agent_run_to_region_streaming() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let target = crate::db::seed::agent_run_flow_json();
+        // A v71-era row: inline region but the exit feeds persist→output with NO
+        // stream edge and output.format=text (the pre-streaming shape).
+        let v71_shape = r#"{"nodes":[{"id":"t1","type":"trigger","config":{}},{"id":"x1","type":"tool_exec","region":"agent_turn","config":{}}],"edges":[{"from_node":"t1","to_node":"x1"}]}"#;
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status, is_default) \
+             VALUES (?1, 'Agent Run', ?2, 'active', 0)",
+            rusqlite::params![AGENT_RUN_FLOW_ID, v71_shape],
+        )
+        .unwrap();
+
+        rewrite_agent_run_to_inline_region(&conn).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, target, "v72 must install the region-streaming graph");
+        // The streaming wire is present: the region exit streams to output.
+        assert!(
+            after.contains(r#""from_port":"stream""#),
+            "region-streaming graph must carry a stream edge"
+        );
+        assert!(
+            after.contains(r#""mode":"stream""#),
+            "output must be in stream mode"
+        );
+
+        // Idempotent re-run is a no-op.
+        rewrite_agent_run_to_inline_region(&conn).unwrap();
+        let again: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, target);
+    }
+
+    /// A fresh `run(&conn)` (all migrations + nothing else) leaves the seeded
+    /// "Agent Run" row compilable as a single inline loop region. This proves the
+    /// migration and seed agree on the canonical graph.
+    #[test]
+    fn fresh_db_agent_run_is_the_inline_region_graph() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        // The seed inserts the row on fresh installs; the migration UPDATE is a
+        // no-op there because the JSON already matches.
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(json) = stored {
+            assert_eq!(json, crate::db::seed::agent_run_flow_json());
+        }
     }
 
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by

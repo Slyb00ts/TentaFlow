@@ -25,7 +25,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::{json, Value};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{broadcast, watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -49,6 +49,25 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default agent_wait budget when the model omits `timeout_secs`.
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 600;
+
+/// Capacity of the process-global child-completion notification ring the
+/// subagent reactor subscribes to. Sized for a burst of concurrent children
+/// settling at once; a lagging reactor that overruns it drops the oldest events
+/// (`RecvError::Lagged`) — the reactor logs and continues, never blocking a
+/// finishing run's task. Reactive flows are an at-least-once-best-effort signal,
+/// not a durable queue (the durable record stays the mailbox / `agent_runs`).
+const CHILD_FINISHED_CHANNEL_CAPACITY: usize = 1024;
+
+/// A settled sub-agent run, broadcast process-wide so the reactor
+/// (`agents::subagent_reactor`) can dispatch event-driven flows keyed on
+/// `on_subagent_complete`. Carries the child's agent id + terminal status so the
+/// reactor matches a flow's filter without a DB read on the hot path.
+#[derive(Debug, Clone)]
+pub struct ChildFinishedEvent {
+    pub run_id: String,
+    pub agent_id: String,
+    pub status: String,
+}
 
 /// Terminal vs in-flight run status (mirrors the DB CHECK set). Carried on the
 /// per-run `watch` channel so a waiter wakes the moment a child settles, no
@@ -156,6 +175,12 @@ pub struct AgentRunManager {
     /// Live-run registry, shared with each spawned task so the task can evict
     /// its own entry on completion (dropping its permit + abort handle).
     runs: Arc<DashMap<String, RunHandle>>,
+    /// Process-global child-completion notifications. Every finishing run's task
+    /// broadcasts a `ChildFinishedEvent` here; the subagent reactor subscribes
+    /// once at startup and dispatches event-driven flows. Always-on (unlike the
+    /// per-scope `ProgressBroker`, whose `publish` is a no-op without a live
+    /// subscriber) so the reactor never has to pre-subscribe to unknown run ids.
+    child_finished_tx: broadcast::Sender<ChildFinishedEvent>,
     /// A `Weak` to the `Arc`-wrapped manager, so a finishing child's task can
     /// start an auto-continuation parent run (§3.6 level 3) on the SAME manager
     /// (counting toward its caps), without forcing the process-global instance —
@@ -196,14 +221,24 @@ impl AgentRunManager {
         max_concurrent_runs: usize,
     ) -> Self {
         let cap = max_concurrent_runs.max(1);
+        let (child_finished_tx, _) = broadcast::channel(CHILD_FINISHED_CHANNEL_CAPACITY);
         Self {
             db,
             runner,
             progress,
             semaphore: Arc::new(Semaphore::new(cap)),
             runs: Arc::new(DashMap::new()),
+            child_finished_tx,
             weak_self: OnceLock::new(),
         }
+    }
+
+    /// Subscribes to the process-global child-completion stream. The subagent
+    /// reactor holds the sole subscriber; the sender lives in the manager, so a
+    /// subscriber dropping never stops finishing tasks from broadcasting (they
+    /// just see no receivers, which `try_send`-style `send` reports as `Err`).
+    pub fn child_finished_subscribe(&self) -> broadcast::Receiver<ChildFinishedEvent> {
+        self.child_finished_tx.subscribe()
     }
 
     /// Stores a `Weak` self-reference so a finishing child can start an
@@ -381,7 +416,9 @@ impl AgentRunManager {
             manager: self.weak_self.get().cloned(),
             runs: self.runs_ref(),
             semaphore: self.semaphore.clone(),
+            child_finished_tx: self.child_finished_tx.clone(),
             run_id: run_id.clone(),
+            agent_id: agent.id.clone(),
             parent_run_id: parent_run_id.map(|s| s.to_string()),
             target_session_id: target_session_id.map(|s| s.to_string()),
             flow_id,
@@ -490,12 +527,15 @@ impl AgentRunManager {
         Ok(json!({ "run_ids": run_ids }))
     }
 
-    /// `core.agent_wait` handler. Waits for each named run to settle on its
-    /// `watch` channel (no polling), bounded by `timeout_secs`. ANTI-LIVELOCK:
+    /// `core.agent_wait` handler. Waits for the named runs to settle on their
+    /// `watch` channels (no polling), bounded by `timeout_secs`. ANTI-LIVELOCK:
     /// the caller's run flips to `waiting` and releases its global permit for the
     /// duration, re-acquiring on wake — so `cap+1` nested waits never deadlock.
     /// Only children of the caller may be waited on (a run cannot await an
-    /// unrelated run's result).
+    /// unrelated run's result). `mode` (`all` default, or `any`) decides whether
+    /// the call returns once every run is terminal or as soon as the first one
+    /// settles; in `any` mode the result map only carries the runs already
+    /// terminal at return time.
     pub async fn handle_agent_wait(&self, caller: &CallerRun, args: &Value) -> Result<Value> {
         let run_ids: Vec<String> = args
             .get("run_ids")
@@ -505,6 +545,10 @@ impl AgentRunManager {
         if run_ids.is_empty() {
             return Err(anyhow!("agent_wait: run_ids required"));
         }
+        let wait_any = matches!(
+            args.get("mode").and_then(|v| v.as_str()),
+            Some("any")
+        );
         let timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
@@ -537,11 +581,16 @@ impl AgentRunManager {
         }
 
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        let mut results = serde_json::Map::new();
-        for id in &run_ids {
-            let entry = self.wait_one(id, deadline).await;
-            results.insert(id.clone(), entry);
-        }
+        let results = if wait_any {
+            self.wait_any(&run_ids, deadline).await
+        } else {
+            let mut map = serde_json::Map::new();
+            for id in &run_ids {
+                let entry = self.wait_one(id, deadline).await;
+                map.insert(id.clone(), entry);
+            }
+            map
+        };
 
         // Reacquire a permit before resuming (the caller's flow keeps running
         // after agent_wait returns). If the pool is saturated this blocks, which
@@ -610,6 +659,48 @@ impl AgentRunManager {
         }
         // Not in registry — read the persisted row directly.
         self.db_result(id)
+    }
+
+    /// `mode=any` wait: returns as soon as the FIRST of `run_ids` reaches a
+    /// terminal state (or the deadline passes). The returned map carries an entry
+    /// only for the run that finished first — a downstream block in `any` mode acts
+    /// on that finisher and leaves the rest running. Each id is awaited through the
+    /// same `wait_one` (its own `watch` subscription + initial DB read for a run
+    /// that already settled); `select_all` races them without spawning, so every
+    /// future keeps borrowing `&self`.
+    async fn wait_any(&self, run_ids: &[String], deadline: Instant) -> serde_json::Map<String, Value> {
+        let mut pending: Vec<_> = run_ids
+            .iter()
+            .map(|id| {
+                let id = id.clone();
+                Box::pin(async move {
+                    let entry = self.wait_one(&id, deadline).await;
+                    (id, entry)
+                })
+            })
+            .collect();
+
+        let mut map = serde_json::Map::new();
+        while !pending.is_empty() {
+            let ((id, entry), _idx, rest) = futures::future::select_all(pending).await;
+            pending = rest;
+            let terminal = entry
+                .get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| matches!(s, "completed" | "failed" | "cancelled" | "interrupted"))
+                .unwrap_or(false);
+            if terminal {
+                // First finisher wins; the remaining waiters are dropped (the runs
+                // they watch keep running).
+                map.insert(id, entry);
+                break;
+            }
+            // A non-terminal settle means this id hit the deadline (timed_out);
+            // record it and keep waiting on the others until one finishes or all
+            // time out.
+            map.insert(id, entry);
+        }
+        map
     }
 
     /// Reads a run's status + result straight from the persisted row — the
@@ -805,6 +896,39 @@ pub struct CallerRun {
     pub session_id: Option<String>,
 }
 
+impl CallerRun {
+    /// Builds the calling run's identity from a harness envelope's `meta`
+    /// (`agent_run_id` + `agent_id`, set by `agent_context`) plus the run's
+    /// principal and session. Shared by `tool_exec` (model-driven control calls)
+    /// and the deterministic `spawn`/`await_subagents`/`subagent_status` blocks so
+    /// both paths derive the caller the same way. An absent id is an empty string
+    /// (the handlers reject an empty `run_id` as "not a managed run context").
+    pub fn from_envelope(
+        envelope: &FlowEnvelope,
+        principal: AgentPrincipal,
+        session_id: Option<String>,
+    ) -> Self {
+        let run_id = envelope
+            .meta
+            .get("agent_run_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let agent_id = envelope
+            .meta
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Self {
+            run_id,
+            agent_id,
+            principal,
+            session_id,
+        }
+    }
+}
+
 /// Everything the spawned task needs. Built in `spawn`, consumed by `run_task`.
 struct TaskContext {
     db: DbPool,
@@ -816,7 +940,13 @@ struct TaskContext {
     manager: Option<std::sync::Weak<AgentRunManager>>,
     runs: Arc<DashMap<String, RunHandle>>,
     semaphore: Arc<Semaphore>,
+    /// Clone of the manager's child-completion broadcast sender — the task emits
+    /// the terminal `ChildFinishedEvent` here for the subagent reactor.
+    child_finished_tx: broadcast::Sender<ChildFinishedEvent>,
     run_id: String,
+    /// The agent definition id this run executes — carried on the completion
+    /// event so the reactor can match a flow's `agent_id` filter directly.
+    agent_id: String,
     parent_run_id: Option<String>,
     /// Chat session the spawning context belonged to — the mailbox
     /// `target_session_id` for this child's result.
@@ -844,7 +974,9 @@ async fn run_task(ctx: TaskContext) {
         manager,
         runs,
         semaphore,
+        child_finished_tx,
         run_id,
+        agent_id,
         parent_run_id,
         target_session_id,
         flow_id,
@@ -888,6 +1020,7 @@ async fn run_task(ctx: TaskContext) {
                 parent_run_id.as_deref(),
                 RunStatus::Cancelled,
             );
+            broadcast_child_finished(&child_finished_tx, &run_id, &agent_id, RunStatus::Cancelled);
             runs.remove(&run_id);
             return;
         }
@@ -970,6 +1103,13 @@ async fn run_task(ctx: TaskContext) {
     // watch channel, not this event, so ordering vs. evict is safe.
     publish_child_finished(&progress, &run_id, parent_run_id.as_deref(), final_status);
 
+    // Process-global completion signal for the subagent reactor (phase 4b). A
+    // top-level run (no parent) fires too: an `on_subagent_complete` flow keyed
+    // on an `agent_id` reacts to ANY run of that agent settling, not only ones
+    // spawned as someone's child. The event is best-effort (no live reactor =
+    // dropped); the durable record stays the mailbox / `agent_runs` row.
+    broadcast_child_finished(&child_finished_tx, &run_id, &agent_id, final_status);
+
     // Mailbox + auto-continuation (§3.6 levels 2 & 3). A run that spawned a
     // child (parent_run_id set) and completed with a result delivers that result
     // back to the spawning context: always enqueue a mailbox entry addressed to
@@ -1020,6 +1160,22 @@ fn publish_child_finished(
     if let Some(parent) = parent_run_id {
         progress.publish(parent, event);
     }
+}
+
+/// Broadcasts a settled run on the process-global child-completion ring. A
+/// `send` error means no subscriber (no reactor wired / headless) — dropped
+/// silently, the durable record stays elsewhere.
+fn broadcast_child_finished(
+    tx: &broadcast::Sender<ChildFinishedEvent>,
+    run_id: &str,
+    agent_id: &str,
+    status: RunStatus,
+) {
+    let _ = tx.send(ChildFinishedEvent {
+        run_id: run_id.to_string(),
+        agent_id: agent_id.to_string(),
+        status: status.as_str().to_string(),
+    });
 }
 
 /// Delivers a finished child's result back to the context that spawned it

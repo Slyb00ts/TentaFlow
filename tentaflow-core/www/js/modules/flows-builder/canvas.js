@@ -8,6 +8,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
+import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
 const NODE_H_APPROX = 110;
@@ -42,6 +43,12 @@ const TYPE_ICON = {
   session_context: 'database',
   speaker_context: 'database',
   memory_analyzer: 'sparkle',
+  // Harness redesign (Part 5-6): inline loop region + background blocks.
+  persist_turn: 'database',
+  spawn: 'flow',
+  await_subagents: 'clock',
+  subagent_status: 'flow',
+  interval: 'clock',
 };
 
 // Mapa node_type -> CSS var dla --node-color
@@ -68,6 +75,11 @@ function typeVar(type) {
     session_context: '--node-session_context',
     speaker_context: '--node-speaker_context',
     memory_analyzer: '--node-memory_analyzer',
+    persist_turn: '--node-conversation_history',
+    spawn: '--node-spawn',
+    await_subagents: '--node-spawn',
+    subagent_status: '--node-spawn',
+    interval: '--node-spawn',
   };
   return map[type] || '--node-llm';
 }
@@ -82,7 +94,16 @@ const TYPE_CATEGORY = {
   template: 'transform', transform: 'transform', router: 'transform',
   pii_filter: 'filter', tts_clean: 'filter',
   output: 'output', end: 'output',
+  persist_turn: 'memory',
+  spawn: 'agent', await_subagents: 'agent', subagent_status: 'agent', interval: 'agent',
 };
+
+// Generuje stabilny identyfikator regionu pętli (loop region). Region grupuje
+// węzły o tym samym `node.region`; krawędź wsteczna tego regionu nosi
+// `edge.kind="loop_back"`.
+function genRegionId() {
+  return 'loop_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+}
 
 // Zwraca listę portów wejściowych/wyjściowych dla nody. Priorytet: adapter
 // metadata z backendu (`template.input_ports`/`template.output_ports` plus
@@ -210,6 +231,7 @@ export class FlowCanvas {
     this.root.classList.add('fb-canvas');
     this.root.innerHTML = `
       <div class="fb-canvas-world">
+        <div class="fb-regions-layer"></div>
         <svg class="fb-edges" xmlns="http://www.w3.org/2000/svg"></svg>
         <div class="fb-nodes-layer"></div>
       </div>
@@ -219,6 +241,7 @@ export class FlowCanvas {
       </div>
     `;
     this.world = this.root.querySelector('.fb-canvas-world');
+    this.regionsLayer = this.root.querySelector('.fb-regions-layer');
     this.svg = this.root.querySelector('.fb-edges');
     this.nodesLayer = this.root.querySelector('.fb-nodes-layer');
     this.hintEl = this.root.querySelector('[data-role="hint"]');
@@ -231,6 +254,7 @@ export class FlowCanvas {
       pu: this._onPointerUp.bind(this),
       wh: this._onWheel.bind(this),
       ck: this._onClick.bind(this),
+      cm: this._onContextMenu.bind(this),
     };
     this.root.addEventListener('pointerdown', this._h.pd);
     window.addEventListener('pointermove', this._h.pm);
@@ -238,6 +262,7 @@ export class FlowCanvas {
     window.addEventListener('pointercancel', this._h.pu);
     this.root.addEventListener('wheel', this._h.wh, { passive: false });
     this.root.addEventListener('click', this._h.ck);
+    this.root.addEventListener('contextmenu', this._h.cm);
     this._activePointers = new Map();
   }
 
@@ -249,8 +274,54 @@ export class FlowCanvas {
       window.removeEventListener('pointercancel', this._h.pu);
       this.root.removeEventListener('wheel', this._h.wh);
       this.root.removeEventListener('click', this._h.ck);
+      this.root.removeEventListener('contextmenu', this._h.cm);
     }
+    this._closeContextMenu();
     this.root.innerHTML = '';
+  }
+
+  // Menu kontekstowe canvas: akcje regionu petli (zgrupuj / rozgrupuj) na
+  // biezacym zaznaczeniu. Otwierane prawym przyciskiem nad wezlem.
+  _onContextMenu(ev) {
+    const nodeEl = ev.target.closest('.fb-node');
+    if (!nodeEl) { this._closeContextMenu(); return; }
+    ev.preventDefault();
+    const id = nodeEl.dataset.nodeId;
+    if (!this.selectedIds.has(id)) this.selectNode(id, { additive: ev.shiftKey });
+
+    this._closeContextMenu();
+    const ids = [...this.selectedIds];
+    const hasRegion = this.selectionHasRegion();
+    const anchor = document.createElement('div');
+    anchor.className = 'fb-context-anchor';
+    anchor.style.position = 'fixed';
+    anchor.style.left = `${ev.clientX}px`;
+    anchor.style.top = `${ev.clientY}px`;
+    anchor.style.zIndex = '9999';
+    const menu = document.createElement('tf-menu');
+    menu.setAttribute('placement', 'bottom-start');
+    menu.innerHTML = `
+      <tf-menu-item action="group" icon="rotate">${escapeHtml(I18n.t('flows_builder.group_loop_region'))}</tf-menu-item>
+      ${hasRegion ? `<tf-menu-item action="ungroup" icon="trash">${escapeHtml(I18n.t('flows_builder.ungroup_loop_region'))}</tf-menu-item>` : ''}
+    `;
+    anchor.appendChild(menu);
+    document.body.appendChild(anchor);
+    this._contextAnchor = anchor;
+    menu.addEventListener('action', (e) => {
+      const act = e.detail?.action;
+      if (act === 'group') this.groupIntoRegion(ids);
+      else if (act === 'ungroup') this.ungroupRegion(ids);
+      this._closeContextMenu();
+    });
+    menu.addEventListener('close', () => this._closeContextMenu());
+    menu.open();
+  }
+
+  _closeContextMenu() {
+    if (this._contextAnchor) {
+      if (this._contextAnchor.isConnected) this._contextAnchor.remove();
+      this._contextAnchor = null;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -264,7 +335,10 @@ export class FlowCanvas {
       const pos = n.position || {};
       const x = typeof n.x === 'number' ? n.x : (typeof pos.x === 'number' ? pos.x : 0);
       const y = typeof n.y === 'number' ? n.y : (typeof pos.y === 'number' ? pos.y : 0);
-      return { ...n, x, y, config: n.config || {} };
+      // `region` (harness loop region id) must round-trip: keep it as a string
+      // or drop it entirely so an empty string never poisons the box grouping.
+      const region = typeof n.region === 'string' && n.region ? n.region : undefined;
+      return { ...n, x, y, region, config: n.config || {} };
     });
     // Krawedzie z backendu (flow_json w DB) nie maja `id` — to pole jest
     // wewnetrznym uchwytem GUI dla selekcji + delete. Generujemy stable
@@ -305,11 +379,15 @@ export class FlowCanvas {
         // konwersji round-trip gubi pozycje — node po save'ie wraca bez
         // wspolrzednych i renderuje sie na (0,0).
         const { x, y, ...rest } = n;
-        return {
+        const out = {
           ...rest,
           position: { x: Number(x) || 0, y: Number(y) || 0 },
           config: { ...n.config },
         };
+        // `region` is the loop-region marker (Part 5). Drop it when empty so
+        // ungrouped nodes round-trip byte-identically (backend serde(default)).
+        if (!out.region) delete out.region;
+        return out;
       }),
       edges: this.edges.map((e) => {
         const out = { ...e };
@@ -322,6 +400,9 @@ export class FlowCanvas {
         }
         if (out.from_port === 'full') delete out.from_port;
         if (out.to_port === 'in') delete out.to_port;
+        // `kind` carries "loop_back" for the region back-edge (Part 5). Drop it
+        // when absent/empty so plain edges keep their canonical shape.
+        if (!out.kind) delete out.kind;
         return out;
       }),
     };
@@ -356,10 +437,28 @@ export class FlowCanvas {
         }
       }
     }
+    // Integralnosc regionu petli (lustro backendowej R11): krawedz `loop_back`
+    // musi laczyc wylacznie wezly tego samego `region`. To jest jedyny
+    // dozwolony cykl — kazda inna krawedz wsteczna jest bledem.
+    for (const edge of this.edges) {
+      if (edge.kind !== 'loop_back') continue;
+      const from = nodeById.get(edge.from_node);
+      const to = nodeById.get(edge.to_node);
+      if (!from || !to) continue; // juz zlapane wyzej jako dangling
+      if (!from.region || from.region !== to.region) {
+        errors.push(I18n.t('flows_builder.loop_back_cross_region'));
+      }
+    }
+
     // Wykrywanie cykli — DFS z kolorowaniem; zwracamy pojedynczy blad jesli
     // jakikolwiek cykl istnieje, bo lista cykli nie wnosi wiecej dla usera.
+    // Krawedzie `loop_back` SA pomijane w grafie sasiedztwa: region petli ma
+    // jedna jawna krawedz wsteczna, ktora backend (cache.rs Kahn) tez wylacza
+    // z in-degree, wiec zewnetrzny DAG pozostaje acykliczny. Bez tego wyjatku
+    // walidacja klienta odrzucalaby kazdy poprawny region.
     const adj = new Map();
     for (const e of this.edges) {
+      if (e.kind === 'loop_back') continue;
       if (!adj.has(e.from_node)) adj.set(e.from_node, []);
       adj.get(e.from_node).push(e.to_node);
     }
@@ -566,6 +665,95 @@ export class FlowCanvas {
     this.onChange();
   }
 
+  // Czy dodanie krawedzi from→to zamknie cykl? Sprawdzamy czy `from` jest juz
+  // osiagalny z `to` przez krawedzie FORWARD (pomijajac loop_back). Jesli tak,
+  // nowa krawedz from→to jest wsteczna. Uzywane do auto-oznaczenia loop_back.
+  _wouldFormCycle(fromId, toId) {
+    const adj = new Map();
+    for (const e of this.edges) {
+      if (e.kind === 'loop_back') continue;
+      if (!adj.has(e.from_node)) adj.set(e.from_node, []);
+      adj.get(e.from_node).push(e.to_node);
+    }
+    const seen = new Set();
+    const stack = [toId];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (cur === fromId) return true;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      for (const next of adj.get(cur) || []) stack.push(next);
+    }
+    return false;
+  }
+
+  // Grupuje wybrane wezly we wspolny region petli (Part 5). Jesli ktorykolwiek
+  // z zaznaczonych wezlow ma juz region, dolaczamy reszte do niego; w
+  // przeciwnym razie generujemy nowy `region` id. Zwraca id regionu.
+  groupIntoRegion(ids) {
+    const idSet = new Set(ids);
+    const members = this.nodes.filter((n) => idSet.has(n.id));
+    if (members.length === 0) return null;
+    const existing = members.map((n) => n.region).find((r) => r);
+    const regionId = existing || genRegionId();
+    for (const n of members) n.region = regionId;
+    this._pushHistory();
+    this.render();
+    this.onChange();
+    return regionId;
+  }
+
+  // Usuwa wezly z regionu petli. Jesli krawedz `loop_back` traci przynaleznosc
+  // (jeden z koncow opuscil region), degradujemy ja do zwyklej krawedzi, bo
+  // loop_back poza regionem jest niewalidowalna (R11).
+  ungroupRegion(ids) {
+    const idSet = new Set(ids);
+    let touched = false;
+    for (const n of this.nodes) {
+      if (idSet.has(n.id) && n.region) { n.region = undefined; touched = true; }
+    }
+    if (!touched) return;
+    for (const e of this.edges) {
+      if (e.kind !== 'loop_back') continue;
+      const from = this.nodes.find((n) => n.id === e.from_node);
+      const to = this.nodes.find((n) => n.id === e.to_node);
+      if (!from?.region || from.region !== to?.region) delete e.kind;
+    }
+    this._pushHistory();
+    this.render();
+    this.onChange();
+  }
+
+  // Loop-region role of a node: 'entry' (target of the region's loop_back edge,
+  // carries the region-level loop config), 'exit' (source of the loop_back edge),
+  // 'member' (in the region but neither endpoint) or null (no region). The config
+  // panel surfaces loop_max_iterations/loop_final_pass only on the entry, and the
+  // region box labels entry/exit ports — both read this single source of truth.
+  regionRole(nodeId) {
+    const node = this.nodes.find((n) => n.id === nodeId);
+    if (!node || !node.region) return null;
+    for (const e of this.edges) {
+      if (e.kind !== 'loop_back') continue;
+      const from = this.nodes.find((n) => n.id === e.from_node);
+      const to = this.nodes.find((n) => n.id === e.to_node);
+      if (!from?.region || from.region !== to?.region) continue;
+      if (from.region !== node.region) continue;
+      if (e.to_node === nodeId) return 'entry';
+      if (e.from_node === nodeId) return 'exit';
+    }
+    return 'member';
+  }
+
+  // Czy zaznaczenie zawiera wezel z regionem? Steruje pozycjami menu
+  // kontekstowego (Zgrupuj / Rozgrupuj).
+  selectionHasRegion() {
+    for (const id of this.selectedIds) {
+      const n = this.nodes.find((x) => x.id === id);
+      if (n?.region) return true;
+    }
+    return false;
+  }
+
   deleteSelected() {
     if (this.selectedIds.size > 0) {
       this.removeNodes([...this.selectedIds]);
@@ -619,10 +807,62 @@ export class FlowCanvas {
   // Rendering
   // -------------------------------------------------------------------------
   render() {
+    this._renderRegions();
     this._renderNodes();
     this._renderEdges();
     this._applyView();
     if (this.hintEl) this.hintEl.style.display = this.nodes.length === 0 ? 'flex' : 'none';
+  }
+
+  // Rysuje wizualne kontenery regionow petli: prostokat-tlo obejmujacy bounding
+  // box wszystkich wezlow o tym samym `node.region`, z etykieta. Kontener jest
+  // za wezlami (osobna warstwa `.fb-regions-layer`, pointer-events: none), wiec
+  // nie blokuje przeciagania ani laczenia portow.
+  _renderRegions() {
+    if (!this.regionsLayer) return;
+    this.regionsLayer.innerHTML = '';
+    const byRegion = new Map();
+    for (const n of this.nodes) {
+      if (!n.region) continue;
+      if (!byRegion.has(n.region)) byRegion.set(n.region, []);
+      byRegion.get(n.region).push(n);
+    }
+    const pad = 28;
+    for (const [regionId, members] of byRegion) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const n of members) {
+        minX = Math.min(minX, n.x);
+        minY = Math.min(minY, n.y);
+        maxX = Math.max(maxX, n.x + NODE_WIDTH);
+        maxY = Math.max(maxY, n.y + NODE_H_APPROX);
+      }
+      const box = document.createElement('div');
+      box.className = 'fb-region-box';
+      box.dataset.regionId = regionId;
+      box.style.left = `${minX - pad}px`;
+      box.style.top = `${minY - pad - 18}px`;
+      box.style.width = `${(maxX - minX) + pad * 2}px`;
+      box.style.height = `${(maxY - minY) + pad * 2 + 18}px`;
+      // Surface which member is the region entry (loop config + loop_back target)
+      // and which is the exit (loop_back source) so the user knows where to wire
+      // the loop. Derived from the same regionRole() the config panel reads.
+      const entry = members.find((m) => this.regionRole(m.id) === 'entry');
+      const exit = members.find((m) => this.regionRole(m.id) === 'exit');
+      const roleHints = [];
+      if (entry) {
+        const name = getNodeDisplayTitle(entry, this.templates.get(entry.type));
+        roleHints.push(`<span class="fb-region-role entry">${escapeHtml(I18n.t('flows_builder.loop_region_entry'))}: ${escapeHtml(name)}</span>`);
+      }
+      if (exit) {
+        const name = getNodeDisplayTitle(exit, this.templates.get(exit.type));
+        roleHints.push(`<span class="fb-region-role exit">${escapeHtml(I18n.t('flows_builder.loop_region_exit'))}: ${escapeHtml(name)}</span>`);
+      }
+      const label = document.createElement('div');
+      label.className = 'fb-region-label';
+      label.innerHTML = `<svg aria-hidden="true"><use href="#i-rotate"/></svg><span>${escapeHtml(I18n.t('flows_builder.loop_region_label', { id: regionId }))}</span>${roleHints.join('')}`;
+      box.appendChild(label);
+      this.regionsLayer.appendChild(box);
+    }
   }
 
   _renderNodes() {
@@ -639,6 +879,7 @@ export class FlowCanvas {
     if (old) old.replaceWith(fresh);
     else this.nodesLayer.appendChild(fresh);
     this._applySelectionClasses();
+    this._renderRegions();
     this._renderEdges();
   }
 
@@ -767,14 +1008,36 @@ export class FlowCanvas {
       hit.setAttribute('d', d);
       hit.dataset.edgeId = e.id;
       this.svg.appendChild(hit);
-      // Visible path
+      // Visible path. Loop-back edges (region cykl) rysowane przerywana linia
+      // (klasa `loop-back`) + znacznik "loop" na srodku, zeby odroznic je od
+      // zwyklych krawedzi forward.
+      const isLoopBack = e.kind === 'loop_back';
       const p = document.createElementNS(svgNs, 'path');
-      p.setAttribute('class', 'fb-edge-path');
+      p.setAttribute('class', isLoopBack ? 'fb-edge-path loop-back' : 'fb-edge-path');
       p.setAttribute('d', d);
       p.dataset.edgeId = e.id;
       const isSelected = this.selectedEdgeId === e.id;
       if (isSelected) p.classList.add('selected');
       this.svg.appendChild(p);
+      if (isLoopBack) {
+        const mid = this._bezierMidpoint(fp.x, fp.y, tp.x, tp.y);
+        const badge = document.createElementNS(svgNs, 'g');
+        badge.setAttribute('class', 'fb-edge-loop-badge');
+        badge.setAttribute('transform', `translate(${mid.x}, ${mid.y})`);
+        const bg = document.createElementNS(svgNs, 'rect');
+        bg.setAttribute('x', '-20'); bg.setAttribute('y', '-9');
+        bg.setAttribute('width', '40'); bg.setAttribute('height', '18');
+        bg.setAttribute('rx', '9');
+        bg.setAttribute('class', 'fb-edge-loop-bg');
+        const txt = document.createElementNS(svgNs, 'text');
+        txt.setAttribute('text-anchor', 'middle');
+        txt.setAttribute('dy', '4');
+        txt.setAttribute('class', 'fb-edge-loop-text');
+        txt.textContent = 'loop';
+        badge.appendChild(bg);
+        badge.appendChild(txt);
+        this.svg.appendChild(badge);
+      }
       // Przepływ energii: nakładka path z animowanym stroke-dashoffset (CSS).
       // Pokazuje kierunek from→to. Czysty CSS — znika z innerHTML='' bez duchów
       // (w przeciwieństwie do starego SVG animateMotion).
@@ -1041,6 +1304,7 @@ export class FlowCanvas {
           el.classList.add('dragging');
         }
       }
+      this._renderRegions();
       this._renderEdges();
       return;
     }
@@ -1141,13 +1405,23 @@ export class FlowCanvas {
               && e.from_port === fromPort
               && e.to_port === toPort);
             if (!exists) {
-              this.edges.push({
+              const edge = {
                 id: 'e_' + Date.now().toString(36),
                 from_node: fromNode.id,
                 to_node: toNodeId,
                 from_port: fromPort,
                 to_port: toPort,
-              });
+              };
+              // Back-edge detection: if both endpoints live in the SAME loop
+              // region and this edge closes a cycle (target is reachable as an
+              // ancestor of source through forward edges), mark it `loop_back`.
+              // The backend (cache.rs) excludes loop_back edges from in-degree,
+              // so this is the only legal way to draw a cycle on the canvas.
+              if (fromNode.region && fromNode.region === toNode?.region
+                && this._wouldFormCycle(fromNode.id, toNodeId)) {
+                edge.kind = 'loop_back';
+              }
+              this.edges.push(edge);
               this._pushHistory();
               this.onChange();
             }

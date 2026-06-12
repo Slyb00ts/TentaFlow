@@ -37,7 +37,38 @@ pub struct CompiledFlow {
     /// `from_port == "stream"`). Detekcja w compile time, nie scanowanie
     /// per-execution.
     pub is_streaming: bool,
+    /// Inline loop regions resolved at compile time (one per distinct
+    /// `FlowNode.region` id). The outer scheduler treats a region as a single
+    /// unit entered at `entry_pos` and exiting at `exit_pos`; the executor runs
+    /// the region's internal sub-DAG inline. Empty for flows with no region.
+    pub regions: Vec<LoopRegion>,
 }
+
+/// A compiled inline loop region: a marked subgraph with exactly one entry
+/// (target of the back edge AND of the external incoming edge) and one exit
+/// (source of the back edge). All positions are indices into
+/// `CompiledFlow::execution_order`.
+#[derive(Debug, Clone)]
+pub struct LoopRegion {
+    pub id: String,
+    /// Region members in topological order of the internal sub-DAG (after the
+    /// `loop_back` edge is removed). `entry_pos` is first, `exit_pos` last.
+    pub member_pos: Vec<usize>,
+    pub entry_pos: usize,
+    pub exit_pos: usize,
+    /// Index into `definition.edges` of the region's `loop_back` edge.
+    pub back_edge_idx: usize,
+    /// Iteration budget, clamped to `LOOP_REGION_MAX_ITERATIONS_CAP`.
+    pub max_iterations: u32,
+    /// Whether one extra grace iteration runs after the budget is exhausted.
+    pub final_pass: bool,
+}
+
+/// Default iteration budget for an inline loop region when the entry node's
+/// config does not set `loop_max_iterations`.
+pub const LOOP_REGION_DEFAULT_MAX_ITERATIONS: u32 = 25;
+/// Hard cap on an inline loop region's iteration budget (R11 also enforces it).
+pub const LOOP_REGION_MAX_ITERATIONS_CAP: u32 = 100;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
@@ -112,6 +143,7 @@ impl CompiledFlow {
             }
         }
         let is_streaming = definition.edges.iter().any(|e| e.from_port == "stream");
+        let regions = build_regions(&definition, &run_idx_by_id, &execution_order)?;
         Ok(Self {
             flow_id: flow_id.to_string(),
             definition: Arc::new(definition),
@@ -119,7 +151,36 @@ impl CompiledFlow {
             incoming_edges_per_pos,
             run_idx_by_id,
             is_streaming,
+            regions,
         })
+    }
+
+    /// The loop region whose `entry_pos` equals `pos`, if any. The executor
+    /// uses this to enter a region inline when the scheduler reaches its entry.
+    pub fn region_at_entry(&self, pos: usize) -> Option<&LoopRegion> {
+        self.regions.iter().find(|r| r.entry_pos == pos)
+    }
+
+    /// Run-index position of a region's member (non-entry) so the outer
+    /// scheduler can recognise and skip it — internal members are driven by the
+    /// region runner, never spawned standalone.
+    pub fn position_is_region_internal(&self, pos: usize) -> bool {
+        self.regions
+            .iter()
+            .any(|r| r.entry_pos != pos && r.member_pos.contains(&pos))
+    }
+
+    /// Contracted producer position for an external consumer: a region is one
+    /// unit whose output is stored at its `entry_pos`, so an edge originating at
+    /// any region member (notably the exit) reads from the entry slot. Non-member
+    /// positions map to themselves. Mirrors the `owner` remap in
+    /// `build_dependency_graph` so input resolution and dependency gating agree.
+    pub fn contracted_producer_pos(&self, pos: usize) -> usize {
+        self.regions
+            .iter()
+            .find(|r| r.member_pos.contains(&pos))
+            .map(|r| r.entry_pos)
+            .unwrap_or(pos)
     }
 
     /// Pozycja node'a "trigger" w execution_order. Walidacja gwarantuje że
@@ -149,6 +210,14 @@ impl CompiledFlow {
     /// Walidacja streaming end-shape gwarantuje co najwyżej jeden taki node;
     /// brak = `None`. Generalizacja starego `llm`-only slotu — harness
     /// `loop`/`subflow`/addon stream block też mogą tu trafić.
+    ///
+    /// An inline loop region is also a producer: when the `from_port="stream"`
+    /// edge originates at a region's exit node, the region itself is the stream
+    /// source (the real tokens come from the `llm` block inside it, but the
+    /// region is the contracted unit on the outer graph). The returned position
+    /// is then the region's `entry_pos` — the unit slot — so the executor enters
+    /// the streaming region runner instead of looking for a node-level producer
+    /// adapter on the exit.
     pub fn stream_producer_run_idx(&self, registry: &AdapterRegistry) -> Option<usize> {
         if !self.is_streaming {
             return None;
@@ -160,12 +229,25 @@ impl CompiledFlow {
             let Some(&pos) = self.run_idx_by_id.get(edge.from.as_str()) else {
                 continue;
             };
+            // A stream edge out of a region exit makes the region the producer.
+            if let Some(region) = self.regions.iter().find(|r| r.exit_pos == pos) {
+                return Some(region.entry_pos);
+            }
             let node = &self.definition.nodes[self.execution_order[pos]];
             if registry.is_stream_producer(&node.node_type) {
                 return Some(pos);
             }
         }
         None
+    }
+
+    /// The inline loop region whose contracted unit produces the stream, if the
+    /// stream producer for this flow is a region. `stream_producer_run_idx`
+    /// returns the region's `entry_pos`; this resolves that position back to the
+    /// region so the executor can drive its streaming runner.
+    pub fn stream_producer_region(&self, registry: &AdapterRegistry) -> Option<&LoopRegion> {
+        let pos = self.stream_producer_run_idx(registry)?;
+        self.regions.iter().find(|r| r.entry_pos == pos)
     }
 
     /// Stage 3d Krok 2c-2: chain stream nodes po producencie (intermediate
@@ -224,6 +306,13 @@ fn topological_sort(def: &FlowDefinition) -> Result<Vec<String>, CompileError> {
         adjacency.entry(node.id.as_str()).or_default();
     }
     for edge in &def.edges {
+        // The inline loop-region back edge closes a cycle in the graph; it is
+        // excluded from the toposort so Kahn does not reject the flow. Region
+        // semantics (the actual repeat) are handled by the executor, not the
+        // topological order.
+        if edge.is_loop_back() {
+            continue;
+        }
         adjacency
             .entry(edge.from.as_str())
             .or_default()
@@ -261,6 +350,96 @@ fn topological_sort(def: &FlowDefinition) -> Result<Vec<String>, CompileError> {
         });
     }
     Ok(sorted)
+}
+
+/// Resolves inline loop regions from `FlowNode.region` ids and the `loop_back`
+/// edges. Structural integrity (single entry/exit, members of one region, no
+/// boundary-crossing forward edges) is the responsibility of R11 in
+/// `validation.rs`, which runs before compile; this function only reads the
+/// already-validated shape, so any inconsistency here is a compiler invariant
+/// breach and surfaces as `CompileError::Validation` via the `validate` call.
+fn build_regions(
+    def: &FlowDefinition,
+    run_idx_by_id: &HashMap<String, usize>,
+    execution_order: &[usize],
+) -> Result<Vec<LoopRegion>, CompileError> {
+    // `execution_order` maps run-index → def-index; used to fetch the entry
+    // node's config (its run-index is its topological rank).
+    use std::collections::BTreeMap;
+
+    // Group member positions per region id (deterministic order via BTreeMap).
+    let mut members_by_region: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for node in &def.nodes {
+        if let Some(region_id) = node.region.as_deref() {
+            if let Some(&pos) = run_idx_by_id.get(node.id.as_str()) {
+                members_by_region.entry(region_id).or_default().push(pos);
+            }
+        }
+    }
+    if members_by_region.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut regions = Vec::with_capacity(members_by_region.len());
+    for (region_id, mut member_pos) in members_by_region {
+        // The single back edge of this region pins entry (its `to`) and exit
+        // (its `from`). R11 guarantees exactly one such edge per region.
+        let (back_edge_idx, back_edge) = def
+            .edges
+            .iter()
+            .enumerate()
+            .find(|(_, e)| {
+                e.is_loop_back()
+                    && def
+                        .nodes
+                        .iter()
+                        .any(|n| n.id == e.from && n.region.as_deref() == Some(region_id))
+            })
+            .ok_or_else(|| {
+                CompileError::Json(format!("region '{region_id}' has no loop_back edge"))
+            })?;
+        let entry_pos = *run_idx_by_id.get(back_edge.to.as_str()).ok_or_else(|| {
+            CompileError::Json(format!("region '{region_id}' back edge target missing"))
+        })?;
+        let exit_pos = *run_idx_by_id.get(back_edge.from.as_str()).ok_or_else(|| {
+            CompileError::Json(format!("region '{region_id}' back edge source missing"))
+        })?;
+
+        // Internal member order: a run-index position IS its topological rank
+        // (the global `execution_order`, built with the back edge excluded,
+        // already topo-sorts the whole acyclic graph), so sorting member
+        // positions ascending yields a valid internal order with `entry_pos`
+        // first.
+        member_pos.sort_unstable();
+        debug_assert_eq!(member_pos.first().copied(), Some(entry_pos));
+
+        let entry_def_idx = execution_order[entry_pos];
+        let entry_node = &def.nodes[entry_def_idx];
+        let max_iterations = entry_node
+            .config
+            .get("loop_max_iterations")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n > 0)
+            .map(|n| n as u32)
+            .unwrap_or(LOOP_REGION_DEFAULT_MAX_ITERATIONS)
+            .min(LOOP_REGION_MAX_ITERATIONS_CAP);
+        let final_pass = entry_node
+            .config
+            .get("loop_final_pass")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        regions.push(LoopRegion {
+            id: region_id.to_string(),
+            member_pos,
+            entry_pos,
+            exit_pos,
+            back_edge_idx,
+            max_iterations,
+            final_pass,
+        });
+    }
+    Ok(regions)
 }
 
 // =============================================================================
