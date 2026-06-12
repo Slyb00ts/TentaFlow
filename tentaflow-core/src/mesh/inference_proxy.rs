@@ -424,6 +424,15 @@ pub async fn dispatch_reverse_stream_request(
         }
     };
 
+    // Diagnostic anchor: every mesh-forwarded chat stream logs which model it
+    // asked for and how it ended on THIS node — without it, errors travel back
+    // to the initiator as opaque strings and the serving node leaves no trace.
+    tracing::info!(
+        target: "mesh::reverse",
+        request_id = %request_id,
+        model = %completion_payload.model,
+        "mesh reverse chat stream start (synthetic dispatch)"
+    );
     let mut chat_request = match build_chat_request(completion_payload) {
         Ok(req) => req,
         Err(e) => {
@@ -497,6 +506,11 @@ pub async fn dispatch_reverse_stream_request(
             }
             Err(e) => {
                 errored = true;
+                tracing::warn!(
+                    target: "mesh::reverse",
+                    request_id = %request_id,
+                    "mesh reverse chat stream error on this node: {e}"
+                );
                 send_stream_chunk_bytes(
                     &tx,
                     ModelStreamChunk {

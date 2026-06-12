@@ -78,7 +78,10 @@ fn envelope_stream_to_chunk_stream(
             // Audio delta (audio leci przez /v1/audio/speech/stream
             // endpoint, NIE chat stream). Defensywnie mapujemy na error.
             Ok(EnvelopeDelta::Audio(_)) => Err(crate::error::CoreError::InternalError {
-                message: "chat stream received Audio delta — flow misconfig".into(),
+                message: format!(
+                    "chat stream received Audio delta — flow misconfig (model='{}')",
+                    model_for_map
+                ),
                 source: None,
             }
             .into()),
@@ -125,7 +128,10 @@ fn envelope_stream_to_chunk_stream(
                     }
                     Some(Ok(EnvelopeDelta::Audio(_))) => Some((
                         Err(crate::error::CoreError::InternalError {
-                            message: "chat stream received Audio delta — flow misconfig".into(),
+                            message: format!(
+                                "chat stream received Audio delta — flow misconfig (model='{}')",
+                                model
+                            ),
                             source: None,
                         }
                         .into()),
