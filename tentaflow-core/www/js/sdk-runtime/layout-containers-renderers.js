@@ -5,7 +5,8 @@
 //   - Grid    (tag 0x0102) — CSS Grid z GridTrack + GridChild
 //   - Stack   (tag 0x0103) — Flex column z domyślnymi gap="md", align="stretch"
 //   - Cluster (tag 0x0104) — horizontal auto-wrap flow
-// Split (0x0105) i ScrollContainer (0x0112) wymagają slot manager — chunk 3.5.
+//   - Split   (tag 0x0105) — 2-pane split with optional resizable divider
+// ScrollContainer (0x0112) lives in form-search-scroll-renderer.js.
 // Spec ref: `tentaflow-sdk-spec/src/protocol/ui/layout/containers.rs`.
 // =============================================================================
 
@@ -448,6 +449,163 @@ function renderCluster(component, ctx) {
 }
 
 // =============================================================================
+// Split (0x0105)
+// =============================================================================
+
+export const SPLIT_TAG = 0x0105;
+
+const SPLIT_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const SPLIT_ORIENTATIONS = new Set(['horizontal', 'vertical']);
+
+function requireBool(value, ctx) {
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`${ctx}: expected bool, got ${typeof value}`);
+  }
+  return value;
+}
+
+function requireNonEmptyString(value, ctx) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${ctx}: expected non-empty string, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/// Converts a `SplitSize` discriminated union (auto / px / percent) to a CSS
+/// flex-basis value. Mirrors per-variant key whitelists from the Rust decoder
+/// in `inline.rs` (SplitSize::decode), incl. the finite 0.0..=100.0 percent
+/// range enforced on the wire.
+function splitSizeToBasis(size, ctx) {
+  if (!size || typeof size !== 'object' || Array.isArray(size)) {
+    throw new TypeError(`${ctx}: SplitSize must be object`);
+  }
+  switch (size.kind) {
+    case 'auto':
+      assertOnlyKnownObjectKeys(size, new Set(['kind']), `${ctx}.auto`);
+      return 'auto';
+    case 'px': {
+      assertOnlyKnownObjectKeys(size, new Set(['kind', 'value']), `${ctx}.px`);
+      const v = requireU32(size.value, `${ctx}.px.value`);
+      return `${v}px`;
+    }
+    case 'percent': {
+      assertOnlyKnownObjectKeys(size, new Set(['kind', 'value']), `${ctx}.percent`);
+      const v = size.value;
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 100) {
+        throw new TypeError(`${ctx}.percent.value must be finite 0.0..=100.0, got ${v}`);
+      }
+      return `${v}%`;
+    }
+    default:
+      throw new TypeError(`${ctx}.kind must be 'auto'/'px'/'percent', got ${size.kind}`);
+  }
+}
+
+export function renderSplit(component, ctx) {
+  assertOnlyKnownFields(component.fields, SPLIT_FIELD_KEYS, 'Split');
+  const orientation = requireEnum(
+    ctx.readField(component.fields, 0),
+    SPLIT_ORIENTATIONS,
+    'Split.orientation'
+  );
+  const primaryBasis = splitSizeToBasis(
+    ctx.readField(component.fields, 1),
+    'Split.primary_size'
+  );
+  const minPrimary = requireU32(ctx.readField(component.fields, 2), 'Split.min_primary');
+  const maxPrimary = requireU32(ctx.readField(component.fields, 3), 'Split.max_primary');
+  if (minPrimary > maxPrimary) {
+    throw new TypeError(
+      `Split: min_primary (${minPrimary}) must be <= max_primary (${maxPrimary})`
+    );
+  }
+  const resizable = requireBool(ctx.readField(component.fields, 4), 'Split.resizable');
+  const primarySlot = requireNonEmptyString(
+    ctx.readField(component.fields, 5),
+    'Split.primary_slot'
+  );
+  const secondarySlot = requireNonEmptyString(
+    ctx.readField(component.fields, 6),
+    'Split.secondary_slot'
+  );
+
+  const horizontal = orientation === 'horizontal';
+  const el = document.createElement('div');
+  el.classList.add('tf-split');
+  el.classList.add(`tf-split--${orientation}`);
+  if (resizable) el.classList.add('tf-split--resizable');
+
+  const primary = document.createElement('div');
+  primary.classList.add('tf-split__pane', 'tf-split__pane--primary');
+  primary.setAttribute('data-slot-id', primarySlot);
+  // Data-driven sizing only goes inline: flex-basis from SplitSize and the
+  // px clamp from min/max_primary. Structural flex layout comes from the
+  // .tf-split* classes.
+  primary.style.flexBasis = primaryBasis;
+  if (horizontal) {
+    primary.style.minWidth = `${minPrimary}px`;
+    primary.style.maxWidth = `${maxPrimary}px`;
+  } else {
+    primary.style.minHeight = `${minPrimary}px`;
+    primary.style.maxHeight = `${maxPrimary}px`;
+  }
+
+  const divider = document.createElement('div');
+  divider.classList.add('tf-split__divider');
+  divider.setAttribute('role', 'separator');
+  // ARIA orientation describes the divider line itself: a horizontal split
+  // (panes side by side) has a vertical divider, and vice versa.
+  divider.setAttribute('aria-orientation', horizontal ? 'vertical' : 'horizontal');
+
+  const secondary = document.createElement('div');
+  secondary.classList.add('tf-split__pane', 'tf-split__pane--secondary');
+  secondary.setAttribute('data-slot-id', secondarySlot);
+
+  if (resizable) {
+    // Pointer-drag resize: move/up listeners live on document so the drag
+    // survives the pointer leaving the divider; both are released via
+    // ctx.registerCleanup when the element is destroyed.
+    let drag = null;
+    const onPointerDown = (e) => {
+      const rect = primary.getBoundingClientRect();
+      drag = {
+        startCoord: horizontal ? e.clientX : e.clientY,
+        startSize: horizontal ? rect.width : rect.height,
+      };
+      if (typeof divider.setPointerCapture === 'function' && e.pointerId != null) {
+        try { divider.setPointerCapture(e.pointerId); } catch {}
+      }
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+    };
+    const onPointerMove = (e) => {
+      if (!drag) return;
+      const coord = horizontal ? e.clientX : e.clientY;
+      const next = drag.startSize + (coord - drag.startCoord);
+      const clamped = Math.min(maxPrimary, Math.max(minPrimary, next));
+      primary.style.flexBasis = `${Math.round(clamped)}px`;
+    };
+    const onPointerUp = () => {
+      drag = null;
+    };
+    divider.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('pointermove', onPointerMove);
+    document.addEventListener('pointerup', onPointerUp);
+    document.addEventListener('pointercancel', onPointerUp);
+    ctx.registerCleanup(() => {
+      divider.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('pointermove', onPointerMove);
+      document.removeEventListener('pointerup', onPointerUp);
+      document.removeEventListener('pointercancel', onPointerUp);
+    });
+  }
+
+  el.appendChild(primary);
+  el.appendChild(divider);
+  el.appendChild(secondary);
+  return el;
+}
+
+// =============================================================================
 // Rejestracja
 // =============================================================================
 
@@ -456,4 +614,5 @@ export function registerLayoutContainersRenderers() {
   if (!lookupComponentRenderer(GRID_TAG)) registerComponentRenderer(GRID_TAG, renderGrid);
   if (!lookupComponentRenderer(STACK_TAG)) registerComponentRenderer(STACK_TAG, renderStack);
   if (!lookupComponentRenderer(CLUSTER_TAG)) registerComponentRenderer(CLUSTER_TAG, renderCluster);
+  if (!lookupComponentRenderer(SPLIT_TAG)) registerComponentRenderer(SPLIT_TAG, renderSplit);
 }

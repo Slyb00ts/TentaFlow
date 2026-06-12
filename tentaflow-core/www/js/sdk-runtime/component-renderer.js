@@ -31,6 +31,7 @@ import {
   SEARCHBOX_TAG, renderSearchBox,
   SCROLLCONTAINER_TAG, renderScrollContainer,
 } from './form-search-scroll-renderer.js';
+import { SPLIT_TAG, renderSplit } from './layout-containers-renderers.js';
 
 // =============================================================================
 // Public registry — per-tag rendererzy
@@ -838,3 +839,4 @@ function applyBindSpec(element, bindSpec, ctx) {
 
 registerComponentRenderer(SEARCHBOX_TAG, renderSearchBox);
 registerComponentRenderer(SCROLLCONTAINER_TAG, renderScrollContainer);
+registerComponentRenderer(SPLIT_TAG, renderSplit);

@@ -589,15 +589,14 @@ impl SessionRegistry {
     pub fn find_connection(&self, addon_id: &str, user_id: &str) -> Option<u64> {
         let read = self.addon_connections.read();
         let count = read.len();
-        tracing::info!(
+        tracing::debug!(
             addon = addon_id,
             user_id,
             entries = count,
-            registry_ptr = format_args!("{:p}", self),
             "find_connection lookup"
         );
         for ((aid, uid), conn_id) in read.iter() {
-            tracing::info!(stored_addon = %aid, stored_uid = %uid, stored_conn = conn_id, "find_connection entry");
+            tracing::debug!(stored_addon = %aid, stored_uid = %uid, stored_conn = conn_id, "find_connection entry");
             if uid == user_id && aid == addon_id {
                 return Some(*conn_id);
             }

@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: sdk-runtime/layout-containers-renderers.test.js
-// Opis: Testy 4 containerów Layout (Krok 3.3a-2): Flex, Grid, Stack, Cluster.
+// Opis: Testy containerów Layout: Flex, Grid, Stack, Cluster, Split.
 // =============================================================================
 
 import './_dom-test-harness.js';
@@ -17,6 +17,7 @@ import {
   GRID_TAG,
   STACK_TAG,
   CLUSTER_TAG,
+  SPLIT_TAG,
 } from './layout-containers-renderers.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
 
@@ -460,6 +461,135 @@ test('Cluster rejects missing gap', () => {
   assertThrows(() =>
     engine.render(comp(CLUSTER_TAG, [[1, 'start'], [2, 'center'], [3, []]]))
   );
+});
+
+// ============================================================================
+// Split
+// ============================================================================
+
+// All 7 fields are required by SPLIT_SCHEMA (schema/data.rs).
+function splitFields(overrides = {}) {
+  const base = {
+    0: 'horizontal',
+    1: { kind: 'percent', value: 30 },
+    2: 100,
+    3: 600,
+    4: false,
+    5: 'pane-a',
+    6: 'pane-b',
+  };
+  Object.assign(base, overrides);
+  return Object.entries(base)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => [Number(k), v]);
+}
+
+test('Split horizontal renders panes, divider and percent basis', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SPLIT_TAG, splitFields()));
+  assert(el.classList.contains('tf-split'));
+  assert(el.classList.contains('tf-split--horizontal'));
+  assert(!el.classList.contains('tf-split--resizable'));
+  assertEq(el.children.length, 3);
+  const [primary, divider, secondary] = el.children;
+  assert(primary.classList.contains('tf-split__pane--primary'));
+  assertEq(primary.getAttribute('data-slot-id'), 'pane-a');
+  assertEq(primary.style.flexBasis, '30%');
+  assertEq(primary.style.minWidth, '100px');
+  assertEq(primary.style.maxWidth, '600px');
+  assertEq(divider.getAttribute('role'), 'separator');
+  // Horizontal split (panes side by side) → the divider line is vertical.
+  assertEq(divider.getAttribute('aria-orientation'), 'vertical');
+  assert(secondary.classList.contains('tf-split__pane--secondary'));
+  assertEq(secondary.getAttribute('data-slot-id'), 'pane-b');
+});
+
+test('Split vertical with px size uses min/max-height', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(SPLIT_TAG, splitFields({ 0: 'vertical', 1: { kind: 'px', value: 240 } }))
+  );
+  assert(el.classList.contains('tf-split--vertical'));
+  const primary = el.children[0];
+  assertEq(primary.style.flexBasis, '240px');
+  assertEq(primary.style.minHeight, '100px');
+  assertEq(primary.style.maxHeight, '600px');
+  assertEq(el.children[1].getAttribute('aria-orientation'), 'horizontal');
+});
+
+test('Split auto size maps to flex-basis auto', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SPLIT_TAG, splitFields({ 1: { kind: 'auto' } })));
+  assertEq(el.children[0].style.flexBasis, 'auto');
+});
+
+test('Split accepts BigInt min/max/px from wire decoder', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(SPLIT_TAG, splitFields({ 1: { kind: 'px', value: 200n }, 2: 50n, 3: 400n }))
+  );
+  const primary = el.children[0];
+  assertEq(primary.style.flexBasis, '200px');
+  assertEq(primary.style.minWidth, '50px');
+  assertEq(primary.style.maxWidth, '400px');
+});
+
+test('Split validation rejects malformed fields', () => {
+  setup();
+  const engine = makeEngine();
+  const cases = [
+    splitFields({ 0: 'diagonal' }),                          // bad orientation
+    splitFields({ 1: { kind: 'percent', value: 120 } }),     // percent > 100
+    splitFields({ 1: { kind: 'percent', value: NaN } }),     // non-finite percent
+    splitFields({ 1: { kind: 'auto', value: 5 } }),          // auto must not carry value
+    splitFields({ 1: { kind: 'px', value: -1 } }),           // negative px
+    splitFields({ 2: 700 }),                                 // min_primary > max_primary
+    splitFields({ 4: undefined }),                           // missing resizable
+    splitFields({ 5: '' }),                                  // empty primary_slot
+    splitFields().concat([[7, 'x']]),                        // unknown field key
+  ];
+  for (const fields of cases) {
+    assertThrows(() => engine.render(comp(SPLIT_TAG, fields)));
+  }
+});
+
+test('Split resizable drag clamps flex-basis to min/max', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SPLIT_TAG, splitFields({ 4: true })));
+  assert(el.classList.contains('tf-split--resizable'));
+  const [primary, divider] = el.children;
+  // happy-dom getBoundingClientRect returns 0 → startSize = 0; drag deltas
+  // drive the basis directly, clamped to [min_primary, max_primary].
+  divider.dispatchEvent(new MouseEvent('pointerdown', { clientX: 200, bubbles: true }));
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 350 }));
+  assertEq(primary.style.flexBasis, '150px');
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 1200 }));
+  assertEq(primary.style.flexBasis, '600px'); // clamped to max_primary
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 210 }));
+  assertEq(primary.style.flexBasis, '100px'); // clamped to min_primary
+  document.dispatchEvent(new MouseEvent('pointerup', {}));
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 500 }));
+  // After pointerup the drag is finished — no further resizing.
+  assertEq(primary.style.flexBasis, '100px');
+});
+
+test('Split destroy removes document drag listeners', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SPLIT_TAG, splitFields({ 4: true })));
+  const [primary, divider] = el.children;
+  divider.dispatchEvent(new MouseEvent('pointerdown', { clientX: 0, bubbles: true }));
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 300 }));
+  assertEq(primary.style.flexBasis, '300px');
+  engine.destroy(el);
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 550 }));
+  // Listeners are unhooked on destroy — basis stays frozen.
+  assertEq(primary.style.flexBasis, '300px');
 });
 
 // ============================================================================

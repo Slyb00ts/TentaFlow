@@ -4482,6 +4482,18 @@ tf-skeleton {
 .tf-flex--radius-pill   { border-radius: var(--tf-radius-pill); }
 .tf-flex--radius-circle { border-radius: var(--tf-radius-circle); }
 
+/* ---------- tf-split (0x0105) ---------- */
+.tf-split { display: flex; min-width: 0; min-height: 0; }
+.tf-split--horizontal { flex-direction: row; }
+.tf-split--vertical { flex-direction: column; }
+.tf-split__pane { min-width: 0; min-height: 0; overflow: auto; }
+.tf-split__pane--primary { flex: 0 0 auto; }
+.tf-split__pane--secondary { flex: 1 1 0; }
+.tf-split__divider { flex: 0 0 auto; background: var(--tf-border); }
+.tf-split--horizontal > .tf-split__divider { width: 4px; cursor: col-resize; }
+.tf-split--vertical > .tf-split__divider { height: 4px; cursor: row-resize; }
+.tf-split--resizable > .tf-split__divider { touch-action: none; }
+
 /* ---------- tf-grid (0x0102) ---------- */
 .tf-grid { display: grid; min-width: 0; }
 .tf-grid--gap-zero { gap: var(--tf-space-zero); }
