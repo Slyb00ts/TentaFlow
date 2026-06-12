@@ -3,8 +3,8 @@
     {
       "type": "uppercase",
       "category": "Text",
-      "label": "Test: Uppercase",
-      "description": "Test flow block — przyjmuje text, zwraca uppercase. Waliduje cale invoke_block path (fresh instance + per-call fuel + JSON envelope).",
+      "label": "Showcase: Uppercase",
+      "description": "Test flow block — takes text, returns it uppercased. Validates the full invoke_block path (fresh instance + per-call fuel + JSON envelope).",
       "icon": "shield",
       "inputs": [
         { "name": "in", "type": "text" }

@@ -2964,7 +2964,7 @@ mod tests {
     fn resource_requirements_missing_section() {
         // Brak sekcji [resources] — Option<ResourceRequirements> = None
         let toml_str = r#"
-            addon_id = "test-addon"
+            addon_id = "sdk-showcase"
             version = "1.0.0"
             display_name = "Test"
             permissions = []

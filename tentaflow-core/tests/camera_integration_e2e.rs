@@ -3,14 +3,14 @@
 // =============================================================================
 //
 // Drives the camera_* host functions through a real WASM guest
-// (`addons/camera-test-addon`). The addon's `on_request` exposes three tools:
+// (`addons/sdk-showcase`). The addon's `on_request` exposes three tools:
 //   - "run_lifecycle"      camera_add -> health -> snapshot -> remove
 //   - "run_path_traversal" camera_add with a hostile URL
 //   - "run_no_write_probe" surfaces Permission denial when cameras.write is
 //                          missing on AddonState
 //
 // Build prerequisite for every test in this file:
-//     cd addons/camera-test-addon && cargo build --target wasm32-wasip1 --release
+//     cd addons/sdk-showcase && cargo build --target wasm32-wasip1 --release
 // All tests are `#[ignore]` so a developer machine without the WASM artifact
 // (or without `assets/test/sample_traffic.mp4` for the snapshot variant) is
 // not blocked.
@@ -32,10 +32,10 @@ use tentaflow_core::crypto::SettingsCipher;
 use tentaflow_core::db;
 
 const CAMERA_TEST_ADDON_WASM: &str =
-    "addons/camera-test-addon/target/wasm32-wasip1/release/tentaflow_addon_camera_test.wasm";
+    "../target-addon-wasm/wasm32-wasip1/release/tentaflow_addon_sdk_showcase.wasm";
 
-const ADDON_ID: &str = "camera-test-addon";
-const INSTANCE_ID: &str = "camera-test-addon-001";
+const ADDON_ID: &str = "sdk-showcase";
+const INSTANCE_ID: &str = "sdk-showcase-camera-001";
 
 // =============================================================================
 // DB + AddonState helpers
@@ -109,7 +109,7 @@ fn create_wasm_instance(
 }
 
 // =============================================================================
-// on_request marshaling — JSON in, JSON out (mirrors test-addon dispatcher)
+// on_request marshaling — JSON in, JSON out (mirrors the sdk-showcase dispatcher)
 // =============================================================================
 
 fn call_on_request(
@@ -233,13 +233,13 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires camera-test-addon WASM build + sample_traffic.mp4"]
+#[ignore = "requires sdk-showcase WASM build + sample_traffic.mp4"]
 async fn camera_addon_lifecycle_e2e() {
     let _g = lock();
     let Some(wasm) = load_wasm() else {
         panic!(
-            "camera-test-addon WASM missing — build with: \
-             cd addons/camera-test-addon && cargo build --target wasm32-wasip1 --release"
+            "sdk-showcase WASM missing — build with: \
+             cd addons/sdk-showcase && cargo build --target wasm32-wasip1 --release"
         );
     };
     let Some(sample) = sample_path() else {
@@ -346,11 +346,11 @@ async fn camera_addon_lifecycle_e2e() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires camera-test-addon WASM build"]
+#[ignore = "requires sdk-showcase WASM build"]
 async fn camera_addon_path_traversal_blocked() {
     let _g = lock();
     let Some(wasm) = load_wasm() else {
-        panic!("camera-test-addon WASM missing");
+        panic!("sdk-showcase WASM missing");
     };
     let db = create_test_db();
     let (mut store, instance) = create_wasm_instance(
@@ -417,11 +417,11 @@ async fn camera_addon_path_traversal_blocked() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires camera-test-addon WASM build"]
+#[ignore = "requires sdk-showcase WASM build"]
 async fn camera_addon_permission_denied_without_write() {
     let _g = lock();
     let Some(wasm) = load_wasm() else {
-        panic!("camera-test-addon WASM missing");
+        panic!("sdk-showcase WASM missing");
     };
     let db = create_test_db();
     // Read-only permissions: no cameras.write granted on AddonState.
@@ -465,11 +465,11 @@ async fn camera_addon_permission_denied_without_write() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires camera-test-addon WASM build + sample_traffic.mp4 + warmup"]
+#[ignore = "requires sdk-showcase WASM build + sample_traffic.mp4 + warmup"]
 async fn camera_addon_snapshot_inline_rgb24_after_warmup() {
     let _g = lock();
     let Some(wasm) = load_wasm() else {
-        panic!("camera-test-addon WASM missing");
+        panic!("sdk-showcase WASM missing");
     };
     let Some(sample) = sample_path() else {
         panic!("sample_traffic.mp4 missing");

@@ -14,9 +14,9 @@
 //   3. `validate_manifest_extensions` — uniqueness checks, enum guards,
 //      signature format, semver `sdk_version`, storage/sql_backends coherence.
 //
-// We bench against `addons/test-addon/manifest.toml` (~120 lines, exercises
-// permissions + tools + network rules + visibility — a realistic mid-size
-// addon manifest).
+// We bench against `addons/sdk-showcase/manifest.toml` (exercises
+// permissions + tools + application/service + storage + vector namespaces —
+// a realistic mid-size addon manifest).
 //
 // Run: `cargo bench --bench manifest_perf -- --quick --noplot`
 
@@ -26,14 +26,14 @@ use criterion::{criterion_group, criterion_main, Criterion};
 
 use tentaflow_core::addon::lifecycle::parse_manifest_toml;
 
-const MANIFEST_SRC: &str = include_str!("../addons/test-addon/manifest.toml");
+const MANIFEST_SRC: &str = include_str!("../addons/sdk-showcase/manifest.toml");
 
 fn bench_manifest_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("manifest");
 
     // Sanity: ensure the manifest still parses before we start the timed loop —
     // a regression in the schema would otherwise show up as a panic mid-bench.
-    parse_manifest_toml(MANIFEST_SRC).expect("test-addon manifest must parse");
+    parse_manifest_toml(MANIFEST_SRC).expect("sdk-showcase manifest must parse");
 
     group.bench_function("parse_validate", |b| {
         b.iter(|| {

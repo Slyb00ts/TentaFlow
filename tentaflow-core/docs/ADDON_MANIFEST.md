@@ -520,7 +520,7 @@ Lifecycle installer wykonuje kolejno:
 ## Backward compatibility
 
 Wszystkie nowe sekcje sa **opcjonalne**. Addony z istniejacymi manifestami
-(`test-app-addon`, `teams-bot`, `embeddings-chunker`, `sharepoint-rag`,
+(`sdk-showcase`, `teams-bot`, `embeddings-chunker`, `sharepoint-rag`,
 `outlook`, `teams`, `malicious-addon`) parsuja sie bez modyfikacji i bez
 uzyskania nowych funkcji — `m.aliases`, `m.gates`, `m.vector_namespaces`,
 `m.flow_templates`, `m.ui_components` sa puste, `m.storage` i `m.gpu` to
@@ -640,5 +640,5 @@ Wynik: 1 bład — manifest niepoprawny, NIE instaluj.
 
 Polecenie wraca kod 1 przy kazdym bledzie, wiec mozna spinac z `set -e`
 lub `cargo test -p tentaflow-cli`. Crate `tentaflow-cli` ma testy integracyjne
-(`tests/cli_addon_validate.rs`), ktore pokrywaja manifesty test-app-addon,
+(`tests/cli_addon_validate.rs`), ktore pokrywaja manifesty sdk-showcase,
 teams-bot oraz dwa zlamane fixtures z `tentaflow-core/tests/fixtures/`.

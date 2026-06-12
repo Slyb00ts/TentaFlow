@@ -694,7 +694,7 @@ mod tests {
         // Arrange — in-memory DB z uzytkownikiem i uprawnieniem
         let db = create_test_db();
         let user_id = insert_test_user(&db, "test_user_cache");
-        let addon_id = "test-addon";
+        let addon_id = "sdk-showcase";
 
         // Ustaw uprawnienie granted=true per user
         set_permission(&db, addon_id, "user", &user_id, "chat_read", true);
@@ -838,7 +838,7 @@ mod tests {
         checker.refresh_all();
 
         // Act
-        let result = checker.check("test-addon", &user_id, "chat_read", None);
+        let result = checker.check("sdk-showcase", &user_id, "chat_read", None);
 
         // Assert — powinno zwrocic NotConfigured (default deny)
         assert_eq!(

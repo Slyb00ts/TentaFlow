@@ -1,8 +1,8 @@
 // =============================================================================
 // File: tests/e2e_smoke_cbor_test.rs
-// E2E smoke test — validates the full CBOR UI pipeline: addon emits PanelShell
-// on on_start, handles "increment" action producing StatePatch, and all CBOR
-// is canonical and decodable by tentaflow-sdk-spec types.
+// E2E smoke test — validates the full CBOR UI pipeline against the bundled
+// sdk-showcase addon: PanelShell on on_start, "increment" action producing
+// StatePatch, and all CBOR canonical and decodable by tentaflow-sdk-spec.
 // =============================================================================
 
 use std::path::Path;
@@ -22,7 +22,8 @@ use tentaflow_core::db;
 use tentaflow_sdk_spec::protocol::ui::ui_payload::UiPayload;
 use tentaflow_sdk_spec::validate_canonical;
 
-const E2E_SMOKE_WASM: &str = "addons/e2e-smoke/target/wasm32-wasip1/release/e2e_smoke.wasm";
+const E2E_SMOKE_WASM: &str =
+    "../target-addon-wasm/wasm32-wasip1/release/tentaflow_addon_sdk_showcase.wasm";
 
 // =============================================================================
 // Fixtures
@@ -42,7 +43,7 @@ fn load_e2e_smoke_wasm() -> Vec<u8> {
     std::fs::read(&wasm_path).unwrap_or_else(|e| {
         panic!(
             "Cannot read WASM at {:?}: {}. Build addon first: \
-             cd addons/e2e-smoke && cargo build --target wasm32-wasip1 --release",
+             cd addons/sdk-showcase && cargo build --target wasm32-wasip1 --release",
             wasm_path, e
         )
     })
@@ -51,8 +52,8 @@ fn load_e2e_smoke_wasm() -> Vec<u8> {
 fn create_addon_state(db: db::DbPool) -> AddonState {
     let ui_panels = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     AddonState {
-        addon_id: "e2e-smoke".to_string(),
-        instance_id: "e2e-smoke-test-001".to_string(),
+        addon_id: "sdk-showcase".to_string(),
+        instance_id: "sdk-showcase-test-001".to_string(),
         user_id: None,
         org_id: None,
         db: db.clone(),
@@ -121,7 +122,7 @@ fn on_start_emits_canonical_panel_shell() {
     let cache = ui_panels.read();
     let key = (
         String::new(),
-        "e2e-smoke".to_string(),
+        "sdk-showcase".to_string(),
         "cbor_msg".to_string(),
     );
     let cbor_bytes = cache.get(&key).expect("PanelShell not in ui_panels cache");
@@ -134,12 +135,13 @@ fn on_start_emits_canonical_panel_shell() {
 
     match &payload {
         UiPayload::PanelShell(shell) => {
-            assert_eq!(shell.addon_id, "e2e-smoke");
+            assert_eq!(shell.addon_id, "sdk-showcase");
             assert_eq!(shell.panel_id, "main");
             assert_eq!(shell.panel_epoch, 1);
             assert_eq!(shell.slots.len(), 1);
             assert_eq!(shell.slots[0].id, "content");
-            assert_eq!(shell.initial_state.len(), 1);
+            // counter, tick_counter, active_tab, demo_result
+            assert_eq!(shell.initial_state.len(), 4);
         }
         other => panic!("expected PanelShell, got tag {:?}", other.tag()),
     }
@@ -204,7 +206,7 @@ fn increment_action_emits_canonical_state_patch() {
     let cache = ui_panels.read();
     let key = (
         String::new(),
-        "e2e-smoke".to_string(),
+        "sdk-showcase".to_string(),
         "cbor_msg".to_string(),
     );
     let cbor_bytes = cache.get(&key).expect("StatePatch not in ui_panels cache");
@@ -217,7 +219,7 @@ fn increment_action_emits_canonical_state_patch() {
 
     match &payload {
         UiPayload::StatePatch(patch) => {
-            assert_eq!(patch.addon_id, "e2e-smoke");
+            assert_eq!(patch.addon_id, "sdk-showcase");
             assert_eq!(patch.panel_id, "main");
             assert_eq!(patch.panel_epoch, 1);
             assert_eq!(patch.base_revision, 0);
@@ -291,7 +293,7 @@ fn multiple_increments_advance_revision() {
     let cache = ui_panels.read();
     let key = (
         String::new(),
-        "e2e-smoke".to_string(),
+        "sdk-showcase".to_string(),
         "cbor_msg".to_string(),
     );
     let cbor_bytes = cache.get(&key).unwrap();
@@ -327,7 +329,7 @@ fn cbor_roundtrip_bit_identical() {
     let cache = ui_panels.read();
     let key = (
         String::new(),
-        "e2e-smoke".to_string(),
+        "sdk-showcase".to_string(),
         "cbor_msg".to_string(),
     );
     let original = cache.get(&key).unwrap().clone();
@@ -340,4 +342,91 @@ fn cbor_roundtrip_bit_identical() {
         original, re_encoded,
         "re-encoded CBOR differs from original — not canonical"
     );
+}
+
+#[test]
+fn catalog_tabs_emit_canonical_slot_content() {
+    let db = create_test_db();
+    let (mut store, instance, ui_panels) = create_instance(db);
+
+    let on_start = instance
+        .get_typed_func::<(), i32>(&mut store, "on_start")
+        .expect("on_start");
+    on_start.call(&mut store, ()).expect("on_start");
+
+    let alloc_fn = instance
+        .get_typed_func::<i32, i32>(&mut store, "alloc")
+        .expect("alloc");
+    let on_request = instance
+        .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "on_request")
+        .expect("on_request");
+
+    let tabs = [
+        "live",
+        "molecules",
+        "layout",
+        "data",
+        "form",
+        "action",
+        "feedback",
+        "specialized",
+        "storage",
+    ];
+
+    for tab in tabs {
+        let request_json = serde_json::json!({
+            "tool": "ui.main.panel-navigate",
+            "params": { "item_id": tab },
+            "user_id": 1,
+        });
+        let request_bytes = serde_json::to_vec(&request_json).unwrap();
+
+        let input_ptr = alloc_fn
+            .call(&mut store, request_bytes.len() as i32)
+            .expect("alloc input");
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+        memory.data_mut(&mut store)[input_ptr as usize..input_ptr as usize + request_bytes.len()]
+            .copy_from_slice(&request_bytes);
+
+        let out_cap: i32 = 65536;
+        let out_ptr = alloc_fn.call(&mut store, out_cap).expect("alloc out");
+        let out_len_ptr = alloc_fn.call(&mut store, 4).expect("alloc out_len");
+
+        let result = on_request
+            .call(
+                &mut store,
+                (
+                    input_ptr,
+                    request_bytes.len() as i32,
+                    out_ptr,
+                    out_cap,
+                    out_len_ptr,
+                ),
+            )
+            .expect("on_request");
+        assert_eq!(result, 0, "panel-navigate '{}' returned non-zero", tab);
+
+        // The last UI message must be a canonical SlotContent for slot 'content'.
+        let cache = ui_panels.read();
+        let key = (
+            String::new(),
+            "sdk-showcase".to_string(),
+            "cbor_msg".to_string(),
+        );
+        let cbor_bytes = cache.get(&key).expect("SlotContent not in ui_panels cache");
+
+        validate_canonical(cbor_bytes)
+            .unwrap_or_else(|e| panic!("tab '{}': CBOR not canonical: {:?}", tab, e));
+
+        let payload: UiPayload = minicbor::decode(cbor_bytes)
+            .unwrap_or_else(|e| panic!("tab '{}': UiPayload decode failed: {}", tab, e));
+        match &payload {
+            UiPayload::SlotContent(slot) => {
+                assert_eq!(slot.addon_id, "sdk-showcase");
+                assert_eq!(slot.panel_id, "main");
+                assert_eq!(slot.slot_id, "content");
+            }
+            other => panic!("tab '{}': expected SlotContent, got tag {:?}", tab, other.tag()),
+        }
+    }
 }
