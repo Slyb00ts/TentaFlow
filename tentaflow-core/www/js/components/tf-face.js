@@ -58,7 +58,7 @@ const PERSPECTIVE_D_DST = 6.1;  // 50mm FF same framing ≈ 0.71 m
 // doesn't reintroduce wide-angle distortion; size at the z=0 plane is unchanged
 // because scalePersp compensates.
 const VIEW_CAMERA_DISTANCE = PERSPECTIVE_D_DST;
-const FACE_WIDTH_SCALE = 0.84; // compensates the silhouette widening introduced by the 28mm->50mm rewarp + flatter display camera; x only, height untouched
+const FACE_WIDTH_SCALE = 0.78; // restores the original on-screen W/H aspect (0.652) after the 28mm->50mm rewarp + flatter display camera; x only, height untouched
 
 function perspectiveScale(z) {
   return ((PERSPECTIVE_D_SRC - z) / PERSPECTIVE_D_SRC)
