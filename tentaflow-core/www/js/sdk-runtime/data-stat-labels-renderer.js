@@ -64,6 +64,12 @@ function requireBool(v, ctx) {
   return v;
 }
 function requireU32(v, ctx) {
+  if (typeof v === 'bigint') {
+    if (v < 0n || v > 0xFFFFFFFFn) {
+      throw new TypeError(`${ctx}: expected u32, got ${v}`);
+    }
+    return Number(v);
+  }
   if (!Number.isInteger(v) || v < 0 || v > 0xFFFFFFFF) {
     throw new TypeError(`${ctx}: expected u32, got ${v}`);
   }

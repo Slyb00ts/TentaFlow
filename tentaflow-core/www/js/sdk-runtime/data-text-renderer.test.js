@@ -114,6 +114,24 @@ test('Text max_lines>0 ustawia CSS var', () => {
   assertEq(el.style.getPropertyValue('--tf-text-max-lines'), '3');
 });
 
+test('Text max_lines jako BigInt z dekodera wire akceptowany', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(TEXT_TAG, [
+    [0, { kind: 'literal', value: 'X' }], [1, 'body'], [5, 3n],
+  ]));
+  assert(el.classList.contains('tf-text--clamp'));
+  assertEq(el.style.getPropertyValue('--tf-text-max-lines'), '3');
+});
+
+test('Text max_lines BigInt poza zakresem u8 throws', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(TEXT_TAG, [
+    [0, { kind: 'literal', value: 'X' }], [1, 'body'], [5, 300n],
+  ])));
+});
+
 test('Text invalid style throws', () => {
   setup();
   const engine = makeEngine();

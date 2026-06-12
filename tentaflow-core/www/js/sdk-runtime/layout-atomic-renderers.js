@@ -38,8 +38,14 @@ function requireEnum(value, set, ctx) {
 }
 
 function requireU16(value, ctx) {
-  // u16 z wire'u przychodzi jako JS Number (boundary §3.1: u32 i mniejsze
-  // są Number, nie BigInt). Floaty / negatywne / > 65535 odrzucamy.
+  // u16 z wire'u może przyjść jako Number albo BigInt (dekoder CBOR oddaje
+  // niektóre inty jako BigInt). Floaty / negatywne / > 65535 odrzucamy.
+  if (typeof value === 'bigint') {
+    if (value < 0n || value > 0xFFFFn) {
+      throw new TypeError(`${ctx}: expected u16 integer, got ${value}`);
+    }
+    return Number(value);
+  }
   if (!Number.isInteger(value) || value < 0 || value > 0xFFFF) {
     throw new TypeError(`${ctx}: expected u16 integer, got ${value}`);
   }

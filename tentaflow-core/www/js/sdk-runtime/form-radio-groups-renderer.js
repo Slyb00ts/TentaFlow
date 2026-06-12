@@ -39,6 +39,10 @@ function requireBool(v, ctx) {
   return v;
 }
 function requireU8(v, ctx) {
+  if (typeof v === 'bigint') {
+    if (v < 0n || v > 0xFFn) throw new TypeError(`${ctx}: expected u8, got ${v}`);
+    return Number(v);
+  }
   if (!Number.isInteger(v) || v < 0 || v > 0xFF) throw new TypeError(`${ctx}: expected u8, got ${v}`);
   return v;
 }
@@ -70,16 +74,26 @@ function parseSelectValue(sv, ctx) {
     case 'bool':
       if (typeof sv.value !== 'boolean') throw new TypeError(`${ctx}.value must be boolean`);
       return { tag: 'bool', value: sv.value };
-    case 'u32':
-      if (!Number.isInteger(sv.value) || sv.value < 0 || sv.value > 0xFFFFFFFF) {
+    case 'u32': {
+      let value = sv.value;
+      if (typeof value === 'bigint') {
+        if (value < 0n || value > 0xFFFFFFFFn) throw new TypeError(`${ctx}.value must be u32`);
+        value = Number(value);
+      } else if (!Number.isInteger(value) || value < 0 || value > 0xFFFFFFFF) {
         throw new TypeError(`${ctx}.value must be u32`);
       }
-      return { tag: 'u32', value: sv.value };
-    case 'i32':
-      if (!Number.isInteger(sv.value) || sv.value < -0x80000000 || sv.value > 0x7FFFFFFF) {
+      return { tag: 'u32', value };
+    }
+    case 'i32': {
+      let value = sv.value;
+      if (typeof value === 'bigint') {
+        if (value < -0x80000000n || value > 0x7FFFFFFFn) throw new TypeError(`${ctx}.value must be i32`);
+        value = Number(value);
+      } else if (!Number.isInteger(value) || value < -0x80000000 || value > 0x7FFFFFFF) {
         throw new TypeError(`${ctx}.value must be i32`);
       }
-      return { tag: 'i32', value: sv.value };
+      return { tag: 'i32', value };
+    }
   }
   throw new TypeError(`${ctx}.kind unsupported`);
 }

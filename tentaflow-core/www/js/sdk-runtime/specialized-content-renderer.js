@@ -526,10 +526,17 @@ function renderVirtualizedLog(component, ctx) {
   const maxBufferRaw = ctx.readField(component.fields, 2);
   let maxBufferEvents = 10000;
   if (maxBufferRaw != null) {
-    if (typeof maxBufferRaw !== 'number' || !Number.isInteger(maxBufferRaw) || maxBufferRaw < 0 || maxBufferRaw > 0xFFFFFFFF) {
-      throw new TypeError('VirtualizedLog.max_buffer_events must be u32');
+    if (typeof maxBufferRaw === 'bigint') {
+      if (maxBufferRaw < 0n || maxBufferRaw > 0xFFFFFFFFn) {
+        throw new TypeError('VirtualizedLog.max_buffer_events must be u32');
+      }
+      maxBufferEvents = Number(maxBufferRaw);
+    } else {
+      if (typeof maxBufferRaw !== 'number' || !Number.isInteger(maxBufferRaw) || maxBufferRaw < 0 || maxBufferRaw > 0xFFFFFFFF) {
+        throw new TypeError('VirtualizedLog.max_buffer_events must be u32');
+      }
+      maxBufferEvents = maxBufferRaw;
     }
-    maxBufferEvents = maxBufferRaw;
   }
   const autoScroll = requireBool(ctx.readField(component.fields, 3), 'VirtualizedLog.auto_scroll');
   const searchable = requireBool(ctx.readField(component.fields, 4), 'VirtualizedLog.searchable');

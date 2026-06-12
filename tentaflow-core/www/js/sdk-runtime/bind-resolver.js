@@ -283,6 +283,12 @@ function formatPercent(value, fmt, locale) {
 }
 
 function clampDecimals(d) {
+  if (typeof d === 'bigint') {
+    if (d < 0n || d > 20n) {
+      throw new TypeError(`decimals must be integer in [0,20], got ${d}`);
+    }
+    return Number(d);
+  }
   if (!Number.isInteger(d) || d < 0 || d > 20) {
     // Intl.NumberFormat wymaga 0..20 zakresu — odrzucamy z TypeError
     // żeby addon natychmiast widział błąd, zamiast ciemnego throw'a z

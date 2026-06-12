@@ -58,6 +58,12 @@ function requireArray(value, ctx) {
 }
 
 function requireU8(value, ctx) {
+  if (typeof value === 'bigint') {
+    if (value < 0n || value > 0xFFn) {
+      throw new TypeError(`${ctx}: expected u8 (0..=255), got ${value}`);
+    }
+    return Number(value);
+  }
   if (!Number.isInteger(value) || value < 0 || value > 0xFF) {
     throw new TypeError(`${ctx}: expected u8 (0..=255), got ${value}`);
   }
@@ -65,6 +71,12 @@ function requireU8(value, ctx) {
 }
 
 function requireU32(value, ctx) {
+  if (typeof value === 'bigint') {
+    if (value < 0n || value > 0xFFFFFFFFn) {
+      throw new TypeError(`${ctx}: expected u32, got ${value}`);
+    }
+    return Number(value);
+  }
   if (!Number.isInteger(value) || value < 0 || value > 0xFFFFFFFF) {
     throw new TypeError(`${ctx}: expected u32, got ${value}`);
   }

@@ -59,8 +59,26 @@ function requirePath(v, ctx) {
   return v;
 }
 function requireU16(v, ctx) {
+  if (typeof v === 'bigint') {
+    if (v < 0n || v > 0xFFFFn) {
+      throw new TypeError(`${ctx}: expected u16, got ${v}`);
+    }
+    return Number(v);
+  }
   if (!Number.isInteger(v) || v < 0 || v > 0xFFFF) {
     throw new TypeError(`${ctx}: expected u16, got ${v}`);
+  }
+  return v;
+}
+function requireI32(v, ctx) {
+  if (typeof v === 'bigint') {
+    if (v < -0x80000000n || v > 0x7FFFFFFFn) {
+      throw new TypeError(`${ctx} must be i32`);
+    }
+    return Number(v);
+  }
+  if (!Number.isInteger(v) || v < -0x80000000 || v > 0x7FFFFFFF) {
+    throw new TypeError(`${ctx} must be i32`);
   }
   return v;
 }
@@ -116,10 +134,7 @@ function parseDatePresetResolve(raw, ctx) {
     throw new TypeError(`${ctx}.kind unsupported: ${raw.kind}`);
   }
   if (raw.kind === 'custom') {
-    if (!Number.isInteger(raw.offset_days)) {
-      throw new TypeError(`${ctx}.custom.offset_days must be i32`);
-    }
-    return { kind: 'custom', offset_days: raw.offset_days };
+    return { kind: 'custom', offset_days: requireI32(raw.offset_days, `${ctx}.custom.offset_days`) };
   }
   for (const k of Object.keys(raw)) {
     if (k !== 'kind') throw new TypeError(`${ctx}: unexpected key '${k}' for kind=${raw.kind}`);
@@ -165,13 +180,11 @@ function parseRangePreset(raw, ctx) {
       let fro, too;
       for (const ie of v) {
         if (!Array.isArray(ie) || ie.length !== 2) throw new TypeError(`${ctx}.range: entry [u8, Value]`);
-        const [ik, iv] = ie;
+        const [ik, ivRaw] = ie;
         if (!RANGE_INNER_KEYS.has(ik)) throw new TypeError(`${ctx}.range: unknown key ${ik}`);
         if (innerSeen.has(ik)) throw new TypeError(`${ctx}.range: duplicate key ${ik}`);
         innerSeen.add(ik);
-        if (!Number.isInteger(iv) || iv < -0x80000000 || iv > 0x7FFFFFFF) {
-          throw new TypeError(`${ctx}.range[${ik}] must be i32`);
-        }
+        const iv = requireI32(ivRaw, `${ctx}.range[${ik}]`);
         if (ik === 0) fro = iv; else too = iv;
       }
       if (fro === undefined) throw new TypeError(`${ctx}.range.from_offset_days required`);

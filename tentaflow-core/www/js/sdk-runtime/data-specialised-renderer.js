@@ -368,10 +368,17 @@ function renderLiveRegion(component, ctx) {
   const clearAfterRaw = ctx.readField(component.fields, 5);
   let clearAfterMs = null;
   if (clearAfterRaw != null) {
-    if (typeof clearAfterRaw !== 'number' || !Number.isInteger(clearAfterRaw) || clearAfterRaw < 0 || clearAfterRaw > 0xFFFFFFFF) {
-      throw new TypeError('LiveRegion.clear_after_ms must be u32 (0..4294967295)');
+    if (typeof clearAfterRaw === 'bigint') {
+      if (clearAfterRaw < 0n || clearAfterRaw > 0xFFFFFFFFn) {
+        throw new TypeError('LiveRegion.clear_after_ms must be u32 (0..4294967295)');
+      }
+      clearAfterMs = Number(clearAfterRaw);
+    } else {
+      if (typeof clearAfterRaw !== 'number' || !Number.isInteger(clearAfterRaw) || clearAfterRaw < 0 || clearAfterRaw > 0xFFFFFFFF) {
+        throw new TypeError('LiveRegion.clear_after_ms must be u32 (0..4294967295)');
+      }
+      clearAfterMs = clearAfterRaw;
     }
-    clearAfterMs = clearAfterRaw;
   }
 
   const wrapper = document.createElement('div');
