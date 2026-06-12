@@ -80,7 +80,11 @@ impl BackendHandle {
     /// trafial na zwolniony port (zombie z poprzedniego attempta).
     pub fn endpoint_signature(&self) -> String {
         match self {
-            BackendHandle::Http(client) => format!("http:{}", client.url()),
+            BackendHandle::Http(client) => format!(
+                "http:{}{}",
+                client.url(),
+                if client.has_api_key() { "#auth" } else { "" }
+            ),
             BackendHandle::Quic(h) => format!("quic:{}", h.config.url),
             BackendHandle::Embedded {
                 engine_id,
@@ -122,11 +126,18 @@ impl LiveHandlesCache {
         }
     }
 
-    pub fn upsert_service_info(&self, svc: &ServiceInfo) -> Result<()> {
-        // Snapshot-driven insert (mesh sync / non-supervisor paths) carries no
-        // local secrets; external-provider keys are injected only on the owning
-        // node by the supervisor's handle reconcile.
-        let handle = build_handle(svc, None)?;
+    pub fn upsert_service_info(
+        &self,
+        svc: &ServiceInfo,
+        creds: Option<ExternalProviderCreds>,
+    ) -> Result<()> {
+        // Snapshot-driven inserts (mesh sync) pass `creds = None` — the
+        // broadcast `ServiceInfo` carries no secrets. The owning node's deploy
+        // handler resolves the decrypted external-provider creds itself;
+        // without them the seeded handle would dispatch unauthenticated until
+        // (and past) the next supervisor reconcile, whose endpoint-signature
+        // compare cannot repair a same-URL creds-less handle.
+        let handle = build_handle(svc, creds)?;
         let quic_inner = match &handle {
             BackendHandle::Quic(h) => Some(h.clone()),
             _ => None,

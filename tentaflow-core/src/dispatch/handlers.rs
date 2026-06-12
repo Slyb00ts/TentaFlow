@@ -3787,7 +3787,20 @@ pub async fn service_manifest_deploy(
                             &local_node_id_task,
                             tentaflow_protocol::ServiceChange::Added(info.clone()),
                         );
-                        if let Err(e) = live_handles_task.upsert_service_info(&info) {
+                        // Deploy always runs on the owning node, so the
+                        // decrypted external-provider creds are resolvable
+                        // here — the seeded handle must authenticate from the
+                        // first request, not wait for a supervisor tick.
+                        let creds = if info.deploy_method == "external" {
+                            crate::services::supervisor::external_provider_creds(
+                                &db_clone,
+                                &settings_cipher_task,
+                                service_id,
+                            )
+                        } else {
+                            None
+                        };
+                        if let Err(e) = live_handles_task.upsert_service_info(&info, creds) {
                             tracing::warn!(error = %e, service_id, "deploy runtime handle upsert failed");
                         }
                         if info.transport == "embedded" {

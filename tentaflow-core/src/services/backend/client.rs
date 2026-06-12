@@ -1129,6 +1129,14 @@ impl BackendClient {
         &self.url
     }
 
+    /// True gdy klient ma niepusty klucz/token. Wchodzi do endpoint
+    /// signature, zeby supervisor reconcile odroznil handle zbudowany bez
+    /// credentials (snapshot upsert) od pozadanego z credami pod tym samym
+    /// URL-em — inaczej external provider zostaje na zawsze bez auth.
+    pub fn has_api_key(&self) -> bool {
+        !self.api_key.is_empty()
+    }
+
     /// Zwraca true jesli request wymaga transformacji (np. PaddleOCR)
     fn needs_transform(&self) -> bool {
         self.request_format.as_deref() != Some("openai") && self.request_format.is_some()
