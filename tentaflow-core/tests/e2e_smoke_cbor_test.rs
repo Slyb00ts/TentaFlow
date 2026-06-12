@@ -49,12 +49,12 @@ fn load_e2e_smoke_wasm() -> Vec<u8> {
     })
 }
 
-fn create_addon_state(db: db::DbPool) -> AddonState {
+fn create_addon_state(db: db::DbPool, user_id: Option<&str>) -> AddonState {
     let ui_panels = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     AddonState {
         addon_id: "sdk-showcase".to_string(),
         instance_id: "sdk-showcase-test-001".to_string(),
-        user_id: None,
+        user_id: user_id.map(str::to_owned),
         org_id: None,
         db: db.clone(),
         permissions: vec!["ui".to_string()],
@@ -77,6 +77,7 @@ fn create_addon_state(db: db::DbPool) -> AddonState {
 
 fn create_instance(
     db: db::DbPool,
+    user_id: Option<&str>,
 ) -> (
     wasmtime::Store<AddonState>,
     wasmtime::Instance,
@@ -86,7 +87,7 @@ fn create_instance(
     let engine = create_engine().expect("create engine");
     let module = compile_module(&engine, &wasm_bytes).expect("compile WASM");
 
-    let state = create_addon_state(db);
+    let state = create_addon_state(db, user_id);
     let ui_panels = state.ui_panels.clone().unwrap();
 
     let mut store = wasmtime::Store::new(&engine, state);
@@ -109,7 +110,7 @@ fn create_instance(
 #[test]
 fn on_start_emits_canonical_panel_shell() {
     let db = create_test_db();
-    let (mut store, instance, ui_panels) = create_instance(db);
+    let (mut store, instance, ui_panels) = create_instance(db, None);
 
     // Call on_start — addon emits PanelShell via ui_render_cbor.
     let on_start = instance
@@ -150,7 +151,7 @@ fn on_start_emits_canonical_panel_shell() {
 #[test]
 fn increment_action_emits_canonical_state_patch() {
     let db = create_test_db();
-    let (mut store, instance, ui_panels) = create_instance(db);
+    let (mut store, instance, ui_panels) = create_instance(db, None);
 
     // First call on_start to establish the panel.
     let on_start = instance
@@ -239,7 +240,7 @@ fn increment_action_emits_canonical_state_patch() {
 #[test]
 fn multiple_increments_advance_revision() {
     let db = create_test_db();
-    let (mut store, instance, ui_panels) = create_instance(db);
+    let (mut store, instance, ui_panels) = create_instance(db, None);
 
     let on_start = instance
         .get_typed_func::<(), i32>(&mut store, "on_start")
@@ -319,7 +320,7 @@ fn multiple_increments_advance_revision() {
 #[test]
 fn cbor_roundtrip_bit_identical() {
     let db = create_test_db();
-    let (mut store, instance, ui_panels) = create_instance(db);
+    let (mut store, instance, ui_panels) = create_instance(db, None);
 
     let on_start = instance
         .get_typed_func::<(), i32>(&mut store, "on_start")
@@ -344,10 +345,220 @@ fn cbor_roundtrip_bit_identical() {
     );
 }
 
+/// Calls the addon's `ui.main.increment` action through on_request.
+fn call_increment(store: &mut wasmtime::Store<AddonState>, instance: &wasmtime::Instance) {
+    let request_json = serde_json::json!({
+        "tool": "ui.main.increment",
+        "params": {},
+        "user_id": 1,
+    });
+    let request_bytes = serde_json::to_vec(&request_json).unwrap();
+
+    let alloc_fn = instance
+        .get_typed_func::<i32, i32>(&mut *store, "alloc")
+        .expect("alloc export");
+    let input_ptr = alloc_fn
+        .call(&mut *store, request_bytes.len() as i32)
+        .expect("alloc input");
+    let memory = instance
+        .get_memory(&mut *store, "memory")
+        .expect("memory export");
+    memory.data_mut(&mut *store)[input_ptr as usize..input_ptr as usize + request_bytes.len()]
+        .copy_from_slice(&request_bytes);
+
+    let out_cap: i32 = 4096;
+    let out_ptr = alloc_fn.call(&mut *store, out_cap).expect("alloc output");
+    let out_len_ptr = alloc_fn.call(&mut *store, 4).expect("alloc out_len");
+
+    let on_request = instance
+        .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut *store, "on_request")
+        .expect("on_request export");
+    let result = on_request
+        .call(
+            &mut *store,
+            (
+                input_ptr,
+                request_bytes.len() as i32,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
+            ),
+        )
+        .expect("on_request call");
+    assert_eq!(result, 0, "on_request returned non-zero");
+}
+
+/// Calls the addon's `on_panel_open` export with the given panel id and epoch.
+fn call_panel_open(
+    store: &mut wasmtime::Store<AddonState>,
+    instance: &wasmtime::Instance,
+    panel_id: &str,
+    epoch: u64,
+) {
+    let alloc_fn = instance
+        .get_typed_func::<i32, i32>(&mut *store, "alloc")
+        .expect("alloc export");
+    let bytes = panel_id.as_bytes();
+    let ptr = alloc_fn
+        .call(&mut *store, bytes.len() as i32)
+        .expect("alloc panel_id");
+    let memory = instance
+        .get_memory(&mut *store, "memory")
+        .expect("memory export");
+    memory.data_mut(&mut *store)[ptr as usize..ptr as usize + bytes.len()].copy_from_slice(bytes);
+
+    let on_panel_open = instance
+        .get_typed_func::<(i32, i32, i64), i32>(&mut *store, "on_panel_open")
+        .expect("on_panel_open export");
+    let result = on_panel_open
+        .call(&mut *store, (ptr, bytes.len() as i32, epoch as i64))
+        .expect("on_panel_open call");
+    assert_eq!(result, 0, "on_panel_open returned non-zero");
+}
+
+/// Regression: closing and reopening the panel resets the host-side expected
+/// state revision (open_panel → revision 0, fresh epoch). The addon must adopt
+/// the new epoch in on_panel_open, restart its own revision counter and stop
+/// advancing it on rejected patches — otherwise every StatePatch after reopen
+/// is rejected with "state revision mismatch".
+#[test]
+fn panel_reopen_resets_state_revision() {
+    use tentaflow_core::addon::ui_session;
+
+    let db = create_test_db();
+    // Distinct user_id so the global-registry connection mapping created here
+    // never matches the other tests in this binary (their user_id is "").
+    let (mut store, instance, ui_panels) = create_instance(db.clone(), Some("reopen-user"));
+
+    // With a concrete user_id the system-call permission bypass does not
+    // apply — grant the "ui" permission as an addon default.
+    db.lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode) \
+             VALUES ('sdk-showcase', 'ui', 'allow')",
+            [],
+        )
+        .expect("grant ui permission");
+    store.data().permission_checker.refresh_all();
+
+    ui_session::init_global_registry(Arc::new(ui_session::SessionRegistry::new()));
+    let registry = ui_session::global_registry().expect("global registry");
+
+    const CONN_ID: u64 = 7;
+    let session_lock = registry.get_or_create(CONN_ID);
+
+    // First panel session: epoch 1, expected revision starts at 0.
+    let epoch1 = session_lock
+        .lock()
+        .open_panel("sdk-showcase", "main")
+        .expect("open panel");
+    assert_eq!(epoch1, 1);
+    registry.register_addon_connection("sdk-showcase", "reopen-user", CONN_ID);
+
+    let on_start = instance
+        .get_typed_func::<(), i32>(&mut store, "on_start")
+        .expect("on_start export");
+    assert_eq!(on_start.call(&mut store, ()).expect("on_start call"), 0);
+    assert!(
+        session_lock
+            .lock()
+            .validate_slot_ownership("sdk-showcase", "main", "content")
+            .is_ok(),
+        "PanelShell was rejected by session validation"
+    );
+
+    // Two accepted patches: host expected revision advances 0 → 1 → 2.
+    call_increment(&mut store, &instance);
+    call_increment(&mut store, &instance);
+    assert_eq!(
+        session_lock
+            .lock()
+            .get_panel("sdk-showcase", "main")
+            .unwrap()
+            .state_revision,
+        2
+    );
+
+    // Panel closed; a service tick fires while no panel is open. The host
+    // rejects the patch (panel_not_open) and the addon must NOT advance its
+    // local revision counter on that rejection.
+    session_lock.lock().close_panel("sdk-showcase", "main");
+    let on_tick = instance
+        .get_typed_func::<i64, i32>(&mut store, "on_tick")
+        .expect("on_tick export");
+    assert_eq!(on_tick.call(&mut store, 0).expect("on_tick call"), 0);
+
+    // Reopen on the same connection: fresh PanelOwnership with epoch 2 and
+    // expected revision reset to 0. The host then calls on_panel_open.
+    let epoch2 = session_lock
+        .lock()
+        .open_panel("sdk-showcase", "main")
+        .expect("reopen panel");
+    assert_eq!(epoch2, 2);
+    call_panel_open(&mut store, &instance, "main", epoch2);
+
+    // The re-sent PanelShell must carry the new epoch and register the shell.
+    {
+        let cache = ui_panels.read();
+        let key = (
+            "reopen-user".to_string(),
+            "sdk-showcase".to_string(),
+            "cbor_msg".to_string(),
+        );
+        let cbor_bytes = cache.get(&key).expect("PanelShell not in ui_panels cache");
+        validate_canonical(cbor_bytes).expect("CBOR is not canonical");
+        let payload: UiPayload = minicbor::decode(cbor_bytes).expect("decode UiPayload");
+        match &payload {
+            UiPayload::PanelShell(shell) => assert_eq!(shell.panel_epoch, 2),
+            other => panic!("expected PanelShell after reopen, got tag {:?}", other.tag()),
+        }
+    }
+
+    // The next patch must be ACCEPTED with the reset revision (0 → 1) — this
+    // is exactly the case that previously failed with "state revision
+    // mismatch: expected 0, got <drifted>".
+    call_increment(&mut store, &instance);
+    assert_eq!(
+        session_lock
+            .lock()
+            .get_panel("sdk-showcase", "main")
+            .unwrap()
+            .state_revision,
+        1,
+        "StatePatch after reopen was rejected — revision did not reset"
+    );
+
+    let cache = ui_panels.read();
+    let key = (
+        "reopen-user".to_string(),
+        "sdk-showcase".to_string(),
+        "cbor_msg".to_string(),
+    );
+    let cbor_bytes = cache.get(&key).expect("StatePatch not in ui_panels cache");
+    validate_canonical(cbor_bytes).expect("CBOR is not canonical");
+    let payload: UiPayload = minicbor::decode(cbor_bytes).expect("decode UiPayload");
+    match &payload {
+        UiPayload::StatePatch(patch) => {
+            assert_eq!(patch.panel_epoch, 2);
+            assert_eq!(patch.base_revision, 0);
+            assert_eq!(patch.new_revision, 1);
+            // Counter restarted with the panel session.
+            assert_eq!(
+                patch.ops[0].op,
+                tentaflow_sdk_spec::protocol::ui::patch::PatchOpKind::Set {
+                    value: tentaflow_sdk_spec::protocol::value::Value::U64(1),
+                }
+            );
+        }
+        other => panic!("expected StatePatch, got tag {:?}", other.tag()),
+    }
+}
+
 #[test]
 fn catalog_tabs_emit_canonical_slot_content() {
     let db = create_test_db();
-    let (mut store, instance, ui_panels) = create_instance(db);
+    let (mut store, instance, ui_panels) = create_instance(db, None);
 
     let on_start = instance
         .get_typed_func::<(), i32>(&mut store, "on_start")
