@@ -1,9 +1,17 @@
 // =============================================================================
-// Plik: sdk-runtime/form-file-color-renderer.test.js
-// Opis: Testy FileInput (0x0318) + ColorPicker (0x0319) — chunk 3.3c-6.
+// File: sdk-runtime/form-file-color-renderer.test.js
+// Description: Tests for FileInput (0x0318) + ColorPicker (0x0319) rendered
+// through the tf-file-input / tf-color-input / tf-input web components.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import { window as domWindow } from './_dom-test-harness.js';
+// tf-input observes child mutations; the harness does not export the
+// observer, so it is bridged here before the components are imported.
+if (!globalThis.MutationObserver) globalThis.MutationObserver = domWindow.MutationObserver;
+import '../components/tf-file-input.js';
+import '../components/tf-color-input.js';
+import '../components/tf-input.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -52,40 +60,53 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
 // ============================================================================
 // FileInput
 // ============================================================================
 
 function fakeFile({ name = 'a.txt', type = 'text/plain', size = 100 } = {}) {
-  // happy-dom File konstruktor jest dostępny ale ma quirks z size;
-  // używamy plain obiektu z minimalnym interface'm który walidator czyta.
+  // The validator only reads a minimal File-like interface.
   return { name, type, size, lastModified: 0 };
 }
 
-test('FileInput renderuje <input type=file> + dropzone', () => {
+function dropFiles(el, files) {
+  const dz = el.querySelector('.tf-file-input-dropzone');
+  const ev = new (globalThis.Event)('drop', { bubbles: false, cancelable: true });
+  ev.dataTransfer = { files };
+  dz.dispatchEvent(ev);
+}
+
+test('FileInput renders <tf-file-input> with accept + internal dropzone', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(FILE_INPUT_TAG, [
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
     [0, PATH('files')], [1, ['*/*']], [2, 1024 * 1024], [3, 1],
     [4, false], [5, false], [7, 'do_upload'],
     [8, { kind: 'literal', value: 'Pliki' }],
-  ]));
+  ])));
+  const fileEl = el.querySelector('tf-file-input');
+  assert(fileEl != null, 'expected tf-file-input web component');
   const input = el.querySelector('input[type=file]');
   assertEq(input.getAttribute('accept'), '*/*');
-  assert(el.querySelector('.tf-file-input__dropzone') != null);
+  assert(el.querySelector('.tf-file-input-dropzone') != null);
 });
 
-test('FileInput multiple=true ustawia multiple attr + label tekst', () => {
+test('FileInput multiple=true sets multiple attr + label from bind', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(FILE_INPUT_TAG, [
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
     [0, PATH('files')], [1, []], [2, 1024], [3, 5],
     [4, true], [5, false], [7, 'up'],
     [8, { kind: 'literal', value: 'Pliki' }],
-  ]));
-  assertEq(el.querySelector('input').hasAttribute('multiple'), true);
-  assertEq(el.querySelector('.tf-file-input__trigger').textContent, 'Wybierz pliki');
+  ])));
+  assertEq(el.querySelector('input[type=file]').hasAttribute('multiple'), true);
+  assertEq(el.querySelector('tf-file-input').getAttribute('label'), 'Pliki');
+  assertEq(el.querySelector('.tf-file-input-label').textContent, 'Pliki');
 });
 
 test('FileInput multiple=false + max_files>1 throws', () => {
@@ -108,30 +129,34 @@ test('FileInput max_files=0 throws', () => {
   ])));
 });
 
-test('FileInput drag_and_drop=true ustawia klasę dropzone--dnd', () => {
+test('FileInput drag_and_drop=false sets no-drop and ignores drops', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(FILE_INPUT_TAG, [
-    [0, PATH('f')], [1, []], [2, 1024], [3, 1],
-    [4, false], [5, true], [7, 'up'],
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
+    [0, PATH('f')], [1, []], [2, 10_000], [3, 1],
+    [4, false], [5, false], [7, 'up'],
     [8, { kind: 'literal', value: 'P' }],
-  ]));
-  assert(el.querySelector('.tf-file-input__dropzone--dnd') != null);
-  assert(el.querySelector('.tf-file-input__dnd-hint') != null);
+  ])));
+  assert(el.querySelector('tf-file-input').hasAttribute('no-drop'));
+  let chg = null;
+  el.addEventListener('files_selected', (e) => { chg = e.detail; });
+  dropFiles(el, [fakeFile()]);
+  assertEq(chg, null);
 });
 
-test('FileInput capture=user ustawia capture attr', () => {
+test('FileInput capture=user sets capture attr on the native input', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(FILE_INPUT_TAG, [
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
     [0, PATH('f')], [1, ['image/*']], [2, 1024 * 1024], [3, 1],
     [4, false], [5, false], [6, 'user'], [7, 'up'],
     [8, { kind: 'literal', value: 'P' }],
-  ]));
-  assertEq(el.querySelector('input').getAttribute('capture'), 'user');
+  ])));
+  assertEq(el.querySelector('tf-file-input').getAttribute('capture'), 'user');
+  assertEq(el.querySelector('input[type=file]').getAttribute('capture'), 'user');
 });
 
-test('FileInput store push renderuje listę plików', () => {
+test('FileInput store push renders file list', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -139,94 +164,92 @@ test('FileInput store push renderuje listę plików', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(FILE_INPUT_TAG, [
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
     [0, PATH('files')], [1, []], [2, 10 * 1024 * 1024], [3, 5],
     [4, true], [5, false], [7, 'up'],
     [8, { kind: 'literal', value: 'P' }],
-  ]));
+  ])));
   const items = el.querySelectorAll('.tf-file-input__item');
   assertEq(items.length, 2);
   assertEq(items[0].querySelector('.tf-file-input__item-name').textContent, 'a.txt');
 });
 
-test('FileInput drag-drop nieakceptowany typ → reject', () => {
+test('FileInput drop of unaccepted type → reject', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(FILE_INPUT_TAG, [
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
     [0, PATH('f')], [1, ['image/*']], [2, 1024 * 1024], [3, 1],
     [4, false], [5, true], [7, 'up'],
     [8, { kind: 'literal', value: 'P' }],
-  ]));
+  ])));
   let rej = null;
   let chg = null;
   el.addEventListener('reject', (e) => { rej = e.detail; });
   el.addEventListener('files_selected', (e) => { chg = e.detail; });
-  const dz = el.querySelector('.tf-file-input__dropzone');
-  const file = fakeFile({ name: 'doc.pdf', type: 'application/pdf', size: 100 });
-  const dragEvent = new (globalThis.Event || function () {})('drop', { bubbles: false, cancelable: true });
-  dragEvent.dataTransfer = { files: [file] };
-  dragEvent.preventDefault = () => {};
-  dz.dispatchEvent(dragEvent);
+  dropFiles(el, [fakeFile({ name: 'doc.pdf', type: 'application/pdf', size: 100 })]);
   assertEq(rej != null && rej.reason, 'accept');
   assertEq(chg, null);
 });
 
-test('FileInput drag-drop size > max → reject', () => {
+test('FileInput drop with size > max → reject', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(FILE_INPUT_TAG, [
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
     [0, PATH('f')], [1, []], [2, 1000], [3, 1],
     [4, false], [5, true], [7, 'up'],
     [8, { kind: 'literal', value: 'P' }],
-  ]));
+  ])));
   let rej = null;
   el.addEventListener('reject', (e) => { rej = e.detail; });
-  const dz = el.querySelector('.tf-file-input__dropzone');
-  const file = fakeFile({ size: 5000 });
-  const ev = new (globalThis.Event)('drop', { bubbles: false, cancelable: true });
-  ev.dataTransfer = { files: [file] };
-  ev.preventDefault = () => {};
-  dz.dispatchEvent(ev);
+  dropFiles(el, [fakeFile({ size: 5000 })]);
   assertEq(rej != null && rej.reason, 'max_size');
 });
 
-test('FileInput drag-drop valid file → files_selected z metadata + upload_action_id', () => {
+test('FileInput drop of valid file → files_selected with metadata + upload_action_id', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(FILE_INPUT_TAG, [
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
     [0, PATH('f')], [1, ['text/*']], [2, 10_000], [3, 1],
     [4, false], [5, true], [7, 'do_upload'],
     [8, { kind: 'literal', value: 'P' }],
-  ]));
+  ])));
   let chg = null;
   el.addEventListener('files_selected', (e) => { chg = e.detail; });
-  const dz = el.querySelector('.tf-file-input__dropzone');
-  const file = fakeFile({ name: 'note.txt', type: 'text/plain', size: 42 });
-  const ev = new (globalThis.Event)('drop', { bubbles: false, cancelable: true });
-  ev.dataTransfer = { files: [file] };
-  ev.preventDefault = () => {};
-  dz.dispatchEvent(ev);
+  dropFiles(el, [fakeFile({ name: 'note.txt', type: 'text/plain', size: 42 })]);
   assertEq(chg.kind, 'files');
   assertEq(chg.upload_action_id, 'do_upload');
   assertEq(chg.value, [{ name: 'note.txt', size: 42, type: 'text/plain', last_modified: 0 }]);
 });
 
-test('FileInput drag-drop > max_files → reject', () => {
+test('FileInput drop of > max_files → reject', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(FILE_INPUT_TAG, [
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
     [0, PATH('f')], [1, []], [2, 10_000], [3, 1],
     [4, false], [5, true], [7, 'up'],
     [8, { kind: 'literal', value: 'P' }],
-  ]));
+  ])));
   let rej = null;
   el.addEventListener('reject', (e) => { rej = e.detail; });
-  const dz = el.querySelector('.tf-file-input__dropzone');
-  const ev = new (globalThis.Event)('drop', { bubbles: false, cancelable: true });
-  ev.dataTransfer = { files: [fakeFile({ name: '1.txt' }), fakeFile({ name: '2.txt' })] };
-  ev.preventDefault = () => {};
-  dz.dispatchEvent(ev);
+  dropFiles(el, [fakeFile({ name: '1.txt' }), fakeFile({ name: '2.txt' })]);
   assertEq(rej != null && rej.reason, 'max_files');
+});
+
+test('FileInput raw component change never escapes the wrapper', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
+    [0, PATH('f')], [1, []], [2, 10_000], [3, 1],
+    [4, false], [5, true], [7, 'up'],
+    [8, { kind: 'literal', value: 'P' }],
+  ])));
+  let rawChange = null;
+  let chg = null;
+  el.addEventListener('change', (e) => { rawChange = e; });
+  el.addEventListener('files_selected', (e) => { chg = e.detail; });
+  dropFiles(el, [fakeFile()]);
+  assertEq(rawChange, null);
+  assert(chg != null && chg.kind === 'files');
 });
 
 test('FileInput unknown field throws', () => {
@@ -240,7 +263,7 @@ test('FileInput unknown field throws', () => {
   ])));
 });
 
-test('FileInput bez label wymaga a11y.label', () => {
+test('FileInput without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(FILE_INPUT_TAG, [
@@ -249,48 +272,78 @@ test('FileInput bez label wymaga a11y.label', () => {
   ])));
 });
 
+test('FileInput a11y.label lands as aria-label on tf-file-input', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('lbl'), value: 'Wybierz plik' }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(FILE_INPUT_TAG, [
+    [0, PATH('f')], [1, []], [2, 1024], [3, 1],
+    [4, false], [5, false], [7, 'up'],
+  ], { a11y: { label: { kind: 'bound', path: PATH('lbl') } } })));
+  assertEq(el.querySelector('tf-file-input').getAttribute('aria-label'), 'Wybierz plik');
+});
+
 // ============================================================================
 // ColorPicker
 // ============================================================================
 
-test('ColorPicker variant=wheel renderuje <input type=color>', () => {
+test('ColorPicker variant=wheel renders <tf-color-input>', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COLOR_PICKER_TAG, [
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
     [0, PATH('c')], [1, 'wheel'], [3, false],
     [4, { kind: 'literal', value: 'C' }],
-  ]));
+  ])));
+  assert(el.querySelector('tf-color-input') != null, 'expected tf-color-input web component');
   assertEq(el.querySelector('input').getAttribute('type'), 'color');
+  assertEq(el.querySelector('tf-color-input').getAttribute('label'), 'C');
 });
 
-test('ColorPicker wheel sync z #rrggbb wartością ze store', () => {
+test('ColorPicker wheel syncs from #rrggbb store value', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('c'), value: '#ff8800' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(COLOR_PICKER_TAG, [
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
     [0, PATH('c')], [1, 'wheel'], [3, false],
     [4, { kind: 'literal', value: 'C' }],
-  ]));
+  ])));
+  assertEq(el.querySelector('tf-color-input').getAttribute('value'), '#ff8800');
   assertEq(el.querySelector('input').value, '#ff8800');
 });
 
-test('ColorPicker wheel change emituje hex value', () => {
+test('ColorPicker wheel expands #rgb and strips alpha for the native picker', () => {
   setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(COLOR_PICKER_TAG, [
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('c'), value: '#abc' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
     [0, PATH('c')], [1, 'wheel'], [3, false],
     [4, { kind: 'literal', value: 'C' }],
-  ]));
+  ])));
+  assertEq(el.querySelector('tf-color-input').getAttribute('value'), '#aabbcc');
+});
+
+test('ColorPicker wheel change emits hex value via tf-bind-write', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
+    [0, PATH('c')], [1, 'wheel'], [3, false],
+    [4, { kind: 'literal', value: 'C' }],
+  ])));
   let got = null;
   el.addEventListener('tf-bind-write', (e) => { got = e.detail; });
   const input = el.querySelector('input');
   input.value = '#00ff00';
-  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
   assertEq(got, { value: '#00ff00', kind: 'hex' });
 });
 
-test('ColorPicker variant=swatch + default palette renderuje 16 swatches', () => {
+test('ColorPicker variant=swatch + default palette renders 16 swatches', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(COLOR_PICKER_TAG, [
@@ -300,7 +353,7 @@ test('ColorPicker variant=swatch + default palette renderuje 16 swatches', () =>
   assertEq(el.querySelectorAll('.tf-color-picker__swatch').length, 16);
 });
 
-test('ColorPicker variant=swatch z allowed_tokens używa tokens (NIE palette)', () => {
+test('ColorPicker variant=swatch with allowed_tokens uses tokens (NOT palette)', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(COLOR_PICKER_TAG, [
@@ -314,7 +367,7 @@ test('ColorPicker variant=swatch z allowed_tokens używa tokens (NIE palette)', 
   assertEq(swatches[0].getAttribute('data-token'), 'accent_primary');
 });
 
-test('ColorPicker variant=tokens_only bez allowed_tokens throws', () => {
+test('ColorPicker variant=tokens_only without allowed_tokens throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(COLOR_PICKER_TAG, [
@@ -341,7 +394,7 @@ test('ColorPicker invalid allowed_tokens value throws', () => {
   ])));
 });
 
-test('ColorPicker swatch click emituje change.kind=token gdy token', () => {
+test('ColorPicker swatch click emits kind=token for tokens', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(COLOR_PICKER_TAG, [
@@ -356,7 +409,7 @@ test('ColorPicker swatch click emituje change.kind=token gdy token', () => {
   assertEq(got, { value: 'tone_success', kind: 'token' });
 });
 
-test('ColorPicker swatch click bez tokenów emituje change.kind=hex', () => {
+test('ColorPicker swatch click without tokens emits kind=hex', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(COLOR_PICKER_TAG, [
@@ -365,20 +418,38 @@ test('ColorPicker swatch click bez tokenów emituje change.kind=hex', () => {
   ]));
   let got = null;
   el.addEventListener('tf-bind-write', (e) => { got = e.detail; });
-  const firstSwatch = el.querySelector('.tf-color-picker__swatch');
-  firstSwatch.click();
+  el.querySelector('.tf-color-picker__swatch').click();
   assertEq(got.kind, 'hex');
   assert(got.value.startsWith('#'));
 });
 
-test('ColorPicker compact dodaje hex input', () => {
+test('ColorPicker compact adds a <tf-input> hex field', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COLOR_PICKER_TAG, [
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
     [0, PATH('c')], [1, 'compact'], [3, false],
     [4, { kind: 'literal', value: 'C' }],
-  ]));
-  assert(el.querySelector('.tf-color-picker__hex') != null);
+  ])));
+  const hexEl = el.querySelector('.tf-color-picker__hex');
+  assert(hexEl != null);
+  assertEq(hexEl.tagName, 'TF-INPUT');
+  assertEq(hexEl.getAttribute('maxlength'), '7');
+});
+
+test('ColorPicker compact valid hex commit emits tf-bind-write', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
+    [0, PATH('c')], [1, 'compact'], [3, false],
+    [4, { kind: 'literal', value: 'C' }],
+  ])));
+  let got = null;
+  el.addEventListener('tf-bind-write', (e) => { got = e.detail; });
+  const hexEl = el.querySelector('.tf-color-picker__hex');
+  const inner = hexEl.querySelector('input');
+  inner.value = '#123456';
+  inner.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(got, { value: '#123456', kind: 'hex' });
 });
 
 test('ColorPicker compact hex input invalid value → revert', () => {
@@ -386,31 +457,32 @@ test('ColorPicker compact hex input invalid value → revert', () => {
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('c'), value: '#abcdef' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(COLOR_PICKER_TAG, [
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
     [0, PATH('c')], [1, 'compact'], [3, false],
     [4, { kind: 'literal', value: 'C' }],
-  ]));
-  const hexI = el.querySelector('.tf-color-picker__hex');
+  ])));
+  const hexEl = el.querySelector('.tf-color-picker__hex');
   let got = null;
   el.addEventListener('tf-bind-write', (e) => { got = e.detail; });
-  hexI.value = 'not_a_hex';
-  hexI.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  const inner = hexEl.querySelector('input');
+  inner.value = 'not_a_hex';
+  inner.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
   assertEq(got, null);
-  assertEq(hexI.value, '#abcdef');
+  assertEq(hexEl.value, '#abcdef');
 });
 
-test('ColorPicker compact show_alpha=false odrzuca 8-hex z alfą', () => {
+test('ColorPicker compact show_alpha=false rejects 8-hex with alpha', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COLOR_PICKER_TAG, [
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
     [0, PATH('c')], [1, 'compact'], [3, false],
     [4, { kind: 'literal', value: 'C' }],
-  ]));
-  const hexI = el.querySelector('.tf-color-picker__hex');
+  ])));
   let got = null;
   el.addEventListener('tf-bind-write', (e) => { got = e.detail; });
-  hexI.value = '#aabbccdd';
-  hexI.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  const inner = el.querySelector('.tf-color-picker__hex input');
+  inner.value = '#aabbccdd';
+  inner.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
   assertEq(got, null);
 });
 
@@ -424,7 +496,7 @@ test('ColorPicker unknown field throws', () => {
   ])));
 });
 
-test('ColorPicker NIE emituje publicznego "change" — bind-write przez tf-bind-write', () => {
+test('ColorPicker never emits a public "change" — bind-write goes via tf-bind-write', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(COLOR_PICKER_TAG, [
@@ -440,13 +512,13 @@ test('ColorPicker NIE emituje publicznego "change" — bind-write przez tf-bind-
   assert(internalWrite != null && internalWrite.kind === 'hex');
 });
 
-test('ColorPicker wheel input.change NIE bubble jako public change na wrapper', () => {
+test('ColorPicker wheel change does NOT bubble as public change on the wrapper', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COLOR_PICKER_TAG, [
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
     [0, PATH('c')], [1, 'wheel'], [3, false],
     [4, { kind: 'literal', value: 'C' }],
-  ]));
+  ])));
   let publicChange = null;
   el.addEventListener('change', (e) => { publicChange = e.detail; });
   const input = el.querySelector('input');
@@ -455,22 +527,22 @@ test('ColorPicker wheel input.change NIE bubble jako public change na wrapper', 
   assertEq(publicChange, null);
 });
 
-test('ColorPicker compact hex.change NIE bubble jako public change', () => {
+test('ColorPicker compact hex change does NOT bubble as public change', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COLOR_PICKER_TAG, [
+  const el = mount(engine.render(comp(COLOR_PICKER_TAG, [
     [0, PATH('c')], [1, 'compact'], [3, false],
     [4, { kind: 'literal', value: 'C' }],
-  ]));
+  ])));
   let publicChange = null;
   el.addEventListener('change', (e) => { publicChange = e.detail; });
-  const hexI = el.querySelector('.tf-color-picker__hex');
-  hexI.value = '#ddccbb';
-  hexI.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  const inner = el.querySelector('.tf-color-picker__hex input');
+  inner.value = '#ddccbb';
+  inner.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
   assertEq(publicChange, null);
 });
 
-test('ColorPicker bez label wymaga a11y.label', () => {
+test('ColorPicker without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(COLOR_PICKER_TAG, [

@@ -2,9 +2,13 @@
 // File: sdk-runtime/feedback-inline-renderer.test.js
 // Description: Tests for Alert (0x0501), Banner (0x0502), Callout (0x0503),
 // Toast (0x0504), Hint (0x0505), OfflineBanner (0x050F) — chunk 3.3e-1.
+// Alert/Toast render through the <tf-alert>/<tf-toast> web components, which
+// are imported after the DOM harness so elements upgrade for real behavior.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-alert.js';
+import '../components/tf-toast.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -74,15 +78,36 @@ function alertFields({
   return f;
 }
 
-test('Alert renders with tone and variant classes', () => {
+// Button (0x0401) child used for Alert.actions.
+function alertButtonComp(label) {
+  return {
+    tag: 0x0401, id: 'btn1',
+    fields: [
+      [0, 'primary'], [1, 'neutral'], [2, LIT(label)],
+      [5, 'md'], [6, false], [9, 'default'],
+    ],
+    handlers: null, bind: null, a11y: null,
+    visibility: null, test_id: null,
+  };
+}
+
+test('Alert renders as tf-alert with mapped tone and variant class', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(ALERT_TAG, alertFields({ tone: 'success', variant: 'filled' })));
   document.body.appendChild(el);
-  assert(el.classList.contains('tf-alert'));
-  assert(el.classList.contains('tf-alert--tone-success'));
+  assertEq(el.tagName, 'TF-ALERT');
+  assertEq(el.getAttribute('tone'), 'success');
   assert(el.classList.contains('tf-alert--variant-filled'));
-  assertEq(el.getAttribute('role'), 'alert');
+  assert(el.querySelector('.tf-alert').classList.contains('success'));
+});
+
+test('Alert maps critical tone to danger', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(ALERT_TAG, alertFields({ tone: 'critical' })));
+  document.body.appendChild(el);
+  assertEq(el.getAttribute('tone'), 'danger');
 });
 
 test('Alert renders message text via BindRef', () => {
@@ -90,7 +115,8 @@ test('Alert renders message text via BindRef', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(ALERT_TAG, alertFields({ message: LIT('Disk full') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-alert__message').textContent, 'Disk full');
+  assertEq(el.getAttribute('message'), 'Disk full');
+  assertEq(el.querySelector('.tf-alert-message').textContent, 'Disk full');
 });
 
 test('Alert reacts to message patch', () => {
@@ -100,9 +126,9 @@ test('Alert reacts to message patch', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(ALERT_TAG, alertFields({ message: BOUND('msg') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-alert__message').textContent, 'Old message');
+  assertEq(el.getAttribute('message'), 'Old message');
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('msg'), op: { kind: 'set', value: 'New message' } }] });
-  assertEq(el.querySelector('.tf-alert__message').textContent, 'New message');
+  assertEq(el.getAttribute('message'), 'New message');
 });
 
 test('Alert rejects missing message', () => {
@@ -111,12 +137,13 @@ test('Alert rejects missing message', () => {
   assertThrows(() => engine.render(comp(ALERT_TAG, [[0, 'info'], [1, 'default'], [6, false]])));
 });
 
-test('Alert dismissible=true adds close button dispatching dismiss event', () => {
+test('Alert dismissible=true shows close button dispatching dismiss event', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(ALERT_TAG, alertFields({ dismissible: true })));
   document.body.appendChild(el);
-  const closeBtn = el.querySelector('.tf-alert__close');
+  assert(el.hasAttribute('dismissable'));
+  const closeBtn = el.querySelector('.tf-alert-close');
   assert(closeBtn != null);
   let dismissed = false;
   el.addEventListener('dismiss', () => { dismissed = true; });
@@ -129,15 +156,26 @@ test('Alert renders title when provided', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(ALERT_TAG, alertFields({ title: LIT('Warning') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-alert__title').textContent, 'Warning');
+  assertEq(el.getAttribute('title'), 'Warning');
+  assertEq(el.querySelector('.tf-alert-title').textContent, 'Warning');
 });
 
-test('Alert renders icon when provided', () => {
+test('Alert renders tone icon from tf-alert', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(ALERT_TAG, alertFields({ icon: { kind: 'named', name: 'alert' } })));
   document.body.appendChild(el);
-  assert(el.querySelector('.tf-alert__icon') != null);
+  assert(el.querySelector('.tf-alert-icon') != null);
+});
+
+test('Alert renders action buttons in preserved actions slot', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(ALERT_TAG, alertFields({ actions: [alertButtonComp('Retry')] })));
+  document.body.appendChild(el);
+  const actionsEl = el.querySelector('.tf-alert-content .tf-alert__actions');
+  assert(actionsEl != null);
+  assertEq(actionsEl.children[0].tagName, 'TF-BUTTON');
 });
 
 test('Alert rejects invalid tone', () => {
@@ -317,15 +355,26 @@ function toastFields({
   return f;
 }
 
-test('Toast renders with tone class and title', () => {
+test('Toast renders as persistent tf-toast with mapped tone and title', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(TOAST_TAG, toastFields({ tone: 'success', title: LIT('Done') })));
   document.body.appendChild(el);
-  assert(el.classList.contains('tf-toast'));
+  assertEq(el.tagName, 'TF-TOAST');
+  assertEq(el.getAttribute('tone'), 'success');
+  assert(el.hasAttribute('persistent'));
   assert(el.classList.contains('tf-toast--tone-success'));
-  assertEq(el.querySelector('.tf-toast__title').textContent, 'Done');
+  assertEq(el.getAttribute('title'), 'Done');
+  assertEq(el.querySelector('.tf-toast-title').textContent, 'Done');
   assertEq(el.getAttribute('role'), 'status');
+});
+
+test('Toast maps critical tone to danger', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(TOAST_TAG, toastFields({ tone: 'critical' })));
+  document.body.appendChild(el);
+  assertEq(el.getAttribute('tone'), 'danger');
 });
 
 test('Toast renders body when provided', () => {
@@ -333,7 +382,8 @@ test('Toast renders body when provided', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(TOAST_TAG, toastFields({ body: LIT('Details here') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-toast__message').textContent, 'Details here');
+  assertEq(el.getAttribute('message'), 'Details here');
+  assertEq(el.querySelector('.tf-toast-message').textContent, 'Details here');
 });
 
 test('Toast title reacts to patch', () => {
@@ -343,9 +393,9 @@ test('Toast title reacts to patch', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(TOAST_TAG, toastFields({ title: BOUND('tt') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-toast__title').textContent, 'Loading');
+  assertEq(el.getAttribute('title'), 'Loading');
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('tt'), op: { kind: 'set', value: 'Complete' } }] });
-  assertEq(el.querySelector('.tf-toast__title').textContent, 'Complete');
+  assertEq(el.getAttribute('title'), 'Complete');
 });
 
 test('Toast rejects missing title', () => {
@@ -354,26 +404,30 @@ test('Toast rejects missing title', () => {
   assertThrows(() => engine.render(comp(TOAST_TAG, [[0, 'info']])));
 });
 
-test('Toast action button dispatches toast_action event', () => {
+test('Toast action tf-button dispatches toast_action event', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(TOAST_TAG, toastFields({ actionLabel: 'Undo', actionId: 'undo_save' })));
   document.body.appendChild(el);
   const actionBtn = el.querySelector('.tf-toast__action');
   assert(actionBtn != null);
-  assertEq(actionBtn.textContent, 'Undo');
+  assertEq(actionBtn.tagName, 'TF-BUTTON');
+  assertEq(actionBtn.getAttribute('label'), 'Undo');
   let detail = null;
   el.addEventListener('toast_action', (e) => { detail = e.detail; });
   actionBtn.click();
   assertEq(detail.action_id, 'undo_save');
 });
 
-test('Toast renders icon when provided', () => {
+test('Toast renders icon in preserved icon slot', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(TOAST_TAG, toastFields({ icon: { kind: 'named', name: 'check' } })));
   document.body.appendChild(el);
-  assert(el.querySelector('.tf-toast__icon') != null);
+  const iconEl = el.querySelector('.tf-toast__icon');
+  assert(iconEl != null);
+  // Preserved inside the tf-toast root, before the title.
+  assert(iconEl.parentElement.classList.contains('tf-toast'));
 });
 
 // ============================================================================
@@ -493,14 +547,15 @@ test('OfflineBanner rejects missing reconnecting', () => {
   assertThrows(() => engine.render(comp(OFFLINE_BANNER_TAG, [[0, LIT('msg')]])));
 });
 
-test('OfflineBanner renders action button when action_label provided', () => {
+test('OfflineBanner renders action tf-button when action_label provided', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(OFFLINE_BANNER_TAG, offlineFields({ actionLabel: LIT('Retry') })));
   document.body.appendChild(el);
   const btn = el.querySelector('.tf-offline-banner__action');
   assert(btn != null);
-  assertEq(btn.textContent, 'Retry');
+  assertEq(btn.tagName, 'TF-BUTTON');
+  assertEq(btn.getAttribute('label'), 'Retry');
 });
 
 test('OfflineBanner action button dispatches offline_action event', () => {

@@ -1,15 +1,22 @@
 // =============================================================================
 // File: tf-modal.js
 // Description: <tf-modal> — modal/drawer overlay component.
-//   Attributes: open (boolean), title, variant (modal|drawer-right|drawer-left|
-//   drawer-bottom).
+//   Attributes: open (boolean), title, subtitle, variant (modal|drawer-right|
+//   drawer-left|drawer-bottom|drawer-top), size (xs|sm|md|lg|xl|fullscreen),
+//   no-dismiss (boolean — ESC/backdrop do not close), no-close (boolean —
+//   hides the header close button).
 //   Events: close.
 //   Static: TfModal.open({title, body, actions}) → Promise.
 // =============================================================================
 
+const MODAL_SIZE_CLASSES = [
+  'tf-modal--size-xs', 'tf-modal--size-sm', 'tf-modal--size-md',
+  'tf-modal--size-lg', 'tf-modal--size-xl', 'tf-modal--size-fullscreen',
+];
+
 class TfModal extends HTMLElement {
   static get observedAttributes() {
-    return ['open', 'title', 'variant'];
+    return ['open', 'title', 'subtitle', 'variant', 'size', 'no-dismiss', 'no-close'];
   }
 
   constructor() {
@@ -77,6 +84,13 @@ class TfModal extends HTMLElement {
 
     card.appendChild(header);
 
+    // Optional subtitle line rendered below the header; hidden when the
+    // `subtitle` attribute is absent so the default layout is unchanged.
+    const subtitleEl = document.createElement('p');
+    subtitleEl.className = 'tf-modal-subtitle';
+    subtitleEl.style.display = 'none';
+    card.appendChild(subtitleEl);
+
     const body = document.createElement('div');
     body.className = 'tf-modal-body';
     if (bodyContent) {
@@ -102,22 +116,35 @@ class TfModal extends HTMLElement {
     this._body = body;
     this._footer = footer;
     this._titleEl = titleEl;
+    this._subtitleEl = subtitleEl;
     this._closeBtn = closeBtn;
   }
 
   _update() {
     const isOpen = this.hasAttribute('open');
     const title = this.getAttribute('title') || '';
+    const subtitle = this.getAttribute('subtitle') || '';
     const variant = this.getAttribute('variant') || 'modal';
+    const size = this.getAttribute('size') || '';
 
     this._titleEl.textContent = title;
+
+    this._subtitleEl.textContent = subtitle;
+    this._subtitleEl.style.display = subtitle ? '' : 'none';
+
+    this._closeBtn.style.display = this.hasAttribute('no-close') ? 'none' : '';
 
     // Remove old variant classes.
     this._card.classList.remove(
       'tf-modal-card--modal', 'tf-modal-card--drawer-right',
-      'tf-modal-card--drawer-left', 'tf-modal-card--drawer-bottom'
+      'tf-modal-card--drawer-left', 'tf-modal-card--drawer-bottom',
+      'tf-modal-card--drawer-top'
     );
     this._card.classList.add(`tf-modal-card--${variant}`);
+
+    // Optional size class; reuses the shared .tf-modal--size-* width rules.
+    this._card.classList.remove(...MODAL_SIZE_CLASSES);
+    if (size) this._card.classList.add(`tf-modal--size-${size}`);
 
     if (isOpen) {
       this._backdrop.classList.add('tf-modal-backdrop--open');
@@ -136,10 +163,12 @@ class TfModal extends HTMLElement {
   }
 
   _onEsc(e) {
+    if (this.hasAttribute('no-dismiss')) return;
     if (e.key === 'Escape') this._dismiss();
   }
 
   _onBackdropClick(e) {
+    if (this.hasAttribute('no-dismiss')) return;
     if (e.target === this._backdrop) this._dismiss();
   }
 

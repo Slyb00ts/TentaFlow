@@ -4,8 +4,10 @@
 // Banner (0x0502), Callout (0x0503), Toast (0x0504), Hint (0x0505),
 // OfflineBanner (0x050F) — chunk 3.3e-1.
 //
-// Alert uses <tf-alert> web component. Other components use tone-based BEM
-// modifiers, reactive BindRef fields, optional IconRef, and (where applicable)
+// Alert uses the <tf-alert> web component and Toast the <tf-toast> web
+// component (declarative, `persistent` — lifecycle is driven by addon state).
+// Banner/Callout/Hint/OfflineBanner use tone-based BEM modifiers with shared
+// CSS, reactive BindRef fields, optional IconRef, and (where applicable)
 // recursive child rendering via ctx.renderChild(). Dismissible components
 // dispatch a 'dismiss' CustomEvent.
 //
@@ -49,7 +51,7 @@ function renderAlert(component, ctx) {
 
   const tone = requireEnum(ctx.readField(component.fields, 0), TONES, 'Alert.tone');
   const variant = requireEnum(ctx.readField(component.fields, 1), ALERT_VARIANTS, 'Alert.variant');
-  const iconRaw = ctx.readField(component.fields, 2);
+  // Field 2 (icon) is accepted but unused: tf-alert renders its own tone icon.
   const titleBind = ctx.readField(component.fields, 3);
   const messageBind = ctx.readField(component.fields, 4);
   if (messageBind == null) throw new TypeError('Alert.message is required (BindRef)');
@@ -85,22 +87,14 @@ function renderAlert(component, ctx) {
   applyMessage();
   ctx.registerCleanup(subscribeBindRef(messageBind, ctx.store, applyMessage));
 
-  // tf-alert handles dismiss internally (removes itself from DOM and emits
-  // 'dismiss' event). Bridge to SDK event protocol.
-  if (dismissible) {
-    const onDismiss = () => {
-      el.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('dismiss', {
-        bubbles: false,
-      }));
-    };
-    el.addEventListener('dismiss', onDismiss);
-    ctx.registerCleanup(() => el.removeEventListener('dismiss', onDismiss));
-  }
+  // tf-alert itself dispatches the 'dismiss' CustomEvent on the root element
+  // when its close button is clicked — that IS the SDK event, no bridge.
 
-  // Actions are rendered as children after the component builds
+  // Actions go into the slot="actions" container preserved by tf-alert.
   if (actionsRaw != null) {
     if (!Array.isArray(actionsRaw)) throw new TypeError('Alert.actions must be array');
     const actionsEl = document.createElement('div');
+    actionsEl.setAttribute('slot', 'actions');
     actionsEl.classList.add('tf-alert__actions');
     for (const actionComp of actionsRaw) {
       if (!actionComp || actionComp.tag !== BUTTON_TAG) throw new TypeError(`Alert.actions: children must be Button (0x${BUTTON_TAG.toString(16)})`);
@@ -233,7 +227,8 @@ function renderCallout(component, ctx) {
 }
 
 // =============================================================================
-// Toast (0x0504)
+// Toast (0x0504) — uses <tf-toast> web component (declarative, persistent:
+// lifecycle is driven by addon state render, not by the auto-dismiss timer)
 // =============================================================================
 
 export const TOAST_TAG = 0x0504;
@@ -254,61 +249,58 @@ function renderToast(component, ctx) {
   if (actionLabelRaw != null) requireString(actionLabelRaw, 'Toast.action_label');
   if (actionIdRaw != null) requireString(actionIdRaw, 'Toast.action_id');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-toast', `tf-toast--tone-${tone}`);
-  wrapper.setAttribute('role', 'status');
-  wrapper.setAttribute('aria-live', 'polite');
+  const el = document.createElement('tf-toast');
+  el.setAttribute('tone', TONE_TO_ALERT[tone] || 'info');
+  el.setAttribute('persistent', '');
+  el.classList.add(`tf-toast--tone-${tone}`);
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-live', 'polite');
 
-  if (iconRaw != null) {
-    const iconEl = renderIcon(iconRaw, 'Toast.icon');
-    iconEl.classList.add('tf-toast__icon');
-    wrapper.appendChild(iconEl);
-  }
-
-  const body = document.createElement('div');
-  body.classList.add('tf-toast__body');
-
-  const titleEl = document.createElement('div');
-  titleEl.classList.add('tf-toast__title');
+  // Reactive title attribute.
   const applyTitle = () => {
     const v = resolveBindRef(titleBind, ctx.store);
-    titleEl.textContent = v == null ? '' : String(v);
+    el.setAttribute('title', v == null ? '' : String(v));
   };
   applyTitle();
   ctx.registerCleanup(subscribeBindRef(titleBind, ctx.store, applyTitle));
-  body.appendChild(titleEl);
 
+  // Reactive message attribute (Toast.body).
   if (bodyBind != null) {
-    const bodyEl = document.createElement('div');
-    bodyEl.classList.add('tf-toast__message');
     const applyBody = () => {
       const v = resolveBindRef(bodyBind, ctx.store);
-      bodyEl.textContent = v == null ? '' : String(v);
+      el.setAttribute('message', v == null ? '' : String(v));
     };
     applyBody();
     ctx.registerCleanup(subscribeBindRef(bodyBind, ctx.store, applyBody));
-    body.appendChild(bodyEl);
   }
 
-  wrapper.appendChild(body);
+  // Slotted icon, preserved by tf-toast and rendered before the title.
+  if (iconRaw != null) {
+    const iconEl = renderIcon(iconRaw, 'Toast.icon');
+    iconEl.setAttribute('slot', 'icon');
+    iconEl.classList.add('tf-toast__icon');
+    el.appendChild(iconEl);
+  }
 
+  // Slotted action button, preserved by tf-toast after the message.
   if (actionLabelRaw != null && actionIdRaw != null) {
-    const actionBtn = document.createElement('button');
-    actionBtn.type = 'button';
+    const actionBtn = document.createElement('tf-button');
+    actionBtn.setAttribute('slot', 'action');
+    actionBtn.setAttribute('variant', 'ghost');
+    actionBtn.setAttribute('label', actionLabelRaw);
     actionBtn.classList.add('tf-toast__action');
-    actionBtn.textContent = actionLabelRaw;
     const onAction = () => {
-      wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('toast_action', {
+      el.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('toast_action', {
         bubbles: false,
         detail: { action_id: actionIdRaw },
       }));
     };
     actionBtn.addEventListener('click', onAction);
     ctx.registerCleanup(() => actionBtn.removeEventListener('click', onAction));
-    wrapper.appendChild(actionBtn);
+    el.appendChild(actionBtn);
   }
 
-  return wrapper;
+  return el;
 }
 
 // =============================================================================
@@ -381,10 +373,9 @@ function renderOfflineBanner(component, ctx) {
   messageEl.classList.add('tf-offline-banner__message');
   wrapper.appendChild(messageEl);
 
-  let actionBtn = null;
   if (actionLabelBind != null) {
-    actionBtn = document.createElement('button');
-    actionBtn.type = 'button';
+    const actionBtn = document.createElement('tf-button');
+    actionBtn.setAttribute('variant', 'ghost');
     actionBtn.classList.add('tf-offline-banner__action');
     const onAction = () => {
       wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('offline_action', {
@@ -397,7 +388,7 @@ function renderOfflineBanner(component, ctx) {
 
     const applyActionLabel = () => {
       const v = resolveBindRef(actionLabelBind, ctx.store);
-      actionBtn.textContent = v == null ? '' : String(v);
+      actionBtn.setAttribute('label', v == null ? '' : String(v));
     };
     applyActionLabel();
     ctx.registerCleanup(subscribeBindRef(actionLabelBind, ctx.store, applyActionLabel));

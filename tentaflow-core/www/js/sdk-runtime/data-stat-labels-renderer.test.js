@@ -3,7 +3,7 @@
 // Opis: Testy KeyValue/StatCard/Stat/Badge/Chip/Tag — chunk 3.3d-2.
 // =============================================================================
 
-import './_dom-test-harness.js';
+import { window as harnessWindow } from './_dom-test-harness.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -13,6 +13,14 @@ import { bootstrapSdkRuntime } from './bootstrap.js';
 import {
   KEY_VALUE_TAG, STAT_CARD_TAG, STAT_TAG, BADGE_TAG, CHIP_TAG, TAG_TAG,
 } from './data-stat-labels-renderer.js';
+
+// The harness exports bound globals; a bound class has no .prototype, which
+// breaks `class X extends HTMLElement`. Restore the raw constructor before
+// loading web components (dynamic import runs after the harness).
+globalThis.HTMLElement = harnessWindow.HTMLElement;
+await import('../components/tf-stat-card.js');
+await import('../components/tf-chip.js');
+await import('../components/tf-key-value.js');
 
 const results = [];
 function test(name, fn) {
@@ -52,12 +60,17 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// Attach to the document so custom elements upgrade (connectedCallback)
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
 // ============================================================================
 // KeyValue
 // ============================================================================
 
-test('KeyValue renderuje <dl> z N row', () => {
+test('KeyValue renderuje <tf-key-value> z N row', () => {
   setup();
   const engine = makeEngine();
   const item = (lbl, val) => [
@@ -68,8 +81,12 @@ test('KeyValue renderuje <dl> z N row', () => {
     [0, [item('Name', 'Ala'), item('Age', '30')]],
     [1, 'default'], [2, 'horizontal'],
   ]));
-  assertEq(el.tagName, 'DL');
-  assertEq(el.querySelectorAll('.tf-keyvalue__row').length, 2);
+  mount(el);
+  assertEq(el.tagName, 'TF-KEY-VALUE');
+  const rows = el.querySelectorAll('tbody tr');
+  assertEq(rows.length, 2);
+  assertEq(rows[0].querySelector('.tf-kv-key').textContent, 'Name');
+  assertEq(rows[0].querySelector('.tf-kv-value').textContent, 'Ala');
 });
 
 test('KeyValue item z action_id renderuje clickable + emit item_click', () => {
@@ -84,6 +101,7 @@ test('KeyValue item z action_id renderuje clickable + emit item_click', () => {
     [0, [item]],
     [1, 'default'], [2, 'horizontal'],
   ]));
+  mount(el);
   let got = null;
   el.addEventListener('item_click', (e) => { got = e.detail; });
   el.querySelector('.tf-keyvalue__value--clickable').click();
@@ -124,7 +142,7 @@ test('KeyValue unknown field throws', () => {
 // StatCard
 // ============================================================================
 
-test('StatCard clickable=true renderuje <button>', () => {
+test('StatCard clickable=true ustawia role=button na <tf-stat-card>', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(STAT_CARD_TAG, [
@@ -132,11 +150,13 @@ test('StatCard clickable=true renderuje <button>', () => {
     [2, { kind: 'literal', value: '12345' }],
     [8, true],
   ]));
-  assertEq(el.tagName, 'BUTTON');
-  assertEq(el.getAttribute('type'), 'button');
+  assertEq(el.tagName, 'TF-STAT-CARD');
+  assertEq(el.getAttribute('role'), 'button');
+  assertEq(el.getAttribute('tabindex'), '0');
+  assert(el.classList.contains('tf-stat-card--clickable'));
 });
 
-test('StatCard clickable=false renderuje <article>', () => {
+test('StatCard clickable=false renderuje <tf-stat-card> bez role', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(STAT_CARD_TAG, [
@@ -144,10 +164,11 @@ test('StatCard clickable=false renderuje <article>', () => {
     [2, { kind: 'literal', value: '1' }],
     [8, false],
   ]));
-  assertEq(el.tagName, 'ARTICLE');
+  assertEq(el.tagName, 'TF-STAT-CARD');
+  assertEq(el.getAttribute('role'), null);
 });
 
-test('StatCard trend=up renderuje arrow + percent', () => {
+test('StatCard trend=up renderuje delta + delta-type', () => {
   setup();
   const engine = makeEngine();
   const trend = [[0, 'up'], [1, 12.5]];
@@ -156,10 +177,13 @@ test('StatCard trend=up renderuje arrow + percent', () => {
     [2, { kind: 'literal', value: '1k' }],
     [5, trend], [8, false],
   ]));
-  const t = el.querySelector('.tf-trend--up');
-  assert(t != null);
-  assertEq(t.querySelector('.tf-trend__arrow').textContent, '▲');
-  assertEq(t.querySelector('.tf-trend__percent').textContent, '12.5%');
+  mount(el);
+  assertEq(el.getAttribute('delta-type'), 'up');
+  assertEq(el.getAttribute('delta'), '12.5%');
+  const d = el.querySelector('.tf-stat-card-delta');
+  assert(d != null);
+  assert(d.classList.contains('up'));
+  assert(d.textContent.includes('12.5%'));
 });
 
 test('StatCard footnote renderuje tone class', () => {
@@ -174,13 +198,14 @@ test('StatCard footnote renderuje tone class', () => {
     [2, { kind: 'literal', value: '1' }],
     [6, fn], [8, false],
   ]));
+  mount(el);
   const f = el.querySelector('.tf-footnote');
   assert(f != null);
   assert(f.classList.contains('tf-footnote--tone-warning'));
   assertEq(f.querySelector('.tf-footnote__content').textContent, 'Updated 1h ago');
 });
 
-test('StatCard accent ustawia klasę border', () => {
+test('StatCard accent ustawia atrybut accent', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(STAT_CARD_TAG, [
@@ -188,7 +213,9 @@ test('StatCard accent ustawia klasę border', () => {
     [2, { kind: 'literal', value: '1' }],
     [7, 'critical'], [8, false],
   ]));
-  assert(el.classList.contains('tf-stat-card--accent-critical'));
+  mount(el);
+  assertEq(el.getAttribute('accent'), 'danger');
+  assert(el.querySelector('.tf-stat-card.accent-danger') != null);
 });
 
 test('StatCard format currency formatuje value', () => {
@@ -200,7 +227,8 @@ test('StatCard format currency formatuje value', () => {
     [4, { kind: 'currency', code: 'USD' }],
     [8, false],
   ]));
-  const v = el.querySelector('.tf-stat-card__value').textContent;
+  mount(el);
+  const v = el.querySelector('.tf-stat-card-value').textContent;
   assert(v.includes('1') && v.includes('234'));
 });
 
@@ -236,7 +264,7 @@ test('StatCard unknown field throws', () => {
 // Stat
 // ============================================================================
 
-test('Stat renderuje label+value+size class', () => {
+test('Stat renderuje <tf-stat-card size> compact variant', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(STAT_TAG, [
@@ -244,9 +272,12 @@ test('Stat renderuje label+value+size class', () => {
     [1, { kind: 'literal', value: '42' }],
     [4, 'lg'],
   ]));
+  mount(el);
+  assertEq(el.tagName, 'TF-STAT-CARD');
+  assertEq(el.getAttribute('size'), 'lg');
+  assert(el.querySelector('.tf-stat.tf-stat--size-lg') != null);
   assertEq(el.querySelector('.tf-stat__label').textContent, 'Users');
   assertEq(el.querySelector('.tf-stat__value').textContent, '42');
-  assert(el.classList.contains('tf-stat--size-lg'));
 });
 
 test('Stat invalid size throws', () => {
@@ -262,7 +293,7 @@ test('Stat invalid size throws', () => {
 // Badge
 // ============================================================================
 
-test('Badge variant=solid + tone=success renderuje klasy', () => {
+test('Badge variant=solid + tone=success renderuje <tf-badge>', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(BADGE_TAG, [
@@ -270,9 +301,9 @@ test('Badge variant=solid + tone=success renderuje klasy', () => {
     [2, { kind: 'literal', value: 'NEW' }],
     [5, 99], [6, false],
   ]));
-  assert(el.classList.contains('tf-badge--variant-solid'));
-  assert(el.classList.contains('tf-badge--tone-success'));
-  assertEq(el.querySelector('.tf-badge__label').textContent, 'NEW');
+  assertEq(el.tagName, 'TF-BADGE');
+  assertEq(el.getAttribute('tone'), 'success');
+  assertEq(el.getAttribute('value'), 'NEW');
 });
 
 test('Badge count > max → overflow display N+', () => {
@@ -329,7 +360,7 @@ test('Badge max=0 throws', () => {
 // Chip
 // ============================================================================
 
-test('Chip variant=solid non-interactive renderuje <span>', () => {
+test('Chip variant=solid non-interactive renderuje <tf-chip>', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(CHIP_TAG, [
@@ -337,10 +368,15 @@ test('Chip variant=solid non-interactive renderuje <span>', () => {
     [2, { kind: 'literal', value: 'tag' }],
     [6, false],
   ]));
-  assertEq(el.tagName, 'SPAN');
+  mount(el);
+  assertEq(el.tagName, 'TF-CHIP');
+  const inner = el.querySelector('.tf-chip');
+  assert(inner != null);
+  assert(inner.classList.contains('accent')); // tone primary → status accent
+  assertEq(el.getAttribute('label'), 'tag');
 });
 
-test('Chip root jest ZAWSZE <span> (uniknięcie button-in-button)', () => {
+test('Chip root jest ZAWSZE <tf-chip>', () => {
   setup();
   const engine = makeEngine();
   for (const v of ['solid', 'soft', 'outline', 'removable', 'selectable', 'toggle']) {
@@ -349,7 +385,7 @@ test('Chip root jest ZAWSZE <span> (uniknięcie button-in-button)', () => {
       [2, { kind: 'literal', value: 'x' }],
       [6, v === 'removable'],
     ], { id: `c_${v}` }));
-    assertEq(el.tagName, 'SPAN', `variant=${v}`);
+    assertEq(el.tagName, 'TF-CHIP', `variant=${v}`);
   }
 });
 
@@ -361,11 +397,12 @@ test('Chip removable renderuje <button.tf-chip__remove>', () => {
     [2, { kind: 'literal', value: 'x' }],
     [6, true],
   ]));
+  mount(el);
   const rm = el.querySelector('.tf-chip__remove');
   assertEq(rm.tagName, 'BUTTON');
 });
 
-test('Chip selectable role=option + tabindex=0', () => {
+test('Chip selectable role=button + tabindex=0', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(CHIP_TAG, [
@@ -373,7 +410,9 @@ test('Chip selectable role=option + tabindex=0', () => {
     [2, { kind: 'literal', value: 'x' }],
     [6, false],
   ]));
-  assertEq(el.getAttribute('role'), 'option');
+  mount(el);
+  assert(el.hasAttribute('clickable'));
+  assertEq(el.getAttribute('role'), 'button');
   assertEq(el.getAttribute('tabindex'), '0');
 });
 
@@ -385,13 +424,14 @@ test('Chip × click emituje remove event', () => {
     [2, { kind: 'literal', value: 'x' }],
     [6, true],
   ]));
+  mount(el);
   let fired = false;
   el.addEventListener('remove', () => { fired = true; });
   el.querySelector('.tf-chip__remove').click();
   assertEq(fired, true);
 });
 
-test('Chip selectable + selected BindRef → aria-pressed reaktywne', () => {
+test('Chip selectable + selected BindRef → atrybut active reaktywny', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('sel'), value: true }], state_revision: 0, truncated: false });
@@ -402,13 +442,15 @@ test('Chip selectable + selected BindRef → aria-pressed reaktywne', () => {
     [5, { kind: 'bound', path: PATH('sel') }],
     [6, false],
   ]));
-  assertEq(el.getAttribute('aria-pressed'), 'true');
-  assert(el.classList.contains('tf-chip--selected'));
+  mount(el);
+  assert(el.hasAttribute('active'));
+  assert(el.querySelector('.tf-chip').classList.contains('active'));
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('sel'), op: { kind: 'set', value: false } }],
   });
-  assertEq(el.getAttribute('aria-pressed'), 'false');
+  assertEq(el.hasAttribute('active'), false);
+  assertEq(el.querySelector('.tf-chip').classList.contains('active'), false);
 });
 
 test('Chip icon + avatar mutually exclusive throws', () => {
@@ -432,6 +474,7 @@ test('Chip avatar kind=initials renderuje', () => {
     [4, { kind: 'initials', initials: 'A' }],
     [6, false],
   ]));
+  mount(el);
   assertEq(el.querySelector('.tf-avatar-ref__initials').textContent, 'A');
 });
 
@@ -444,6 +487,7 @@ test('Chip avatar kind=image z https renderuje <img>', () => {
     [4, { kind: 'image', ref: 'https://example.com/a.png' }],
     [6, false],
   ]));
+  mount(el);
   const img = el.querySelector('.tf-avatar-ref__img');
   assertEq(img.tagName, 'IMG');
   assertEq(img.getAttribute('src'), 'https://example.com/a.png');
@@ -469,6 +513,7 @@ test('Chip avatar kind=icon renderuje SVG', () => {
     [4, { kind: 'icon', icon: { kind: 'named', name: 'check' } }],
     [6, false],
   ]));
+  mount(el);
   assert(el.querySelector('.tf-avatar-ref__icon') != null);
 });
 
@@ -498,7 +543,7 @@ test('Chip avatar unknown field throws', () => {
 // Tag
 // ============================================================================
 
-test('Tag renderuje <span> z tone+size classes', () => {
+test('Tag renderuje <tf-chip variant=tag> z tone+size classes', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(TAG_TAG, [
@@ -506,10 +551,14 @@ test('Tag renderuje <span> z tone+size classes', () => {
     [1, { kind: 'literal', value: 'beta' }],
     [2, 'sm'],
   ]));
-  assertEq(el.tagName, 'SPAN');
-  assert(el.classList.contains('tf-tag--tone-info'));
-  assert(el.classList.contains('tf-tag--size-sm'));
-  assertEq(el.textContent, 'beta');
+  mount(el);
+  assertEq(el.tagName, 'TF-CHIP');
+  assertEq(el.getAttribute('variant'), 'tag');
+  const tag = el.querySelector('.tf-tag');
+  assert(tag != null);
+  assert(tag.classList.contains('tf-tag--tone-info'));
+  assert(tag.classList.contains('tf-tag--size-sm'));
+  assertEq(tag.textContent, 'beta');
 });
 
 test('Tag invalid size throws', () => {

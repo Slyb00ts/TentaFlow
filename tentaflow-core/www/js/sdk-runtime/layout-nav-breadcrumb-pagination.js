@@ -1,8 +1,9 @@
 // =============================================================================
 // Plik: sdk-runtime/layout-nav-breadcrumb-pagination.js
-// Opis: Rendererzy Breadcrumb (0x0110) + Pagination (0x0111) — Faza 6
-// Krok 3.3a-5. Bez zależności od slot manager (chunk 3.5) ani icon
-// registry (chunk 3.3d) — icon/local_action present jest odrzucany.
+// Opis: Renderers for Breadcrumb (0x0110) + Pagination (0x0111).
+// Breadcrumb renders through the dashboard <tf-breadcrumb> /
+// <tf-breadcrumb-item> web components; Pagination stays hand-rolled (no
+// tf-pagination component exists) using shared dashboard classes only.
 // Spec ref: `tentaflow-sdk-spec/src/protocol/ui/layout/nav.rs`.
 // =============================================================================
 
@@ -94,31 +95,26 @@ function renderBreadcrumb(component, ctx) {
   const maxItemsRaw = ctx.readField(component.fields, 2);
   const maxItems = maxItemsRaw === undefined ? 5 : requireU8(maxItemsRaw, 'Breadcrumb.max_items');
 
-  const nav = document.createElement('nav');
-  nav.classList.add('tf-breadcrumb');
-  nav.classList.add(`tf-breadcrumb--separator-${separator}`);
-  nav.setAttribute('aria-label', 'Breadcrumb');
-  const list = document.createElement('ol');
-  list.classList.add('tf-breadcrumb__list');
-  nav.appendChild(list);
+  // <tf-breadcrumb> renders the canonical dashboard breadcrumb (single ">"
+  // separator). The SDK separator enum is still validated and exposed as a
+  // data attribute for tooling, but the visual separator is the component's.
+  const root = document.createElement('tf-breadcrumb');
+  root.setAttribute('data-separator', separator);
 
-  // Strategia collapse'u: jeśli items.length > max_items, pokazujemy
-  // pierwszy + "…" + ostatnie (max_items - 2). To zachowuje początek
-  // ścieżki + kontekst bieżącej lokacji, ukrywając środek.
+  // Collapse strategy: when items.length > max_items show the first item +
+  // "…" + the last (max_items - 2). Keeps the path start and the current
+  // location context while hiding the middle.
   const displayItems = collapseBreadcrumbItems(items, maxItems);
 
-  for (let i = 0; i < displayItems.length; i++) {
-    const entry = displayItems[i];
+  // Clickable entries in DOM order — maps the n-th rendered <a> back to its
+  // original item index and action id.
+  const clickableEntries = [];
+
+  for (const entry of displayItems) {
+    const itemEl = document.createElement('tf-breadcrumb-item');
     if (entry.ellipsis) {
-      const li = document.createElement('li');
-      li.classList.add('tf-breadcrumb__item');
-      li.classList.add('tf-breadcrumb__item--ellipsis');
-      li.setAttribute('aria-hidden', 'true');
-      li.textContent = '…';
-      list.appendChild(li);
-      if (i < displayItems.length - 1) {
-        list.appendChild(makeSeparator(separator));
-      }
+      itemEl.textContent = '…';
+      root.appendChild(itemEl);
       continue;
     }
     const item = entry.item;
@@ -136,61 +132,55 @@ function renderBreadcrumb(component, ctx) {
       ? null
       : requireString(item.action_id, `Breadcrumb.items[${itemIdx}].action_id`);
 
-    const li = document.createElement('li');
-    li.classList.add('tf-breadcrumb__item');
     if (isCurrent) {
-      li.classList.add('tf-breadcrumb__item--current');
-    }
-
-    // Element interaktywny: <a> dla klikalnych, <span> dla bieżącej
-    // pozycji. Klik na breadcrumb item z action_id dispatchuje
-    // CustomEvent('click') z detail.{action_id, item_index} —
-    // dispatcher (chunk 3.6) zmapuje action_id na backend handler.
-    const inner = isCurrent || actionId == null
-      ? document.createElement('span')
-      : document.createElement('a');
-    inner.classList.add('tf-breadcrumb__link');
-    if (inner.tagName === 'A') {
-      inner.setAttribute('href', '#');
-      inner.setAttribute('role', 'link');
-    }
-    if (isCurrent) {
-      // ARIA: aria-current="page" idzie na ELEMENT WEWNĘTRZNY (link/span),
-      // nie na li — zgodnie z W3C wcag practices breadcrumb pattern.
-      inner.setAttribute('aria-current', 'page');
+      itemEl.setAttribute('current', '');
     }
     if (!isCurrent && actionId != null) {
-      const onClick = (e) => {
-        e.preventDefault();
-        // Native MouseEvent musi NIE bubble do nav — inaczej nadpisałby
-        // nasz CustomEvent('click', { detail: ... }) gołym MouseEvent'em
-        // z `detail=clickCount` w listenerze nav-level.
-        e.stopPropagation();
-        nav.dispatchEvent(
-          new (globalThis.CustomEvent || globalThis.Event)('click', {
-            bubbles: false,
-            detail: { action_id: actionId, item_index: itemIdx },
-          })
-        );
-      };
-      inner.addEventListener('click', onClick);
-      ctx.registerCleanup(() => inner.removeEventListener('click', onClick));
+      // href makes the component render an <a>; navigation is suppressed in
+      // the delegated click handler below and replaced by the SDK action.
+      itemEl.setAttribute('href', '#');
+      clickableEntries.push({ actionId, itemIdx });
     }
-    // Label binding.
+
+    // Label binding. The component's MutationObserver does not watch item
+    // text (no subtree), so force a re-render after post-connect updates.
     const applyLabel = () => {
       const v = resolveBindRef(item.label, ctx.store);
-      inner.textContent = v == null ? '' : String(v);
+      itemEl.textContent = v == null ? '' : String(v);
+      if (root._nav) root._render();
     };
     applyLabel();
     const off = subscribeBindRef(item.label, ctx.store, applyLabel);
     ctx.registerCleanup(off);
-    li.appendChild(inner);
-    list.appendChild(li);
-    if (i < displayItems.length - 1) {
-      list.appendChild(makeSeparator(separator));
-    }
+    root.appendChild(itemEl);
   }
-  return nav;
+
+  // Delegated capture-phase click: the component rebuilds its anchors on
+  // every internal re-render, so per-anchor listeners would go stale.
+  // stopPropagation keeps the raw MouseEvent from reaching consumer
+  // listeners on the root — they only ever see our CustomEvent('click')
+  // with detail.{action_id, item_index}, same as before the migration.
+  const onClick = (e) => {
+    const anchor = e.target && e.target.closest
+      ? e.target.closest('a.tf-breadcrumb-item')
+      : null;
+    if (!anchor || !root.contains(anchor)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const anchors = Array.from(root.querySelectorAll('a.tf-breadcrumb-item'));
+    const clickEntry = clickableEntries[anchors.indexOf(anchor)];
+    if (!clickEntry) return;
+    root.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('click', {
+        bubbles: false,
+        detail: { action_id: clickEntry.actionId, item_index: clickEntry.itemIdx },
+      })
+    );
+  };
+  root.addEventListener('click', onClick, true);
+  ctx.registerCleanup(() => root.removeEventListener('click', onClick, true));
+
+  return root;
 }
 
 function collapseBreadcrumbItems(items, maxItems) {
@@ -206,19 +196,6 @@ function collapseBreadcrumbItems(items, maxItems) {
     result.push({ item: items[i], originalIndex: i });
   }
   return result;
-}
-
-function makeSeparator(kind) {
-  const sep = document.createElement('li');
-  sep.classList.add('tf-breadcrumb__separator');
-  sep.classList.add(`tf-breadcrumb__separator--${kind}`);
-  sep.setAttribute('aria-hidden', 'true');
-  switch (kind) {
-    case 'chevron': sep.textContent = '›'; break;
-    case 'slash': sep.textContent = '/'; break;
-    case 'dot': sep.textContent = '·'; break;
-  }
-  return sep;
 }
 
 // =============================================================================
@@ -254,7 +231,7 @@ function renderPagination(component, ctx) {
   wrapper.classList.add(`tf-pagination--variant-${variant}`);
   wrapper.setAttribute('aria-label', 'Pagination');
 
-  // Prev / Next przyciski.
+  // Prev / Next buttons.
   const prevBtn = document.createElement('button');
   prevBtn.classList.add('tf-pagination__btn', 'tf-pagination__prev');
   prevBtn.setAttribute('type', 'button');
@@ -266,8 +243,8 @@ function renderPagination(component, ctx) {
   nextBtn.setAttribute('aria-label', 'Next page');
   nextBtn.textContent = '›';
 
-  // Środkowy element zależy od wariantu: compact → "N / total",
-  // full → numerki stron (max 7), input → <input type=number>.
+  // Middle element depends on the variant: compact → "N / total",
+  // full → page numbers (max 7), input → <input type=number>.
   const middle = document.createElement('div');
   middle.classList.add('tf-pagination__middle');
 
@@ -298,7 +275,7 @@ function renderPagination(component, ctx) {
   ctx.registerCleanup(() => prevBtn.removeEventListener('click', onPrevClick));
   ctx.registerCleanup(() => nextBtn.removeEventListener('click', onNextClick));
 
-  // Summary tekst "page X of Y".
+  // Summary text "page X of Y".
   const summary = document.createElement('div');
   summary.classList.add('tf-pagination__summary');
   if (!showSummary) summary.setAttribute('hidden', '');
@@ -312,9 +289,9 @@ function renderPagination(component, ctx) {
     pageInput.classList.add('tf-pagination__input');
     pageInput.setAttribute('aria-label', 'Go to page');
     const onChange = (e) => {
-      // Native <input> change event bubbles — odetnijmy żeby listener na
-      // wrapper'ze nie dostał najpierw native eventu (bez detail), a
-      // potem naszego CustomEvent (z detail.page).
+      // Native <input> change bubbles — cut it off so the wrapper listener
+      // does not receive the raw native event (no detail) before our
+      // CustomEvent (with detail.page).
       e.stopPropagation();
       const parsed = parseInt(pageInput.value, 10);
       if (Number.isInteger(parsed)) emitChange(parsed);
@@ -361,7 +338,7 @@ function renderPagination(component, ctx) {
       renderFullVariant(middle, currentValue, totalValue, emitChange, fullVariantPool);
     }
   };
-  // Po destroy: zwolnij listenery dla aktualnych numeric buttons.
+  // On destroy: release listeners attached to the current numeric buttons.
   if (variant === 'full') {
     ctx.registerCleanup(() => {
       for (const off of fullVariantPool) { try { off(); } catch {} }
@@ -381,10 +358,10 @@ function renderPagination(component, ctx) {
   return wrapper;
 }
 
-/// Per-rerender pool listenerów `full` variant'u. Każde przerenderowanie
-/// odpala wszystkie poprzednie listenery, czyści middle, i buduje od nowa.
-/// Bez tego repeated page changes akumulowałyby cleanup closures dla
-/// odłączonych elementów.
+/// Per-rerender listener pool for the `full` variant. Every re-render
+/// releases all previous listeners, clears the middle, and rebuilds.
+/// Without it repeated page changes would accumulate cleanup closures
+/// for detached elements.
 function renderFullVariant(middle, current, total, emitChange, fullVariantPool) {
   for (const off of fullVariantPool) {
     try { off(); } catch {}
@@ -418,7 +395,7 @@ function renderFullVariant(middle, current, total, emitChange, fullVariantPool) 
 }
 
 function computePaginationWindow(current, total) {
-  // Pokazujemy: 1, …, current-1, current, current+1, …, total. Max 7 spots.
+  // Show: 1, …, current-1, current, current+1, …, total. Max 7 spots.
   if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
   const pages = [];
   pages.push(1);
@@ -436,7 +413,7 @@ function computePaginationWindow(current, total) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerLayoutBreadcrumbPaginationRenderers() {

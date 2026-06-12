@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: sdk-runtime/layout-nav-renderers.js
-// Opis: Renderer NavTabs (tag 0x010C) z Layout nav (Faza 6 Krok 3.3a-4).
+// Opis: NavTabs renderer (tag 0x010C) from Layout nav.
 // Uses <tf-tabs> + <tf-tab> web components for tab rendering with FLIP
 // indicator, horizontal overflow, and chevron scroll.
 //
@@ -200,7 +200,7 @@ function renderNavTabs(component, ctx) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerLayoutNavRenderers() {
