@@ -81,9 +81,9 @@ test('Breadcrumb renders tf-breadcrumb with items, separators and aria-current',
       [
         0,
         [
-          { label: { kind: 'literal', value: 'Home' }, action_id: 'go-home', is_current: false },
-          { label: { kind: 'literal', value: 'Reports' }, action_id: 'go-reports', is_current: false },
-          { label: { kind: 'literal', value: 'Q4' }, is_current: true },
+          [[0, { kind: 'literal', value: 'Home' }], [2, 'go-home'], [4, false]],
+          [[0, { kind: 'literal', value: 'Reports' }], [2, 'go-reports'], [4, false]],
+          [[0, { kind: 'literal', value: 'Q4' }], [4, true]],
         ],
       ],
       [1, 'chevron'],
@@ -109,8 +109,8 @@ test('Breadcrumb current item renders as span, action items as links', () => {
       [
         0,
         [
-          { label: { kind: 'literal', value: 'A' }, action_id: 'a-click', is_current: false },
-          { label: { kind: 'literal', value: 'B' }, is_current: true },
+          [[0, { kind: 'literal', value: 'A' }], [2, 'a-click'], [4, false]],
+          [[0, { kind: 'literal', value: 'B' }], [4, true]],
         ],
       ],
       [1, 'slash'],
@@ -130,9 +130,9 @@ test('Breadcrumb link click dispatches click with action_id and item_index', () 
       [
         0,
         [
-          { label: { kind: 'literal', value: 'A' }, action_id: 'navA', is_current: false },
-          { label: { kind: 'literal', value: 'B' }, action_id: 'navB', is_current: false },
-          { label: { kind: 'literal', value: 'C' }, is_current: true },
+          [[0, { kind: 'literal', value: 'A' }], [2, 'navA'], [4, false]],
+          [[0, { kind: 'literal', value: 'B' }], [2, 'navB'], [4, false]],
+          [[0, { kind: 'literal', value: 'C' }], [4, true]],
         ],
       ],
       [1, 'dot'],
@@ -157,7 +157,7 @@ test('Breadcrumb default max_items=5 collapses long trails with ellipsis', () =>
   const engine = makeEngine();
   const items = [];
   for (let i = 0; i < 8; i++) {
-    items.push({ label: { kind: 'literal', value: `L${i}` }, is_current: i === 7 });
+    items.push([[0, { kind: 'literal', value: `L${i}` }], [4, i === 7]]);
   }
   const el = engine.render(
     comp(BREADCRUMB_TAG, [[0, items], [1, 'chevron']])
@@ -181,7 +181,7 @@ test('Breadcrumb label BindRef updates rendered text reactively', () => {
   const engine = makeEngine(store);
   const el = engine.render(
     comp(BREADCRUMB_TAG, [
-      [0, [{ label: { kind: 'bound', path: PATH('crumb') }, is_current: true }]],
+      [0, [[[0, { kind: 'bound', path: PATH('crumb') }], [4, true]]]],
       [1, 'chevron'],
     ])
   );
@@ -201,12 +201,12 @@ test('Breadcrumb item icon and local_action are gracefully ignored', () => {
     comp(BREADCRUMB_TAG, [
       [
         0,
-        [{
-          label: { kind: 'literal', value: 'X' },
-          is_current: true,
-          icon: { kind: 'name', name: 'star' },
-          local_action: { kind: 'navigate' },
-        }],
+        [[
+          [0, { kind: 'literal', value: 'X' }],
+          [4, true],
+          [1, { kind: 'name', name: 'star' }],
+          [3, { kind: 'navigate' }],
+        ]],
       ],
       [1, 'chevron'],
     ])
@@ -221,7 +221,7 @@ test('Breadcrumb rejects invalid separator', () => {
   assertThrows(() =>
     engine.render(
       comp(BREADCRUMB_TAG, [
-        [0, [{ label: { kind: 'literal', value: 'X' }, is_current: true }]],
+        [0, [[[0, { kind: 'literal', value: 'X' }], [4, true]]]],
         [1, 'arrow'],
       ])
     )

@@ -224,11 +224,12 @@ function renderWizardShell(component, ctx) {
       if (step == null || typeof step !== 'object') continue;
       const stepEl = document.createElement('div');
       stepEl.classList.add('tf-wizard-shell__step');
-      const stepId = typeof step[0] === 'string' ? step[0] : '';
-      stepEl.dataset.stepId = stepId;
-      if (step[2] === true) stepEl.classList.add('tf-wizard-shell__step--optional');
+      // WizardStep is an inline struct — [key, value] pairs on the wire.
+      const stepIdRaw = ctx.readField(step, 0);
+      stepEl.dataset.stepId = typeof stepIdRaw === 'string' ? stepIdRaw : '';
+      if (ctx.readField(step, 2) === true) stepEl.classList.add('tf-wizard-shell__step--optional');
 
-      const label = step[1];
+      const label = ctx.readField(step, 1);
       if (label != null) {
         const labelEl = document.createElement('span');
         labelEl.classList.add('tf-wizard-shell__step-label');
@@ -236,7 +237,7 @@ function renderWizardShell(component, ctx) {
         stepEl.appendChild(labelEl);
       }
 
-      const description = step[4];
+      const description = ctx.readField(step, 4);
       if (description != null) {
         const descEl = document.createElement('span');
         descEl.classList.add('tf-wizard-shell__step-desc');
@@ -453,7 +454,9 @@ function renderWelcomeHero(component, ctx) {
       const li = document.createElement('li');
       li.classList.add('tf-welcome-hero__feature');
 
-      const featIcon = feat[0];
+      // FeatureItem is an inline struct — decoded as [key, value] pairs,
+      // read via ctx.readField like every other inline struct.
+      const featIcon = ctx.readField(feat, 0);
       if (featIcon != null) {
         const iconEl = renderIcon(featIcon, 'FeatureItem.icon');
         iconEl.classList.add('tf-welcome-hero__feature-icon');
@@ -462,14 +465,14 @@ function renderWelcomeHero(component, ctx) {
 
       const featContent = document.createElement('div');
       featContent.classList.add('tf-welcome-hero__feature-content');
-      const featTitle = feat[1];
+      const featTitle = ctx.readField(feat, 1);
       if (featTitle != null) {
         const ftEl = document.createElement('strong');
         ftEl.classList.add('tf-welcome-hero__feature-title');
         applyTextBind(ftEl, featTitle, ctx);
         featContent.appendChild(ftEl);
       }
-      const featDesc = feat[2];
+      const featDesc = ctx.readField(feat, 2);
       if (featDesc != null) {
         const fdEl = document.createElement('span');
         fdEl.classList.add('tf-welcome-hero__feature-desc');

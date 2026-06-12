@@ -107,34 +107,50 @@ fn create_instance(
 // Tests
 // =============================================================================
 
-#[test]
-fn on_start_emits_canonical_panel_shell() {
-    let db = create_test_db();
-    let (mut store, instance, ui_panels) = create_instance(db, None);
+/// Drains all `ui.cbor_message` events captured by the dispatch channel and
+/// decodes them into UiPayloads (in send order). Each message is also checked
+/// for canonical encoding.
+fn drain_ui_payloads(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<tentaflow_core::addon::event_bus::Event>,
+) -> Vec<UiPayload> {
+    let mut payloads = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if event.event_type != "ui.cbor_message" {
+            continue;
+        }
+        let cbor: Vec<u8> = event.payload["cbor"]
+            .as_array()
+            .expect("cbor bytes array")
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u8)
+            .collect();
+        validate_canonical(&cbor).expect("CBOR is not canonical");
+        payloads.push(minicbor::decode(&cbor).expect("failed to decode UiPayload"));
+    }
+    payloads
+}
 
-    // Call on_start — addon emits PanelShell via ui_render_cbor.
+#[test]
+fn on_start_emits_canonical_panel_shell_then_initial_slot_content() {
+    let db = create_test_db();
+    let (mut store, instance, _ui_panels) = create_instance(db, None);
+
+    // Capture every ui_render_cbor message in order via the event-bus
+    // dispatch channel (the ui_panels cache only keeps the last message).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    store.data().event_bus.set_dispatch_sender(tx);
+
+    // Call on_start — addon emits PanelShell + initial SlotContent.
     let on_start = instance
         .get_typed_func::<(), i32>(&mut store, "on_start")
         .expect("on_start export");
     let result = on_start.call(&mut store, ()).expect("on_start call");
     assert_eq!(result, 0, "on_start returned non-zero");
 
-    // Verify PanelShell was stored in ui_panels cache.
-    let cache = ui_panels.read();
-    let key = (
-        String::new(),
-        "sdk-showcase".to_string(),
-        "cbor_msg".to_string(),
-    );
-    let cbor_bytes = cache.get(&key).expect("PanelShell not in ui_panels cache");
+    let payloads = drain_ui_payloads(&mut rx);
+    assert_eq!(payloads.len(), 2, "expected PanelShell + SlotContent");
 
-    // Verify canonical CBOR encoding.
-    validate_canonical(cbor_bytes).expect("CBOR is not canonical");
-
-    // Decode as UiPayload and verify it's a PanelShell.
-    let payload: UiPayload = minicbor::decode(cbor_bytes).expect("failed to decode UiPayload");
-
-    match &payload {
+    match &payloads[0] {
         UiPayload::PanelShell(shell) => {
             assert_eq!(shell.addon_id, "sdk-showcase");
             assert_eq!(shell.panel_id, "main");
@@ -145,6 +161,18 @@ fn on_start_emits_canonical_panel_shell() {
             assert_eq!(shell.initial_state.len(), 4);
         }
         other => panic!("expected PanelShell, got tag {:?}", other.tag()),
+    }
+
+    // The default tab content must follow immediately — without it the
+    // content slot stays on its Loading placeholder until a tab click.
+    match &payloads[1] {
+        UiPayload::SlotContent(content) => {
+            assert_eq!(content.addon_id, "sdk-showcase");
+            assert_eq!(content.panel_id, "main");
+            assert_eq!(content.panel_epoch, 1);
+            assert_eq!(content.slot_id, "content");
+        }
+        other => panic!("expected SlotContent, got tag {:?}", other.tag()),
     }
 }
 
@@ -498,7 +526,10 @@ fn panel_reopen_resets_state_revision() {
     assert_eq!(epoch2, 2);
     call_panel_open(&mut store, &instance, "main", epoch2);
 
-    // The re-sent PanelShell must carry the new epoch and register the shell.
+    // on_panel_open re-sends PanelShell then the initial SlotContent; the
+    // single-slot cache holds the last ACCEPTED message. SlotContent with the
+    // new epoch proves the re-sent shell registered and the slot push passed
+    // session validation.
     {
         let cache = ui_panels.read();
         let key = (
@@ -506,12 +537,18 @@ fn panel_reopen_resets_state_revision() {
             "sdk-showcase".to_string(),
             "cbor_msg".to_string(),
         );
-        let cbor_bytes = cache.get(&key).expect("PanelShell not in ui_panels cache");
+        let cbor_bytes = cache.get(&key).expect("SlotContent not in ui_panels cache");
         validate_canonical(cbor_bytes).expect("CBOR is not canonical");
         let payload: UiPayload = minicbor::decode(cbor_bytes).expect("decode UiPayload");
         match &payload {
-            UiPayload::PanelShell(shell) => assert_eq!(shell.panel_epoch, 2),
-            other => panic!("expected PanelShell after reopen, got tag {:?}", other.tag()),
+            UiPayload::SlotContent(content) => {
+                assert_eq!(content.panel_epoch, 2);
+                assert_eq!(content.slot_id, "content");
+            }
+            other => panic!(
+                "expected SlotContent after reopen, got tag {:?}",
+                other.tag()
+            ),
         }
     }
 

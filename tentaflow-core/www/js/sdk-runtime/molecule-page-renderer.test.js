@@ -128,8 +128,8 @@ test('Header renders actions as tf-button children in actions area', () => {
 test('Header renders subtitle, status badge and meta chips', () => {
   setup();
   const engine = makeEngine();
-  const badge = { 0: 'status', 1: 'success', 2: LIT('Active') };
-  const chip = { 0: 'solid', 1: 'info', 2: LIT('tag1') };
+  const badge = [[0, 'status'], [1, 'success'], [2, LIT('Active')]];
+  const chip = [[0, 'solid'], [1, 'info'], [2, LIT('tag1')]];
   const el = mount(engine.render(comp(HEADER_TAG, [
     [0, ICON_NAMED('check')],
     [1, LIT('Main')],
@@ -199,8 +199,8 @@ test('PageHeader renders breadcrumbs', () => {
   setup();
   const engine = makeEngine();
   const crumbs = [
-    { 0: LIT('Home'), 4: false },
-    { 0: LIT('Settings'), 4: true },
+    [[0, LIT('Home')], [4, false]],
+    [[0, LIT('Settings')], [4, true]],
   ];
   const el = engine.render(comp(PAGE_HEADER_TAG, [
     [0, LIT('Page')],
@@ -218,8 +218,8 @@ test('PageHeader renders tabs as <tf-tabs> with tf-tab children', () => {
   setup();
   const engine = makeEngine();
   const tabs = [
-    { 0: 'tab1', 1: LIT('General') },
-    { 0: 'tab2', 1: LIT('Advanced'), 5: true },
+    [[0, 'tab1'], [1, LIT('General')]],
+    [[0, 'tab2'], [1, LIT('Advanced')], [5, true]],
   ];
   const el = mount(engine.render(comp(PAGE_HEADER_TAG, [
     [0, LIT('Page')],
@@ -322,8 +322,8 @@ test('Toolbar renders filter chips as clickable tf-chip', () => {
   setup();
   const engine = makeEngine();
   const filters = [
-    { 0: 'f1', 1: LIT('Active') },
-    { 0: 'f2', 1: LIT('Archived') },
+    [[0, 'f1'], [1, LIT('Active')]],
+    [[0, 'f2'], [1, LIT('Archived')]],
   ];
   const el = engine.render(comp(TOOLBAR_TAG, [
     [1, filters],
@@ -435,8 +435,8 @@ test('Inspector renders tabs and actions', () => {
   setup();
   const engine = makeEngine();
   const tabs = [
-    { 0: 'properties', 1: LIT('Properties') },
-    { 0: 'history', 1: LIT('History') },
+    [[0, 'properties'], [1, LIT('Properties')]],
+    [[0, 'history'], [1, LIT('History')]],
   ];
   const el = mount(engine.render(comp(INSPECTOR_TAG, [
     [0, LIT('Item')],

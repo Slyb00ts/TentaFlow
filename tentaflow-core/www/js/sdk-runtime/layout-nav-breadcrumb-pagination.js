@@ -16,9 +16,31 @@ import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
 const BREADCRUMB_SEPARATORS = new Set(['chevron', 'slash', 'dot']);
 const PAGINATION_VARIANTS = new Set(['compact', 'full', 'input']);
 
-const BREADCRUMB_ITEM_KEYS = new Set([
-  'label', 'icon', 'action_id', 'local_action', 'is_current',
-]);
+// BreadcrumbItem field keys per spec (inline structs decode to [key, value]
+// pair arrays): 0 label, 1 icon, 2 action_id, 3 local_action, 4 is_current.
+const BREADCRUMB_ITEM_KEYS = new Set([0, 1, 2, 3, 4]);
+
+function readInlineField(pairs, key) {
+  if (!Array.isArray(pairs)) return undefined;
+  for (const entry of pairs) {
+    if (Array.isArray(entry) && entry.length === 2 && entry[0] === key) return entry[1];
+  }
+  return undefined;
+}
+
+function assertOnlyKnownInlineKeys(pairs, allowedKeys, ctx) {
+  if (!Array.isArray(pairs)) {
+    throw new TypeError(`${ctx}: expected inline struct ([key, value] pairs)`);
+  }
+  for (const entry of pairs) {
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      throw new TypeError(`${ctx}: malformed inline struct entry`);
+    }
+    if (!allowedKeys.has(entry[0])) {
+      throw new TypeError(`${ctx}: unexpected key '${entry[0]}'`);
+    }
+  }
+}
 
 function requireEnum(value, set, ctx) {
   if (typeof value !== 'string' || !set.has(value)) {
@@ -67,14 +89,6 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
     }
   }
 }
-function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
-  for (const k of Object.keys(obj)) {
-    if (!allowedKeys.has(k)) {
-      throw new TypeError(`${ctx}: unexpected key '${k}'`);
-    }
-  }
-}
-
 // =============================================================================
 // Breadcrumb (0x0110)
 // =============================================================================
@@ -119,18 +133,21 @@ function renderBreadcrumb(component, ctx) {
     }
     const item = entry.item;
     const itemIdx = entry.originalIndex;
-    assertOnlyKnownObjectKeys(item, BREADCRUMB_ITEM_KEYS, `Breadcrumb.items[${itemIdx}]`);
-    if (item.label == null) {
+    assertOnlyKnownInlineKeys(item, BREADCRUMB_ITEM_KEYS, `Breadcrumb.items[${itemIdx}]`);
+    const labelBind = readInlineField(item, 0);
+    if (labelBind == null) {
       throw new TypeError(`Breadcrumb.items[${itemIdx}].label is required`);
     }
     // icon and local_action: gracefully ignored (optional decorations)
+    const isCurrentRaw = readInlineField(item, 4);
     const isCurrent = requireBool(
-      item.is_current === undefined ? false : item.is_current,
+      isCurrentRaw === undefined ? false : isCurrentRaw,
       `Breadcrumb.items[${itemIdx}].is_current`
     );
-    const actionId = item.action_id == null
+    const actionIdRaw = readInlineField(item, 2);
+    const actionId = actionIdRaw == null
       ? null
-      : requireString(item.action_id, `Breadcrumb.items[${itemIdx}].action_id`);
+      : requireString(actionIdRaw, `Breadcrumb.items[${itemIdx}].action_id`);
 
     if (isCurrent) {
       itemEl.setAttribute('current', '');
@@ -145,12 +162,12 @@ function renderBreadcrumb(component, ctx) {
     // Label binding. The component's MutationObserver does not watch item
     // text (no subtree), so force a re-render after post-connect updates.
     const applyLabel = () => {
-      const v = resolveBindRef(item.label, ctx.store);
+      const v = resolveBindRef(labelBind, ctx.store);
       itemEl.textContent = v == null ? '' : String(v);
       if (root._nav) root._render();
     };
     applyLabel();
-    const off = subscribeBindRef(item.label, ctx.store, applyLabel);
+    const off = subscribeBindRef(labelBind, ctx.store, applyLabel);
     ctx.registerCleanup(off);
     root.appendChild(itemEl);
   }

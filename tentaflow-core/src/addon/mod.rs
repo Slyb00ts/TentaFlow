@@ -1987,6 +1987,19 @@ impl AddonManager {
         };
         // Write lock zwolniony — inne watki moga operowac na mapie
 
+        // Refuel przed wywolaniem — store jest wspoldzielony z service tickami,
+        // ktore RESETUJA fuel do malego budzetu ticka (refuel_store ustawia,
+        // nie dodaje). Bez refuelu kazdy call_tool po ticku startuje z
+        // resztka ~5M i moze wytrapic w polowie wykonania (losowy backtrace).
+        if let Err(e) = runtime::refuel_store(&mut addon_instance.store, DEFAULT_FUEL_LIMIT) {
+            self.instances
+                .lock()
+                .entry(addon_id.to_string())
+                .or_default()
+                .push(addon_instance);
+            return Err(anyhow::anyhow!("refuel_store: {e}"));
+        }
+
         // Przygotuj dane wejsciowe jako JSON
         let request_json = serde_json::json!({
             "tool": tool_name,
@@ -2460,6 +2473,12 @@ impl AddonManager {
 
         // Wykonaj WASM poza lockiem
         for (addon_id, _pos, ref mut addon_instance) in &mut extracted {
+            // Refuel — store wspoldzielony z tickami, ktore zostawiaja maly
+            // budzet (patrz call_tool_inner).
+            if let Err(e) = runtime::refuel_store(&mut addon_instance.store, DEFAULT_FUEL_LIMIT) {
+                warn!("refuel_store przed on_event nieudany dla '{}': {e}", addon_id);
+                continue;
+            }
             let event_export = addon_instance.language_adapter.export_on_event();
             if let Ok(on_event) = addon_instance
                 .instance
