@@ -24,6 +24,7 @@ import '/js/components/tf-agent-activity.js';
 import { attachAgentActivity } from '/js/lib/agent-activity-bridge.js';
 
 const STORAGE_KEY = 'tentaflow_chat_conversations_v1';
+const FLOW_SELECTION_KEY = 'tentaflow_chat_flow_v1';
 const MAX_INPUT_CHARS = 4096;
 // Bubble chrome (avatar 36 + gap 12 + bubble padding 16+16). User messages do
 // not span the full inner column; assistant messages do. Heuristic — overscan
@@ -803,10 +804,12 @@ function sendMessage() {
 // callerowi rozroznic via=voice w meta wiadomosci, a zarazem decyduje
 // czy assistant deltas trzeba feedowac do AudioPipeline.
 function sendMessageInternal(text, opts = {}) {
-  // Model dla syntetycznego flow — pierwszy chat-capable model z registry.
-  // Wybrany flow usera ma własny model w configu bloku LLM.
-  const modelId = modelOptions[0]?.id ?? 'default';
   const { flowId, label: modelLabel } = currentFlowSelection();
+  // Model jedzie w requescie WYŁĄCZNIE dla syntetycznego Default Chat (brak
+  // flowId). Przy wybranym flow modele definiują bloki flow — wysyłanie
+  // modelu obok flowId pozwalało mu po cichu wypełnić blok LLM bez
+  // przypiętego modelu pierwszym lokalnym modelem danego noda.
+  const modelId = flowId ? '' : (modelOptions[0]?.id ?? 'default');
   const conv = ensureActiveConv();
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 
@@ -874,10 +877,6 @@ function sendMessageInternal(text, opts = {}) {
 // engine: audio → STT → LLM → TTS, a flow odsyła przeplatane tekst+audio.
 // Tekst dopisujemy do bąbla asystenta, audio podajemy do AudioPipeline.
 function sendVoiceUtterance(wav, sampleRate) {
-  // Fallback rozwiązania flow po model+chat gdy brak flowId — pierwszy
-  // chat-capable model z registry (flow wybrany w trybie audio i tak
-  // niesie własne modele w blokach STT/LLM/TTS).
-  const modelId = modelOptions[0]?.id ?? 'default';
   const conv = ensureActiveConv();
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 
@@ -891,6 +890,9 @@ function sendVoiceUtterance(wav, sampleRate) {
   const flowId = (flowSelEl && flowSelEl.value)
     ? flowSelEl.value
     : (conv.audioConfig?.flowId ?? null);
+  // Model wyłącznie dla fallbacku model+chat (brak flowId) — wybrany flow
+  // niesie własne modele w blokach STT/LLM/TTS.
+  const modelId = flowId ? '' : (modelOptions[0]?.id ?? 'default');
 
   const flowForLabel = flowId ? flowCache.find((f) => String(f.id) === String(flowId)) : null;
   const modelLabel = flowForLabel?.name || (I18n.t('chat.default_flow') || 'Default Chat');
@@ -1410,8 +1412,20 @@ const ChatScreen = {
       .join('');
     if (innerSelect) {
       innerSelect.innerHTML = optionsHtml;
+      // Restore last selection — without it every page reload silently
+      // reset the selector to "Default Chat" (synthetic flow + first local
+      // model), even though the user believed their flow was still active.
+      const savedFlow = localStorage.getItem(FLOW_SELECTION_KEY) || '';
+      if (savedFlow && flowCache.some((f) => String(f.id) === savedFlow)) {
+        innerSelect.value = savedFlow;
+      }
       sel.setAttribute('value', innerSelect.value);
     }
+    sel?.addEventListener('change', () => {
+      try {
+        localStorage.setItem(FLOW_SELECTION_KEY, byId('chat-flow')?.value || '');
+      } catch { /* quota — selection just won't survive reload */ }
+    });
 
     renderConvList();
     updateHeaderTitle();
