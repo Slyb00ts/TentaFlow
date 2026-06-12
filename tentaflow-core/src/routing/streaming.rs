@@ -72,24 +72,22 @@ fn envelope_stream_to_chunk_stream(
         });
         let id_for_map = id;
         let model_for_map = model;
-        let mapped = stream.map(move |item| match item {
-            Ok(EnvelopeDelta::Llm(c)) => Ok(make_chunk(&id_for_map, created, &model_for_map, c)),
-            // Etap 3c: chat streaming bridge nigdy nie powinno dostać
-            // Audio delta (audio leci przez /v1/audio/speech/stream
-            // endpoint, NIE chat stream). Defensywnie mapujemy na error.
-            Ok(EnvelopeDelta::Audio(_)) => Err(crate::error::CoreError::InternalError {
-                message: format!(
-                    "chat stream received Audio delta — flow misconfig (model='{}')",
-                    model_for_map
-                ),
-                source: None,
-            }
-            .into()),
-            Err(e) => Err(crate::error::CoreError::InternalError {
-                message: format!("flow stream error: {e}"),
-                source: None,
-            }
-            .into()),
+        let mapped = stream.filter_map(move |item| {
+            futures::future::ready(match item {
+                Ok(EnvelopeDelta::Llm(c)) => {
+                    Some(Ok(make_chunk(&id_for_map, created, &model_for_map, c)))
+                }
+                // Voice flow invoked on the text-chat surface: its TTS audio
+                // deltas are meaningless here — drop them and keep the text
+                // stream alive instead of aborting mid-reply. Audio surfaces
+                // (FlowInvoke / /v1/audio) consume the same flow's audio.
+                Ok(EnvelopeDelta::Audio(_)) => None,
+                Err(e) => Some(Err(crate::error::CoreError::InternalError {
+                    message: format!("flow stream error: {e}"),
+                    source: None,
+                }
+                .into())),
+            })
         });
         return Box::pin(mapped);
     }
@@ -112,51 +110,49 @@ fn envelope_stream_to_chunk_stream(
                     id,
                     created,
                     model,
-                } => match stream.next().await {
-                    Some(Ok(EnvelopeDelta::Llm(c))) => {
-                        let chunk = make_chunk(&id, created, &model, c);
-                        Some((
-                            Ok(chunk),
-                            SplitState::Producing {
-                                stream,
-                                outcome,
-                                id,
-                                created,
-                                model,
-                            },
-                        ))
+                } => loop {
+                    match stream.next().await {
+                        Some(Ok(EnvelopeDelta::Llm(c))) => {
+                            let chunk = make_chunk(&id, created, &model, c);
+                            break Some((
+                                Ok(chunk),
+                                SplitState::Producing {
+                                    stream,
+                                    outcome,
+                                    id,
+                                    created,
+                                    model,
+                                },
+                            ));
+                        }
+                        // Voice flow on the text-chat surface — TTS audio
+                        // deltas are dropped, the text stream continues.
+                        Some(Ok(EnvelopeDelta::Audio(_))) => continue,
+                        Some(Err(e)) => {
+                            break Some((
+                                Err(crate::error::CoreError::InternalError {
+                                    message: format!("flow stream error: {e}"),
+                                    source: None,
+                                }
+                                .into()),
+                                SplitState::Done,
+                            ));
+                        }
+                        None => {
+                            break match outcome.await {
+                                Ok(o) => {
+                                    let tail = build_flow_tail_chunk(&o, &id, created, &model);
+                                    Some((Ok(tail), SplitState::Done))
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "flow finalizer dropped without outcome — no usage tail"
+                                    );
+                                    None
+                                }
+                            };
+                        }
                     }
-                    Some(Ok(EnvelopeDelta::Audio(_))) => Some((
-                        Err(crate::error::CoreError::InternalError {
-                            message: format!(
-                                "chat stream received Audio delta — flow misconfig (model='{}')",
-                                model
-                            ),
-                            source: None,
-                        }
-                        .into()),
-                        SplitState::Done,
-                    )),
-                    Some(Err(e)) => Some((
-                        Err(crate::error::CoreError::InternalError {
-                            message: format!("flow stream error: {e}"),
-                            source: None,
-                        }
-                        .into()),
-                        SplitState::Done,
-                    )),
-                    None => match outcome.await {
-                        Ok(o) => {
-                            let tail = build_flow_tail_chunk(&o, &id, created, &model);
-                            Some((Ok(tail), SplitState::Done))
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "flow finalizer dropped without outcome — no usage tail"
-                            );
-                            None
-                        }
-                    },
                 },
                 SplitState::Done => None,
             }

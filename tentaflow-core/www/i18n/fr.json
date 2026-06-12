@@ -2212,6 +2212,7 @@
     "attach_unavailable": "Pièces jointes bientôt disponibles",
     "empty_response": "(réponse vide)",
     "default_flow": "Chat par défaut",
+    "synthetic_flow": "Sans flow (modèle brut)",
     "you": "Vous",
     "assistant": "Assistant",
     "connected": "Connecté",

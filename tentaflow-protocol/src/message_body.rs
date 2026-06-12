@@ -836,6 +836,10 @@ pub struct FlowSummary {
     pub created_at_epoch: u64,
     pub updated_at_epoch: u64,
     pub enabled: bool,
+    /// `flows.is_default` — the chat UI preselects this flow on first load
+    /// instead of the synthetic no-flow chat.
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]

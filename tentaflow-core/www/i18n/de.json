@@ -2212,6 +2212,7 @@
     "attach_unavailable": "Anhänge demnächst verfügbar",
     "empty_response": "(leere Antwort)",
     "default_flow": "Standard-Chat",
+    "synthetic_flow": "Ohne Flow (rohes Modell)",
     "you": "Du",
     "assistant": "Assistent",
     "connected": "Verbunden",
