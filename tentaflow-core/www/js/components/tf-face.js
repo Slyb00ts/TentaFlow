@@ -1032,6 +1032,9 @@ class TfFace extends HTMLElement {
 
     const mainW = this._canvas.width;
     const mainH = this._canvas.height;
+    // Scale stroke width with rendered face size (CSS px): faces >= 560px keep
+    // full thickness, smaller embedded faces thin down with a 0.5 floor.
+    const sizeK = Math.min(1, Math.max(0.5, (Math.min(mainW, mainH) / dpr) / 560));
     const glowW = Math.max(1, Math.floor(mainW / dpr));
     const glowH = Math.max(1, Math.floor(mainH / dpr));
     if (this._glowCanvas.width !== glowW || this._glowCanvas.height !== glowH) {
@@ -1049,7 +1052,7 @@ class TfFace extends HTMLElement {
       const wB = (key >> 5) & 0xf;
       const al = aB / 19;
       const dT = wB / 9;
-      gc.lineWidth = dpr * (1.4 + dT * 0.5);
+      gc.lineWidth = dpr * (1.4 + dT * 0.5) * sizeK;
       gc.strokeStyle = `rgba(${tint.r},${tint.g},${tint.b},${al.toFixed(3)})`;
       gc.beginPath();
       for (let i = 0; i < arr.length; i++) {
@@ -1068,7 +1071,7 @@ class TfFace extends HTMLElement {
       const wB = (key >> 5) & 0xf;
       const al = aB / 19;
       const dT = wB / 9;
-      ctx.lineWidth = dpr * (1.4 + dT * 0.5);
+      ctx.lineWidth = dpr * (1.4 + dT * 0.5) * sizeK;
       ctx.strokeStyle = `rgba(${tint.r},${tint.g},${tint.b},${al.toFixed(3)})`;
       ctx.beginPath();
       for (let i = 0; i < arr.length; i++) {
