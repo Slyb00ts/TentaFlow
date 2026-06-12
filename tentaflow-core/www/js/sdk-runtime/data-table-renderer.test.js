@@ -497,6 +497,44 @@ test('Table row actions builder throws when row misses row_key_field', () => {
   assertThrows(() => tfTable.rowActions({ name: 'no id here' }, 0));
 });
 
+test('Table column id shadowing row_key_field keeps original key in events', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'real-1', display_id: 'PRETTY-1' }] },
+      { path: PATH('sel'), value: [] },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  // Column id equals row_key_field but reads a DIFFERENT field — the
+  // flattened cell value must not clobber the row identifier.
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id', field: 'display_id' })],
+    selectMode: 'multi',
+    selectedIdsBind: { kind: 'bound', path: PATH('sel') },
+  })));
+  const sr = mount(el);
+  assertEq(sr.querySelector('tbody td').textContent, 'PRETTY-1');
+  let clicked = null;
+  let selected = null;
+  el.addEventListener('row_click', (e) => { clicked = e.detail; });
+  el.addEventListener('selection_change', (e) => { selected = e.detail; });
+  sr.querySelector('tbody tr').click();
+  // Events carry the ORIGINAL row key, not the formatted display value.
+  assertEq(clicked, { row_id: 'real-1' });
+  assertEq(selected, { selected_ids: ['real-1'], mode: 'multi', changed_row_id: 'real-1' });
+});
+
+test('Table reserved __tfRowKey column id throws', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: '__tfRowKey' })],
+  }))));
+});
+
 test('Table sticky_columns > columns.length throws', () => {
   setup();
   const engine = makeEngine();
@@ -772,7 +810,8 @@ test('Table row_actions builder renderuje tf-menu z pozycjami', () => {
     ],
   })));
   const tfTable = el.querySelector('tf-table');
-  const menuEl = tfTable.rowActions({ camera_id: 'cam-1', name: 'A' }, 0);
+  // tf-table calls the builder with its own (transformed) rows.
+  const menuEl = tfTable.rowActions(tfTable.rows[0], 0);
   const items = menuEl.querySelectorAll('tf-menu-item');
   assertEq(items.length, 2);
   assertEq(items[0].getAttribute('action'), 'act-edit');
@@ -799,7 +838,7 @@ test('Table row_action klik niesie row_id i klucz wiersza do backend params', ()
     })],
   })));
   const tfTable = el.querySelector('tf-table');
-  const menuEl = tfTable.rowActions({ camera_id: 'cam-42', name: 'A' }, 0);
+  const menuEl = tfTable.rowActions(tfTable.rows[0], 0);
   // tf-menu zamyka się we własnym listenerze na zbubblowanym tf-menu-select,
   // więc listener pozycji nie może zatrzymać propagacji.
   let reachedMenu = 0;

@@ -32,6 +32,11 @@ const VALUE_FORMAT_KINDS = new Set([
   'date', 'time', 'datetime', 'relative', 'plain',
 ]);
 const ID_RE = /^[a-z0-9_-]{1,64}$/;
+// Reserved flattened-row property carrying the ORIGINAL row key. transformRows
+// writes formatted cell values under column ids, so a column whose id equals
+// row_key_field would clobber row[rowKeyField] with a display value — every
+// row-key consumer reads this property instead.
+const ROW_KEY_PROP = '__tfRowKey';
 const TEMPLATE_ID_RE = /^[a-z0-9_-]{1,64}$/;
 const EMPTY_STATE_TAG = 0x0003;
 const BUTTON_TAG = 0x0401;
@@ -362,6 +367,9 @@ function renderTable(component, ctx) {
   })();
   const colIds = new Set();
   for (const col of columns) {
+    // ID_RE already rejects this name (uppercase letters), but the reserved
+    // row-key property must never be writable via a column id — defensive.
+    if (col.id === ROW_KEY_PROP) throw new TypeError(`Table.columns: id '${ROW_KEY_PROP}' is reserved`);
     if (colIds.has(col.id)) throw new TypeError(`Table.columns: duplicate id '${col.id}'`);
     colIds.add(col.id);
   }
@@ -499,13 +507,12 @@ function renderTable(component, ctx) {
   };
   ctx.registerCleanup(runRebuildCleanups);
 
+  // Rows reaching consumers are transformRows output, so the raw key lives
+  // under ROW_KEY_PROP (row[rowKeyField] may hold a formatted display value).
   const extractRowId = (row) => {
-    if (row == null || typeof row !== 'object') {
-      throw new TypeError(`Table.row missing row_key_field '${rowKeyField}'`);
-    }
-    const id = row[rowKeyField];
+    const id = row != null && typeof row === 'object' ? row[ROW_KEY_PROP] : undefined;
     if (typeof id !== 'string') {
-      throw new TypeError(`Table.row.${rowKeyField} must be string, got ${typeof id}`);
+      throw new TypeError(`Table.row missing row_key_field '${rowKeyField}'`);
     }
     return id;
   };
@@ -619,6 +626,9 @@ function renderTable(component, ctx) {
   const transformRows = (rows) => {
     return rows.map((row) => {
       const flat = { ...row };
+      // Preserve the raw row key BEFORE the column loop; the loop can never
+      // overwrite it because ROW_KEY_PROP is rejected as a column id.
+      flat[ROW_KEY_PROP] = row != null && typeof row === 'object' ? row[rowKeyField] : undefined;
       // Formatted cell values live under the column id (the tf-column key).
       for (const col of columns) {
         if (col.hidden_by_default) continue;
@@ -751,7 +761,7 @@ function renderTable(component, ctx) {
   const onRowClick = (e) => {
     const { row, index } = e.detail || {};
     if (!row) return;
-    const rowId = row[rowKeyField] || `row-${index}`;
+    const rowId = typeof row[ROW_KEY_PROP] === 'string' ? row[ROW_KEY_PROP] : `row-${index}`;
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('row_click', {
         bubbles: false,
