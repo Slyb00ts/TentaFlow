@@ -46,41 +46,29 @@ const EDGES = (() => {
   return result;
 })();
 
-// Perspective rewarp: the mesh was reconstructed from 28mm full-frame photos
-// shot at close range, which bakes wide-angle close-up distortion into the
-// geometry — vertices near the camera (nose, +z) are laterally inflated and
-// far ones (cheek outline, ears, -z) compressed. s(z) undoes the source
-// projection and reapplies a longer-distance (50mm-equivalent) one, scaling
-// only x/y per vertex; z stays untouched. s(0) = 1 at the head pivot.
-const PERSPECTIVE_D_SRC = 3.4;  // 28mm FF headshot ≈ 0.40 m ≈ 3.4 head-units (1 unit ≈ 0.117 m)
-const PERSPECTIVE_D_DST = 6.1;  // 50mm FF same framing ≈ 0.71 m
-// Display camera matches the 50mm target distance so the on-screen projection
-// doesn't reintroduce wide-angle distortion; size at the z=0 plane is unchanged
-// because scalePersp compensates.
-const VIEW_CAMERA_DISTANCE = PERSPECTIVE_D_DST;
-const FACE_WIDTH_SCALE = 0.78; // restores the original on-screen W/H aspect (0.652) after the 28mm->50mm rewarp + flatter display camera; x only, height untouched
+// Flat "50mm-like" display camera. The old 1.8 projected nearby vertices
+// (nose, +z) with a much larger perspective factor than far ones, exaggerating
+// nose width ~2.2x vs the cheeks; 6.1 brings that down to ~1.2x.
+const VIEW_CAMERA_DISTANCE = 6.1;
+// Uniform x-only squeeze restoring the original on-screen W/H aspect (0.652)
+// under the flat camera; a single affine factor, so it does not distort the
+// face's internal feature proportions.
+const FACE_WIDTH_SCALE = 0.849;
 
-function perspectiveScale(z) {
-  return ((PERSPECTIVE_D_SRC - z) / PERSPECTIVE_D_SRC)
-    * (PERSPECTIVE_D_DST / (PERSPECTIVE_D_DST - z));
-}
-
-// Base mesh rewarped to 50mm perspective. Every renderer path uses this; raw
-// BASE_POSITIONS only feed the warp itself and the capture-space rigid fit.
-const WARPED_POSITIONS = (() => {
+// Base mesh with the uniform width squeeze applied. Every renderer path uses
+// this; raw BASE_POSITIONS only feed the capture-space rigid fit.
+const RENDER_POSITIONS = (() => {
   const out = new Float32Array(BASE_POSITIONS.length);
   for (let i = 0; i < NUM_VERTICES; i++) {
     const j = i * 3;
-    const z = BASE_POSITIONS[j + 2];
-    const s = perspectiveScale(z);
-    out[j] = BASE_POSITIONS[j] * s * FACE_WIDTH_SCALE;
-    out[j + 1] = BASE_POSITIONS[j + 1] * s;
-    out[j + 2] = z;
+    out[j] = BASE_POSITIONS[j] * FACE_WIDTH_SCALE;
+    out[j + 1] = BASE_POSITIONS[j + 1];
+    out[j + 2] = BASE_POSITIONS[j + 2];
   }
   return out;
 })();
 
-// Shading normals derived from the warped geometry so edge visibility fades
+// Shading normals derived from the render geometry so edge visibility fades
 // match what is actually drawn.
 const BASE_NORMALS = (() => {
   const nx = new Float32Array(NUM_VERTICES);
@@ -89,18 +77,18 @@ const BASE_NORMALS = (() => {
   let cx = 0, cy = 0, cz = 0;
   for (let i = 0; i < NUM_VERTICES; i++) {
     const j = i * 3;
-    cx += WARPED_POSITIONS[j];
-    cy += WARPED_POSITIONS[j + 1];
-    cz += WARPED_POSITIONS[j + 2];
+    cx += RENDER_POSITIONS[j];
+    cy += RENDER_POSITIONS[j + 1];
+    cz += RENDER_POSITIONS[j + 2];
   }
   cx /= NUM_VERTICES;
   cy /= NUM_VERTICES;
   cz /= NUM_VERTICES;
   for (let i = 0; i < NUM_VERTICES; i++) {
     const j = i * 3;
-    const dx = WARPED_POSITIONS[j] - cx;
-    const dy = WARPED_POSITIONS[j + 1] - cy;
-    const dz = WARPED_POSITIONS[j + 2] - cz;
+    const dx = RENDER_POSITIONS[j] - cx;
+    const dy = RENDER_POSITIONS[j + 1] - cy;
+    const dz = RENDER_POSITIONS[j + 2] - cz;
     const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (len > 1e-6) {
       nx[i] = dx / len;
@@ -286,28 +274,20 @@ export function removeRigidMotion(basePositions, delta, numVertices) {
 // Rigid-motion-free blendshape deltas; the renderer must only ever use these
 // (never raw BLENDSHAPE_DELTAS) so animating a weight deforms the face
 // locally instead of rocking the whole head. The rigid fit runs in capture
-// space (against raw BASE_POSITIONS), then each cleaned delta is rewarped so
-// it stays consistent with WARPED_POSITIONS:
-// final_i = W(base_i + clean_i) - W(base_i), with W using the deformed
-// vertex's own z (base_z + delta_z).
+// space (against raw BASE_POSITIONS); since the render transform is linear
+// (x scaled by FACE_WIDTH_SCALE), each delta only needs its x component
+// scaled by the same factor to stay consistent with RENDER_POSITIONS.
 const CLEAN_DELTAS = (() => {
-  const warpDelta = (delta) => {
-    const out = new Float32Array(delta.length);
-    for (let i = 0; i < NUM_VERTICES; i++) {
-      const j = i * 3;
-      const dz = delta[j + 2];
-      const s = perspectiveScale(BASE_POSITIONS[j + 2] + dz);
-      out[j] = (BASE_POSITIONS[j] + delta[j]) * s * FACE_WIDTH_SCALE - WARPED_POSITIONS[j];
-      out[j + 1] = (BASE_POSITIONS[j + 1] + delta[j + 1]) * s - WARPED_POSITIONS[j + 1];
-      out[j + 2] = dz;
-    }
+  const scaleDelta = (delta) => {
+    const out = Float32Array.from(delta);
+    for (let j = 0; j < out.length; j += 3) out[j] *= FACE_WIDTH_SCALE;
     return out;
   };
   return BLENDSHAPE_DELTAS.map((delta, s) => {
     const cleaned = removeRigidMotion(BASE_POSITIONS, delta, NUM_VERTICES);
-    if (cleaned) return warpDelta(cleaned);
+    if (cleaned) return scaleDelta(cleaned);
     console.warn(`tf-face: rigid-motion removal failed for blendshape ${s}, keeping raw delta`);
-    return warpDelta(delta);
+    return scaleDelta(delta);
   });
 })();
 
@@ -878,7 +858,7 @@ class TfFace extends HTMLElement {
 
   _applyBlendshapes(m) {
     const dst = this._workVertices;
-    dst.set(WARPED_POSITIONS);
+    dst.set(RENDER_POSITIONS);
     const THRESHOLD = 1e-4;
 
     const apply = (bsIdx, weight, maskL, maskR) => {
