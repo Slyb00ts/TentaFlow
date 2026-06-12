@@ -3019,6 +3019,7 @@
     "attach_unavailable": "Attachments coming soon",
     "empty_response": "(empty response)",
     "default_flow": "Default Chat",
+    "synthetic_flow": "No flow (raw model)",
     "you": "You",
     "assistant": "Assistant",
     "connected": "Connected",

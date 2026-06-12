@@ -3161,6 +3161,7 @@
     "attach_unavailable": "Załączniki wkrótce",
     "empty_response": "(pusta odpowiedź)",
     "default_flow": "Domyślny czat",
+    "synthetic_flow": "Bez flow (surowy model)",
     "you": "Ty",
     "assistant": "Asystent",
     "connected": "Połączony",

@@ -1075,7 +1075,7 @@ function currentFlowSelection() {
   const sel = byId('chat-flow');
   const id = sel?.value || '';
   if (!id) {
-    return { flowId: null, label: I18n.t('chat.default_flow') || 'Default Chat' };
+    return { flowId: null, label: I18n.t('chat.synthetic_flow') || 'No flow (raw model)' };
   }
   const f = flowCache.find((f) => String(f.id) === id);
   return { flowId: id, label: f?.name || `Flow #${id}` };
@@ -1405,19 +1405,26 @@ const ChatScreen = {
     // pierwszy chat-capable model z registry (modelOptions[0]).
     const sel = byId('chat-flow');
     const innerSelect = sel?.querySelector('select');
-    const defaultFlowLabel = I18n.t('chat.default_flow') || 'Default Chat';
-    const optionsHtml = [`<option value="">${escapeHtml(defaultFlowLabel)}</option>`]
+    // The no-flow option must NOT be labelled like a flow — a user flow named
+    // "Default Chat" rendered an indistinguishable duplicate and picking the
+    // wrong one silently chatted with the first local model instead.
+    const syntheticLabel = I18n.t('chat.synthetic_flow') || 'No flow (raw model)';
+    const optionsHtml = [`<option value="">${escapeHtml(syntheticLabel)}</option>`]
       .concat(flowCache.map((f) =>
         `<option value="${escapeHtml(String(f.id))}">${escapeHtml(f.name || ('Flow #' + f.id))}</option>`))
       .join('');
     if (innerSelect) {
       innerSelect.innerHTML = optionsHtml;
-      // Restore last selection — without it every page reload silently
-      // reset the selector to "Default Chat" (synthetic flow + first local
-      // model), even though the user believed their flow was still active.
-      const savedFlow = localStorage.getItem(FLOW_SELECTION_KEY) || '';
-      if (savedFlow && flowCache.some((f) => String(f.id) === savedFlow)) {
+      // Restore last selection; on the very first load (nothing saved yet)
+      // preselect the flow marked default in the Flow Builder — chat should
+      // start on the operator's flow, not on the raw-model fallback.
+      const savedFlow = localStorage.getItem(FLOW_SELECTION_KEY);
+      if (savedFlow !== null
+          && (savedFlow === '' || flowCache.some((f) => String(f.id) === savedFlow))) {
         innerSelect.value = savedFlow;
+      } else {
+        const def = flowCache.find((f) => f.is_default || f.isDefault);
+        if (def) innerSelect.value = String(def.id);
       }
       sel.setAttribute('value', innerSelect.value);
     }
