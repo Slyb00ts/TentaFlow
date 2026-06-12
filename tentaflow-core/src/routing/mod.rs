@@ -87,10 +87,17 @@ async fn build_initial_envelope_inner(
     blobs: &dyn crate::flow_engine::blob_store::BlobStore,
 ) -> Result<(FlowEnvelope, FlowRequestMeta)> {
     let mut env = FlowEnvelope::empty();
-    env.meta.insert(
-        "model".into(),
-        serde_json::Value::String(request.model.clone()),
-    );
+    // Empty request.model stays OUT of meta: the dashboard sends no model for
+    // an explicitly selected flow, and an empty seed here would let an llm
+    // node without a pinned model silently dispatch to "" (or, historically,
+    // to whatever model the client defaulted to). Missing model must surface
+    // as the adapter's hard "llm adapter: no model" error instead.
+    if !request.model.is_empty() {
+        env.meta.insert(
+            "model".into(),
+            serde_json::Value::String(request.model.clone()),
+        );
+    }
 
     // Etap 2: request seed params trafiają do envelope.meta. LlmNodeAdapter
     // czyta je przez fallback `node.config -> envelope.meta`, więc operator
