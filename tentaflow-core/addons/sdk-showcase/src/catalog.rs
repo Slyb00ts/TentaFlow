@@ -22,6 +22,32 @@ use tentaflow_sdk_spec::protocol::value::Value;
 /// plain Text leaf instead of recursing further.
 const MAX_DEPTH: u32 = 4;
 
+/// Component tags the JS sdk-runtime has NO renderer for yet — rendering any
+/// of them throws "no renderer registered" and kills the whole slot, so the
+/// catalog skips them and shows a per-tab info line instead.
+/// MUST stay in sync with KNOWN_MISSING in
+/// tentaflow-core/www/js/sdk-runtime/component-registry-completeness.test.js
+/// and may only SHRINK (remove a tag here once its JS renderer ships).
+const RENDERER_NOT_IMPLEMENTED: &[u16] = &[
+    0x010A, // Sidebar
+    0x010B, // Tabs
+    0x0308, // TagInput
+    0x0309, // MentionInput
+    0x0601, // Canvas2D
+    0x0602, // WebGLSurface
+    0x0603, // WGPUSurface
+    0x0701, // PermissionMatrix
+    0x0702, // NetworkRuleEditor
+    0x0703, // RelationGraph
+    0x0704, // AlarmFeed
+    0x0705, // WeeklyScheduleGrid
+    0x0706, // AccessMatrix
+    0x0707, // ReqCard
+    0x0708, // DecisionRow
+    0x0709, // Inbox
+    0x070A, // RuntimeStatusGrid
+];
+
 /// Tab id → catalog section header. Returns None for non-catalog tabs.
 pub fn section_for_tab(tab: &str) -> Option<&'static str> {
     match tab {
@@ -42,8 +68,13 @@ pub fn section_for_tab(tab: &str) -> Option<&'static str> {
 pub fn section_stack(tab: &str, section_header: &str) -> Component {
     let mut ctr: u64 = 0;
     let mut children: Vec<Component> = Vec::new();
+    let mut hidden: u64 = 0;
 
     for meta in ALL_COMPONENTS.iter().filter(|m| m.section == section_header) {
+        if RENDERER_NOT_IMPLEMENTED.contains(&meta.tag) {
+            hidden += 1;
+            continue;
+        }
         ctr += 1;
         let caption = Text {
             content: BindRef::Literal(Value::Text(format!(
@@ -61,6 +92,25 @@ pub fn section_stack(tab: &str, section_header: &str) -> Component {
         .expect("Text caption encode");
         children.push(caption);
         children.push(sample_component(meta, 0, &mut ctr));
+    }
+
+    if hidden > 0 {
+        let note = Text {
+            content: BindRef::Literal(Value::Text(format!(
+                "{} component{} hidden — JS renderer not implemented yet",
+                hidden,
+                if hidden == 1 { "" } else { "s" }
+            ))),
+            style: TextStyle::Caption,
+            tone: Some(Tone::Muted),
+            align: None,
+            wrap: None,
+            max_lines: None,
+            format: None,
+        }
+        .into_component(format!("cat-{}-hidden-note", tab))
+        .expect("Text hidden-note encode");
+        children.push(note);
     }
 
     Stack {

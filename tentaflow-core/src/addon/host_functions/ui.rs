@@ -126,10 +126,10 @@ pub fn ui_render_cbor(mut caller: WasmCaller<'_, AddonState>, cbor_ptr: i32, cbo
     // Validate outbound slot/shell messages against session state.
     if let Some(registry) = crate::addon::ui_session::global_registry() {
         let user_id = caller.data().user_id.clone().unwrap_or_default();
-        tracing::info!(addon = %addon_id, user_id, tag = tag.as_u16(), "ui_render_cbor: looking up connection");
+        tracing::debug!(addon = %addon_id, user_id, tag = tag.as_u16(), "ui_render_cbor: looking up connection");
 
         if let Some(conn_id) = registry.find_connection(&addon_id, &user_id) {
-            tracing::info!(conn_id, "ui_render_cbor: found connection");
+            tracing::debug!(conn_id, "ui_render_cbor: found connection");
             let session_lock = registry.get_or_create(conn_id);
             let mut session = session_lock.lock();
 
@@ -176,7 +176,7 @@ pub fn ui_render_cbor(mut caller: WasmCaller<'_, AddonState>, cbor_ptr: i32, cbo
     // from impersonating another addon's panels.
     let cbor_bytes = rewrite_addon_id(&cbor_bytes, &addon_id).unwrap_or(cbor_bytes);
 
-    info!(
+    tracing::debug!(
         "ui_render_cbor: addon='{}', tag=0x{:04X}, bytes={}",
         addon_id,
         tag.as_u16(),
@@ -505,7 +505,7 @@ fn handle_panel_shell_registration(
     dec.u16().map_err(|e| format!("tag: {e}"))?;
 
     // Decode PanelShell body using minicbor derive (map-keyed struct).
-    tracing::info!("PanelShell: decoding body...");
+    tracing::debug!("PanelShell: decoding body...");
     let shell: tentaflow_sdk_spec::protocol::ui::panel::PanelShell =
         match minicbor::Decode::decode(&mut dec, &mut ()) {
             Ok(s) => s,
@@ -520,7 +520,7 @@ fn handle_panel_shell_registration(
     // Decode the full CBOR payload as generic Value so nested handlers inside
     // FieldMap children are visible without depending on concrete layout types.
     let actions = extract_action_ids_from_cbor_bytes(bytes);
-    tracing::info!(
+    tracing::debug!(
         actions = ?actions,
         layout_tag = shell.layout.tag,
         layout_has_handlers = shell.layout.handlers.is_some(),
