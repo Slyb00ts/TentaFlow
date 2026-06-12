@@ -1,9 +1,14 @@
 // =============================================================================
-// Plik: sdk-runtime/form-select-renderer.test.js
-// Opis: Testy Select (0x0303) — chunk 3.3c-3a.
+// File: sdk-runtime/form-select-renderer.test.js
+// Description: Tests for Select (0x0303) rendered through the <tf-select> web
+// component with native <option>/<optgroup> children. Option values are
+// serialized as "<kind>:<value>" strings; the renderer converts the component
+// change back to the SDK { value, kind } SelectValue via the __tfReemit
+// pattern (raw events are stopImmediatePropagation'd).
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-select.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -56,8 +61,14 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// tf-select consumes its light-DOM <option> children in connectedCallback,
+// so tests that touch the inner native <select> mount the element first.
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
-/// Helper: SelectOption jako FieldMap [[key, value], ...].
+/// Helper: SelectOption as FieldMap [[key, value], ...].
 function opt({ value, label, icon, disabled = false, groupId, description } = {}) {
   const f = [[0, value], [1, label], [3, disabled]];
   if (icon != null) f.push([2, icon]);
@@ -83,343 +94,185 @@ function selectFields({ path = PATH('sel'), options = [], searchable = false, cl
   }
   return f;
 }
-function keydown(el, key, mods = {}) {
-  const ev = new (globalThis.KeyboardEvent || globalThis.Event)('keydown', {
-    key, bubbles: false, cancelable: true, ...mods,
-  });
-  el.dispatchEvent(ev);
-  return ev;
+/// Helper: pick an option on the inner native <select> and fire change.
+function pick(el, serialized) {
+  const select = el.querySelector('select');
+  select.value = serialized;
+  select.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
 }
 
 // ============================================================================
-// Render + selected value
+// Render + option serialization
 // ============================================================================
 
-test('Select trigger to <div role=combobox> (NIE <button>) by uniknąć button-in-button', () => {
+test('Select renders <tf-select> with serialized option values', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A')], clearable: true,
-    3: { kind: 'literal', value: 'L' },
-  })));
-  const trigger = el.querySelector('.tf-select__trigger');
-  assertEq(trigger.tagName, 'DIV');
-  assertEq(trigger.getAttribute('role'), 'combobox');
-  assertEq(trigger.getAttribute('tabindex'), '0');
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
+    3: { kind: 'literal', value: 'Frukty' },
+  }))));
+  assertEq(el.tagName.toLowerCase(), 'tf-select');
+  assert(el.classList.contains('tf-select--size-md'));
+  const options = el.querySelectorAll('option');
+  assertEq(options.length, 2);
+  assertEq(options[0].value, 'tstr:a');
+  assertEq(options[0].textContent, 'Apple');
+  assertEq(options[1].value, 'tstr:b');
+  assertEq(options[1].textContent, 'Banana');
 });
 
-test('Select renderuje trigger combobox + placeholder gdy brak wartości', () => {
+test('Select placeholder renders disabled empty-value option first', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
-    3: { kind: 'literal', value: 'Frukty' },
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'Apple')],
+    3: { kind: 'literal', value: 'F' },
     2: { kind: 'literal', value: 'Wybierz...' },
-  })));
-  const trigger = el.querySelector('.tf-select__trigger');
-  assertEq(trigger.getAttribute('role'), 'combobox');
-  assertEq(trigger.getAttribute('aria-haspopup'), 'listbox');
-  assertEq(trigger.getAttribute('aria-expanded'), 'false');
-  const lbl = el.querySelector('.tf-select__trigger-label');
-  assertEq(lbl.textContent, 'Wybierz...');
-  assert(lbl.classList.contains('tf-select__trigger-label--placeholder'));
+  }))));
+  const first = el.querySelector('option');
+  assertEq(first.value, '');
+  assertEq(first.disabled, true);
+  assertEq(first.textContent, 'Wybierz...');
 });
 
-test('Select pokazuje label aktualnie wybranej opcji', () => {
+test('Select syncs value attr from store (selected option)', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('sel'), value: 'b' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
     options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'F' },
-  })));
-  assertEq(el.querySelector('.tf-select__trigger-label').textContent, 'Banana');
+  }))));
+  assertEq(el.getAttribute('value'), 'tstr:b');
+  assertEq(el.querySelector('select').value, 'tstr:b');
 });
 
-test('Select reactive label po store push', () => {
+test('Select reactive value sync after store push', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('sel'), value: 'a' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
     options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'F' },
-  })));
-  assertEq(el.querySelector('.tf-select__trigger-label').textContent, 'Apple');
+  }))));
+  assertEq(el.getAttribute('value'), 'tstr:a');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('sel'), op: { kind: 'set', value: 'b' } }],
   });
-  assertEq(el.querySelector('.tf-select__trigger-label').textContent, 'Banana');
+  assertEq(el.getAttribute('value'), 'tstr:b');
+  assertEq(el.querySelector('select').value, 'tstr:b');
 });
 
-// ============================================================================
-// Open/close popover
-// ============================================================================
-
-test('Select trigger click otwiera popover + aria-expanded=true', () => {
+test('Select store value not in options resolves to empty value', () => {
   setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-select__trigger');
-  const popover = el.querySelector('.tf-select__popover');
-  assertEq(popover.hidden, true);
-  trigger.click();
-  assertEq(popover.hidden, false);
-  assertEq(trigger.getAttribute('aria-expanded'), 'true');
-});
-
-test('Select Escape zamyka popover + aria-expanded=false', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-select__trigger');
-  trigger.click();
-  assertEq(el.querySelector('.tf-select__popover').hidden, false);
-  keydown(trigger, 'Escape');
-  assertEq(el.querySelector('.tf-select__popover').hidden, true);
-  assertEq(trigger.getAttribute('aria-expanded'), 'false');
-});
-
-test('Select outside click zamyka popover', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  el.querySelector('.tf-select__trigger').click();
-  assertEq(el.querySelector('.tf-select__popover').hidden, false);
-  // Symulujemy click na document poza wrapper'em.
-  const outside = document.createElement('div');
-  document.body.appendChild(outside);
-  outside.click();
-  assertEq(el.querySelector('.tf-select__popover').hidden, true);
-});
-
-// ============================================================================
-// Keyboard nav + select
-// ============================================================================
-
-test('Select ArrowDown po openie ustawia aria-activedescendant na pierwszą opcję', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-select__trigger');
-  keydown(trigger, 'ArrowDown');  // opens
-  // Po open, aria-activedescendant wskazuje na pierwszą opcję.
-  const first = el.querySelector('.tf-select__option');
-  assertEq(trigger.getAttribute('aria-activedescendant'), first.id);
-});
-
-test('Select ArrowDown przechodzi do kolejnej opcji', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B'), tstrOpt('c', 'C')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-select__trigger');
-  trigger.click();  // open + active=0
-  keydown(trigger, 'ArrowDown');
-  const second = el.querySelectorAll('.tf-select__option')[1];
-  assertEq(trigger.getAttribute('aria-activedescendant'), second.id);
-});
-
-test('Select ArrowUp wraps z pierwszej na ostatnią', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-select__trigger');
-  trigger.click();  // active=0
-  keydown(trigger, 'ArrowUp');  // wrap → idx=1
-  const last = el.querySelectorAll('.tf-select__option')[1];
-  assertEq(trigger.getAttribute('aria-activedescendant'), last.id);
-});
-
-test('Select Home/End jumpują na pierwszą/ostatnią opcję', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B'), tstrOpt('c', 'C')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-select__trigger');
-  trigger.click();
-  keydown(trigger, 'End');
-  const opts = el.querySelectorAll('.tf-select__option');
-  assertEq(trigger.getAttribute('aria-activedescendant'), opts[2].id);
-  keydown(trigger, 'Home');
-  assertEq(trigger.getAttribute('aria-activedescendant'), opts[0].id);
-});
-
-test('Select Enter commituje aktywną opcję + emituje change z SelectValue', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
-  const trigger = el.querySelector('.tf-select__trigger');
-  trigger.click();  // active=0
-  keydown(trigger, 'ArrowDown');  // active=1
-  keydown(trigger, 'Enter');
-  assertEq(got, { value: 'b', kind: 'tstr' });
-  // Popover zamknięty po commit.
-  assertEq(el.querySelector('.tf-select__popover').hidden, true);
-});
-
-test('Select mousedown na opcji commituje wartość', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-select__trigger').click();
-  const second = el.querySelectorAll('.tf-select__option')[1];
-  second.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true }));
-  assertEq(got, { value: 'b', kind: 'tstr' });
-});
-
-test('Select disabled opcja nie jest commitowalna', () => {
-  setup();
-  const engine = makeEngine();
-  const optDisabled = [
-    [0, { kind: 'tstr', value: 'x' }],
-    [1, { kind: 'literal', value: 'X' }],
-    [3, true],
-  ];
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [optDisabled, tstrOpt('b', 'B')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
-  const trigger = el.querySelector('.tf-select__trigger');
-  trigger.click();
-  // Active descendant powinno być na pierwszej widocznej NIE-disabled opcji.
-  const opts = el.querySelectorAll('.tf-select__option');
-  assertEq(trigger.getAttribute('aria-activedescendant'), opts[1].id);
-  keydown(trigger, 'Enter');
-  assertEq(got, { value: 'b', kind: 'tstr' });
-});
-
-// ============================================================================
-// Searchable filter
-// ============================================================================
-
-test('Select searchable=true renderuje search input w popover', () => {
-  setup();
-  const engine = makeEngine();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('sel'), value: 'zzz' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
   const el = engine.render(comp(SELECT_TAG, selectFields({
     options: [tstrOpt('a', 'Apple')],
-    searchable: true,
-    3: { kind: 'literal', value: 'L' },
+    3: { kind: 'literal', value: 'F' },
   })));
-  assert(el.querySelector('.tf-select__search') != null);
+  assertEq(el.getAttribute('value'), '');
 });
 
-test('Select search filter ukrywa nie-pasujące opcje', () => {
+// ============================================================================
+// Change re-emission (SDK SelectValue payload)
+// ============================================================================
+
+test('Select option pick re-emits change with { value, kind } SelectValue', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana'), tstrOpt('c', 'Cherry')],
-    searchable: true,
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  el.querySelector('.tf-select__trigger').click();
-  const search = el.querySelector('.tf-select__search');
-  search.value = 'an';
-  search.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  const opts = el.querySelectorAll('.tf-select__option');
-  assertEq(opts[0].hidden, true);   // Apple
-  assertEq(opts[1].hidden, false);  // Banana
-  assertEq(opts[2].hidden, true);   // Cherry
+  }))));
+  const got = [];
+  el.addEventListener('change', (e) => got.push(e.detail));
+  pick(el, 'tstr:b');
+  // Exactly one SDK event — the raw serialized-string event must be blocked.
+  assertEq(got, [{ value: 'b', kind: 'tstr' }]);
 });
 
-// ============================================================================
-// Clearable
-// ============================================================================
-
-test('Select clearable=true z wybraną wartością renderuje clear button', () => {
+test('Select u32 option emits numeric value with kind=u32', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({ entries: [{ path: PATH('sel'), value: 'a' }], state_revision: 0, truncated: false });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A')],
-    clearable: true,
+  const engine = makeEngine();
+  const u32opt = opt({
+    value: { kind: 'u32', value: 5 },
+    label: { kind: 'literal', value: 'Pięć' },
+  });
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [u32opt],
     3: { kind: 'literal', value: 'L' },
-  })));
-  const clear = el.querySelector('.tf-select__clear');
-  assertEq(clear.hidden, false);
-});
-
-test('Select clear button emituje change z null value', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({ entries: [{ path: PATH('sel'), value: 'a' }], state_revision: 0, truncated: false });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A')],
-    clearable: true,
-    3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
+  assertEq(el.querySelector('option').value, 'u32:5');
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-select__clear').click();
-  assertEq(got, { value: null, kind: null });
+  pick(el, 'u32:5');
+  assertEq(got, { value: 5, kind: 'u32' });
 });
 
-test('Select clearable=false NIE renderuje clear button', () => {
+test('Select bool option emits boolean value with kind=bool', () => {
+  setup();
+  const engine = makeEngine();
+  const boolOpt = opt({
+    value: { kind: 'bool', value: true },
+    label: { kind: 'literal', value: 'Tak' },
+  });
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [boolOpt],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  let got = null;
+  el.addEventListener('change', (e) => { got = e.detail; });
+  pick(el, 'bool:true');
+  assertEq(got, { value: true, kind: 'bool' });
+});
+
+test('Select empty selection with clearable=false emits nothing', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('sel'), value: 'a' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
     options: [tstrOpt('a', 'A')],
     clearable: false,
+    2: { kind: 'literal', value: 'Wybierz...' },
     3: { kind: 'literal', value: 'L' },
-  })));
-  assertEq(el.querySelector('.tf-select__clear'), null);
+  }))));
+  let got = null;
+  el.addEventListener('change', (e) => { got = e.detail; });
+  pick(el, '');
+  assertEq(got, null);
+});
+
+test('Select empty selection with clearable=true emits { value: null, kind: null }', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('sel'), value: 'a' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'A')],
+    clearable: true,
+    2: { kind: 'literal', value: 'Wybierz...' },
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  let got = null;
+  el.addEventListener('change', (e) => { got = e.detail; });
+  pick(el, '');
+  assertEq(got, { value: null, kind: null });
 });
 
 // ============================================================================
 // Groups
 // ============================================================================
 
-test('Select groups renderuje group headers + zgrupowane opcje', () => {
+test('Select groups render <optgroup> with labels + grouped options', () => {
   setup();
   const engine = makeEngine();
   const grp1 = [[0, 'fr'], [1, { kind: 'literal', value: 'Owoce' }]];
@@ -439,13 +292,24 @@ test('Select groups renderuje group headers + zgrupowane opcje', () => {
     9: [grp1, grp2],
     3: { kind: 'literal', value: 'L' },
   })));
-  const headers = el.querySelectorAll('.tf-select__group-header');
-  assertEq(headers.length, 2);
-  assertEq(headers[0].textContent, 'Owoce');
-  assertEq(headers[1].textContent, 'Warzywa');
+  // Renderer output contract (pre-mount light DOM): optgroup per group with
+  // the resolved label and the assigned options inside.
+  const groups = el.querySelectorAll('optgroup');
+  assertEq(groups.length, 2);
+  assertEq(groups[0].getAttribute('label'), 'Owoce');
+  assertEq(groups[1].getAttribute('label'), 'Warzywa');
+  assertEq(groups[0].querySelector('option').value, 'tstr:a');
+  assertEq(groups[1].querySelector('option').value, 'tstr:c');
+  // After mount tf-select harvests the options into its native <select>;
+  // both grouped options must survive and stay selectable.
+  mount(el);
+  const opts = el.querySelectorAll('select option');
+  assertEq(opts.length, 2);
+  assertEq(opts[0].value, 'tstr:a');
+  assertEq(opts[1].value, 'tstr:c');
 });
 
-test('Select option z nieznanym group_id throws', () => {
+test('Select option with unknown group_id throws', () => {
   setup();
   const engine = makeEngine();
   const grp = [[0, 'fr'], [1, { kind: 'literal', value: 'Owoce' }]];
@@ -460,11 +324,24 @@ test('Select option z nieznanym group_id throws', () => {
   }))));
 });
 
+test('Select group with missing id/label throws', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [], 9: [[[1, { kind: 'literal', value: 'X' }]]],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [], 9: [[[0, 'gid']]],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+});
+
 // ============================================================================
 // Disabled
 // ============================================================================
 
-test('Select disabled BindRef blokuje open + ustawia aria-disabled', () => {
+test('Select disabled BindRef sets disabled attr + disables inner select', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -472,70 +349,23 @@ test('Select disabled BindRef blokuje open + ustawia aria-disabled', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
     options: [tstrOpt('a', 'A')],
     3: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
-  const trigger = el.querySelector('.tf-select__trigger');
-  assertEq(trigger.getAttribute('aria-disabled'), 'true');
-  trigger.click();
-  assertEq(el.querySelector('.tf-select__popover').hidden, true);
-});
-
-test('Select option z IconRef::Named renderuje SVG icon przez shared renderer', () => {
-  setup();
-  const engine = makeEngine();
-  const withIcon = [
-    [0, { kind: 'tstr', value: 'a' }],
-    [1, { kind: 'literal', value: 'Apple' }],
-    [2, { kind: 'named', name: 'check' }],
-    [3, false],
-  ];
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [withIcon],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  const svg = el.querySelector('.tf-select__option svg.tf-icon');
-  assert(svg != null, 'expected SVG rendered by icon-renderer for IconRef::Named');
-  assert(svg.classList.contains('tf-icon--name-check'));
-});
-
-test('Select option z IconRef o złym shape (brak kind) throws', () => {
-  setup();
-  const engine = makeEngine();
-  const badIcon = [
-    [0, { kind: 'tstr', value: 'a' }],
-    [1, { kind: 'literal', value: 'A' }],
-    [2, { name: 'check' }],  // brakuje `kind: 'named'`
-    [3, false],
-  ];
-  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
-    options: [badIcon],
-    3: { kind: 'literal', value: 'L' },
   }))));
+  assertEq(el.hasAttribute('disabled'), true);
+  assertEq(el.querySelector('select').disabled, true);
+  // Flip off — re-enabled reactively.
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('lock'), op: { kind: 'set', value: false } }],
+  });
+  assertEq(el.hasAttribute('disabled'), false);
+  assertEq(el.querySelector('select').disabled, false);
 });
 
-test('Select group ma role=group + aria-labelledby na samym group elemencie', () => {
-  setup();
-  const engine = makeEngine();
-  const grp = [[0, 'fr'], [1, { kind: 'literal', value: 'Owoce' }]];
-  const apple = [
-    [0, { kind: 'tstr', value: 'a' }],
-    [1, { kind: 'literal', value: 'A' }],
-    [3, false], [4, 'fr'],
-  ];
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [apple], 9: [grp],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  const group = el.querySelector('.tf-select__group');
-  assertEq(group.getAttribute('role'), 'group');
-  const header = el.querySelector('.tf-select__group-header');
-  assertEq(group.getAttribute('aria-labelledby'), header.id);
-});
-
-test('Select disabled + clearable wyłącza nested clear button', () => {
+test('Select disabled suppresses change re-emission', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -543,56 +373,44 @@ test('Select disabled + clearable wyłącza nested clear button', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A')], clearable: true,
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
     3: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
-  const trigger = el.querySelector('.tf-select__trigger');
-  const clear = el.querySelector('.tf-select__clear');
-  assert(!trigger.hasAttribute('tabindex'), 'trigger powinno stracić tabindex w disabled');
-  assertEq(clear.disabled, true);
-  // Flip OFF — clear znowu enabled.
-  store.applyPatch({
-    base_revision: 0, new_revision: 1,
-    ops: [{ path: PATH('lock'), op: { kind: 'set', value: false } }],
-  });
-  assertEq(clear.disabled, false);
+  }))));
+  let got = null;
+  el.addEventListener('change', (e) => { got = e.detail; });
+  pick(el, 'tstr:b');
+  assertEq(got, null);
 });
 
-test('Select disabled flip mid-open blokuje commit click', () => {
+// ============================================================================
+// Label / a11y
+// ============================================================================
+
+test('Select label sets label + aria-label attrs (reactive)', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: '' }, { path: PATH('lock'), value: false }],
+    entries: [{ path: PATH('lbl'), value: 'Frukty' }],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(SELECT_TAG, selectFields({
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
     options: [tstrOpt('a', 'A')],
-    3: { kind: 'literal', value: 'L' },
-    7: { kind: 'bound', path: PATH('lock') },
-  })));
-  document.body.appendChild(el);
-  let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
-  const trigger = el.querySelector('.tf-select__trigger');
-  trigger.click();  // open OK (lock=false)
-  // Teraz przerzucamy disabled na true PODCZAS open'a.
+    3: { kind: 'bound', path: PATH('lbl') },
+  }))));
+  assertEq(el.getAttribute('label'), 'Frukty');
+  assertEq(el.getAttribute('aria-label'), 'Frukty');
+  assertEq(el.querySelector('.tf-label').textContent, 'Frukty');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
-    ops: [{ path: PATH('lock'), op: { kind: 'set', value: true } }],
+    ops: [{ path: PATH('lbl'), op: { kind: 'set', value: 'Fruits' } }],
   });
-  const li = el.querySelector('.tf-select__option');
-  li.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true }));
-  assertEq(got, null);  // commit musi być zablokowane
+  assertEq(el.getAttribute('label'), 'Fruits');
 });
 
-// ============================================================================
-// A11y label fallback
-// ============================================================================
-
-test('Select bez label wymaga a11y.label + mirror na trigger aria-label', () => {
+test('Select without label mirrors a11y.label as aria-label', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -603,10 +421,11 @@ test('Select bez label wymaga a11y.label + mirror na trigger aria-label', () => 
   const el = engine.render(comp(SELECT_TAG, selectFields({
     options: [tstrOpt('a', 'A')],
   }), { a11y: { label: { kind: 'bound', path: PATH('lbl') } } }));
-  assertEq(el.querySelector('.tf-select__trigger').getAttribute('aria-label'), 'Wybierz');
+  assertEq(el.getAttribute('aria-label'), 'Wybierz');
+  assertEq(el.hasAttribute('label'), false);
 });
 
-test('Select bez label i bez a11y.label throws', () => {
+test('Select without label and without a11y.label throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
@@ -614,8 +433,120 @@ test('Select bez label i bez a11y.label throws', () => {
   }))));
 });
 
+test('Select a11y.label rejects whitespace-only initial value', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'A')],
+  }), { a11y: { label: { kind: 'literal', value: '  ' } } })));
+});
+
 // ============================================================================
-// Validation
+// SelectValue / SelectOption validation
+// ============================================================================
+
+test('Select u32 SelectValue accepts BigInt in range', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [opt({
+      value: { kind: 'u32', value: 4294967295n },
+      label: { kind: 'literal', value: 'Max' },
+    })],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assertEq(el.querySelector('option').value, 'u32:4294967295');
+});
+
+test('Select u32 SelectValue rejects out-of-range BigInt', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [opt({
+      value: { kind: 'u32', value: 4294967296n },
+      label: { kind: 'literal', value: 'X' },
+    })],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+});
+
+test('Select i32 SelectValue accepts negative BigInt and rejects overflow', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [opt({
+      value: { kind: 'i32', value: -2147483648n },
+      label: { kind: 'literal', value: 'Min' },
+    })],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assertEq(el.querySelector('option').value, 'i32:-2147483648');
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [opt({
+      value: { kind: 'i32', value: 2147483648n },
+      label: { kind: 'literal', value: 'X' },
+    })],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+});
+
+test('Select SelectValue with unknown kind throws', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [opt({
+      value: { kind: 'float', value: 1.5 },
+      label: { kind: 'literal', value: 'X' },
+    })],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+});
+
+test('Select option missing value/label throws', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [[[1, { kind: 'literal', value: 'X' }], [3, false]]],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [[[0, { kind: 'tstr', value: 'a' }], [3, false]]],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+});
+
+test('Select option with duplicate field key throws', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(SELECT_TAG, selectFields({
+    options: [[
+      [0, { kind: 'tstr', value: 'a' }],
+      [0, { kind: 'tstr', value: 'b' }],
+      [1, { kind: 'literal', value: 'X' }],
+    ]],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+});
+
+test('Select disabled option renders disabled <option>', () => {
+  setup();
+  const engine = makeEngine();
+  const disabledOpt = [
+    [0, { kind: 'tstr', value: 'x' }],
+    [1, { kind: 'literal', value: 'X' }],
+    [3, true],
+  ];
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [disabledOpt, tstrOpt('b', 'B')],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const opts = el.querySelectorAll('option');
+  assertEq(opts[0].disabled, true);
+  assertEq(opts[1].disabled, false);
+});
+
+// ============================================================================
+// Field validation
 // ============================================================================
 
 test('Select unknown field key throws', () => {
@@ -637,21 +568,31 @@ test('Select invalid size throws', () => {
   }))));
 });
 
-test('Select destroy odpina document click listener', () => {
+test('Select non-boolean searchable/clearable/virtualize throws', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(SELECT_TAG, selectFields({
-    options: [tstrOpt('a', 'A')],
+  assertThrows(() => engine.render(comp(SELECT_TAG, [
+    [0, PATH('sel')], [1, []], [4, 'yes'], [5, false], [6, false], [8, 'md'],
+    [3, { kind: 'literal', value: 'L' }],
+  ])));
+});
+
+test('Select destroy unbinds store subscription', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('sel'), value: 'a' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-select__trigger');
-  trigger.click();
+  }))));
+  assertEq(el.getAttribute('value'), 'tstr:a');
   engine.destroy(el);
-  // Po destroy outside-click nie powinien rzucić ani błędu.
-  const outside = document.createElement('div');
-  document.body.appendChild(outside);
-  outside.click();
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('sel'), op: { kind: 'set', value: 'b' } }],
+  });
+  assertEq(el.getAttribute('value'), 'tstr:a');
 });
 
 // ---- report ----

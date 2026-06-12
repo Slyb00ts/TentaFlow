@@ -4,6 +4,7 @@
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-table.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -31,6 +32,8 @@ function assertThrows(fn, m) {
 const PATH = (...segs) => segs.map((s) =>
   typeof s === 'number' ? { kind: 'index', value: s } : { kind: 'key', value: s });
 
+const BUTTON_TAG = 0x0401;
+
 function makeStore() { return new StateStore({ addon_id: 'a', panel_id: 'p', panel_epoch: 1n }); }
 function makeEngine(store) {
   return new ComponentRenderer({ store: store || makeStore(), eventDispatcher: { emit() {} }, locale: 'en-US' });
@@ -45,10 +48,23 @@ function comp(tag, fields, extra = {}) {
     test_id: extra.test_id ?? null,
   };
 }
+// tf-table adopts shadow styles at connect time (shared-styles.js): it touches
+// the bare `Document` global and fetches /css/controls.css. Bridge both so the
+// async adoption resolves instead of crashing Node with an unhandled rejection.
+globalThis.Document = window.Document;
+globalThis.fetch = async () => ({ ok: true, text: async () => '' });
+
 function setup() {
   _clearComponentRendererRegistry();
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
+}
+
+/// Mounts a rendered Table wrapper and returns its tf-table shadow root —
+/// tf-table builds thead/tbody only after connectedCallback.
+function mount(el) {
+  document.body.appendChild(el);
+  return el.querySelector('tf-table').shadowRoot;
 }
 
 /// Helper: TableColumn FieldMap.
@@ -90,7 +106,7 @@ function tableFields({
 // Render basics
 // ============================================================================
 
-test('Table renderuje <table> z thead + tbody', () => {
+test('Table renders tf-table + tf-column with shadow thead/tbody', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -101,12 +117,18 @@ test('Table renderuje <table> z thead + tbody', () => {
   const el = engine.render(comp(TABLE_TAG, tableFields({
     columns: [col({ id: 'name', header: 'Name', field: 'name' })],
   })));
-  assertEq(el.querySelector('table').tagName, 'TABLE');
-  assertEq(el.querySelectorAll('thead th').length, 1);
-  assertEq(el.querySelectorAll('tbody tr').length, 2);
+  const tfCol = el.querySelector('tf-column');
+  assertEq(tfCol.getAttribute('key'), 'name');
+  assertEq(tfCol.getAttribute('label'), 'Name');
+  const sr = mount(el);
+  assertEq(sr.querySelectorAll('thead th').length, 1);
+  assertEq(sr.querySelector('thead th').textContent, 'Name');
+  assertEq(sr.querySelectorAll('tbody tr').length, 2);
+  assert(el.classList.contains('tf-table--variant-default'));
+  assert(el.classList.contains('tf-table--density-default'));
 });
 
-test('Table cell content z field_path lookup', () => {
+test('Table cell content resolved from nested field_path', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -117,10 +139,11 @@ test('Table cell content z field_path lookup', () => {
   const c = col({ id: 'name', header: 'Name' });
   c[2] = [2, PATH('user', 'name')];  // nested
   const el = engine.render(comp(TABLE_TAG, tableFields({ columns: [c] })));
-  assertEq(el.querySelector('tbody td').textContent, 'Ala');
+  const sr = mount(el);
+  assertEq(sr.querySelector('tbody td').textContent, 'Ala');
 });
 
-test('Table XSS-safe: HTML w cell przez textContent', () => {
+test('Table XSS-safe: HTML in cell goes through textContent', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -131,11 +154,12 @@ test('Table XSS-safe: HTML w cell przez textContent', () => {
   const el = engine.render(comp(TABLE_TAG, tableFields({
     columns: [col({ id: 'name', field: 'name' })],
   })));
-  assertEq(el.querySelector('script'), null);
-  assert(el.querySelector('tbody td').textContent.includes('<script>'));
+  const sr = mount(el);
+  assertEq(sr.querySelector('script'), null);
+  assert(sr.querySelector('tbody td').textContent.includes('<script>'));
 });
 
-test('Table row click emituje row_click z row_id', () => {
+test('Table row click re-emits row_click with row_id', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -146,34 +170,35 @@ test('Table row click emituje row_click z row_id', () => {
   const el = engine.render(comp(TABLE_TAG, tableFields({
     columns: [col({ id: 'name' })],
   })));
+  const sr = mount(el);
   let got = null;
   el.addEventListener('row_click', (e) => { got = e.detail; });
-  el.querySelector('tbody tr').click();
+  sr.querySelector('tbody tr').click();
   assertEq(got, { row_id: 'r1' });
 });
 
-test('Table dblclick emituje row_double_click', () => {
+test('Table badge column renders tf-chip cell', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
-    entries: [{ path: PATH('rows'), value: [{ id: 'r1', name: 'A' }] }],
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', status: 'ok' }] }],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(TABLE_TAG, tableFields({
-    columns: [col({ id: 'name' })],
+    columns: [col({ id: 'status', field: 'status', render: 'badge' })],
   })));
-  let got = null;
-  el.addEventListener('row_double_click', (e) => { got = e.detail; });
-  el.querySelector('tbody tr').dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('dblclick', { bubbles: true }));
-  assertEq(got, { row_id: 'r1' });
+  assertEq(el.querySelector('tf-column').getAttribute('renderer'), 'chip');
+  const sr = mount(el);
+  const chip = sr.querySelector('tbody td .tf-chip');
+  assertEq(chip.textContent, 'ok');
 });
 
 // ============================================================================
 // Selection
 // ============================================================================
 
-test('Table selectable=single z radio + emit selection_change', () => {
+test('Table selectable=single row click emits selection_change', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -189,22 +214,22 @@ test('Table selectable=single z radio + emit selection_change', () => {
     selectMode: 'single',
     selectedIdsBind: { kind: 'bound', path: PATH('sel') },
   })));
-  const radios = el.querySelectorAll('tbody input[type=radio]');
-  assertEq(radios.length, 2);
+  const sr = mount(el);
   let got = null;
   el.addEventListener('selection_change', (e) => { got = e.detail; });
-  radios[0].checked = true;
-  radios[0].dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
-  assertEq(got.selected_ids, 'r1');
+  const tr = sr.querySelectorAll('tbody tr')[0];
+  tr.click();
+  assertEq(got, { selected_ids: 'r1', mode: 'single', changed_row_id: 'r1' });
+  assert(tr.classList.contains('selected'));
 });
 
-test('Table selectable=multi z checkboxes + select-all', () => {
+test('Table selectable=multi merges clicked row into bound selection', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
     entries: [
       { path: PATH('rows'), value: [{ id: 'r1' }, { id: 'r2' }] },
-      { path: PATH('sel'), value: [] },
+      { path: PATH('sel'), value: ['r1'] },
     ],
     state_revision: 0, truncated: false,
   });
@@ -214,13 +239,11 @@ test('Table selectable=multi z checkboxes + select-all', () => {
     selectMode: 'multi',
     selectedIdsBind: { kind: 'bound', path: PATH('sel') },
   })));
+  const sr = mount(el);
   let got = null;
   el.addEventListener('selection_change', (e) => { got = e.detail; });
-  const all = el.querySelector('.tf-table__select-all');
-  all.checked = true;
-  all.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
-  assertEq(got.all, true);
-  assertEq(got.selected_ids, ['r1', 'r2']);
+  sr.querySelectorAll('tbody tr')[1].click();
+  assertEq(got, { selected_ids: ['r1', 'r2'], mode: 'multi', changed_row_id: 'r2' });
 });
 
 test('Table selectable != none bez selected_ids throws', () => {
@@ -236,7 +259,7 @@ test('Table selectable != none bez selected_ids throws', () => {
 // Sort
 // ============================================================================
 
-test('Table sortable header click emituje sort_change', () => {
+test('Table sortable header click re-emits sort_change asc', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -252,19 +275,20 @@ test('Table sortable header click emituje sort_change', () => {
     sortable: true,
     sortByBind: { kind: 'bound', path: PATH('sort') },
   })));
+  const sr = mount(el);
   let got = null;
   el.addEventListener('sort_change', (e) => { got = e.detail; });
-  el.querySelector('.tf-table__th--sortable').click();
+  sr.querySelector('th.sortable').click();
   assertEq(got, { sort: { column_id: 'name', direction: 'asc' } });
 });
 
-test('Table sort indicator pokazuje aktualny kierunek', () => {
+test('Table second sort click toggles direction to desc', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
     entries: [
-      { path: PATH('rows'), value: [] },
-      { path: PATH('sort'), value: { column_id: 'name', direction: 'desc' } },
+      { path: PATH('rows'), value: [{ id: 'r1' }] },
+      { path: PATH('sort'), value: null },
     ],
     state_revision: 0, truncated: false,
   });
@@ -274,31 +298,75 @@ test('Table sort indicator pokazuje aktualny kierunek', () => {
     sortable: true,
     sortByBind: { kind: 'bound', path: PATH('sort') },
   })));
-  const th = el.querySelector('.tf-table__th--sortable');
-  assertEq(th.getAttribute('aria-sort'), 'descending');
-  assertEq(th.querySelector('.tf-table__th-sort').textContent, '▼');
-});
-
-test('Table sort toggle desc → none', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [
-      { path: PATH('rows'), value: [] },
-      { path: PATH('sort'), value: { column_id: 'name', direction: 'desc' } },
-    ],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(TABLE_TAG, tableFields({
-    columns: [col({ id: 'name', sortable: true })],
-    sortable: true,
-    sortByBind: { kind: 'bound', path: PATH('sort') },
-  })));
+  const sr = mount(el);
   let got = null;
   el.addEventListener('sort_change', (e) => { got = e.detail; });
-  el.querySelector('.tf-table__th--sortable').click();
-  assertEq(got, { sort: null });
+  const th = sr.querySelector('th.sortable');
+  th.click();
+  th.click();
+  assertEq(got, { sort: { column_id: 'name', direction: 'desc' } });
+  assert(th.classList.contains('sorted-desc'));
+});
+
+test('Table sort click reorders shadow rows', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'r1', name: 'B' }, { id: 'r2', name: 'A' }] },
+      { path: PATH('sort'), value: null },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name', field: 'name', sortable: true })],
+    sortable: true,
+    sortByBind: { kind: 'bound', path: PATH('sort') },
+  })));
+  const sr = mount(el);
+  assertEq(sr.querySelector('tbody td').textContent, 'B');
+  sr.querySelector('th.sortable').click();
+  assertEq(sr.querySelector('tbody td').textContent, 'A');
+});
+
+test('Table sort_change emits TableColumn id when id != field_path[0]', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [
+        { id: 'r1', user: { name: 'B', role: 'admin' } },
+        { id: 'r2', user: { name: 'A', role: 'guest' } },
+      ] },
+      { path: PATH('sort'), value: null },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  // Both columns share field_path[0] === 'user' — keys must stay unique.
+  const cName = col({ id: 'user_name', header: 'Name', sortable: true });
+  cName[2] = [2, PATH('user', 'name')];
+  const cRole = col({ id: 'user_role', header: 'Role' });
+  cRole[2] = [2, PATH('user', 'role')];
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [cName, cRole],
+    sortable: true,
+    sortByBind: { kind: 'bound', path: PATH('sort') },
+  })));
+  assertEq(el.querySelectorAll('tf-column')[0].getAttribute('key'), 'user_name');
+  assertEq(el.querySelectorAll('tf-column')[1].getAttribute('key'), 'user_role');
+  const sr = mount(el);
+  // Cell rendering still resolves the nested field_path per column.
+  const tds = sr.querySelectorAll('tbody tr')[0].querySelectorAll('td');
+  assertEq(tds[0].textContent, 'B');
+  assertEq(tds[1].textContent, 'admin');
+  let got = null;
+  el.addEventListener('sort_change', (e) => { got = e.detail; });
+  sr.querySelector('th.sortable').click();
+  assertEq(got, { sort: { column_id: 'user_name', direction: 'asc' } });
+  // tf-table internal sort works on the column-id keyed values.
+  assertEq(sr.querySelector('tbody td').textContent, 'A');
 });
 
 // ============================================================================
@@ -322,7 +390,8 @@ test('Table pagination slice rows wg page_size + current_page', () => {
     pagination,
   })));
   // page=2, size=2 → rows 3,4
-  const cells = el.querySelectorAll('tbody td');
+  const sr = mount(el);
+  const cells = sr.querySelectorAll('tbody td');
   assertEq(cells.length, 2);
   assertEq(cells[0].textContent, 'r3');
 });
@@ -385,13 +454,19 @@ test('Table show_size_picker renderuje select', () => {
   assertEq(sel.value, '25');
 });
 
-test('Table pagination page_size=0 throws', () => {
+test('Table pagination page_size=0 throws, BigInt page_size accepted', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(TABLE_TAG, tableFields({
     columns: [col({ id: 'id' })],
     pagination: [[0, 0], [1, PATH('page')], [2, false]],
   }))));
+  // u32 page_size also accepted as BigInt
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id' })],
+    pagination: [[0, 10n], [1, PATH('page')], [2, false]],
+  }), { id: 'c2' }));
+  assert(el.querySelector('.tf-table__pagination') != null);
 });
 
 // ============================================================================
@@ -406,17 +481,20 @@ test('Table duplicate column ids throws', () => {
   }))));
 });
 
-test('Table row bez row_key_field throws przy renderze', () => {
+test('Table row actions builder throws when row misses row_key_field', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
-    entries: [{ path: PATH('rows'), value: [{ name: 'no id here' }] }],
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', name: 'A' }] }],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  assertThrows(() => engine.render(comp(TABLE_TAG, tableFields({
+  const el = engine.render(comp(TABLE_TAG, tableFields({
     columns: [col({ id: 'name' })],
-  }))));
+    rowActions: [rowActionButton({ id: 'act-edit', label: 'Edit', actionId: 'edit_row' })],
+  })));
+  const tfTable = el.querySelector('tf-table');
+  assertThrows(() => tfTable.rowActions({ name: 'no id here' }, 0));
 });
 
 test('Table sticky_columns > columns.length throws', () => {
@@ -505,13 +583,13 @@ test('Table empty rows pokazuje empty_state', () => {
   assertEq(el.querySelector('.tf-table__empty-state').hidden, false);
 });
 
-test('Table select-all event ma mode=multi w payload', () => {
+test('Table deselect click emits empty selection list', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
     entries: [
       { path: PATH('rows'), value: [{ id: 'r1' }] },
-      { path: PATH('sel'), value: [] },
+      { path: PATH('sel'), value: ['r1'] },
     ],
     state_revision: 0, truncated: false,
   });
@@ -521,15 +599,17 @@ test('Table select-all event ma mode=multi w payload', () => {
     selectMode: 'multi',
     selectedIdsBind: { kind: 'bound', path: PATH('sel') },
   })));
+  const sr = mount(el);
   let got = null;
   el.addEventListener('selection_change', (e) => { got = e.detail; });
-  const all = el.querySelector('.tf-table__select-all');
-  all.checked = true;
-  all.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
-  assertEq(got.mode, 'multi');
+  const tr = sr.querySelector('tbody tr');
+  tr.click();  // selects in tf-table → ['r1']
+  assertEq(got.selected_ids, ['r1']);
+  tr.click();  // deselects → []
+  assertEq(got, { selected_ids: [], mode: 'multi', changed_row_id: 'r1' });
 });
 
-test('Table select-all checkbox sync bez bulk_actions też działa', () => {
+test('Table bulk actions toolbar follows selection bind', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -544,14 +624,19 @@ test('Table select-all checkbox sync bez bulk_actions też działa', () => {
     columns: [col({ id: 'id' })],
     selectMode: 'multi',
     selectedIdsBind: { kind: 'bound', path: PATH('sel') },
-    bulkActions: [],
+    bulkActions: [rowActionButton({ id: 'bulk-del', label: 'Delete', actionId: 'delete_rows' })],
   })));
-  const all = el.querySelector('.tf-table__select-all');
-  // Wszystkie zaznaczone → checkbox checked.
-  assertEq(all.checked, true);
+  const toolbar = el.querySelector('.tf-table__bulk-actions');
+  assertEq(toolbar.hidden, false);
+  assert(toolbar.querySelector('tf-button') != null, 'bulk Button must be rendered');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('sel'), op: { kind: 'set', value: [] } }],
+  });
+  assertEq(toolbar.hidden, true);
 });
 
-test('Table empty rows ukrywa tbody', () => {
+test('Table empty rows render zero shadow rows', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -562,7 +647,8 @@ test('Table empty rows ukrywa tbody', () => {
   const el = engine.render(comp(TABLE_TAG, tableFields({
     columns: [col({ id: 'a' })],
   })));
-  assertEq(el.querySelector('tbody').hidden, true);
+  const sr = mount(el);
+  assertEq(sr.querySelectorAll('tbody tr').length, 0);
 });
 
 test('Table ValueFormat z obcym polem dla wariantu throws', () => {
@@ -592,15 +678,16 @@ test('Table reactive rebuild po patch rows', () => {
   const el = engine.render(comp(TABLE_TAG, tableFields({
     columns: [col({ id: 'id' })],
   })));
-  assertEq(el.querySelectorAll('tbody tr').length, 1);
+  const sr = mount(el);
+  assertEq(sr.querySelectorAll('tbody tr').length, 1);
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('rows'), op: { kind: 'set', value: [{ id: 'r1' }, { id: 'r2' }, { id: 'r3' }] } }],
   });
-  assertEq(el.querySelectorAll('tbody tr').length, 3);
+  assertEq(sr.querySelectorAll('tbody tr').length, 3);
 });
 
-test('Table sticky_columns=N dodaje klasę dla pierwszych N kolumn', () => {
+test('Table sticky_header adds wrapper class, BigInt sticky_columns accepted', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -610,18 +697,15 @@ test('Table sticky_columns=N dodaje klasę dla pierwszych N kolumn', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(TABLE_TAG, tableFields({
     columns: [col({ id: 'a', field: 'a' }), col({ id: 'b', field: 'b' })],
-    stickyColumns: 1,
+    stickyHeader: true,
+    stickyColumns: 1n,
   })));
-  const ths = el.querySelectorAll('thead th[data-column-id]');
-  assert(ths[0].classList.contains('tf-table__th--sticky-left'));
-  assert(!ths[1].classList.contains('tf-table__th--sticky-left'));
+  assert(el.classList.contains('tf-table--sticky-header'));
 });
 
 // ============================================================================
 // Row actions (kebab menu)
 // ============================================================================
-
-const BUTTON_TAG = 0x0401;
 
 /// Build a row-action Button component with a backend handler.
 function rowActionButton({ id, label, actionId, params = {}, icon = null, variant = 'secondary' }) {
@@ -745,7 +829,7 @@ test('Table bez row_actions nie ustawia buildera akcji', () => {
     columns: [col({ id: 'name' })],
   })));
   const tfTable = el.querySelector('tf-table');
-  assertEq(tfTable.rowActions, undefined);
+  assertEq(tfTable.rowActions, null);
 });
 
 // ---- report ----

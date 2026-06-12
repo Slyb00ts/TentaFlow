@@ -178,59 +178,32 @@ function spinnerFields({
   return f;
 }
 
-test('Spinner renders with size and tone classes', () => {
+test('Spinner renders <tf-spinner> with size attribute and tone class', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(SPINNER_TAG, spinnerFields({ size: 'lg', tone: 'success' })));
   document.body.appendChild(el);
-  assert(el.classList.contains('tf-spinner'));
-  assert(el.classList.contains('tf-spinner--size-lg'));
+  assertEq(el.tagName, 'TF-SPINNER');
+  assertEq(el.getAttribute('size'), 'lg');
   assert(el.classList.contains('tf-spinner--tone-success'));
-  assertEq(el.getAttribute('role'), 'status');
 });
 
-test('Spinner default variant renders circle element', () => {
+test('Spinner variant maps to a modifier class on the host', () => {
   setup();
   const engine = makeEngine(makeStore());
-  const el = engine.render(comp(SPINNER_TAG, spinnerFields({ variant: 'default' })));
-  document.body.appendChild(el);
-  assert(el.classList.contains('tf-spinner--default'));
-  assert(el.querySelector('.tf-spinner__circle') != null);
+  for (const variant of ['default', 'ring', 'dots', 'bars']) {
+    const el = engine.render(comp(SPINNER_TAG, spinnerFields({ variant })));
+    document.body.appendChild(el);
+    assert(el.classList.contains(`tf-spinner--${variant}`), `variant ${variant}`);
+  }
 });
 
-test('Spinner ring variant renders circle element', () => {
-  setup();
-  const engine = makeEngine(makeStore());
-  const el = engine.render(comp(SPINNER_TAG, spinnerFields({ variant: 'ring' })));
-  document.body.appendChild(el);
-  assert(el.classList.contains('tf-spinner--ring'));
-  assert(el.querySelector('.tf-spinner__circle') != null);
-});
-
-test('Spinner dots variant renders 3 dots', () => {
-  setup();
-  const engine = makeEngine(makeStore());
-  const el = engine.render(comp(SPINNER_TAG, spinnerFields({ variant: 'dots' })));
-  document.body.appendChild(el);
-  assertEq(el.querySelectorAll('.tf-spinner__dot').length, 3);
-});
-
-test('Spinner bars variant renders 4 bars', () => {
-  setup();
-  const engine = makeEngine(makeStore());
-  const el = engine.render(comp(SPINNER_TAG, spinnerFields({ variant: 'bars' })));
-  document.body.appendChild(el);
-  assertEq(el.querySelectorAll('.tf-spinner__bar').length, 4);
-});
-
-test('Spinner label renders screen-reader text', () => {
+test('Spinner label sets aria-label on the host', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(SPINNER_TAG, spinnerFields({ label: LIT('Loading data') })));
   document.body.appendChild(el);
-  const sr = el.querySelector('.tf-visually-hidden');
-  assert(sr != null);
-  assertEq(sr.textContent, 'Loading data');
+  assertEq(el.getAttribute('aria-label'), 'Loading data');
 });
 
 test('Spinner label reacts to patch', () => {
@@ -240,17 +213,23 @@ test('Spinner label reacts to patch', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(SPINNER_TAG, spinnerFields({ label: BOUND('sl') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-visually-hidden').textContent, 'Wait');
+  assertEq(el.getAttribute('aria-label'), 'Wait');
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('sl'), op: { kind: 'set', value: 'Almost done' } }] });
-  assertEq(el.querySelector('.tf-visually-hidden').textContent, 'Almost done');
+  assertEq(el.getAttribute('aria-label'), 'Almost done');
 });
 
-test('Spinner no label omits screen-reader span', () => {
+test('Spinner without label has no aria-label', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(SPINNER_TAG, spinnerFields()));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-visually-hidden'), null);
+  assertEq(el.getAttribute('aria-label'), null);
+});
+
+test('Spinner rejects non-BindRef label', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  assertThrows(() => engine.render(comp(SPINNER_TAG, spinnerFields({ label: 'raw-string' }))));
 });
 
 test('Spinner rejects invalid size', () => {

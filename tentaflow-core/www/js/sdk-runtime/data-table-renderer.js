@@ -292,15 +292,6 @@ function formatCellValue(value, render, format, locale) {
   }
 }
 
-/// Map field_path to a simple key string for tf-column key attribute.
-/// Takes the first key segment's value as the column key.
-function fieldPathToKey(fieldPath) {
-  for (const seg of fieldPath) {
-    if (seg.kind === 'key') return seg.value;
-  }
-  return '';
-}
-
 /// Read a FieldMap value by u8 key from a decoded Component.fields array.
 function readComponentField(fields, key) {
   if (!Array.isArray(fields)) return undefined;
@@ -457,7 +448,12 @@ function renderTable(component, ctx) {
     const col = columns[i];
     if (col.hidden_by_default) continue;
     const tfCol = document.createElement('tf-column');
-    tfCol.setAttribute('key', fieldPathToKey(col.field_path));
+    // tf-table accepts arbitrary column keys and resolves cells via row[key],
+    // so the unique TableColumn id is used as the key (field_path's first
+    // segment could collide when two columns read the same row field) and
+    // transformRows mirrors that by writing formatted values under col.id.
+    // The `sort` event then carries the spec-mandated column_id directly.
+    tfCol.setAttribute('key', col.id);
     if (sortable && col.sortable) tfCol.setAttribute('sortable', '');
     if (col.render === 'number' || col.render === 'currency' || col.render === 'percent' || col.render === 'bytes') {
       tfCol.setAttribute('renderer', 'num');
@@ -623,16 +619,15 @@ function renderTable(component, ctx) {
   const transformRows = (rows) => {
     return rows.map((row) => {
       const flat = { ...row };
-      // For nested field_paths, resolve and add as top-level key
+      // Formatted cell values live under the column id (the tf-column key).
       for (const col of columns) {
         if (col.hidden_by_default) continue;
-        const key = fieldPathToKey(col.field_path);
         const rawVal = readRowField(row, col.field_path);
         const formatted = formatCellValue(rawVal, col.render, col.format, ctx.locale);
         if (col.render === 'chip' || col.render === 'badge' || col.render === 'tag') {
-          flat[key] = { label: formatted, status: 'info' };
+          flat[col.id] = { label: formatted, status: 'info' };
         } else {
-          flat[key] = formatted;
+          flat[col.id] = formatted;
         }
       }
       return flat;
@@ -739,7 +734,9 @@ function renderTable(component, ctx) {
   // Bridge tf-table events to SDK event protocol
   const onSort = (e) => {
     const { key, dir } = e.detail || {};
-    if (!key) return;
+    // tf-column keys are column ids (see column construction above), so the
+    // emitted key IS the spec column_id; unknown keys are dropped defensively.
+    if (!key || !colIds.has(key)) return;
     const sortPayload = { column_id: key, direction: dir === 'desc' ? 'desc' : 'asc' };
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('sort_change', {

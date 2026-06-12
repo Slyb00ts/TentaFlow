@@ -63,7 +63,7 @@ function setup() {
 // LinkButton (0x0404)
 // ============================================================================
 
-test('LinkButton renders <button type=button> with link-style classes', () => {
+test('LinkButton renders <tf-button variant=ghost> with tone/underline classes', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -73,12 +73,12 @@ test('LinkButton renders <button type=button> with link-style classes', () => {
       [4, 'hover'],
     ])
   );
-  assertEq(el.tagName, 'BUTTON');
-  assertEq(el.getAttribute('type'), 'button');
-  assert(el.classList.contains('tf-link-button'));
+  document.body.appendChild(el);
+  assertEq(el.tagName, 'TF-BUTTON');
+  assertEq(el.getAttribute('variant'), 'ghost');
   assert(el.classList.contains('tf-link-button--tone-primary'));
   assert(el.classList.contains('tf-link-button--underline-hover'));
-  assertEq(el.querySelector('.tf-link-button__label').textContent, 'Otwórz');
+  assertEq(el.getAttribute('label'), 'Otwórz');
 });
 
 test('LinkButton reactive label from BindRef', () => {
@@ -95,16 +95,15 @@ test('LinkButton reactive label from BindRef', () => {
       [3, 'neutral'], [4, 'never'],
     ])
   );
-  const label = el.querySelector('.tf-link-button__label');
-  assertEq(label.textContent, 'V1');
+  assertEq(el.getAttribute('label'), 'V1');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('lbl'), op: { kind: 'set', value: 'V2' } }],
   });
-  assertEq(label.textContent, 'V2');
+  assertEq(el.getAttribute('label'), 'V2');
 });
 
-test('LinkButton with icon_leading and icon_trailing', () => {
+test('LinkButton named icon_leading maps to icon attr, icon_trailing renders svg child', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -115,10 +114,15 @@ test('LinkButton with icon_leading and icon_trailing', () => {
       [3, 'primary'], [4, 'always'],
     ])
   );
-  const icons = el.querySelectorAll('.tf-link-button__icon');
-  assertEq(icons.length, 2);
-  assert(icons[0].classList.contains('tf-link-button__icon--leading'));
-  assert(icons[1].classList.contains('tf-link-button__icon--trailing'));
+  document.body.appendChild(el);
+  assertEq(el.getAttribute('icon'), 'download');
+  const trailing = el.querySelectorAll('svg.tf-icon');
+  assertEq(trailing.length, 1);
+  assert(trailing[0].classList.contains('tf-icon--name-external_link'));
+  assertEq(
+    trailing[0].querySelector('use').getAttribute('href'),
+    '/img/icons.svg#icon-external-link'
+  );
 });
 
 test('LinkButton click via engine handler', () => {
@@ -167,7 +171,7 @@ test('LinkButton rejects unknown field key', () => {
 // Link (0x0405)
 // ============================================================================
 
-test('Link renders <a role=link href=#> bez nawigacji', () => {
+test('Link renders <tf-button role=link> with tone/underline classes', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -176,16 +180,16 @@ test('Link renders <a role=link href=#> bez nawigacji', () => {
       [1, 'hover'], [2, 'info'],
     ])
   );
-  assertEq(el.tagName, 'A');
+  document.body.appendChild(el);
+  assertEq(el.tagName, 'TF-BUTTON');
   assertEq(el.getAttribute('role'), 'link');
-  assertEq(el.getAttribute('href'), '#');
-  assert(el.classList.contains('tf-link'));
+  assertEq(el.getAttribute('variant'), 'ghost');
   assert(el.classList.contains('tf-link--tone-info'));
   assert(el.classList.contains('tf-link--underline-hover'));
-  assertEq(el.querySelector('.tf-link__label').textContent, 'Zobacz');
+  assertEq(el.getAttribute('label'), 'Zobacz');
 });
 
-test('Link click default-prevented (no anchor scroll-to-top)', () => {
+test('Link has no raw href (navigation only via engine handlers)', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -193,10 +197,8 @@ test('Link click default-prevented (no anchor scroll-to-top)', () => {
       [0, { kind: 'literal', value: 'X' }], [1, 'never'], [2, 'primary'],
     ])
   );
-  let defaultPrevented = false;
-  el.addEventListener('click', (e) => { defaultPrevented = e.defaultPrevented; });
-  el.click();
-  assert(defaultPrevented);
+  assertEq(el.getAttribute('href'), null);
+  assertEq(el.tagName, 'TF-BUTTON');
 });
 
 test('Link click goes through engine handler (separate from preventDefault)', () => {
@@ -214,7 +216,7 @@ test('Link click goes through engine handler (separate from preventDefault)', ()
   assertEq(dispatched[0].event_kind, 'click');
 });
 
-test('Link with leading_icon and trailing_icon', () => {
+test('Link named leading_icon maps to icon attr, trailing_icon renders svg child', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -225,10 +227,11 @@ test('Link with leading_icon and trailing_icon', () => {
       [4, { kind: 'named', name: 'arrow_right' }],
     ])
   );
-  const icons = el.querySelectorAll('.tf-link__icon');
-  assertEq(icons.length, 2);
-  assert(icons[0].classList.contains('tf-link__icon--leading'));
-  assert(icons[1].classList.contains('tf-link__icon--trailing'));
+  document.body.appendChild(el);
+  assertEq(el.getAttribute('icon'), 'external_link');
+  const trailing = el.querySelectorAll('svg.tf-icon');
+  assertEq(trailing.length, 1);
+  assert(trailing[0].classList.contains('tf-icon--name-arrow_right'));
 });
 
 test('Link rejects missing required tone', () => {
@@ -254,23 +257,26 @@ const FAB_VALID = [
   [3, 'bottom_right'],
 ];
 
-test('Fab renders <button> with icon, position class, bez label = aria.label wymagany', () => {
+test('Fab renders <tf-button> with icon attr + position class; icon-only requires a11y.label', () => {
   setup();
   const engine = makeEngine();
-  // Bez label'a + bez a11y.label → throw (a11y enforcement).
+  // Without label field and without a11y.label → throw (a11y enforcement).
   assertThrows(() => engine.render(comp(FAB_TAG, FAB_VALID)));
-  // Z a11y.label OK.
+  // With a11y.label OK.
   const el = engine.render(
     comp(FAB_TAG, FAB_VALID, {
       a11y: { label: { kind: 'literal', value: 'Add new' } },
     })
   );
-  assertEq(el.tagName, 'BUTTON');
+  document.body.appendChild(el);
+  assertEq(el.tagName, 'TF-BUTTON');
+  assertEq(el.getAttribute('variant'), 'primary');
   assert(el.classList.contains('tf-fab'));
   assert(el.classList.contains('tf-fab--tone-primary'));
   assert(el.classList.contains('tf-fab--size-md'));
   assert(el.classList.contains('tf-fab--position-bottom_right'));
-  assert(el.querySelector('.tf-fab__icon') != null);
+  // Named icon maps to tf-button icon attribute (no child icon element).
+  assertEq(el.getAttribute('icon'), 'plus');
   assertEq(el.getAttribute('aria-label'), 'Add new');
 });
 
@@ -284,7 +290,7 @@ test('Fab with label renders extended variant', () => {
     ])
   );
   assert(el.classList.contains('tf-fab--extended'));
-  assertEq(el.querySelector('.tf-fab__label').textContent, 'New item');
+  assertEq(el.getAttribute('label'), 'New item');
 });
 
 test('Fab label reactive from BindRef', () => {
@@ -301,12 +307,12 @@ test('Fab label reactive from BindRef', () => {
       [4, { kind: 'bound', path: PATH('fl') }],
     ])
   );
-  assertEq(el.querySelector('.tf-fab__label').textContent, 'Create');
+  assertEq(el.getAttribute('label'), 'Create');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('fl'), op: { kind: 'set', value: 'Add' } }],
   });
-  assertEq(el.querySelector('.tf-fab__label').textContent, 'Add');
+  assertEq(el.getAttribute('label'), 'Add');
 });
 
 test('Fab rejects missing required icon', () => {
@@ -330,7 +336,7 @@ test('Fab rejects invalid position', () => {
   );
 });
 
-test('Fab inline position w extended variant', () => {
+test('Fab inline position in extended variant', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(

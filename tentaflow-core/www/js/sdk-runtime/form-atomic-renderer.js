@@ -222,13 +222,15 @@ function renderToggle(component, ctx) {
   ctx.registerCleanup(ctx.store.subscribe(bindPath, applyChecked));
 
   // tf-toggle emits 'change' with detail.checked (bubbles:true). Intercept
-  // and re-emit on wrapper with SDK { value, kind } shape.
+  // and re-emit on wrapper with SDK { value, kind } shape. Propagation is
+  // stopped BEFORE the disabled check so the raw component event (with its
+  // { checked } detail) never reaches the wrapper, even on a muted control.
   const onChange = (e) => {
+    e.stopPropagation();
     if (isDisabledFn()) {
       e.preventDefault();
       return;
     }
-    e.stopPropagation();
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
@@ -324,20 +326,25 @@ function renderCheckbox(component, ctx) {
     ctx.registerCleanup(subscribeBindRef(indeterminateBind, ctx.store, apply));
   }
 
-  // tf-checkbox emits 'change' with detail.checked (bubbles:true). Intercept
-  // and re-emit with SDK { value, kind } shape.
+  // tf-checkbox emits 'change' with detail.checked (bubbles:true). The SDK
+  // re-emit is dispatched on the SAME element the listener is attached to, so
+  // it MUST carry the `__tfReemit` guard (select-renderer pattern) — without
+  // it the listener consumes its own synthetic event and recurses forever.
+  // The raw component event is stopImmediatePropagation'd so the dispatcher
+  // (registered after us on this element) only ever sees the SDK shape.
   const onChange = (e) => {
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
     if (isDisabledFn()) {
       e.preventDefault();
       return;
     }
-    e.stopPropagation();
-    el.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)('change', {
-        bubbles: false,
-        detail: { value: e.detail.checked, kind: 'bool' },
-      })
-    );
+    const ce = new CustomEvent('change', {
+      bubbles: false,
+      detail: { value: e.detail.checked, kind: 'bool' },
+    });
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
   };
   el.addEventListener('change', onChange);
   ctx.registerCleanup(() => el.removeEventListener('change', onChange));

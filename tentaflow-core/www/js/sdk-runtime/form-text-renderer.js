@@ -296,16 +296,22 @@ function renderInput(component, ctx) {
     el.dispatchEvent(ce);
   };
 
+  // Both the component CustomEvent ({ value }) and the inner native control's
+  // own bubbled event reach the host per action. Every raw event is blocked,
+  // but only the component one (string detail.value) re-emits — otherwise the
+  // dispatcher would receive two SDK events per keystroke.
   const onInput = (e) => {
     if (e.__tfReemit) return;
     e.stopImmediatePropagation();
     if (muted()) return;
+    if (!e.detail || typeof e.detail.value !== 'string') return;
     reemit('input');
   };
   const onChange = (e) => {
     if (e.__tfReemit) return;
     e.stopImmediatePropagation();
     if (muted()) return;
+    if (!e.detail || typeof e.detail.value !== 'string') return;
     reemit('change');
   };
   const onKeyDown = (e) => {
@@ -315,29 +321,29 @@ function renderInput(component, ctx) {
     if (muted()) return;
     reemit('submit');
   };
-  const onFocus = () => {
+  // Native focus/blur don't bubble, so the host listens to focusin/focusout
+  // (which do) and re-emits the SDK focus/blur names the dispatcher expects.
+  // Re-emitting under a DIFFERENT name than the raw event makes recursion
+  // impossible; the `__tfReemit` tag keeps the renderer convention uniform.
+  const reemitFocusEdge = (name) => {
     if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('focus', { bubbles: false, detail: null })
-    );
+    const ce = new CustomEvent(name, { bubbles: false, detail: null });
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
   };
-  const onBlur = () => {
-    if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('blur', { bubbles: false, detail: null })
-    );
-  };
+  const onFocusIn = () => reemitFocusEdge('focus');
+  const onFocusOut = () => reemitFocusEdge('blur');
   el.addEventListener('input', onInput);
   el.addEventListener('change', onChange);
   el.addEventListener('keydown', onKeyDown);
-  el.addEventListener('focus', onFocus);
-  el.addEventListener('blur', onBlur);
+  el.addEventListener('focusin', onFocusIn);
+  el.addEventListener('focusout', onFocusOut);
   ctx.registerCleanup(() => {
     el.removeEventListener('input', onInput);
     el.removeEventListener('change', onChange);
     el.removeEventListener('keydown', onKeyDown);
-    el.removeEventListener('focus', onFocus);
-    el.removeEventListener('blur', onBlur);
+    el.removeEventListener('focusin', onFocusIn);
+    el.removeEventListener('focusout', onFocusOut);
   });
 
   return el;
@@ -446,39 +452,41 @@ function renderTextarea(component, ctx) {
     el.dispatchEvent(ce);
   };
 
+  // Same dedupe as Input: only the component CustomEvent (string detail.value)
+  // re-emits; the inner native control's bubbled event is blocked silently.
   const onInput = (e) => {
     if (e.__tfReemit) return;
     e.stopImmediatePropagation();
     if (muted()) return;
+    if (!e.detail || typeof e.detail.value !== 'string') return;
     reemit('input');
   };
   const onChange = (e) => {
     if (e.__tfReemit) return;
     e.stopImmediatePropagation();
     if (muted()) return;
+    if (!e.detail || typeof e.detail.value !== 'string') return;
     reemit('change');
   };
-  const onFocus = () => {
+  // focusin/focusout bubble (native focus/blur don't); re-emitting under a
+  // different name than the raw event makes recursion impossible.
+  const reemitFocusEdge = (name) => {
     if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('focus', { bubbles: false, detail: null })
-    );
+    const ce = new CustomEvent(name, { bubbles: false, detail: null });
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
   };
-  const onBlur = () => {
-    if (muted()) return;
-    el.dispatchEvent(
-      new CustomEvent('blur', { bubbles: false, detail: null })
-    );
-  };
+  const onFocusIn = () => reemitFocusEdge('focus');
+  const onFocusOut = () => reemitFocusEdge('blur');
   el.addEventListener('input', onInput);
   el.addEventListener('change', onChange);
-  el.addEventListener('focus', onFocus);
-  el.addEventListener('blur', onBlur);
+  el.addEventListener('focusin', onFocusIn);
+  el.addEventListener('focusout', onFocusOut);
   ctx.registerCleanup(() => {
     el.removeEventListener('input', onInput);
     el.removeEventListener('change', onChange);
-    el.removeEventListener('focus', onFocus);
-    el.removeEventListener('blur', onBlur);
+    el.removeEventListener('focusin', onFocusIn);
+    el.removeEventListener('focusout', onFocusOut);
   });
 
   return el;

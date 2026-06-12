@@ -1,9 +1,17 @@
 // =============================================================================
-// Plik: sdk-runtime/form-text-renderer.test.js
-// Opis: Testy Input/Textarea — chunk 3.3c-2.
+// File: sdk-runtime/form-text-renderer.test.js
+// Description: Tests for Input (0x0301) / Textarea (0x0302) rendered through
+// the <tf-input> / <tf-textarea> web components. Components are imported so
+// happy-dom upgrades them on mount; tf-input needs MutationObserver bridged
+// before import. The renderer intercepts raw events and re-emits synthetic
+// `__tfReemit` events with the SDK { value, kind } payload.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import { window as domWindow } from './_dom-test-harness.js';
+if (!globalThis.MutationObserver) globalThis.MutationObserver = domWindow.MutationObserver;
+import '../components/tf-input.js';
+import '../components/tf-textarea.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -56,9 +64,14 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// tf-input/tf-textarea build their light DOM in connectedCallback, so tests
+// that touch the inner native control mount the rendered element first.
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
-/// Helper: minimalny Input bez optional pól. Wymaga type+bind_path+
-/// validators(=[])+size; reszta opcjonalna.
+/// Helper: minimal Input. Requires type+bind_path+validators(=[])+size.
 function inputFields({ type = 'text', path = PATH('q'), validators = [], size = 'md', ...rest } = {}) {
   const f = [[0, type], [1, path], [9, validators], [18, size]];
   for (const [k, v] of Object.entries(rest)) {
@@ -83,7 +96,7 @@ function textareaFields({ path = PATH('body'), validators = [], size = 'md', row
 // Input (0x0301)
 // ============================================================================
 
-test('Input renderuje <input> z type+aktualną wartością ze store', () => {
+test('Input renders <tf-input> with type attr + store value on inner input', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -91,37 +104,40 @@ test('Input renderuje <input> z type+aktualną wartością ze store', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
-    type: 'email', label: undefined,
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    type: 'email',
     3: { kind: 'literal', value: 'Email' },
-  })));
+  }))));
+  assertEq(el.tagName.toLowerCase(), 'tf-input');
+  assert(el.classList.contains('tf-input--size-md'));
+  assert(el.classList.contains('tf-input--type-email'));
+  assertEq(el.getAttribute('type'), 'email');
+  assertEq(el.getAttribute('label'), 'Email');
   const input = el.querySelector('input');
-  assertEq(input.tagName, 'INPUT');
-  assertEq(input.getAttribute('type'), 'email');
+  assertEq(input.type, 'email');
   assertEq(input.value, 'hello');
-  // <label> for-attr powiązany z input.id.
-  const label = el.querySelector('label');
-  assertEq(label.getAttribute('for'), input.getAttribute('id'));
+  assertEq(el.querySelector('.tf-label').textContent, 'Email');
 });
 
-test('Input phone mapuje na HTML type=tel', () => {
+test('Input phone maps to HTML type=tel', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     type: 'phone',
     3: { kind: 'literal', value: 'L' },
-  })));
-  assertEq(el.querySelector('input').getAttribute('type'), 'tel');
+  }))));
+  assertEq(el.getAttribute('type'), 'tel');
+  assertEq(el.querySelector('input').type, 'tel');
 });
 
-test('Input reaguje na store push (one-way read)', () => {
+test('Input reacts to store push (one-way read)', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('q'), value: '' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   const input = el.querySelector('input');
   assertEq(input.value, '');
   store.applyPatch({
@@ -131,12 +147,12 @@ test('Input reaguje na store push (one-way read)', () => {
   assertEq(input.value, 'world');
 });
 
-test('Input typing dispatchuje input+change z aktualnym tekstem', () => {
+test('Input typing re-emits input+change with SDK { value, kind: tstr }', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   const input = el.querySelector('input');
   const evs = [];
   el.addEventListener('input', (e) => evs.push(['input', e.detail]));
@@ -150,7 +166,48 @@ test('Input typing dispatchuje input+change z aktualnym tekstem', () => {
   ]);
 });
 
-test('Input disabled BindRef blokuje input/change events', () => {
+test('Input bubbled native events do not duplicate SDK input/change', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const input = el.querySelector('input');
+  const evs = [];
+  el.addEventListener('input', (e) => evs.push(['input', e.detail]));
+  el.addEventListener('change', (e) => evs.push(['change', e.detail]));
+  // Real browsers bubble the inner native control's events to the host
+  // ALONGSIDE the component CustomEvent — each action must still produce
+  // exactly one SDK event, and the raw event must never carry through.
+  input.value = 'abc';
+  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: true }));
+  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(evs, [
+    ['input', { value: 'abc', kind: 'tstr' }],
+    ['change', { value: 'abc', kind: 'tstr' }],
+  ]);
+});
+
+test('Input focusin/focusout re-emit exactly one SDK focus/blur each', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const input = el.querySelector('input');
+  const evs = [];
+  el.addEventListener('focus', (e) => evs.push(['focus', e.detail]));
+  el.addEventListener('blur', (e) => evs.push(['blur', e.detail]));
+  // Native focus/blur don't bubble — the renderer listens to focusin/focusout
+  // and re-emits SDK focus/blur. Pre-fix the re-emit re-entered its own
+  // listener (same event name on the same host) and recursed; one bubbled
+  // focusin/focusout must complete with exactly one SDK event.
+  input.dispatchEvent(new (globalThis.Event)('focusin', { bubbles: true }));
+  input.dispatchEvent(new (globalThis.Event)('focusout', { bubbles: true }));
+  assertEq(evs, [['focus', null], ['blur', null]]);
+});
+
+test('Input disabled BindRef blocks input/change events', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -158,12 +215,13 @@ test('Input disabled BindRef blokuje input/change events', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
     15: { kind: 'bound', path: PATH('lock') },
-  })));
+  }))));
+  assertEq(el.hasAttribute('disabled'), true);
   const input = el.querySelector('input');
-  assertEq(input.hasAttribute('disabled'), true);
+  assertEq(input.disabled, true);
   let got = null;
   el.addEventListener('input', (e) => { got = e.detail; });
   input.value = 'x';
@@ -171,7 +229,7 @@ test('Input disabled BindRef blokuje input/change events', () => {
   assertEq(got, null);
 });
 
-test('Input readonly BindRef blokuje events ale renderuje value', () => {
+test('Input readonly BindRef blocks events but renders value', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -179,20 +237,21 @@ test('Input readonly BindRef blokuje events ale renderuje value', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
     16: { kind: 'bound', path: PATH('ro') },
-  })));
-  const input = el.querySelector('input');
-  assertEq(input.value, 'X');
-  assertEq(input.hasAttribute('readonly'), true);
+  }))));
+  assertEq(el.hasAttribute('readonly'), true);
+  assertEq(el.querySelector('input').value, 'X');
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  el.querySelector('input').dispatchEvent(
+    new (globalThis.Event)('change', { bubbles: false })
+  );
   assertEq(got, null);
 });
 
-test('Input error BindRef ustawia aria-invalid + renderuje .tf-input__error', () => {
+test('Input error BindRef sets error attr + renders .tf-error-text', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -200,30 +259,30 @@ test('Input error BindRef ustawia aria-invalid + renderuje .tf-input__error', ()
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
     17: { kind: 'bound', path: PATH('err') },
-  })));
-  const input = el.querySelector('input');
-  assertEq(input.getAttribute('aria-invalid'), 'true');
-  const err = el.querySelector('.tf-input__error');
-  assertEq(err.textContent, 'Wymagane');
+  }))));
+  assertEq(el.getAttribute('error'), 'Wymagane');
+  assertEq(el.querySelector('.tf-error-text').textContent, 'Wymagane');
+  assert(el.querySelector('input').classList.contains('tf-input-error'));
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('err'), op: { kind: 'set', value: '' } }],
   });
-  assertEq(input.hasAttribute('aria-invalid'), false);
-  assertEq(el.querySelector('.tf-input__error'), null);
+  assertEq(el.hasAttribute('error'), false);
+  assertEq(el.querySelector('.tf-error-text').textContent, '');
+  assert(!el.querySelector('input').classList.contains('tf-input-error'));
 });
 
-test('Input ustawia HTML attrs: maxlength, minlength, pattern, autocomplete, inputmode', () => {
+test('Input passes maxlength/minlength/pattern/autocomplete/inputmode to inner input', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
     10: 64, 11: 2, 12: '^[a-z]+$',
     13: 'current_password', 14: 'numeric',
-  })));
+  }))));
   const input = el.querySelector('input');
   assertEq(input.getAttribute('maxlength'), '64');
   assertEq(input.getAttribute('minlength'), '2');
@@ -232,68 +291,90 @@ test('Input ustawia HTML attrs: maxlength, minlength, pattern, autocomplete, inp
   assertEq(input.getAttribute('inputmode'), 'numeric');
 });
 
-test('Input z ValidationRule::Required ustawia required+aria-required', () => {
+test('Input max_length accepts BigInt u16 and rejects out-of-range', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+    10: 64n,
+  }))));
+  assertEq(el.getAttribute('maxlength'), '64');
+  assertThrows(() => engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+    10: 0x10000n,
+  }))));
+});
+
+test('Input with ValidationRule::Required sets required on inner input', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
     validators: [{ kind: 'required' }],
-  })));
-  const input = el.querySelector('input');
-  assertEq(input.hasAttribute('required'), true);
-  assertEq(input.getAttribute('aria-required'), 'true');
+  }))));
+  assertEq(el.hasAttribute('required'), true);
+  assertEq(el.querySelector('input').hasAttribute('required'), true);
 });
 
-test('Input leading_icon + trailing_icon renderowane jako .tf-input__icon', () => {
+test('Input leading_icon sets icon attr and inner icon hook', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
-    5: { kind: 'named', name: 'search' }, 6: { kind: 'named', name: 'x' },
-  })));
-  const lead = el.querySelector('.tf-input__icon--leading');
-  const trail = el.querySelector('.tf-input__icon--trailing');
-  assert(lead.classList.contains('tf-icon--name-search'));
-  assert(trail.classList.contains('tf-icon--name-x'));
+    5: { kind: 'named', name: 'search' },
+  }))));
+  assertEq(el.getAttribute('icon'), 'search');
+  assert(el.querySelector('.tf-input-wrap').classList.contains('tf-input-wrap-has-icon'));
+  assertEq(el.querySelector('use').getAttribute('href'), '#i-search');
 });
 
-test('Input prefix/suffix renderowane jako reactive .tf-input__affix', () => {
+test('Input placeholder + hint attrs are reactive', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
-    entries: [{ path: PATH('q'), value: '' }, { path: PATH('px'), value: '$' }],
+    entries: [{ path: PATH('q'), value: '' }, { path: PATH('ph'), value: 'Szukaj...' }],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
-    7: { kind: 'bound', path: PATH('px') },
-    8: { kind: 'literal', value: 'USD' },
-  })));
-  const px = el.querySelector('.tf-input__affix--prefix');
-  const sx = el.querySelector('.tf-input__affix--suffix');
-  assertEq(px.textContent, '$');
-  assertEq(sx.textContent, 'USD');
+    2: { kind: 'bound', path: PATH('ph') },
+    4: { kind: 'literal', value: 'pomocniczy' },
+  }))));
+  assertEq(el.getAttribute('placeholder'), 'Szukaj...');
+  assertEq(el.querySelector('input').placeholder, 'Szukaj...');
+  assertEq(el.getAttribute('hint'), 'pomocniczy');
+  assertEq(el.querySelector('.tf-hint').textContent, 'pomocniczy');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
-    ops: [{ path: PATH('px'), op: { kind: 'set', value: '€' } }],
+    ops: [{ path: PATH('ph'), op: { kind: 'set', value: 'Search...' } }],
   });
-  assertEq(px.textContent, '€');
+  assertEq(el.querySelector('input').placeholder, 'Search...');
 });
 
-test('Input bez label wymaga a11y.label', () => {
+test('Input without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(INPUT_TAG, inputFields({}))));
 });
 
-test('Input bez label akceptuje a11y.label', () => {
+test('Input without label accepts a11y.label (reactive aria-label mirror)', () => {
   setup();
-  const engine = makeEngine();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('q'), value: '' }, { path: PATH('lbl'), value: 'Wyszukaj' }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
   const el = engine.render(comp(INPUT_TAG, inputFields({}), {
-    a11y: { label: { kind: 'literal', value: 'Search' } },
+    a11y: { label: { kind: 'bound', path: PATH('lbl') } },
   }));
-  assertEq(el.querySelector('input').tagName, 'INPUT');
+  assertEq(el.getAttribute('aria-label'), 'Wyszukaj');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('lbl'), op: { kind: 'set', value: 'Search' } }],
+  });
+  assertEq(el.getAttribute('aria-label'), 'Search');
 });
 
 test('Input unknown field key throws', () => {
@@ -324,62 +405,49 @@ test('Input invalid InputSize throws', () => {
   }))));
 });
 
-test('Input bez label ustawia aria-label na <input> z a11y.label (mirror)', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('q'), value: '' }, { path: PATH('lbl'), value: 'Wyszukaj' }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({}), {
-    a11y: { label: { kind: 'bound', path: PATH('lbl') } },
-  }));
-  const input = el.querySelector('input');
-  assertEq(input.getAttribute('aria-label'), 'Wyszukaj');
-  store.applyPatch({
-    base_revision: 0, new_revision: 1,
-    ops: [{ path: PATH('lbl'), op: { kind: 'set', value: 'Search' } }],
-  });
-  assertEq(input.getAttribute('aria-label'), 'Search');
-});
-
-test('Input Enter dispatchuje submit + preventDefault na keydown', () => {
+test('Input invalid validators (non-array) throws', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  assertThrows(() => engine.render(comp(INPUT_TAG, [
+    [0, 'text'], [1, PATH('q')], [9, 'not-an-array'], [18, 'md'],
+    [3, { kind: 'literal', value: 'L' }],
+  ])));
+});
+
+test('Input Enter on host re-emits submit + preventDefault', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
-  })));
-  const input = el.querySelector('input');
+  }))));
   let submit = null;
   el.addEventListener('submit', (e) => { submit = e.detail; });
-  input.value = 'query';
+  el.value = 'query';
   const ev = new (globalThis.KeyboardEvent || globalThis.Event)('keydown', {
     key: 'Enter', bubbles: false, cancelable: true,
   });
-  input.dispatchEvent(ev);
+  el.dispatchEvent(ev);
   assertEq(submit, { value: 'query', kind: 'tstr' });
   assertEq(ev.defaultPrevented, true);
 });
 
-test('Input Enter z Shift NIE submit', () => {
+test('Input Enter with Shift does NOT submit', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
-  })));
-  const input = el.querySelector('input');
+  }))));
   let submit = null;
   el.addEventListener('submit', (e) => { submit = e.detail; });
   const ev = new (globalThis.KeyboardEvent || globalThis.Event)('keydown', {
     key: 'Enter', shiftKey: true, bubbles: false, cancelable: true,
   });
-  input.dispatchEvent(ev);
+  el.dispatchEvent(ev);
   assertEq(submit, null);
   assertEq(ev.defaultPrevented, false);
 });
 
-test('Input readonly Enter robi preventDefault ale NIE dispatchuje submit', () => {
+test('Input readonly Enter preventDefaults but does NOT submit', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -387,24 +455,23 @@ test('Input readonly Enter robi preventDefault ale NIE dispatchuje submit', () =
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
     16: { kind: 'bound', path: PATH('ro') },
-  })));
-  const input = el.querySelector('input');
+  }))));
   let submit = null;
   el.addEventListener('submit', (e) => { submit = e.detail; });
   const ev = new (globalThis.KeyboardEvent || globalThis.Event)('keydown', {
     key: 'Enter', bubbles: false, cancelable: true,
   });
-  input.dispatchEvent(ev);
+  el.dispatchEvent(ev);
   assertEq(submit, null);
-  // preventDefault MUSI być wywołany niezależnie od muted, bo natywny
-  // form parent inaczej submittnie się bez kontroli host'a.
+  // preventDefault MUST run regardless of muted state — a native parent form
+  // would otherwise submit outside host control.
   assertEq(ev.defaultPrevented, true);
 });
 
-test('Input disabled tłumi focus/blur events renderera', () => {
+test('Input disabled suppresses renderer focus/blur re-emission', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -412,31 +479,32 @@ test('Input disabled tłumi focus/blur events renderera', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
     15: { kind: 'bound', path: PATH('lock') },
-  })));
-  const input = el.querySelector('input');
+  }))));
+  // Muted renderer must NOT re-emit SDK focus/blur for the bubbled
+  // focusin/focusout edges of a disabled control.
   const evs = [];
   el.addEventListener('focus', () => evs.push('focus'));
   el.addEventListener('blur', () => evs.push('blur'));
-  input.dispatchEvent(new (globalThis.Event)('focus', { bubbles: false }));
-  input.dispatchEvent(new (globalThis.Event)('blur', { bubbles: false }));
+  const input = el.querySelector('input');
+  input.dispatchEvent(new (globalThis.Event)('focusin', { bubbles: true }));
+  input.dispatchEvent(new (globalThis.Event)('focusout', { bubbles: true }));
   assertEq(evs, []);
 });
 
-test('Input destroy odpina subskrypcję store + listenery', () => {
+test('Input destroy unbinds store subscription + listeners', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('q'), value: 'a' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(INPUT_TAG, inputFields({
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   const input = el.querySelector('input');
   engine.destroy(el);
-  // Po destroy subskrypcja powinna być zwolniona — store update nie zmienia
-  // value wewnątrz input'a.
+  // After destroy a store update must no longer reach the inner input.
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('q'), op: { kind: 'set', value: 'CHANGED' } }],
@@ -448,35 +516,39 @@ test('Input destroy odpina subskrypcję store + listenery', () => {
 // Textarea (0x0302)
 // ============================================================================
 
-test('Textarea renderuje <textarea> z rows default=3', () => {
+test('Textarea renders <tf-textarea> with rows default=3', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('body'), value: 'hi' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
     2: { kind: 'literal', value: 'Body' },
-  })));
+  }))));
+  assertEq(el.tagName.toLowerCase(), 'tf-textarea');
+  assert(el.classList.contains('tf-textarea--size-md'));
+  assertEq(el.getAttribute('rows'), '3');
+  assertEq(el.getAttribute('label'), 'Body');
   const ta = el.querySelector('textarea');
-  assertEq(ta.tagName, 'TEXTAREA');
   assertEq(ta.value, 'hi');
-  assertEq(ta.getAttribute('rows'), '3');
+  assertEq(Number(ta.rows), 3);
 });
 
-test('Textarea explicit rows respektowany', () => {
+test('Textarea explicit rows respected', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
     rows: 8, 2: { kind: 'literal', value: 'L' },
-  })));
-  assertEq(el.querySelector('textarea').getAttribute('rows'), '8');
+  }))));
+  assertEq(el.getAttribute('rows'), '8');
+  assertEq(Number(el.querySelector('textarea').rows), 8);
 });
 
-test('Textarea typing dispatchuje input+change', () => {
+test('Textarea typing re-emits input+change with SDK payload', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
     2: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   const ta = el.querySelector('textarea');
   const evs = [];
   el.addEventListener('input', (e) => evs.push(['input', e.detail]));
@@ -490,7 +562,43 @@ test('Textarea typing dispatchuje input+change', () => {
   ]);
 });
 
-test('Textarea monospace=true ustawia klasę', () => {
+test('Textarea bubbled native events do not duplicate SDK input/change', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
+    2: { kind: 'literal', value: 'L' },
+  }))));
+  const ta = el.querySelector('textarea');
+  const evs = [];
+  el.addEventListener('input', (e) => evs.push(['input', e.detail]));
+  el.addEventListener('change', (e) => evs.push(['change', e.detail]));
+  // Real-browser bubbling: native event reaches the host alongside the
+  // component CustomEvent — exactly one SDK event per action.
+  ta.value = 'xyz';
+  ta.dispatchEvent(new (globalThis.Event)('input', { bubbles: true }));
+  ta.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(evs, [
+    ['input', { value: 'xyz', kind: 'tstr' }],
+    ['change', { value: 'xyz', kind: 'tstr' }],
+  ]);
+});
+
+test('Textarea focusin/focusout re-emit exactly one SDK focus/blur each', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
+    2: { kind: 'literal', value: 'L' },
+  }))));
+  const ta = el.querySelector('textarea');
+  const evs = [];
+  el.addEventListener('focus', (e) => evs.push(['focus', e.detail]));
+  el.addEventListener('blur', (e) => evs.push(['blur', e.detail]));
+  ta.dispatchEvent(new (globalThis.Event)('focusin', { bubbles: true }));
+  ta.dispatchEvent(new (globalThis.Event)('focusout', { bubbles: true }));
+  assertEq(evs, [['focus', null], ['blur', null]]);
+});
+
+test('Textarea monospace=true sets class', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
@@ -499,18 +607,28 @@ test('Textarea monospace=true ustawia klasę', () => {
   assert(el.classList.contains('tf-textarea--monospace'));
 });
 
-test('Textarea autoresize=true ustawia klasę + odpala layout po typing', () => {
+test('Textarea autoresize=true sets autogrow attr', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
     autoresize: true, 2: { kind: 'literal', value: 'L' },
-  })));
-  assert(el.classList.contains('tf-textarea--autoresize'));
-  // Sam fakt nie throw'a + listener wpięty — sprawdzenie obecności
-  // przez dispatch event'u.
+  }))));
+  assertEq(el.hasAttribute('autogrow'), true);
+  // Typing through the component autogrow path must not throw.
   const ta = el.querySelector('textarea');
   ta.value = 'aaa\nbbb\nccc\nddd';
   ta.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
+});
+
+test('Textarea maxlength passes through to inner textarea', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
+    2: { kind: 'literal', value: 'L' },
+    5: 500,
+  }))));
+  assertEq(el.getAttribute('maxlength'), '500');
+  assertEq(el.querySelector('textarea').getAttribute('maxlength'), '500');
 });
 
 test('Textarea max_rows < rows throws', () => {
@@ -529,7 +647,7 @@ test('Textarea rows=0 throws', () => {
   }))));
 });
 
-test('Textarea disabled BindRef blokuje events', () => {
+test('Textarea disabled BindRef blocks events', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -537,12 +655,13 @@ test('Textarea disabled BindRef blokuje events', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
     2: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
+  }))));
+  assertEq(el.hasAttribute('disabled'), true);
   const ta = el.querySelector('textarea');
-  assertEq(ta.hasAttribute('disabled'), true);
+  assertEq(ta.disabled, true);
   let got = null;
   el.addEventListener('input', (e) => { got = e.detail; });
   ta.value = 'y';
@@ -550,7 +669,7 @@ test('Textarea disabled BindRef blokuje events', () => {
   assertEq(got, null);
 });
 
-test('Textarea error BindRef ustawia aria-invalid + .tf-input__error', () => {
+test('Textarea error BindRef sets error attr + .tf-error-text', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -558,29 +677,29 @@ test('Textarea error BindRef ustawia aria-invalid + .tf-input__error', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
     2: { kind: 'literal', value: 'L' },
     9: { kind: 'bound', path: PATH('err') },
-  })));
-  const ta = el.querySelector('textarea');
-  assertEq(ta.getAttribute('aria-invalid'), 'true');
-  assertEq(el.querySelector('.tf-input__error').textContent, 'Za krótkie');
+  }))));
+  assertEq(el.getAttribute('error'), 'Za krótkie');
+  assertEq(el.querySelector('.tf-error-text').textContent, 'Za krótkie');
+  assert(el.querySelector('textarea').classList.contains('tf-input-error'));
 });
 
-test('Textarea bez label wymaga a11y.label', () => {
+test('Textarea without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(TEXTAREA_TAG, textareaFields({}))));
 });
 
-test('Textarea reactive value sync ze store', () => {
+test('Textarea reactive value sync from store', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('body'), value: 'a' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
     2: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   const ta = el.querySelector('textarea');
   assertEq(ta.value, 'a');
   store.applyPatch({
@@ -590,7 +709,7 @@ test('Textarea reactive value sync ze store', () => {
   assertEq(ta.value, 'b');
 });
 
-test('Textarea bez label ustawia aria-label na <textarea> z a11y.label', () => {
+test('Textarea without label sets aria-label from a11y.label', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -601,10 +720,10 @@ test('Textarea bez label ustawia aria-label na <textarea> z a11y.label', () => {
   const el = engine.render(comp(TEXTAREA_TAG, textareaFields({}), {
     a11y: { label: { kind: 'bound', path: PATH('lbl') } },
   }));
-  assertEq(el.querySelector('textarea').getAttribute('aria-label'), 'Opis');
+  assertEq(el.getAttribute('aria-label'), 'Opis');
 });
 
-test('Textarea disabled tłumi focus/blur', () => {
+test('Textarea disabled suppresses renderer focus/blur re-emission', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -612,33 +731,36 @@ test('Textarea disabled tłumi focus/blur', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
     2: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
-  const ta = el.querySelector('textarea');
+  }))));
+  // Muted renderer must NOT re-emit SDK focus/blur for the bubbled
+  // focusin/focusout edges of a disabled control.
   const evs = [];
   el.addEventListener('focus', () => evs.push('focus'));
   el.addEventListener('blur', () => evs.push('blur'));
-  ta.dispatchEvent(new (globalThis.Event)('focus', { bubbles: false }));
-  ta.dispatchEvent(new (globalThis.Event)('blur', { bubbles: false }));
+  const ta = el.querySelector('textarea');
+  ta.dispatchEvent(new (globalThis.Event)('focusin', { bubbles: true }));
+  ta.dispatchEvent(new (globalThis.Event)('focusout', { bubbles: true }));
   assertEq(evs, []);
 });
 
-test('Textarea destroy odpina autoresize listener', () => {
+test('Textarea destroy unbinds store subscription', () => {
   setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(TEXTAREA_TAG, textareaFields({
-    autoresize: true, 2: { kind: 'literal', value: 'L' },
-  })));
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('body'), value: 'a' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
+    2: { kind: 'literal', value: 'L' },
+  }))));
   const ta = el.querySelector('textarea');
   engine.destroy(el);
-  // Po destroy zmiana wartości + input event nie ma już żadnego subskrybenta;
-  // wywołanie nie powinno rzucić ani zmienić style.height z poziomu hook'a.
-  ta.value = 'long\ncontent\nhere';
-  ta.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  // Brak crashu = pass. (Layout sam w sobie nie jest weryfikowalny w
-  // happy-dom — pilnujemy że cleanup nie zostawia dangling subskrypcji.)
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('body'), op: { kind: 'set', value: 'CHANGED' } }],
+  });
+  assertEq(ta.value, 'a');
 });
 
 test('Textarea unknown field key throws', () => {
