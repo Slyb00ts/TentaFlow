@@ -315,6 +315,17 @@ impl ModelRuntimeExecutor {
                 .await
             {
                 Ok(stream) => {
+                    // One line per stream-chat answering "where did this
+                    // request ACTUALLY go" — requested model vs resolved
+                    // target (alias fallbacks can silently swap a remote
+                    // model for a local one and this is the only place that
+                    // sees the final decision).
+                    tracing::info!(
+                        requested_model = %request.model,
+                        target = ?target,
+                        attempts,
+                        "chat stream dispatch routed"
+                    );
                     ctx.route_metadata.served_by_node = served_by(&target);
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
                     ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
