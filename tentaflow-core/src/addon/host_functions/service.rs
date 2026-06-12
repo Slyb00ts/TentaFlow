@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn check_permission_no_service_permission_returns_false() {
         let state = create_test_addon_state(
-            "test-addon",
+            "sdk-showcase",
             vec!["llm".to_string(), "storage".to_string()],
             None,
             true,
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn check_permission_service_with_resource_name_no_permission_returns_false() {
-        let state = create_test_addon_state("test-addon", vec!["llm".to_string()], None, true);
+        let state = create_test_addon_state("sdk-showcase", vec!["llm".to_string()], None, true);
         assert!(!check_permission(&state, "service", Some("teams-stt")));
     }
 

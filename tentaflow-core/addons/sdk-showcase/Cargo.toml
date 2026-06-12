@@ -1,0 +1,18 @@
+[package]
+name = "tentaflow-addon-sdk-showcase"
+version = "1.0.0"
+edition = "2021"
+description = "Consolidated test/showcase addon — exercises host functions (storage, sql, camera, vector, events, llm) and renders the full SDK component catalog over the binary CBOR UI protocol."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tentaflow-addon-sdk = { path = "../../addon-sdk/sdk" }
+tentaflow-sdk-spec = { path = "../../../tentaflow-sdk-spec" }
+minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true

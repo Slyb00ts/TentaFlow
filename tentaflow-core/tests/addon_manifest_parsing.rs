@@ -844,12 +844,12 @@ required_claims = [
 // =============================================================================
 
 #[test]
-fn test_backward_compat_test_app_addon() {
+fn test_backward_compat_sdk_showcase() {
     let manifest =
-        std::fs::read_to_string("addons/test-app-addon/manifest.toml").expect("read manifest");
-    let m = parse_manifest_toml(&manifest).expect("test-app-addon manifest must still parse");
-    assert_eq!(m.addon_id, "test-app-addon");
-    assert!(m.storage.is_none());
+        std::fs::read_to_string("addons/sdk-showcase/manifest.toml").expect("read manifest");
+    let m = parse_manifest_toml(&manifest).expect("sdk-showcase manifest must still parse");
+    assert_eq!(m.addon_id, "sdk-showcase");
+    assert!(m.storage.is_some());
     assert!(m.aliases.is_empty());
     assert!(m.gpu.is_none());
 }

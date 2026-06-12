@@ -198,10 +198,10 @@ mod tests {
     #[test]
     fn test_addon_data_dir_creates_directory() {
         with_tmp_home(|| {
-            let path = addon_data_dir("org-default", "test-addon").expect("addon_data_dir");
+            let path = addon_data_dir("org-default", "sdk-showcase").expect("addon_data_dir");
             assert!(path.exists(), "katalog utworzony");
             assert!(path.is_dir());
-            assert!(path.ends_with("test-addon"));
+            assert!(path.ends_with("sdk-showcase"));
         });
     }
 

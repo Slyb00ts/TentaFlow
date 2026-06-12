@@ -23,16 +23,21 @@ use tentaflow_core::db;
 // Stale
 // =============================================================================
 
-/// Sciezka do skompilowanego WASM test-addon (wzgledna od katalogu projektu).
-/// Kompilacja: cd addons/test-addon && cargo build --target wasm32-wasip1 --release
-/// Target wasm32-wasip1 (rust stdlib wymaga WASI imports nawet jesli addon
-/// uzywa tylko host functions z namespace "tentaflow" — patrz TODO o WASI
-/// linker wiring w runtime_wasmtime.rs).
+/// Sciezka do skompilowanego WASM sdk-showcase. Build.rs core kompiluje
+/// wszystkie bundlowane addony do wspolnego katalogu repo-root
+/// `target-addon-wasm/` (target wasm32-wasip1 — rust stdlib wymaga WASI
+/// imports nawet jesli addon uzywa tylko host functions z namespace
+/// "tentaflow").
 const TEST_ADDON_WASM: &str =
-    "addons/test-addon/target/wasm32-wasip1/release/tentaflow_addon_test.wasm";
+    "../target-addon-wasm/wasm32-wasip1/release/tentaflow_addon_sdk_showcase.wasm";
 
-/// Sciezka do katalogu test-addon (dla lifecycle::install)
-const TEST_ADDON_DIR: &str = "addons/test-addon";
+/// Sciezka do katalogu sdk-showcase (dla lifecycle::install)
+const TEST_ADDON_DIR: &str = "addons/sdk-showcase";
+
+/// Serializuje testy ktore kopiuja/usuwaja wspolny plik
+/// `addons/sdk-showcase/addon.wasm` (addon_lifecycle_full i
+/// addon_manifest_parsing biegna rownolegle w tym samym binarium).
+static ADDON_WASM_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 // =============================================================================
 // Helpery testowe
@@ -64,7 +69,7 @@ fn load_test_wasm() -> Vec<u8> {
     std::fs::read(&wasm_path).unwrap_or_else(|e| {
         panic!(
             "Nie udalo sie wczytac WASM z {:?}: {}. Skompiluj addon: \
-             cd addons/test-addon && cargo build --target wasm32-wasip1 --release",
+             cd addons/sdk-showcase && cargo build --target wasm32-wasip1 --release",
             wasm_path, e
         )
     })
@@ -72,7 +77,7 @@ fn load_test_wasm() -> Vec<u8> {
 
 /// Tworzy AddonState z podanymi uprawnieniami (system call, bez user_id)
 fn create_addon_state(db: db::DbPool, permissions: Vec<String>) -> AddonState {
-    create_addon_state_with_id(db, permissions, "test-addon", "test-instance-001")
+    create_addon_state_with_id(db, permissions, "sdk-showcase", "test-instance-001")
 }
 
 /// Tworzy AddonState z podanym addon_id i instance_id
@@ -331,7 +336,7 @@ fn addon_tool_storage() {
             "INSERT OR IGNORE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
               vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
-             VALUES ('test-addon', 0, 0, 0, 1, 0, 100, 0, 0)",
+             VALUES ('sdk-showcase', 0, 0, 0, 1, 0, 100, 0, 0)",
             [],
         )
         .expect("Blad wstawiania limitow zasobow");
@@ -509,6 +514,9 @@ fn addon_permission_denied() {
 fn addon_lifecycle_full() {
     use tentaflow_core::addon::lifecycle;
 
+    let _wasm_lock = ADDON_WASM_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let db = create_test_db();
 
     // Skopiuj WASM do addon.wasm (manifest.toml mowi wasm_file = "addon.wasm")
@@ -537,7 +545,7 @@ fn addon_lifecycle_full() {
     // 1. Instalacja addonu
     let manifest = lifecycle::install(&addon_dir, &db).expect("Blad instalacji addonu");
 
-    assert_eq!(manifest.addon_id, "test-addon");
+    assert_eq!(manifest.addon_id, "sdk-showcase");
     assert_eq!(manifest.version, "1.0.0");
     assert!(
         !manifest.tools.is_empty(),
@@ -549,7 +557,7 @@ fn addon_lifecycle_full() {
         let conn = db.lock().unwrap();
         let exists: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = 'test-addon'",
+                "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = 'sdk-showcase'",
                 [],
                 |row| row.get(0),
             )
@@ -561,11 +569,11 @@ fn addon_lifecycle_full() {
     {
         let conn = db.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO addon_declared_permissions (addon_id, permission_type) VALUES ('test-addon', 'storage')",
+            "INSERT OR IGNORE INTO addon_declared_permissions (addon_id, permission_type) VALUES ('sdk-showcase', 'storage')",
             [],
         ).unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO addon_declared_permissions (addon_id, permission_type) VALUES ('test-addon', 'log')",
+            "INSERT OR IGNORE INTO addon_declared_permissions (addon_id, permission_type) VALUES ('sdk-showcase', 'log')",
             [],
         ).unwrap();
     }
@@ -576,7 +584,7 @@ fn addon_lifecycle_full() {
     let module = compile_module(&engine, &wasm_bytes).expect("Blad kompilacji");
 
     let state = AddonState {
-        addon_id: "test-addon".to_string(),
+        addon_id: "sdk-showcase".to_string(),
         instance_id: "lifecycle-test-001".to_string(),
         user_id: None,
         org_id: None,
@@ -630,14 +638,14 @@ fn addon_lifecycle_full() {
     assert_eq!(stop_result, 0, "on_stop powinno zwrocic 0");
 
     // 8. Odinstaluj addon
-    lifecycle::uninstall("test-addon", &db).expect("Blad deinstalacji");
+    lifecycle::uninstall("sdk-showcase", &db).expect("Blad deinstalacji");
 
     // 9. Sprawdz cleanup w DB
     {
         let conn = db.lock().unwrap();
         let exists: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = 'test-addon'",
+                "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = 'sdk-showcase'",
                 [],
                 |row| row.get(0),
             )
@@ -702,6 +710,9 @@ fn addon_unknown_tool() {
 fn addon_manifest_parsing() {
     use tentaflow_core::addon::lifecycle;
 
+    let _wasm_lock = ADDON_WASM_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let addon_dir = Path::new(manifest_dir).join(TEST_ADDON_DIR);
     let manifest_path = addon_dir.join("manifest.toml");
@@ -739,9 +750,9 @@ fn addon_manifest_parsing() {
     let db = create_test_db();
     let manifest = lifecycle::install(&addon_dir, &db).expect("Blad parsowania manifest.toml");
 
-    assert_eq!(manifest.addon_id, "test-addon");
+    assert_eq!(manifest.addon_id, "sdk-showcase");
     assert_eq!(manifest.version, "1.0.0");
-    assert_eq!(manifest.display_name, "Test Addon");
+    assert_eq!(manifest.display_name, "SDK Showcase");
     assert!(manifest.description.is_some());
     assert!(manifest.author.is_some());
 
@@ -795,7 +806,7 @@ fn addon_manifest_parsing() {
 
 /// Sciezka do skompilowanego WASM malicious-addon
 const MALICIOUS_ADDON_WASM: &str =
-    "addons/malicious-addon/target/wasm32-wasip1/release/tentaflow_addon_malicious.wasm";
+    "../target-addon-wasm/wasm32-wasip1/release/tentaflow_addon_malicious.wasm";
 
 /// Wczytuje bajty WASM malicious-addon z dysku
 fn load_malicious_wasm() -> Vec<u8> {
@@ -909,7 +920,7 @@ fn malicious_storage_isolation() {
             "INSERT OR IGNORE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
               vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
-             VALUES ('test-addon', 0, 0, 0, 1, 0, 100, 0, 0)",
+             VALUES ('sdk-showcase', 0, 0, 0, 1, 0, 100, 0, 0)",
             [],
         )
         .unwrap();
@@ -923,7 +934,7 @@ fn malicious_storage_isolation() {
         .unwrap();
     }
 
-    // 1. Zainstaluj test-addon i zapisz dane w storage
+    // 1. Zaladuj sdk-showcase i zapisz dane w storage
     {
         let (mut store, instance) = create_wasm_instance(
             db.clone(),
@@ -937,23 +948,23 @@ fn malicious_storage_isolation() {
             "test_storage",
             serde_json::json!({"key": "secret_data", "value": "very_sensitive_password_123"}),
         )
-        .expect("Blad zapisu danych test-addon");
+        .expect("Blad zapisu danych sdk-showcase");
         assert_eq!(
             response["ok"], true,
-            "test-addon powinien zapisac dane: {:?}",
+            "sdk-showcase powinien zapisac dane: {:?}",
             response
         );
     }
 
-    // Sprawdz ze dane sa w DB pod addon_id="test-addon"
+    // Sprawdz ze dane sa w DB pod addon_id="sdk-showcase"
     {
         let conn = db.lock().unwrap();
         let exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM addon_storage WHERE addon_id = 'test-addon' AND storage_key = 'secret_data'",
+            "SELECT COUNT(*) > 0 FROM addon_storage WHERE addon_id = 'sdk-showcase' AND storage_key = 'secret_data'",
             [],
             |row| row.get(0),
         ).unwrap();
-        assert!(exists, "Dane test-addon powinny byc w DB");
+        assert!(exists, "Dane sdk-showcase powinny byc w DB");
     }
 
     // 2. Zaladuj malicious-addon i probj krasc dane
@@ -971,10 +982,10 @@ fn malicious_storage_isolation() {
     )
     .expect("Blad wywolania try_steal_storage");
 
-    // Addon nie powinien widziec danych test-addon (izolacja per addon_id)
+    // Addon nie powinien widziec danych sdk-showcase (izolacja per addon_id)
     assert_eq!(
         response["ok"], true,
-        "Storage powinno byc izolowane — malicious nie widzi danych test-addon: {:?}",
+        "Storage powinno byc izolowane — malicious nie widzi danych sdk-showcase: {:?}",
         response
     );
     assert!(
@@ -1295,7 +1306,7 @@ fn malicious_cross_addon_storage() {
             "INSERT OR IGNORE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
               vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
-             VALUES ('test-addon', 0, 0, 0, 1, 0, 100, 0, 0)",
+             VALUES ('sdk-showcase', 0, 0, 0, 1, 0, 100, 0, 0)",
             [],
         )
         .unwrap();

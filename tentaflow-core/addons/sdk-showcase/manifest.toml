@@ -1,0 +1,321 @@
+[addon]
+id = "sdk-showcase"
+name = "SDK Showcase"
+version = "1.0.0"
+description = "Consolidated test/showcase addon — exercises host functions, permissions and limits, and renders the full SDK component catalog (CBOR UI)."
+category = "test"
+keywords = ["test", "showcase", "catalog", "sdk"]
+author = "TentaFlow Tests"
+license = "Apache-2.0"
+homepage = ""
+icon = "shield"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+sdk_version = ">=0.2.0, <1.0"
+
+# --- Permissions (union of the former test addons) ---
+
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Read key-value entries scoped to this addon."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Write addon storage"
+description = "Write key-value entries scoped to this addon."
+risk = "medium"
+
+[[permission]]
+id = "sql.read"
+display_name = "Read SQL"
+description = "SELECT/WITH/EXPLAIN on the per-addon SQLite database."
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Write SQL"
+description = "INSERT/UPDATE/DELETE on the per-addon SQLite database."
+risk = "medium"
+
+[[permission]]
+id = "http.request"
+display_name = "Perform HTTP requests"
+description = "Issue outbound HTTP requests to allowed hosts."
+risk = "high"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Generate with LLM"
+description = "Call LLM models for completions."
+risk = "medium"
+
+[[permission]]
+id = "secrets.read"
+display_name = "Read secrets"
+description = "Read encrypted secrets bound to this addon."
+risk = "high"
+
+[[permission]]
+id = "events.publish"
+display_name = "Publish events"
+description = "Emit test events on the shared bus."
+risk = "low"
+
+[[permission]]
+id = "events.subscribe"
+display_name = "Subscribe to events"
+description = "Receive events from the shared bus."
+risk = "low"
+
+[[permission]]
+id = "ui"
+display_name = "Render UI"
+description = "CBOR UI channel (PanelShell / SlotContent / StatePatch)."
+risk = "low"
+
+[[permission]]
+id = "notifications"
+display_name = "Show notifications"
+description = "Emit toast notifications via ui_notify."
+risk = "low"
+
+[[permission]]
+id = "flow_blocks"
+display_name = "Execute flow blocks"
+description = "Execute the custom 'uppercase' flow block."
+risk = "low"
+
+[[permission]]
+id = "cameras.read"
+display_name = "Read cameras"
+description = "List, get, health probes against owned cameras."
+risk = "low"
+
+[[permission]]
+id = "cameras.write"
+display_name = "Manage cameras"
+description = "Add, update, remove cameras owned by this addon."
+risk = "medium"
+
+[[permission]]
+id = "cameras.snapshot"
+display_name = "Capture snapshots"
+description = "Capture RGB24 snapshots from owned cameras."
+risk = "medium"
+
+[[permission]]
+id = "streams.subscribe"
+display_name = "Subscribe to camera streams"
+description = "Receive live frames via stream_subscribe/next/close."
+risk = "low"
+
+[[permission]]
+id = "recording.read"
+display_name = "Read recordings"
+description = "Issue signed URLs and inline-fetch stored snapshots / segments."
+risk = "low"
+
+[[permission]]
+id = "recording.write"
+display_name = "Manage recordings"
+description = "Save snapshots / segments and purge recordings owned by this addon."
+risk = "medium"
+
+[[permission]]
+id = "vector.read"
+display_name = "Search vectors"
+description = "k-NN search over the addon's vector namespaces."
+risk = "low"
+
+[[permission]]
+id = "vector.write"
+display_name = "Write vectors"
+description = "Upsert/delete vectors in the addon's vector namespaces."
+risk = "medium"
+
+# --- Application (Apps menu launcher) ---
+[application]
+entry_panel = "main"
+title = "SDK Showcase"
+icon = "shield"
+sort_order = 999
+
+# --- Service (background tick driver) ---
+[service]
+enabled = true
+tick_interval_ms = 2000
+tick_fuel_budget = 5000000
+tick_timeout_ms = 1000
+
+[visibility]
+admin_only = true
+default_groups = []
+show_in_catalog = false
+
+# --- Per-addon SQL storage with migrations ---
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+
+[resources]
+memory_mb = 128
+fuel_limit = 10000000
+# storage limit MUST be explicit > 0 — lifecycle.rs writes
+# `storage_total_mb.unwrap_or(0)` to the DB and the storage host function
+# rejects every store_set when the limit is 0 (no unlimited semantics).
+storage_total_mb = 20
+
+[[vector_namespace]]
+name = "showcase"
+dimensions = 8
+distance = "cosine"
+data_class = "C"
+
+[config.schema]
+test_value = { type = "string", label = "Test value", default = "hello" }
+
+# --- Tools ---
+
+[[tool]]
+id = "echo"
+display_name = "Echo"
+description = "Return the provided text."
+keywords = ["echo"]
+
+[[tool.parameter]]
+name = "text"
+param_type = "string"
+description = "Text to echo."
+required = true
+
+[[tool]]
+id = "test_storage"
+display_name = "Storage round-trip"
+description = "Test storage write and read."
+keywords = ["storage"]
+
+[[tool.parameter]]
+name = "key"
+param_type = "string"
+description = "Storage key."
+required = true
+
+[[tool.parameter]]
+name = "value"
+param_type = "string"
+description = "Storage value."
+required = true
+
+[[tool]]
+id = "test_permissions"
+display_name = "Permission check"
+description = "Test permission checking via host function."
+keywords = ["permission"]
+
+[[tool.parameter]]
+name = "permission"
+param_type = "string"
+description = "Permission id to test."
+required = true
+
+[[tool]]
+id = "test_log"
+display_name = "Log test"
+description = "Test structured logging from the guest."
+keywords = ["log"]
+
+[[tool]]
+id = "test_crash"
+display_name = "Fuel metering test"
+description = "Run an infinite loop to exercise fuel metering."
+keywords = ["fuel", "crash"]
+
+[[tool]]
+id = "run_sql_suite"
+display_name = "SQL suite"
+description = "Run the full SQL scenario: exec with bind params, query, query_one, transaction, DDL-block probe."
+keywords = ["sql", "suite"]
+
+[[tool]]
+id = "run_vector_suite"
+display_name = "Vector suite"
+description = "Run the vector scenario: upsert, k-NN search, delete in the 'showcase' namespace."
+keywords = ["vector", "suite"]
+
+[[tool]]
+id = "run_lifecycle"
+display_name = "Camera lifecycle"
+description = "camera_add -> camera_health -> camera_snapshot -> camera_remove."
+keywords = ["camera", "lifecycle"]
+
+[[tool.parameter]]
+name = "sample_path"
+param_type = "string"
+description = "Absolute path to the test mp4 file."
+required = true
+
+[[tool]]
+id = "run_path_traversal"
+display_name = "Path traversal probe"
+description = "camera_add with a hostile URL; expected to fail with an ABI error."
+keywords = ["camera", "security"]
+
+[[tool.parameter]]
+name = "bad_url"
+param_type = "string"
+description = "Hostile URL to feed camera_add."
+required = true
+
+[[tool]]
+id = "run_no_write_probe"
+display_name = "Permission denied probe"
+description = "Attempts camera_add; succeeds when cameras.write is granted, returns Permission when not."
+keywords = ["camera", "permission"]
+
+[[tool.parameter]]
+name = "sample_path"
+param_type = "string"
+description = "Absolute path to the test mp4 file (used only on the happy path)."
+required = true
+
+[[tool]]
+id = "run_recording_lifecycle"
+display_name = "Recording lifecycle"
+description = "camera_add -> frame -> save_snapshot -> signed URL -> purge -> remove."
+keywords = ["camera", "recording"]
+
+[[tool.parameter]]
+name = "sample_path"
+param_type = "string"
+description = "Absolute path to the test mp4 file."
+required = true
+
+[[tool]]
+id = "run_recording_save_segment"
+display_name = "Recording segment"
+description = "camera_add -> save_segment (1s) -> purge -> remove."
+keywords = ["camera", "recording"]
+
+[[tool.parameter]]
+name = "sample_path"
+param_type = "string"
+description = "Absolute path to the test mp4 file."
+required = true
+
+[[tool]]
+id = "run_frame_url_basic"
+display_name = "Frame URL"
+description = "camera_add -> frame -> frame_url (60s TTL) -> remove."
+keywords = ["camera", "frame"]
+
+[[tool.parameter]]
+name = "sample_path"
+param_type = "string"
+description = "Absolute path to the test mp4 file."
+required = true

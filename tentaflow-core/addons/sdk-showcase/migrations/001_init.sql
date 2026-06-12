@@ -1,7 +1,7 @@
 -- =============================================================================
--- Plik: addons/sql-test-addon/migrations/001_init.sql
--- Opis: Schemat testowy F1a M1.W4 — jedna tabela `items` z UNIQUE constraint
---       (do testow SqlConstraint) i indeksem na name.
+-- File: addons/sdk-showcase/migrations/001_init.sql
+-- Purpose: test schema for the SQL host function suite — one `items` table
+--          with a UNIQUE constraint (SqlConstraint probes) and a name index.
 -- =============================================================================
 
 CREATE TABLE items (

@@ -470,7 +470,7 @@ mod tests {
         details.insert("key".to_string(), "val".to_string());
 
         let entry = UiAuditWriter::build_entry(
-            "test-addon",
+            "sdk-showcase",
             UiAuditAction::UnknownTag,
             UiAuditOutcome::Rejected,
             RiskClass::A,
@@ -480,7 +480,7 @@ mod tests {
             details,
         );
 
-        assert_eq!(entry.addon_id, "test-addon");
+        assert_eq!(entry.addon_id, "sdk-showcase");
         assert_eq!(entry.action, UiAuditAction::UnknownTag);
         assert_eq!(entry.outcome, UiAuditOutcome::Rejected);
         assert_eq!(entry.risk_class, RiskClass::A);

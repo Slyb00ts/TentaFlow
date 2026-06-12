@@ -36,7 +36,7 @@ fn insert_camera(conn: &Connection, camera_id: &str, vendor: &str) -> rusqlite::
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             camera_id,
-            "test-addon",
+            "sdk-showcase",
             "Test Camera",
             vendor,
             "file:///tmp/x.mp4",
