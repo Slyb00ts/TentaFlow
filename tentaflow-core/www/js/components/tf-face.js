@@ -58,6 +58,7 @@ const PERSPECTIVE_D_DST = 6.1;  // 50mm FF same framing ≈ 0.71 m
 // doesn't reintroduce wide-angle distortion; size at the z=0 plane is unchanged
 // because scalePersp compensates.
 const VIEW_CAMERA_DISTANCE = PERSPECTIVE_D_DST;
+const FACE_WIDTH_SCALE = 0.84; // compensates the silhouette widening introduced by the 28mm->50mm rewarp + flatter display camera; x only, height untouched
 
 function perspectiveScale(z) {
   return ((PERSPECTIVE_D_SRC - z) / PERSPECTIVE_D_SRC)
@@ -72,7 +73,7 @@ const WARPED_POSITIONS = (() => {
     const j = i * 3;
     const z = BASE_POSITIONS[j + 2];
     const s = perspectiveScale(z);
-    out[j] = BASE_POSITIONS[j] * s;
+    out[j] = BASE_POSITIONS[j] * s * FACE_WIDTH_SCALE;
     out[j + 1] = BASE_POSITIONS[j + 1] * s;
     out[j + 2] = z;
   }
@@ -296,7 +297,7 @@ const CLEAN_DELTAS = (() => {
       const j = i * 3;
       const dz = delta[j + 2];
       const s = perspectiveScale(BASE_POSITIONS[j + 2] + dz);
-      out[j] = (BASE_POSITIONS[j] + delta[j]) * s - WARPED_POSITIONS[j];
+      out[j] = (BASE_POSITIONS[j] + delta[j]) * s * FACE_WIDTH_SCALE - WARPED_POSITIONS[j];
       out[j + 1] = (BASE_POSITIONS[j + 1] + delta[j + 1]) * s - WARPED_POSITIONS[j + 1];
       out[j + 2] = dz;
     }
