@@ -85,6 +85,10 @@ pub extern "C" fn on_install() -> i32 {
 pub extern "C" fn on_start() -> i32 {
     log::info("sdk-showcase started — sending PanelShell");
     send_panel_shell();
+    // The content slot declares SlotDefault::Loading — without an initial
+    // SlotContent push the panel would stay on the loading placeholder until
+    // the user clicks a nav tab.
+    send_tab_content(&active_tab());
     0
 }
 
@@ -111,6 +115,7 @@ pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64
         ACTIVE_TAB = None;
     }
     send_panel_shell();
+    send_tab_content(&active_tab());
     0
 }
 

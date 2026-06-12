@@ -12,7 +12,13 @@ const fs = require('fs');
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-const BINARY = path.join(__dirname, '../../../tentaflow/target/release/tentaflow');
+// Cargo uses a shared target dir for all crates (.cargo/config.toml:
+// target-dir = "target_shared" at repo root). Prefer release, accept debug.
+const BINARY_CANDIDATES = [
+  path.join(__dirname, '../../../target_shared/release/tentaflow'),
+  path.join(__dirname, '../../../target_shared/debug/tentaflow'),
+];
+const BINARY = BINARY_CANDIDATES.find((p) => fs.existsSync(p)) ?? BINARY_CANDIDATES[0];
 const DEFAULT_PORT = 18099;
 const DEFAULT_DB = '/tmp/e2e-ui-test.db';
 const CONFIG_TEMPLATE = path.join(__dirname, '../config-ui-test.toml');
@@ -54,7 +60,7 @@ function registerCleanup(child) {
   process.on('uncaughtException', cleanup);
 }
 
-function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB } = {}) {
+function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB, rustLog = 'warn' } = {}) {
   removeDbFiles(db);
   let cfg = configFile;
   if (!cfg) {
@@ -62,9 +68,18 @@ function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB } = {}) 
     renderConfig(cfg, port);
   }
   const proc = spawn(BINARY, ['-c', cfg, '--db', db], {
-    env: { ...process.env, RUST_LOG: 'warn' },
+    env: { ...process.env, RUST_LOG: rustLog },
   });
-  proc.stderr.on('data', (d) => process.stderr.write(`[ui:${port}] ${d}`));
+  // Keep an in-memory tail of backend logs so specs can attach them to
+  // failure diagnostics (e.g. find_connection / PanelOpen traces).
+  proc.logTail = [];
+  const capture = (d) => {
+    process.stderr.write(`[ui:${port}] ${d}`);
+    proc.logTail.push(d.toString());
+    if (proc.logTail.length > 500) proc.logTail.splice(0, proc.logTail.length - 500);
+  };
+  proc.stderr.on('data', capture);
+  proc.stdout.on('data', capture);
   registerCleanup(proc);
   return proc;
 }

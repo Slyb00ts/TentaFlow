@@ -17,6 +17,10 @@ use tentaflow_sdk_spec::protocol::ui::schema::{
 use tentaflow_sdk_spec::protocol::ui::tokens::{FlexAlign, Spacing, TextStyle, Tone};
 use tentaflow_sdk_spec::protocol::ui::typed_field::encode_to_value;
 use tentaflow_sdk_spec::protocol::value::Value;
+use tentaflow_sdk_spec::protocol::control::CborMap;
+use tentaflow_sdk_spec::protocol::ui::a11y::{Accessibility, EventKind};
+use tentaflow_sdk_spec::protocol::ui::component::HandlerMap;
+use tentaflow_sdk_spec::protocol::ui::handler::{FailurePolicy, Handler};
 
 /// Nested component sampling depth cap — below this the generator emits a
 /// plain Text leaf instead of recursing further.
@@ -48,6 +52,18 @@ const RENDERER_NOT_IMPLEMENTED: &[u16] = &[
     0x070A, // RuntimeStatusGrid
 ];
 
+/// Overlay components that render page-level chrome (backdrop, drawer panel,
+/// floating popover) when mounted. Sampling them inline would cover the whole
+/// dashboard with an open backdrop, so the catalog skips them.
+const OVERLAY_NOT_SAMPLED: &[u16] = &[
+    0x0509, // Modal
+    0x050A, // Drawer
+    0x050B, // Popover
+    0x050C, // Sheet
+    0x050D, // GateScreen
+    0x050E, // ConfirmationDialog (renders through tf-modal)
+];
+
 /// Tab id → catalog section header. Returns None for non-catalog tabs.
 pub fn section_for_tab(tab: &str) -> Option<&'static str> {
     match tab {
@@ -71,7 +87,8 @@ pub fn section_stack(tab: &str, section_header: &str) -> Component {
     let mut hidden: u64 = 0;
 
     for meta in ALL_COMPONENTS.iter().filter(|m| m.section == section_header) {
-        if RENDERER_NOT_IMPLEMENTED.contains(&meta.tag) {
+        if RENDERER_NOT_IMPLEMENTED.contains(&meta.tag) || OVERLAY_NOT_SAMPLED.contains(&meta.tag)
+        {
             hidden += 1;
             continue;
         }
@@ -97,7 +114,7 @@ pub fn section_stack(tab: &str, section_header: &str) -> Component {
     if hidden > 0 {
         let note = Text {
             content: BindRef::Literal(Value::Text(format!(
-                "{} component{} hidden — JS renderer not implemented yet",
+                "{} component{} hidden — missing JS renderer or page-level overlay",
                 hidden,
                 if hidden == 1 { "" } else { "s" }
             ))),
@@ -136,7 +153,10 @@ fn sample_component(meta: &ComponentMeta, depth: u32, ctr: &mut u64) -> Componen
     }
     let mut entries: Vec<(u8, Value)> = Vec::new();
     for f in meta.fields {
-        if f.wire.starts_with("Option<") {
+        // Optional BindRefs are included: several renderers require at least
+        // one display field among optional ones (e.g. MenuButton demands
+        // trigger_label or trigger_icon) and a text sample is always safe.
+        if f.wire.starts_with("Option<") && f.wire != "Option<BindRef>" {
             continue;
         }
         entries.push((f.key, sample_value(f.wire, f.name, depth, ctr)));
@@ -148,7 +168,15 @@ fn sample_component(meta: &ComponentMeta, depth: u32, ctr: &mut u64) -> Componen
         fields: FieldMap(entries),
         handlers: None,
         bind: None,
-        a11y: None,
+        // Interactive components without a visible label (Toggle, IconButton,
+        // ...) require an accessible name — give every sample one.
+        a11y: Some(Accessibility {
+            label: Some(BindRef::Literal(Value::Text(format!(
+                "Sample {}",
+                meta.name
+            )))),
+            ..Accessibility::default()
+        }),
         visibility: None,
         test_id: None,
     }
@@ -192,9 +220,22 @@ fn sample_value(wire: &str, field: &str, depth: u32, ctr: &mut u64) -> Value {
     }
     if let Some(names) = strip_generic(wire, "ComponentRef<") {
         let first = names.split('|').next().unwrap_or(names);
-        let comp = component_by_name(first)
+        let mut comp = component_by_name(first)
             .map(|m| sample_component(m, depth + 1, ctr))
             .unwrap_or_else(|| text_leaf(first, ctr));
+        // Buttons embedded by reference (Table.row_actions, card actions...)
+        // must carry a backend handler — renderers reject inert buttons.
+        if first == "Button" {
+            comp.handlers = Some(HandlerMap(vec![(
+                EventKind::Click,
+                Handler::Backend {
+                    action_id: "refresh".into(),
+                    params: CborMap(vec![]),
+                    optimistic: None,
+                    on_failure: FailurePolicy::Toast,
+                },
+            )]));
+        }
         return encode_to_value(&comp).unwrap_or(Value::Null);
     }
     match wire {
@@ -210,10 +251,12 @@ fn sample_value(wire: &str, field: &str, depth: u32, ctr: &mut u64) -> Value {
             encode_to_value(&path).unwrap_or(Value::Null)
         }
         "tstr" => Value::Text(text_sample(field)),
-        "bool" => Value::Bool(false),
+        // Combobox requires searchable=true (catalog §5 0x0305); FormGroup
+        // allows `expanded` (sampled as Option<BindRef>) only when collapsible.
+        "bool" => Value::Bool(matches!(field, "searchable" | "collapsible")),
         "u8" | "u16" | "u32" | "u64" => Value::U64(uint_sample(field)),
         "i32" | "i64" => Value::I64(1),
-        "f64" => Value::F64(0.5),
+        "f64" => Value::F64(float_sample(field)),
         "Component" => {
             let comp = text_leaf("nested content", ctr);
             encode_to_value(&comp).unwrap_or(Value::Null)
@@ -243,10 +286,39 @@ fn bind_literal(field: &str) -> Value {
 }
 
 fn text_sample(field: &str) -> String {
+    // `*_id` fields (template ids, action ids...) are grammar-validated to
+    // [a-z0-9_-]; everything else gets a human-readable sample.
+    if field == "id" || field.ends_with("_id") || field.ends_with("_ids") {
+        return "demo-id".into();
+    }
     match field {
-        "id" => "demo-id".into(),
-        "src" | "url" | "href" => "https://example.invalid/demo".into(),
+        // CodeBlock validates the language tag grammar.
+        "language" => "rust".into(),
+        // Image sources must actually load in the browser (a dead https URL
+        // produces ERR_NAME_NOT_RESOLVED console noise) — use an inline 1x1
+        // PNG, which the asset-src validators accept.
+        "src" | "ref_" => concat!(
+            "data:image/png;base64,",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkY",
+            "PhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        )
+        .into(),
+        // Plain links are not fetched by the browser.
+        "url" | "href" => "https://example.invalid/demo".into(),
+        // Validated as ISO 4217 by the CurrencyInput renderer.
+        "currency_code" => "USD".into(),
         _ => format!("Sample {}", field.replace('_', " ")),
+    }
+}
+
+/// Range-validated float fields (Slider/Heatmap scale): min must stay < max.
+fn float_sample(field: &str) -> f64 {
+    if field.contains("min") {
+        0.0
+    } else if field.contains("max") {
+        100.0
+    } else {
+        0.5
     }
 }
 
@@ -265,6 +337,11 @@ fn uint_sample(field: &str) -> u64 {
 // =============================================================================
 
 fn enum_sample(name: &str) -> Value {
+    // LiveRegion's first variant is "off", but the LiveRegion component
+    // renderer only accepts polite/assertive for politeness.
+    if name == "LiveRegion" {
+        return Value::Text("polite".into());
+    }
     ALL_ENUMS
         .iter()
         .find(|e| e.name == name)
@@ -290,8 +367,10 @@ fn inline_sample(name: &str, depth: u32, ctr: &mut u64) -> Value {
             if f.wire.starts_with("Option<") {
                 continue;
             }
+            // Schema field names keep the Rust keyword-escape underscore
+            // (e.g. `ref_`), but manual encoders emit the bare name (`ref`).
             entries.push((
-                Value::Text(f.name.into()),
+                Value::Text(f.name.trim_end_matches('_').into()),
                 sample_value(f.wire, f.name, depth, ctr),
             ));
         }
@@ -300,7 +379,11 @@ fn inline_sample(name: &str, depth: u32, ctr: &mut u64) -> Value {
     if let Some(i) = ALL_INLINE_STRUCTS.iter().find(|i| i.name == name) {
         let mut entries: Vec<(Value, Value)> = Vec::new();
         for f in i.fields {
-            if f.wire.starts_with("Option<") {
+            // Optional fields are included only for BindRefs: several
+            // renderers require at least one display field (e.g.
+            // SegmentOption demands label or icon), and an optional BindRef
+            // is always a safe text sample.
+            if f.wire.starts_with("Option<") && f.wire != "Option<BindRef>" {
                 continue;
             }
             entries.push((

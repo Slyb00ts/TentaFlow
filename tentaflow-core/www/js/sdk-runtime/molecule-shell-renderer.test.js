@@ -213,10 +213,11 @@ test('WizardShell renders steps and content/footer slots', () => {
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('wizard_step'), value: 'step2' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
+  // StepDef inline structs decode to [key, value] pair arrays on the wire.
   const steps = [
-    { 0: 'step1', 1: LIT('Personal'), 2: false },
-    { 0: 'step2', 1: LIT('Payment'), 2: false },
-    { 0: 'step3', 1: LIT('Review'), 2: true },
+    [[0, 'step1'], [1, LIT('Personal')], [2, false]],
+    [[0, 'step2'], [1, LIT('Payment')], [2, false]],
+    [[0, 'step3'], [1, LIT('Review')], [2, true]],
   ];
   const el = engine.render(comp(WIZARD_SHELL_TAG, [
     [0, steps],
@@ -426,9 +427,11 @@ test('WelcomeHero renders illustration, title, subtitle, primary action', () => 
 test('WelcomeHero renders features list', () => {
   setup();
   const engine = makeEngine();
+  // FeatureItem inline structs decode to [key, value] pair arrays on the
+  // wire (see inline_value_to_js in tentaflow-protocol-wasm).
   const features = [
-    { 0: ICON_NAMED('check'), 1: LIT('Fast'), 2: LIT('Blazing speed') },
-    { 0: ICON_NAMED('shield'), 1: LIT('Secure') },
+    [[0, ICON_NAMED('check')], [1, LIT('Fast')], [2, LIT('Blazing speed')]],
+    [[0, ICON_NAMED('shield')], [1, LIT('Secure')]],
   ];
   const el = engine.render(comp(WELCOME_HERO_TAG, [
     [0, ICON_NAMED('star')],

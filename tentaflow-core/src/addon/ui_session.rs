@@ -557,8 +557,17 @@ impl SessionRegistry {
     }
 
     /// Removes the session for `connection_id` (called on WS disconnect).
+    /// Also drops every (addon_id, user_id) → connection_id mapping owned by
+    /// this connection — PanelClose does the same cleanup explicitly, but on
+    /// an abrupt disconnect no PanelClose arrives and stale mappings would
+    /// keep routing ticks/renders to a dead connection (`panel_not_open`
+    /// warnings) until the same addon+user reopened a panel. Mappings owned
+    /// by other live connections are untouched.
     pub fn remove(&self, connection_id: u64) {
         self.sessions.write().remove(&connection_id);
+        self.addon_connections
+            .write()
+            .retain(|_, conn_id| *conn_id != connection_id);
     }
 
     /// Records which connection_id is serving a given addon+user panel session.
@@ -1027,6 +1036,24 @@ mod tests {
 
         reg.unregister_addon_connection("contacts", "1");
         assert!(reg.find_connection("contacts", "1").is_none());
+    }
+
+    #[test]
+    fn registry_remove_purges_only_own_addon_mappings() {
+        let reg = SessionRegistry::new();
+        reg.get_or_create(1);
+        reg.get_or_create(2);
+        reg.register_addon_connection("tentavision", "1", 1);
+        reg.register_addon_connection("contacts", "1", 1);
+        reg.register_addon_connection("tentavision", "2", 2);
+
+        // Disconnect of connection 1 drops both of its mappings...
+        reg.remove(1);
+        assert!(reg.find_connection("tentavision", "1").is_none());
+        assert!(reg.find_connection("contacts", "1").is_none());
+
+        // ...while connection 2's mapping survives.
+        assert_eq!(reg.find_connection("tentavision", "2"), Some(2));
     }
 
     #[test]

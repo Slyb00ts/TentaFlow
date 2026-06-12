@@ -604,7 +604,10 @@ function resolveAddonIcon(raw) {
 }
 
 window.addEventListener('error', (e) => {
-  console.error('[app] uncaught:', e.error);
+  // Benign browser notice fired when observers trigger layout in the same
+  // frame (tf-tabs / chart resize observers) — not an application error.
+  if (typeof e.message === 'string' && e.message.startsWith('ResizeObserver loop')) return;
+  console.error('[app] uncaught:', e.error ?? e.message);
 });
 
 bootstrap().catch((err) => {

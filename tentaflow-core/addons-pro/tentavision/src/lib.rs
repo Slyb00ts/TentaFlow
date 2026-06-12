@@ -315,16 +315,17 @@ fn next_id() -> String {
     alloc::format!("c{}", n)
 }
 
-fn send_ui(payload: &UiPayload) {
+fn send_ui(payload: &UiPayload) -> i32 {
     let mut buf = Vec::with_capacity(4096);
     if minicbor::encode(payload, &mut buf).is_err() {
         log::error("TentaVision: CBOR encode failed");
-        return;
+        return -1;
     }
     let ret = unsafe { ui_render_cbor(buf.as_ptr() as i32, buf.len() as i32) };
     if ret < 0 {
         log::error("TentaVision: ui_render_cbor returned error");
     }
+    ret
 }
 
 fn send_panel_shell(layout: Component, slots: Vec<SlotDecl>, initial_state: Vec<StateEntry>) {
@@ -374,10 +375,7 @@ fn send_state_patches(pairs: Vec<(String, Value)>) {
     if pairs.is_empty() {
         return;
     }
-    // `fetch_add` reserves a revision atomically: `base` is the previous value
-    // and `new_rev = base + 1`. A plain load+store could hand two concurrent
-    // patches the same base/new revision, so one would be rejected by the host.
-    let base = STATE_REVISION.fetch_add(1, Ordering::Relaxed);
+    let base = STATE_REVISION.load(Ordering::Relaxed);
     let new_rev = base + 1;
     let epoch = PANEL_EPOCH.load(Ordering::Relaxed);
     let ops = pairs
@@ -395,7 +393,11 @@ fn send_state_patches(pairs: Vec<(String, Value)>) {
         new_revision: new_rev,
         ops,
     });
-    send_ui(&payload);
+    // The host advances its expected revision only when it accepts the patch;
+    // advancing locally on rejection would drift the counters apart forever.
+    if send_ui(&payload) == 0 {
+        STATE_REVISION.store(new_rev, Ordering::Relaxed);
+    }
 }
 
 // =============================================================================

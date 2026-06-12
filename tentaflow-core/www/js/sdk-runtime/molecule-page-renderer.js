@@ -87,11 +87,14 @@ function applyAttrBind(element, attrName, bindRef, ctx) {
 function renderInlineBadge(raw, ctx) {
   if (raw == null || typeof raw !== 'object') return null;
   const el = document.createElement('tf-badge');
-  const tone = typeof raw[1] === 'string' ? raw[1] : 'neutral';
+  const toneRaw = ctx.readField(raw, 1);
+  const tone = typeof toneRaw === 'string' ? toneRaw : 'neutral';
   el.setAttribute('tone', BADGE_TONE_TO_TF[tone] || 'accent');
-  const valueBind = raw[3] != null ? raw[3] : raw[2];
+  const countBind = ctx.readField(raw, 3);
+  const valueBind = countBind != null ? countBind : ctx.readField(raw, 2);
   if (valueBind != null) applyAttrBind(el, 'value', valueBind, ctx);
-  if (raw[4] != null) renderIcon(raw[4], 'InlineBadge.icon');
+  const iconRaw = ctx.readField(raw, 4);
+  if (iconRaw != null) renderIcon(iconRaw, 'InlineBadge.icon');
   return el;
 }
 
@@ -100,14 +103,17 @@ function renderInlineBadge(raw, ctx) {
 function renderInlineChip(raw, ctx) {
   if (raw == null || typeof raw !== 'object') return null;
   const el = document.createElement('tf-chip');
-  const tone = typeof raw[1] === 'string' ? raw[1] : 'neutral';
+  const toneRaw = ctx.readField(raw, 1);
+  const tone = typeof toneRaw === 'string' ? toneRaw : 'neutral';
   el.setAttribute('status', CHIP_TONE_TO_STATUS[tone] || 'info');
-  if (raw[2] != null) applyAttrBind(el, 'label', raw[2], ctx);
-  if (raw[3] != null) {
-    renderIcon(raw[3], 'InlineChip.icon');
-    if (raw[3].kind === 'named') el.setAttribute('icon', raw[3].name);
+  const labelBind = ctx.readField(raw, 2);
+  if (labelBind != null) applyAttrBind(el, 'label', labelBind, ctx);
+  const iconRaw = ctx.readField(raw, 3);
+  if (iconRaw != null) {
+    renderIcon(iconRaw, 'InlineChip.icon');
+    if (iconRaw.kind === 'named') el.setAttribute('icon', iconRaw.name);
   }
-  if (raw[6] === true) el.setAttribute('removable', '');
+  if (ctx.readField(raw, 6) === true) el.setAttribute('removable', '');
   return el;
 }
 
@@ -121,21 +127,22 @@ function renderNavTabs(tabs, ctx, parent) {
   for (const tab of tabs) {
     if (tab == null || typeof tab !== 'object') continue;
     const tabEl = document.createElement('tf-tab');
-    const id = typeof tab[0] === 'string' ? tab[0] : '';
-    tabEl.id = id;
-    const label = tab[1];
+    const idRaw = ctx.readField(tab, 0);
+    tabEl.id = typeof idRaw === 'string' ? idRaw : '';
+    const label = ctx.readField(tab, 1);
     if (label != null) applyAttrBind(tabEl, 'label', label, ctx);
-    const icon = tab[2];
+    const icon = ctx.readField(tab, 2);
     if (icon != null) {
       renderIcon(icon, `${parent}.tabs.icon`);
       if (icon.kind === 'named') tabEl.setAttribute('icon', icon.name);
     }
-    const badge = tab[3];
+    const badge = ctx.readField(tab, 3);
     if (badge != null && typeof badge === 'object') {
-      const countBind = badge[3] != null ? badge[3] : badge[2];
+      const badgeCount = ctx.readField(badge, 3);
+      const countBind = badgeCount != null ? badgeCount : ctx.readField(badge, 2);
       if (countBind != null) applyAttrBind(tabEl, 'count', countBind, ctx);
     }
-    if (tab[5] === true) tabEl.setAttribute('disabled', '');
+    if (ctx.readField(tab, 5) === true) tabEl.setAttribute('disabled', '');
     tabsEl.appendChild(tabEl);
   }
   return tabsEl;
@@ -159,9 +166,9 @@ function renderBreadcrumbs(crumbs, ctx) {
     }
     const li = document.createElement('li');
     li.classList.add('tf-molecule-breadcrumbs__item');
-    const isCurrent = item[4] === true;
-    const label = item[0];
-    const icon = item[1];
+    const isCurrent = ctx.readField(item, 4) === true;
+    const label = ctx.readField(item, 0);
+    const icon = ctx.readField(item, 1);
     const el = document.createElement('span');
     el.classList.add('tf-molecule-breadcrumbs__link');
     if (!isCurrent) {
@@ -197,11 +204,11 @@ function renderFilterChips(filters, ctx) {
     const chip = document.createElement('tf-chip');
     chip.setAttribute('clickable', '');
     chip.setAttribute('status', 'info');
-    const id = typeof f[0] === 'string' ? f[0] : '';
-    chip.dataset.filterId = id;
-    const label = f[1];
+    const idRaw = ctx.readField(f, 0);
+    chip.dataset.filterId = typeof idRaw === 'string' ? idRaw : '';
+    const label = ctx.readField(f, 1);
     if (label != null) applyAttrBind(chip, 'label', label, ctx);
-    const icon = f[2];
+    const icon = ctx.readField(f, 2);
     if (icon != null) {
       renderIcon(icon, 'FilterChipDef.icon');
       if (icon.kind === 'named') chip.setAttribute('icon', icon.name);
