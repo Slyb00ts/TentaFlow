@@ -598,6 +598,14 @@ async fn handle_peer_connected(
         peer_store.set_status(&node_id, "disconnected");
         return;
     }
+    // Re-assert pod per-peer lockiem. Inline set_quic_connected(true) z event
+    // loopu moze zostac nadpisane przez wyscigajacy handle_peer_disconnected
+    // poprzedniego polaczenia (jego is_connected-check zdazyl zobaczyc pusta
+    // mape ZANIM nowe polaczenie sie zarejestrowalo, a zapis false wykonal sie
+    // juz PO inline true). Bez tego store zostaje "disconnected" na zawsze
+    // mimo zywego transportu — routing i sync omijaja zywego peera.
+    peer_store.set_quic_connected(&node_id, true);
+    peer_store.set_status(&node_id, "connected");
     info!(peer_id = %node_id, "QUIC peer polaczony");
 
     // Cache is_trusted raz — unikamy 3x DashMap lookup w dalszej czesci handlera.
@@ -1456,6 +1464,48 @@ fn spawn_quic_event_handler(
                         peer_store.update_metrics(&node_id, &metrics);
                         // Aktualizuj topologie peera na podstawie jego connected_peers
                         peer_store.update_topology(&node_id, metrics.connected_peers);
+                    }
+                    // Heartbeat nad zywym transportem = dowod polaczenia (to samo
+                    // zalozenie, na ktorym peer_registry naprawia swoj stan w
+                    // update_metrics). Jesli store ma quic_connected=false, to
+                    // stale disconnect wygral wyscig eventow — napraw flage od
+                    // razu i odpal pelny handler connected pod per-peer lockiem,
+                    // bo stale disconnect zdazyl tez wyrzucic klucze HMAC
+                    // (forget_peer) i cooldown TrustedKeysSync.
+                    if !peer_store.is_quic_connected(&node_id)
+                        && qm_events.is_connected(&node_id).await
+                    {
+                        warn!(
+                            peer_id = %node_id,
+                            "Heartbeat od peera oznaczonego jako rozlaczony — naprawiam stale disconnect"
+                        );
+                        peer_store.set_quic_connected(&node_id, true);
+                        peer_store.set_status(&node_id, "connected");
+                        peer_store.mark_routes_dirty();
+                        let peer_lock = peer_event_locks
+                            .entry(node_id.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone();
+                        let peer_store_c = peer_store.clone();
+                        let qm_events_c = qm_events.clone();
+                        let local_node_info_c = local_node_info.clone();
+                        let local_node_id_c = local_node_id.clone();
+                        let mesh_security_c = mesh_security.clone();
+                        let last_sync_sent_c = last_sync_sent.clone();
+                        tokio::spawn(async move {
+                            let _guard = peer_lock.lock().await;
+                            handle_peer_connected(
+                                node_id,
+                                peer_store_c,
+                                qm_events_c,
+                                local_node_info_c,
+                                local_node_id_c,
+                                mesh_security_c,
+                                last_sync_sent_c,
+                                SYNC_COOLDOWN_SECS,
+                            )
+                            .await;
+                        });
                     }
                 }
                 Ok(IrohMeshEvent::PairingRequestReceived { peer_id, data }) => {
