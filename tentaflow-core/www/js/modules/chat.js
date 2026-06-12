@@ -39,7 +39,6 @@ let unsubscribe = null;
 // Teardown for the per-session agent-activity run-events subscription. Re-bound
 // on every conversation switch (each conversation is its own session scope).
 let agentActivityTeardown = null;
-let modelOptions = [];
 let conversations = [];
 let activeConvId = null;
 let vlist = null;
@@ -805,11 +804,12 @@ function sendMessage() {
 // czy assistant deltas trzeba feedowac do AudioPipeline.
 function sendMessageInternal(text, opts = {}) {
   const { flowId, label: modelLabel } = currentFlowSelection();
-  // Model jedzie w requescie WYŁĄCZNIE dla syntetycznego Default Chat (brak
-  // flowId). Przy wybranym flow modele definiują bloki flow — wysyłanie
-  // modelu obok flowId pozwalało mu po cichu wypełnić blok LLM bez
-  // przypiętego modelu pierwszym lokalnym modelem danego noda.
-  const modelId = flowId ? '' : (modelOptions[0]?.id ?? 'default');
+  // Czat działa WYŁĄCZNIE przez flow — żadnego fallbacku na surowy model.
+  // Brak flow = twardy stop z komunikatem, nie cicha podmiana.
+  if (!flowId) {
+    toast(I18n.t('chat.flow_required') || 'Select a flow — chat runs only through flows', 'error');
+    return;
+  }
   const conv = ensureActiveConv();
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 
@@ -827,7 +827,7 @@ function sendMessageInternal(text, opts = {}) {
   // Głosowe wypowiedzi idą osobno przez sendVoiceUtterance (FlowInvoke).
   ApiBinary.subscribe(
     'chatStreamRequest',
-    { modelId, userMessage: text, flowId },
+    { modelId: '', userMessage: text, flowId },
     {
       onChunk: (body) => {
         if (body.variant === 'ChatStreamChunk') {
@@ -890,12 +890,14 @@ function sendVoiceUtterance(wav, sampleRate) {
   const flowId = (flowSelEl && flowSelEl.value)
     ? flowSelEl.value
     : (conv.audioConfig?.flowId ?? null);
-  // Model wyłącznie dla fallbacku model+chat (brak flowId) — wybrany flow
-  // niesie własne modele w blokach STT/LLM/TTS.
-  const modelId = flowId ? '' : (modelOptions[0]?.id ?? 'default');
+  // Glos rowniez dziala WYLACZNIE przez flow — bez fallbacku model+chat.
+  if (!flowId) {
+    toast(I18n.t('chat.flow_required') || 'Select a flow — chat runs only through flows', 'error');
+    return;
+  }
 
-  const flowForLabel = flowId ? flowCache.find((f) => String(f.id) === String(flowId)) : null;
-  const modelLabel = flowForLabel?.name || (I18n.t('chat.default_flow') || 'Default Chat');
+  const flowForLabel = flowCache.find((f) => String(f.id) === String(flowId));
+  const modelLabel = flowForLabel?.name || `Flow #${flowId}`;
   const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: 'voice' };
   pushMessage(conv, assistantMsg);
 
@@ -903,9 +905,9 @@ function sendVoiceUtterance(wav, sampleRate) {
     'flowInvokeRequest',
     {
       // Tryb audio odpala WYBRANY przez usera flow (po ID) — z jego blokami
-      // STT/LLM/TTS i modelami. Bez flowId fallback na rozwiązanie model+chat.
+      // STT/LLM/TTS i modelami.
       flowId,
-      model: modelId,
+      model: '',
       serviceType: 'chat',
       mime: 'audio/wav',
       sampleRate,
@@ -1075,7 +1077,7 @@ function currentFlowSelection() {
   const sel = byId('chat-flow');
   const id = sel?.value || '';
   if (!id) {
-    return { flowId: null, label: I18n.t('chat.synthetic_flow') || 'No flow (raw model)' };
+    return { flowId: null, label: '—' };
   }
   const f = flowCache.find((f) => String(f.id) === id);
   return { flowId: id, label: f?.name || `Flow #${id}` };
@@ -1375,19 +1377,9 @@ const ChatScreen = {
       const list = Array.isArray(all) ? all : [];
       const catOf = (m) => (m.category || m.service_type || '').toLowerCase();
 
-      // Filter by capabilities (more granular than category — embedding-only
-      // LLM rows would otherwise leak into chat dispatch).
-      const chatOnly = list.filter((m) => {
-        const caps = Array.isArray(m.capabilities) ? m.capabilities : [];
-        return caps.length === 0 || caps.includes('chat');
-      });
-      // Selektor czatu wybiera flow, nie model — z listy modeli zostaje
-      // tylko id pierwszego chat-capable modelu (fallback dla synthetic flow).
-      modelOptions = chatOnly.map((m) => ({ id: m.model_name }));
       engineCache.stt = list.filter((m) => catOf(m) === 'stt');
       engineCache.tts = list.filter((m) => catOf(m) === 'tts');
     } catch {
-      modelOptions = [];
       engineCache.stt = [];
       engineCache.tts = [];
     }
@@ -1405,25 +1397,23 @@ const ChatScreen = {
     // pierwszy chat-capable model z registry (modelOptions[0]).
     const sel = byId('chat-flow');
     const innerSelect = sel?.querySelector('select');
-    // The no-flow option must NOT be labelled like a flow — a user flow named
-    // "Default Chat" rendered an indistinguishable duplicate and picking the
-    // wrong one silently chatted with the first local model instead.
-    const syntheticLabel = I18n.t('chat.synthetic_flow') || 'No flow (raw model)';
-    const optionsHtml = [`<option value="">${escapeHtml(syntheticLabel)}</option>`]
-      .concat(flowCache.map((f) =>
-        `<option value="${escapeHtml(String(f.id))}">${escapeHtml(f.name || ('Flow #' + f.id))}</option>`))
-      .join('');
+    // Czat dziala WYLACZNIE przez flow — selektor listuje tylko flowy
+    // (zero opcji "surowego modelu"; ta opcja maskowala sie kiedys pod
+    // nazwa "Default Chat" i po cichu gadala pierwszym lokalnym modelem).
+    const optionsHtml = flowCache.length === 0
+      ? `<option value="" disabled>${escapeHtml('— brak flow —')}</option>`
+      : flowCache.map((f) =>
+          `<option value="${escapeHtml(String(f.id))}">${escapeHtml(f.name || ('Flow #' + f.id))}</option>`)
+        .join('');
     if (innerSelect) {
       innerSelect.innerHTML = optionsHtml;
-      // Restore last selection; on the very first load (nothing saved yet)
-      // preselect the flow marked default in the Flow Builder — chat should
-      // start on the operator's flow, not on the raw-model fallback.
+      // Selection priority: last saved pick > flow marked default in the
+      // Flow Builder > first flow on the list.
       const savedFlow = localStorage.getItem(FLOW_SELECTION_KEY);
-      if (savedFlow !== null
-          && (savedFlow === '' || flowCache.some((f) => String(f.id) === savedFlow))) {
+      if (savedFlow && flowCache.some((f) => String(f.id) === savedFlow)) {
         innerSelect.value = savedFlow;
       } else {
-        const def = flowCache.find((f) => f.is_default || f.isDefault);
+        const def = flowCache.find((f) => f.is_default || f.isDefault) || flowCache[0];
         if (def) innerSelect.value = String(def.id);
       }
       sel.setAttribute('value', innerSelect.value);
