@@ -402,7 +402,32 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "agent_run_region_streaming",
             MigrationStep::Rust(rewrite_agent_run_to_inline_region),
         ),
+        (
+            73,
+            "drop_legacy_harness_flows",
+            MigrationStep::Rust(drop_legacy_harness_flows),
+        ),
+        (
+            74,
+            "agent_run_filled_defaults",
+            MigrationStep::Rust(rewrite_agent_run_to_inline_region),
+        ),
     ]
+}
+
+/// Removes the legacy sub-flow harness rows (`…011` TentaFlow Harness, `…013`
+/// Agent Iteration) from already-provisioned databases. The harness is now the
+/// single "Agent Run" graph (`…012`) with an inline loop region, so these rows
+/// are dead weight that would otherwise keep showing up as separate flows in the
+/// builder. The agent block resolves only `AGENT_RUN_FLOW_ID` (`…012`).
+fn drop_legacy_harness_flows(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM flows WHERE id IN \
+         ('00000000-0000-4000-8000-000000000011', \
+          '00000000-0000-4000-8000-000000000013')",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Stable id of the seeded "Agent Run" harness flow (mirrors `seed::AGENT_RUN_FLOW_ID`
@@ -6314,6 +6339,60 @@ mod tests {
         assert!(
             after.contains(r#""mode":"stream""#),
             "output must be in stream mode"
+        );
+
+        // Idempotent re-run is a no-op.
+        rewrite_agent_run_to_inline_region(&conn).unwrap();
+        let again: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, target);
+    }
+
+    /// v74 rewrites a v72-shaped "Agent Run" row (empty config boxes, 200px node
+    /// spacing) to the defaults-filled, 360px-spaced graph in place, idempotently.
+    /// The target is `agent_run_flow_json()`, so a row carrying the older
+    /// empty-config/overlapping-layout graph is rewritten and a row already on the
+    /// filled graph is a no-op.
+    #[test]
+    fn migration_v74_fills_agent_run_defaults_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let target = crate::db::seed::agent_run_flow_json();
+        // A v72-era row: correct region-streaming wiring but empty prompt config
+        // and the old 200px spacing (the pre-defaults shape).
+        let v72_shape = r#"{"nodes":[{"id":"c0","type":"agent_context","position":{"x":400,"y":0},"config":{"agent_id":"","from_vars":true}},{"id":"k1","type":"compact_context","position":{"x":600,"y":0},"region":"agent_turn","config":{"threshold_percent":50}}],"edges":[{"from_node":"c0","to_node":"k1"}]}"#;
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status, is_default) \
+             VALUES (?1, 'Agent Run', ?2, 'active', 0)",
+            rusqlite::params![AGENT_RUN_FLOW_ID, v72_shape],
+        )
+        .unwrap();
+
+        rewrite_agent_run_to_inline_region(&conn).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, target, "v74 must install the defaults-filled graph");
+        // The compaction prompt defaults are present (not empty boxes anymore).
+        assert!(
+            after.contains("structured \\nhandoff summary")
+                || after.contains("structured handoff summary"),
+            "filled graph must carry the summary system prompt"
+        );
+        // 360px spacing: the last node sits at x=2520 (8 nodes spaced 360).
+        assert!(
+            after.contains(r#""x":2520"#),
+            "filled graph must use 360px node spacing"
         );
 
         // Idempotent re-run is a no-op.

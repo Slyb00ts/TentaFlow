@@ -1,0 +1,21 @@
+{
+  "_comment": "Reactive sub-agent completion demo (NOT seeded — import via Flow Builder). The flow starts when a child run of the matched agent reaches the 'completed' terminal state (on_subagent_complete), summarises the result with an LLM and outputs it. Nodes spaced 360px on x, y=0. Validates R1-R11.",
+  "nodes": [
+    {"id": "ev", "type": "on_subagent_complete", "position": {"x": 0, "y": 0},
+     "config": {"agent_id": "", "match_status": "completed"}},
+    {"id": "m1", "type": "llm", "position": {"x": 360, "y": 0},
+     "config": {
+       "model": "",
+       "system_prompt": "Summarise the finished sub-agent result for the parent in two sentences.",
+       "temperature": 0.3,
+       "max_tokens": 512,
+       "stream": false
+     }},
+    {"id": "o1", "type": "output", "position": {"x": 720, "y": 0},
+     "config": {"mode": "blocking"}}
+  ],
+  "edges": [
+    {"from_node": "ev", "to_node": "m1", "from_port": "text", "to_port": "in", "data_type": "text"},
+    {"from_node": "m1", "to_node": "o1", "from_port": "full", "to_port": "text", "data_type": "text"}
+  ]
+}

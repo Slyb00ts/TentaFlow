@@ -1,0 +1,41 @@
+{
+  "_comment": "Deterministic agent orchestration demo (NOT seeded — import via Flow Builder). Parent agent fans out N sub-agents in the background (spawn), polls their status in a watch loop region (subagent_status -> interval -loop_back-> subagent_status) until every child is terminal, then awaits the results, combines them and outputs. Nodes spaced 360px on x; the watch region sits on y=160 so its loop_back reads clearly under the main lane. Validates R1-R11.",
+  "nodes": [
+    {"id": "t1", "type": "trigger", "position": {"x": 0, "y": 0}, "config": {}},
+    {"id": "c0", "type": "agent_context", "position": {"x": 360, "y": 0},
+     "config": {"agent_id": "", "from_vars": true}},
+    {"id": "sp", "type": "spawn", "position": {"x": 720, "y": 0},
+     "config": {
+       "agent_id": "",
+       "task": "{{payload}}",
+       "context": "",
+       "output_variable": "spawned_run_ids"
+     }},
+    {"id": "st", "type": "subagent_status", "position": {"x": 1080, "y": 160},
+     "region": "watch",
+     "config": {"output_variable": "subagent_status"}},
+    {"id": "iv", "type": "interval", "position": {"x": 1440, "y": 160},
+     "region": "watch",
+     "config": {"seconds": 5, "loop_max_iterations": 120}},
+    {"id": "aw", "type": "await_subagents", "position": {"x": 1800, "y": 0},
+     "config": {
+       "run_ids_var": "spawned_run_ids",
+       "timeout_secs": 600,
+       "mode": "all",
+       "output_variable": "subagent_results"
+     }},
+    {"id": "cb", "type": "combine", "position": {"x": 2160, "y": 0}, "config": {}},
+    {"id": "o1", "type": "output", "position": {"x": 2520, "y": 0},
+     "config": {"mode": "blocking"}}
+  ],
+  "edges": [
+    {"from_node": "t1", "to_node": "c0", "from_port": "text", "data_type": "text"},
+    {"from_node": "c0", "to_node": "sp"},
+    {"from_node": "sp", "to_node": "st"},
+    {"from_node": "st", "to_node": "iv"},
+    {"from_node": "iv", "to_node": "st", "kind": "loop_back"},
+    {"from_node": "iv", "to_node": "aw"},
+    {"from_node": "aw", "to_node": "cb"},
+    {"from_node": "cb", "to_node": "o1", "from_port": "full", "to_port": "text"}
+  ]
+}
