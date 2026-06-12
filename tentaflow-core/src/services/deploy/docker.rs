@@ -382,6 +382,38 @@ mod backend {
         }
     }
 
+    /// Recursively appends a context directory to the build tar, forcing mode
+    /// 0755 on `*.sh` files. The classic builder (bollard uses `/build`, no
+    /// BuildKit) does not support `COPY --chmod` and takes file modes from the
+    /// tar headers — but the exec bit is unreliable on disk: the containers
+    /// bundle ships scripts as 0644 and Windows has no exec bit at all.
+    fn append_context_dir(
+        builder: &mut tar::Builder<Vec<u8>>,
+        dir: &Path,
+        prefix: &Path,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let rel = prefix.join(entry.file_name());
+            if path.is_dir() {
+                builder.append_dir(&rel, &path)?;
+                append_context_dir(builder, &path, &rel)?;
+            } else {
+                let mut file = std::fs::File::open(&path)?;
+                if rel.extension().is_some_and(|e| e == "sh") {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_metadata(&file.metadata()?);
+                    header.set_mode(0o755);
+                    builder.append_data(&mut header, &rel, &mut file)?;
+                } else {
+                    builder.append_file(&rel, &mut file)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Builds an image from `<containers_root>/<context_path>/`. Streams build
     /// log lines into `log` (when present). The Dockerfile is expected at
     /// `<context>/Dockerfile`; bollard reads it relative to the tar root, so
@@ -405,8 +437,7 @@ mod backend {
         // Pack the context root as the tar root so the Dockerfile is at the
         // top level. Bollard streams this body as the build context.
         let mut tar_builder = tar::Builder::new(Vec::new());
-        tar_builder
-            .append_dir_all(".", context)
+        append_context_dir(&mut tar_builder, context, Path::new(""))
             .map_err(|e| DeployError::Docker(format!("tar context: {}", e)))?;
         let tar_bytes = tar_builder
             .into_inner()

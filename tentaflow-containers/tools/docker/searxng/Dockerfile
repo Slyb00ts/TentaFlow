@@ -7,7 +7,7 @@
 FROM searxng/searxng:2026.5.17-d7e8b7cd1
 
 COPY settings.yml /etc/searxng/settings.yml
-COPY --chmod=0755 entrypoint.sh /usr/local/bin/tentaflow-searxng-entrypoint
+COPY entrypoint.sh /usr/local/bin/tentaflow-searxng-entrypoint
 
 EXPOSE 8080
 
