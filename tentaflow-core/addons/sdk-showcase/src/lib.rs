@@ -51,7 +51,12 @@ const VECTOR_NAMESPACE: &str = "showcase";
 
 static mut COUNTER: u64 = 0;
 static mut STATE_REVISION: u64 = 0;
+static mut PANEL_EPOCH: u64 = 1;
 static mut ACTIVE_TAB: Option<String> = None;
+
+fn panel_epoch() -> u64 {
+    unsafe { PANEL_EPOCH }
+}
 
 fn active_tab() -> String {
     unsafe {
@@ -86,6 +91,26 @@ pub extern "C" fn on_start() -> i32 {
 #[no_mangle]
 pub extern "C" fn on_stop() -> i32 {
     log::info("sdk-showcase stopped");
+    0
+}
+
+/// Panel reopen handler — the host assigns a fresh epoch and resets the
+/// expected state revision to 0 on every PanelOpen, so the addon must adopt
+/// the new epoch, restart its own revision counter and re-register the shell.
+#[no_mangle]
+pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64) -> i32 {
+    let panel_id = read_string(panel_id_ptr, panel_id_len);
+    if panel_id != PANEL_ID {
+        log::warn(&format!("on_panel_open: unknown panel '{}'", panel_id));
+        return 0;
+    }
+    unsafe {
+        PANEL_EPOCH = epoch as u64;
+        STATE_REVISION = 0;
+        COUNTER = 0;
+        ACTIVE_TAB = None;
+    }
+    send_panel_shell();
     0
 }
 
@@ -899,7 +924,7 @@ fn send_panel_shell() {
     let shell = PanelShell {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
-        panel_epoch: 1,
+        panel_epoch: panel_epoch(),
         layout,
         slots: vec![SlotDecl {
             id: SLOT_ID.into(),
@@ -939,7 +964,7 @@ fn send_tab_content(tab: &str) {
     let slot_content = SlotContent {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
-        panel_epoch: 1,
+        panel_epoch: panel_epoch(),
         slot_id: SLOT_ID.into(),
         fragment,
         state_overlay: Some(vec![StateEntry {
@@ -1057,22 +1082,25 @@ fn storage_tab() -> Component {
 // =============================================================================
 
 fn send_state_patch(ops: Vec<PatchOp>) {
-    let (base, new) = unsafe {
-        let base = STATE_REVISION;
-        STATE_REVISION += 1;
-        (base, STATE_REVISION)
-    };
+    let base = unsafe { STATE_REVISION };
+    let new = base + 1;
 
     let patch = StatePatch {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
-        panel_epoch: 1,
+        panel_epoch: panel_epoch(),
         base_revision: base,
         new_revision: new,
         ops,
     };
 
-    send_ui(&UiPayload::StatePatch(patch));
+    // The host advances its expected revision only when it accepts the patch;
+    // advancing locally on rejection would drift the counters apart forever.
+    if send_ui(&UiPayload::StatePatch(patch)) == 0 {
+        unsafe {
+            STATE_REVISION = new;
+        }
+    }
 }
 
 fn read_tick_counter() -> u64 {
