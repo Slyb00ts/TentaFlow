@@ -4,7 +4,9 @@
 // LoginShell (0x0007), WizardShell (0x000B), EmptyState (0x0003),
 // ErrorBoundary (0x0008), WelcomeHero (0x0009) — chunk 3.3f.
 //
-// EmptyState replaces the temporary implementation in data-list-renderer.js.
+// EmptyState renders the dashboard <tf-empty-state> web component; the
+// remaining entries are page-level structural shells without tf-* equivalents
+// (interactive children still render as tf-* components, e.g. <tf-button>).
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/molecules/shell.rs,
 //           tentaflow-sdk-spec/src/protocol/ui/molecules/empty.rs.
@@ -16,14 +18,12 @@ import {
 } from './component-renderer.js';
 import { resolveBindRef, subscribeBindRef, assertBindRef } from './bind-resolver.js';
 import {
-  TONES,
   requireEnum, requireBool, requireString,
   assertOnlyKnownFields,
 } from './data-chart-shared.js';
 import { renderIcon } from './icon-renderer.js';
 import { BUTTON_TAG } from './action-button-renderer.js';
 
-const DENSITIES = new Set(['default', 'compact', 'comfortable']);
 const SPACINGS = new Set(['zero', 'xxs', 'xs', 'sm', 'md', 'lg', 'xl', 'xxl']);
 const EMPTY_STATE_VARIANTS = new Set(['default', 'compact', 'illustrated']);
 
@@ -52,6 +52,17 @@ function applyTextBind(element, bindRef, ctx) {
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
 }
 
+// Reactive BindRef → attribute mirror (web components re-render through
+// attributeChangedCallback, e.g. <tf-empty-state title/message>).
+function applyAttrBind(element, attrName, bindRef, ctx) {
+  const apply = () => {
+    const v = resolveBindRef(bindRef, ctx.store);
+    element.setAttribute(attrName, v == null ? '' : String(v));
+  };
+  apply();
+  ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
+}
+
 // =============================================================================
 // AppShell (0x0006) — 5 fields
 // =============================================================================
@@ -71,7 +82,6 @@ function renderAppShell(component, ctx) {
 
   const wrapper = document.createElement('div');
   wrapper.classList.add('tf-app-shell');
-  if (collapsibleSidebar) wrapper.classList.add('tf-app-shell--collapsible');
 
   if (headerSlotRaw != null) {
     requireString(headerSlotRaw, 'AppShell.header_slot');
@@ -89,11 +99,12 @@ function renderAppShell(component, ctx) {
   sidebar.setAttribute('data-slot-id', sidebarSlot);
 
   if (collapsibleSidebar) {
-    const toggle = document.createElement('button');
+    const toggle = document.createElement('tf-button');
     toggle.classList.add('tf-app-shell__sidebar-toggle');
-    toggle.type = 'button';
+    toggle.setAttribute('variant', 'ghost');
+    toggle.setAttribute('size', 'sm');
+    toggle.setAttribute('label', '☰');
     toggle.setAttribute('aria-label', 'Toggle sidebar');
-    toggle.textContent = '☰';
     toggle.addEventListener('click', () => {
       const collapsed = wrapper.classList.toggle('tf-app-shell--sidebar-collapsed');
       toggle.setAttribute('aria-expanded', String(!collapsed));
@@ -252,13 +263,17 @@ function renderWizardShell(component, ctx) {
   footer.setAttribute('data-slot-id', footerSlot);
   wrapper.appendChild(footer);
 
-  if (cancellable) wrapper.classList.add('tf-wizard-shell--cancellable');
+  // State marker only — controls.css defines no cancellable modifier, so this
+  // stays a data attribute instead of an unstyled class.
+  if (cancellable) wrapper.setAttribute('data-cancellable', 'true');
 
   return wrapper;
 }
 
 // =============================================================================
-// EmptyState (0x0003) — 6 fields (replaces temporary in data-list-renderer)
+// EmptyState (0x0003) — 6 fields, renders the dashboard <tf-empty-state>
+// web component (icon goes in via slot="icon", CTA buttons as light-DOM
+// children that the component sweeps into its actions area).
 // =============================================================================
 
 export const EMPTY_STATE_TAG = 0x0003;
@@ -285,40 +300,30 @@ function renderEmptyState(component, ctx) {
     assertComponentTag(secondaryActionRaw, BUTTON_TAG, 'EmptyState', 'secondary_action');
   }
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-empty-state', `tf-empty-state--variant-${variant}`);
+  const wrapper = document.createElement('tf-empty-state');
+  // 'default' carries no modifier — base component styling applies.
+  if (variant !== 'default') {
+    wrapper.classList.add(`tf-empty-state--variant-${variant}`);
+  }
   wrapper.setAttribute('role', 'status');
 
-  const iconEl = renderIcon(iconRaw, 'EmptyState.icon');
-  iconEl.classList.add('tf-empty-state__icon');
-  wrapper.appendChild(iconEl);
+  // renderIcon keeps full IconRef validation (named + asset) and size/tone
+  // classes; the component honours a slot="icon" child over its icon attr.
+  const iconSlot = document.createElement('span');
+  iconSlot.setAttribute('slot', 'icon');
+  iconSlot.appendChild(renderIcon(iconRaw, 'EmptyState.icon'));
+  wrapper.appendChild(iconSlot);
 
-  const headingEl = document.createElement('h3');
-  headingEl.classList.add('tf-empty-state__heading');
-  applyTextBind(headingEl, headingBind, ctx);
-  wrapper.appendChild(headingEl);
-
+  applyAttrBind(wrapper, 'title', headingBind, ctx);
   if (messageBind != null) {
-    const msg = document.createElement('p');
-    msg.classList.add('tf-empty-state__message');
-    applyTextBind(msg, messageBind, ctx);
-    wrapper.appendChild(msg);
+    applyAttrBind(wrapper, 'message', messageBind, ctx);
   }
 
-  if (primaryActionRaw != null || secondaryActionRaw != null) {
-    const actions = document.createElement('div');
-    actions.classList.add('tf-empty-state__actions');
-    if (primaryActionRaw != null) {
-      const btn = ctx.renderChild(primaryActionRaw);
-      btn.classList.add('tf-empty-state__action', 'tf-empty-state__action--primary');
-      actions.appendChild(btn);
-    }
-    if (secondaryActionRaw != null) {
-      const btn = ctx.renderChild(secondaryActionRaw);
-      btn.classList.add('tf-empty-state__action', 'tf-empty-state__action--secondary');
-      actions.appendChild(btn);
-    }
-    wrapper.appendChild(actions);
+  if (primaryActionRaw != null) {
+    wrapper.appendChild(ctx.renderChild(primaryActionRaw));
+  }
+  if (secondaryActionRaw != null) {
+    wrapper.appendChild(ctx.renderChild(secondaryActionRaw));
   }
 
   return wrapper;
@@ -479,13 +484,9 @@ function renderWelcomeHero(component, ctx) {
 
   const actionsEl = document.createElement('div');
   actionsEl.classList.add('tf-welcome-hero__actions');
-  const primaryBtn = ctx.renderChild(primaryActionRaw);
-  primaryBtn.classList.add('tf-welcome-hero__action--primary');
-  actionsEl.appendChild(primaryBtn);
+  actionsEl.appendChild(ctx.renderChild(primaryActionRaw));
   if (secondaryActionRaw != null) {
-    const secondaryBtn = ctx.renderChild(secondaryActionRaw);
-    secondaryBtn.classList.add('tf-welcome-hero__action--secondary');
-    actionsEl.appendChild(secondaryBtn);
+    actionsEl.appendChild(ctx.renderChild(secondaryActionRaw));
   }
   wrapper.appendChild(actionsEl);
 

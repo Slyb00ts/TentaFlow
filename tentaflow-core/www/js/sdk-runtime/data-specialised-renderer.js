@@ -1,13 +1,13 @@
 // =============================================================================
-// Plik: sdk-runtime/data-specialised-renderer.js
-// Opis: Renderery CalendarMonth (0x0223), Image (0x0224), VisuallyHidden
-// (0x0225), LiveRegionComponent (0x0226) — chunk 3.3d-15.
+// File: sdk-runtime/data-specialised-renderer.js
+// Description: Renderers for CalendarMonth (0x0223), Image (0x0224),
+// VisuallyHidden (0x0225), LiveRegionComponent (0x0226) — chunk 3.3d-15.
 //
-// CalendarMonth: statyczny widok miesiąca (grid 7 kolumn). month BindRef
-// "YYYY-MM", events_path opcjonalna (tablica {date, tone?, label?}),
-// show_week_numbers, first_day_of_week (sunday/monday). Handler day_click.
+// CalendarMonth: static month view (7-column grid). month BindRef
+// "YYYY-MM", optional events_path (array of {date, tone?, label?}),
+// show_week_numbers, first_day_of_week (sunday/monday). day_click handler.
 //
-// Image: <img> z src_ref BindRef, alt, width/height DimensionToken,
+// Image: <img> with src_ref BindRef, alt, width/height DimensionToken,
 // fit (cover/contain/fill/none), aspect_ratio, radius, clickable, lazy_load.
 //
 // VisuallyHidden: screen-reader-only content (CSS clip pattern). Optional
@@ -43,6 +43,15 @@ const MONTH_RE = /^\d{4}-(?:0[1-9]|1[0-2])$/;
 const DAY_NAMES_SUN = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
 const DAY_NAMES_MON = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 
+// Deliberately NOT <tf-calendar>: that element is an interactive scheduling
+// calendar (day/week/month/timeline views, internal nav state, drag slot
+// selection, datetime events {start,end,color}, Monday-first/Polish labels
+// hardcoded) whose month-view day click navigates into the day view. The SDK
+// CalendarMonth contract is a passive, host-bound month grid (BindRef month,
+// {date,tone} event markers, sunday/monday first-day, week numbers, plain
+// day_click). Adapting tf-calendar would require gating its header/nav/click
+// behavior — non-additive changes — so this stays a hand-rolled grid styled
+// by the shared .tf-calendar__* block in controls.css.
 function renderCalendarMonth(component, ctx) {
   assertOnlyKnownFields(component.fields, CALENDAR_MONTH_FIELD_KEYS, 'CalendarMonth');
 
@@ -416,7 +425,7 @@ function renderLiveRegion(component, ctx) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerDataSpecialisedRenderers() {

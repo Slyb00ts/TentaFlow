@@ -27,6 +27,10 @@ import {
   readBindSpec,
   formatValue,
 } from './bind-resolver.js';
+import {
+  SEARCHBOX_TAG, renderSearchBox,
+  SCROLLCONTAINER_TAG, renderScrollContainer,
+} from './form-search-scroll-renderer.js';
 
 // =============================================================================
 // Public registry — per-tag rendererzy
@@ -831,3 +835,6 @@ function applyBindSpec(element, bindSpec, ctx) {
       throw new TypeError(`applyBindSpec: unknown BindSpec.kind ${bindSpec.kind}`);
   }
 }
+
+registerComponentRenderer(SEARCHBOX_TAG, renderSearchBox);
+registerComponentRenderer(SCROLLCONTAINER_TAG, renderScrollContainer);

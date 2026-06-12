@@ -11,6 +11,7 @@ import {
 } from './component-renderer.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
 import { PIE_CHART_TAG } from './data-pie-chart-renderer.js';
+import '../components/tf-pie-chart.js';
 
 const results = [];
 function test(name, fn) {

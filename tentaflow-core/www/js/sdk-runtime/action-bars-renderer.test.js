@@ -1,9 +1,16 @@
 // =============================================================================
-// Plik: sdk-runtime/action-bars-renderer.test.js
-// Opis: Testy ActionBar/SegmentedControl/FilterChips/WizardFooter (3.3b-6).
+// File: sdk-runtime/action-bars-renderer.test.js
+// Description: Tests for ActionBar/SegmentedControl/FilterChips/WizardFooter
+//              against the tf-* component output (tf-segmented, tf-filter-chips,
+//              tf-button children).
 // =============================================================================
 
 import './_dom-test-harness.js';
+// Component modules register the custom elements the renderers instantiate.
+// tf-button is intentionally NOT imported (it pulls a browser-only root
+// import); tf-button assertions use tag-name queries on un-upgraded hosts.
+import '../components/tf-segmented.js';
+import '../components/tf-filter-chips.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -84,8 +91,8 @@ test('ActionBar renders leading + divider + trailing slots', () => {
     ])
   );
   assertEq(el.getAttribute('role'), 'toolbar');
-  assertEq(el.querySelectorAll('.tf-action-bar__leading .tf-button').length, 1);
-  assertEq(el.querySelectorAll('.tf-action-bar__trailing .tf-button').length, 2);
+  assertEq(el.querySelectorAll('.tf-action-bar__leading tf-button').length, 1);
+  assertEq(el.querySelectorAll('.tf-action-bar__trailing tf-button').length, 2);
   assert(el.querySelector('.tf-action-bar__divider') != null);
 });
 
@@ -117,7 +124,7 @@ test('ActionBar rejects non-Button child', () => {
 // SegmentedControl
 // ============================================================================
 
-test('SegmentedControl renders radiogroup z opcjami i ustawia aria-checked po store', () => {
+test('SegmentedControl renders tf-segmented and tracks store selection via value attribute', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -129,24 +136,28 @@ test('SegmentedControl renders radiogroup z opcjami i ustawia aria-checked po st
     comp(SEGMENTED_CONTROL_TAG, [
       [0, PATH('view')],
       [1, [
-        { value: { kind: 'tstr', value: 'list' }, label: { kind: 'literal', value: 'Lista' } },
-        { value: { kind: 'tstr', value: 'grid' }, label: { kind: 'literal', value: 'Siatka' } },
+        [[0, { kind: 'tstr', value: 'list' }], [1, { kind: 'literal', value: 'Lista' }]],
+        [[0, { kind: 'tstr', value: 'grid' }], [1, { kind: 'literal', value: 'Siatka' }]],
       ]],
       [2, 'md'],
       [3, false],
     ])
   );
-  assertEq(el.getAttribute('role'), 'radiogroup');
-  const opts = el.querySelectorAll('.tf-segmented__option');
-  assertEq(opts[0].getAttribute('aria-checked'), 'true');
-  assertEq(opts[1].getAttribute('aria-checked'), 'false');
-  // Patch w store przesuwa selection.
+  assertEq(el.tagName.toLowerCase(), 'tf-segmented');
+  assertEq(el.getAttribute('size'), 'md');
+  document.body.appendChild(el);
+  // tf-segmented builds option buttons on connect.
+  const opts = el.querySelectorAll('.tf-seg-opt');
+  assertEq(opts.length, 2);
+  assertEq(opts[0].textContent, 'Lista');
+  assertEq(opts[1].textContent, 'Siatka');
+  assertEq(el.getAttribute('value'), 'list');
+  // Store patch moves the selection (renderer drives the value attribute).
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('view'), op: { kind: 'set', value: 'grid' } }],
   });
-  assertEq(opts[0].getAttribute('aria-checked'), 'false');
-  assertEq(opts[1].getAttribute('aria-checked'), 'true');
+  assertEq(el.getAttribute('value'), 'grid');
 });
 
 test('SegmentedControl click dispatches change z detail.value+kind', () => {
@@ -156,21 +167,32 @@ test('SegmentedControl click dispatches change z detail.value+kind', () => {
     entries: [{ path: PATH('mode'), value: 1 }],
     state_revision: 0, truncated: false,
   });
-  const engine = makeEngine(store);
+  const dispatched = [];
+  const engine = new ComponentRenderer({
+    store,
+    eventDispatcher: { emit(e) { dispatched.push(e); } },
+    locale: 'en-US',
+  });
   const el = engine.render(
     comp(SEGMENTED_CONTROL_TAG, [
       [0, PATH('mode')],
       [1, [
-        { value: { kind: 'u32', value: 0 }, label: { kind: 'literal', value: 'A' } },
-        { value: { kind: 'u32', value: 1 }, label: { kind: 'literal', value: 'B' } },
+        [[0, { kind: 'u32', value: 0 }], [1, { kind: 'literal', value: 'A' }]],
+        [[0, { kind: 'u32', value: 1 }], [1, { kind: 'literal', value: 'B' }]],
       ]],
       [2, 'sm'], [3, false],
-    ])
+    ], { id: 'seg1', handlers: [['change', { kind: 'backend', operation_id: 'op' }]] })
   );
+  document.body.appendChild(el);
   let received = null;
   el.addEventListener('change', (e) => { received = e.detail; });
-  el.querySelectorAll('.tf-segmented__option')[0].click();
+  el.querySelectorAll('.tf-seg-opt')[0].click();
+  // Re-emitted event carries the typed SelectValue, not the raw tf-segmented string.
   assertEq(received, { value: 0, kind: 'u32' });
+  // SDK handler sees the same converted detail (raw event is blocked).
+  assertEq(dispatched.length, 1);
+  assertEq(dispatched[0].source_id, 'seg1');
+  assertEq(dispatched[0].dom_event.detail, { value: 0, kind: 'u32' });
 });
 
 test('SegmentedControl rejects empty options', () => {
@@ -190,7 +212,7 @@ test('SegmentedControl rejects option bez label i bez icon', () => {
     engine.render(
       comp(SEGMENTED_CONTROL_TAG, [
         [0, PATH('x')],
-        [1, [{ value: { kind: 'bool', value: true } }]],
+        [1, [[[0, { kind: 'bool', value: true }]]]],
         [2, 'md'], [3, false],
       ])
     )
@@ -204,7 +226,7 @@ test('SegmentedControl rejects SelectValue z unknown kind', () => {
     engine.render(
       comp(SEGMENTED_CONTROL_TAG, [
         [0, PATH('x')],
-        [1, [{ value: { kind: 'float', value: 3.14 }, label: { kind: 'literal', value: 'X' } }]],
+        [1, [[[0, { kind: 'float', value: 3.14 }], [1, { kind: 'literal', value: 'X' }]]]],
         [2, 'md'], [3, false],
       ])
     )
@@ -222,10 +244,10 @@ test('SegmentedControl icon-only z named icon bez label rejected (a11y)', () => 
     engine.render(
       comp(SEGMENTED_CONTROL_TAG, [
         [0, PATH('x')],
-        [1, [{
-          value: { kind: 'tstr', value: 'a' },
-          icon: { kind: 'named', name: 'star' },
-        }]],
+        [1, [[
+          [0, { kind: 'tstr', value: 'a' }],
+          [2, { kind: 'named', name: 'star' }],
+        ]]],
         [2, 'md'], [3, false],
       ])
     )
@@ -243,14 +265,15 @@ test('SegmentedControl icon-only z asset icon z alt OK', () => {
   const el = engine.render(
     comp(SEGMENTED_CONTROL_TAG, [
       [0, PATH('x')],
-      [1, [{
-        value: { kind: 'tstr', value: 'a' },
-        icon: { kind: 'asset', ref: '/x.png', alt: 'Star variant' },
-      }]],
+      [1, [[
+        [0, { kind: 'tstr', value: 'a' }],
+        [2, { kind: 'asset', ref: '/x.png', alt: 'Star variant' }],
+      ]]],
       [2, 'sm'], [3, false],
     ])
   );
-  assertEq(el.querySelectorAll('.tf-segmented__option').length, 1);
+  document.body.appendChild(el);
+  assertEq(el.querySelectorAll('.tf-seg-opt').length, 1);
 });
 
 test('FilterChips multi mode reflects selected_ids array', () => {
@@ -264,24 +287,30 @@ test('FilterChips multi mode reflects selected_ids array', () => {
   const el = engine.render(
     comp(FILTER_CHIPS_TAG, [
       [0, [
-        { id: 'a', label: { kind: 'literal', value: 'Alpha' } },
-        { id: 'b', label: { kind: 'literal', value: 'Beta' } },
+        [[0, 'a'], [1, { kind: 'literal', value: 'Alpha' }]],
+        [[0, 'b'], [1, { kind: 'literal', value: 'Beta' }]],
       ]],
       [1, PATH('sel')],
       [2, 'multi'],
       [3, false],
     ])
   );
-  const chips = el.querySelectorAll('.tf-filter-chips__chip');
-  // ARIA: role=checkbox (multi) używa aria-checked, nie aria-pressed.
-  assertEq(chips[0].getAttribute('aria-checked'), 'true');
-  assertEq(chips[1].getAttribute('aria-checked'), 'false');
+  assertEq(el.tagName.toLowerCase(), 'tf-filter-chips');
+  assertEq(el.getAttribute('mode'), 'multi');
+  document.body.appendChild(el);
+  // tf-filter-chips marks selection with the `active` class on chip buttons.
+  let chips = el.querySelectorAll('.tf-filter-chip');
+  assertEq(chips.length, 2);
+  assert(chips[0].classList.contains('active'));
+  assert(!chips[1].classList.contains('active'));
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('sel'), op: { kind: 'set', value: ['a', 'b'] } }],
   });
-  assertEq(chips[0].getAttribute('aria-checked'), 'true');
-  assertEq(chips[1].getAttribute('aria-checked'), 'true');
+  // The component re-renders chips on `.filters` assignment — re-query.
+  chips = el.querySelectorAll('.tf-filter-chip');
+  assert(chips[0].classList.contains('active'));
+  assert(chips[1].classList.contains('active'));
 });
 
 test('FilterChips chip click dispatches change z detail.chip_id', () => {
@@ -294,15 +323,16 @@ test('FilterChips chip click dispatches change z detail.chip_id', () => {
   const engine = makeEngine(store);
   const el = engine.render(
     comp(FILTER_CHIPS_TAG, [
-      [0, [{ id: 'x', label: { kind: 'literal', value: 'X' } }]],
+      [0, [[[0, 'x'], [1, { kind: 'literal', value: 'X' }]]]],
       [1, PATH('sel')],
       [2, 'multi'],
       [3, false],
     ])
   );
+  document.body.appendChild(el);
   let received = null;
   el.addEventListener('change', (e) => { received = e.detail; });
-  el.querySelector('.tf-filter-chips__chip').click();
+  el.querySelector('.tf-filter-chip').click();
   assertEq(received, { chip_id: 'x' });
 });
 
@@ -316,12 +346,14 @@ test('FilterChips clearable=true renders × button which dispatches clear', () =
   const engine = makeEngine(store);
   const el = engine.render(
     comp(FILTER_CHIPS_TAG, [
-      [0, [{ id: 'x', label: { kind: 'literal', value: 'X' } }]],
+      [0, [[[0, 'x'], [1, { kind: 'literal', value: 'X' }]]]],
       [1, PATH('sel')],
       [2, 'single'],
       [3, true],
     ])
   );
+  assert(el.hasAttribute('clearable'));
+  document.body.appendChild(el);
   const clear = el.querySelector('.tf-filter-chips__clear');
   assert(clear != null);
   let cleared = false;
@@ -343,19 +375,20 @@ test('FilterChips with count_path renders reactive count number', () => {
   const engine = makeEngine(store);
   const el = engine.render(
     comp(FILTER_CHIPS_TAG, [
-      [0, [{ id: 'a', label: { kind: 'literal', value: 'A' }, count_path: PATH('counts', 'a') }]],
+      [0, [[[0, 'a'], [1, { kind: 'literal', value: 'A' }], [4, PATH('counts', 'a')]]]],
       [1, PATH('sel')],
       [2, 'multi'],
       [3, false],
     ])
   );
-  const count = el.querySelector('.tf-filter-chips__chip-count');
-  assertEq(count.textContent, '42');
+  document.body.appendChild(el);
+  assertEq(el.querySelector('.tf-filter-chip-count').textContent, '42');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('counts', 'a'), op: { kind: 'set', value: 99 } }],
   });
-  assertEq(count.textContent, '99');
+  // Chips re-render on `.filters` assignment — re-query the count element.
+  assertEq(el.querySelector('.tf-filter-chip-count').textContent, '99');
 });
 
 test('FilterChips rejects duplicate chip id', () => {
@@ -365,8 +398,8 @@ test('FilterChips rejects duplicate chip id', () => {
     engine.render(
       comp(FILTER_CHIPS_TAG, [
         [0, [
-          { id: 'x', label: { kind: 'literal', value: 'A' } },
-          { id: 'x', label: { kind: 'literal', value: 'B' } },
+          [[0, 'x'], [1, { kind: 'literal', value: 'A' }]],
+          [[0, 'x'], [1, { kind: 'literal', value: 'B' }]],
         ]],
         [1, PATH('sel')], [2, 'multi'], [3, false],
       ])
@@ -390,14 +423,15 @@ test('WizardFooter renders all 4 optional buttons + extra w odpowiednich slotach
       [4, [btn('Pomoc')]],
     ])
   );
-  assert(el.querySelector('.tf-wizard-footer__back') != null);
-  assert(el.querySelector('.tf-wizard-footer__cancel') != null);
-  assert(el.querySelector('.tf-wizard-footer__next') != null);
-  assert(el.querySelector('.tf-wizard-footer__skip') != null);
-  assertEq(el.querySelectorAll('.tf-wizard-footer__center .tf-button').length, 1);
+  // Slot classes mark tf-button children placed by the renderer.
+  assertEq(el.querySelector('.tf-wizard-footer__back').tagName.toLowerCase(), 'tf-button');
+  assertEq(el.querySelector('.tf-wizard-footer__cancel').tagName.toLowerCase(), 'tf-button');
+  assertEq(el.querySelector('.tf-wizard-footer__next').tagName.toLowerCase(), 'tf-button');
+  assertEq(el.querySelector('.tf-wizard-footer__skip').tagName.toLowerCase(), 'tf-button');
+  assertEq(el.querySelectorAll('.tf-wizard-footer__center tf-button').length, 1);
   // Left = back + cancel; right = skip + next.
-  assertEq(el.querySelectorAll('.tf-wizard-footer__left .tf-button').length, 2);
-  assertEq(el.querySelectorAll('.tf-wizard-footer__right .tf-button').length, 2);
+  assertEq(el.querySelectorAll('.tf-wizard-footer__left tf-button').length, 2);
+  assertEq(el.querySelectorAll('.tf-wizard-footer__right tf-button').length, 2);
 });
 
 test('WizardFooter wszystkie 4 actions optional — empty extra_actions OK', () => {
@@ -407,7 +441,7 @@ test('WizardFooter wszystkie 4 actions optional — empty extra_actions OK', () 
     comp(WIZARD_FOOTER_TAG, [[4, []]])
   );
   assertEq(el.getAttribute('role'), 'toolbar');
-  assertEq(el.querySelectorAll('.tf-button').length, 0);
+  assertEq(el.querySelectorAll('tf-button').length, 0);
 });
 
 test('WizardFooter rejects non-Button w back_action', () => {

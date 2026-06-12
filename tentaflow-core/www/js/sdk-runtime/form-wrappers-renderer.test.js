@@ -1,9 +1,15 @@
 // =============================================================================
-// Plik: sdk-runtime/form-wrappers-renderer.test.js
-// Opis: Testy FormField/FormGroup/FormSection/Form — chunk 3.3c-8.
+// File: sdk-runtime/form-wrappers-renderer.test.js
+// Description: Tests for FormField/FormGroup/FormSection/Form. Children render
+// through the tf-input web component, so it is imported for happy-dom upgrade.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import { window as domWindow } from './_dom-test-harness.js';
+// tf-input observes child mutations; the harness does not export the
+// observer, so it is bridged here before the component is imported.
+if (!globalThis.MutationObserver) globalThis.MutationObserver = domWindow.MutationObserver;
+import '../components/tf-input.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -53,8 +59,14 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// tf-input builds its light DOM in connectedCallback, so tests that touch the
+// inner native <input> mount the rendered tree first.
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
-/// Minimalny Input do użycia jako child.
+/// Minimal Input used as a child component.
 function dummyInput(id = 'child') {
   return comp(INPUT_TAG, [
     [0, 'text'], [1, PATH('q')], [9, []], [18, 'md'],
@@ -220,7 +232,7 @@ test('FormGroup renderuje children + spacing class', () => {
     [2, false], [4, [dummyInput('i1'), dummyInput('i2')]],
     [5, 'md'],
   ]));
-  assertEq(el.querySelectorAll('.tf-input').length, 2);
+  assertEq(el.querySelectorAll('tf-input').length, 2);
   assert(el.classList.contains('tf-form-group--spacing-md'));
 });
 
@@ -457,7 +469,7 @@ test('Form pusta children throws', () => {
   ])));
 });
 
-test('Form disabled BindRef ustawia aria-disabled + native inputs', () => {
+test('Form disabled BindRef ustawia aria-disabled + tf-input host', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('lock'), value: true }], state_revision: 0, truncated: false });
@@ -467,25 +479,28 @@ test('Form disabled BindRef ustawia aria-disabled + native inputs', () => {
     [5, { kind: 'bound', path: PATH('lock') }],
   ]));
   assertEq(el.getAttribute('aria-disabled'), 'true');
-  assertEq(el.querySelector('input').hasAttribute('disabled'), true);
+  assertEq(el.querySelector('tf-input').hasAttribute('disabled'), true);
 });
 
-test('Form disabled flip OFF zdejmuje disabled z native inputs', () => {
+test('Form disabled flip OFF zdejmuje disabled z tf-input + inner input', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('lock'), value: true }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(FORM_TAG, [
+  const el = mount(engine.render(comp(FORM_TAG, [
     [0, [dummyInput('i')]], [1, 'x'], [2, []], [3, true], [4, 'stacked'],
     [5, { kind: 'bound', path: PATH('lock') }],
-  ]));
-  const input = el.querySelector('input');
-  assertEq(input.hasAttribute('disabled'), true);
+  ])));
+  const host = el.querySelector('tf-input');
+  assertEq(host.hasAttribute('disabled'), true);
+  // Component reflects the host attribute onto its internal native input.
+  assertEq(el.querySelector('input').disabled, true);
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('lock'), op: { kind: 'set', value: false } }],
   });
-  assertEq(input.hasAttribute('disabled'), false);
+  assertEq(host.hasAttribute('disabled'), false);
+  assertEq(el.querySelector('input').disabled, false);
   assertEq(el.hasAttribute('aria-disabled'), false);
 });
 

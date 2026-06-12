@@ -11,6 +11,7 @@ import {
 } from './component-renderer.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
 import { BAR_CHART_TAG, STACKED_BAR_TAG } from './data-bar-chart-renderer.js';
+import '../components/tf-bar-chart.js';
 
 const results = [];
 function test(name, fn) {

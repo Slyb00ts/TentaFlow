@@ -20,7 +20,7 @@ function safeIconName(value) {
 
 class TfTab extends HTMLElement {
   static get observedAttributes() {
-    return ['count', 'icon', 'disabled'];
+    return ['count', 'icon', 'disabled', 'label'];
   }
 
   constructor() {
@@ -55,13 +55,18 @@ class TfTab extends HTMLElement {
   _update() {
     const icon = safeIconName(this.getAttribute('icon'));
     const count = this.getAttribute('count');
+    // The `label` attribute (reactive via setAttribute) overrides the text
+    // captured from the light DOM at build time — mirrors tf-button/tf-chip.
+    const label = this.hasAttribute('label')
+      ? this.getAttribute('label')
+      : this._btn._label;
     const iconHtml = icon
       ? `<svg width="12" height="12" aria-hidden="true"><use href="#i-${icon}"/></svg>`
       : '';
     const countHtml = count
       ? `<span class="tf-tab-count">${escapeHtml(count)}</span>`
       : '';
-    this._btn.innerHTML = `${iconHtml}<span class="tf-tab-label">${escapeHtml(this._btn._label)}</span>${countHtml}`;
+    this._btn.innerHTML = `${iconHtml}<span class="tf-tab-label">${escapeHtml(label)}</span>${countHtml}`;
     this._btn.dataset.tabId = this.id || '';
     if (this.hasAttribute('disabled')) this._btn.setAttribute('disabled', '');
     else this._btn.removeAttribute('disabled');

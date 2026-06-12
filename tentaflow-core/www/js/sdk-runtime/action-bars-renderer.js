@@ -13,7 +13,6 @@ import {
   lookupComponentRenderer,
 } from './component-renderer.js';
 import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
-import { renderIcon } from './icon-renderer.js';
 import { BUTTON_TAG } from './action-button-renderer.js';
 
 const SEGMENT_SIZES = new Set(['sm', 'md', 'lg']);
@@ -241,11 +240,8 @@ function renderSegmentedControl(component, ctx) {
     if (!Array.isArray(opt)) {
       throw new TypeError(`SegmentedControl.options[${i}] must be FieldMap`);
     }
+    // Key 3 (badge) is accepted by the schema but not rendered by tf-segmented.
     assertOnlyKnownFieldMapKeys(opt, SEGMENT_OPTION_KEYS, `SegmentedControl.options[${i}]`);
-    const optBadge = ctx.readField(opt, 3);
-    if (optBadge != null) {
-      // Badge gracefully skipped
-    }
     const optValue = ctx.readField(opt, 0);
     if (optValue == null) {
       throw new TypeError(`SegmentedControl.options[${i}].value is required`);
@@ -306,18 +302,22 @@ function renderSegmentedControl(component, ctx) {
   applySelection();
   ctx.registerCleanup(ctx.store.subscribe(bindPath, applySelection));
 
-  // Forward tf-segmented 'change' event to SDK handler with SelectValue detail
+  // tf-segmented emits 'change' with detail.value = the stringified option
+  // value. SDK handlers expect the typed SelectValue {value, kind}, so the raw
+  // event is stopImmediatePropagation'd and a single synthetic 'change' tagged
+  // `__tfReemit` carries the converted value to the dispatcher.
   const onChange = (e) => {
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
     const rawVal = e.detail && e.detail.value;
-    // Find matching option to get the full SelectValue kind
     for (const { parsedValue } of optionMeta) {
       if (String(parsedValue.value) === String(rawVal)) {
-        seg.dispatchEvent(
-          new (globalThis.CustomEvent || globalThis.Event)('sdk-change', {
-            bubbles: false,
-            detail: { value: parsedValue.value, kind: parsedValue.tag },
-          })
-        );
+        const ce = new CustomEvent('change', {
+          bubbles: false,
+          detail: { value: parsedValue.value, kind: parsedValue.tag },
+        });
+        ce.__tfReemit = true;
+        seg.dispatchEvent(ce);
         return;
       }
     }
@@ -359,6 +359,7 @@ function renderFilterChips(component, ctx) {
 
   const el = document.createElement('tf-filter-chips');
   el.setAttribute('mode', mode);
+  if (clearable) el.setAttribute('clearable', '');
 
   // Parse chip definitions
   const seenIds = new Set();
@@ -383,10 +384,7 @@ function renderFilterChips(component, ctx) {
     if (chipLabel == null) {
       throw new TypeError(`FilterChips.chips[${i}].label must be BindRef`);
     }
-    const chipBadge = ctx.readField(chip, 3);
-    if (chipBadge != null) {
-      // Badge gracefully skipped
-    }
+    // Key 3 (badge) is accepted by the schema but not rendered by tf-filter-chips.
     const chipIcon = ctx.readField(chip, 2);
     const countPathRaw = ctx.readField(chip, 4);
     const countPath = countPathRaw == null
@@ -450,17 +448,22 @@ function renderFilterChips(component, ctx) {
     }
   }
 
-  // Forward tf-filter-chips change event with chip_id
+  // tf-filter-chips emits 'change' with detail {id, active, filters}. SDK
+  // handlers expect detail {chip_id}, so the raw event is
+  // stopImmediatePropagation'd and a synthetic 'change' tagged `__tfReemit`
+  // carries the SDK shape to the dispatcher. Selection state stays
+  // store-driven: rebuildFilters re-applies `.filters` on store patches.
   const onChange = (e) => {
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
     const chipId = e.detail && e.detail.id;
-    if (chipId != null) {
-      el.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('sdk-change', {
-          bubbles: false,
-          detail: { chip_id: chipId },
-        })
-      );
-    }
+    if (chipId == null) return;
+    const ce = new CustomEvent('change', {
+      bubbles: false,
+      detail: { chip_id: chipId },
+    });
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
   };
   el.addEventListener('change', onChange);
   ctx.registerCleanup(() => el.removeEventListener('change', onChange));

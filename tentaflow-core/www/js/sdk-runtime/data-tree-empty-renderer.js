@@ -1,8 +1,10 @@
 // =============================================================================
 // File: sdk-runtime/data-tree-empty-renderer.js
-// Description: Renderers for Tree (0x0213) kept as-is (no tf-tree component),
-//              and EmptyCell (0x0214) using <tf-empty-state> for empty_state
-//              display. Tree keeps full keyboard nav and lazy_load support.
+// Description: Renderers for Tree (0x0213) — uses the <tf-tree> web component
+//              (nodes/expandedIds/selectedId properties, expand/collapse/select
+//              events bridged 1:1 to SDK events) — and EmptyCell (0x0214) as a
+//              plain inline placeholder span. Keyboard nav and lazy_load live
+//              in <tf-tree>.
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/tables.rs.
 // =============================================================================
 
@@ -59,7 +61,7 @@ function validateNode(node, ctx) {
 }
 
 // =============================================================================
-// Tree (0x0213) — kept as-is (no tf-tree component)
+// Tree (0x0213) — uses <tf-tree> web component
 // =============================================================================
 
 export const TREE_TAG = 0x0213;
@@ -75,20 +77,15 @@ function renderTree(component, ctx) {
   const variant = requireEnum(ctx.readField(component.fields, 3), TREE_VARIANTS, 'Tree.variant');
   const lazyLoad = requireBool(ctx.readField(component.fields, 4), 'Tree.lazy_load');
 
+  // Wrapper is the SDK event boundary: <tf-tree> emits generic
+  // expand/collapse/select with `{ id }`, the wrapper re-emits the SDK shapes.
   const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-tree');
-  wrapper.classList.add(`tf-tree--variant-${variant}`);
-  wrapper.setAttribute('role', 'tree');
-  if (lazyLoad) wrapper.classList.add('tf-tree--lazy');
+  wrapper.classList.add('tf-tree-wrapper');
 
-  let nodeElements = new Map();
-  let flatVisible = [];
-  let rebuildCleanups = [];
-  const runRebuildCleanups = () => {
-    for (const fn of rebuildCleanups) { try { fn(); } catch {} }
-    rebuildCleanups = [];
-  };
-  ctx.registerCleanup(runRebuildCleanups);
+  const tfTree = document.createElement('tf-tree');
+  tfTree.setAttribute('variant', variant);
+  if (lazyLoad) tfTree.setAttribute('lazy', '');
+  wrapper.appendChild(tfTree);
 
   const getExpandedSet = () => {
     const raw = resolveBindRef(expandedIdsBind, ctx.store);
@@ -101,147 +98,34 @@ function renderTree(component, ctx) {
     return typeof v === 'string' ? v : null;
   };
 
-  const emit = (kind, detail) => {
-    wrapper.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)(kind, { bubbles: false, detail })
-    );
-  };
-
-  function renderNode(node, depth, parentIds) {
+  // Validates the full CBOR node tree and maps it to the <tf-tree> node shape
+  // (camelCase keys, icons pre-rendered to DOM nodes).
+  function mapNode(node, depth) {
     validateNode(node, `Tree.node[${node.id}]`);
     if (depth > NODE_MAX_DEPTH) {
       throw new TypeError(`Tree: node nesting > ${NODE_MAX_DEPTH} (id=${node.id})`);
     }
-    const li = document.createElement('li');
-    li.classList.add('tf-tree__node');
-    li.setAttribute('role', 'treeitem');
-    li.setAttribute('data-node-id', node.id);
-    li.setAttribute('data-depth', String(depth));
-    if (node.disabled === true) {
-      li.classList.add('tf-tree__node--disabled');
-      li.setAttribute('aria-disabled', 'true');
-    }
-    nodeElements.set(node.id, li);
-
-    const row = document.createElement('div');
-    row.classList.add('tf-tree__row');
-    row.style.paddingLeft = `${depth * 1.25}em`;
-    row.setAttribute('tabindex', '-1');
-
-    const expandedSet = getExpandedSet();
-    const isExpanded = expandedSet.has(node.id);
-    const hasChildren = (Array.isArray(node.children) && node.children.length > 0)
-      || (lazyLoad && node.has_children === true);
-
-    const caret = document.createElement('span');
-    caret.classList.add('tf-tree__caret');
-    caret.setAttribute('aria-hidden', 'true');
-    if (hasChildren) {
-      caret.textContent = isExpanded ? '▾' : '▸';
-      caret.classList.add('tf-tree__caret--clickable');
-    } else {
-      caret.textContent = ' ';
-      caret.classList.add('tf-tree__caret--empty');
-    }
-    row.appendChild(caret);
-
+    const mapped = {
+      id: node.id,
+      label: node.label != null ? node.label : undefined,
+      disabled: node.disabled === true,
+      hasChildren: node.has_children === true,
+    };
     if (variant === 'with_icons' && node.icon != null) {
-      const ic = renderIcon(node.icon, `Tree.node[${node.id}].icon`);
-      ic.classList.add('tf-tree__icon');
-      row.appendChild(ic);
+      mapped.icon = renderIcon(node.icon, `Tree.node[${node.id}].icon`);
     }
-
-    const label = document.createElement('span');
-    label.classList.add('tf-tree__label');
-    label.textContent = node.label != null ? node.label : node.id;
-    row.appendChild(label);
-
-    const selectedId = getSelected();
-    if (selectedId === node.id) {
-      li.classList.add('tf-tree__node--selected');
-      li.setAttribute('aria-selected', 'true');
+    if (Array.isArray(node.children)) {
+      mapped.children = node.children.map((c) => mapNode(c, depth + 1));
     }
-    if (hasChildren) {
-      li.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
-    }
-
-    const onCaretClick = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (!hasChildren) return;
-      if (node.disabled === true) return;
-      if (isExpanded) {
-        emit('collapse', { node_id: node.id });
-      } else {
-        emit('expand', { node_id: node.id, lazy_load: lazyLoad });
-      }
-    };
-    const onRowClick = (e) => {
-      e.preventDefault();
-      if (node.disabled === true) return;
-      if (e.target === caret || caret.contains(e.target)) {
-        onCaretClick(e);
-        return;
-      }
-      emit('select', { node_id: node.id });
-    };
-    row.addEventListener('click', onRowClick);
-    rebuildCleanups.push(() => row.removeEventListener('click', onRowClick));
-
-    li.appendChild(row);
-    flatVisible.push({ id: node.id, depth, hasChildren, expanded: isExpanded, disabled: node.disabled === true });
-
-    if (hasChildren && isExpanded && Array.isArray(node.children) && node.children.length > 0) {
-      const childList = document.createElement('ul');
-      childList.classList.add('tf-tree__children');
-      childList.setAttribute('role', 'group');
-      const nextPath = [...parentIds, node.id];
-      for (const child of node.children) {
-        childList.appendChild(renderNode(child, depth + 1, nextPath));
-      }
-      li.appendChild(childList);
-    }
-    return li;
+    return mapped;
   }
 
-  const rootList = document.createElement('ul');
-  rootList.classList.add('tf-tree__root');
-  rootList.setAttribute('role', 'group');
-  wrapper.appendChild(rootList);
-
-  let focusedId = null;
-  const captureFocus = () => {
-    const active = document.activeElement;
-    if (!active) return;
-    if (!wrapper.contains(active)) return;
-    const row = active.closest('.tf-tree__row');
-    if (!row || !wrapper.contains(row)) return;
-    const li = row.parentElement;
-    if (li && li.hasAttribute('data-node-id')) {
-      focusedId = li.getAttribute('data-node-id');
-    }
-  };
-  const restoreFocus = () => {
-    if (focusedId == null) return;
-    const li = nodeElements.get(focusedId);
-    if (!li) return;
-    const row = li.querySelector('.tf-tree__row');
-    if (row) try { row.focus(); } catch {}
-  };
-
   const rebuild = () => {
-    captureFocus();
-    runRebuildCleanups();
-    rootList.replaceChildren();
-    nodeElements = new Map();
-    flatVisible = [];
     let nodes;
     try { nodes = ctx.store.read(nodesPath); } catch { nodes = undefined; }
-    if (!Array.isArray(nodes)) return;
-    for (const n of nodes) {
-      rootList.appendChild(renderNode(n, 0, []));
-    }
-    restoreFocus();
+    tfTree.nodes = Array.isArray(nodes) ? nodes.map((n) => mapNode(n, 0)) : [];
+    tfTree.expandedIds = getExpandedSet();
+    tfTree.selectedId = getSelected();
   };
   rebuild();
   ctx.registerCleanup(ctx.store.subscribe(nodesPath, rebuild));
@@ -250,89 +134,29 @@ function renderTree(component, ctx) {
     ctx.registerCleanup(subscribeBindRef(selectedIdBind, ctx.store, rebuild));
   }
 
-  const focusNode = (id) => {
-    const li = nodeElements.get(id);
-    if (!li) return;
-    const row = li.querySelector('.tf-tree__row');
-    if (!row) return;
-    row.setAttribute('tabindex', '0');
-    for (const el of wrapper.querySelectorAll('.tf-tree__row')) {
-      if (el !== row) el.setAttribute('tabindex', '-1');
-    }
-    try { row.focus(); } catch {}
+  const emit = (kind, detail) => {
+    wrapper.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)(kind, { bubbles: false, detail })
+    );
   };
-
-  const onKey = (e) => {
-    const active = document.activeElement;
-    const activeRow = active && active.closest && active.closest('.tf-tree__row');
-    if (!activeRow || !wrapper.contains(activeRow)) return;
-    const activeLi = activeRow.parentElement;
-    const id = activeLi && activeLi.getAttribute('data-node-id');
-    if (id == null) return;
-    const idx = flatVisible.findIndex((n) => n.id === id);
-    const cur = flatVisible[idx];
-    if (!cur) return;
-    switch (e.key) {
-      case 'ArrowDown': {
-        e.preventDefault();
-        if (idx + 1 < flatVisible.length) focusNode(flatVisible[idx + 1].id);
-        return;
-      }
-      case 'ArrowUp': {
-        e.preventDefault();
-        if (idx > 0) focusNode(flatVisible[idx - 1].id);
-        return;
-      }
-      case 'ArrowRight': {
-        if (!cur.hasChildren) return;
-        e.preventDefault();
-        if (cur.disabled) return;
-        if (!cur.expanded) emit('expand', { node_id: cur.id, lazy_load: lazyLoad });
-        else if (idx + 1 < flatVisible.length && flatVisible[idx + 1].depth > cur.depth) {
-          focusNode(flatVisible[idx + 1].id);
-        }
-        return;
-      }
-      case 'ArrowLeft': {
-        e.preventDefault();
-        if (cur.expanded) {
-          if (cur.disabled) return;
-          emit('collapse', { node_id: cur.id });
-        } else if (cur.depth > 0) {
-          for (let i = idx - 1; i >= 0; i--) {
-            if (flatVisible[i].depth < cur.depth) { focusNode(flatVisible[i].id); break; }
-          }
-        }
-        return;
-      }
-      case 'Enter':
-      case ' ': {
-        e.preventDefault();
-        if (cur.disabled) return;
-        emit('select', { node_id: cur.id });
-        return;
-      }
-      case 'Home': {
-        e.preventDefault();
-        if (flatVisible.length > 0) focusNode(flatVisible[0].id);
-        return;
-      }
-      case 'End': {
-        e.preventDefault();
-        if (flatVisible.length > 0) focusNode(flatVisible[flatVisible.length - 1].id);
-        return;
-      }
-    }
-  };
-  wrapper.addEventListener('keydown', onKey);
-  ctx.registerCleanup(() => wrapper.removeEventListener('keydown', onKey));
+  const onExpand = (e) => emit('expand', { node_id: e.detail.id, lazy_load: lazyLoad });
+  const onCollapse = (e) => emit('collapse', { node_id: e.detail.id });
+  const onSelect = (e) => emit('select', { node_id: e.detail.id });
+  tfTree.addEventListener('expand', onExpand);
+  tfTree.addEventListener('collapse', onCollapse);
+  tfTree.addEventListener('select', onSelect);
+  ctx.registerCleanup(() => {
+    tfTree.removeEventListener('expand', onExpand);
+    tfTree.removeEventListener('collapse', onCollapse);
+    tfTree.removeEventListener('select', onSelect);
+  });
 
   return wrapper;
 }
 
 // =============================================================================
-// EmptyCell (0x0214) — uses <tf-empty-state> for n_a/loading, plain span
-//                       for simple dash/em_dash/none variants
+// EmptyCell (0x0214) — plain inline <span> placeholder (table cell context,
+//                       not a full empty-state panel)
 // =============================================================================
 
 export const EMPTY_CELL_TAG = 0x0214;

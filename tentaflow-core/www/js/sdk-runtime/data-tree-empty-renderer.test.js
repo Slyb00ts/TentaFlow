@@ -4,6 +4,7 @@
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-tree.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -72,7 +73,7 @@ test('Tree renderuje flat root nodes', () => {
     [0, PATH('nodes')], [1, { kind: 'bound', path: PATH('exp') }],
     [3, 'default'], [4, false],
   ]));
-  assertEq(el.getAttribute('role'), 'tree');
+  assertEq(el.querySelector('.tf-tree').getAttribute('role'), 'tree');
   assertEq(el.querySelectorAll('.tf-tree__node').length, 2);
 });
 

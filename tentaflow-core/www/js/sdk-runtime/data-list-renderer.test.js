@@ -285,9 +285,13 @@ test('EmptyState renderuje icon+heading+message+actions', () => {
     message: { kind: 'literal', value: 'Click below to add' },
     primary,
   }));
-  assertEq(el.querySelector('.tf-empty-state__heading').textContent, 'No items');
-  assertEq(el.querySelector('.tf-empty-state__message').textContent, 'Click below to add');
-  assert(el.querySelector('.tf-empty-state__action--primary') != null);
+  // molecule-shell renders the <tf-empty-state> web component: heading/message
+  // land in attributes, icon in slot="icon", actions as tf-button children.
+  assertEq(el.tagName, 'TF-EMPTY-STATE');
+  assertEq(el.getAttribute('title'), 'No items');
+  assertEq(el.getAttribute('message'), 'Click below to add');
+  assert(el.querySelector('[slot="icon"]') != null);
+  assert(el.querySelector('tf-button') != null);
 });
 
 test('EmptyState variant=illustrated ustawia klasę', () => {

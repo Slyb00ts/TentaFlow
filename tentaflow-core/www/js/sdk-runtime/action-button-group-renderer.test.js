@@ -1,6 +1,7 @@
 // =============================================================================
-// Plik: sdk-runtime/action-button-group-renderer.test.js
-// Opis: Testy ButtonGroup (tag 0x0403) — chunk 3.3b-4.
+// File: sdk-runtime/action-button-group-renderer.test.js
+// Description: Tests for ButtonGroup (tag 0x0403) — wrapper div with tf-button
+//              children rendered through the SDK Button renderer.
 // =============================================================================
 
 import './_dom-test-harness.js';
@@ -78,7 +79,7 @@ test('ButtonGroup renders div role=group z orientation class', () => {
   assert(el.classList.contains('tf-button-group'));
   assert(el.classList.contains('tf-button-group--orientation-horizontal'));
   assert(!el.classList.contains('tf-button-group--attached'));
-  assertEq(el.querySelectorAll('.tf-button').length, 3);
+  assertEq(el.querySelectorAll('tf-button').length, 3);
 });
 
 test('ButtonGroup vertical attached=true', () => {
@@ -133,7 +134,7 @@ test('ButtonGroup empty buttons array is valid (empty group)', () => {
   const el = engine.render(
     comp(BUTTON_GROUP_TAG, [[0, []], [1, 'horizontal'], [2, false]])
   );
-  assertEq(el.querySelectorAll('.tf-button').length, 0);
+  assertEq(el.querySelectorAll('tf-button').length, 0);
 });
 
 test('ButtonGroup rejects unknown field key', () => {
@@ -180,7 +181,7 @@ test('ButtonGroup propaguje handlers + bind do dzieci Button', () => {
       [1, 'horizontal'], [2, false],
     ])
   );
-  el.querySelector('.tf-button').click();
+  el.querySelector('tf-button').click();
   assertEq(dispatched.length, 1);
   assertEq(dispatched[0].source_id, 'btn-save');
 });

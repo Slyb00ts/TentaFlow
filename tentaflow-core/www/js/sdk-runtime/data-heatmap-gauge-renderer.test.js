@@ -1,9 +1,12 @@
 // =============================================================================
-// Plik: sdk-runtime/data-heatmap-gauge-renderer.test.js
-// Opis: Testy Heatmap (0x021B) + Gauge (0x021C) — chunk 3.3d-12.
+// File: sdk-runtime/data-heatmap-gauge-renderer.test.js
+// Description: Tests for Heatmap (0x021B) + Gauge (0x021C) renderers backed by
+// the <tf-heatmap> and <tf-gauge> web components.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-heatmap.js';
+import '../components/tf-gauge.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -72,7 +75,7 @@ function heatmapFields({
   ];
 }
 
-test('Heatmap renderuje rect per cell', () => {
+test('Heatmap renderuje pełną siatkę rows×cols przez tf-heatmap', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -87,11 +90,11 @@ test('Heatmap renderuje rect per cell', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(HEATMAP_TAG, heatmapFields()));
   document.body.appendChild(el);
-  const cells = el.querySelectorAll('rect.tf-heatmap__cell');
+  // tf-heatmap renders the full 2x2 grid; each provided cell got a level.
+  const cells = el.querySelectorAll('.tf-heatmap-cell');
   assertEq(cells.length, 4);
-  // Cell ma data-attrs.
-  assertEq(cells[0].getAttribute('data-row-id'), 'r1');
-  assertEq(cells[0].getAttribute('data-col-id'), 'c1');
+  // value=100 normalizes to 1.0 → highest level bucket.
+  assertEq(el.querySelectorAll('.tf-heatmap-cell[data-level="4"]').length, 1);
 });
 
 test('Heatmap pomija unknown row_id/col_id', () => {
@@ -99,19 +102,21 @@ test('Heatmap pomija unknown row_id/col_id', () => {
   const store = makeStore();
   store.applySnapshot({
     entries: [{ path: PATH('cells'), value: [
-      { row_id: 'r1', col_id: 'c1', value: 10 },
-      { row_id: 'unknown', col_id: 'c1', value: 20 },
-      { row_id: 'r1', col_id: 'unknown', value: 30 },
+      { row_id: 'r1', col_id: 'c1', value: 80 },
+      { row_id: 'unknown', col_id: 'c1', value: 90 },
+      { row_id: 'r1', col_id: 'unknown', value: 95 },
     ] }],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(HEATMAP_TAG, heatmapFields()));
   document.body.appendChild(el);
-  assertEq(el.querySelectorAll('rect.tf-heatmap__cell').length, 1);
+  // The grid stays 2x2 but only the known cell carries a non-zero level.
+  assertEq(el.querySelectorAll('.tf-heatmap-cell').length, 4);
+  assertEq(el.querySelectorAll('.tf-heatmap-cell[data-level]').length, 1);
 });
 
-test('Heatmap legend categorical renderuje per-bucket swatch', () => {
+test('Heatmap categorical scale waliduje się i renderuje legendę', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -129,8 +134,8 @@ test('Heatmap legend categorical renderuje per-bucket swatch', () => {
   }});
   const el = engine.render(comp(HEATMAP_TAG, fields));
   document.body.appendChild(el);
-  const buckets = el.querySelectorAll('.tf-heatmap__legend-bucket');
-  assertEq(buckets.length, 3);
+  assert(el.querySelector('.tf-heatmap-legend') != null);
+  assertEq(el.querySelectorAll('.tf-heatmap-legend-swatch').length, 4);
 });
 
 test('Heatmap legend=none nie renderuje legendy', () => {
@@ -140,7 +145,7 @@ test('Heatmap legend=none nie renderuje legendy', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(HEATMAP_TAG, heatmapFields({ legendPosition: 'none' })));
   document.body.appendChild(el);
-  assert(el.querySelector('.tf-heatmap__legend') == null);
+  assert(el.querySelector('.tf-heatmap-legend') == null);
 });
 
 test('Heatmap reaguje na zmianę cells_path', () => {
@@ -150,7 +155,8 @@ test('Heatmap reaguje na zmianę cells_path', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(HEATMAP_TAG, heatmapFields()));
   document.body.appendChild(el);
-  assertEq(el.querySelectorAll('rect.tf-heatmap__cell').length, 1);
+  // value=10 → 0.1 → level 0 (no data-level attribute).
+  assertEq(el.querySelectorAll('.tf-heatmap-cell[data-level]').length, 0);
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('cells'), op: { kind: 'set', value: [
@@ -158,7 +164,9 @@ test('Heatmap reaguje na zmianę cells_path', () => {
       { row_id: 'r2', col_id: 'c2', value: 80 },
     ] } }],
   });
-  assertEq(el.querySelectorAll('rect.tf-heatmap__cell').length, 2);
+  // value=80 → 0.8 → level 4 appears after the patch.
+  assertEq(el.querySelectorAll('.tf-heatmap-cell').length, 4);
+  assertEq(el.querySelectorAll('.tf-heatmap-cell[data-level="4"]').length, 1);
 });
 
 test('Heatmap odrzuca scale.linear z min>=max', () => {

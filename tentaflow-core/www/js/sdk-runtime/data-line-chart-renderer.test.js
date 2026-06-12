@@ -11,6 +11,7 @@ import {
 } from './component-renderer.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
 import { LINE_CHART_TAG } from './data-line-chart-renderer.js';
+import '../components/tf-line-chart.js';
 
 const results = [];
 function test(name, fn) {

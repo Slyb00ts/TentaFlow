@@ -1,11 +1,12 @@
 // =============================================================================
 // File: sdk-runtime/molecule-shell-renderer.test.js
 // Description: Tests for AppShell (0x0006), LoginShell (0x0007),
-// WizardShell (0x000B), EmptyState (0x0003), ErrorBoundary (0x0008),
-// WelcomeHero (0x0009) — chunk 3.3f.
+// WizardShell (0x000B), EmptyState (0x0003 → <tf-empty-state>),
+// ErrorBoundary (0x0008), WelcomeHero (0x0009) — chunk 3.3f.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import { window as harnessWindow } from './_dom-test-harness.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -17,6 +18,12 @@ import {
   EMPTY_STATE_TAG, ERROR_BOUNDARY_TAG, WELCOME_HERO_TAG,
 } from './molecule-shell-renderer.js';
 import { BUTTON_TAG } from './action-button-renderer.js';
+
+// The harness exports bound globals; a bound class has no .prototype, which
+// breaks `class X extends HTMLElement`. Restore the raw constructor before
+// loading web components (dynamic import runs after the harness).
+globalThis.HTMLElement = harnessWindow.HTMLElement;
+await import('../components/tf-empty-state.js');
 
 const results = [];
 function test(name, fn) {
@@ -69,6 +76,11 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// Attach to the document so custom elements upgrade (connectedCallback)
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
 // ============================================================================
 // AppShell (0x0006)
@@ -91,7 +103,7 @@ test('AppShell renders sidebar and content slots', () => {
   assert(sidebar.classList.contains('tf-app-shell__sidebar'), 'sidebar class');
 });
 
-test('AppShell renders collapsible sidebar with toggle', () => {
+test('AppShell renders collapsible sidebar with tf-button toggle', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(APP_SHELL_TAG, [
@@ -100,9 +112,25 @@ test('AppShell renders collapsible sidebar with toggle', () => {
     [3, 'md'],
     [4, true],
   ]));
-  assert(el.classList.contains('tf-app-shell--collapsible'), 'collapsible');
   const toggle = el.querySelector('.tf-app-shell__sidebar-toggle');
   assert(toggle != null, 'toggle present');
+  assertEq(toggle.tagName, 'TF-BUTTON', 'toggle is tf-button');
+  assertEq(toggle.getAttribute('aria-expanded'), 'true', 'expanded initially');
+  toggle.dispatchEvent(new Event('click', { bubbles: true }));
+  assert(el.classList.contains('tf-app-shell--sidebar-collapsed'), 'collapsed class after click');
+  assertEq(toggle.getAttribute('aria-expanded'), 'false', 'aria-expanded after click');
+});
+
+test('AppShell without collapsible has no toggle', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(APP_SHELL_TAG, [
+    [0, 'nav'],
+    [1, 'body'],
+    [3, 'md'],
+    [4, false],
+  ]));
+  assert(el.querySelector('.tf-app-shell__sidebar-toggle') == null, 'no toggle');
 });
 
 test('AppShell renders optional header slot', () => {
@@ -198,7 +226,7 @@ test('WizardShell renders steps and content/footer slots', () => {
     [4, true],
   ]));
   assert(el.classList.contains('tf-wizard-shell'), 'class');
-  assert(el.classList.contains('tf-wizard-shell--cancellable'), 'cancellable');
+  assertEq(el.getAttribute('data-cancellable'), 'true', 'cancellable marker');
   const stepEls = el.querySelectorAll('.tf-wizard-shell__step');
   assertEq(stepEls.length, 3, 'three steps');
   assert(stepEls[1].classList.contains('tf-wizard-shell__step--current'), 'step2 current');
@@ -229,39 +257,62 @@ test('WizardShell renders without steps', () => {
   ]));
   const steps = el.querySelector('.tf-wizard-shell__steps');
   assert(steps == null, 'no steps nav when empty');
+  assert(el.getAttribute('data-cancellable') == null, 'no cancellable marker');
 });
 
 // ============================================================================
-// EmptyState (0x0003)
+// EmptyState (0x0003) — <tf-empty-state>
 // ============================================================================
 
-test('EmptyState renders icon, heading, variant', () => {
+test('EmptyState renders <tf-empty-state> with icon slot and heading', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(EMPTY_STATE_TAG, [
+  const el = mount(engine.render(comp(EMPTY_STATE_TAG, [
     [0, ICON_NAMED('file')],
     [1, LIT('No items')],
     [5, 'default'],
-  ]));
-  assert(el.classList.contains('tf-empty-state'), 'class');
-  assert(el.classList.contains('tf-empty-state--variant-default'), 'variant');
-  assert(el.querySelector('.tf-empty-state__heading').textContent === 'No items', 'heading');
+  ])));
+  assertEq(el.tagName, 'TF-EMPTY-STATE', 'web component tag');
+  assertEq(el.getAttribute('title'), 'No items', 'title attribute');
   assert(el.getAttribute('role') === 'status', 'role');
+  // 'default' variant adds no modifier class
+  assert(!el.classList.contains('tf-empty-state--variant-default'), 'no default modifier');
+  assert(el.querySelector('.tf-empty-state-title') != null, 'component built');
+  assertEq(el.querySelector('.tf-empty-state-title').textContent, 'No items', 'title rendered');
+  assert(el.querySelector('.tf-empty-state-icon .tf-icon') != null, 'slotted icon in icon area');
 });
 
-test('EmptyState renders message and actions', () => {
+test('EmptyState renders message and CTA tf-buttons in actions area', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(EMPTY_STATE_TAG, [
+  const el = mount(engine.render(comp(EMPTY_STATE_TAG, [
     [0, ICON_NAMED('search')],
     [1, LIT('Nothing found')],
     [2, LIT('Try adjusting your filters')],
     [3, btnComp('Clear')],
     [5, 'illustrated'],
-  ]));
-  assert(el.querySelector('.tf-empty-state__message').textContent === 'Try adjusting your filters', 'message');
-  assert(el.querySelector('.tf-empty-state__actions') != null, 'actions');
-  assert(el.classList.contains('tf-empty-state--variant-illustrated'), 'illustrated');
+  ])));
+  assertEq(el.getAttribute('message'), 'Try adjusting your filters', 'message attribute');
+  assertEq(el.querySelector('.tf-empty-state-message').textContent, 'Try adjusting your filters', 'message rendered');
+  assert(el.classList.contains('tf-empty-state--variant-illustrated'), 'illustrated modifier');
+  const actions = el.querySelector('.tf-empty-state-actions');
+  assert(actions != null, 'actions area');
+  assertEq(actions.querySelectorAll('tf-button').length, 1, 'CTA is tf-button');
+});
+
+test('EmptyState renders primary + secondary actions', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(EMPTY_STATE_TAG, [
+    [0, ICON_NAMED('add')],
+    [1, LIT('Empty')],
+    [3, btnComp('Create')],
+    [4, btnComp('Import')],
+    [5, 'compact'],
+  ])));
+  assert(el.classList.contains('tf-empty-state--variant-compact'), 'compact modifier');
+  const actions = el.querySelector('.tf-empty-state-actions');
+  assertEq(actions.querySelectorAll('tf-button').length, 2, 'two CTA buttons');
 });
 
 test('EmptyState rejects non-Button primary_action', () => {
@@ -281,6 +332,16 @@ test('EmptyState requires icon', () => {
   assertThrows(() => engine.render(comp(EMPTY_STATE_TAG, [
     [1, LIT('No icon')],
     [5, 'default'],
+  ])));
+});
+
+test('EmptyState rejects unknown variant', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(EMPTY_STATE_TAG, [
+    [0, ICON_NAMED('file')],
+    [1, LIT('E')],
+    [5, 'huge'],
   ])));
 });
 
@@ -327,6 +388,7 @@ test('ErrorBoundary renders actions as Button children', () => {
   const actions = el.querySelector('.tf-error-boundary__actions');
   assert(actions != null, 'actions');
   assertEq(actions.children.length, 2, 'two action buttons');
+  assertEq(actions.children[0].tagName, 'TF-BUTTON', 'actions are tf-button');
 });
 
 test('ErrorBoundary rejects non-Button actions', () => {
@@ -356,7 +418,9 @@ test('WelcomeHero renders illustration, title, subtitle, primary action', () => 
   assert(el.querySelector('.tf-welcome-hero__illustration') != null, 'illustration');
   assert(el.querySelector('.tf-welcome-hero__title').textContent === 'Welcome!', 'title');
   assert(el.querySelector('.tf-welcome-hero__subtitle').textContent === 'Get started with TentaFlow', 'subtitle');
-  assert(el.querySelector('.tf-welcome-hero__actions') != null, 'actions');
+  const actions = el.querySelector('.tf-welcome-hero__actions');
+  assert(actions != null, 'actions');
+  assertEq(actions.children[0].tagName, 'TF-BUTTON', 'primary is tf-button');
 });
 
 test('WelcomeHero renders features list', () => {

@@ -11,6 +11,7 @@ import {
 } from './component-renderer.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
 import { AREA_CHART_TAG } from './data-area-chart-renderer.js';
+import '../components/tf-area-chart.js';
 
 const results = [];
 function test(name, fn) {

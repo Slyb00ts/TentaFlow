@@ -1,11 +1,12 @@
 // =============================================================================
 // File: sdk-runtime/molecule-page-renderer.test.js
-// Description: Tests for Header (0x0001), PageHeader (0x0002),
-// SectionHeader (0x0004), Toolbar (0x0005), StatGroup (0x000A),
-// Inspector (0x000C) — chunk 3.3f.
+// Description: Tests for Header (0x0001 → <tf-detail-header>),
+// PageHeader (0x0002), SectionHeader (0x0004), Toolbar (0x0005),
+// StatGroup (0x000A), Inspector (0x000C) — chunk 3.3f.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import { window as harnessWindow } from './_dom-test-harness.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -18,8 +19,19 @@ import {
 } from './molecule-page-renderer.js';
 import { BUTTON_TAG } from './action-button-renderer.js';
 import { STAT_CARD_TAG } from './data-stat-labels-renderer.js';
-import { SEGMENTED_CONTROL_TAG } from './action-bars-renderer.js';
-import { SELECT_TAG } from './form-select-renderer.js';
+
+// The harness exports bound globals; a bound class has no .prototype, which
+// breaks `class X extends HTMLElement`. Restore the raw constructor before
+// loading web components (dynamic import runs after the harness).
+globalThis.HTMLElement = harnessWindow.HTMLElement;
+// happy-dom exposes observers on the window object only — bridge for tf-tabs.
+globalThis.ResizeObserver = harnessWindow.ResizeObserver;
+// Keep rAF inert so tf-tabs skips its layout passes (no real layout in Node).
+globalThis.requestAnimationFrame = () => 0;
+await import('../components/tf-detail-header.js');
+await import('../components/tf-tabs.js');
+await import('../components/tf-chip.js');
+await import('../components/tf-badge.js');
 
 const results = [];
 function test(name, fn) {
@@ -40,7 +52,6 @@ function assertThrows(fn, m) {
 const PATH = (...segs) => segs.map((s) =>
   typeof s === 'number' ? { kind: 'index', value: s } : { kind: 'key', value: s });
 const LIT = (value) => ({ kind: 'literal', value });
-const BOUND = (...segs) => ({ kind: 'bound', path: PATH(...segs) });
 const ICON_NAMED = (name) => ({ kind: 'named', name, size: null, tone: null });
 
 function makeStore() { return new StateStore({ addon_id: 'a', panel_id: 'p', panel_epoch: 1n }); }
@@ -72,55 +83,74 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// Attach to the document so custom elements upgrade (connectedCallback)
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
 // ============================================================================
-// Header (0x0001)
+// Header (0x0001) — <tf-detail-header>
 // ============================================================================
 
-test('Header renders with icon, title, and density', () => {
+test('Header renders <tf-detail-header> with icon slot, title, density', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(HEADER_TAG, [
+  const el = mount(engine.render(comp(HEADER_TAG, [
     [0, ICON_NAMED('user')],
     [1, LIT('Test Header')],
     [4, []],
     [5, []],
     [6, 'compact'],
-  ]));
-  assert(el.classList.contains('tf-header'), 'has tf-header class');
-  assert(el.classList.contains('tf-header--density-compact'), 'compact density');
-  assert(el.querySelector('.tf-header__title').textContent === 'Test Header', 'title text');
+  ])));
+  assertEq(el.tagName, 'TF-DETAIL-HEADER', 'web component tag');
+  assertEq(el.getAttribute('title'), 'Test Header', 'title attribute');
+  assertEq(el.getAttribute('data-density'), 'compact', 'density marker');
+  assertEq(el.querySelector('.tf-detail-title').textContent, 'Test Header', 'title rendered');
+  assert(el.querySelector('.tf-detail-icon .tf-icon') != null, 'slotted icon in icon circle');
 });
 
-test('Header renders actions as Button children', () => {
+test('Header renders actions as tf-button children in actions area', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(HEADER_TAG, [
+  const el = mount(engine.render(comp(HEADER_TAG, [
     [0, ICON_NAMED('settings')],
     [1, LIT('Actions')],
     [4, []],
     [5, [btnComp('Save'), btnComp('Cancel')]],
     [6, 'default'],
-  ]));
-  const actions = el.querySelector('.tf-header__actions');
-  assert(actions != null, 'actions container exists');
-  assertEq(actions.children.length, 2, 'two action buttons');
+  ])));
+  const actions = el.querySelector('.tf-detail-actions');
+  assert(actions != null, 'actions area exists');
+  assertEq(actions.querySelectorAll('tf-button').length, 2, 'two tf-button actions');
 });
 
-test('Header renders subtitle and meta chips', () => {
+test('Header renders subtitle, status badge and meta chips', () => {
   setup();
   const engine = makeEngine();
+  const badge = { 0: 'status', 1: 'success', 2: LIT('Active') };
   const chip = { 0: 'solid', 1: 'info', 2: LIT('tag1') };
-  const el = engine.render(comp(HEADER_TAG, [
+  const el = mount(engine.render(comp(HEADER_TAG, [
     [0, ICON_NAMED('check')],
     [1, LIT('Main')],
+    [2, badge],
     [3, LIT('Sub title')],
     [4, [chip]],
     [5, []],
     [6, 'default'],
-  ]));
-  assert(el.querySelector('.tf-header__subtitle').textContent === 'Sub title', 'subtitle');
-  assert(el.querySelector('.tf-inline-chip') != null, 'meta chip rendered');
+  ])));
+  assertEq(el.getAttribute('subtitle'), 'Sub title', 'subtitle attribute');
+  assertEq(el.querySelector('.tf-detail-subtitle').textContent, 'Sub title', 'subtitle rendered');
+  const badges = el.querySelector('.tf-detail-badges');
+  assert(badges != null, 'badges area');
+  const badgeEl = badges.querySelector('tf-badge');
+  assert(badgeEl != null, 'status badge is tf-badge');
+  assertEq(badgeEl.getAttribute('tone'), 'success', 'badge tone mapped');
+  assertEq(badgeEl.getAttribute('value'), 'Active', 'badge value');
+  const chipEl = badges.querySelector('tf-chip');
+  assert(chipEl != null, 'meta chip is tf-chip');
+  assertEq(chipEl.getAttribute('label'), 'tag1', 'chip label');
+  assertEq(chipEl.getAttribute('status'), 'info', 'chip status mapped');
 });
 
 test('Header rejects unknown field key', () => {
@@ -177,29 +207,32 @@ test('PageHeader renders breadcrumbs', () => {
     [2, crumbs],
     [3, []],
   ]));
-  const bc = el.querySelector('.tf-molecule-breadcrumbs');
-  assert(bc != null, 'breadcrumbs rendered');
-  const items = bc.querySelectorAll('.tf-molecule-breadcrumbs__item');
+  const list = el.querySelector('.tf-molecule-breadcrumbs__list');
+  assert(list != null, 'breadcrumbs rendered');
+  const items = list.querySelectorAll('.tf-molecule-breadcrumbs__item');
   assertEq(items.length, 2, 'two breadcrumb items');
+  assert(items[1].classList.contains('tf-molecule-breadcrumbs__item--current'), 'second current');
 });
 
-test('PageHeader renders tabs', () => {
+test('PageHeader renders tabs as <tf-tabs> with tf-tab children', () => {
   setup();
   const engine = makeEngine();
   const tabs = [
     { 0: 'tab1', 1: LIT('General') },
     { 0: 'tab2', 1: LIT('Advanced'), 5: true },
   ];
-  const el = engine.render(comp(PAGE_HEADER_TAG, [
+  const el = mount(engine.render(comp(PAGE_HEADER_TAG, [
     [0, LIT('Page')],
     [3, []],
     [4, tabs],
-  ]));
-  const tabNav = el.querySelector('.tf-molecule-tabs');
-  assert(tabNav != null, 'tabs rendered');
-  const tabBtns = tabNav.querySelectorAll('.tf-molecule-tabs__tab');
-  assertEq(tabBtns.length, 2, 'two tabs');
-  assert(tabBtns[1].disabled, 'second tab locked');
+  ])));
+  const tabsEl = el.querySelector('tf-tabs');
+  assert(tabsEl != null, 'tf-tabs rendered');
+  const tabEls = tabsEl.querySelectorAll('tf-tab');
+  assertEq(tabEls.length, 2, 'two tabs');
+  assertEq(tabEls[0].getAttribute('label'), 'General', 'first label');
+  assert(tabEls[1].hasAttribute('disabled'), 'second tab locked');
+  assert(tabEls[1].querySelector('button').disabled, 'locked tab button disabled');
 });
 
 // ============================================================================
@@ -241,6 +274,7 @@ test('SectionHeader renders actions', () => {
   const actions = el.querySelector('.tf-section-header__actions');
   assert(actions != null, 'actions');
   assertEq(actions.children.length, 1, 'one action');
+  assertEq(actions.children[0].tagName, 'TF-BUTTON', 'action is tf-button');
 });
 
 // ============================================================================
@@ -284,7 +318,7 @@ test('Toolbar rejects wrong search tag', () => {
   ])));
 });
 
-test('Toolbar renders filter chips', () => {
+test('Toolbar renders filter chips as clickable tf-chip', () => {
   setup();
   const engine = makeEngine();
   const filters = [
@@ -296,15 +330,21 @@ test('Toolbar renders filter chips', () => {
     [4, []],
     [5, 'default'],
   ]));
-  const filterChips = el.querySelectorAll('.tf-molecule-filters__chip');
-  assertEq(filterChips.length, 2, 'two filter chips');
+  const filtersEl = el.querySelector('.tf-molecule-filters');
+  assert(filtersEl != null, 'filters container');
+  assert(filtersEl.classList.contains('tf-toolbar__filters'), 'toolbar filters class');
+  const chips = filtersEl.querySelectorAll('tf-chip');
+  assertEq(chips.length, 2, 'two filter chips');
+  assert(chips[0].hasAttribute('clickable'), 'chip clickable');
+  assertEq(chips[0].getAttribute('label'), 'Active', 'chip label');
+  assertEq(chips[0].dataset.filterId, 'f1', 'filter id');
 });
 
 // ============================================================================
 // StatGroup (0x000A)
 // ============================================================================
 
-test('StatGroup renders grid with columns', () => {
+test('StatGroup renders grid of tf-stat-card with columns', () => {
   setup();
   const engine = makeEngine();
   const stat1 = comp(STAT_CARD_TAG, [
@@ -324,7 +364,7 @@ test('StatGroup renders grid with columns', () => {
   ]));
   assert(el.classList.contains('tf-stat-group'), 'class');
   assert(el.style.gridTemplateColumns === 'repeat(2, 1fr)', 'grid cols');
-  assertEq(el.querySelectorAll('.tf-stat-group__item').length, 2, 'two items');
+  assertEq(el.querySelectorAll('tf-stat-card').length, 2, 'two tf-stat-card items');
 });
 
 test('StatGroup defaults columns to stats count', () => {
@@ -356,7 +396,7 @@ test('StatGroup rejects non-StatCard children', () => {
 // Inspector (0x000C)
 // ============================================================================
 
-test('Inspector renders with slot and collapsible', () => {
+test('Inspector renders with slot and collapsible tf-button toggle', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(INSPECTOR_TAG, [
@@ -370,7 +410,12 @@ test('Inspector renders with slot and collapsible', () => {
   assert(el.querySelector('.tf-inspector__title').textContent === 'Details', 'title');
   const body = el.querySelector('.tf-inspector__body');
   assert(body.getAttribute('data-slot-id') === 'detail-slot', 'slot');
-  assert(el.querySelector('.tf-inspector__toggle') != null, 'toggle button');
+  const toggle = el.querySelector('.tf-inspector__toggle');
+  assert(toggle != null, 'toggle present');
+  assertEq(toggle.tagName, 'TF-BUTTON', 'toggle is tf-button');
+  toggle.dispatchEvent(new Event('click', { bubbles: true }));
+  assert(el.classList.contains('tf-inspector--collapsed'), 'collapsed after click');
+  assertEq(toggle.getAttribute('aria-expanded'), 'false', 'aria-expanded after click');
 });
 
 test('Inspector renders without collapsible', () => {
@@ -393,16 +438,16 @@ test('Inspector renders tabs and actions', () => {
     { 0: 'properties', 1: LIT('Properties') },
     { 0: 'history', 1: LIT('History') },
   ];
-  const el = engine.render(comp(INSPECTOR_TAG, [
+  const el = mount(engine.render(comp(INSPECTOR_TAG, [
     [0, LIT('Item')],
     [1, 'item-slot'],
     [2, [btnComp('Close')]],
     [3, tabs],
     [4, false],
-  ]));
-  const tabsEl = el.querySelector('.tf-molecule-tabs');
-  assert(tabsEl != null, 'tabs rendered');
-  assertEq(tabsEl.querySelectorAll('.tf-molecule-tabs__tab').length, 2, 'two tabs');
+  ])));
+  const tabsEl = el.querySelector('tf-tabs');
+  assert(tabsEl != null, 'tf-tabs rendered');
+  assertEq(tabsEl.querySelectorAll('tf-tab').length, 2, 'two tabs');
   assert(el.querySelector('.tf-inspector__actions') != null, 'actions');
 });
 

@@ -62,7 +62,6 @@ function renderImageGallery(component, ctx) {
 
       const img = document.createElement('img');
       img.classList.add('tf-image-gallery__img');
-      img.style.objectFit = 'cover';
       const src = typeof item === 'string' ? item : (item.src || item.url || '');
       if (typeof src === 'string' && !/^javascript:/i.test(src.trim())) img.src = src;
       img.alt = (item.alt != null ? String(item.alt) : `Image ${i + 1}`);
@@ -182,22 +181,18 @@ function renderCarousel(component, ctx) {
   wrapper.appendChild(viewport);
 
   if (showArrows) {
-    const prevBtn = document.createElement('button');
-    prevBtn.type = 'button';
-    prevBtn.classList.add('tf-carousel__arrow', 'tf-carousel__arrow--prev');
-    prevBtn.setAttribute('aria-label', 'Previous slide');
-    prevBtn.textContent = '‹';
-    prevBtn.addEventListener('click', () => navigate(-1));
-
-    const nextBtn = document.createElement('button');
-    nextBtn.type = 'button';
-    nextBtn.classList.add('tf-carousel__arrow', 'tf-carousel__arrow--next');
-    nextBtn.setAttribute('aria-label', 'Next slide');
-    nextBtn.textContent = '›';
-    nextBtn.addEventListener('click', () => navigate(1));
-
-    wrapper.appendChild(prevBtn);
-    wrapper.appendChild(nextBtn);
+    const makeArrow = (dir, glyph, ariaLabel) => {
+      const btn = document.createElement('tf-button');
+      btn.setAttribute('variant', 'ghost');
+      btn.setAttribute('type', 'button');
+      btn.setAttribute('label', glyph);
+      btn.setAttribute('aria-label', ariaLabel);
+      btn.classList.add('tf-carousel__arrow', `tf-carousel__arrow--${dir < 0 ? 'prev' : 'next'}`);
+      btn.addEventListener('click', () => navigate(dir));
+      return btn;
+    };
+    wrapper.appendChild(makeArrow(-1, '‹', 'Previous slide'));
+    wrapper.appendChild(makeArrow(1, '›', 'Next slide'));
   }
 
   if (showIndicators) {
@@ -209,6 +204,9 @@ function renderCarousel(component, ctx) {
       const items = getItems();
       const currentIdx = getIndex();
       for (let i = 0; i < items.length; i++) {
+        // Indicator dots stay native <button>: .tf-carousel__indicator styles
+        // the element itself as an 8px dot; tf-button's inner .tf-btn markup
+        // cannot collapse to that affordance.
         const dot = document.createElement('button');
         dot.type = 'button';
         dot.classList.add('tf-carousel__indicator');
@@ -291,6 +289,11 @@ export const FPS_COUNTER_TAG = 0x060E;
 const FPS_FIELD_KEYS = new Set([0, 1, 2]);
 const FPS_VARIANTS = new Set(['minimal', 'detailed']);
 
+// Deliberately NOT <tf-fps-counter>: that element self-subscribes to a binary
+// protocol stream (stream-id attribute via ApiBinary) and has no API to accept
+// values pushed from the SDK reactive store, while this component is driven by
+// source_path. Its markup classes (sdk-fps-*) also have no shared CSS — the
+// .tf-fps-counter__* block in controls.css was authored for this renderer.
 function renderFpsCounter(component, ctx) {
   assertOnlyKnownFields(component.fields, FPS_FIELD_KEYS, 'FpsCounter');
 

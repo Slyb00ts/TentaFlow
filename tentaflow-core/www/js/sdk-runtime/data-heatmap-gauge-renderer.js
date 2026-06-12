@@ -1,7 +1,9 @@
 // =============================================================================
 // File: sdk-runtime/data-heatmap-gauge-renderer.js
-// Description: Renderers for Heatmap (0x021B) using <tf-heatmap> web component,
-//              and Gauge (0x021C) kept as SVG (no tf-gauge component exists).
+// Description: Renderers for Heatmap (0x021B) using <tf-heatmap> and Gauge
+//              (0x021C) using <tf-gauge> web components. The renderers only
+//              validate the CBOR FieldMap and map BindRefs to component
+//              attributes/properties; all drawing lives in the components.
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/gauge.rs.
 // =============================================================================
 
@@ -11,7 +13,7 @@ import {
 } from './component-renderer.js';
 import { resolveBindRef, subscribeBindRef, formatValue, assertBindRef } from './bind-resolver.js';
 import {
-  SVG_NS, TONES,
+  TONES,
   requireEnum, requireBool, requireU16, requireF64, requireString,
   requirePath, assertOnlyKnownFields, assertValueFormat,
 } from './data-chart-shared.js';
@@ -237,8 +239,8 @@ function renderHeatmap(component, ctx) {
   rebuildCells();
   ctx.registerCleanup(ctx.store.subscribe(cellsPath, rebuildCells));
 
-  // Forward cell-click events
-  heatmap.onCellClick = (row, col) => {
+  // Forward cell-click events (tf-heatmap calls back with a single object)
+  heatmap.onCellClick = ({ row, col }) => {
     const rowId = rows[row] ? rows[row].id : String(row);
     const colId = columns[col] ? columns[col].id : String(col);
     heatmap.dispatchEvent(
@@ -253,7 +255,7 @@ function renderHeatmap(component, ctx) {
 }
 
 // =============================================================================
-// Gauge (0x021C) — kept as SVG (no tf-gauge component)
+// Gauge (0x021C) — uses <tf-gauge> web component
 // =============================================================================
 
 export const GAUGE_TAG = 0x021C;
@@ -280,42 +282,6 @@ function parseGaugeThreshold(raw, ctx) {
   return { value, tone, label };
 }
 
-function gaugeArcSpan(variant) {
-  if (variant === 'circular') return Math.PI * 2;
-  if (variant === 'arc') return Math.PI * 1.5;
-  return Math.PI;
-}
-
-function gaugeArcStart(variant) {
-  if (variant === 'circular') return -Math.PI / 2;
-  if (variant === 'arc') return Math.PI * 0.75;
-  return Math.PI;
-}
-
-function describeArc(cx, cy, r, startAngle, endAngle) {
-  const sweepAngle = endAngle - startAngle;
-  if (Math.abs(sweepAngle) < 1e-6) {
-    const x = cx + r * Math.cos(startAngle);
-    const y = cy + r * Math.sin(startAngle);
-    return `M ${x} ${y}`;
-  }
-  if (Math.abs(sweepAngle) >= Math.PI * 2 - 1e-6) {
-    const midAngle = startAngle + Math.PI;
-    const x0 = cx + r * Math.cos(startAngle);
-    const y0 = cy + r * Math.sin(startAngle);
-    const xMid = cx + r * Math.cos(midAngle);
-    const yMid = cy + r * Math.sin(midAngle);
-    return `M ${x0} ${y0} A ${r} ${r} 0 1 1 ${xMid} ${yMid} A ${r} ${r} 0 1 1 ${x0} ${y0}`;
-  }
-  const x0 = cx + r * Math.cos(startAngle);
-  const y0 = cy + r * Math.sin(startAngle);
-  const x1 = cx + r * Math.cos(endAngle);
-  const y1 = cy + r * Math.sin(endAngle);
-  const largeArc = Math.abs(sweepAngle) > Math.PI ? 1 : 0;
-  const sweepFlag = sweepAngle > 0 ? 1 : 0;
-  return `M ${x0} ${y0} A ${r} ${r} 0 ${largeArc} ${sweepFlag} ${x1} ${y1}`;
-}
-
 function renderGauge(component, ctx) {
   assertOnlyKnownFields(component.fields, GAUGE_FIELD_KEYS, 'Gauge');
 
@@ -336,128 +302,63 @@ function renderGauge(component, ctx) {
   const sizePx = requireU16(ctx.readField(component.fields, 7), 'Gauge.size_px');
   if (sizePx === 0) throw new TypeError('Gauge.size_px must be > 0');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-gauge');
-  wrapper.classList.add(`tf-gauge--variant-${variant}`);
-  wrapper.style.width = `${sizePx}px`;
-  wrapper.style.height = `${sizePx}px`;
+  // <tf-gauge> web component — renderer only maps validated fields onto it.
+  const el = document.createElement('tf-gauge');
+  el.setAttribute('min', String(min));
+  el.setAttribute('max', String(max));
+  el.setAttribute('variant', variant);
+  el.setAttribute('size', String(sizePx));
 
-  const svg = document.createElementNS(SVG_NS, 'svg');
-  svg.setAttribute('viewBox', `0 0 ${sizePx} ${sizePx}`);
-  svg.setAttribute('width', String(sizePx));
-  svg.setAttribute('height', String(sizePx));
-  svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', 'Gauge');
-  svg.classList.add('tf-gauge__svg');
-  wrapper.appendChild(svg);
-
-  const cx = sizePx / 2;
-  const cy = sizePx / 2;
-  const radius = sizePx * 0.4;
-  const strokeW = sizePx * 0.08;
-
-  const arcSpan = gaugeArcSpan(variant);
-  const arcStart = gaugeArcStart(variant);
-
-  const trackPath = describeArc(cx, cy, radius, arcStart, arcStart + arcSpan);
-  const track = document.createElementNS(SVG_NS, 'path');
-  track.setAttribute('d', trackPath);
-  track.setAttribute('fill', 'none');
-  track.setAttribute('stroke-width', String(strokeW));
-  track.classList.add('tf-gauge__track');
-  svg.appendChild(track);
-
-  const valueArc = document.createElementNS(SVG_NS, 'path');
-  valueArc.setAttribute('fill', 'none');
-  valueArc.setAttribute('stroke-width', String(strokeW));
-  valueArc.classList.add('tf-gauge__value-arc');
-  svg.appendChild(valueArc);
-
-  for (const th of thresholds) {
-    const ratio = (th.value - min) / (max - min);
-    if (ratio < 0 || ratio > 1) continue;
-    const angle = arcStart + arcSpan * ratio;
-    const inner = radius - strokeW * 0.6;
-    const outer = radius + strokeW * 0.6;
-    const x1 = cx + Math.cos(angle) * inner;
-    const y1 = cy + Math.sin(angle) * inner;
-    const x2 = cx + Math.cos(angle) * outer;
-    const y2 = cy + Math.sin(angle) * outer;
-    const tick = document.createElementNS(SVG_NS, 'line');
-    tick.setAttribute('x1', String(x1));
-    tick.setAttribute('y1', String(y1));
-    tick.setAttribute('x2', String(x2));
-    tick.setAttribute('y2', String(y2));
-    tick.classList.add('tf-gauge__threshold');
-    tick.classList.add(`tf-gauge__threshold--tone-${th.tone}`);
-    if (th.label != null) {
-      const title = document.createElementNS(SVG_NS, 'title');
-      const applyLbl = () => {
+  // Thresholds: resolve label BindRefs to strings; re-push on label changes.
+  const applyThresholds = () => {
+    el.thresholds = thresholds.map((th) => {
+      let label = null;
+      if (th.label != null) {
         const v = resolveBindRef(th.label, ctx.store);
-        title.textContent = v == null ? `${th.value}` : `${v}`;
-        tick.setAttribute('aria-label', title.textContent);
-      };
-      applyLbl();
-      ctx.registerCleanup(subscribeBindRef(th.label, ctx.store, applyLbl));
-      tick.appendChild(title);
+        label = v == null ? String(th.value) : String(v);
+      }
+      return { value: th.value, tone: th.tone, label };
+    });
+  };
+  applyThresholds();
+  for (const th of thresholds) {
+    if (th.label != null) {
+      ctx.registerCleanup(subscribeBindRef(th.label, ctx.store, applyThresholds));
     }
-    svg.appendChild(tick);
   }
 
-  const valueText = document.createElementNS(SVG_NS, 'text');
-  valueText.setAttribute('x', String(cx));
-  valueText.setAttribute('y', String(cy));
-  valueText.setAttribute('text-anchor', 'middle');
-  valueText.setAttribute('dominant-baseline', 'middle');
-  valueText.classList.add('tf-gauge__value-text');
-  svg.appendChild(valueText);
-
-  let labelText = null;
   if (labelBind != null) {
-    labelText = document.createElementNS(SVG_NS, 'text');
-    labelText.setAttribute('x', String(cx));
-    labelText.setAttribute('y', String(cy + sizePx * 0.12));
-    labelText.setAttribute('text-anchor', 'middle');
-    labelText.classList.add('tf-gauge__label');
-    const apply = () => {
+    const applyLabel = () => {
       const v = resolveBindRef(labelBind, ctx.store);
-      labelText.textContent = v == null ? '' : String(v);
+      el.setAttribute('label', v == null ? '' : String(v));
     };
-    apply();
-    ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, apply));
-    svg.appendChild(labelText);
+    applyLabel();
+    ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
   }
 
   const apply = () => {
     const raw = resolveBindRef(valueBind, ctx.store);
-    const invalid = (raw == null) || typeof raw !== 'number' || !Number.isFinite(raw);
-    if (invalid) {
-      valueArc.setAttribute('d', `M ${cx + radius * Math.cos(arcStart)} ${cy + radius * Math.sin(arcStart)}`);
-      const tone = raw == null ? 'muted' : 'critical';
-      valueArc.setAttribute('class', `tf-gauge__value-arc tf-gauge__value-arc--tone-${tone}`);
-      valueText.textContent = '—';
-      svg.setAttribute('aria-label', `— (${min}-${max})`);
-      if (raw != null) svg.setAttribute('aria-invalid', 'true');
-      else svg.removeAttribute('aria-invalid');
+    if (raw == null) {
+      // Absent attribute = empty state (muted tone, no aria-invalid).
+      el.removeAttribute('display-value');
+      el.removeAttribute('value');
       return;
     }
-    svg.removeAttribute('aria-invalid');
-    const clamped = Math.max(min, Math.min(max, raw));
-    const ratio = (clamped - min) / (max - min);
-    const endAngle = arcStart + arcSpan * ratio;
-    valueArc.setAttribute('d', describeArc(cx, cy, radius, arcStart, endAngle));
-    let tone = 'primary';
-    for (const th of thresholds) {
-      if (clamped >= th.value) tone = th.tone;
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+      // Non-finite attribute = invalid state (critical tone + aria-invalid).
+      el.removeAttribute('display-value');
+      el.setAttribute('value', 'NaN');
+      return;
     }
-    valueArc.setAttribute('class', `tf-gauge__value-arc tf-gauge__value-arc--tone-${tone}`);
-    valueText.textContent = format ? formatValue(clamped, format, ctx.locale) : String(clamped);
-    svg.setAttribute('aria-label', `${valueText.textContent} (${min}-${max})`);
+    const clamped = Math.max(min, Math.min(max, raw));
+    if (format) el.setAttribute('display-value', formatValue(clamped, format, ctx.locale));
+    else el.removeAttribute('display-value');
+    el.setAttribute('value', String(raw));
   };
   apply();
   ctx.registerCleanup(subscribeBindRef(valueBind, ctx.store, apply));
 
-  return wrapper;
+  return el;
 }
 
 // =============================================================================
